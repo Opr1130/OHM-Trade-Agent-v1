@@ -1,0 +1,15 @@
+{
+  "symbol": "{{ticker}}",
+  "asset_class": "crypto",
+  "timeframe": "{{interval}}",
+  "side": "long",
+  "price": {{close}},
+  "stop_price": 0,
+  "target_price": 0,
+  "rsi": 0,
+  "volume_ratio": 0,
+  "ema_fast": 0,
+  "ema_slow": 0,
+  "breakout": false,
+  "market_regime": "neutral"
+}
