@@ -20,7 +20,9 @@ def review_signal(signal: TradingSignal, model: str, api_key: str) -> dict:
         reasoning={"effort": "medium"},
         input=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(signal.model_dump(mode="json"))},
+            {"role": "user", "content": json.dumps(
+                signal.model_dump(mode="json", exclude={"timestamp"})
+            )},
         ],
     )
     result = json.loads(response.output_text)
