@@ -52,6 +52,47 @@ class KrakenClient:
 
         return result
 
+    def get_asset_pairs(self) -> dict[str, dict[str, Any]]:
+        """Return all online Kraken spot trading pairs."""
+        result = self._get("AssetPairs", {})
+
+        return {
+            pair_id: details
+            for pair_id, details in result.items()
+            if isinstance(details, dict)
+            and details.get("status") == "online"
+        }
+
+    def get_tickers(
+        self,
+        pairs: list[str],
+    ) -> dict[str, dict[str, float]]:
+        """Return ticker data for multiple Kraken pairs."""
+        if not pairs:
+            return {}
+
+        result = self._get(
+            "Ticker",
+            {"pair": ",".join(pairs)},
+        )
+
+        tickers: dict[str, dict[str, float]] = {}
+
+        for pair_name, ticker in result.items():
+            tickers[pair_name] = {
+                "ask": float(ticker["a"][0]),
+                "bid": float(ticker["b"][0]),
+                "last": float(ticker["c"][0]),
+                "volume_today": float(ticker["v"][0]),
+                "volume_24h": float(ticker["v"][1]),
+                "high_today": float(ticker["h"][0]),
+                "high_24h": float(ticker["h"][1]),
+                "low_today": float(ticker["l"][0]),
+                "low_24h": float(ticker["l"][1]),
+            }
+
+        return tickers
+
     def get_ticker(self, pair: str) -> dict[str, float]:
         result = self._get("Ticker", {"pair": pair})
 
