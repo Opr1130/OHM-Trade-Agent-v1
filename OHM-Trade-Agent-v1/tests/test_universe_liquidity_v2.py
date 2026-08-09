@@ -465,7 +465,10 @@ def test_one_underlying_asset_is_one_chief_payload_and_one_api_call(monkeypatch)
     assert context["primary_quote_currency"] == "USD"
     assert context["combined_24h_liquidity_usd"] == 260_000_000
     assert responses.payload["candidates"][0]["market_data_quality"]["status"] == "PASS"
-    assert responses.payload["candidates"][0]["execution_quality"]["status"] == "UNAVAILABLE"
+    execution = responses.payload["candidates"][0]["execution_evidence"]
+    assert execution["status"] == "UNAVAILABLE"
+    assert execution["book_coverage_status"] == "UNAVAILABLE"
+    assert "execution_quality" not in responses.payload["candidates"][0]
 
 
 def _actionable_plan(symbol):
