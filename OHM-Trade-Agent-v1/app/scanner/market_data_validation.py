@@ -85,8 +85,18 @@ def validate_market_data(
             non_finite += 1
             continue
         timestamps.append(float(candle.timestamp))
-        prices = (candle.open, candle.high, candle.low, candle.close, candle.vwap)
-        if any(price <= 0 for price in prices) or candle.volume < 0:
+        ohlc_prices = (candle.open, candle.high, candle.low, candle.close)
+        zero_activity_vwap = (
+            candle.vwap == 0
+            and candle.volume == 0
+            and candle.trade_count == 0
+        )
+        if (
+            any(price <= 0 for price in ohlc_prices)
+            or candle.volume < 0
+            or candle.vwap < 0
+            or (candle.vwap == 0 and not zero_activity_vwap)
+        ):
             invalid_ohlc += 1
             continue
         if (
