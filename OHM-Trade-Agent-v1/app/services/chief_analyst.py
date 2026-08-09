@@ -17,8 +17,11 @@ Do not place trades.
 Do not assume every high technical score is investable.
 Each payload item is one unique underlying asset. Never return duplicate
 candidates for its USD and USDT markets. Use the exact primary_pair value as
-the candidate symbol; primary market selection is analysis context, not an
-execution or currency-conversion recommendation.
+the candidate symbol. When a USD market exists it is the canonical identity
+used to keep the setup and trade lifecycle stable; this does not claim that it
+has greater liquidity. A secondary USDT market is supporting liquidity and
+cross-market evidence only, not a currency-conversion or execution
+recommendation. A USDT-only asset remains explicitly USDT quoted.
 Consider:
 - trend quality
 - RSI extension
