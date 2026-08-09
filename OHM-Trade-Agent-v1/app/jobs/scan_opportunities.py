@@ -1,6 +1,7 @@
 from app.core.config import get_settings
 from app.scanner.candidates import select_candidates
-from app.scanner.market_scanner import scan_market
+from app.scanner.market_scanner import confirm_secondary_markets, scan_market
+from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import review_candidates
 from app.services.economic_quality_gate import evaluate_economic_quality
@@ -15,10 +16,10 @@ def main():
 
     # ---------------------------------------------------------
     # STEP 1: Scan the market.
-    # OHM scans up to 100 assets internally.
-    # This does NOT mean 100 Telegram notifications.
+    # OHM scans the configured unique-asset universe internally.
+    # This does NOT increase the eight-candidate Chief shortlist.
     # ---------------------------------------------------------
-    scan = scan_market(limit=100)
+    scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
 
     # ---------------------------------------------------------
     # STEP 2: Local technical screening.
@@ -27,6 +28,22 @@ def main():
     candidates = select_candidates(scan.snapshots)
 
     print("OHM AI Opportunity Scan")
+    if scan.universe is not None:
+        print("===== OHM UNIVERSE =====")
+        print("Eligible USD markets:", scan.universe.eligible_usd_markets)
+        print("Eligible USDT markets:", scan.universe.eligible_usdt_markets)
+        print("Unique underlying assets:", scan.universe.unique_underlying_assets)
+        print("Selected liquid assets:", scan.universe.selected_liquid_assets)
+        print(
+            "USDT/USD conversion:",
+            (
+                f"{scan.universe.usdt_usd_rate:.6f}"
+                if scan.universe.usdt_usd_rate is not None
+                else "UNAVAILABLE"
+            ),
+        )
+        for warning in scan.universe.warnings:
+            print("UNIVERSE WARNING:", warning)
     print("Requested:", scan.requested)
     print("Analyzed:", scan.analyzed)
     print("Skipped:", scan.skipped)
@@ -36,6 +53,26 @@ def main():
     if not candidates:
         print("No technical candidates.")
         return
+
+    # Secondary OHLC is fetched only for the maximum-eight shortlist.
+    secondary_summary = confirm_secondary_markets(candidates)
+    print(
+        "Secondary confirmations:",
+        f"requested={secondary_summary.requested}",
+        f"analyzed={secondary_summary.analyzed}",
+        f"failed={secondary_summary.failed}",
+    )
+    for candidate in candidates:
+        print(
+            f"CROSS PAIR {candidate.underlying_asset or candidate.symbol}: "
+            f"Primary={candidate.primary_pair or candidate.symbol} "
+            f"Secondary={candidate.secondary_pair or 'NONE'} "
+            f"Combined=${candidate.combined_24h_liquidity_usd:,.2f} "
+            f"PrimaryVol={candidate.volume_ratio:.2f}x "
+            f"SecondaryVol="
+            f"{candidate.secondary_volume_ratio if candidate.secondary_volume_ratio is not None else 'N/A'} "
+            f"Status={candidate.cross_pair_confirmation_status}"
+        )
 
     # ---------------------------------------------------------
     # STEP 3: AI Chief review.
@@ -60,7 +97,7 @@ def main():
         len(review.get("top_candidates", [])),
     )
     print(
-        "Qualified alerts before economic gate:",
+        "Qualified alerts before deterministic quality gates:",
         len(alerts),
     )
 
@@ -96,6 +133,8 @@ def main():
             snapshot,
             alert["risk_level"],
         )
+        alert["underlying_asset"] = snapshot.underlying_asset or snapshot.symbol
+        alert["primary_pair"] = snapshot.primary_pair or snapshot.symbol
 
         # Deterministic target realism gate. A failure remains internal and is
         # stopped before pending persistence or any Telegram action.
