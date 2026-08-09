@@ -124,6 +124,17 @@ def test_api_failure_is_unavailable_and_candidates_continue():
     assert all(item.independent_market_reference.status == UNAVAILABLE for item in candidates)
 
 
+def test_unexpected_runtime_error_propagates():
+    class Client:
+        api_mode = "KEYLESS"
+        def get_markets_by_symbols(self, symbols):
+            raise RuntimeError("programming defect")
+    candidate = snapshot()
+    with pytest.raises(RuntimeError, match="programming defect"):
+        validate_finalist_references([candidate], 1, client=Client(), now=NOW)
+    assert candidate.independent_market_reference is None
+
+
 def test_api_key_header_is_used_but_never_returned(monkeypatch):
     secret = "secret-demo-key"
     captured = {}

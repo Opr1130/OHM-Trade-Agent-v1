@@ -6,7 +6,7 @@ import math
 from typing import Any
 
 from app.scanner.models import MarketSnapshot
-from app.services.coingecko import CoinGeckoClient
+from app.services.coingecko import CoinGeckoAPIError, CoinGeckoClient
 
 
 CONFIRMED = "CONFIRMED"
@@ -185,7 +185,7 @@ def validate_finalist_references(
     symbols = [_candidate_symbol(item) for item in requested]
     try:
         rows = client.get_markets_by_symbols(symbols)
-    except Exception:
+    except CoinGeckoAPIError:
         rows = []
         for candidate in requested:
             candidate.independent_market_reference = _unavailable(
