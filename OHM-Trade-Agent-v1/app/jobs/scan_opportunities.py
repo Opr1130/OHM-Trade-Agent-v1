@@ -118,7 +118,20 @@ def main():
             f"24h resistance clearance="
             f"{target_quality.clearance_to_24h_resistance_pct:.2f}% "
             f"72h resistance clearance="
-            f"{target_quality.clearance_to_72h_resistance_pct:.2f}%"
+            f"{target_quality.clearance_to_72h_resistance_pct:.2f}% "
+            f"T1 move={target_quality.target_1_move_pct:.2f}% "
+            f"24h upside p50/p75/p90="
+            f"{snapshot.rolling_24h_upside_median_pct:.2f}/"
+            f"{snapshot.rolling_24h_upside_p75_pct:.2f}/"
+            f"{snapshot.rolling_24h_upside_p90_pct:.2f}% "
+            f"T2 move={target_quality.target_2_move_pct:.2f}% "
+            f"72h upside p50/p75/p90="
+            f"{snapshot.rolling_72h_upside_median_pct:.2f}/"
+            f"{snapshot.rolling_72h_upside_p75_pct:.2f}/"
+            f"{snapshot.rolling_72h_upside_p90_pct:.2f}% "
+            f"ATR diagnostic only: T1="
+            f"{target_quality.target_1_atr_multiple:.2f} "
+            f"T2={target_quality.target_2_atr_multiple:.2f}"
         )
 
         # -----------------------------------------------------
