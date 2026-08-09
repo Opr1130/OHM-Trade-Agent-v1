@@ -107,7 +107,8 @@ def main():
         print(
             f"EXECUTION {candidate.symbol}: "
             f"Data={data_status} "
-            f"Status={execution.status} "
+            f"StructuralStatus={execution.status} "
+            f"BookCoverage={execution.book_coverage_status} "
             f"Spread={execution.spread_bps if execution.spread_bps is not None else 'N/A'}bps "
             f"VisibleAsk=${execution.visible_ask_notional if execution.visible_ask_notional is not None else 0:,.2f} "
             f"VisibleBid=${execution.visible_bid_notional if execution.visible_bid_notional is not None else 0:,.2f} "
