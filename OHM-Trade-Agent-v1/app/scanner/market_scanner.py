@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from app.exchanges.kraken import KrakenClient
 from app.indicators.technical import atr, ema, macd, rsi, volume_ratio
 from app.scanner.models import MarketSnapshot
+from app.scanner.execution_validation import (
+    INVALID,
+    ExecutionValidation,
+    evaluate_execution,
+    unavailable_execution,
+)
+from app.scanner.market_data_validation import validate_market_data
 from app.scanner.cross_pair_confirmation import evaluate_cross_pair_confirmation
 from app.scanner.technical_scorer import score_snapshot
 from app.scanner.universe import (
@@ -28,6 +35,9 @@ class ScanResult:
     skips: list[str]
     failures: list[str]
     universe: UniverseBuildResult | None = None
+    data_quality_rejected: int = 0
+    data_quality_warnings: int = 0
+    data_quality_rejections: list[str] | None = None
 
 
 @dataclass
@@ -182,6 +192,16 @@ def analyze_symbol(
                 f"{symbol}: insufficient history ({len(candles)} candles)",
             )
 
+        ticker_last = (
+            universe_asset.primary_ticker_last if universe_asset else None
+        )
+        data_validation = validate_market_data(candles, ticker_last, interval_minutes=60)
+        if not data_validation.qualified:
+            return (
+                "data_reject", None,
+                f"{symbol}: {'; '.join(data_validation.rejection_reasons)}",
+            )
+
         closes = [candle.close for candle in candles]
         highs = [candle.high for candle in candles]
         lows = [candle.low for candle in candles]
@@ -270,6 +290,7 @@ def analyze_symbol(
             rolling_72h_upside_median_pct=rolling_72h_upside[0],
             rolling_72h_upside_p75_pct=rolling_72h_upside[1],
             rolling_72h_upside_p90_pct=rolling_72h_upside[2],
+            market_data_validation=data_validation,
         )
 
         if universe_asset is not None:
@@ -295,6 +316,10 @@ def analyze_symbol(
                 universe_asset.combined_24h_notional_usd
             )
             snapshot.liquidity_rank = universe_asset.liquidity_rank
+            snapshot.kraken_public_symbol = universe_asset.primary_kraken_symbol
+            snapshot.ticker_last = universe_asset.primary_ticker_last
+            snapshot.ticker_bid = universe_asset.primary_ticker_bid
+            snapshot.ticker_ask = universe_asset.primary_ticker_ask
 
         snapshot.technical_score = score_snapshot(snapshot).score
 
@@ -316,6 +341,7 @@ def scan_market(
     snapshots: list[MarketSnapshot] = []
     skips: list[str] = []
     failures: list[str] = []
+    data_rejections: list[str] = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
@@ -334,6 +360,8 @@ def scan_market(
                 snapshots.append(snapshot)
             elif status == "skip" and message:
                 skips.append(message)
+            elif status == "data_reject" and message:
+                data_rejections.append(message)
             elif status == "fail" and message:
                 failures.append(message)
 
@@ -351,11 +379,19 @@ def scan_market(
         skips=sorted(skips),
         failures=sorted(failures),
         universe=universe,
+        data_quality_rejected=len(data_rejections),
+        data_quality_warnings=sum(
+            snapshot.market_data_validation.status == "WARN"
+            for snapshot in snapshots
+            if snapshot.market_data_validation is not None
+        ),
+        data_quality_rejections=sorted(data_rejections),
     )
 
 
 def confirm_secondary_markets(
     candidates: list[MarketSnapshot],
+    usdt_usd_rate: float | None = None,
 ) -> SecondaryConfirmationSummary:
     """Fetch secondary OHLC only for shortlisted assets that have one."""
     requested_candidates = [
@@ -391,9 +427,68 @@ def confirm_secondary_markets(
             candidate.cross_pair_confirmation_status = result.status
             candidate.cross_pair_strengths = result.strengths
             candidate.cross_pair_warnings = result.warnings
+            if secondary is not None and usdt_usd_rate is not None:
+                normalized_secondary = secondary.last_price * usdt_usd_rate
+                divergence = abs(
+                    normalized_secondary - candidate.last_price
+                ) / candidate.last_price * 100
+                candidate.cross_pair_price_divergence_pct = divergence
+                if divergence <= 0.50:
+                    candidate.cross_pair_price_status = "NORMAL"
+                elif divergence <= 2.00:
+                    candidate.cross_pair_price_status = "WARNING"
+                    candidate.cross_pair_warnings.append(
+                        "Normalized USD/USDT prices differ by more than 0.50%"
+                    )
+                else:
+                    candidate.cross_pair_price_status = "MATERIAL_DIVERGENCE"
+                    candidate.cross_pair_warnings.append(
+                        "Normalized USD/USDT prices differ by more than 2.00%"
+                    )
 
     return SecondaryConfirmationSummary(
         requested=len(requested_candidates),
         analyzed=analyzed,
         failed=failed,
     )
+
+
+def deep_validate_candidates(
+    candidates: list[MarketSnapshot],
+    validation_notional_usd: float,
+    usdt_usd_rate: float | None,
+    client: KrakenClient | None = None,
+) -> list[MarketSnapshot]:
+    """Attach public book/trade evidence to at most the eight finalists."""
+    client = client or KrakenClient()
+    validated: list[MarketSnapshot] = []
+    for candidate in candidates[:8]:
+        symbol = candidate.kraken_public_symbol or candidate.symbol
+        try:
+            book = client.get_pre_trade(symbol)
+        except Exception as exc:
+            candidate.execution_validation = unavailable_execution(
+                f"PreTrade unavailable: {exc}"
+            )
+            validated.append(candidate)
+            continue
+        try:
+            trades = client.get_post_trade(symbol, count=100)
+        except Exception:
+            trades = None
+        quote_rate = (
+            usdt_usd_rate
+            if candidate.primary_quote_currency == "USDT" and usdt_usd_rate
+            else 1.0
+        )
+        result: ExecutionValidation = evaluate_execution(
+            book=book,
+            validation_notional_usd=validation_notional_usd,
+            ticker_last=candidate.ticker_last or candidate.last_price,
+            quote_to_usd_rate=quote_rate,
+            trades=trades,
+        )
+        candidate.execution_validation = result
+        if result.status != INVALID:
+            validated.append(candidate)
+    return validated
