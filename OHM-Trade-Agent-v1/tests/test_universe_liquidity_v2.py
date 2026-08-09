@@ -18,7 +18,8 @@ from app.scanner.universe import (
     UniverseBuildResult,
     build_kraken_asset_universe,
 )
-from app.services import chief_analyst
+from app.services import chief_alert_notifier, chief_analyst
+from app.services.entry_exit_advisor import EntryExitPlan
 
 
 def pair(base, quote, *, altname=None):
@@ -117,8 +118,9 @@ def test_dual_market_combines_liquidity_without_duplicate_asset():
     assert len(result.assets) == 1
     sol = result.assets[0]
     assert sol.combined_24h_notional_usd == 90_000_000 + 171_700_000
-    assert sol.primary_pair == "SOLUSDT"
-    assert sol.secondary_pair == "SOLUSD"
+    assert sol.primary_pair == "SOLUSD"
+    assert sol.secondary_pair == "SOLUSDT"
+    assert sol.primary_quote_currency == "USD"
     assert sum(len(call) for call in client.ticker_calls) == 3
 
 
@@ -143,7 +145,7 @@ def test_liquidity_ranking_and_usd_tie_break_are_deterministic():
     assert bbb.secondary_pair == "BBBUSDT"
 
 
-def test_nearly_equal_liquidity_prefers_usd_deterministically():
+def test_usd_remains_canonical_when_usdt_is_far_more_liquid():
     result, _ = build(
         {
             "SOLUSD": pair("SOL", "USD"),
@@ -152,11 +154,54 @@ def test_nearly_equal_liquidity_prefers_usd_deterministically():
         },
         {
             "SOLUSD": ticker(100, 1_000),
-            "SOLUSDT": ticker(100.05, 1_000),
+            "SOLUSDT": ticker(100, 100_000),
             "USDTZUSD": ticker(1, 1_000),
         },
     )
     assert result.assets[0].primary_pair == "SOLUSD"
+    assert result.assets[0].secondary_pair == "SOLUSDT"
+
+
+def test_liquidity_reversal_across_scans_does_not_change_pair_identity():
+    pairs = {
+        "SOLUSD": pair("SOL", "USD"),
+        "SOLUSDT": pair("SOL", "USDT"),
+        "USDTZUSD": pair("USDT", "USD"),
+    }
+    usd_led, _ = build(pairs, {
+        "SOLUSD": ticker(100, 100_000),
+        "SOLUSDT": ticker(100, 1_000),
+        "USDTZUSD": ticker(1, 1_000),
+    })
+    usdt_led, _ = build(pairs, {
+        "SOLUSD": ticker(100, 1_000),
+        "SOLUSDT": ticker(100, 100_000),
+        "USDTZUSD": ticker(1, 1_000),
+    })
+    assert usd_led.assets[0].primary_pair == "SOLUSD"
+    assert usdt_led.assets[0].primary_pair == "SOLUSD"
+    assert usd_led.assets[0].secondary_pair == "SOLUSDT"
+    assert usdt_led.assets[0].secondary_pair == "SOLUSDT"
+
+
+def test_secondary_usdt_liquidity_can_improve_rank_without_becoming_primary():
+    result, _ = build(
+        {
+            "AAAUSD": pair("AAA", "USD"),
+            "BBBUSDT": pair("BBB", "USDT"),
+            "BBBUSD": pair("BBB", "USD"),
+            "USDTZUSD": pair("USDT", "USD"),
+        },
+        {
+            "AAAUSD": ticker(1, 1_000),
+            "BBBUSD": ticker(1, 600),
+            "BBBUSDT": ticker(1, 600),
+            "USDTZUSD": ticker(1, 1_000),
+        },
+    )
+    assert [asset.base_asset for asset in result.assets] == ["BBB", "AAA"]
+    assert result.assets[0].primary_pair == "BBBUSD"
+    assert result.assets[0].combined_24h_notional_usd == 1_200
 
 
 def test_ticker_returned_under_kraken_altname_is_resolved():
@@ -293,8 +338,8 @@ def test_scan_analyzes_only_one_primary_pair_per_unique_asset(monkeypatch):
     assets = [
         UniverseAsset(
             base_asset="SOL", usd_pair="SOLUSD", usdt_pair="SOLUSDT",
-            primary_pair="SOLUSDT", secondary_pair="SOLUSD",
-            primary_quote_currency="USDT",
+            primary_pair="SOLUSD", secondary_pair="SOLUSDT",
+            primary_quote_currency="USD",
             usdt_24h_notional_usd_equivalent=200,
             usd_24h_notional_usd=100,
             combined_24h_notional_usd=300, liquidity_rank=1,
@@ -328,7 +373,7 @@ def test_scan_analyzes_only_one_primary_pair_per_unique_asset(monkeypatch):
 
     monkeypatch.setattr(market_scanner, "analyze_symbol", fake_analyze)
     result = market_scanner.scan_market(limit=200)
-    assert sorted(calls) == ["BTCUSD", "SOLUSDT"]
+    assert sorted(calls) == ["BTCUSD", "SOLUSD"]
     assert result.requested == result.analyzed == 2
     assert len({item.underlying_asset for item in result.snapshots}) == 2
 
@@ -359,4 +404,46 @@ def test_one_underlying_asset_is_one_chief_payload_and_one_api_call(monkeypatch)
     assert responses.payload["candidate_count"] == 1
     context = responses.payload["candidates"][0]["liquidity_context"]
     assert context["underlying_asset"] == "SOL"
+    assert context["primary_pair"] == "SOLUSD"
+    assert context["secondary_pair"] == "SOLUSDT"
+    assert context["primary_quote_currency"] == "USD"
     assert context["combined_24h_liquidity_usd"] == 260_000_000
+
+
+def _actionable_plan(symbol):
+    return EntryExitPlan(
+        symbol=symbol, valid_now=True, entry_style="pullback_or_retest",
+        entry_low=99, entry_high=100, chase_limit=101, stop_price=96,
+        target_1=106, target_2=110, reward_to_risk_1=2,
+        reward_to_risk_2=3, risk_level="low", reason="Test plan",
+    )
+
+
+def test_telegram_dual_market_uses_stable_usd_market_identity():
+    message = chief_alert_notifier.format_trade_plan(
+        {
+            "underlying_asset": "SOL", "primary_pair": "SOLUSD",
+            "secondary_pair": "SOLUSDT", "primary_quote_currency": "USD",
+            "confidence": 90, "decision": "alert",
+        },
+        _actionable_plan("SOLUSD"),
+        "Summary",
+    )
+    assert "Market: SOLUSD" in message
+    assert "Market: SOLUSDT" not in message
+    assert "no automatic USD conversion" not in message
+
+
+def test_telegram_usdt_only_market_is_explicitly_quoted_without_conversion():
+    message = chief_alert_notifier.format_trade_plan(
+        {
+            "underlying_asset": "XYZ", "primary_pair": "XYZUSDT",
+            "secondary_pair": None, "primary_quote_currency": "USDT",
+            "confidence": 90, "decision": "alert",
+        },
+        _actionable_plan("XYZUSDT"),
+        "Summary",
+    )
+    assert "Market: XYZUSDT" in message
+    assert "USDT availability required" in message
+    assert "no automatic USD conversion" in message
