@@ -1,6 +1,10 @@
 from app.core.config import get_settings
 from app.scanner.candidates import select_candidates
-from app.scanner.market_scanner import confirm_secondary_markets, scan_market
+from app.scanner.market_scanner import (
+    confirm_secondary_markets,
+    deep_validate_candidates,
+    scan_market,
+)
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import review_candidates
@@ -48,6 +52,12 @@ def main():
     print("Analyzed:", scan.analyzed)
     print("Skipped:", scan.skipped)
     print("Failed:", scan.failed)
+    print("===== OHM MARKET DATA VALIDATION =====")
+    print("Validated:", scan.analyzed)
+    print("Rejected:", scan.data_quality_rejected)
+    print("Warnings:", scan.data_quality_warnings)
+    for reason in scan.data_quality_rejections or []:
+        print("DATA REJECT:", reason)
     print("Technical shortlist:", len(candidates))
 
     if not candidates:
@@ -55,7 +65,10 @@ def main():
         return
 
     # Secondary OHLC is fetched only for the maximum-eight shortlist.
-    secondary_summary = confirm_secondary_markets(candidates)
+    secondary_summary = confirm_secondary_markets(
+        candidates,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+    )
     print(
         "Secondary confirmations:",
         f"requested={secondary_summary.requested}",
@@ -73,6 +86,42 @@ def main():
             f"{candidate.secondary_volume_ratio if candidate.secondary_volume_ratio is not None else 'N/A'} "
             f"Status={candidate.cross_pair_confirmation_status}"
         )
+
+    # Deep public execution validation is bounded by the existing maximum-eight
+    # shortlist and completes before the single Chief request.
+    execution_requested = len(candidates)
+    candidates = deep_validate_candidates(
+        candidates,
+        settings.account_equity,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+    )
+    print("Execution validation requested:", execution_requested)
+    print("Execution structural rejects:", execution_requested - len(candidates))
+    for candidate in candidates:
+        execution = candidate.execution_validation
+        data_status = (
+            candidate.market_data_validation.status
+            if candidate.market_data_validation is not None
+            else "UNAVAILABLE"
+        )
+        print(
+            f"EXECUTION {candidate.symbol}: "
+            f"Data={data_status} "
+            f"Status={execution.status} "
+            f"Spread={execution.spread_bps if execution.spread_bps is not None else 'N/A'}bps "
+            f"VisibleAsk=${execution.visible_ask_notional if execution.visible_ask_notional is not None else 0:,.2f} "
+            f"VisibleBid=${execution.visible_bid_notional if execution.visible_bid_notional is not None else 0:,.2f} "
+            f"AskDepth0.5Complete={execution.ask_depth_050_complete} "
+            f"BidDepth0.5Complete={execution.bid_depth_050_complete} "
+            f"ValidationNotional=${execution.validation_notional_usd:,.2f} "
+            f"BuyCoverage={execution.buy_visible_coverage_pct if execution.buy_visible_coverage_pct is not None else 'N/A'}% "
+            f"RoundTripDrag={execution.estimated_visible_round_trip_market_drag_pct if execution.estimated_visible_round_trip_market_drag_pct is not None else 'N/A'}% "
+            f"RecentTradeAge={execution.latest_trade_age_seconds if execution.latest_trade_age_seconds is not None else 'N/A'}s"
+        )
+
+    if not candidates:
+        print("No candidates survived structural execution-data validation.")
+        return
 
     # ---------------------------------------------------------
     # STEP 3: AI Chief review.
