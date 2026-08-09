@@ -31,6 +31,53 @@ def test_valid_ohlc_passes():
     assert validate(candles()).status == PASS
 
 
+def test_zero_trade_flat_candle_with_zero_vwap_is_valid():
+    items = candles()
+    items[-1] = Candle(
+        timestamp=items[-1].timestamp,
+        open=0.08655,
+        high=0.08655,
+        low=0.08655,
+        close=0.08655,
+        vwap=0.0,
+        volume=0.0,
+        trade_count=0,
+    )
+    result = validate(items, ticker=0.08655)
+    assert result.qualified
+    assert result.invalid_ohlc_count == 0
+
+
+@pytest.mark.parametrize("volume,trade_count", [(1.0, 0), (0.0, 1), (1.0, 1)])
+def test_zero_vwap_with_trading_activity_rejects(volume, trade_count):
+    items = candles()
+    items[-1] = Candle(**(items[-1].__dict__ | {
+        "vwap": 0.0,
+        "volume": volume,
+        "trade_count": trade_count,
+    }))
+    result = validate(items)
+    assert result.status == REJECT
+    assert result.invalid_ohlc_count == 1
+
+
+def test_mixed_history_accepts_legitimate_zero_trade_candles():
+    items = candles()
+    for index in (25, 100, 175):
+        items[index] = Candle(**(items[index].__dict__ | {
+            "open": 100,
+            "high": 100,
+            "low": 100,
+            "close": 100,
+            "vwap": 0.0,
+            "volume": 0.0,
+            "trade_count": 0,
+        }))
+    result = validate(items)
+    assert result.status == PASS
+    assert result.invalid_ohlc_count == 0
+
+
 @pytest.mark.parametrize("field,value", [
     ("open", 0), ("close", -1), ("high", math.nan),
     ("low", math.inf), ("volume", -1),
