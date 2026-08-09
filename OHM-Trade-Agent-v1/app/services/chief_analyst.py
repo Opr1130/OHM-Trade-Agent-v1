@@ -60,6 +60,20 @@ AMBIGUOUS specifically means OHM deliberately selected no CoinGecko asset, so
 no external price or divergence conclusion may be drawn from that reference.
 Neither AMBIGUOUS nor UNAVAILABLE is an automatic trading rejection.
 
+Market regime is deterministic breadth context, not a probability. RISK_OFF
+is caution evidence and is not an automatic rejection. CoinGecko global data
+is independent aggregate context and is not executable venue data.
+CryptoPanic headlines are external information, not verified truth. News votes
+are not probabilities. CryptoPanic news is associated only after identity-safe
+structured instrument matching. News UNRESOLVED means OHM deliberately refused
+ticker-only attribution; no news conclusion may be drawn from it. It is missing
+safe identity evidence, not a trading rejection. CoinMarketCal events are
+scheduled-catalyst evidence;
+estimated dates are windows or deadlines, not exact timestamps. UNAVAILABLE
+means evidence is missing. UNRESOLVED means external identity could not be
+safely established. Never invent external evidence or recalculate supplied
+deterministic metrics.
+
 Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
 hypothetical economic comparison. It is not a recommended allocation. Capital
 allocation is outside this review and will be implemented separately.
@@ -93,6 +107,8 @@ def review_candidates(
     model: str,
     api_key: str,
     account_equity: float | None = None,
+    market_regime_context: object | None = None,
+    coingecko_global_context: object | None = None,
 ) -> dict:
     client = OpenAI(api_key=api_key)
 
@@ -135,6 +151,16 @@ def review_candidates(
                 "independent_market_reference": (
                     asdict(candidate.independent_market_reference)
                     if is_dataclass(candidate.independent_market_reference)
+                    else None
+                ),
+                "news_context": (
+                    asdict(candidate.news_context)
+                    if is_dataclass(candidate.news_context)
+                    else None
+                ),
+                "scheduled_catalyst_context": (
+                    asdict(candidate.scheduled_catalyst_context)
+                    if is_dataclass(candidate.scheduled_catalyst_context)
                     else None
                 ),
                 "liquidity_context": {
@@ -233,6 +259,18 @@ def review_candidates(
                 "content": json.dumps(
                     {
                         "candidate_count": len(payload),
+                        "market_regime_context": {
+                            "ohm_breadth": (
+                                asdict(market_regime_context)
+                                if is_dataclass(market_regime_context)
+                                else None
+                            ),
+                            "coingecko_global": (
+                                asdict(coingecko_global_context)
+                                if is_dataclass(coingecko_global_context)
+                                else None
+                            ),
+                        },
                         "candidates": payload,
                     }
                 ),
