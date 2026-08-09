@@ -16,6 +16,10 @@ from app.services.chief_analyst import review_candidates
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.pending_setup_registry import PendingSetup, add_pending_setup
+from app.services.profit_ranking import (
+    QualifiedOpportunity,
+    rank_profit_opportunities,
+)
 from app.services.recommendation_gate import qualified_alerts
 from app.services.target_attainability import evaluate_target_attainability
 
@@ -286,6 +290,7 @@ def main():
     economic_passed = 0
     target_rejected = 0
     target_passed = 0
+    qualified_opportunities: list[QualifiedOpportunity] = []
 
     # ---------------------------------------------------------
     # STEP 5: Build entry/exit plan for every candidate that
@@ -388,14 +393,52 @@ def main():
             f"R/R={plan.reward_to_risk_2:.2f}:1"
         )
 
-        # -----------------------------------------------------
-        # STEP 7: Pending setup.
-        #
-        # Only ECONOMICALLY QUALIFIED opportunities are allowed
-        # into the pending-setup system.
-        #
-        # Weak WAIT candidates never reach this point.
-        # -----------------------------------------------------
+        # Qualification is deliberately side-effect free. Every survivor is
+        # collected before ranking, pending persistence, or Telegram dispatch.
+        qualified_opportunities.append(
+            QualifiedOpportunity(
+                alert=alert,
+                snapshot=snapshot,
+                plan=plan,
+                target_quality=target_quality,
+                economic_quality=economic,
+            )
+        )
+
+    # ---------------------------------------------------------
+    # STEP 7: Rank every deterministic-gate survivor.
+    # Ranking is comparative only: it does not reject, rescue, or suppress.
+    # ---------------------------------------------------------
+    ranked_opportunities = rank_profit_opportunities(qualified_opportunities)
+    print("===== OHM PROFIT RANKING =====")
+    print("Qualified survivors:", len(ranked_opportunities))
+    for ranked in ranked_opportunities:
+        result = ranked.profit_ranking
+        economic = ranked.opportunity.economic_quality
+        drag = result.measured_execution_drag_pct
+        print(
+            f"RANK {ranked.rank} {result.symbol}: "
+            f"Score={result.total_score:.2f} "
+            f"Economic={result.economic_opportunity_score:.2f} "
+            f"Target={result.target_quality_score:.2f} "
+            f"Execution={result.execution_quality_score:.2f} "
+            f"Technical={result.technical_quality_score:.2f} "
+            f"Evidence={result.evidence_quality_score:.2f} "
+            f"T2Move={economic.target_2_move_pct:.2f}% "
+            f"ValidationNetT2=${economic.target_2_net_profit:.2f} "
+            f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
+        )
+
+    # ---------------------------------------------------------
+    # STEP 8: Preserve lifecycle behavior for all survivors, now in rank order.
+    # ---------------------------------------------------------
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        alert = opportunity.alert
+        plan = opportunity.plan
+        alert["profit_rank"] = ranked.rank
+        alert["profit_rank_score"] = ranked.profit_ranking.total_score
+
         if not plan.valid_now:
             setup = PendingSetup(
                 symbol=plan.symbol,
@@ -414,20 +457,6 @@ def main():
             add_pending_setup(setup)
             pending_saved += 1
 
-        # -----------------------------------------------------
-        # STEP 8: Telegram.
-        #
-        # For THIS first integration test, any opportunity that
-        # reaches here has passed the economic gate.
-        #
-        # In our NEXT change, Telegram will be restricted to:
-        #
-        #   ENTER NOW
-        #   GET READY
-        #   PLACE LIMIT
-        #
-        # Ordinary WAIT / WATCH / REJECT will remain silent.
-        # -----------------------------------------------------
         if send_trade_plan(
             candidate=alert,
             plan=plan,
