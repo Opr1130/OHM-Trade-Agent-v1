@@ -43,6 +43,12 @@ recalculate them. Kraken PreTrade contains only the top 10 aggregated levels;
 incomplete depth is partial observed liquidity, never zero liquidity. The
 execution validation notional uses ACCOUNT_EQUITY only as hypothetical
 validation capital, not a recommended allocation or an execution instruction.
+Execution status describes only structural/API validity. Book coverage status
+describes visibility and completeness of the returned top-10 book only.
+COMPLETE does not mean spread, impact, slippage, or market drag is economically
+attractive. Evaluate those supplied measurements separately without
+recalculating them. Never convert coverage status into a probability of
+successful execution.
 
 Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
 hypothetical economic comparison. It is not a recommended allocation. Capital
@@ -111,7 +117,7 @@ def review_candidates(
                     if is_dataclass(candidate.market_data_validation)
                     else None
                 ),
-                "execution_quality": (
+                "execution_evidence": (
                     asdict(candidate.execution_validation)
                     if is_dataclass(candidate.execution_validation)
                     else None
