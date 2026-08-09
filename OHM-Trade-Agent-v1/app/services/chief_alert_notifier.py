@@ -124,7 +124,8 @@ def format_trade_plan(
     return (
         f"{headline}\n\n"
         f"{action_text}\n\n"
-        f"Symbol: {plan.symbol}\n"
+        f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
+        f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: "
         f"{candidate.get('confidence', 0)}%\n"
