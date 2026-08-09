@@ -50,6 +50,13 @@ attractive. Evaluate those supplied measurements separately without
 recalculating them. Never convert coverage status into a probability of
 successful execution.
 
+CoinGecko is an independent aggregated market reference, not an execution
+venue. Kraken remains the source of executable and order-book evidence.
+Reference divergence may reflect stale or anomalous information or legitimate
+venue differences. AMBIGUOUS reduces confidence in the reference mapping;
+UNAVAILABLE is missing evidence, not automatic rejection. Do not recalculate
+the supplied reference metrics. Reference status is not a probability.
+
 Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
 hypothetical economic comparison. It is not a recommended allocation. Capital
 allocation is outside this review and will be implemented separately.
@@ -120,6 +127,11 @@ def review_candidates(
                 "execution_evidence": (
                     asdict(candidate.execution_validation)
                     if is_dataclass(candidate.execution_validation)
+                    else None
+                ),
+                "independent_market_reference": (
+                    asdict(candidate.independent_market_reference)
+                    if is_dataclass(candidate.independent_market_reference)
                     else None
                 ),
                 "liquidity_context": {

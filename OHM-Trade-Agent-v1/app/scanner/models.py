@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.scanner.execution_validation import ExecutionValidation
     from app.scanner.market_data_validation import MarketDataValidation
+    from app.scanner.reference_market_validation import ReferenceMarketValidation
 
 
 @dataclass
@@ -89,3 +90,4 @@ class MarketSnapshot:
     execution_validation: ExecutionValidation | None = None
     cross_pair_price_divergence_pct: float | None = None
     cross_pair_price_status: str = "UNAVAILABLE"
+    independent_market_reference: ReferenceMarketValidation | None = None

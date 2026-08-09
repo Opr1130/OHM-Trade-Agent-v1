@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.6"
     ai_enabled: bool = False
+    coingecko_api_key: str | None = None
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

@@ -353,6 +353,21 @@ def test_target_quality_failure_suppresses_telegram(monkeypatch):
         lambda limit: ScanResult([weak], 1, 1, 0, 0, [], []),
     )
     monkeypatch.setattr(scan_opportunities, "select_candidates", lambda items: items)
+    def unavailable_reference(candidates, *args, **kwargs):
+        candidates[0].independent_market_reference = SimpleNamespace(
+            status="UNAVAILABLE", coingecko_id=None, reference_price_usd=None,
+            kraken_normalized_price_usd=None, price_divergence_pct=None,
+            age_seconds=None, market_cap_rank=None,
+        )
+        return SimpleNamespace(
+            requested=1, available=0, unavailable=1, ambiguous=0,
+            api_mode="KEYLESS",
+        )
+    monkeypatch.setattr(
+        scan_opportunities,
+        "validate_finalist_references",
+        unavailable_reference,
+    )
     monkeypatch.setattr(
         scan_opportunities, "review_candidates",
         lambda *args: {"top_candidates": [{
