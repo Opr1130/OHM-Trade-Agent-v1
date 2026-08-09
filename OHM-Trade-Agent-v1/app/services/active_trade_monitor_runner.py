@@ -6,6 +6,7 @@ from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
 from app.services.trade_monitor import monitor_trade
 from app.services.trade_monitor_notifier import send_monitor_update
+from app.services.trade_outcome_registry import update_active_observation
 
 
 @dataclass
@@ -29,6 +30,10 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     for trade in trades:
         try:
             monitor_result = monitor_trade(trade)
+            update_active_observation(
+                trade,
+                monitor_result.current_price,
+            )
 
             if send_monitor_update(
                 trade=trade,
