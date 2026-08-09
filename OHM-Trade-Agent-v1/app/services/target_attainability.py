@@ -21,8 +21,8 @@ MIN_QUALIFYING_SCORE = 65
 NEAR_RESISTANCE_ATR = 0.25
 MIN_BREAKOUT_VOLUME_RATIO = 1.1
 
-# A move more than 10% above the asset's rolling p90 range is materially beyond
-# an uncommon but historically observed move and is therefore rejected.
+# A move more than 10% above the asset's rolling p90 favorable upside excursion
+# is materially beyond an uncommon but historically observed long opportunity.
 MATERIAL_P90_EXCESS_RATIO = 1.10
 
 # Recent 24h range near its rolling median indicates usable current movement.
@@ -104,8 +104,17 @@ def _historical_move_points(
     p90_pct: float,
     weight: int,
 ) -> tuple[int, str]:
-    if min(median_pct, p75_pct, p90_pct) <= 0:
+    if (
+        min(median_pct, p75_pct, p90_pct) < 0
+        or not median_pct <= p75_pct <= p90_pct
+    ):
         return 0, "unavailable"
+    if p90_pct == 0:
+        return (
+            (weight, "normal")
+            if move_pct <= 0
+            else (0, "materially_above_p90")
+        )
     if move_pct <= median_pct:
         return weight, "normal"
     if move_pct <= p75_pct:
@@ -178,17 +187,17 @@ def evaluate_target_attainability(
     historical_specs = (
         (
             t1_move_pct,
-            snapshot.rolling_24h_range_median_pct,
-            snapshot.rolling_24h_range_p75_pct,
-            snapshot.rolling_24h_range_p90_pct,
+            snapshot.rolling_24h_upside_median_pct,
+            snapshot.rolling_24h_upside_p75_pct,
+            snapshot.rolling_24h_upside_p90_pct,
             T1_HISTORICAL_MOVE_WEIGHT,
             "Target 1/24h",
         ),
         (
             t2_move_pct,
-            snapshot.rolling_72h_range_median_pct,
-            snapshot.rolling_72h_range_p75_pct,
-            snapshot.rolling_72h_range_p90_pct,
+            snapshot.rolling_72h_upside_median_pct,
+            snapshot.rolling_72h_upside_p75_pct,
+            snapshot.rolling_72h_upside_p90_pct,
             HISTORICAL_MOVE_WEIGHT - T1_HISTORICAL_MOVE_WEIGHT,
             "Target 2/72h",
         ),
@@ -273,14 +282,14 @@ def evaluate_target_attainability(
             warnings.append("Current volatility is abnormal versus recent history")
         volatility_context = (
             f"Current 24h range is {volatility_ratio:.2f}x rolling median; "
-            f"T1 {t1_move_pct:.2f}% vs 24h p50/p75/p90 "
-            f"{snapshot.rolling_24h_range_median_pct:.2f}/"
-            f"{snapshot.rolling_24h_range_p75_pct:.2f}/"
-            f"{snapshot.rolling_24h_range_p90_pct:.2f}%; "
-            f"T2 {t2_move_pct:.2f}% vs 72h p50/p75/p90 "
-            f"{snapshot.rolling_72h_range_median_pct:.2f}/"
-            f"{snapshot.rolling_72h_range_p75_pct:.2f}/"
-            f"{snapshot.rolling_72h_range_p90_pct:.2f}%; "
+            f"T1 {t1_move_pct:.2f}% vs 24h upside p50/p75/p90 "
+            f"{snapshot.rolling_24h_upside_median_pct:.2f}/"
+            f"{snapshot.rolling_24h_upside_p75_pct:.2f}/"
+            f"{snapshot.rolling_24h_upside_p90_pct:.2f}%; "
+            f"T2 {t2_move_pct:.2f}% vs 72h upside p50/p75/p90 "
+            f"{snapshot.rolling_72h_upside_median_pct:.2f}/"
+            f"{snapshot.rolling_72h_upside_p75_pct:.2f}/"
+            f"{snapshot.rolling_72h_upside_p90_pct:.2f}%; "
             f"T1={t1_atr:.2f} ATR and T2={t2_atr:.2f} ATR (diagnostic only)"
         )
     else:
