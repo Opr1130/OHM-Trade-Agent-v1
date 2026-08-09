@@ -23,6 +23,120 @@ class ScanResult:
     failures: list[str]
 
 
+def _percentage_change(current: float, previous: float) -> float:
+    if previous <= 0:
+        return 0.0
+    return (current - previous) / previous * 100
+
+
+def _window_metrics(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    hours: int,
+) -> tuple[float, float, float, float]:
+    """Return high, low, total range %, and mean hourly range %.
+
+    Range percentages use the latest close as a stable common denominator.
+    Hourly range is averaged after normalizing each candle by its close.
+    """
+    window_highs = highs[-hours:]
+    window_lows = lows[-hours:]
+    window_closes = closes[-hours:]
+    recent_high = max(window_highs)
+    recent_low = min(window_lows)
+    current = closes[-1]
+    realized_range_pct = (recent_high - recent_low) / current * 100
+    hourly_ranges = [
+        (high - low) / close * 100 if close > 0 else 0.0
+        for high, low, close in zip(window_highs, window_lows, window_closes)
+    ]
+    average_hourly_range_pct = sum(hourly_ranges) / len(hourly_ranges)
+    return recent_high, recent_low, realized_range_pct, average_hourly_range_pct
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    """Return a deterministic linearly interpolated percentile."""
+    if not values:
+        return 0.0
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = position - lower_index
+    return ordered[lower_index] + (
+        ordered[upper_index] - ordered[lower_index]
+    ) * fraction
+
+
+def _rolling_range_percentiles(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    hours: int,
+) -> tuple[float, float, float]:
+    """Calculate p50/p75/p90 of overlapping rolling high-low ranges.
+
+    Each window is normalized by its ending close so assets with different
+    prices remain comparable. With 200 candles this yields 177 observations
+    for 24h windows and 129 observations for 72h windows.
+    """
+    ranges: list[float] = []
+    for end in range(hours - 1, len(closes)):
+        start = end - hours + 1
+        ending_close = closes[end]
+        if ending_close <= 0:
+            continue
+        window_range = max(highs[start:end + 1]) - min(lows[start:end + 1])
+        ranges.append(window_range / ending_close * 100)
+    return (
+        _percentile(ranges, 50),
+        _percentile(ranges, 75),
+        _percentile(ranges, 90),
+    )
+
+
+def _rolling_upside_excursions(
+    highs: list[float],
+    closes: list[float],
+    hours: int,
+) -> list[float]:
+    """Return fully observed forward favorable excursions for long entries.
+
+    For entry reference close[s], the forward window contains exactly `hours`
+    future candles: highs[s + 1:s + hours + 1]. Incomplete windows at the end
+    are excluded, so N candles produce N - hours observations.
+    """
+    excursions: list[float] = []
+    for start in range(len(closes) - hours):
+        starting_reference = closes[start]
+        if starting_reference <= 0:
+            continue
+        maximum_future_high = max(highs[start + 1:start + hours + 1])
+        excursion_pct = (
+            (maximum_future_high - starting_reference)
+            / starting_reference
+            * 100
+        )
+        excursions.append(max(0.0, excursion_pct))
+    return excursions
+
+
+def _rolling_upside_percentiles(
+    highs: list[float],
+    closes: list[float],
+    hours: int,
+) -> tuple[float, float, float]:
+    excursions = _rolling_upside_excursions(highs, closes, hours)
+    return (
+        _percentile(excursions, 50),
+        _percentile(excursions, 75),
+        _percentile(excursions, 90),
+    )
+
+
 def determine_trend(
     last_price: float,
     ema20: float,
@@ -67,6 +181,31 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
         atr_pct = (atr_value / last_price) * 100
         volume_value = volume_ratio(volumes, 20)
 
+        (
+            recent_24h_high,
+            recent_24h_low,
+            realized_range_24h_pct,
+            average_hourly_range_24h_pct,
+        ) = _window_metrics(highs, lows, closes, 24)
+        (
+            recent_72h_high,
+            recent_72h_low,
+            realized_range_72h_pct,
+            average_hourly_range_72h_pct,
+        ) = _window_metrics(highs, lows, closes, 72)
+        rolling_24h_percentiles = _rolling_range_percentiles(
+            highs, lows, closes, 24
+        )
+        rolling_72h_percentiles = _rolling_range_percentiles(
+            highs, lows, closes, 72
+        )
+        rolling_24h_upside = _rolling_upside_percentiles(
+            highs, closes, 24
+        )
+        rolling_72h_upside = _rolling_upside_percentiles(
+            highs, closes, 72
+        )
+
         trend = determine_trend(
             last_price,
             ema20_value,
@@ -89,6 +228,31 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
             volume_ratio=volume_value,
             technical_score=0,
             trend=trend,
+            recent_24h_high=recent_24h_high,
+            recent_24h_low=recent_24h_low,
+            recent_72h_high=recent_72h_high,
+            recent_72h_low=recent_72h_low,
+            momentum_6h_pct=_percentage_change(last_price, closes[-7]),
+            momentum_24h_pct=_percentage_change(last_price, closes[-25]),
+            momentum_72h_pct=_percentage_change(last_price, closes[-73]),
+            distance_to_24h_high_pct=(recent_24h_high - last_price) / last_price * 100,
+            distance_to_72h_high_pct=(recent_72h_high - last_price) / last_price * 100,
+            realized_range_24h_pct=realized_range_24h_pct,
+            realized_range_72h_pct=realized_range_72h_pct,
+            average_hourly_range_24h_pct=average_hourly_range_24h_pct,
+            average_hourly_range_72h_pct=average_hourly_range_72h_pct,
+            rolling_24h_range_median_pct=rolling_24h_percentiles[0],
+            rolling_24h_range_p75_pct=rolling_24h_percentiles[1],
+            rolling_24h_range_p90_pct=rolling_24h_percentiles[2],
+            rolling_72h_range_median_pct=rolling_72h_percentiles[0],
+            rolling_72h_range_p75_pct=rolling_72h_percentiles[1],
+            rolling_72h_range_p90_pct=rolling_72h_percentiles[2],
+            rolling_24h_upside_median_pct=rolling_24h_upside[0],
+            rolling_24h_upside_p75_pct=rolling_24h_upside[1],
+            rolling_24h_upside_p90_pct=rolling_24h_upside[2],
+            rolling_72h_upside_median_pct=rolling_72h_upside[0],
+            rolling_72h_upside_p75_pct=rolling_72h_upside[1],
+            rolling_72h_upside_p90_pct=rolling_72h_upside[2],
         )
 
         snapshot.technical_score = score_snapshot(snapshot).score
