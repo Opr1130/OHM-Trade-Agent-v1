@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from app.jobs import scan_opportunities
@@ -6,11 +7,14 @@ from app.scanner.market_scanner import (
     _percentage_change,
     _percentile,
     _rolling_range_percentiles,
+    _rolling_upside_excursions,
+    _rolling_upside_percentiles,
     _window_metrics,
 )
 from app.scanner.models import MarketSnapshot
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
+from app.services import chief_analyst
 from app.services.target_attainability import evaluate_target_attainability
 
 
@@ -31,6 +35,12 @@ def snapshot(**overrides) -> MarketSnapshot:
         rolling_72h_range_median_pct=12.0,
         rolling_72h_range_p75_pct=16.0,
         rolling_72h_range_p90_pct=20.0,
+        rolling_24h_upside_median_pct=8.0,
+        rolling_24h_upside_p75_pct=10.0,
+        rolling_24h_upside_p90_pct=12.0,
+        rolling_72h_upside_median_pct=12.0,
+        rolling_72h_upside_p75_pct=16.0,
+        rolling_72h_upside_p90_pct=20.0,
     )
     values.update(overrides)
     return MarketSnapshot(**values)
@@ -67,6 +77,126 @@ def test_hourly_history_metrics_are_deterministic():
     assert rolling[0] <= rolling[1] <= rolling[2]
 
 
+def test_upside_windows_are_complete_and_counts_are_exact():
+    closes = [100.0 + index * 0.1 for index in range(200)]
+    highs = [close + 0.5 for close in closes]
+    excursions_24h = _rolling_upside_excursions(highs, closes, 24)
+    excursions_72h = _rolling_upside_excursions(highs, closes, 72)
+    assert len(excursions_24h) == 176
+    assert len(excursions_72h) == 128
+    assert excursions_24h[-1] == (
+        max(highs[176:200]) - closes[175]
+    ) / closes[175] * 100
+    assert excursions_72h[-1] == (
+        max(highs[128:200]) - closes[127]
+    ) / closes[127] * 100
+
+
+def test_downside_range_does_not_masquerade_as_long_upside():
+    closes = [100.0 - index * 0.2 for index in range(80)]
+    highs = list(closes)
+    lows = [close - 5.0 for close in closes]
+    full_range = _rolling_range_percentiles(highs, lows, closes, 24)
+    upside = _rolling_upside_percentiles(highs, closes, 24)
+    assert full_range[0] > 10.0
+    assert upside == (0.0, 0.0, 0.0)
+
+    market = snapshot(
+        rolling_24h_range_median_pct=full_range[0],
+        rolling_24h_range_p75_pct=full_range[1],
+        rolling_24h_range_p90_pct=full_range[2],
+        rolling_24h_upside_median_pct=0.1,
+        rolling_24h_upside_p75_pct=0.2,
+        rolling_24h_upside_p90_pct=0.3,
+        rolling_72h_upside_median_pct=0.2,
+        rolling_72h_upside_p75_pct=0.3,
+        rolling_72h_upside_p90_pct=0.4,
+    )
+    result = evaluate_target_attainability(
+        build_entry_exit_plan(market, "low"), market
+    )
+    assert result.qualified is False
+    assert any("historical p90" in reason for reason in result.rejection_reasons)
+
+
+def test_genuine_upside_history_has_ordered_larger_percentiles():
+    closes = [100.0 + index * 0.2 for index in range(200)]
+    highs = [close + 0.5 for close in closes]
+    upside_24h = _rolling_upside_percentiles(highs, closes, 24)
+    upside_72h = _rolling_upside_percentiles(highs, closes, 72)
+    assert upside_24h[0] <= upside_24h[1] <= upside_24h[2]
+    assert upside_72h[0] <= upside_72h[1] <= upside_72h[2]
+    assert upside_72h[0] > upside_24h[0]
+
+
+def test_same_full_range_but_genuine_upside_scores_better():
+    plan_market = snapshot(recent_24h_high=120.0, recent_72h_high=130.0)
+    generated = build_entry_exit_plan(plan_market, "low")
+    downside = snapshot(
+        recent_24h_high=120.0,
+        recent_72h_high=130.0,
+        rolling_24h_range_median_pct=10.0,
+        rolling_72h_range_median_pct=18.0,
+        rolling_24h_upside_median_pct=1.0,
+        rolling_24h_upside_p75_pct=2.0,
+        rolling_24h_upside_p90_pct=3.0,
+        rolling_72h_upside_median_pct=2.0,
+        rolling_72h_upside_p75_pct=3.0,
+        rolling_72h_upside_p90_pct=4.0,
+    )
+    upside = snapshot(
+        recent_24h_high=120.0,
+        recent_72h_high=130.0,
+        rolling_24h_range_median_pct=10.0,
+        rolling_72h_range_median_pct=18.0,
+        rolling_24h_upside_median_pct=8.0,
+        rolling_24h_upside_p75_pct=10.0,
+        rolling_24h_upside_p90_pct=12.0,
+        rolling_72h_upside_median_pct=12.0,
+        rolling_72h_upside_p75_pct=16.0,
+        rolling_72h_upside_p90_pct=20.0,
+    )
+    downside_result = evaluate_target_attainability(generated, downside)
+    upside_result = evaluate_target_attainability(generated, upside)
+    assert downside.realized_range_24h_pct == upside.realized_range_24h_pct
+    assert "Current 24h range is 1.60x rolling median" in downside_result.volatility_context
+    assert "Current 24h range is 1.60x rolling median" in upside_result.volatility_context
+    assert upside_result.attainability_score >= downside_result.attainability_score + 25
+
+
+def test_chief_payload_labels_hypothetical_economics_and_uses_one_call(monkeypatch):
+    class FakeResponses:
+        def __init__(self):
+            self.calls = 0
+            self.input = None
+
+        def create(self, **kwargs):
+            self.calls += 1
+            self.input = kwargs["input"]
+            return SimpleNamespace(output_text=json.dumps({
+                "market_view": "",
+                "recommended_action": "no_trade",
+                "top_candidates": [],
+                "summary": "",
+            }))
+
+    responses = FakeResponses()
+    monkeypatch.setattr(
+        chief_analyst,
+        "OpenAI",
+        lambda api_key: SimpleNamespace(responses=responses),
+    )
+    chief_analyst.review_candidates([snapshot()], "model", "key", 2_000)
+    payload = json.loads(responses.input[1]["content"])
+    low_quality = payload["candidates"][0][
+        "deterministic_quality_by_risk_level"
+    ]["low"]
+    assert responses.calls == 1
+    assert low_quality["economic_assumed_capital"] == 2_000
+    assert "hypothetical_target_2_net_profit_at_assumed_capital" in low_quality
+    assert "target_2_net_profit" not in low_quality
+
+
 def test_clean_target_scores_well_and_passes():
     result = evaluate_target_attainability(plan(), snapshot())
     assert result.qualified is True
@@ -86,22 +216,22 @@ def test_nearby_resistance_receives_meaningful_penalty_or_rejection():
 def test_historically_unrealistic_target_is_rejected():
     generated = build_entry_exit_plan(
         snapshot(
-            rolling_24h_range_median_pct=2.0,
-            rolling_24h_range_p75_pct=2.5,
-            rolling_24h_range_p90_pct=3.0,
-            rolling_72h_range_median_pct=3.0,
-            rolling_72h_range_p75_pct=4.0,
-            rolling_72h_range_p90_pct=5.0,
+            rolling_24h_upside_median_pct=2.0,
+            rolling_24h_upside_p75_pct=2.5,
+            rolling_24h_upside_p90_pct=3.0,
+            rolling_72h_upside_median_pct=3.0,
+            rolling_72h_upside_p75_pct=4.0,
+            rolling_72h_upside_p90_pct=5.0,
         ),
         "low",
     )
     result = evaluate_target_attainability(generated, snapshot(
-        rolling_24h_range_median_pct=2.0,
-        rolling_24h_range_p75_pct=2.5,
-        rolling_24h_range_p90_pct=3.0,
-        rolling_72h_range_median_pct=3.0,
-        rolling_72h_range_p75_pct=4.0,
-        rolling_72h_range_p90_pct=5.0,
+        rolling_24h_upside_median_pct=2.0,
+        rolling_24h_upside_p75_pct=2.5,
+        rolling_24h_upside_p90_pct=3.0,
+        rolling_72h_upside_median_pct=3.0,
+        rolling_72h_upside_p75_pct=4.0,
+        rolling_72h_upside_p90_pct=5.0,
     ))
     assert result.qualified is False
     assert any("historical p90" in reason for reason in result.rejection_reasons)
@@ -111,12 +241,12 @@ def test_recent_range_realism_changes_score():
     normal = evaluate_target_attainability(plan(), snapshot())
     abnormal = evaluate_target_attainability(
         plan(), snapshot(
-            rolling_24h_range_median_pct=2.0,
-            rolling_24h_range_p75_pct=3.0,
-            rolling_24h_range_p90_pct=4.0,
-            rolling_72h_range_median_pct=3.0,
-            rolling_72h_range_p75_pct=4.0,
-            rolling_72h_range_p90_pct=5.0,
+            rolling_24h_upside_median_pct=2.0,
+            rolling_24h_upside_p75_pct=3.0,
+            rolling_24h_upside_p90_pct=4.0,
+            rolling_72h_upside_median_pct=3.0,
+            rolling_72h_upside_p75_pct=4.0,
+            rolling_72h_upside_p90_pct=5.0,
         )
     )
     assert normal.attainability_score >= abnormal.attainability_score + 20
