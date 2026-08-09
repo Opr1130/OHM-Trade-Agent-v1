@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict, is_dataclass
 
 from openai import OpenAI
 
@@ -36,6 +37,12 @@ Consider:
 Target-quality scores are deterministic opportunity-quality scores, not a
 probability of success. AI confidence is comparative review confidence, not a
 win probability. Do not recalculate supplied deterministic metrics.
+
+Market-data and execution values are deterministic evidence. Do not
+recalculate them. Kraken PreTrade contains only the top 10 aggregated levels;
+incomplete depth is partial observed liquidity, never zero liquidity. The
+execution validation notional uses ACCOUNT_EQUITY only as hypothetical
+validation capital, not a recommended allocation or an execution instruction.
 
 Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
 hypothetical economic comparison. It is not a recommended allocation. Capital
@@ -99,6 +106,16 @@ def review_candidates(
                 "strengths": card.strengths,
                 "warnings": card.warnings,
                 "weaknesses": card.weaknesses,
+                "market_data_quality": (
+                    asdict(candidate.market_data_validation)
+                    if is_dataclass(candidate.market_data_validation)
+                    else None
+                ),
+                "execution_quality": (
+                    asdict(candidate.execution_validation)
+                    if is_dataclass(candidate.execution_validation)
+                    else None
+                ),
                 "liquidity_context": {
                     "underlying_asset": (
                         candidate.underlying_asset or candidate.symbol
@@ -123,6 +140,10 @@ def review_candidates(
                     ),
                     "cross_pair_strengths": candidate.cross_pair_strengths or [],
                     "cross_pair_warnings": candidate.cross_pair_warnings or [],
+                    "cross_pair_price_divergence_pct": (
+                        candidate.cross_pair_price_divergence_pct
+                    ),
+                    "cross_pair_price_status": candidate.cross_pair_price_status,
                 },
                 "market_structure": {
                     "distance_to_24h_high_pct": round(candidate.distance_to_24h_high_pct, 2),
