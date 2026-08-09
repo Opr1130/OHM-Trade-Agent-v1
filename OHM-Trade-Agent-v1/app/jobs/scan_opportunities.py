@@ -6,6 +6,7 @@ from app.scanner.market_scanner import (
     scan_market,
 )
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
+from app.scanner.reference_market_validation import validate_finalist_references
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import review_candidates
 from app.services.economic_quality_gate import evaluate_economic_quality
@@ -123,6 +124,32 @@ def main():
     if not candidates:
         print("No candidates survived structural execution-data validation.")
         return
+
+    # Independent aggregated reference evidence is one fail-open batch for the
+    # maximum-eight finalists. Kraken remains the execution venue.
+    reference_summary = validate_finalist_references(
+        candidates,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+        api_key=getattr(settings, "coingecko_api_key", None),
+    )
+    print("===== OHM INDEPENDENT REFERENCE VALIDATION =====")
+    print("Requested:", reference_summary.requested)
+    print("Available:", reference_summary.available)
+    print("Unavailable:", reference_summary.unavailable)
+    print("Ambiguous:", reference_summary.ambiguous)
+    print("API mode:", reference_summary.api_mode)
+    for candidate in candidates:
+        reference = candidate.independent_market_reference
+        print(
+            f"REFERENCE {candidate.symbol}: "
+            f"Status={reference.status} "
+            f"CoinGecko={reference.coingecko_id or 'N/A'} "
+            f"CGPrice=${reference.reference_price_usd if reference.reference_price_usd is not None else 'N/A'} "
+            f"KrakenUSD=${reference.kraken_normalized_price_usd if reference.kraken_normalized_price_usd is not None else 'N/A'} "
+            f"Divergence={reference.price_divergence_pct if reference.price_divergence_pct is not None else 'N/A'}% "
+            f"Age={reference.age_seconds if reference.age_seconds is not None else 'N/A'}s "
+            f"Rank={reference.market_cap_rank if reference.market_cap_rank is not None else 'N/A'}"
+        )
 
     # ---------------------------------------------------------
     # STEP 3: AI Chief review.
