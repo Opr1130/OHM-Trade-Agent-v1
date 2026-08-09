@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Header, HTTPException, status
 
 from app.core.config import get_settings
@@ -6,7 +8,11 @@ from app.services.ai_reviewer import review_signal
 from app.services.journal import append_signal
 from app.services.risk import build_risk_plan
 from app.services.scoring import score_signal
-from app.services.telegram_notifier import format_trade_alert, send_telegram_message
+from app.services.telegram_notifier import (
+    build_trade_confirmation_buttons,
+    format_trade_alert,
+    send_telegram_message,
+)
 
 router = APIRouter()
 
@@ -30,6 +36,7 @@ def tradingview_webhook(
         )
 
     deterministic_score, reasons = score_signal(signal)
+
     risk = build_risk_plan(
         signal,
         settings.account_equity,
@@ -51,13 +58,17 @@ def tradingview_webhook(
             settings.openai_model,
             settings.openai_api_key,
         )
+
         ai_score = ai["score"]
         ai_summary = ai["summary"]
 
     final_score = (
         deterministic_score
         if ai_score is None
-        else round((deterministic_score * 0.65) + (ai_score * 0.35))
+        else round(
+            (deterministic_score * 0.65)
+            + (ai_score * 0.35)
+        )
     )
 
     if not risk.allowed:
@@ -92,11 +103,27 @@ def tradingview_webhook(
         and settings.telegram_bot_token
         and settings.telegram_chat_id
     ):
-        message = format_trade_alert(signal, decision)
+        # Unique ID used by Telegram buttons.
+        # This does NOT execute a Kraken trade.
+        trade_id = (
+            f"OHM-{signal.symbol.upper()}-"
+            f"{uuid4().hex[:8]}"
+        )
+
+        message = format_trade_alert(
+            signal,
+            decision,
+        )
+
+        buttons = build_trade_confirmation_buttons(
+            trade_id,
+        )
+
         send_telegram_message(
             settings.telegram_bot_token,
             settings.telegram_chat_id,
             message,
+            reply_markup=buttons,
         )
 
     return decision
