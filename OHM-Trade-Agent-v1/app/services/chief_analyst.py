@@ -56,6 +56,9 @@ Reference divergence may reflect stale or anomalous information or legitimate
 venue differences. AMBIGUOUS reduces confidence in the reference mapping;
 UNAVAILABLE is missing evidence, not automatic rejection. Do not recalculate
 the supplied reference metrics. Reference status is not a probability.
+AMBIGUOUS specifically means OHM deliberately selected no CoinGecko asset, so
+no external price or divergence conclusion may be drawn from that reference.
+Neither AMBIGUOUS nor UNAVAILABLE is an automatic trading rejection.
 
 Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
 hypothetical economic comparison. It is not a recommended allocation. Capital

@@ -64,24 +64,60 @@ def test_alias_xbt_normalizes_to_btc():
     assert result.coingecko_id == "bitcoin"
 
 
-def test_multiple_matches_choose_best_rank_and_mark_ambiguous():
+def test_multiple_matches_are_ambiguous_without_selecting_highest_ranked_row():
     result = evaluate(rows=[
         row(coin_id="small-sol", rank=500, market_cap=5_000),
         row(coin_id="solana", rank=5, market_cap=50_000),
     ])
     assert result.status == AMBIGUOUS
     assert result.mapping_status == AMBIGUOUS
-    assert result.coingecko_id == "solana"
+    assert result.available
     assert result.matched_candidate_count == 2
+    assert result.kraken_normalized_price_usd == 100
+    assert result.coingecko_id is None
+    assert result.coingecko_name is None
+    assert result.reference_price_usd is None
+    assert result.absolute_price_difference_usd is None
+    assert result.price_divergence_pct is None
+    assert result.market_cap_usd is None
+    assert result.market_cap_rank is None
+    assert result.volume_24h_usd is None
+    assert result.change_24h_pct is None
+    assert result.last_updated is None
+    assert result.age_seconds is None
+    assert "no external identity was selected" in result.warnings[0]
 
 
-def test_multiple_unranked_matches_choose_highest_market_cap():
+def test_ambiguous_mapping_does_not_select_by_market_cap():
     result = evaluate(rows=[
         row(coin_id="small", rank=None, market_cap=1),
         row(coin_id="large", rank=None, market_cap=10),
     ])
-    assert result.coingecko_id == "large"
     assert result.status == AMBIGUOUS
+    assert result.coingecko_id is None
+    assert result.market_cap_usd is None
+
+
+def test_ambiguous_candidate_remains_in_pipeline():
+    class Client:
+        api_mode = "KEYLESS"
+        def __init__(self): self.calls = 0
+        def get_markets_by_symbols(self, symbols):
+            self.calls += 1
+            return [
+                row(coin_id="small-sol", rank=500),
+                row(coin_id="solana", rank=5),
+            ]
+    client = Client()
+    candidate = snapshot()
+    candidates = [candidate]
+    summary = validate_finalist_references(candidates, 1, client=client, now=NOW)
+    assert candidates == [candidate]
+    assert candidate.independent_market_reference.status == AMBIGUOUS
+    assert summary.requested == 1
+    assert summary.available == 1
+    assert summary.ambiguous == 1
+    assert client.calls == 1
 
 
 def test_missing_symbol_is_unavailable():
@@ -191,6 +227,39 @@ def test_chief_receives_reference_in_exactly_one_responses_call(monkeypatch):
     reference = responses.payload["candidates"][0]["independent_market_reference"]
     assert reference["coingecko_id"] == "solana"
     assert reference["status"] == CONFIRMED
+
+
+def test_chief_receives_ambiguous_reference_without_identity_or_price(monkeypatch):
+    candidate = snapshot()
+    candidate.independent_market_reference = evaluate(rows=[
+        row(coin_id="small-sol", rank=500),
+        row(coin_id="solana", rank=5),
+    ])
+    class Responses:
+        calls = 0
+        payload = None
+        def create(self, **kwargs):
+            self.calls += 1
+            self.payload = json.loads(kwargs["input"][1]["content"])
+            return SimpleNamespace(output_text=json.dumps({
+                "market_view": "", "recommended_action": "no_trade",
+                "top_candidates": [], "summary": "",
+            }))
+    responses = Responses()
+    monkeypatch.setattr(
+        chief_analyst, "OpenAI",
+        lambda api_key: SimpleNamespace(responses=responses),
+    )
+    chief_analyst.review_candidates([candidate], "model", "key")
+    assert responses.calls == 1
+    reference = responses.payload["candidates"][0]["independent_market_reference"]
+    assert reference["status"] == AMBIGUOUS
+    assert reference["mapping_status"] == AMBIGUOUS
+    assert reference["matched_candidate_count"] == 2
+    assert reference["coingecko_id"] is None
+    assert reference["coingecko_name"] is None
+    assert reference["reference_price_usd"] is None
+    assert reference["price_divergence_pct"] is None
 
 
 def test_no_kraken_private_or_order_endpoint_added():

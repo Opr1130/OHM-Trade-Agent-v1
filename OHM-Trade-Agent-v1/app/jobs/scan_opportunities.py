@@ -143,6 +143,7 @@ def main():
         print(
             f"REFERENCE {candidate.symbol}: "
             f"Status={reference.status} "
+            f"Matches={getattr(reference, 'matched_candidate_count', 0)} "
             f"CoinGecko={reference.coingecko_id or 'N/A'} "
             f"CGPrice=${reference.reference_price_usd if reference.reference_price_usd is not None else 'N/A'} "
             f"KrakenUSD=${reference.kraken_normalized_price_usd if reference.kraken_normalized_price_usd is not None else 'N/A'} "
