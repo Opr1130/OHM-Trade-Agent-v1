@@ -60,3 +60,17 @@ class MarketSnapshot:
     rolling_72h_upside_median_pct: float = 0.0
     rolling_72h_upside_p75_pct: float = 0.0
     rolling_72h_upside_p90_pct: float = 0.0
+
+    underlying_asset: str = ""
+    primary_pair: str = ""
+    secondary_pair: str | None = None
+    primary_quote_currency: str = ""
+    primary_24h_liquidity_usd: float = 0.0
+    secondary_24h_liquidity_usd: float = 0.0
+    combined_24h_liquidity_usd: float = 0.0
+    liquidity_rank: int = 0
+
+    secondary_volume_ratio: float | None = None
+    cross_pair_confirmation_status: str = "SINGLE_MARKET"
+    cross_pair_strengths: list[str] | None = None
+    cross_pair_warnings: list[str] | None = None

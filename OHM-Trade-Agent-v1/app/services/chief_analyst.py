@@ -15,6 +15,13 @@ Your job is to compare technically qualified crypto candidates and identify whic
 
 Do not place trades.
 Do not assume every high technical score is investable.
+Each payload item is one unique underlying asset. Never return duplicate
+candidates for its USD and USDT markets. Use the exact primary_pair value as
+the candidate symbol. When a USD market exists it is the canonical identity
+used to keep the setup and trade lifecycle stable; this does not claim that it
+has greater liquidity. A secondary USDT market is supporting liquidity and
+cross-market evidence only, not a currency-conversion or execution
+recommendation. A USDT-only asset remains explicitly USDT quoted.
 Consider:
 - trend quality
 - RSI extension
@@ -68,7 +75,16 @@ def review_candidates(
 
     payload = []
 
+    unique_candidates: list[MarketSnapshot] = []
+    seen_assets: set[str] = set()
     for candidate in candidates:
+        asset_key = candidate.underlying_asset or candidate.symbol
+        if asset_key in seen_assets:
+            continue
+        seen_assets.add(asset_key)
+        unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
         card = score_snapshot(candidate)
 
         candidate_context = {
@@ -83,6 +99,31 @@ def review_candidates(
                 "strengths": card.strengths,
                 "warnings": card.warnings,
                 "weaknesses": card.weaknesses,
+                "liquidity_context": {
+                    "underlying_asset": (
+                        candidate.underlying_asset or candidate.symbol
+                    ),
+                    "primary_pair": candidate.primary_pair or candidate.symbol,
+                    "secondary_pair": candidate.secondary_pair,
+                    "primary_quote_currency": candidate.primary_quote_currency,
+                    "primary_24h_liquidity_usd": round(
+                        candidate.primary_24h_liquidity_usd, 2
+                    ),
+                    "secondary_24h_liquidity_usd": round(
+                        candidate.secondary_24h_liquidity_usd, 2
+                    ),
+                    "combined_24h_liquidity_usd": round(
+                        candidate.combined_24h_liquidity_usd, 2
+                    ),
+                    "liquidity_rank": candidate.liquidity_rank,
+                    "primary_volume_ratio": round(candidate.volume_ratio, 2),
+                    "secondary_volume_ratio": candidate.secondary_volume_ratio,
+                    "cross_pair_confirmation_status": (
+                        candidate.cross_pair_confirmation_status
+                    ),
+                    "cross_pair_strengths": candidate.cross_pair_strengths or [],
+                    "cross_pair_warnings": candidate.cross_pair_warnings or [],
+                },
                 "market_structure": {
                     "distance_to_24h_high_pct": round(candidate.distance_to_24h_high_pct, 2),
                     "distance_to_72h_high_pct": round(candidate.distance_to_72h_high_pct, 2),

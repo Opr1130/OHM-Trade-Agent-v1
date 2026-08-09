@@ -4,8 +4,14 @@ from dataclasses import dataclass
 from app.exchanges.kraken import KrakenClient
 from app.indicators.technical import atr, ema, macd, rsi, volume_ratio
 from app.scanner.models import MarketSnapshot
+from app.scanner.cross_pair_confirmation import evaluate_cross_pair_confirmation
 from app.scanner.technical_scorer import score_snapshot
-from app.scanner.universe import get_kraken_usd_universe
+from app.scanner.universe import (
+    DEFAULT_UNIQUE_ASSET_LIMIT,
+    UniverseAsset,
+    UniverseBuildResult,
+    build_kraken_asset_universe,
+)
 
 
 MIN_CANDLES_REQUIRED = 200
@@ -21,6 +27,14 @@ class ScanResult:
     failed: int
     skips: list[str]
     failures: list[str]
+    universe: UniverseBuildResult | None = None
+
+
+@dataclass
+class SecondaryConfirmationSummary:
+    requested: int
+    analyzed: int
+    failed: int
 
 
 def _percentage_change(current: float, previous: float) -> float:
@@ -152,7 +166,10 @@ def determine_trend(
     return "neutral"
 
 
-def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]:
+def analyze_symbol(
+    symbol: str,
+    universe_asset: UniverseAsset | None = None,
+) -> tuple[str, MarketSnapshot | None, str | None]:
     client = KrakenClient()
 
     try:
@@ -255,6 +272,30 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
             rolling_72h_upside_p90_pct=rolling_72h_upside[2],
         )
 
+        if universe_asset is not None:
+            if universe_asset.primary_quote_currency == "USD":
+                primary_liquidity = universe_asset.usd_24h_notional_usd
+                secondary_liquidity = (
+                    universe_asset.usdt_24h_notional_usd_equivalent
+                )
+            else:
+                primary_liquidity = (
+                    universe_asset.usdt_24h_notional_usd_equivalent
+                )
+                secondary_liquidity = universe_asset.usd_24h_notional_usd
+            snapshot.underlying_asset = universe_asset.base_asset
+            snapshot.primary_pair = universe_asset.primary_pair
+            snapshot.secondary_pair = universe_asset.secondary_pair
+            snapshot.primary_quote_currency = (
+                universe_asset.primary_quote_currency
+            )
+            snapshot.primary_24h_liquidity_usd = primary_liquidity
+            snapshot.secondary_24h_liquidity_usd = secondary_liquidity
+            snapshot.combined_24h_liquidity_usd = (
+                universe_asset.combined_24h_notional_usd
+            )
+            snapshot.liquidity_rank = universe_asset.liquidity_rank
+
         snapshot.technical_score = score_snapshot(snapshot).score
 
         return "ok", snapshot, None
@@ -263,9 +304,11 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
         return "fail", None, f"{symbol}: {exc}"
 
 
-def scan_market(limit: int = 100) -> ScanResult:
+def scan_market(
+    limit: int = DEFAULT_UNIQUE_ASSET_LIMIT,
+) -> ScanResult:
     universe_client = KrakenClient()
-    symbols = get_kraken_usd_universe(
+    universe = build_kraken_asset_universe(
         client=universe_client,
         limit=limit,
     )
@@ -276,8 +319,12 @@ def scan_market(limit: int = 100) -> ScanResult:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(analyze_symbol, symbol): symbol
-            for symbol in symbols
+            executor.submit(
+                analyze_symbol,
+                asset.primary_pair,
+                asset,
+            ): asset.primary_pair
+            for asset in universe.assets
         }
 
         for future in as_completed(futures):
@@ -297,10 +344,56 @@ def scan_market(limit: int = 100) -> ScanResult:
 
     return ScanResult(
         snapshots=snapshots,
-        requested=len(symbols),
+        requested=len(universe.assets),
         analyzed=len(snapshots),
         skipped=len(skips),
         failed=len(failures),
         skips=sorted(skips),
         failures=sorted(failures),
+        universe=universe,
+    )
+
+
+def confirm_secondary_markets(
+    candidates: list[MarketSnapshot],
+) -> SecondaryConfirmationSummary:
+    """Fetch secondary OHLC only for shortlisted assets that have one."""
+    requested_candidates = [
+        candidate for candidate in candidates if candidate.secondary_pair
+    ]
+    for candidate in candidates:
+        if not candidate.secondary_pair:
+            result = evaluate_cross_pair_confirmation(candidate, None)
+            candidate.cross_pair_confirmation_status = result.status
+            candidate.cross_pair_strengths = result.strengths
+            candidate.cross_pair_warnings = result.warnings
+
+    analyzed = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(analyze_symbol, candidate.secondary_pair): candidate
+            for candidate in requested_candidates
+        }
+        for future in as_completed(futures):
+            candidate = futures[future]
+            try:
+                status, secondary, _ = future.result()
+            except Exception:
+                status, secondary = "fail", None
+            if status == "ok" and secondary is not None:
+                analyzed += 1
+                candidate.secondary_volume_ratio = secondary.volume_ratio
+            else:
+                failed += 1
+                secondary = None
+            result = evaluate_cross_pair_confirmation(candidate, secondary)
+            candidate.cross_pair_confirmation_status = result.status
+            candidate.cross_pair_strengths = result.strengths
+            candidate.cross_pair_warnings = result.warnings
+
+    return SecondaryConfirmationSummary(
+        requested=len(requested_candidates),
+        analyzed=analyzed,
+        failed=failed,
     )
