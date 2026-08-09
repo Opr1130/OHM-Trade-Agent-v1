@@ -34,6 +34,14 @@ class UniverseAsset:
     usdt_24h_notional_usd_equivalent: float = 0.0
     combined_24h_notional_usd: float = 0.0
     liquidity_rank: int = 0
+    primary_kraken_symbol: str = ""
+    secondary_kraken_symbol: str | None = None
+    primary_ticker_last: float = 0.0
+    primary_ticker_bid: float = 0.0
+    primary_ticker_ask: float = 0.0
+    secondary_ticker_last: float | None = None
+    secondary_ticker_bid: float | None = None
+    secondary_ticker_ask: float | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,7 @@ class _EligibleMarket:
     display_pair: str
     base_asset: str
     quote_currency: str
+    kraken_public_symbol: str
 
 
 def _normalize_base(base: str) -> str:
@@ -143,6 +152,9 @@ def build_kraken_asset_universe(
             display_pair=_display_pair(base_asset, quote_currency),
             base_asset=base_asset,
             quote_currency=quote_currency,
+            # Transparency endpoints use canonical display assets (BTC, DOGE)
+            # rather than lifecycle concatenation or legacy XBT/XDG aliases.
+            kraken_public_symbol=f"{base_asset}/{quote_currency}",
         ))
 
     request_ids = sorted({market.pair_id for market in markets} | set(conversion_pairs))
@@ -186,6 +198,8 @@ def build_kraken_asset_universe(
         if market.quote_currency == "USD":
             item["usd_pair"] = market.display_pair
             item["usd_notional"] = quote_notional
+            item["usd_kraken_symbol"] = market.kraken_public_symbol
+            item["usd_ticker"] = ticker
         else:
             item["usdt_pair"] = market.display_pair
             item["usdt_quote_notional"] = quote_notional
@@ -194,6 +208,8 @@ def build_kraken_asset_universe(
                 if usdt_usd_rate is not None
                 else 0.0
             )
+            item["usdt_kraken_symbol"] = market.kraken_public_symbol
+            item["usdt_ticker"] = ticker
 
     assets: list[UniverseAsset] = []
     for base_asset, item in by_asset.items():
@@ -218,10 +234,20 @@ def build_kraken_asset_universe(
             primary_pair = str(usd_pair)
             secondary_pair = str(usdt_pair) if usdt_pair else None
             primary_quote = "USD"
+            primary_kraken_symbol = str(item["usd_kraken_symbol"])
+            secondary_kraken_symbol = (
+                str(item["usdt_kraken_symbol"]) if usdt_pair else None
+            )
+            primary_ticker = dict(item["usd_ticker"])
+            secondary_ticker = dict(item["usdt_ticker"]) if usdt_pair else None
         else:
             primary_pair = str(usdt_pair)
             secondary_pair = None
             primary_quote = "USDT"
+            primary_kraken_symbol = str(item["usdt_kraken_symbol"])
+            secondary_kraken_symbol = None
+            primary_ticker = dict(item["usdt_ticker"])
+            secondary_ticker = None
 
         assets.append(UniverseAsset(
             base_asset=base_asset,
@@ -234,6 +260,22 @@ def build_kraken_asset_universe(
             usdt_24h_notional_quote=usdt_quote_notional,
             usdt_24h_notional_usd_equivalent=usdt_usd_notional,
             combined_24h_notional_usd=combined,
+            primary_kraken_symbol=primary_kraken_symbol,
+            secondary_kraken_symbol=secondary_kraken_symbol,
+            primary_ticker_last=float(primary_ticker["last"]),
+            primary_ticker_bid=float(primary_ticker.get("bid", primary_ticker["last"])),
+            primary_ticker_ask=float(primary_ticker.get("ask", primary_ticker["last"])),
+            secondary_ticker_last=(
+                float(secondary_ticker["last"]) if secondary_ticker else None
+            ),
+            secondary_ticker_bid=(
+                float(secondary_ticker.get("bid", secondary_ticker["last"]))
+                if secondary_ticker else None
+            ),
+            secondary_ticker_ask=(
+                float(secondary_ticker.get("ask", secondary_ticker["last"]))
+                if secondary_ticker else None
+            ),
         ))
 
     assets.sort(key=lambda asset: (-asset.combined_24h_notional_usd, asset.base_asset))

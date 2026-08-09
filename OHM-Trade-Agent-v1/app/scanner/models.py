@@ -1,4 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.scanner.execution_validation import ExecutionValidation
+    from app.scanner.market_data_validation import MarketDataValidation
 
 
 @dataclass
@@ -74,3 +81,11 @@ class MarketSnapshot:
     cross_pair_confirmation_status: str = "SINGLE_MARKET"
     cross_pair_strengths: list[str] | None = None
     cross_pair_warnings: list[str] | None = None
+    kraken_public_symbol: str = ""
+    ticker_last: float = 0.0
+    ticker_bid: float = 0.0
+    ticker_ask: float = 0.0
+    market_data_validation: MarketDataValidation | None = None
+    execution_validation: ExecutionValidation | None = None
+    cross_pair_price_divergence_pct: float | None = None
+    cross_pair_price_status: str = "UNAVAILABLE"
