@@ -64,7 +64,11 @@ Market regime is deterministic breadth context, not a probability. RISK_OFF
 is caution evidence and is not an automatic rejection. CoinGecko global data
 is independent aggregate context and is not executable venue data.
 CryptoPanic headlines are external information, not verified truth. News votes
-are not probabilities. CoinMarketCal events are scheduled-catalyst evidence;
+are not probabilities. CryptoPanic news is associated only after identity-safe
+structured instrument matching. News UNRESOLVED means OHM deliberately refused
+ticker-only attribution; no news conclusion may be drawn from it. It is missing
+safe identity evidence, not a trading rejection. CoinMarketCal events are
+scheduled-catalyst evidence;
 estimated dates are windows or deadlines, not exact timestamps. UNAVAILABLE
 means evidence is missing. UNRESOLVED means external identity could not be
 safely established. Never invent external evidence or recalculate supplied

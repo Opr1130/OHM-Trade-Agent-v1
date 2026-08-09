@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import re
 from typing import Any
 
 from app.scanner.models import MarketSnapshot
+from app.scanner.reference_market_validation import UNIQUE
 from app.services.cryptopanic import CryptoPanicAPIError, CryptoPanicClient
 
 
 AVAILABLE = "AVAILABLE"
 UNAVAILABLE = "UNAVAILABLE"
+UNRESOLVED = "UNRESOLVED"
 MAX_CHIEF_NEWS_ITEMS = 3
 SYMBOL_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
@@ -47,6 +50,7 @@ class NewsValidationSummary:
     available: int
     unavailable: int
     request_count: int
+    unresolved: int = 0
 
 
 def normalize_symbol(value: str) -> str:
@@ -74,6 +78,38 @@ def unavailable_news(warning: str) -> NewsContext:
         latest_post_age_seconds=None,
         warnings=(warning,),
     )
+
+
+def unresolved_news() -> NewsContext:
+    return NewsContext(
+        status=UNRESOLVED,
+        matched_post_count=0,
+        recent_post_count_6h=0,
+        recent_post_count_24h=0,
+        latest_post_age_seconds=None,
+        warnings=(
+            "CryptoPanic identity could not be safely resolved; ticker-only "
+            "news attribution was refused",
+        ),
+    )
+
+
+def _normalized_identity(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _identity_anchor(candidate: MarketSnapshot) -> tuple[str, str] | None:
+    reference = candidate.independent_market_reference
+    if (
+        reference is None
+        or reference.mapping_status != UNIQUE
+        or not reference.coingecko_id
+        or not reference.coingecko_name
+        or not _normalized_identity(reference.coingecko_id)
+        or not _normalized_identity(reference.coingecko_name)
+    ):
+        return None
+    return reference.coingecko_id, reference.coingecko_name
 
 
 def _timestamp(value: Any) -> datetime | None:
@@ -105,6 +141,12 @@ def evaluate_news_context(
     now: datetime | None = None,
 ) -> NewsContext:
     now = now or datetime.now(timezone.utc)
+    identity = _identity_anchor(candidate)
+    if identity is None:
+        return unresolved_news()
+    coingecko_id, coingecko_name = identity
+    normalized_id = _normalized_identity(coingecko_id)
+    normalized_name = _normalized_identity(coingecko_name)
     wanted = candidate_symbol(candidate)
     items: list[NewsItem] = []
     invalid_timestamps = 0
@@ -117,7 +159,15 @@ def evaluate_news_context(
                 instrument
                 for instrument in instruments
                 if isinstance(instrument, dict)
-                and normalize_symbol(str(instrument.get("code", ""))) == wanted
+                and _normalized_identity(
+                    normalize_symbol(str(instrument.get("code", "")))
+                ) == _normalized_identity(wanted)
+                and (
+                    _normalized_identity(str(instrument.get("title", "")))
+                    == normalized_name
+                    or _normalized_identity(str(instrument.get("slug", "")))
+                    == normalized_id
+                )
             ),
             None,
         )
@@ -187,24 +237,46 @@ def validate_finalist_news(
     now: datetime | None = None,
 ) -> NewsValidationSummary:
     requested = candidates[:8]
+    safely_identified: list[MarketSnapshot] = []
+    for candidate in requested:
+        if _identity_anchor(candidate) is None:
+            candidate.news_context = unresolved_news()
+        else:
+            safely_identified.append(candidate)
+
+    if not safely_identified:
+        return NewsValidationSummary(
+            requested=len(requested),
+            available=0,
+            unavailable=0,
+            request_count=0,
+            unresolved=len(requested),
+        )
+
     if client is None and not auth_token:
-        for candidate in requested:
+        for candidate in safely_identified:
             candidate.news_context = unavailable_news(
                 "CryptoPanic authentication token is not configured"
             )
-        return NewsValidationSummary(len(requested), 0, len(requested), 0)
+        return NewsValidationSummary(
+            requested=len(requested),
+            available=0,
+            unavailable=len(safely_identified),
+            request_count=0,
+            unresolved=len(requested) - len(safely_identified),
+        )
 
     client = client or CryptoPanicClient(auth_token or "", api_plan)
-    symbols = [candidate_symbol(item) for item in requested]
+    symbols = [candidate_symbol(item) for item in safely_identified]
     try:
         posts = client.get_posts(symbols)
     except CryptoPanicAPIError:
-        for candidate in requested:
+        for candidate in safely_identified:
             candidate.news_context = unavailable_news(
                 "CryptoPanic batch request unavailable"
             )
     else:
-        for candidate in requested:
+        for candidate in safely_identified:
             candidate.news_context = evaluate_news_context(candidate, posts, now)
     contexts = [candidate.news_context for candidate in requested]
     return NewsValidationSummary(
@@ -212,4 +284,5 @@ def validate_finalist_news(
         available=sum(item is not None and item.status == AVAILABLE for item in contexts),
         unavailable=sum(item is not None and item.status == UNAVAILABLE for item in contexts),
         request_count=1,
+        unresolved=sum(item is not None and item.status == UNRESOLVED for item in contexts),
     )

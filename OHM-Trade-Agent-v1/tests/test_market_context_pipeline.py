@@ -114,6 +114,41 @@ def test_chief_receives_all_context_in_exactly_one_responses_call(monkeypatch):
     assert chief_candidate["scheduled_catalyst_context"]["mapping_status"] == "RESOLVED"
 
 
+def test_chief_receives_unresolved_news_without_fabricated_items(monkeypatch):
+    candidate = snapshot()
+    candidate.news_context = NewsContext(
+        status="UNRESOLVED",
+        matched_post_count=0,
+        recent_post_count_6h=0,
+        recent_post_count_24h=0,
+        latest_post_age_seconds=None,
+        warnings=("ticker-only attribution refused",),
+    )
+    class Responses:
+        def __init__(self):
+            self.calls = 0
+            self.payload = None
+        def create(self, **kwargs):
+            self.calls += 1
+            self.payload = json.loads(kwargs["input"][1]["content"])
+            return SimpleNamespace(output_text=json.dumps({
+                "market_view": "", "recommended_action": "no_trade",
+                "top_candidates": [], "summary": "",
+            }))
+    responses = Responses()
+    monkeypatch.setattr(
+        chief_analyst, "OpenAI",
+        lambda api_key: SimpleNamespace(responses=responses),
+    )
+    chief_analyst.review_candidates([candidate], "model", "key")
+    news = responses.payload["candidates"][0]["news_context"]
+    assert responses.calls == 1
+    assert news["status"] == "UNRESOLVED"
+    assert news["matched_post_count"] == 0
+    assert news["recent_items"] == []
+    assert "ticker-only attribution" in chief_analyst.SYSTEM_PROMPT
+
+
 def test_pipeline_evidence_order_precedes_single_chief_call(monkeypatch, tmp_path):
     candidate = snapshot()
     calls = []

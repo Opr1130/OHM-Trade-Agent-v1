@@ -211,6 +211,7 @@ def main():
         f"requested={news_summary.requested}",
         f"available={news_summary.available}",
         f"unavailable={news_summary.unavailable}",
+        f"unresolved={getattr(news_summary, 'unresolved', 0)}",
     )
     print(
         "Catalyst summary:",

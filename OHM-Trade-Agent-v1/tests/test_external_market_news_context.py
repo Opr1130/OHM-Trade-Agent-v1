@@ -13,9 +13,16 @@ from app.scanner.models import MarketSnapshot
 from app.scanner.news_context import (
     AVAILABLE as NEWS_AVAILABLE,
     UNAVAILABLE as NEWS_UNAVAILABLE,
+    UNRESOLVED as NEWS_UNRESOLVED,
     validate_finalist_news,
 )
-from app.scanner.reference_market_validation import validate_finalist_references
+from app.scanner.reference_market_validation import (
+    AMBIGUOUS,
+    UNIQUE,
+    UNAVAILABLE as REFERENCE_UNAVAILABLE,
+    ReferenceMarketValidation,
+    validate_finalist_references,
+)
 from app.services import cryptopanic
 from app.services.coingecko import CoinGeckoAPIError
 from app.services.cryptopanic import CryptoPanicAPIError, CryptoPanicClient
@@ -24,8 +31,23 @@ from app.services.cryptopanic import CryptoPanicAPIError, CryptoPanicClient
 NOW = datetime(2026, 8, 9, 12, tzinfo=timezone.utc)
 
 
-def snapshot(symbol="SOLUSD", underlying="SOL") -> MarketSnapshot:
-    return MarketSnapshot(
+def snapshot(
+    symbol="SOLUSD",
+    underlying="SOL",
+    coingecko_id=None,
+    coingecko_name=None,
+) -> MarketSnapshot:
+    identities = {
+        "SOL": ("solana", "Solana"),
+        "XBT": ("bitcoin", "Bitcoin"),
+        "BTC": ("bitcoin", "Bitcoin"),
+        "XDG": ("dogecoin", "Dogecoin"),
+        "DOGE": ("dogecoin", "Dogecoin"),
+    }
+    default_id, default_name = identities.get(
+        underlying, (underlying.lower(), underlying)
+    )
+    candidate = MarketSnapshot(
         symbol=symbol,
         last_price=100,
         ema20=99,
@@ -45,6 +67,16 @@ def snapshot(symbol="SOLUSD", underlying="SOL") -> MarketSnapshot:
         primary_quote_currency="USD",
         ticker_last=100,
     )
+    candidate.independent_market_reference = ReferenceMarketValidation(
+        status="CONFIRMED",
+        available=True,
+        mapping_status=UNIQUE,
+        api_mode="KEYLESS",
+        coingecko_id=coingecko_id or default_id,
+        coingecko_name=coingecko_name or default_name,
+        matched_candidate_count=1,
+    )
+    return candidate
 
 
 def market_row(symbol="sol", coin_id="solana"):
@@ -61,7 +93,21 @@ def market_row(symbol="sol", coin_id="solana"):
     }
 
 
-def post(code="SOL", *, hours=1, post_id=1, title="Solana update"):
+def post(
+    code="SOL",
+    *,
+    hours=1,
+    post_id=1,
+    title="Solana update",
+    instrument_title=None,
+    instrument_slug=None,
+):
+    identities = {
+        "SOL": ("Solana", "solana"),
+        "BTC": ("Bitcoin", "bitcoin"),
+        "DOGE": ("Dogecoin", "dogecoin"),
+    }
+    default_title, default_slug = identities.get(code, (code, code.lower()))
     return {
         "id": post_id,
         "title": title,
@@ -69,7 +115,11 @@ def post(code="SOL", *, hours=1, post_id=1, title="Solana update"):
         "published_at": (NOW - timedelta(hours=hours)).isoformat(),
         "kind": "news",
         "source": {"title": "Provider", "domain": "example.com"},
-        "instruments": [{"code": code, "title": code, "slug": code.lower()}],
+        "instruments": [{
+            "code": code,
+            "title": instrument_title or default_title,
+            "slug": instrument_slug or default_slug,
+        }],
         "votes": {"positive": 4, "negative": 1},
     }
 
@@ -143,6 +193,100 @@ def test_news_uses_one_batch_and_normalizes_xbt_xdg():
     assert all(item.news_context.matched_post_count == 1 for item in candidates)
 
 
+def test_unique_identity_exact_code_and_title_match_attaches_news():
+    candidate = snapshot()
+    class Client:
+        def get_posts(self, symbols):
+            return [post("SOL", instrument_title="Solana", instrument_slug="wrong")]
+    validate_finalist_news([candidate], client=Client(), now=NOW)
+    assert candidate.news_context.matched_post_count == 1
+
+
+def test_unique_identity_exact_code_and_slug_match_attaches_news():
+    candidate = snapshot()
+    class Client:
+        def get_posts(self, symbols):
+            return [post("SOL", instrument_title="Wrong Asset", instrument_slug="solana")]
+    validate_finalist_news([candidate], client=Client(), now=NOW)
+    assert candidate.news_context.matched_post_count == 1
+
+
+def test_same_ticker_wrong_title_and_slug_does_not_attach():
+    candidate = snapshot()
+    class Client:
+        def get_posts(self, symbols):
+            return [post(
+                "SOL", instrument_title="Different Asset",
+                instrument_slug="different-asset",
+            )]
+    validate_finalist_news([candidate], client=Client(), now=NOW)
+    assert candidate.news_context.status == NEWS_AVAILABLE
+    assert candidate.news_context.matched_post_count == 0
+    assert candidate.news_context.recent_items == ()
+
+
+def test_exact_identity_normalization_removes_only_formatting():
+    candidate = snapshot(
+        "PENGUUSD", "PENGU", "pudgy-penguins", "Pudgy Penguins"
+    )
+    class Client:
+        def get_posts(self, symbols):
+            return [post(
+                "PENGU", instrument_title="Pudgy_Penguins",
+                instrument_slug="not-the-id",
+            )]
+    validate_finalist_news([candidate], client=Client(), now=NOW)
+    assert candidate.news_context.matched_post_count == 1
+
+
+def test_ambiguous_coingecko_identity_is_unresolved_without_request():
+    candidate = snapshot()
+    candidate.independent_market_reference = ReferenceMarketValidation(
+        status=AMBIGUOUS, available=True, mapping_status=AMBIGUOUS,
+        api_mode="KEYLESS", matched_candidate_count=2,
+    )
+    class Client:
+        def __init__(self): self.calls = 0
+        def get_posts(self, symbols):
+            self.calls += 1
+            return [post("SOL")]
+    client = Client()
+    summary = validate_finalist_news([candidate], client=client, now=NOW)
+    assert client.calls == 0
+    assert summary.request_count == 0
+    assert summary.unresolved == 1
+    assert candidate.news_context.status == NEWS_UNRESOLVED
+    assert candidate.news_context.matched_post_count == 0
+    assert candidate.news_context.recent_items == ()
+
+
+def test_unavailable_coingecko_identity_is_unresolved():
+    candidate = snapshot()
+    candidate.independent_market_reference = ReferenceMarketValidation(
+        status=REFERENCE_UNAVAILABLE, available=False,
+        mapping_status=REFERENCE_UNAVAILABLE, api_mode="KEYLESS",
+    )
+    summary = validate_finalist_news([candidate], client=object(), now=NOW)
+    assert summary.request_count == 0
+    assert candidate.news_context.status == NEWS_UNRESOLVED
+    assert "ticker-only" in candidate.news_context.warnings[0]
+
+
+def test_ticker_only_collision_cannot_create_news_evidence():
+    candidate = snapshot()
+    candidate.independent_market_reference = None
+    class Client:
+        def get_posts(self, symbols):
+            raise AssertionError("no request should be made")
+    validate_finalist_news([candidate], client=Client(), now=NOW)
+    assert candidate.news_context.status == NEWS_UNRESOLVED
+    assert candidate.news_context.matched_post_count == 0
+    assert candidate.news_context.recent_post_count_6h == 0
+    assert candidate.news_context.recent_post_count_24h == 0
+    assert candidate.news_context.latest_post_age_seconds is None
+    assert candidate.news_context.recent_items == ()
+
+
 def test_news_uses_exactly_one_batch_for_eight_finalists():
     class Client:
         def __init__(self): self.calls = 0
@@ -155,6 +299,25 @@ def test_news_uses_exactly_one_batch_for_eight_finalists():
     summary = validate_finalist_news(candidates, client=client, now=NOW)
     assert client.calls == 1
     assert summary.request_count == 1
+
+
+def test_mixed_identities_batch_only_safe_finalists_once():
+    safe = snapshot()
+    unsafe = snapshot("FUNUSD", "FUN")
+    unsafe.independent_market_reference = ReferenceMarketValidation(
+        status=AMBIGUOUS, available=True, mapping_status=AMBIGUOUS,
+        api_mode="KEYLESS", matched_candidate_count=2,
+    )
+    class Client:
+        def __init__(self): self.calls = []
+        def get_posts(self, symbols):
+            self.calls.append(symbols)
+            return [post("SOL"), post("FUN", instrument_title="FunFair")]
+    client = Client()
+    validate_finalist_news([safe, unsafe], client=client, now=NOW)
+    assert client.calls == [["SOL"]]
+    assert safe.news_context.matched_post_count == 1
+    assert unsafe.news_context.status == NEWS_UNRESOLVED
 
 
 def test_structured_instruments_associate_only_related_news():
