@@ -25,6 +25,28 @@ class Candle:
     trade_count: int
 
 
+@dataclass(frozen=True)
+class BookLevel:
+    price: float
+    quantity: float
+    publication_timestamp: str | None = None
+
+
+@dataclass(frozen=True)
+class PreTradeBook:
+    symbol: str
+    bids: list[BookLevel]
+    asks: list[BookLevel]
+
+
+@dataclass(frozen=True)
+class PublicTrade:
+    price: float
+    quantity: float
+    trade_timestamp: str
+    publication_timestamp: str | None = None
+
+
 class KrakenClient:
     def __init__(self, timeout_seconds: float = 15.0) -> None:
         self.timeout_seconds = timeout_seconds
@@ -150,3 +172,37 @@ class KrakenClient:
             )
 
         return candles
+
+    def get_pre_trade(self, symbol: str) -> PreTradeBook:
+        """Return Kraken's public top-10 aggregated transparency book."""
+        result = self._get("PreTrade", {"symbol": symbol})
+        return PreTradeBook(
+            symbol=str(result.get("symbol", symbol)),
+            bids=[self._book_level(item) for item in result.get("bids", [])[:10]],
+            asks=[self._book_level(item) for item in result.get("asks", [])[:10]],
+        )
+
+    @staticmethod
+    def _book_level(item: dict[str, Any]) -> BookLevel:
+        return BookLevel(
+            price=float(item["price"]),
+            quantity=float(item["qty"]),
+            publication_timestamp=item.get("publication_ts"),
+        )
+
+    def get_post_trade(
+        self,
+        symbol: str,
+        count: int = 100,
+    ) -> list[PublicTrade]:
+        """Return bounded recent public spot trades without authentication."""
+        result = self._get("PostTrade", {"symbol": symbol, "count": count})
+        return [
+            PublicTrade(
+                price=float(item["price"]),
+                quantity=float(item["quantity"]),
+                trade_timestamp=str(item["trade_ts"]),
+                publication_timestamp=item.get("publication_ts"),
+            )
+            for item in result.get("trades", [])
+        ]
