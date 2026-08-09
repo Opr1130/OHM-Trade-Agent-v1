@@ -3,6 +3,11 @@ from pathlib import Path
 from typing import Any
 
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.pending_setup_registry import (
+    PendingSetup,
+    add_pending_setup,
+    terminalize_pending_setup,
+)
 from app.services.telegram_notifier import (
     build_trade_confirmation_buttons,
     send_telegram_message,
@@ -221,15 +226,23 @@ def send_trade_plan(
     reply_markup = None
 
     if action == "ENTER_NOW":
-        trade_id = (
-            f"{plan.symbol}:"
-            f"{plan.entry_low}:"
-            f"{plan.entry_high}"
+        setup = add_pending_setup(
+            PendingSetup(
+                symbol=plan.symbol,
+                entry_low=plan.entry_low,
+                entry_high=plan.entry_high,
+                chase_limit=plan.chase_limit,
+                stop_price=plan.stop_price,
+                target_1=plan.target_1,
+                target_2=plan.target_2,
+                risk_level=plan.risk_level,
+                confidence=int(candidate.get("confidence", 0)),
+                confirmation_price=plan.entry_high,
+            )
         )
-
         reply_markup = (
             build_trade_confirmation_buttons(
-                trade_id
+                setup.trade_id
             )
         )
 
@@ -251,5 +264,8 @@ def send_trade_plan(
         )
 
         _save_state(state)
+
+    elif action == "ENTER_NOW":
+        terminalize_pending_setup(setup.trade_id, "send_failed")
 
     return sent

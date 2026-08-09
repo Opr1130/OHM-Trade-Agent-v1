@@ -61,22 +61,23 @@ def build_entry_exit_plan(
     rr2 = (target_2 - entry_reference) / risk_per_unit
 
     too_extended = price > snapshot.ema20 + (atr_value * 1.25)
-    valid_now = not too_extended
-
     if too_extended:
         entry_style = "wait_for_pullback"
+        valid_now = False
         reason = (
             "Price is extended above EMA20 relative to ATR. "
             "Wait for a pullback instead of chasing."
         )
     elif snapshot.last_price >= snapshot.ema20:
         entry_style = "pullback_or_retest"
+        valid_now = True
         reason = (
             "Trend structure supports a controlled pullback or retest entry "
             "with ATR-based risk."
         )
     else:
         entry_style = "wait"
+        valid_now = False
         reason = "Price is below EMA20; wait for trend recovery."
 
     return EntryExitPlan(

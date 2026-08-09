@@ -2,7 +2,10 @@ import json
 from pathlib import Path
 
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
-from app.services.pending_setup_registry import PendingSetup
+from app.services.pending_setup_registry import (
+    PendingSetup,
+    terminalize_pending_setup,
+)
 from app.services.telegram_notifier import send_telegram_message
 
 
@@ -73,7 +76,14 @@ def send_pending_setup_update(
     state = _load_state()
     previous_status = state.get(setup.symbol)
 
+    terminal_status = {
+        "INVALIDATED": "invalidated",
+        "TOO_EXTENDED": "too_extended",
+    }.get(result.status)
+
     if previous_status == result.status:
+        if terminal_status:
+            terminalize_pending_setup(setup.trade_id, terminal_status)
         return False
 
     sent = send_telegram_message(
@@ -85,5 +95,8 @@ def send_pending_setup_update(
     if sent:
         state[setup.symbol] = result.status
         _save_state(state)
+
+    if terminal_status:
+        terminalize_pending_setup(setup.trade_id, terminal_status)
 
     return sent
