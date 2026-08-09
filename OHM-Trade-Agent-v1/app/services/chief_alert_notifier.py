@@ -131,12 +131,24 @@ def format_trade_plan(
             "conversion)\n"
         )
 
+    ranking_note = ""
+    if candidate.get("profit_rank") is not None:
+        ranking_note += (
+            f"OHM Opportunity Rank: #{candidate['profit_rank']}\n"
+        )
+    if candidate.get("profit_rank_score") is not None:
+        ranking_note += (
+            f"Profit Rank Score: "
+            f"{float(candidate['profit_rank_score']):.2f}/100\n"
+        )
+
     return (
         f"{headline}\n\n"
         f"{action_text}\n\n"
         f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
         f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
         f"{quote_note}"
+        f"{ranking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: "
         f"{candidate.get('confidence', 0)}%\n"
