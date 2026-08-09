@@ -6,6 +6,7 @@ from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
+    get_pending_setups,
     terminalize_pending_setup,
 )
 from app.services.telegram_notifier import (
@@ -209,6 +210,13 @@ def should_send_trade_plan(
     return current_key != previous_key
 
 
+def _existing_setup_trade_id(symbol: str) -> str | None:
+    for pending in get_pending_setups():
+        if pending.symbol == symbol:
+            return pending.trade_id or None
+    return None
+
+
 def send_trade_plan(
     candidate: dict[str, Any],
     plan: EntryExitPlan,
@@ -259,12 +267,16 @@ def send_trade_plan(
             )
         )
 
+    trade_id = (
+        setup.trade_id
+        if setup is not None
+        else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+    )
+    if trade_id:
+        candidate["trade_id"] = trade_id
+
     record_recommendation(
-        trade_id=(
-            setup.trade_id
-            if setup is not None
-            else str(candidate.get("trade_id") or "") or None
-        ),
+        trade_id=trade_id,
         candidate=candidate,
         plan=plan,
         action=action,
