@@ -30,6 +30,10 @@ Target-quality scores are deterministic opportunity-quality scores, not a
 probability of success. AI confidence is comparative review confidence, not a
 win probability. Do not recalculate supplied deterministic metrics.
 
+Economic assumed capital is ACCOUNT_EQUITY used only as validation capital for
+hypothetical economic comparison. It is not a recommended allocation. Capital
+allocation is outside this review and will be implemented separately.
+
 Return JSON only in this exact shape:
 
 {
@@ -97,6 +101,16 @@ def review_candidates(
                         "p75": round(candidate.rolling_72h_range_p75_pct, 2),
                         "p90": round(candidate.rolling_72h_range_p90_pct, 2),
                     },
+                    "rolling_24h_long_upside_percentiles": {
+                        "p50": round(candidate.rolling_24h_upside_median_pct, 2),
+                        "p75": round(candidate.rolling_24h_upside_p75_pct, 2),
+                        "p90": round(candidate.rolling_24h_upside_p90_pct, 2),
+                    },
+                    "rolling_72h_long_upside_percentiles": {
+                        "p50": round(candidate.rolling_72h_upside_median_pct, 2),
+                        "p75": round(candidate.rolling_72h_upside_p75_pct, 2),
+                        "p90": round(candidate.rolling_72h_upside_p90_pct, 2),
+                    },
                 },
             }
 
@@ -117,7 +131,10 @@ def review_candidates(
                     "momentum_context": target_quality.momentum_context,
                     "economic_qualified": economic.qualified,
                     "economic_rejection": economic.rejection_reason,
-                    "target_2_net_profit": economic.target_2_net_profit,
+                    "economic_assumed_capital": economic.recommended_capital,
+                    "hypothetical_target_2_net_profit_at_assumed_capital": (
+                        economic.target_2_net_profit
+                    ),
                 }
             candidate_context["deterministic_quality_by_risk_level"] = quality_by_risk_level
 
