@@ -135,6 +135,8 @@ def main():
         )
         alert["underlying_asset"] = snapshot.underlying_asset or snapshot.symbol
         alert["primary_pair"] = snapshot.primary_pair or snapshot.symbol
+        alert["secondary_pair"] = snapshot.secondary_pair
+        alert["primary_quote_currency"] = snapshot.primary_quote_currency
 
         # Deterministic target realism gate. A failure remains internal and is
         # stopped before pending persistence or any Telegram action.
