@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from app.scanner import market_scanner
 from app.scanner.candidates import MAX_CANDIDATES, select_candidates
 from app.scanner.cross_pair_confirmation import (
@@ -20,6 +22,8 @@ from app.scanner.universe import (
 )
 from app.services import chief_alert_notifier, chief_analyst
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.scanner.execution_validation import unavailable_execution
+from app.scanner.market_data_validation import MarketDataValidation
 
 
 def pair(base, quote, *, altname=None):
@@ -32,7 +36,7 @@ def pair(base, quote, *, altname=None):
 
 
 def ticker(last, volume):
-    return {"last": last, "volume_24h": volume}
+    return {"last": last, "bid": last - 0.1, "ask": last + 0.1, "volume_24h": volume}
 
 
 class FakeKraken:
@@ -217,6 +221,18 @@ def test_ticker_returned_under_kraken_altname_is_resolved():
     result = build_kraken_asset_universe(client)
     assert result.assets[0].base_asset == "BTC"
     assert result.assets[0].primary_pair == "BTCUSD"
+    assert result.assets[0].primary_kraken_symbol == "BTC/USD"
+    assert result.assets[0].primary_ticker_last == 50_000
+
+
+def test_doge_lifecycle_normalization_preserves_kraken_public_symbol():
+    result, _ = build(
+        {"XXDGZUSD": pair("DOGE", "USD")},
+        {"XXDGZUSD": ticker(0.2, 1_000)},
+    )
+    assert result.assets[0].base_asset == "DOGE"
+    assert result.assets[0].primary_pair == "DOGEUSD"
+    assert result.assets[0].primary_kraken_symbol == "DOGE/USD"
 
 
 def test_inverse_usdt_conversion_is_normalized():
@@ -308,6 +324,36 @@ def test_cross_pair_states():
     assert evaluate_cross_pair_confirmation(primary, None).status == SINGLE_MARKET
 
 
+def test_cross_pair_price_normalization_and_divergence_context(monkeypatch):
+    primary = snapshot(last_price=150)
+    secondary = snapshot("SOLUSDT", last_price=150.1)
+    monkeypatch.setattr(
+        market_scanner, "analyze_symbol", lambda symbol: ("ok", secondary, None)
+    )
+    market_scanner.confirm_secondary_markets([primary], usdt_usd_rate=0.999)
+    assert primary.cross_pair_price_status == "NORMAL"
+    assert primary.cross_pair_price_divergence_pct == pytest.approx(
+        abs(150.1 * 0.999 - 150) / 150 * 100
+    )
+
+
+def test_cross_pair_price_warning_material_and_missing_conversion(monkeypatch):
+    primary = snapshot(last_price=100)
+    secondary = snapshot("SOLUSDT", last_price=101)
+    monkeypatch.setattr(
+        market_scanner, "analyze_symbol", lambda symbol: ("ok", secondary, None)
+    )
+    market_scanner.confirm_secondary_markets([primary], usdt_usd_rate=1)
+    assert primary.cross_pair_price_status == "WARNING"
+    secondary.last_price = 104
+    market_scanner.confirm_secondary_markets([primary], usdt_usd_rate=1)
+    assert primary.cross_pair_price_status == "MATERIAL_DIVERGENCE"
+    missing = snapshot(last_price=100)
+    market_scanner.confirm_secondary_markets([missing], usdt_usd_rate=None)
+    assert missing.cross_pair_price_divergence_pct is None
+    assert missing.cross_pair_price_status == "UNAVAILABLE"
+
+
 def test_secondary_ohlc_only_for_max_eight_finalists_and_failure_is_safe(monkeypatch):
     snapshots = [
         snapshot(
@@ -380,6 +426,16 @@ def test_scan_analyzes_only_one_primary_pair_per_unique_asset(monkeypatch):
 
 def test_one_underlying_asset_is_one_chief_payload_and_one_api_call(monkeypatch):
     first = snapshot("SOLUSD")
+    first.market_data_validation = MarketDataValidation(
+        status="PASS", qualified=True, warnings=[], rejection_reasons=[],
+        candle_count=200, latest_candle_timestamp=1,
+        latest_candle_age_seconds=10, duplicate_timestamp_count=0,
+        gap_count=0, largest_gap_seconds=0, invalid_ohlc_count=0,
+        non_finite_value_count=0, ticker_last=100,
+        latest_ohlc_close=100, ticker_vs_ohlc_difference_pct=0,
+        suspicious_spike_detected=False,
+    )
+    first.execution_validation = unavailable_execution("test context")
     duplicate = snapshot("SOLUSDT", primary_pair="SOLUSDT")
 
     class Responses:
@@ -408,6 +464,8 @@ def test_one_underlying_asset_is_one_chief_payload_and_one_api_call(monkeypatch)
     assert context["secondary_pair"] == "SOLUSDT"
     assert context["primary_quote_currency"] == "USD"
     assert context["combined_24h_liquidity_usd"] == 260_000_000
+    assert responses.payload["candidates"][0]["market_data_quality"]["status"] == "PASS"
+    assert responses.payload["candidates"][0]["execution_quality"]["status"] == "UNAVAILABLE"
 
 
 def _actionable_plan(symbol):
