@@ -7,12 +7,14 @@ import math
 from app.exchanges.kraken import BookLevel, PreTradeBook, PublicTrade
 
 
-HIGH = "HIGH"
-MEDIUM = "MEDIUM"
-LOW = "LOW"
+VALID = "VALID"
 UNAVAILABLE = "UNAVAILABLE"
 INVALID = "INVALID"
 WARN = "WARN"
+FRESH = "FRESH"
+COMPLETE = "COMPLETE"
+PARTIAL = "PARTIAL"
+INSUFFICIENT = "INSUFFICIENT"
 DEPTH_BANDS_PCT = (0.25, 0.50)
 RECENT_TRADE_WARN_AGE_SECONDS = 300
 RECENT_TRADE_PRICE_WARN_PCT = 2.0
@@ -32,6 +34,7 @@ class FillSimulation:
 @dataclass(frozen=True)
 class ExecutionValidation:
     status: str
+    book_coverage_status: str
     warnings: list[str]
     best_bid: float | None = None
     best_ask: float | None = None
@@ -66,7 +69,11 @@ class ExecutionValidation:
 
 
 def unavailable_execution(reason: str) -> ExecutionValidation:
-    return ExecutionValidation(status=UNAVAILABLE, warnings=[reason])
+    return ExecutionValidation(
+        status=UNAVAILABLE,
+        book_coverage_status=UNAVAILABLE,
+        warnings=[reason],
+    )
 
 
 def _validate_levels(levels: list[BookLevel]) -> bool:
@@ -153,13 +160,13 @@ def _trade_context(
     if trades is None:
         return UNAVAILABLE, None, None, ["recent PostTrade validation unavailable"]
     if not trades:
-        return LOW, None, None, ["PostTrade returned no recent trades"]
+        return WARN, None, None, ["PostTrade returned no recent trades"]
     latest = max(trades, key=lambda trade: trade.trade_timestamp)
     try:
         trade_time = datetime.fromisoformat(latest.trade_timestamp.replace("Z", "+00:00"))
         age = max(0.0, (now - trade_time).total_seconds())
     except ValueError:
-        return LOW, latest.price, None, ["latest trade timestamp is invalid"]
+        return WARN, latest.price, None, ["latest trade timestamp is invalid"]
     warnings: list[str] = []
     if age > RECENT_TRADE_WARN_AGE_SECONDS:
         warnings.append("latest public trade is stale")
@@ -169,7 +176,7 @@ def _trade_context(
     )
     if reference_difference > RECENT_TRADE_PRICE_WARN_PCT:
         warnings.append("latest public trade price disagrees with ticker/book")
-    return WARN if warnings else HIGH, latest.price, age, warnings
+    return WARN if warnings else FRESH, latest.price, age, warnings
 
 
 def evaluate_execution(
@@ -184,7 +191,8 @@ def evaluate_execution(
     warnings: list[str] = []
     if not _validate_levels(book.bids) or not _validate_levels(book.asks):
         return ExecutionValidation(
-            status=INVALID, warnings=["book is empty or contains invalid levels"],
+            status=INVALID, book_coverage_status=UNAVAILABLE,
+            warnings=["book is empty or contains invalid levels"],
             validation_notional_usd=validation_notional_usd,
         )
     bids = sorted(book.bids, key=lambda level: level.price, reverse=True)
@@ -192,7 +200,8 @@ def evaluate_execution(
     best_bid, best_ask = bids[0].price, asks[0].price
     if best_bid >= best_ask:
         return ExecutionValidation(
-            status=INVALID, warnings=["book is crossed or locked"],
+            status=INVALID, book_coverage_status=UNAVAILABLE,
+            warnings=["book is crossed or locked"],
             best_bid=best_bid, best_ask=best_ask,
             validation_notional_usd=validation_notional_usd,
         )
@@ -220,12 +229,15 @@ def evaluate_execution(
         trades, ticker_last, mid, now
     )
     warnings.extend(trade_warnings)
-    if buy.fully_covered and sell.fully_covered:
-        status = HIGH if ask050complete and bid050complete else MEDIUM
+    if not buy.fully_covered or not sell.fully_covered:
+        book_coverage_status = INSUFFICIENT
+    elif ask050complete and bid050complete:
+        book_coverage_status = COMPLETE
     else:
-        status = LOW
+        book_coverage_status = PARTIAL
     return ExecutionValidation(
-        status=status, warnings=warnings, best_bid=best_bid, best_ask=best_ask,
+        status=VALID, book_coverage_status=book_coverage_status,
+        warnings=warnings, best_bid=best_bid, best_ask=best_ask,
         mid_price=mid, absolute_spread=spread, spread_pct=spread_pct,
         spread_bps=spread_bps,
         visible_bid_notional=sum(level.price * level.quantity for level in bids) * quote_to_usd_rate,
