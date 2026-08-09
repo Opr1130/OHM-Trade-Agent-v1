@@ -81,13 +81,6 @@ def _unavailable(api_mode: str, warning: str) -> ReferenceMarketValidation:
     )
 
 
-def _select_match(matches: list[dict[str, Any]]) -> dict[str, Any]:
-    ranked = [item for item in matches if isinstance(item.get("market_cap_rank"), int)]
-    if ranked:
-        return min(ranked, key=lambda item: item["market_cap_rank"])
-    return max(matches, key=lambda item: float(item.get("market_cap") or 0.0))
-
-
 def evaluate_reference_market(
     candidate: MarketSnapshot,
     market_rows: list[dict[str, Any]],
@@ -103,17 +96,6 @@ def evaluate_reference_market(
     ]
     if not matches:
         return _unavailable(api_mode, f"No CoinGecko match for {wanted}")
-    selected = _select_match(matches)
-    mapping_status = AMBIGUOUS if len(matches) > 1 else UNIQUE
-    warnings: list[str] = []
-    if mapping_status == AMBIGUOUS:
-        warnings.append(
-            f"Symbol matched {len(matches)} CoinGecko assets; highest-ranked reference selected"
-        )
-
-    reference_price = selected.get("current_price")
-    if not isinstance(reference_price, (int, float)) or not math.isfinite(reference_price) or reference_price <= 0:
-        return _unavailable(api_mode, "Selected CoinGecko reference has no valid USD price")
     kraken_price = candidate.ticker_last or candidate.last_price
     if candidate.primary_quote_currency == "USDT":
         if usdt_usd_rate is None or usdt_usd_rate <= 0:
@@ -121,6 +103,26 @@ def evaluate_reference_market(
         kraken_price *= usdt_usd_rate
     if not math.isfinite(kraken_price) or kraken_price <= 0:
         return _unavailable(api_mode, "Kraken normalized USD price unavailable")
+
+    if len(matches) > 1:
+        return ReferenceMarketValidation(
+            status=AMBIGUOUS,
+            available=True,
+            mapping_status=AMBIGUOUS,
+            api_mode=api_mode,
+            matched_candidate_count=len(matches),
+            kraken_normalized_price_usd=kraken_price,
+            warnings=(
+                f"{len(matches)} CoinGecko assets share ticker {wanted}; "
+                "no external identity was selected",
+            ),
+        )
+
+    selected = matches[0]
+    warnings: list[str] = []
+    reference_price = selected.get("current_price")
+    if not isinstance(reference_price, (int, float)) or not math.isfinite(reference_price) or reference_price <= 0:
+        return _unavailable(api_mode, "Selected CoinGecko reference has no valid USD price")
 
     absolute_difference = abs(float(reference_price) - kraken_price)
     divergence = absolute_difference / kraken_price * 100
@@ -140,9 +142,7 @@ def evaluate_reference_market(
     if age is None or age > REFERENCE_STALE_SECONDS:
         warnings.append("CoinGecko reference is stale or has unknown age")
 
-    if mapping_status == AMBIGUOUS:
-        status = AMBIGUOUS
-    elif age is None or age > REFERENCE_STALE_SECONDS:
+    if age is None or age > REFERENCE_STALE_SECONDS:
         status = STALE
     elif divergence > REFERENCE_MATERIAL_DIVERGENCE_PCT:
         status = MATERIAL_DIVERGENCE
@@ -153,7 +153,7 @@ def evaluate_reference_market(
     return ReferenceMarketValidation(
         status=status,
         available=True,
-        mapping_status=mapping_status,
+        mapping_status=UNIQUE,
         api_mode=api_mode,
         coingecko_id=str(selected.get("id")) if selected.get("id") else None,
         coingecko_name=str(selected.get("name")) if selected.get("name") else None,
