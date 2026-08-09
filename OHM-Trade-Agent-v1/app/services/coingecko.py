@@ -58,3 +58,24 @@ class CoinGeckoClient:
         if not isinstance(payload, list):
             raise CoinGeckoAPIError("CoinGecko markets response was not a list")
         return [item for item in payload if isinstance(item, dict)]
+
+    def get_global_market(self) -> dict[str, Any]:
+        """Return CoinGecko's independent aggregate market snapshot."""
+        headers = (
+            {"x-cg-demo-api-key": self.api_key}
+            if self.api_key
+            else {}
+        )
+        try:
+            response = httpx.get(
+                f"{COINGECKO_API_BASE}/global",
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise CoinGeckoAPIError("CoinGecko global request failed") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            raise CoinGeckoAPIError("CoinGecko global response was invalid")
+        return payload["data"]

@@ -1,5 +1,7 @@
 from app.core.config import get_settings
 from app.scanner.candidates import select_candidates
+from app.scanner.global_market_context import load_coingecko_global_context
+from app.scanner.market_regime import evaluate_market_regime
 from app.scanner.market_scanner import (
     confirm_secondary_markets,
     deep_validate_candidates,
@@ -7,6 +9,8 @@ from app.scanner.market_scanner import (
 )
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
 from app.scanner.reference_market_validation import validate_finalist_references
+from app.scanner.news_context import validate_finalist_news
+from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import review_candidates
 from app.services.economic_quality_gate import evaluate_economic_quality
@@ -25,6 +29,10 @@ def main():
     # This does NOT increase the eight-candidate Chief shortlist.
     # ---------------------------------------------------------
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
+
+    # Deterministic breadth uses the complete validated Kraken scan. It does
+    # not make another Kraken request and is informational in v1.
+    market_regime = evaluate_market_regime(scan.snapshots)
 
     # ---------------------------------------------------------
     # STEP 2: Local technical screening.
@@ -60,6 +68,21 @@ def main():
     for reason in scan.data_quality_rejections or []:
         print("DATA REJECT:", reason)
     print("Technical shortlist:", len(candidates))
+    print("===== OHM MARKET REGIME =====")
+    print("Sample:", market_regime.sample_size)
+    print("Regime:", market_regime.regime)
+    print(
+        "BreadthScore:",
+        market_regime.breadth_score
+        if market_regime.breadth_score is not None
+        else "N/A",
+    )
+    print("AboveEMA20:", market_regime.pct_above_ema20)
+    print("AboveEMA50:", market_regime.pct_above_ema50)
+    print("AboveEMA200:", market_regime.pct_above_ema200)
+    print("Positive24h:", market_regime.pct_positive_momentum_24h)
+    print("Positive72h:", market_regime.pct_positive_momentum_72h)
+    print("BullishTrend:", market_regime.pct_bullish_trend)
 
     if not candidates:
         print("No technical candidates.")
@@ -152,6 +175,76 @@ def main():
             f"Rank={reference.market_cap_rank if reference.market_cap_rank is not None else 'N/A'}"
         )
 
+    # One optional CoinGecko global request supplements deterministic OHM
+    # breadth. It neither duplicates nor replaces the finalist markets batch.
+    coingecko_global = load_coingecko_global_context(
+        api_key=getattr(settings, "coingecko_api_key", None)
+    )
+    print("CoinGeckoGlobal:", coingecko_global.status)
+    print(
+        "MarketCap24hChange:",
+        coingecko_global.market_cap_change_24h_pct
+        if coingecko_global.market_cap_change_24h_pct is not None
+        else "N/A",
+    )
+    print(
+        "BTCDominance:",
+        coingecko_global.btc_market_cap_percentage
+        if coingecko_global.btc_market_cap_percentage is not None
+        else "N/A",
+    )
+
+    # External finalist evidence remains fail-open and bounded to one provider
+    # batch each. It is context for the existing single Chief comparison.
+    news_summary = validate_finalist_news(
+        candidates,
+        auth_token=getattr(settings, "cryptopanic_auth_token", None),
+        api_plan=getattr(settings, "cryptopanic_api_plan", "developer"),
+    )
+    catalyst_summary = validate_scheduled_catalysts(
+        candidates,
+        api_key=getattr(settings, "coinmarketcal_api_key", None),
+    )
+    print("===== OHM NEWS & CATALYSTS =====")
+    print(
+        "News summary:",
+        f"requested={news_summary.requested}",
+        f"available={news_summary.available}",
+        f"unavailable={news_summary.unavailable}",
+    )
+    print(
+        "Catalyst summary:",
+        f"requested={catalyst_summary.requested}",
+        f"available={catalyst_summary.available}",
+        f"unresolved={catalyst_summary.unresolved}",
+        f"unavailable={catalyst_summary.unavailable}",
+    )
+    for candidate in candidates:
+        news = candidate.news_context
+        catalyst = candidate.scheduled_catalyst_context
+        print(
+            f"NEWS {candidate.symbol}: "
+            f"Status={news.status} "
+            f"Posts24h={news.recent_post_count_24h} "
+            f"Posts6h={news.recent_post_count_6h} "
+            f"LatestAge="
+            f"{news.latest_post_age_seconds if news.latest_post_age_seconds is not None else 'N/A'}s"
+        )
+        nearest = catalyst.nearest_event
+        nearest_display = (
+            nearest.displayed_date
+            if nearest is not None and nearest.is_estimated
+            else nearest.date if nearest is not None else None
+        )
+        print(
+            f"CATALYST {candidate.symbol}: "
+            f"Status={catalyst.status} "
+            f"Mapping={catalyst.mapping_status} "
+            f"Slug={catalyst.coinmarketcal_slug or 'N/A'} "
+            f"Events7d={catalyst.event_count_next_7d} "
+            f"Nearest={nearest_display or 'N/A'}"
+        )
+
     # ---------------------------------------------------------
     # STEP 3: AI Chief review.
     # The Chief compares only the technical shortlist.
@@ -161,6 +254,8 @@ def main():
         settings.openai_model,
         settings.openai_api_key,
         settings.account_equity,
+        market_regime_context=market_regime,
+        coingecko_global_context=coingecko_global,
     )
 
     # ---------------------------------------------------------

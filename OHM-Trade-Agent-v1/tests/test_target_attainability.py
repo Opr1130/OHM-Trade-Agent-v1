@@ -369,8 +369,39 @@ def test_target_quality_failure_suppresses_telegram(monkeypatch):
         unavailable_reference,
     )
     monkeypatch.setattr(
+        scan_opportunities,
+        "load_coingecko_global_context",
+        lambda **kwargs: SimpleNamespace(
+            status="UNAVAILABLE", market_cap_change_24h_pct=None,
+            btc_market_cap_percentage=None,
+        ),
+    )
+    def unavailable_news(candidates, **kwargs):
+        candidates[0].news_context = SimpleNamespace(
+            status="UNAVAILABLE", recent_post_count_24h=0,
+            recent_post_count_6h=0, latest_post_age_seconds=None,
+        )
+        return SimpleNamespace(requested=1, available=0, unavailable=1)
+    monkeypatch.setattr(
+        scan_opportunities, "validate_finalist_news", unavailable_news
+    )
+    def unresolved_catalysts(candidates, **kwargs):
+        candidates[0].scheduled_catalyst_context = SimpleNamespace(
+            status="UNRESOLVED", mapping_status="UNRESOLVED",
+            coinmarketcal_slug=None, event_count_next_7d=0,
+            nearest_event=None,
+        )
+        return SimpleNamespace(
+            requested=1, available=0, unresolved=1, unavailable=0,
+        )
+    monkeypatch.setattr(
+        scan_opportunities,
+        "validate_scheduled_catalysts",
+        unresolved_catalysts,
+    )
+    monkeypatch.setattr(
         scan_opportunities, "review_candidates",
-        lambda *args: {"top_candidates": [{
+        lambda *args, **kwargs: {"top_candidates": [{
             "symbol": weak.symbol, "risk_level": "medium", "confidence": 90,
             "decision": "alert",
         }], "summary": "summary"},
