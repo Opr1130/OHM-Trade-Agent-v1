@@ -1,7 +1,9 @@
-import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
+
+from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 PENDING_FILE = Path("/app/data/pending_setups.json")
@@ -20,35 +22,37 @@ class PendingSetup:
     confidence: int
     status: str = "waiting"
     created_at: str = ""
+    trade_id: str = ""
+    confirmation_price: float | None = None
 
 
 def _load_raw() -> dict:
-    if not PENDING_FILE.exists():
-        return {}
-
-    try:
-        return json.loads(PENDING_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return load_json(PENDING_FILE)
 
 
 def _save_raw(data: dict) -> None:
-    PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PENDING_FILE.write_text(json.dumps(data, indent=2))
+    save_json_atomic(PENDING_FILE, data)
 
 
-def add_pending_setup(setup: PendingSetup) -> None:
-    data = _load_raw()
+def registry_lock_file() -> Path:
+    return PENDING_FILE.parent / ".trade_registry.lock"
 
-    if not setup.created_at:
-        setup.created_at = datetime.now(timezone.utc).isoformat()
 
-    data[setup.symbol] = asdict(setup)
-    _save_raw(data)
+def add_pending_setup(setup: PendingSetup) -> PendingSetup:
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
+        if not setup.created_at:
+            setup.created_at = datetime.now(timezone.utc).isoformat()
+        if not setup.trade_id:
+            setup.trade_id = f"OHM-{setup.symbol.upper()}-{uuid4().hex[:12]}"
+        data[setup.symbol] = asdict(setup)
+        _save_raw(data)
+    return setup
 
 
 def get_pending_setups() -> list[PendingSetup]:
-    data = _load_raw()
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
 
     return [
         PendingSetup(**item)
@@ -57,12 +61,32 @@ def get_pending_setups() -> list[PendingSetup]:
     ]
 
 
+def get_pending_setup_by_trade_id(trade_id: str) -> PendingSetup | None:
+    return next(
+        (setup for setup in get_pending_setups() if setup.trade_id == trade_id),
+        None,
+    )
+
+
+def terminalize_pending_setup(trade_id: str, status: str) -> bool:
+    if status not in {"skipped", "invalidated", "too_extended", "send_failed"}:
+        raise ValueError(f"Unsupported terminal status: {status}")
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
+        for item in data.values():
+            if item.get("trade_id") == trade_id and item.get("status") == "waiting":
+                item["status"] = status
+                item["terminal_at"] = datetime.now(timezone.utc).isoformat()
+                _save_raw(data)
+                return True
+    return False
+
+
 def remove_pending_setup(symbol: str) -> bool:
-    data = _load_raw()
-
-    if symbol not in data:
-        return False
-
-    del data[symbol]
-    _save_raw(data)
-    return True
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
+        if symbol not in data:
+            return False
+        del data[symbol]
+        _save_raw(data)
+        return True

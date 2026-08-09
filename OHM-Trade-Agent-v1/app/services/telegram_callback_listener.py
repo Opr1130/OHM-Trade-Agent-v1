@@ -5,6 +5,8 @@ import time
 import httpx
 
 from app.core.config import get_settings
+from app.services.confirm_entry import confirm_trade_id
+from app.services.pending_setup_registry import terminalize_pending_setup
 from app.services.telegram_notifier import send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,17 @@ def process_callback(update: dict) -> None:
     if callback_data.startswith("trade_filled:"):
         trade_id = callback_data.split(":", 1)[1]
 
+        try:
+            trade = confirm_trade_id(trade_id)
+        except ValueError as exc:
+            if callback_id:
+                answer_callback_query(
+                    settings.telegram_bot_token,
+                    callback_id,
+                    str(exc),
+                )
+            return
+
         logger.info(
             "OHM TRADE CONFIRMED: %s",
             trade_id,
@@ -97,6 +110,7 @@ def process_callback(update: dict) -> None:
             (
                 "✅ OHM TRADE CONFIRMED\n\n"
                 f"Trade ID: {trade_id}\n"
+                f"Symbol: {trade.symbol}\n"
                 "Status: FILLED\n\n"
                 "OHM recorded your confirmation.\n"
                 "Kraken execution is NOT enabled."
@@ -107,6 +121,8 @@ def process_callback(update: dict) -> None:
 
     if callback_data.startswith("trade_skip:"):
         trade_id = callback_data.split(":", 1)[1]
+
+        terminalize_pending_setup(trade_id, "skipped")
 
         logger.info(
             "OHM TRADE SKIPPED: %s",
