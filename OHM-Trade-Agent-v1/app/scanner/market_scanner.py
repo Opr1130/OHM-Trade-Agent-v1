@@ -98,6 +98,45 @@ def _rolling_range_percentiles(
     )
 
 
+def _rolling_upside_excursions(
+    highs: list[float],
+    closes: list[float],
+    hours: int,
+) -> list[float]:
+    """Return fully observed forward favorable excursions for long entries.
+
+    For entry reference close[s], the forward window contains exactly `hours`
+    future candles: highs[s + 1:s + hours + 1]. Incomplete windows at the end
+    are excluded, so N candles produce N - hours observations.
+    """
+    excursions: list[float] = []
+    for start in range(len(closes) - hours):
+        starting_reference = closes[start]
+        if starting_reference <= 0:
+            continue
+        maximum_future_high = max(highs[start + 1:start + hours + 1])
+        excursion_pct = (
+            (maximum_future_high - starting_reference)
+            / starting_reference
+            * 100
+        )
+        excursions.append(max(0.0, excursion_pct))
+    return excursions
+
+
+def _rolling_upside_percentiles(
+    highs: list[float],
+    closes: list[float],
+    hours: int,
+) -> tuple[float, float, float]:
+    excursions = _rolling_upside_excursions(highs, closes, hours)
+    return (
+        _percentile(excursions, 50),
+        _percentile(excursions, 75),
+        _percentile(excursions, 90),
+    )
+
+
 def determine_trend(
     last_price: float,
     ema20: float,
@@ -160,6 +199,12 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
         rolling_72h_percentiles = _rolling_range_percentiles(
             highs, lows, closes, 72
         )
+        rolling_24h_upside = _rolling_upside_percentiles(
+            highs, closes, 24
+        )
+        rolling_72h_upside = _rolling_upside_percentiles(
+            highs, closes, 72
+        )
 
         trend = determine_trend(
             last_price,
@@ -202,6 +247,12 @@ def analyze_symbol(symbol: str) -> tuple[str, MarketSnapshot | None, str | None]
             rolling_72h_range_median_pct=rolling_72h_percentiles[0],
             rolling_72h_range_p75_pct=rolling_72h_percentiles[1],
             rolling_72h_range_p90_pct=rolling_72h_percentiles[2],
+            rolling_24h_upside_median_pct=rolling_24h_upside[0],
+            rolling_24h_upside_p75_pct=rolling_24h_upside[1],
+            rolling_24h_upside_p90_pct=rolling_24h_upside[2],
+            rolling_72h_upside_median_pct=rolling_72h_upside[0],
+            rolling_72h_upside_p75_pct=rolling_72h_upside[1],
+            rolling_72h_upside_p90_pct=rolling_72h_upside[2],
         )
 
         snapshot.technical_score = score_snapshot(snapshot).score
