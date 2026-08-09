@@ -121,11 +121,22 @@ def format_trade_plan(
             "Cannot format non-actionable OHM trade plan"
         )
 
+    quote_note = ""
+    if (
+        candidate.get("primary_quote_currency") == "USDT"
+        and not candidate.get("secondary_pair")
+    ):
+        quote_note = (
+            "Quote: USDT (USDT availability required; no automatic USD "
+            "conversion)\n"
+        )
+
     return (
         f"{headline}\n\n"
         f"{action_text}\n\n"
         f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
         f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
+        f"{quote_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: "
         f"{candidate.get('confidence', 0)}%\n"
