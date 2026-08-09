@@ -53,3 +53,10 @@ class MarketSnapshot:
     rolling_72h_range_median_pct: float = 0.0
     rolling_72h_range_p75_pct: float = 0.0
     rolling_72h_range_p90_pct: float = 0.0
+
+    rolling_24h_upside_median_pct: float = 0.0
+    rolling_24h_upside_p75_pct: float = 0.0
+    rolling_24h_upside_p90_pct: float = 0.0
+    rolling_72h_upside_median_pct: float = 0.0
+    rolling_72h_upside_p75_pct: float = 0.0
+    rolling_72h_upside_p90_pct: float = 0.0
