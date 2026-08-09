@@ -7,9 +7,6 @@ from app.exchanges.kraken import KrakenClient
 
 DEFAULT_UNIQUE_ASSET_LIMIT = 200
 TICKER_BATCH_SIZE = 100
-# Treat liquidity estimates within 0.1% as effectively tied; prefer USD to
-# avoid quote switching caused by insignificant ticker noise.
-PRIMARY_LIQUIDITY_TIE_RELATIVE_TOLERANCE = 0.001
 
 EXCLUDED_BASE_ASSETS = {
     # Stablecoins / tokenized fiat
@@ -209,25 +206,21 @@ def build_kraken_asset_universe(
         if combined <= 0:
             continue
 
-        strongest_notional = max(usd_notional, usdt_usd_notional)
-        effectively_tied = (
-            strongest_notional > 0
-            and abs(usd_notional - usdt_usd_notional) / strongest_notional
-            <= PRIMARY_LIQUIDITY_TIE_RELATIVE_TOLERANCE
-        )
-        # Effective ties prefer USD. Otherwise the stronger USD-equivalent
-        # market becomes primary. This is analysis, not an execution pair.
-        if usd_pair and (
-            usd_notional >= usdt_usd_notional
-            or effectively_tied
-            or not usdt_pair
-        ):
+        # The primary pair is a persistent lifecycle identity, not a liquidity
+        # prize. Pending setups, active trades, callbacks, and monitors all use
+        # the pair symbol as their key, so a ticker-driven USD/USDT flip would
+        # split one underlying asset across two lifecycle records. ACCOUNT_EQUITY
+        # is also USD-denominated. Keep USD canonical whenever it exists; USDT
+        # contributes discovery, liquidity, and later cross-pair confirmation.
+        # A future lifecycle may separate underlying_asset, analysis_pair, and
+        # execution_pair, but that routing redesign is outside Universe v2.
+        if usd_pair:
             primary_pair = str(usd_pair)
             secondary_pair = str(usdt_pair) if usdt_pair else None
             primary_quote = "USD"
         else:
             primary_pair = str(usdt_pair)
-            secondary_pair = str(usd_pair) if usd_pair else None
+            secondary_pair = None
             primary_quote = "USDT"
 
         assets.append(UniverseAsset(
