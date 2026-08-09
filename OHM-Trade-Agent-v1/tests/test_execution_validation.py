@@ -4,7 +4,7 @@ import pytest
 
 from app.exchanges.kraken import BookLevel, PreTradeBook, PublicTrade, KrakenClient
 from app.scanner.execution_validation import (
-    HIGH, INVALID, LOW, MEDIUM, UNAVAILABLE,
+    COMPLETE, FRESH, INSUFFICIENT, INVALID, PARTIAL, UNAVAILABLE, VALID,
     evaluate_execution, simulate_buy, simulate_sell,
 )
 from app.scanner.market_scanner import deep_validate_candidates
@@ -36,7 +36,7 @@ def evaluate(value=None, notional=500, trades=None):
 
 def test_normal_book_spread_and_visible_notionals():
     result = evaluate(trades=[trade()])
-    assert result.status in {HIGH, MEDIUM}
+    assert result.status == VALID
     assert result.best_bid == 99.9
     assert result.best_ask == 100.1
     assert result.spread_bps == pytest.approx(20)
@@ -63,6 +63,7 @@ def test_depth_completeness_for_top_ten_cutoff():
     assert not result.ask_depth_025_complete
     assert not result.bid_depth_050_complete
     assert not result.ask_depth_050_complete
+    assert result.book_coverage_status == PARTIAL
 
 
 def test_depth_complete_when_boundary_is_observed():
@@ -71,6 +72,7 @@ def test_depth_complete_when_boundary_is_observed():
     ))
     assert result.bid_depth_025_complete and result.ask_depth_025_complete
     assert result.bid_depth_050_complete and result.ask_depth_050_complete
+    assert result.book_coverage_status == COMPLETE
 
 
 def test_short_book_is_complete_and_never_extrapolated():
@@ -80,6 +82,7 @@ def test_short_book_is_complete_and_never_extrapolated():
     assert result.visible_ask_notional == pytest.approx(sum(x.price * x.quantity for x in value.asks))
     assert result.buy_visible_coverage_pct < 100
     assert result.buy_vwap is None
+    assert result.book_coverage_status == INSUFFICIENT
 
 
 def test_one_and_multi_level_buy_fill_and_impact():
@@ -124,11 +127,40 @@ def test_round_trip_drag_uses_fully_visible_vwaps():
     assert result.estimated_visible_round_trip_market_drag_pct == pytest.approx((101 - 99) / 101 * 100)
 
 
+def test_wide_spread_with_complete_coverage_has_no_high_quality_label():
+    result = evaluate(book(
+        bids=[BookLevel(80, 100)], asks=[BookLevel(120, 100)]
+    ), notional=1_200)
+    assert result.status == VALID
+    assert result.book_coverage_status == COMPLETE
+    assert result.spread_bps == pytest.approx(4_000)
+    assert "HIGH" not in {result.status, result.book_coverage_status}
+
+
+def test_large_round_trip_drag_with_complete_coverage_is_only_complete():
+    result = evaluate(book(
+        bids=[BookLevel(90, 100)], asks=[BookLevel(110, 100)]
+    ), notional=1_100)
+    assert result.status == VALID
+    assert result.book_coverage_status == COMPLETE
+    assert result.estimated_visible_round_trip_market_drag_pct > 18
+    assert "HIGH" not in {result.status, result.book_coverage_status}
+
+
+def test_insufficient_visible_bids_sets_insufficient_book_coverage():
+    result = evaluate(book(
+        bids=[BookLevel(99.9, 0.1)], asks=[BookLevel(100.1, 100)]
+    ), notional=1_000)
+    assert result.buy_fully_covered
+    assert not result.sell_fully_covered
+    assert result.book_coverage_status == INSUFFICIENT
+
+
 def test_recent_trade_fresh_stale_and_price_anomaly():
     fresh = evaluate(trades=[trade()])
     stale = evaluate(trades=[trade(age=600)])
     anomaly = evaluate(trades=[trade(price=110)])
-    assert fresh.recent_trade_status == HIGH
+    assert fresh.recent_trade_status == FRESH
     assert any("stale" in warning for warning in stale.warnings)
     assert any("disagrees" in warning for warning in anomaly.warnings)
 
@@ -136,7 +168,7 @@ def test_recent_trade_fresh_stale_and_price_anomaly():
 def test_post_trade_unavailable_is_context_not_crash():
     result = evaluate(trades=None)
     assert result.recent_trade_status == UNAVAILABLE
-    assert result.status in {HIGH, MEDIUM}
+    assert result.status == VALID
 
 
 def snapshot(index=0):
@@ -169,6 +201,7 @@ def test_pretrade_failure_is_unavailable_and_posttrade_not_called():
     item = snapshot()
     assert deep_validate_candidates([item], 2_000, 1, Client()) == [item]
     assert item.execution_validation.status == UNAVAILABLE
+    assert item.execution_validation.book_coverage_status == UNAVAILABLE
 
 
 def test_public_client_methods_use_no_credentials(monkeypatch):
