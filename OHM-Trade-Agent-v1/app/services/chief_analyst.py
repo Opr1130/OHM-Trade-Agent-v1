@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import asdict, is_dataclass
 
 from openai import OpenAI
@@ -7,6 +8,7 @@ from app.scanner.models import MarketSnapshot
 from app.scanner.technical_scorer import score_snapshot
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
+from app.services.openai_usage_telemetry import append_usage_record
 from app.services.target_attainability import evaluate_target_attainability
 
 
@@ -101,6 +103,74 @@ Confidence must be 0-100.
 Be conservative.
 """
 
+_ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
+
+
+def _reasoning_effort() -> str:
+    effort = os.getenv("OPENAI_REASONING_EFFORT", "medium").strip().lower()
+    if effort not in _ALLOWED_REASONING_EFFORTS:
+        raise ValueError(
+            "OPENAI_REASONING_EFFORT must be one of: low, medium, high"
+        )
+    return effort
+
+
+def _max_output_tokens() -> int:
+    raw = os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "1200").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("OPENAI_MAX_OUTPUT_TOKENS must be an integer") from exc
+    if value < 256 or value > 4096:
+        raise ValueError("OPENAI_MAX_OUTPUT_TOKENS must be between 256 and 4096")
+    return value
+
+
+def _quality_by_risk_level(
+    candidate: MarketSnapshot,
+    account_equity: float,
+) -> tuple[dict, bool]:
+    quality_by_risk_level: dict = {}
+    deterministically_viable = False
+    for risk_level in ("low", "medium"):
+        plan = build_entry_exit_plan(candidate, risk_level)
+        target_quality = evaluate_target_attainability(plan, candidate)
+        economic = evaluate_economic_quality(plan, account_equity)
+        viable = target_quality.qualified and economic.qualified
+        deterministically_viable = deterministically_viable or viable
+        quality_by_risk_level[risk_level] = {
+            "target_quality_score": target_quality.attainability_score,
+            "target_quality_qualified": target_quality.qualified,
+            "target_quality_warnings": target_quality.warnings,
+            "target_quality_rejections": target_quality.rejection_reasons,
+            "target_2_atr_multiple": target_quality.target_2_atr_multiple,
+            "resistance_clearance_24h_pct": (
+                target_quality.clearance_to_24h_resistance_pct
+            ),
+            "resistance_clearance_72h_pct": (
+                target_quality.clearance_to_72h_resistance_pct
+            ),
+            "momentum_context": target_quality.momentum_context,
+            "economic_qualified": economic.qualified,
+            "economic_rejection": economic.rejection_reason,
+            "economic_assumed_capital": economic.recommended_capital,
+            "hypothetical_target_2_net_profit_at_assumed_capital": (
+                economic.target_2_net_profit
+            ),
+        }
+    return quality_by_risk_level, deterministically_viable
+
+
+def _no_trade_review(reason: str) -> dict:
+    return {
+        "market_view": "",
+        "recommended_action": "no_trade",
+        "top_candidates": [],
+        "summary": reason,
+        "chief_api_skipped": True,
+        "chief_eligible_candidates": 0,
+    }
+
 
 def review_candidates(
     candidates: list[MarketSnapshot],
@@ -110,8 +180,6 @@ def review_candidates(
     market_regime_context: object | None = None,
     coingecko_global_context: object | None = None,
 ) -> dict:
-    client = OpenAI(api_key=api_key)
-
     payload = []
 
     unique_candidates: list[MarketSnapshot] = []
@@ -124,134 +192,136 @@ def review_candidates(
         unique_candidates.append(candidate)
 
     for candidate in unique_candidates:
-        card = score_snapshot(candidate)
-
-        candidate_context = {
-                "symbol": candidate.symbol,
-                "technical_score": candidate.technical_score,
-                "price": candidate.last_price,
-                "trend": candidate.trend,
-                "rsi": round(candidate.rsi, 2),
-                "macd_histogram": round(candidate.macd_histogram, 6),
-                "atr_pct": round(candidate.atr_pct, 3),
-                "volume_ratio": round(candidate.volume_ratio, 2),
-                "strengths": card.strengths,
-                "warnings": card.warnings,
-                "weaknesses": card.weaknesses,
-                "market_data_quality": (
-                    asdict(candidate.market_data_validation)
-                    if is_dataclass(candidate.market_data_validation)
-                    else None
-                ),
-                "execution_evidence": (
-                    asdict(candidate.execution_validation)
-                    if is_dataclass(candidate.execution_validation)
-                    else None
-                ),
-                "independent_market_reference": (
-                    asdict(candidate.independent_market_reference)
-                    if is_dataclass(candidate.independent_market_reference)
-                    else None
-                ),
-                "news_context": (
-                    asdict(candidate.news_context)
-                    if is_dataclass(candidate.news_context)
-                    else None
-                ),
-                "scheduled_catalyst_context": (
-                    asdict(candidate.scheduled_catalyst_context)
-                    if is_dataclass(candidate.scheduled_catalyst_context)
-                    else None
-                ),
-                "liquidity_context": {
-                    "underlying_asset": (
-                        candidate.underlying_asset or candidate.symbol
-                    ),
-                    "primary_pair": candidate.primary_pair or candidate.symbol,
-                    "secondary_pair": candidate.secondary_pair,
-                    "primary_quote_currency": candidate.primary_quote_currency,
-                    "primary_24h_liquidity_usd": round(
-                        candidate.primary_24h_liquidity_usd, 2
-                    ),
-                    "secondary_24h_liquidity_usd": round(
-                        candidate.secondary_24h_liquidity_usd, 2
-                    ),
-                    "combined_24h_liquidity_usd": round(
-                        candidate.combined_24h_liquidity_usd, 2
-                    ),
-                    "liquidity_rank": candidate.liquidity_rank,
-                    "primary_volume_ratio": round(candidate.volume_ratio, 2),
-                    "secondary_volume_ratio": candidate.secondary_volume_ratio,
-                    "cross_pair_confirmation_status": (
-                        candidate.cross_pair_confirmation_status
-                    ),
-                    "cross_pair_strengths": candidate.cross_pair_strengths or [],
-                    "cross_pair_warnings": candidate.cross_pair_warnings or [],
-                    "cross_pair_price_divergence_pct": (
-                        candidate.cross_pair_price_divergence_pct
-                    ),
-                    "cross_pair_price_status": candidate.cross_pair_price_status,
-                },
-                "market_structure": {
-                    "distance_to_24h_high_pct": round(candidate.distance_to_24h_high_pct, 2),
-                    "distance_to_72h_high_pct": round(candidate.distance_to_72h_high_pct, 2),
-                    "momentum_6h_pct": round(candidate.momentum_6h_pct, 2),
-                    "momentum_24h_pct": round(candidate.momentum_24h_pct, 2),
-                    "momentum_72h_pct": round(candidate.momentum_72h_pct, 2),
-                    "realized_range_24h_pct": round(candidate.realized_range_24h_pct, 2),
-                    "realized_range_72h_pct": round(candidate.realized_range_72h_pct, 2),
-                    "rolling_24h_range_percentiles": {
-                        "p50": round(candidate.rolling_24h_range_median_pct, 2),
-                        "p75": round(candidate.rolling_24h_range_p75_pct, 2),
-                        "p90": round(candidate.rolling_24h_range_p90_pct, 2),
-                    },
-                    "rolling_72h_range_percentiles": {
-                        "p50": round(candidate.rolling_72h_range_median_pct, 2),
-                        "p75": round(candidate.rolling_72h_range_p75_pct, 2),
-                        "p90": round(candidate.rolling_72h_range_p90_pct, 2),
-                    },
-                    "rolling_24h_long_upside_percentiles": {
-                        "p50": round(candidate.rolling_24h_upside_median_pct, 2),
-                        "p75": round(candidate.rolling_24h_upside_p75_pct, 2),
-                        "p90": round(candidate.rolling_24h_upside_p90_pct, 2),
-                    },
-                    "rolling_72h_long_upside_percentiles": {
-                        "p50": round(candidate.rolling_72h_upside_median_pct, 2),
-                        "p75": round(candidate.rolling_72h_upside_p75_pct, 2),
-                        "p90": round(candidate.rolling_72h_upside_p90_pct, 2),
-                    },
-                },
-            }
-
+        quality_by_risk_level = None
         if account_equity is not None:
-            quality_by_risk_level = {}
-            for risk_level in ("low", "medium"):
-                plan = build_entry_exit_plan(candidate, risk_level)
-                target_quality = evaluate_target_attainability(plan, candidate)
-                economic = evaluate_economic_quality(plan, account_equity)
-                quality_by_risk_level[risk_level] = {
-                    "target_quality_score": target_quality.attainability_score,
-                    "target_quality_qualified": target_quality.qualified,
-                    "target_quality_warnings": target_quality.warnings,
-                    "target_quality_rejections": target_quality.rejection_reasons,
-                    "target_2_atr_multiple": target_quality.target_2_atr_multiple,
-                    "resistance_clearance_24h_pct": target_quality.clearance_to_24h_resistance_pct,
-                    "resistance_clearance_72h_pct": target_quality.clearance_to_72h_resistance_pct,
-                    "momentum_context": target_quality.momentum_context,
-                    "economic_qualified": economic.qualified,
-                    "economic_rejection": economic.rejection_reason,
-                    "economic_assumed_capital": economic.recommended_capital,
-                    "hypothetical_target_2_net_profit_at_assumed_capital": (
-                        economic.target_2_net_profit
-                    ),
-                }
-            candidate_context["deterministic_quality_by_risk_level"] = quality_by_risk_level
+            quality_by_risk_level, viable = _quality_by_risk_level(
+                candidate, account_equity
+            )
+            if not viable:
+                continue
 
+        card = score_snapshot(candidate)
+        candidate_context = {
+            "symbol": candidate.symbol,
+            "technical_score": candidate.technical_score,
+            "price": candidate.last_price,
+            "trend": candidate.trend,
+            "rsi": round(candidate.rsi, 2),
+            "macd_histogram": round(candidate.macd_histogram, 6),
+            "atr_pct": round(candidate.atr_pct, 3),
+            "volume_ratio": round(candidate.volume_ratio, 2),
+            "strengths": card.strengths,
+            "warnings": card.warnings,
+            "weaknesses": card.weaknesses,
+            "market_data_quality": (
+                asdict(candidate.market_data_validation)
+                if is_dataclass(candidate.market_data_validation)
+                else None
+            ),
+            "execution_evidence": (
+                asdict(candidate.execution_validation)
+                if is_dataclass(candidate.execution_validation)
+                else None
+            ),
+            "independent_market_reference": (
+                asdict(candidate.independent_market_reference)
+                if is_dataclass(candidate.independent_market_reference)
+                else None
+            ),
+            "news_context": (
+                asdict(candidate.news_context)
+                if is_dataclass(candidate.news_context)
+                else None
+            ),
+            "scheduled_catalyst_context": (
+                asdict(candidate.scheduled_catalyst_context)
+                if is_dataclass(candidate.scheduled_catalyst_context)
+                else None
+            ),
+            "liquidity_context": {
+                "underlying_asset": candidate.underlying_asset or candidate.symbol,
+                "primary_pair": candidate.primary_pair or candidate.symbol,
+                "secondary_pair": candidate.secondary_pair,
+                "primary_quote_currency": candidate.primary_quote_currency,
+                "primary_24h_liquidity_usd": round(
+                    candidate.primary_24h_liquidity_usd, 2
+                ),
+                "secondary_24h_liquidity_usd": round(
+                    candidate.secondary_24h_liquidity_usd, 2
+                ),
+                "combined_24h_liquidity_usd": round(
+                    candidate.combined_24h_liquidity_usd, 2
+                ),
+                "liquidity_rank": candidate.liquidity_rank,
+                "primary_volume_ratio": round(candidate.volume_ratio, 2),
+                "secondary_volume_ratio": candidate.secondary_volume_ratio,
+                "cross_pair_confirmation_status": (
+                    candidate.cross_pair_confirmation_status
+                ),
+                "cross_pair_strengths": candidate.cross_pair_strengths or [],
+                "cross_pair_warnings": candidate.cross_pair_warnings or [],
+                "cross_pair_price_divergence_pct": (
+                    candidate.cross_pair_price_divergence_pct
+                ),
+                "cross_pair_price_status": candidate.cross_pair_price_status,
+            },
+            "market_structure": {
+                "distance_to_24h_high_pct": round(
+                    candidate.distance_to_24h_high_pct, 2
+                ),
+                "distance_to_72h_high_pct": round(
+                    candidate.distance_to_72h_high_pct, 2
+                ),
+                "momentum_6h_pct": round(candidate.momentum_6h_pct, 2),
+                "momentum_24h_pct": round(candidate.momentum_24h_pct, 2),
+                "momentum_72h_pct": round(candidate.momentum_72h_pct, 2),
+                "realized_range_24h_pct": round(
+                    candidate.realized_range_24h_pct, 2
+                ),
+                "realized_range_72h_pct": round(
+                    candidate.realized_range_72h_pct, 2
+                ),
+                "rolling_24h_range_percentiles": {
+                    "p50": round(candidate.rolling_24h_range_median_pct, 2),
+                    "p75": round(candidate.rolling_24h_range_p75_pct, 2),
+                    "p90": round(candidate.rolling_24h_range_p90_pct, 2),
+                },
+                "rolling_72h_range_percentiles": {
+                    "p50": round(candidate.rolling_72h_range_median_pct, 2),
+                    "p75": round(candidate.rolling_72h_range_p75_pct, 2),
+                    "p90": round(candidate.rolling_72h_range_p90_pct, 2),
+                },
+                "rolling_24h_long_upside_percentiles": {
+                    "p50": round(candidate.rolling_24h_upside_median_pct, 2),
+                    "p75": round(candidate.rolling_24h_upside_p75_pct, 2),
+                    "p90": round(candidate.rolling_24h_upside_p90_pct, 2),
+                },
+                "rolling_72h_long_upside_percentiles": {
+                    "p50": round(candidate.rolling_72h_upside_median_pct, 2),
+                    "p75": round(candidate.rolling_72h_upside_p75_pct, 2),
+                    "p90": round(candidate.rolling_72h_upside_p90_pct, 2),
+                },
+            },
+        }
+        if quality_by_risk_level is not None:
+            candidate_context["deterministic_quality_by_risk_level"] = (
+                quality_by_risk_level
+            )
         payload.append(candidate_context)
 
+    if account_equity is not None and not payload:
+        return _no_trade_review(
+            "Chief API skipped: no finalist can pass both deterministic target "
+            "and economic gates under low or medium risk."
+        )
+
+    effort = _reasoning_effort()
+    max_output_tokens = _max_output_tokens()
+    client = OpenAI(api_key=api_key)
     response = client.responses.create(
         model=model,
-        reasoning={"effort": "medium"},
+        reasoning={"effort": effort},
+        max_output_tokens=max_output_tokens,
         input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -278,4 +348,26 @@ def review_candidates(
         ],
     )
 
-    return json.loads(response.output_text)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        record = append_usage_record(
+            model=model,
+            reasoning_effort=effort,
+            candidate_count=len(payload),
+            usage=usage,
+        )
+        print(
+            "OPENAI USAGE "
+            f"Model={record['model']} "
+            f"Candidates={record['candidate_count']} "
+            f"Input={record['input_tokens']} "
+            f"Cached={record['cached_input_tokens']} "
+            f"Output={record['output_tokens']} "
+            f"Reasoning={record['reasoning_tokens']} "
+            f"Total={record['total_tokens']}"
+        )
+
+    review = json.loads(response.output_text)
+    review["chief_api_skipped"] = False
+    review["chief_eligible_candidates"] = len(payload)
+    return review
