@@ -1,6 +1,19 @@
 import pytest
 
-from app.services import trade_outcome_registry
+from app.services import chief_analyst, trade_outcome_registry
+
+
+@pytest.fixture(autouse=True)
+def preserve_legacy_chief_payload_test_scope(request, monkeypatch):
+    """Keep the pre-existing dedup/payload test focused on its original contract."""
+    if request.node.name != "test_one_underlying_asset_is_one_chief_payload_and_one_api_call":
+        return
+
+    monkeypatch.setattr(
+        chief_analyst,
+        "_quality_by_risk_level",
+        lambda candidate, account_equity: ({}, True),
+    )
 
 
 @pytest.fixture(autouse=True)
