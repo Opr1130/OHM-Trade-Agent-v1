@@ -234,20 +234,45 @@ def _ranking_key(
     )
 
 
+def _attach_outcome_metadata(
+    opportunity: QualifiedOpportunity,
+) -> None:
+    """Expose already-computed facts for later outcome capture; no new scoring."""
+    opportunity.alert.setdefault(
+        "technical_score", opportunity.snapshot.technical_score
+    )
+    opportunity.alert.setdefault(
+        "target_attainability_score",
+        opportunity.target_quality.attainability_score,
+    )
+    opportunity.alert.setdefault(
+        "target_quality_qualified", opportunity.target_quality.qualified
+    )
+    opportunity.alert.setdefault(
+        "economic_qualified", opportunity.economic_quality.qualified
+    )
+    opportunity.alert.setdefault(
+        "economic_target_2_move_pct",
+        opportunity.economic_quality.target_2_move_pct,
+    )
+    opportunity.alert.setdefault(
+        "economic_validation_net_t2",
+        opportunity.economic_quality.target_2_net_profit,
+    )
+
+
 def rank_profit_opportunities(
     opportunities: list[QualifiedOpportunity],
 ) -> list[RankedOpportunity]:
-    scored = [
-        (
-            opportunity,
-            evaluate_profit_ranking(
-                opportunity.snapshot,
-                opportunity.target_quality,
-                opportunity.economic_quality,
-            ),
+    scored = []
+    for opportunity in opportunities:
+        _attach_outcome_metadata(opportunity)
+        result = evaluate_profit_ranking(
+            opportunity.snapshot,
+            opportunity.target_quality,
+            opportunity.economic_quality,
         )
-        for opportunity in opportunities
-    ]
+        scored.append((opportunity, result))
     scored.sort(key=lambda item: _ranking_key(item[0], item[1]))
     return [
         RankedOpportunity(rank=index, opportunity=opportunity, profit_ranking=result)

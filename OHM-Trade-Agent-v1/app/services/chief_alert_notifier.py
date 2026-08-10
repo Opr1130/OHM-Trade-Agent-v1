@@ -6,12 +6,14 @@ from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
+    get_pending_setups,
     terminalize_pending_setup,
 )
 from app.services.telegram_notifier import (
     build_trade_confirmation_buttons,
     send_telegram_message,
 )
+from app.services.trade_outcome_registry import record_recommendation
 
 
 STATE_FILE = Path("/app/data/alert_state.json")
@@ -191,10 +193,6 @@ def should_send_trade_plan(
 ) -> bool:
     action = _action_type(plan)
 
-    #
-    # REJECT / WATCH / ordinary WAIT conditions
-    # never reach Telegram.
-    #
     if action is None:
         return False
 
@@ -212,6 +210,13 @@ def should_send_trade_plan(
     return current_key != previous_key
 
 
+def _existing_setup_trade_id(symbol: str) -> str | None:
+    for pending in get_pending_setups():
+        if pending.symbol == symbol:
+            return pending.trade_id or None
+    return None
+
+
 def send_trade_plan(
     candidate: dict[str, Any],
     plan: EntryExitPlan,
@@ -222,9 +227,6 @@ def send_trade_plan(
 
     action = _action_type(plan)
 
-    #
-    # Silent means silent.
-    #
     if action is None:
         return False
 
@@ -240,14 +242,8 @@ def send_trade_plan(
         summary=summary,
     )
 
-    #
-    # ENTER NOW uses the already-tested Telegram confirmation
-    # buttons.
-    #
-    # PLACE LIMIT will get its own "LIMIT PLACED" button in
-    # the next upgrade to the callback listener.
-    #
     reply_markup = None
+    setup = None
 
     if action == "ENTER_NOW":
         setup = add_pending_setup(
@@ -264,11 +260,27 @@ def send_trade_plan(
                 confirmation_price=plan.entry_high,
             )
         )
+        candidate["trade_id"] = setup.trade_id
         reply_markup = (
             build_trade_confirmation_buttons(
                 setup.trade_id
             )
         )
+
+    trade_id = (
+        setup.trade_id
+        if setup is not None
+        else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+    )
+    if trade_id:
+        candidate["trade_id"] = trade_id
+
+    record_recommendation(
+        trade_id=trade_id,
+        candidate=candidate,
+        plan=plan,
+        action=action,
+    )
 
     sent = send_telegram_message(
         bot_token,
@@ -289,7 +301,7 @@ def send_trade_plan(
 
         _save_state(state)
 
-    elif action == "ENTER_NOW":
+    elif action == "ENTER_NOW" and setup is not None:
         terminalize_pending_setup(setup.trade_id, "send_failed")
 
     return sent

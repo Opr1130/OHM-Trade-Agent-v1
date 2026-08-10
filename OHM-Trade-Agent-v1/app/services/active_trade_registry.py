@@ -64,11 +64,27 @@ def get_active_trades() -> list[ActiveTrade]:
 
 
 def close_trade(symbol: str) -> bool:
+    trade_id = ""
+    closed = False
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         if symbol not in data:
             return False
-        data[symbol]["status"] = "closed"
-        data[symbol]["closed_at"] = datetime.now(timezone.utc).isoformat()
+        item = data[symbol]
+        if item.get("status") == "closed":
+            return True
+        trade_id = str(item.get("trade_id") or "")
+        item["status"] = "closed"
+        item["closed_at"] = datetime.now(timezone.utc).isoformat()
         _save_raw(data)
-        return True
+        closed = True
+    if closed:
+        from app.services.trade_outcome_registry import terminalize_active_outcome
+
+        terminalize_active_outcome(
+            trade_id=trade_id or None,
+            symbol=symbol,
+            status="closed",
+            reason="active_registry_closed",
+        )
+    return closed

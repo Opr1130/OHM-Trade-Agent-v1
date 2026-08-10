@@ -71,6 +71,7 @@ def get_pending_setup_by_trade_id(trade_id: str) -> PendingSetup | None:
 def terminalize_pending_setup(trade_id: str, status: str) -> bool:
     if status not in {"skipped", "invalidated", "too_extended", "send_failed"}:
         raise ValueError(f"Unsupported terminal status: {status}")
+    terminalized = False
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         for item in data.values():
@@ -78,8 +79,13 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
                 item["status"] = status
                 item["terminal_at"] = datetime.now(timezone.utc).isoformat()
                 _save_raw(data)
-                return True
-    return False
+                terminalized = True
+                break
+    if terminalized:
+        from app.services.trade_outcome_registry import terminalize_setup_outcome
+
+        terminalize_setup_outcome(trade_id, status)
+    return terminalized
 
 
 def remove_pending_setup(symbol: str) -> bool:
