@@ -17,58 +17,74 @@ class TradeMonitorResult:
 def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     client = KrakenClient()
     candles = client.get_ohlc(trade.symbol, interval=60)
-
     closes = [c.close for c in candles]
     volumes = [c.volume for c in candles]
-
     current_price = closes[-1]
     ema20_value = ema(closes, 20)
     rsi_value = rsi(closes, 14)
     macd_line, macd_signal, _ = macd(closes)
     vol_ratio = volume_ratio(volumes, 20)
+    direction = (trade.direction or "LONG").upper()
 
-    unrealized_pct = (
-        (current_price - trade.entry_price) / trade.entry_price
-    ) * 100
-
+    raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
+    unrealized_pct = -raw_move if direction == "SHORT" else raw_move
     reasons: list[str] = []
     action = "HOLD"
 
-    if current_price <= trade.stop_price:
-        action = "EXIT_NOW"
-        reasons.append("Stop price breached")
-
-    elif current_price >= trade.target_2:
-        action = "TAKE_PROFIT"
-        reasons.append("Target 2 reached")
-
-    elif current_price >= trade.target_1:
-        action = "TAKE_PROFIT"
-        reasons.append("Target 1 reached")
-
-    if current_price < ema20_value:
-        reasons.append("Price lost EMA20")
-
-        if action == "HOLD":
-            action = "WARNING"
-
-    if macd_line < macd_signal:
-        reasons.append("MACD turned bearish")
-
-        if action == "HOLD":
-            action = "WARNING"
-
-    if rsi_value < 40:
-        reasons.append("RSI momentum weakened")
-
-        if action == "HOLD":
-            action = "WARNING"
-
-    if vol_ratio >= 1.8 and current_price < trade.entry_price:
-        reasons.append("Heavy selling volume detected")
-
-        if action in {"HOLD", "WARNING"}:
+    if direction == "SHORT":
+        if current_price >= trade.stop_price:
             action = "EXIT_NOW"
+            reasons.append("Short stop price breached")
+        elif current_price <= trade.target_2:
+            action = "TAKE_PROFIT"
+            reasons.append("Short Target 2 reached")
+        elif current_price <= trade.target_1:
+            action = "TAKE_PROFIT"
+            reasons.append("Short Target 1 reached")
+
+        if current_price > ema20_value:
+            reasons.append("Price reclaimed EMA20 against short")
+            if action == "HOLD":
+                action = "WARNING"
+        if macd_line > macd_signal:
+            reasons.append("MACD turned bullish against short")
+            if action == "HOLD":
+                action = "WARNING"
+        if rsi_value > 60:
+            reasons.append("RSI momentum strengthened against short")
+            if action == "HOLD":
+                action = "WARNING"
+        if vol_ratio >= 1.8 and current_price > trade.entry_price:
+            reasons.append("Heavy buying volume detected against short")
+            if action in {"HOLD", "WARNING"}:
+                action = "EXIT_NOW"
+    else:
+        if current_price <= trade.stop_price:
+            action = "EXIT_NOW"
+            reasons.append("Stop price breached")
+        elif current_price >= trade.target_2:
+            action = "TAKE_PROFIT"
+            reasons.append("Target 2 reached")
+        elif current_price >= trade.target_1:
+            action = "TAKE_PROFIT"
+            reasons.append("Target 1 reached")
+
+        if current_price < ema20_value:
+            reasons.append("Price lost EMA20")
+            if action == "HOLD":
+                action = "WARNING"
+        if macd_line < macd_signal:
+            reasons.append("MACD turned bearish")
+            if action == "HOLD":
+                action = "WARNING"
+        if rsi_value < 40:
+            reasons.append("RSI momentum weakened")
+            if action == "HOLD":
+                action = "WARNING"
+        if vol_ratio >= 1.8 and current_price < trade.entry_price:
+            reasons.append("Heavy selling volume detected")
+            if action in {"HOLD", "WARNING"}:
+                action = "EXIT_NOW"
 
     if not reasons:
         reasons.append("Trade structure remains healthy")
