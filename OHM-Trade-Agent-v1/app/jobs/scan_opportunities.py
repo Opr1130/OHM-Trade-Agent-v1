@@ -32,6 +32,11 @@ from app.services.short_target_attainability import evaluate_short_target_attain
 from app.services.target_attainability import evaluate_target_attainability
 
 
+# Backwards-compatible test/extension seam. Production default is the new mixed
+# directional selector; existing callers that patch select_candidates still work.
+select_candidates = select_directional_candidates
+
+
 def _direction_counts(candidates):
     return (
         sum(c.trade_direction == "LONG" for c in candidates),
@@ -62,7 +67,7 @@ def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     market_regime = evaluate_market_regime(scan.snapshots)
-    candidates = select_directional_candidates(scan.snapshots)
+    candidates = select_candidates(scan.snapshots)
 
     print("OHM AI Opportunity Scan")
     if scan.universe is not None:
@@ -108,11 +113,9 @@ def main():
         print("No technical candidates.")
         return
 
-    # One free public pair-discovery call. Shorts cannot progress unless Kraken's
-    # US retail margin venue says the pair is tradeable.
     margin_summary = validate_short_margin_eligibility(
         candidates,
-        account_leverage_ceiling=3.0,
+        account_leverage_ceiling=getattr(settings, "max_margin_leverage", 3.0),
     )
     print("===== OHM SHORT MARGIN ELIGIBILITY =====")
     print(
@@ -241,7 +244,6 @@ def main():
         f"unavailable={catalyst_summary.unavailable}",
     )
 
-    # Cost invariant: LONG and SHORT opportunities share the same single Chief call.
     review = review_candidates(
         candidates,
         settings.openai_model,
@@ -274,7 +276,11 @@ def main():
             print("Snapshot missing for:", alert["symbol"], direction)
             continue
 
-        plan = build_entry_exit_plan(snapshot, alert["risk_level"], direction=direction)
+        plan = (
+            build_entry_exit_plan(snapshot, alert["risk_level"], direction="SHORT")
+            if direction == "SHORT"
+            else build_entry_exit_plan(snapshot, alert["risk_level"])
+        )
         alert["direction"] = direction
         alert["technical_score"] = snapshot.technical_score
         alert["underlying_asset"] = snapshot.underlying_asset or snapshot.symbol
@@ -317,8 +323,8 @@ def main():
             f"T1={economic.target_1_move_pct:.2f}% T2={economic.target_2_move_pct:.2f}% "
             f"Net@T2=${economic.target_2_net_profit:.2f} "
             f"R/R={plan.reward_to_risk_2:.2f}:1 "
-            f"Leverage={economic.leverage:.1f}x "
-            f"AccountRiskAtStop={economic.account_risk_at_stop_pct:.2f}%"
+            f"Leverage={getattr(economic, 'leverage', 1.0):.1f}x "
+            f"AccountRiskAtStop={getattr(economic, 'account_risk_at_stop_pct', 0.0):.2f}%"
         )
 
         alert["target_attainability_score"] = target_quality.attainability_score
