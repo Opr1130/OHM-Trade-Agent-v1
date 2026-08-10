@@ -19,6 +19,8 @@ class ActiveTrade:
     status: str = "active"
     opened_at: str = ""
     trade_id: str = ""
+    direction: str = "LONG"
+    margin_leverage: float = 1.0
 
 
 def _load_raw() -> dict:
@@ -33,7 +35,15 @@ def registry_lock_file() -> Path:
     return TRADE_FILE.parent / ".trade_registry.lock"
 
 
+def _from_item(item: dict) -> ActiveTrade:
+    normalized = dict(item)
+    normalized.setdefault("direction", "LONG")
+    normalized.setdefault("margin_leverage", 1.0)
+    return ActiveTrade(**normalized)
+
+
 def add_trade(trade: ActiveTrade) -> None:
+    trade.direction = (trade.direction or "LONG").upper()
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         if not trade.opened_at:
@@ -45,19 +55,14 @@ def add_trade(trade: ActiveTrade) -> None:
 def get_trade(symbol: str) -> ActiveTrade | None:
     with registry_lock(registry_lock_file()):
         item = _load_raw().get(symbol)
-
-    if not item:
-        return None
-
-    return ActiveTrade(**item)
+    return _from_item(item) if item else None
 
 
 def get_active_trades() -> list[ActiveTrade]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-
     return [
-        ActiveTrade(**item)
+        _from_item(item)
         for item in data.values()
         if item.get("status") == "active"
     ]
@@ -80,7 +85,6 @@ def close_trade(symbol: str) -> bool:
         closed = True
     if closed:
         from app.services.trade_outcome_registry import terminalize_active_outcome
-
         terminalize_active_outcome(
             trade_id=trade_id or None,
             symbol=symbol,

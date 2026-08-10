@@ -9,12 +9,21 @@ from app.services.trade_outcome_registry import mark_trade_entered
 
 
 def _validate_fill(setup: PendingSetup, actual_fill_price: float) -> None:
-    if actual_fill_price > setup.chase_limit:
-        raise ValueError(
-            f"Fill {actual_fill_price} is above chase limit {setup.chase_limit}"
-        )
-    if actual_fill_price <= setup.stop_price:
-        raise ValueError("Fill price is already at or below the setup stop")
+    direction = (setup.direction or "LONG").upper()
+    if direction == "SHORT":
+        if actual_fill_price < setup.chase_limit:
+            raise ValueError(
+                f"Fill {actual_fill_price} is below short chase limit {setup.chase_limit}"
+            )
+        if actual_fill_price >= setup.stop_price:
+            raise ValueError("Short fill price is already at or above the setup stop")
+    else:
+        if actual_fill_price > setup.chase_limit:
+            raise ValueError(
+                f"Fill {actual_fill_price} is above chase limit {setup.chase_limit}"
+            )
+        if actual_fill_price <= setup.stop_price:
+            raise ValueError("Fill price is already at or below the setup stop")
 
 
 def _transition_to_active(
@@ -38,7 +47,7 @@ def _transition_to_active(
         if trade_id:
             existing_trade = next(
                 (
-                    ActiveTrade(**item)
+                    active_trade_registry._from_item(item)
                     for item in active.values()
                     if item.get("trade_id") == trade_id
                 ),
@@ -62,7 +71,10 @@ def _transition_to_active(
                 identifier = trade_id or symbol
                 raise ValueError(f"No confirmable pending setup found for {identifier}")
 
-            setup = PendingSetup(**setup_item)
+            normalized_setup = dict(setup_item)
+            normalized_setup.setdefault("direction", "LONG")
+            normalized_setup.setdefault("margin_leverage", 1.0)
+            setup = PendingSetup(**normalized_setup)
             fill_price = actual_fill_price
             if fill_price is None:
                 fill_price = setup.confirmation_price
@@ -79,10 +91,11 @@ def _transition_to_active(
                 risk_level=setup.risk_level,
                 opened_at=datetime.now(timezone.utc).isoformat(),
                 trade_id=setup.trade_id,
+                direction=setup.direction,
+                margin_leverage=setup.margin_leverage,
             )
             active[created_trade.symbol] = asdict(created_trade)
             active_trade_registry._save_raw(active)
-
             pending.pop(setup.symbol, None)
             pending_setup_registry._save_raw(pending)
 

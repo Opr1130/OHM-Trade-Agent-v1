@@ -51,6 +51,8 @@ class MarketSnapshot:
 
     distance_to_24h_high_pct: float = 0.0
     distance_to_72h_high_pct: float = 0.0
+    distance_to_24h_low_pct: float = 0.0
+    distance_to_72h_low_pct: float = 0.0
 
     realized_range_24h_pct: float = 0.0
     realized_range_72h_pct: float = 0.0
@@ -70,6 +72,17 @@ class MarketSnapshot:
     rolling_72h_upside_median_pct: float = 0.0
     rolling_72h_upside_p75_pct: float = 0.0
     rolling_72h_upside_p90_pct: float = 0.0
+
+    rolling_24h_downside_median_pct: float = 0.0
+    rolling_24h_downside_p75_pct: float = 0.0
+    rolling_24h_downside_p90_pct: float = 0.0
+    rolling_72h_downside_median_pct: float = 0.0
+    rolling_72h_downside_p75_pct: float = 0.0
+    rolling_72h_downside_p90_pct: float = 0.0
+
+    # LONG is the backwards-compatible default. Short-list candidates are
+    # cloned with SHORT and a direction-specific technical score.
+    trade_direction: str = "LONG"
 
     underlying_asset: str = ""
     primary_pair: str = ""
@@ -95,3 +108,11 @@ class MarketSnapshot:
     independent_market_reference: ReferenceMarketValidation | None = None
     news_context: NewsContext | None = None
     scheduled_catalyst_context: ScheduledCatalystContext | None = None
+
+    # US retail margin evidence. These fields are informational/advisory only;
+    # no automatic Kraken order is placed by v1.
+    margin_eligible: bool = False
+    margin_venue_symbol: str | None = None
+    margin_max_leverage: float | None = None
+    margin_validation_status: str = "NOT_REQUIRED"
+    margin_warnings: list[str] | None = None

@@ -62,6 +62,7 @@ class ExecutionValidation:
     buy_fully_covered: bool = False
     sell_fully_covered: bool = False
     estimated_visible_round_trip_market_drag_pct: float | None = None
+    estimated_visible_short_round_trip_market_drag_pct: float | None = None
     recent_trade_status: str = UNAVAILABLE
     latest_trade_price: float | None = None
     latest_trade_age_seconds: float | None = None
@@ -123,6 +124,32 @@ def simulate_buy(
     return FillSimulation(
         quantity, spent, vwap if covered else None, impact, cost_mid,
         min(100.0, spent / notional * 100) if notional > 0 else 0.0, covered,
+    )
+
+
+def simulate_buy_quantity(
+    asks: list[BookLevel],
+    quantity: float,
+    mid: float,
+) -> FillSimulation:
+    """Simulate buying an exact base quantity, used to cover a short."""
+    remaining = quantity
+    bought = 0.0
+    spent = 0.0
+    for level in asks:
+        consumed = min(remaining, level.quantity)
+        bought += consumed
+        spent += consumed * level.price
+        remaining -= consumed
+        if remaining <= 1e-12:
+            break
+    covered = remaining <= 1e-12
+    vwap = spent / bought if bought > 0 else None
+    impact = ((vwap / asks[0].price) - 1) * 100 if covered and vwap else None
+    cost_mid = ((vwap / mid) - 1) * 100 if covered and vwap else None
+    return FillSimulation(
+        bought, spent, vwap if covered else None, impact, cost_mid,
+        min(100.0, bought / quantity * 100) if quantity > 0 else 0.0, covered,
     )
 
 
@@ -215,6 +242,8 @@ def evaluate_execution(
     ask050, ask050complete = _depth(asks, mid, 0.50, "ask")
 
     quote_notional = validation_notional_usd / quote_to_usd_rate
+
+    # Existing LONG path: spend a fixed quote notional, then sell the acquired base.
     buy = simulate_buy(asks, quote_notional, mid)
     sell = simulate_sell(bids, buy.filled_quantity, mid)
     if not buy.fully_covered:
@@ -224,6 +253,22 @@ def evaluate_execution(
     drag = None
     if buy.fully_covered and sell.fully_covered and buy.vwap and sell.vwap:
         drag = (buy.vwap - sell.vwap) / buy.vwap * 100
+
+    # SHORT path: sell a base quantity worth the requested notional at mid, then
+    # buy back that exact quantity. This avoids treating the long buy-first path
+    # as a proxy for short execution quality.
+    short_quantity = quote_notional / mid if mid > 0 else 0.0
+    short_sell = simulate_sell(bids, short_quantity, mid)
+    short_cover = simulate_buy_quantity(asks, short_sell.filled_quantity, mid)
+    short_drag = None
+    if (
+        short_sell.fully_covered
+        and short_cover.fully_covered
+        and short_sell.filled_notional > 0
+    ):
+        short_drag = (
+            short_cover.filled_notional - short_sell.filled_notional
+        ) / short_sell.filled_notional * 100
 
     trade_status, trade_price, trade_age, trade_warnings = _trade_context(
         trades, ticker_last, mid, now
@@ -258,6 +303,7 @@ def evaluate_execution(
         sell_visible_coverage_pct=sell.visible_coverage_pct,
         buy_fully_covered=buy.fully_covered, sell_fully_covered=sell.fully_covered,
         estimated_visible_round_trip_market_drag_pct=drag,
+        estimated_visible_short_round_trip_market_drag_pct=short_drag,
         recent_trade_status=trade_status, latest_trade_price=trade_price,
         latest_trade_age_seconds=trade_age,
         recent_trade_count=len(trades) if trades is not None else 0,

@@ -1,6 +1,18 @@
 import pytest
 
+from app.jobs import scan_opportunities
 from app.services import chief_analyst, trade_outcome_registry
+
+
+@pytest.fixture(autouse=True)
+def preserve_legacy_candidate_selector_test_scope(monkeypatch):
+    """Let legacy tests patch select_candidates while production uses directional selection."""
+    scan_opportunities.select_candidates = scan_opportunities.select_directional_candidates
+    monkeypatch.setattr(
+        scan_opportunities,
+        "select_directional_candidates",
+        lambda items: scan_opportunities.select_candidates(items),
+    )
 
 
 @pytest.fixture(autouse=True)

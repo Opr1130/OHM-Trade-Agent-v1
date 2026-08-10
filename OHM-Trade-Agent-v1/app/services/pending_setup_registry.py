@@ -24,6 +24,8 @@ class PendingSetup:
     created_at: str = ""
     trade_id: str = ""
     confirmation_price: float | None = None
+    direction: str = "LONG"
+    margin_leverage: float = 1.0
 
 
 def _load_raw() -> dict:
@@ -39,6 +41,7 @@ def registry_lock_file() -> Path:
 
 
 def add_pending_setup(setup: PendingSetup) -> PendingSetup:
+    setup.direction = (setup.direction or "LONG").upper()
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         if not setup.created_at:
@@ -50,22 +53,25 @@ def add_pending_setup(setup: PendingSetup) -> PendingSetup:
     return setup
 
 
+def _from_item(item: dict) -> PendingSetup:
+    normalized = dict(item)
+    normalized.setdefault("direction", "LONG")
+    normalized.setdefault("margin_leverage", 1.0)
+    return PendingSetup(**normalized)
+
+
 def get_pending_setups() -> list[PendingSetup]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-
     return [
-        PendingSetup(**item)
+        _from_item(item)
         for item in data.values()
         if item.get("status") == "waiting"
     ]
 
 
 def get_pending_setup_by_trade_id(trade_id: str) -> PendingSetup | None:
-    return next(
-        (setup for setup in get_pending_setups() if setup.trade_id == trade_id),
-        None,
-    )
+    return next((setup for setup in get_pending_setups() if setup.trade_id == trade_id), None)
 
 
 def terminalize_pending_setup(trade_id: str, status: str) -> bool:
@@ -83,7 +89,6 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
                 break
     if terminalized:
         from app.services.trade_outcome_registry import terminalize_setup_outcome
-
         terminalize_setup_outcome(trade_id, status)
     return terminalized
 

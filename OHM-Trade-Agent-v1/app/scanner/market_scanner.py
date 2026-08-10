@@ -59,11 +59,6 @@ def _window_metrics(
     closes: list[float],
     hours: int,
 ) -> tuple[float, float, float, float]:
-    """Return high, low, total range %, and mean hourly range %.
-
-    Range percentages use the latest close as a stable common denominator.
-    Hourly range is averaged after normalizing each candle by its close.
-    """
     window_highs = highs[-hours:]
     window_lows = lows[-hours:]
     window_closes = closes[-hours:]
@@ -75,12 +70,10 @@ def _window_metrics(
         (high - low) / close * 100 if close > 0 else 0.0
         for high, low, close in zip(window_highs, window_lows, window_closes)
     ]
-    average_hourly_range_pct = sum(hourly_ranges) / len(hourly_ranges)
-    return recent_high, recent_low, realized_range_pct, average_hourly_range_pct
+    return recent_high, recent_low, realized_range_pct, sum(hourly_ranges) / len(hourly_ranges)
 
 
 def _percentile(values: list[float], percentile: float) -> float:
-    """Return a deterministic linearly interpolated percentile."""
     if not values:
         return 0.0
     if not 0 <= percentile <= 100:
@@ -90,23 +83,12 @@ def _percentile(values: list[float], percentile: float) -> float:
     lower_index = int(position)
     upper_index = min(lower_index + 1, len(ordered) - 1)
     fraction = position - lower_index
-    return ordered[lower_index] + (
-        ordered[upper_index] - ordered[lower_index]
-    ) * fraction
+    return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
 
 
 def _rolling_range_percentiles(
-    highs: list[float],
-    lows: list[float],
-    closes: list[float],
-    hours: int,
+    highs: list[float], lows: list[float], closes: list[float], hours: int
 ) -> tuple[float, float, float]:
-    """Calculate p50/p75/p90 of overlapping rolling high-low ranges.
-
-    Each window is normalized by its ending close so assets with different
-    prices remain comparable. With 200 candles this yields 177 observations
-    for 24h windows and 129 observations for 72h windows.
-    """
     ranges: list[float] = []
     for end in range(hours - 1, len(closes)):
         start = end - hours + 1
@@ -115,64 +97,55 @@ def _rolling_range_percentiles(
             continue
         window_range = max(highs[start:end + 1]) - min(lows[start:end + 1])
         ranges.append(window_range / ending_close * 100)
-    return (
-        _percentile(ranges, 50),
-        _percentile(ranges, 75),
-        _percentile(ranges, 90),
-    )
+    return (_percentile(ranges, 50), _percentile(ranges, 75), _percentile(ranges, 90))
 
 
 def _rolling_upside_excursions(
-    highs: list[float],
-    closes: list[float],
-    hours: int,
+    highs: list[float], closes: list[float], hours: int
 ) -> list[float]:
-    """Return fully observed forward favorable excursions for long entries.
-
-    For entry reference close[s], the forward window contains exactly `hours`
-    future candles: highs[s + 1:s + hours + 1]. Incomplete windows at the end
-    are excluded, so N candles produce N - hours observations.
-    """
     excursions: list[float] = []
     for start in range(len(closes) - hours):
-        starting_reference = closes[start]
-        if starting_reference <= 0:
+        reference = closes[start]
+        if reference <= 0:
             continue
         maximum_future_high = max(highs[start + 1:start + hours + 1])
-        excursion_pct = (
-            (maximum_future_high - starting_reference)
-            / starting_reference
-            * 100
-        )
-        excursions.append(max(0.0, excursion_pct))
+        excursions.append(max(0.0, (maximum_future_high - reference) / reference * 100))
     return excursions
 
 
 def _rolling_upside_percentiles(
-    highs: list[float],
-    closes: list[float],
-    hours: int,
+    highs: list[float], closes: list[float], hours: int
 ) -> tuple[float, float, float]:
-    excursions = _rolling_upside_excursions(highs, closes, hours)
-    return (
-        _percentile(excursions, 50),
-        _percentile(excursions, 75),
-        _percentile(excursions, 90),
-    )
+    values = _rolling_upside_excursions(highs, closes, hours)
+    return (_percentile(values, 50), _percentile(values, 75), _percentile(values, 90))
 
 
-def determine_trend(
-    last_price: float,
-    ema20: float,
-    ema50: float,
-    ema200: float,
-) -> str:
+def _rolling_downside_excursions(
+    lows: list[float], closes: list[float], hours: int
+) -> list[float]:
+    """Fully observed favorable excursions for hypothetical short entries."""
+    excursions: list[float] = []
+    for start in range(len(closes) - hours):
+        reference = closes[start]
+        if reference <= 0:
+            continue
+        minimum_future_low = min(lows[start + 1:start + hours + 1])
+        excursions.append(max(0.0, (reference - minimum_future_low) / reference * 100))
+    return excursions
+
+
+def _rolling_downside_percentiles(
+    lows: list[float], closes: list[float], hours: int
+) -> tuple[float, float, float]:
+    values = _rolling_downside_excursions(lows, closes, hours)
+    return (_percentile(values, 50), _percentile(values, 75), _percentile(values, 90))
+
+
+def determine_trend(last_price: float, ema20: float, ema50: float, ema200: float) -> str:
     if last_price > ema20 > ema50 > ema200:
         return "bullish"
-
     if last_price < ema20 < ema50 < ema200:
         return "bearish"
-
     return "neutral"
 
 
@@ -181,74 +154,39 @@ def analyze_symbol(
     universe_asset: UniverseAsset | None = None,
 ) -> tuple[str, MarketSnapshot | None, str | None]:
     client = KrakenClient()
-
     try:
         candles = client.get_ohlc(symbol, interval=60)
-
         if len(candles) < MIN_CANDLES_REQUIRED:
-            return (
-                "skip",
-                None,
-                f"{symbol}: insufficient history ({len(candles)} candles)",
-            )
+            return "skip", None, f"{symbol}: insufficient history ({len(candles)} candles)"
 
-        ticker_last = (
-            universe_asset.primary_ticker_last if universe_asset else None
-        )
+        ticker_last = universe_asset.primary_ticker_last if universe_asset else None
         data_validation = validate_market_data(candles, ticker_last, interval_minutes=60)
         if not data_validation.qualified:
-            return (
-                "data_reject", None,
-                f"{symbol}: {'; '.join(data_validation.rejection_reasons)}",
-            )
+            return "data_reject", None, f"{symbol}: {'; '.join(data_validation.rejection_reasons)}"
 
-        closes = [candle.close for candle in candles]
-        highs = [candle.high for candle in candles]
-        lows = [candle.low for candle in candles]
-        volumes = [candle.volume for candle in candles]
-
+        closes = [c.close for c in candles]
+        highs = [c.high for c in candles]
+        lows = [c.low for c in candles]
+        volumes = [c.volume for c in candles]
         last_price = closes[-1]
         ema20_value = ema(closes, 20)
         ema50_value = ema(closes, 50)
         ema200_value = ema(closes, 200)
         rsi_value = rsi(closes, 14)
-
         macd_line, macd_signal, macd_histogram = macd(closes)
         atr_value = atr(highs, lows, closes, 14)
         atr_pct = (atr_value / last_price) * 100
         volume_value = volume_ratio(volumes, 20)
 
-        (
-            recent_24h_high,
-            recent_24h_low,
-            realized_range_24h_pct,
-            average_hourly_range_24h_pct,
-        ) = _window_metrics(highs, lows, closes, 24)
-        (
-            recent_72h_high,
-            recent_72h_low,
-            realized_range_72h_pct,
-            average_hourly_range_72h_pct,
-        ) = _window_metrics(highs, lows, closes, 72)
-        rolling_24h_percentiles = _rolling_range_percentiles(
-            highs, lows, closes, 24
-        )
-        rolling_72h_percentiles = _rolling_range_percentiles(
-            highs, lows, closes, 72
-        )
-        rolling_24h_upside = _rolling_upside_percentiles(
-            highs, closes, 24
-        )
-        rolling_72h_upside = _rolling_upside_percentiles(
-            highs, closes, 72
-        )
-
-        trend = determine_trend(
-            last_price,
-            ema20_value,
-            ema50_value,
-            ema200_value,
-        )
+        recent_24h_high, recent_24h_low, realized_range_24h_pct, avg_hourly_24 = _window_metrics(highs, lows, closes, 24)
+        recent_72h_high, recent_72h_low, realized_range_72h_pct, avg_hourly_72 = _window_metrics(highs, lows, closes, 72)
+        rolling_24h_percentiles = _rolling_range_percentiles(highs, lows, closes, 24)
+        rolling_72h_percentiles = _rolling_range_percentiles(highs, lows, closes, 72)
+        rolling_24h_upside = _rolling_upside_percentiles(highs, closes, 24)
+        rolling_72h_upside = _rolling_upside_percentiles(highs, closes, 72)
+        rolling_24h_downside = _rolling_downside_percentiles(lows, closes, 24)
+        rolling_72h_downside = _rolling_downside_percentiles(lows, closes, 72)
+        trend = determine_trend(last_price, ema20_value, ema50_value, ema200_value)
 
         snapshot = MarketSnapshot(
             symbol=symbol,
@@ -274,10 +212,12 @@ def analyze_symbol(
             momentum_72h_pct=_percentage_change(last_price, closes[-73]),
             distance_to_24h_high_pct=(recent_24h_high - last_price) / last_price * 100,
             distance_to_72h_high_pct=(recent_72h_high - last_price) / last_price * 100,
+            distance_to_24h_low_pct=(last_price - recent_24h_low) / last_price * 100,
+            distance_to_72h_low_pct=(last_price - recent_72h_low) / last_price * 100,
             realized_range_24h_pct=realized_range_24h_pct,
             realized_range_72h_pct=realized_range_72h_pct,
-            average_hourly_range_24h_pct=average_hourly_range_24h_pct,
-            average_hourly_range_72h_pct=average_hourly_range_72h_pct,
+            average_hourly_range_24h_pct=avg_hourly_24,
+            average_hourly_range_72h_pct=avg_hourly_72,
             rolling_24h_range_median_pct=rolling_24h_percentiles[0],
             rolling_24h_range_p75_pct=rolling_24h_percentiles[1],
             rolling_24h_range_p90_pct=rolling_24h_percentiles[2],
@@ -290,31 +230,29 @@ def analyze_symbol(
             rolling_72h_upside_median_pct=rolling_72h_upside[0],
             rolling_72h_upside_p75_pct=rolling_72h_upside[1],
             rolling_72h_upside_p90_pct=rolling_72h_upside[2],
+            rolling_24h_downside_median_pct=rolling_24h_downside[0],
+            rolling_24h_downside_p75_pct=rolling_24h_downside[1],
+            rolling_24h_downside_p90_pct=rolling_24h_downside[2],
+            rolling_72h_downside_median_pct=rolling_72h_downside[0],
+            rolling_72h_downside_p75_pct=rolling_72h_downside[1],
+            rolling_72h_downside_p90_pct=rolling_72h_downside[2],
             market_data_validation=data_validation,
         )
 
         if universe_asset is not None:
             if universe_asset.primary_quote_currency == "USD":
                 primary_liquidity = universe_asset.usd_24h_notional_usd
-                secondary_liquidity = (
-                    universe_asset.usdt_24h_notional_usd_equivalent
-                )
+                secondary_liquidity = universe_asset.usdt_24h_notional_usd_equivalent
             else:
-                primary_liquidity = (
-                    universe_asset.usdt_24h_notional_usd_equivalent
-                )
+                primary_liquidity = universe_asset.usdt_24h_notional_usd_equivalent
                 secondary_liquidity = universe_asset.usd_24h_notional_usd
             snapshot.underlying_asset = universe_asset.base_asset
             snapshot.primary_pair = universe_asset.primary_pair
             snapshot.secondary_pair = universe_asset.secondary_pair
-            snapshot.primary_quote_currency = (
-                universe_asset.primary_quote_currency
-            )
+            snapshot.primary_quote_currency = universe_asset.primary_quote_currency
             snapshot.primary_24h_liquidity_usd = primary_liquidity
             snapshot.secondary_24h_liquidity_usd = secondary_liquidity
-            snapshot.combined_24h_liquidity_usd = (
-                universe_asset.combined_24h_notional_usd
-            )
+            snapshot.combined_24h_liquidity_usd = universe_asset.combined_24h_notional_usd
             snapshot.liquidity_rank = universe_asset.liquidity_rank
             snapshot.kraken_public_symbol = universe_asset.primary_kraken_symbol
             snapshot.ticker_last = universe_asset.primary_ticker_last
@@ -322,22 +260,14 @@ def analyze_symbol(
             snapshot.ticker_ask = universe_asset.primary_ticker_ask
 
         snapshot.technical_score = score_snapshot(snapshot).score
-
         return "ok", snapshot, None
-
     except Exception as exc:
         return "fail", None, f"{symbol}: {exc}"
 
 
-def scan_market(
-    limit: int = DEFAULT_UNIQUE_ASSET_LIMIT,
-) -> ScanResult:
+def scan_market(limit: int = DEFAULT_UNIQUE_ASSET_LIMIT) -> ScanResult:
     universe_client = KrakenClient()
-    universe = build_kraken_asset_universe(
-        client=universe_client,
-        limit=limit,
-    )
-
+    universe = build_kraken_asset_universe(client=universe_client, limit=limit)
     snapshots: list[MarketSnapshot] = []
     skips: list[str] = []
     failures: list[str] = []
@@ -345,17 +275,11 @@ def scan_market(
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(
-                analyze_symbol,
-                asset.primary_pair,
-                asset,
-            ): asset.primary_pair
+            executor.submit(analyze_symbol, asset.primary_pair, asset): asset.primary_pair
             for asset in universe.assets
         }
-
         for future in as_completed(futures):
             status, snapshot, message = future.result()
-
             if status == "ok" and snapshot is not None:
                 snapshots.append(snapshot)
             elif status == "skip" and message:
@@ -365,11 +289,7 @@ def scan_market(
             elif status == "fail" and message:
                 failures.append(message)
 
-    snapshots.sort(
-        key=lambda item: item.technical_score,
-        reverse=True,
-    )
-
+    snapshots.sort(key=lambda item: item.technical_score, reverse=True)
     return ScanResult(
         snapshots=snapshots,
         requested=len(universe.assets),
@@ -393,10 +313,7 @@ def confirm_secondary_markets(
     candidates: list[MarketSnapshot],
     usdt_usd_rate: float | None = None,
 ) -> SecondaryConfirmationSummary:
-    """Fetch secondary OHLC only for shortlisted assets that have one."""
-    requested_candidates = [
-        candidate for candidate in candidates if candidate.secondary_pair
-    ]
+    requested_candidates = [candidate for candidate in candidates if candidate.secondary_pair]
     for candidate in candidates:
         if not candidate.secondary_pair:
             result = evaluate_cross_pair_confirmation(candidate, None)
@@ -429,27 +346,19 @@ def confirm_secondary_markets(
             candidate.cross_pair_warnings = result.warnings
             if secondary is not None and usdt_usd_rate is not None:
                 normalized_secondary = secondary.last_price * usdt_usd_rate
-                divergence = abs(
-                    normalized_secondary - candidate.last_price
-                ) / candidate.last_price * 100
+                divergence = abs(normalized_secondary - candidate.last_price) / candidate.last_price * 100
                 candidate.cross_pair_price_divergence_pct = divergence
                 if divergence <= 0.50:
                     candidate.cross_pair_price_status = "NORMAL"
                 elif divergence <= 2.00:
                     candidate.cross_pair_price_status = "WARNING"
-                    candidate.cross_pair_warnings.append(
-                        "Normalized USD/USDT prices differ by more than 0.50%"
-                    )
+                    candidate.cross_pair_warnings.append("Normalized USD/USDT prices differ by more than 0.50%")
                 else:
                     candidate.cross_pair_price_status = "MATERIAL_DIVERGENCE"
-                    candidate.cross_pair_warnings.append(
-                        "Normalized USD/USDT prices differ by more than 2.00%"
-                    )
+                    candidate.cross_pair_warnings.append("Normalized USD/USDT prices differ by more than 2.00%")
 
     return SecondaryConfirmationSummary(
-        requested=len(requested_candidates),
-        analyzed=analyzed,
-        failed=failed,
+        requested=len(requested_candidates), analyzed=analyzed, failed=failed
     )
 
 
@@ -459,7 +368,6 @@ def deep_validate_candidates(
     usdt_usd_rate: float | None,
     client: KrakenClient | None = None,
 ) -> list[MarketSnapshot]:
-    """Attach public book/trade evidence to at most the eight finalists."""
     client = client or KrakenClient()
     validated: list[MarketSnapshot] = []
     for candidate in candidates[:8]:
@@ -467,9 +375,7 @@ def deep_validate_candidates(
         try:
             book = client.get_pre_trade(symbol)
         except Exception as exc:
-            candidate.execution_validation = unavailable_execution(
-                f"PreTrade unavailable: {exc}"
-            )
+            candidate.execution_validation = unavailable_execution(f"PreTrade unavailable: {exc}")
             validated.append(candidate)
             continue
         try:

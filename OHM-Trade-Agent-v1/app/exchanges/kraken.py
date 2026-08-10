@@ -63,43 +63,35 @@ class KrakenClient:
             raise KrakenAPIError(f"Kraken request failed: {exc}") from exc
 
         payload = response.json()
-
         errors = payload.get("error", [])
         if errors:
             raise KrakenAPIError(f"Kraken API error: {', '.join(errors)}")
-
         result = payload.get("result")
         if not isinstance(result, dict):
             raise KrakenAPIError("Kraken response did not contain a valid result")
-
         return result
 
-    def get_asset_pairs(self) -> dict[str, dict[str, Any]]:
-        """Return all online Kraken spot trading pairs."""
-        result = self._get("AssetPairs", {})
-
+    def get_asset_pairs(
+        self,
+        execution_venue: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return online Kraken pairs, optionally scoped to an execution venue."""
+        params: dict[str, Any] = {}
+        if execution_venue:
+            params["execution_venue"] = execution_venue
+        result = self._get("AssetPairs", params)
         return {
             pair_id: details
             for pair_id, details in result.items()
             if isinstance(details, dict)
-            and details.get("status") == "online"
+            and details.get("status", "online") == "online"
         }
 
-    def get_tickers(
-        self,
-        pairs: list[str],
-    ) -> dict[str, dict[str, float]]:
-        """Return ticker data for multiple Kraken pairs."""
+    def get_tickers(self, pairs: list[str]) -> dict[str, dict[str, float]]:
         if not pairs:
             return {}
-
-        result = self._get(
-            "Ticker",
-            {"pair": ",".join(pairs)},
-        )
-
+        result = self._get("Ticker", {"pair": ",".join(pairs)})
         tickers: dict[str, dict[str, float]] = {}
-
         for pair_name, ticker in result.items():
             tickers[pair_name] = {
                 "ask": float(ticker["a"][0]),
@@ -112,17 +104,13 @@ class KrakenClient:
                 "low_today": float(ticker["l"][0]),
                 "low_24h": float(ticker["l"][1]),
             }
-
         return tickers
 
     def get_ticker(self, pair: str) -> dict[str, float]:
         result = self._get("Ticker", {"pair": pair})
-
         if not result:
             raise KrakenAPIError(f"No ticker data returned for {pair}")
-
         ticker = next(iter(result.values()))
-
         return {
             "ask": float(ticker["a"][0]),
             "bid": float(ticker["b"][0]),
@@ -135,46 +123,24 @@ class KrakenClient:
             "low_24h": float(ticker["l"][1]),
         }
 
-    def get_ohlc(
-        self,
-        pair: str,
-        interval: int = 60,
-        since: int | None = None,
-    ) -> list[Candle]:
-        params: dict[str, Any] = {
-            "pair": pair,
-            "interval": interval,
-        }
-
+    def get_ohlc(self, pair: str, interval: int = 60, since: int | None = None) -> list[Candle]:
+        params: dict[str, Any] = {"pair": pair, "interval": interval}
         if since is not None:
             params["since"] = since
-
         result = self._get("OHLC", params)
         candle_key = next((key for key in result if key != "last"), None)
-
         if candle_key is None:
             raise KrakenAPIError(f"No OHLC data returned for {pair}")
-
-        candles: list[Candle] = []
-
-        for row in result[candle_key]:
-            candles.append(
-                Candle(
-                    timestamp=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    vwap=float(row[5]),
-                    volume=float(row[6]),
-                    trade_count=int(row[7]),
-                )
+        return [
+            Candle(
+                timestamp=int(row[0]), open=float(row[1]), high=float(row[2]),
+                low=float(row[3]), close=float(row[4]), vwap=float(row[5]),
+                volume=float(row[6]), trade_count=int(row[7]),
             )
-
-        return candles
+            for row in result[candle_key]
+        ]
 
     def get_pre_trade(self, symbol: str) -> PreTradeBook:
-        """Return Kraken's public top-10 aggregated transparency book."""
         result = self._get("PreTrade", {"symbol": symbol})
         return PreTradeBook(
             symbol=str(result.get("symbol", symbol)),
@@ -190,12 +156,7 @@ class KrakenClient:
             publication_timestamp=item.get("publication_ts"),
         )
 
-    def get_post_trade(
-        self,
-        symbol: str,
-        count: int = 100,
-    ) -> list[PublicTrade]:
-        """Return bounded recent public spot trades without authentication."""
+    def get_post_trade(self, symbol: str, count: int = 100) -> list[PublicTrade]:
         result = self._get("PostTrade", {"symbol": symbol, "count": count})
         return [
             PublicTrade(
