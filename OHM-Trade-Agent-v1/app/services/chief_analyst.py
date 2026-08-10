@@ -84,8 +84,6 @@ def _quality_by_risk_level(
     viable_any = False
     direction = candidate.trade_direction.upper()
     for risk_level in ("low", "medium"):
-        # Preserve the exact legacy LONG call shape so existing test doubles and
-        # the long-only cost-control path remain untouched.
         plan = (
             build_entry_exit_plan(candidate, risk_level, direction="SHORT")
             if direction == "SHORT"
@@ -119,8 +117,10 @@ def _quality_by_risk_level(
             "economic_qualified": economic.qualified,
             "economic_rejection": economic.rejection_reason,
             "economic_assumed_capital": economic.recommended_capital,
-            "economic_validation_leverage": economic.leverage,
-            "economic_account_risk_at_stop_pct": economic.account_risk_at_stop_pct,
+            "economic_validation_leverage": getattr(economic, "leverage", 1.0),
+            "economic_account_risk_at_stop_pct": getattr(
+                economic, "account_risk_at_stop_pct", 0.0
+            ),
             "hypothetical_target_2_net_profit_at_assumed_capital": economic.target_2_net_profit,
         }
     return quality_by_risk_level, viable_any
