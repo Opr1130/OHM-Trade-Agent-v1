@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = Field(default=1.0, gt=0, le=5)
     max_open_trades: int = Field(default=2, ge=1, le=10)
 
+    # Margin Intelligence v1 is advisory/manual only. The configured ceiling
+    # mirrors what the account is permitted to use, while validation remains
+    # conservatively fixed at 2x until outcome data justifies anything else.
+    max_margin_leverage: float = Field(default=3.0, ge=2.0, le=3.0)
+
 
 @lru_cache
 def get_settings() -> Settings:
