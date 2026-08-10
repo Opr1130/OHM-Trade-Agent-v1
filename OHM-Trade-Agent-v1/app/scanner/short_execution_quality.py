@@ -1,4 +1,4 @@
-from app.scanner.execution_validation import FRESH, PARTIAL, COMPLETE
+from app.scanner.execution_validation import COMPLETE, FRESH, PARTIAL
 from app.scanner.models import MarketSnapshot
 
 
@@ -25,9 +25,9 @@ def short_execution_is_tradeable(candidate: MarketSnapshot) -> tuple[bool, list[
         reasons.append("Buyback coverage is below 99%")
     if execution.spread_bps is None or execution.spread_bps > MAX_SHORT_SPREAD_BPS:
         reasons.append("Spread exceeds short quality limit")
-    drag = execution.estimated_visible_round_trip_market_drag_pct
+    drag = execution.estimated_visible_short_round_trip_market_drag_pct
     if drag is None or drag > MAX_SHORT_ROUND_TRIP_DRAG_PCT:
-        reasons.append("Round-trip visible market drag exceeds short quality limit")
+        reasons.append("Short sell-then-buyback market drag exceeds quality limit")
     if execution.recent_trade_status != FRESH:
         reasons.append("Recent public trade evidence is not fresh")
     return not reasons, reasons
