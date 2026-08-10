@@ -28,7 +28,7 @@ Target-quality scores are deterministic opportunity-quality scores, not probabil
 
 Kraken market-data and execution values are deterministic evidence. PreTrade contains only the top 10 aggregated levels; incomplete depth is partial observed liquidity, never zero liquidity. SHORT entry depends on bid-side sellability and eventual cover depends on ask-side buyback liquidity. Never convert execution coverage into probability.
 
-CoinGecko is independent aggregated reference evidence, not an execution venue. AMBIGUOUS means OHM selected no external identity and no price/divergence conclusion may be drawn. UNAVAILABLE is missing evidence, not automatic rejection. News/catalyst evidence can be missing or unresolved and is never a substitute for safe identity matching.
+CoinGecko is independent aggregated reference evidence, not an execution venue. AMBIGUOUS means OHM selected no external identity and no price/divergence conclusion may be drawn. UNAVAILABLE is missing evidence, not automatic rejection. CryptoPanic news is associated only after identity-safe structured instrument matching; ticker-only attribution is refused. News/catalyst evidence can be missing or unresolved and is never a substitute for safe identity matching.
 
 Market regime is deterministic breadth context, not a probability. RISK_OFF is caution for longs and context for shorts, not an automatic direction signal. Economic assumed capital is validation capital, not allocation advice.
 
@@ -84,7 +84,13 @@ def _quality_by_risk_level(
     viable_any = False
     direction = candidate.trade_direction.upper()
     for risk_level in ("low", "medium"):
-        plan = build_entry_exit_plan(candidate, risk_level, direction=direction)
+        # Preserve the exact legacy LONG call shape so existing test doubles and
+        # the long-only cost-control path remain untouched.
+        plan = (
+            build_entry_exit_plan(candidate, risk_level, direction="SHORT")
+            if direction == "SHORT"
+            else build_entry_exit_plan(candidate, risk_level)
+        )
         if direction == "SHORT":
             target = evaluate_short_target_attainability(plan, candidate)
             economic = evaluate_economic_quality(
