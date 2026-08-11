@@ -56,6 +56,7 @@ def _normalize(item: dict) -> OrderIntent:
     normalized.setdefault("filled_at", None)
     normalized.setdefault("cancelled_at", None)
     normalized.setdefault("actual_entry_fee", None)
+    normalized.pop("fill_price", None)
     return OrderIntent(**normalized)
 
 
@@ -161,6 +162,8 @@ def mark_order_filled(
 ) -> ActiveTrade:
     if fill_price <= 0:
         raise ValueError("fill_price must be positive")
+    if actual_entry_fee is not None and actual_entry_fee < 0:
+        raise ValueError("actual_entry_fee cannot be negative")
     with registry_lock(LOCK_FILE):
         data = _load()
         if trade_id not in data:
@@ -188,6 +191,8 @@ def mark_order_filled(
         trade_id=intent.trade_id,
         direction=intent.direction,
         margin_leverage=intent.margin_leverage,
+        capital=intent.capital,
+        actual_entry_fee=actual_entry_fee,
     )
     add_trade(trade)
     from app.services.trade_outcome_registry import mark_trade_entered
