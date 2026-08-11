@@ -21,6 +21,13 @@ class ActiveTrade:
     trade_id: str = ""
     direction: str = "LONG"
     margin_leverage: float = 1.0
+    capital: float | None = None
+    actual_entry_fee: float | None = None
+    actual_exit_fee: float | None = None
+    financing_fee: float = 0.0
+    closed_at: str | None = None
+    close_price: float | None = None
+    close_reason: str | None = None
 
 
 def _load_raw() -> dict:
@@ -39,6 +46,13 @@ def _from_item(item: dict) -> ActiveTrade:
     normalized = dict(item)
     normalized.setdefault("direction", "LONG")
     normalized.setdefault("margin_leverage", 1.0)
+    normalized.setdefault("capital", None)
+    normalized.setdefault("actual_entry_fee", None)
+    normalized.setdefault("actual_exit_fee", None)
+    normalized.setdefault("financing_fee", 0.0)
+    normalized.setdefault("closed_at", None)
+    normalized.setdefault("close_price", None)
+    normalized.setdefault("close_reason", None)
     return ActiveTrade(**normalized)
 
 
@@ -61,16 +75,20 @@ def get_trade(symbol: str) -> ActiveTrade | None:
 def get_active_trades() -> list[ActiveTrade]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-    return [
-        _from_item(item)
-        for item in data.values()
-        if item.get("status") == "active"
-    ]
+    return [_from_item(item) for item in data.values() if item.get("status") == "active"]
 
 
-def close_trade(symbol: str) -> bool:
+def close_trade(
+    symbol: str,
+    *,
+    close_price: float | None = None,
+    actual_exit_fee: float | None = None,
+    financing_fee: float | None = None,
+    reason: str = "manual_close",
+) -> bool:
     trade_id = ""
     closed = False
+    final_price = close_price
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         if symbol not in data:
@@ -81,6 +99,19 @@ def close_trade(symbol: str) -> bool:
         trade_id = str(item.get("trade_id") or "")
         item["status"] = "closed"
         item["closed_at"] = datetime.now(timezone.utc).isoformat()
+        item["close_reason"] = reason
+        if close_price is not None:
+            if close_price <= 0:
+                raise ValueError("close_price must be positive")
+            item["close_price"] = close_price
+        if actual_exit_fee is not None:
+            if actual_exit_fee < 0:
+                raise ValueError("actual_exit_fee cannot be negative")
+            item["actual_exit_fee"] = actual_exit_fee
+        if financing_fee is not None:
+            if financing_fee < 0:
+                raise ValueError("financing_fee cannot be negative")
+            item["financing_fee"] = financing_fee
         _save_raw(data)
         closed = True
     if closed:
@@ -89,6 +120,7 @@ def close_trade(symbol: str) -> bool:
             trade_id=trade_id or None,
             symbol=symbol,
             status="closed",
-            reason="active_registry_closed",
+            reason=reason,
+            final_price=final_price,
         )
     return closed
