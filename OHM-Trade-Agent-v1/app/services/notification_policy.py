@@ -39,15 +39,20 @@ def should_emit(
     now = now or _now()
     event_type = event_type.upper()
     key = f"{identity}:{event_type}"
-    with registry_lock(LOCK_FILE):
-        state = load_json(STATE_FILE)
-        previous = state.get(key, {})
-        if previous.get("fingerprint") == fingerprint:
-            return False
-        last_at = _parse(previous.get("sent_at"))
-        if event_type not in CRITICAL_EVENTS and last_at is not None:
-            if (now - last_at).total_seconds() < cooldown_seconds:
+    try:
+        with registry_lock(LOCK_FILE):
+            state = load_json(STATE_FILE)
+            previous = state.get(key, {})
+            if previous.get("fingerprint") == fingerprint:
                 return False
+            last_at = _parse(previous.get("sent_at"))
+            if event_type not in CRITICAL_EVENTS and last_at is not None:
+                if (now - last_at).total_seconds() < cooldown_seconds:
+                    return False
+    except OSError:
+        # Dedup persistence must never prevent a legitimate alert. Production
+        # has a writable /app/data volume; tests/read-only recovery modes may not.
+        return True
     return True
 
 
@@ -60,7 +65,12 @@ def record_emitted(
 ) -> None:
     now = now or _now()
     key = f"{identity}:{event_type.upper()}"
-    with registry_lock(LOCK_FILE):
-        state = load_json(STATE_FILE)
-        state[key] = {"fingerprint": fingerprint, "sent_at": now.isoformat()}
-        save_json_atomic(STATE_FILE, state)
+    try:
+        with registry_lock(LOCK_FILE):
+            state = load_json(STATE_FILE)
+            state[key] = {"fingerprint": fingerprint, "sent_at": now.isoformat()}
+            save_json_atomic(STATE_FILE, state)
+    except OSError:
+        # Notification delivery already succeeded; inability to persist the
+        # dedup marker should be observable in logs upstream but must not crash.
+        return
