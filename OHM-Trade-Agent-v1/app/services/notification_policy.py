@@ -9,7 +9,16 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 STATE_FILE = Path("/app/data/notification_state.json")
 LOCK_FILE = STATE_FILE.parent / ".notification_state.lock"
 DEFAULT_COOLDOWN_SECONDS = 6 * 60 * 60
-CRITICAL_EVENTS = {"STOP", "T1", "T2", "CLOSED", "EMERGENCY", "FILLED"}
+CRITICAL_EVENTS = {
+    "STOP",
+    "T1",
+    "T2",
+    "CLOSED",
+    "EMERGENCY",
+    "FILLED",
+    "TAKE_PROFIT",
+    "EXIT_NOW",
+}
 
 
 def _now() -> datetime:
@@ -50,8 +59,6 @@ def should_emit(
                 if (now - last_at).total_seconds() < cooldown_seconds:
                     return False
     except OSError:
-        # Dedup persistence must never prevent a legitimate alert. Production
-        # has a writable /app/data volume; tests/read-only recovery modes may not.
         return True
     return True
 
@@ -71,6 +78,4 @@ def record_emitted(
             state[key] = {"fingerprint": fingerprint, "sent_at": now.isoformat()}
             save_json_atomic(STATE_FILE, state)
     except OSError:
-        # Notification delivery already succeeded; inability to persist the
-        # dedup marker should be observable in logs upstream but must not crash.
         return
