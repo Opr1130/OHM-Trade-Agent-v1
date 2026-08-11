@@ -32,6 +32,15 @@ def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> st
         "EXIT_NOW": "🛑",
     }.get(result.action, "ℹ️")
     reasons = "\n".join(f"• {reason}" for reason in result.reasons)
+    pnl_note = ""
+    if result.net_pnl is not None:
+        pnl_note = (
+            f"Gross P/L: ${result.gross_pnl:.2f}\n"
+            f"Est. Trading Costs: ${result.estimated_total_costs:.2f}\n"
+            f"NET P/L: ${result.net_pnl:.2f} ({result.net_pnl_pct:.2f}%)\n"
+            f"Break-even Move: {result.break_even_move_pct:.3f}%\n"
+            f"Fee Basis: {result.fee_source}\n\n"
+        )
     return (
         f"{icon} OHM AI — TRADE MONITOR\n\n"
         f"Symbol: {trade.symbol}\n"
@@ -39,7 +48,8 @@ def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> st
         f"Risk: {trade.risk_level.upper()}\n\n"
         f"Entry: {trade.entry_price}\n"
         f"Current: {result.current_price}\n"
-        f"Unrealized: {result.unrealized_pct}%\n\n"
+        f"Price Move P/L: {result.unrealized_pct}%\n"
+        f"{pnl_note}"
         f"Stop: {trade.stop_price}\n"
         f"Target 1: {trade.target_1}\n"
         f"Target 2: {trade.target_2}\n\n"
@@ -53,8 +63,6 @@ def send_monitor_update(
     bot_token: str,
     chat_id: str,
 ) -> bool:
-    # Closed trades must never emit monitoring messages even if a stale caller
-    # still holds an object reference.
     if trade.status != "active":
         return False
 
