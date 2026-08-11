@@ -22,10 +22,17 @@ def main() -> None:
         print("Maintenance mode: all trading workflows skipped.")
         return
 
-    # Position and order lifecycle monitoring is always prioritized outside
-    # maintenance, including overnight quiet hours and MONITOR mode.
+    # Active positions always receive deterministic protection outside
+    # MAINTENANCE, including overnight quiet hours.
     monitor_active_main()
-    monitor_pending_main()
+
+    # Pending opportunities are routine discovery/lifecycle noise while the
+    # operator is asleep. They resume after 05:00 ET; active risk protection
+    # remains live throughout quiet hours.
+    if decision.quiet_hours:
+        print("Pending setup monitor skipped during quiet hours.")
+    else:
+        monitor_pending_main()
 
     # Broad discovery is state/capacity/time gated. This is the only branch
     # that can reach the paid Chief analysis path.
