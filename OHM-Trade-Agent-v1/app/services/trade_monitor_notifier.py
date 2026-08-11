@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
+from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_monitor import TradeMonitorResult
 
@@ -12,7 +13,6 @@ STATE_FILE = Path("/app/data/trade_monitor_state.json")
 def _load_state() -> dict[str, str]:
     if not STATE_FILE.exists():
         return {}
-
     try:
         return json.loads(STATE_FILE.read_text())
     except (json.JSONDecodeError, OSError):
@@ -24,22 +24,14 @@ def _save_state(state: dict[str, str]) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def format_monitor_message(
-    trade: ActiveTrade,
-    result: TradeMonitorResult,
-) -> str:
+def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> str:
     icon = {
         "HOLD": "✅",
         "WARNING": "⚠️",
         "TAKE_PROFIT": "🎯",
         "EXIT_NOW": "🛑",
     }.get(result.action, "ℹ️")
-
-    reasons = "\n".join(
-        f"• {reason}"
-        for reason in result.reasons
-    )
-
+    reasons = "\n".join(f"• {reason}" for reason in result.reasons)
     return (
         f"{icon} OHM AI — TRADE MONITOR\n\n"
         f"Symbol: {trade.symbol}\n"
@@ -61,23 +53,24 @@ def send_monitor_update(
     bot_token: str,
     chat_id: str,
 ) -> bool:
+    # Closed trades must never emit monitoring messages even if a stale caller
+    # still holds an object reference.
+    if trade.status != "active":
+        return False
+
     state = _load_state()
     previous_action = state.get(trade.symbol)
-
-    # Only notify when the trade state changes.
     if previous_action == result.action:
         return False
 
-    message = format_monitor_message(trade, result)
+    identity = trade.trade_id or trade.symbol
+    fingerprint = f"{trade.direction}:{result.action}"
+    if not should_emit(identity=identity, event_type=result.action, fingerprint=fingerprint):
+        return False
 
-    sent = send_telegram_message(
-        bot_token,
-        chat_id,
-        message,
-    )
-
+    sent = send_telegram_message(bot_token, chat_id, format_monitor_message(trade, result))
     if sent:
         state[trade.symbol] = result.action
         _save_state(state)
-
+        record_emitted(identity=identity, event_type=result.action, fingerprint=fingerprint)
     return sent
