@@ -61,16 +61,8 @@ def test_mixed_long_short_share_one_chief_call_and_payload(monkeypatch):
     long = _snapshot("SOLUSD", "LONG")
     short = _snapshot("BTCUSD", "SHORT", margin_eligible=True)
     responses = _Responses()
-    monkeypatch.setattr(
-        chief_analyst,
-        "_quality_by_risk_level",
-        lambda candidate, equity: ({"low": {"ok": True}}, True),
-    )
-    monkeypatch.setattr(
-        chief_analyst,
-        "OpenAI",
-        lambda api_key: SimpleNamespace(responses=responses),
-    )
+    monkeypatch.setattr(chief_analyst, "_quality_by_risk_level", lambda candidate, equity: ({"low": {"ok": True}}, True))
+    monkeypatch.setattr(chief_analyst, "OpenAI", lambda api_key: SimpleNamespace(responses=responses))
 
     review = chief_analyst.review_candidates([long, short], "model", "key", 2000)
     payload = json.loads(responses.kwargs["input"][1]["content"])
@@ -78,26 +70,15 @@ def test_mixed_long_short_share_one_chief_call_and_payload(monkeypatch):
     assert responses.calls == 1
     assert review["chief_eligible_candidates"] == 2
     assert payload["candidate_count"] == 2
-    assert {(row["symbol"], row["direction"]) for row in payload["candidates"]} == {
-        ("SOLUSD", "LONG"),
-        ("BTCUSD", "SHORT"),
-    }
+    assert {(row["symbol"], row["direction"]) for row in payload["candidates"]} == {("SOLUSD", "LONG"), ("BTCUSD", "SHORT")}
 
 
 def test_ineligible_short_never_reaches_chief(monkeypatch):
     long = _snapshot("SOLUSD", "LONG")
     unsafe_short = _snapshot("BTCUSD", "SHORT", margin_eligible=False)
     responses = _Responses()
-    monkeypatch.setattr(
-        chief_analyst,
-        "_quality_by_risk_level",
-        lambda candidate, equity: ({"low": {"ok": True}}, True),
-    )
-    monkeypatch.setattr(
-        chief_analyst,
-        "OpenAI",
-        lambda api_key: SimpleNamespace(responses=responses),
-    )
+    monkeypatch.setattr(chief_analyst, "_quality_by_risk_level", lambda candidate, equity: ({"low": {"ok": True}}, True))
+    monkeypatch.setattr(chief_analyst, "OpenAI", lambda api_key: SimpleNamespace(responses=responses))
 
     chief_analyst.review_candidates([unsafe_short, long], "model", "key", 2000)
     payload = json.loads(responses.kwargs["input"][1]["content"])
@@ -110,16 +91,8 @@ def test_ineligible_short_never_reaches_chief(monkeypatch):
 def test_chief_payload_is_still_hard_capped_at_eight(monkeypatch):
     candidates = [_snapshot(f"C{i}USD", "LONG") for i in range(12)]
     responses = _Responses()
-    monkeypatch.setattr(
-        chief_analyst,
-        "_quality_by_risk_level",
-        lambda candidate, equity: ({"low": {"ok": True}}, True),
-    )
-    monkeypatch.setattr(
-        chief_analyst,
-        "OpenAI",
-        lambda api_key: SimpleNamespace(responses=responses),
-    )
+    monkeypatch.setattr(chief_analyst, "_quality_by_risk_level", lambda candidate, equity: ({"low": {"ok": True}}, True))
+    monkeypatch.setattr(chief_analyst, "OpenAI", lambda api_key: SimpleNamespace(responses=responses))
 
     chief_analyst.review_candidates(candidates, "model", "key", 2000)
     payload = json.loads(responses.kwargs["input"][1]["content"])
@@ -131,13 +104,7 @@ def test_exact_short_sell_then_buyback_drag_is_measured_and_used():
     bids = [BookLevel(price=99.9 - i * 0.01, quantity=100.0) for i in range(10)]
     asks = [BookLevel(price=100.1 + i * 0.01, quantity=100.0) for i in range(10)]
     now = datetime(2026, 8, 10, tzinfo=timezone.utc)
-    trades = [
-        PublicTrade(
-            price=100.0,
-            quantity=1.0,
-            trade_timestamp="2026-08-09T23:59:30+00:00",
-        )
-    ]
+    trades = [PublicTrade(price=100.0, quantity=1.0, trade_timestamp="2026-08-09T23:59:30+00:00")]
     execution = evaluate_execution(
         PreTradeBook(symbol="BTC/USD", bids=bids, asks=asks),
         validation_notional_usd=2000.0,
@@ -150,5 +117,7 @@ def test_exact_short_sell_then_buyback_drag_is_measured_and_used():
 
     assert execution.estimated_visible_short_round_trip_market_drag_pct is not None
     assert execution.estimated_visible_short_round_trip_market_drag_pct > 0
-    ok, reasons = short_execution_is_tradeable(candidate)
+    # This unit test verifies the already-computed exact execution math. Live
+    # BTNL refresh behavior is covered separately and must not make CI network dependent.
+    ok, reasons = short_execution_is_tradeable(candidate, refresh_margin_book=False)
     assert ok, reasons

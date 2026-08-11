@@ -3,16 +3,14 @@ from pathlib import Path
 from typing import Any
 
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.notification_policy import record_emitted, should_emit
 from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setups,
     terminalize_pending_setup,
 )
-from app.services.telegram_notifier import (
-    build_trade_confirmation_buttons,
-    send_telegram_message,
-)
+from app.services.telegram_notifier import build_trade_confirmation_buttons, send_telegram_message
 from app.services.trade_outcome_registry import record_recommendation
 
 
@@ -45,13 +43,27 @@ def _action_type(plan: EntryExitPlan) -> str | None:
     return None
 
 
+def _round_price(value: float) -> str:
+    # Dedup should represent a materially different plan, not tiny floating
+    # point/market refresh changes. Six significant decimals are ample for
+    # both low-priced tokens and large-cap assets.
+    return f"{float(value):.6g}"
+
+
 def _alert_state_key(candidate: dict[str, Any], plan: EntryExitPlan) -> str:
     action = _action_type(plan) or "SILENT"
-    confidence = int(candidate.get("confidence", 0))
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
-    return (
-        f"{direction}:{action}:{plan.risk_level}:{confidence}:"
-        f"{plan.entry_low}:{plan.entry_high}:{plan.stop_price}:{plan.target_2}"
+    return ":".join(
+        [
+            direction,
+            action,
+            plan.risk_level,
+            _round_price(plan.entry_low),
+            _round_price(plan.entry_high),
+            _round_price(plan.stop_price),
+            _round_price(plan.target_1),
+            _round_price(plan.target_2),
+        ]
     )
 
 
@@ -60,10 +72,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     if action == "ENTER_NOW":
         headline = f"🔥 OHM CHIEF — {direction} — ENTER NOW"
-        action_text = (
-            "Action: ENTRY CONDITIONS VALID\n"
-            "Use the approved entry zone and respect the chase boundary."
-        )
+        action_text = "Action: ENTRY CONDITIONS VALID\nUse the approved entry zone and respect the chase boundary."
     elif action == "PLACE_LIMIT":
         headline = f"🎯 OHM CHIEF — {direction} — PLACE LIMIT"
         action_text = (
@@ -90,8 +99,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     margin_note = ""
     if direction == "SHORT":
         margin_note = (
-            f"Margin: Kraken US retail eligible | Validation leverage: "
-            f"{float(candidate.get('margin_leverage') or 2.0):.1f}x\n"
+            f"Margin: Kraken US retail eligible | Validation leverage: {float(candidate.get('margin_leverage') or 2.0):.1f}x\n"
             "Execution: MANUAL ONLY — verify live Kraken margin/opening/rollover fees before entry\n"
         )
 
@@ -116,12 +124,22 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
 
 
 def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
-    if _action_type(plan) is None:
+    action = _action_type(plan)
+    if action is None:
         return False
-    state = _load_state()
     current_key = _alert_state_key(candidate, plan)
-    previous_key = state.get(plan.symbol)
-    return current_key != previous_key
+    # Legacy alert_state still protects older deployments. New persistent
+    # notification policy adds a six-hour non-critical cooldown and a stable
+    # identity that does not change merely because AI confidence moved.
+    state = _load_state()
+    if state.get(plan.symbol) == current_key:
+        return False
+    direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
+    return should_emit(
+        identity=f"{direction}:{plan.symbol}",
+        event_type="OPPORTUNITY",
+        fingerprint=current_key,
+    )
 
 
 def _existing_setup_trade_id(symbol: str) -> str | None:
@@ -168,26 +186,18 @@ def send_trade_plan(
         candidate["trade_id"] = setup.trade_id
         reply_markup = build_trade_confirmation_buttons(setup.trade_id)
 
-    trade_id = (
-        setup.trade_id
-        if setup is not None
-        else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
-    )
+    trade_id = setup.trade_id if setup is not None else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
     if trade_id:
         candidate["trade_id"] = trade_id
 
-    record_recommendation(
-        trade_id=trade_id,
-        candidate=candidate,
-        plan=plan,
-        action=action,
-    )
-
+    record_recommendation(trade_id=trade_id, candidate=candidate, plan=plan, action=action)
     sent = send_telegram_message(bot_token, chat_id, message, reply_markup=reply_markup)
     if sent:
+        key = _alert_state_key(candidate, plan)
         state = _load_state()
-        state[plan.symbol] = _alert_state_key(candidate, plan)
+        state[plan.symbol] = key
         _save_state(state)
+        record_emitted(identity=f"{direction}:{plan.symbol}", event_type="OPPORTUNITY", fingerprint=key)
     elif action == "ENTER_NOW" and setup is not None:
         terminalize_pending_setup(setup.trade_id, "send_failed")
     return sent

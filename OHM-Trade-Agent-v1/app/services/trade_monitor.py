@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from app.exchanges.kraken import KrakenClient
 from app.indicators.technical import ema, macd, rsi, volume_ratio
 from app.services.active_trade_registry import ActiveTrade
+from app.services.fee_pnl import calculate_fee_aware_pnl
 
 
 @dataclass
@@ -12,6 +13,12 @@ class TradeMonitorResult:
     current_price: float
     unrealized_pct: float
     reasons: list[str]
+    gross_pnl: float | None = None
+    estimated_total_costs: float | None = None
+    net_pnl: float | None = None
+    net_pnl_pct: float | None = None
+    break_even_move_pct: float | None = None
+    fee_source: str | None = None
 
 
 def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
@@ -86,6 +93,22 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             if action in {"HOLD", "WARNING"}:
                 action = "EXIT_NOW"
 
+    pnl = None
+    if trade.capital is not None and trade.capital > 0:
+        pnl = calculate_fee_aware_pnl(
+            direction=direction,
+            entry_price=trade.entry_price,
+            current_or_exit_price=current_price,
+            capital=trade.capital,
+            leverage=trade.margin_leverage,
+            actual_entry_fee=trade.actual_entry_fee,
+            financing_fee=trade.financing_fee,
+        )
+        if pnl.gross_pnl > 0 and pnl.net_pnl <= 0:
+            reasons.append(
+                "Gross price move is positive but estimated net P/L remains negative after trading costs"
+            )
+
     if not reasons:
         reasons.append("Trade structure remains healthy")
 
@@ -95,4 +118,10 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
         current_price=round(current_price, 8),
         unrealized_pct=round(unrealized_pct, 2),
         reasons=reasons,
+        gross_pnl=(pnl.gross_pnl if pnl else None),
+        estimated_total_costs=(pnl.total_costs if pnl else None),
+        net_pnl=(pnl.net_pnl if pnl else None),
+        net_pnl_pct=(pnl.net_pnl_pct_on_capital if pnl else None),
+        break_even_move_pct=(pnl.break_even_move_pct if pnl else None),
+        fee_source=(pnl.fee_source if pnl else None),
     )

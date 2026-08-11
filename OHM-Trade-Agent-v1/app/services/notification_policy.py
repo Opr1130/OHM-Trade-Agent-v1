@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.services.registry_io import load_json, registry_lock, save_json_atomic
+
+
+STATE_FILE = Path("/app/data/notification_state.json")
+LOCK_FILE = STATE_FILE.parent / ".notification_state.lock"
+DEFAULT_COOLDOWN_SECONDS = 6 * 60 * 60
+CRITICAL_EVENTS = {
+    "STOP",
+    "T1",
+    "T2",
+    "CLOSED",
+    "EMERGENCY",
+    "FILLED",
+    "TAKE_PROFIT",
+    "EXIT_NOW",
+}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def should_emit(
+    *,
+    identity: str,
+    event_type: str,
+    fingerprint: str,
+    cooldown_seconds: int = DEFAULT_COOLDOWN_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    now = now or _now()
+    event_type = event_type.upper()
+    key = f"{identity}:{event_type}"
+    try:
+        with registry_lock(LOCK_FILE):
+            state = load_json(STATE_FILE)
+            previous = state.get(key, {})
+            if previous.get("fingerprint") == fingerprint:
+                return False
+            last_at = _parse(previous.get("sent_at"))
+            if event_type not in CRITICAL_EVENTS and last_at is not None:
+                if (now - last_at).total_seconds() < cooldown_seconds:
+                    return False
+    except OSError:
+        return True
+    return True
+
+
+def record_emitted(
+    *,
+    identity: str,
+    event_type: str,
+    fingerprint: str,
+    now: datetime | None = None,
+) -> None:
+    now = now or _now()
+    key = f"{identity}:{event_type.upper()}"
+    try:
+        with registry_lock(LOCK_FILE):
+            state = load_json(STATE_FILE)
+            state[key] = {"fingerprint": fingerprint, "sent_at": now.isoformat()}
+            save_json_atomic(STATE_FILE, state)
+    except OSError:
+        return
