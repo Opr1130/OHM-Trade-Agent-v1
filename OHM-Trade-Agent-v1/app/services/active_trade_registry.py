@@ -89,6 +89,7 @@ def close_trade(
     trade_id = ""
     closed = False
     final_price = close_price
+    closed_trade: ActiveTrade | None = None
     with registry_lock(registry_lock_file()):
         data = _load_raw()
         if symbol not in data:
@@ -113,6 +114,7 @@ def close_trade(
                 raise ValueError("financing_fee cannot be negative")
             item["financing_fee"] = financing_fee
         _save_raw(data)
+        closed_trade = _from_item(item)
         closed = True
     if closed:
         from app.services.trade_outcome_registry import terminalize_active_outcome
@@ -123,4 +125,7 @@ def close_trade(
             reason=reason,
             final_price=final_price,
         )
+        if closed_trade is not None:
+            from app.services.outcome_financials import finalize_financial_outcome
+            finalize_financial_outcome(closed_trade)
     return closed
