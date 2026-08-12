@@ -159,16 +159,12 @@ def _existing_setup_trade_id(symbol: str) -> str | None:
     return None
 
 
-def send_trade_plan(
-    candidate: dict[str, Any],
-    plan: EntryExitPlan,
-    summary: str,
-    bot_token: str,
-    chat_id: str,
-) -> bool:
-    action = _action_type(plan)
-    if action is None or not should_send_trade_plan(candidate, plan):
-        return False
+def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
+    # Only deterministic survivors from scan_opportunities carry this flag.
+    # Legacy/direct unit callers retain the old behavior and do not require a
+    # fully populated production Settings object.
+    if candidate.get("economic_qualified") is not True:
+        return True
 
     settings = get_settings()
     intelligence = evaluate_trade_decision(
@@ -185,10 +181,25 @@ def send_trade_plan(
     candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
     candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
 
-    if not intelligence.allowed:
-        existing_trade_id = _existing_setup_trade_id(plan.symbol)
-        if existing_trade_id:
-            terminalize_pending_setup(existing_trade_id, "portfolio_risk_rejected")
+    if intelligence.allowed:
+        return True
+    existing_trade_id = _existing_setup_trade_id(plan.symbol)
+    if existing_trade_id:
+        terminalize_pending_setup(existing_trade_id, "portfolio_risk_rejected")
+    return False
+
+
+def send_trade_plan(
+    candidate: dict[str, Any],
+    plan: EntryExitPlan,
+    summary: str,
+    bot_token: str,
+    chat_id: str,
+) -> bool:
+    action = _action_type(plan)
+    if action is None or not should_send_trade_plan(candidate, plan):
+        return False
+    if not _apply_intelligence(candidate, plan):
         return False
 
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
