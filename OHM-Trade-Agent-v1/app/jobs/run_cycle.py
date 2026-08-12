@@ -3,10 +3,30 @@ from __future__ import annotations
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_opportunities import main as scan_main
+from app.services.kraken_reconciliation import reconcile_kraken_account
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 
 
 def main() -> None:
+    # Reconcile the exchange first so stale OHM lifecycle state cannot drive
+    # monitoring, capacity decisions, or duplicate alerts. The integration is
+    # read-only at the Kraken boundary; mutation of OHM state is separately
+    # gated by KRAKEN_RECONCILIATION_MODE=apply.
+    reconciliation = reconcile_kraken_account()
+    print("OHM Kraken Reconciliation")
+    print("Status:", reconciliation.status)
+    print("Mode:", reconciliation.mode)
+    print("Active checked:", reconciliation.active_checked)
+    print("Order intents checked:", reconciliation.order_intents_checked)
+    print("Open orders seen:", reconciliation.open_orders_seen)
+    print("Fills seen:", reconciliation.fills_seen)
+    print("Would close:", len(reconciliation.would_close))
+    print("Closed:", len(reconciliation.closed))
+    print("Would fill:", len(reconciliation.would_fill))
+    print("Filled:", len(reconciliation.filled))
+    if reconciliation.reason:
+        print("Reconciliation reason:", reconciliation.reason)
+
     decision = get_operator_decision()
     print("OHM Unified Cycle")
     print("Override mode:", decision.override_mode)
