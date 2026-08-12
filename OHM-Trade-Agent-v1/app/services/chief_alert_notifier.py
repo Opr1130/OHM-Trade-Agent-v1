@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from app.core.config import get_settings
+from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.pending_setup_registry import (
@@ -11,6 +13,7 @@ from app.services.pending_setup_registry import (
     terminalize_pending_setup,
 )
 from app.services.telegram_notifier import build_trade_confirmation_buttons, send_telegram_message
+from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
 
@@ -44,9 +47,6 @@ def _action_type(plan: EntryExitPlan) -> str | None:
 
 
 def _round_price(value: float) -> str:
-    # Dedup should represent a materially different plan, not tiny floating
-    # point/market refresh changes. Six significant decimals are ample for
-    # both low-priced tokens and large-cap assets.
     return f"{float(value):.6g}"
 
 
@@ -96,6 +96,19 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     if candidate.get("profit_rank_score") is not None:
         ranking_note += f"Profit Rank Score: {float(candidate['profit_rank_score']):.2f}/100\n"
 
+    intelligence_note = ""
+    if candidate.get("recommended_capital") is not None:
+        intelligence_note += f"Recommended Capital: ${float(candidate['recommended_capital']):,.2f}\n"
+    if candidate.get("recommended_risk_dollars") is not None:
+        intelligence_note += f"Estimated Stop Risk: ${float(candidate['recommended_risk_dollars']):,.2f}\n"
+    if candidate.get("projected_net_edge_pct") is not None:
+        intelligence_note += f"Projected Net Edge: {float(candidate['projected_net_edge_pct']):.2f}%\n"
+    if candidate.get("calibration_status") is not None:
+        intelligence_note += (
+            f"Calibration: {candidate['calibration_status']} "
+            f"({float(candidate.get('calibration_multiplier') or 1.0):.2f}x sizing only)\n"
+        )
+
     margin_note = ""
     if direction == "SHORT":
         margin_note = (
@@ -109,7 +122,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
         f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
         f"Direction: {direction}\n"
-        f"{quote_note}{margin_note}{ranking_note}"
+        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: {candidate.get('confidence', 0)}%\n"
         f"Technical Decision: {str(candidate.get('decision', '')).upper()}\n\n"
@@ -128,9 +141,6 @@ def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bo
     if action is None:
         return False
     current_key = _alert_state_key(candidate, plan)
-    # Legacy alert_state still protects older deployments. New persistent
-    # notification policy adds a six-hour non-critical cooldown and a stable
-    # identity that does not change merely because AI confidence moved.
     state = _load_state()
     if state.get(plan.symbol) == current_key:
         return False
@@ -160,6 +170,27 @@ def send_trade_plan(
     if action is None or not should_send_trade_plan(candidate, plan):
         return False
 
+    settings = get_settings()
+    intelligence = evaluate_trade_decision(
+        candidate=candidate,
+        plan=plan,
+        account_capital=settings.account_equity,
+        active_trades=get_active_trades(),
+    )
+    candidate["recommended_capital"] = intelligence.allocation.recommended_capital
+    candidate["recommended_risk_dollars"] = intelligence.allocation.risk_dollars
+    candidate["projected_net_edge_pct"] = intelligence.projected_net_edge_pct
+    candidate["calibration_status"] = intelligence.calibration_status
+    candidate["calibration_multiplier"] = intelligence.calibration_multiplier
+    candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
+    candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
+
+    if not intelligence.allowed:
+        existing_trade_id = _existing_setup_trade_id(plan.symbol)
+        if existing_trade_id:
+            terminalize_pending_setup(existing_trade_id, "portfolio_risk_rejected")
+        return False
+
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
     message = format_trade_plan(candidate=candidate, plan=plan, summary=summary)
@@ -186,7 +217,11 @@ def send_trade_plan(
         candidate["trade_id"] = setup.trade_id
         reply_markup = build_trade_confirmation_buttons(setup.trade_id)
 
-    trade_id = setup.trade_id if setup is not None else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+    trade_id = (
+        setup.trade_id
+        if setup is not None
+        else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+    )
     if trade_id:
         candidate["trade_id"] = trade_id
 
@@ -197,7 +232,11 @@ def send_trade_plan(
         state = _load_state()
         state[plan.symbol] = key
         _save_state(state)
-        record_emitted(identity=f"{direction}:{plan.symbol}", event_type="OPPORTUNITY", fingerprint=key)
+        record_emitted(
+            identity=f"{direction}:{plan.symbol}",
+            event_type="OPPORTUNITY",
+            fingerprint=key,
+        )
     elif action == "ENTER_NOW" and setup is not None:
         terminalize_pending_setup(setup.trade_id, "send_failed")
     return sent
