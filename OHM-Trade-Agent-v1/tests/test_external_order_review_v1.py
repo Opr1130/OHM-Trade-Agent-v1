@@ -66,7 +66,7 @@ def test_external_orders_send_once_and_remain_unmanaged(monkeypatch, tmp_path):
 def test_ohm_linked_order_is_not_reviewed_as_external(monkeypatch, tmp_path):
     monkeypatch.setattr(review, "REVIEW_FILE", tmp_path / "external_order_reviews.json")
     monkeypatch.setattr(review, "LOCK_FILE", tmp_path / ".external_order_reviews.lock")
-    intent = SimpleNamespace(symbol="CSPRUSD", direction="LONG", limit_price=0.003)
+    intent = SimpleNamespace(symbol="CSPRUSD", direction="SHORT", limit_price=0.003)
     monkeypatch.setattr(review, "get_live_order_intents", lambda: [intent])
     monkeypatch.setattr(
         review,
