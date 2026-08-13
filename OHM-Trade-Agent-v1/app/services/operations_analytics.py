@@ -138,13 +138,14 @@ def record_scan_output(text: str, *, started_at: datetime | None = None) -> dict
     row = parse_scan_output(text)
     row["timestamp_utc"] = (started_at or _now()).isoformat()
     row["completed_at_utc"] = _now().isoformat()
-    SCAN_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
+        SCAN_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with registry_lock(SCAN_ACTIVITY_LOCK):
             with SCAN_ACTIVITY_FILE.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, separators=(",", ":")) + "\n")
                 handle.flush()
     except Exception:
+        # Analytics must never block or fail the production scan path.
         pass
     return row
 
@@ -170,7 +171,7 @@ def _sum(rows: list[dict[str, Any]], field: str) -> int:
     return total
 
 
-def _decision_counts(shadows: list[dict[str, Any]]) -> dict[str, int]:
+def _decision_counts(shadows: list[dict[str, Any]]) -> dict[str, Any]:
     counts = Counter(str(row.get("decision") or "UNKNOWN").upper() for row in shadows)
     rejected = sum(
         count
