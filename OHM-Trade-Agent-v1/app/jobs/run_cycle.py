@@ -27,7 +27,7 @@ def _run_cycle_once() -> None:
         reconciliation = ReconciliationSummary(
             status="UNAVAILABLE",
             mode="observe",
-            reason=f"reconciliation failed open: {exc}",
+            reason=f"reconciliation failed open: {type(exc).__name__}: {exc}",
         )
     print("OHM Kraken Reconciliation")
     print("Status:", reconciliation.status)
@@ -51,7 +51,7 @@ def _run_cycle_once() -> None:
     except Exception as exc:
         external_review = ExternalOrderReviewSummary(
             status="UNAVAILABLE",
-            reason=f"external order review failed open: {exc}",
+            reason=f"external order review failed open: {type(exc).__name__}: {exc}",
         )
     print("OHM External Order Review")
     print("Status:", external_review.status)
