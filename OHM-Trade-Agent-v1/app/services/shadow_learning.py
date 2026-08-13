@@ -10,6 +10,7 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 SHADOW_FILE = Path("/app/data/shadow_learning.json")
 LOCK_FILE = SHADOW_FILE.parent / ".shadow_learning.lock"
+SHADOW_DEDUP_SECONDS = 4 * 60 * 60
 HORIZONS_SECONDS = {
     "5m": 5 * 60,
     "15m": 15 * 60,
@@ -47,6 +48,53 @@ def _key(symbol: str, direction: str, observed_at: str, decision: str) -> str:
     return f"{symbol.upper()}:{direction.upper()}:{decision.upper()}:{observed_at}"
 
 
+def _dedup_identity(
+    *,
+    symbol: str,
+    direction: str,
+    decision: str,
+    source: str,
+    market_regime: str | None,
+) -> tuple[str, str, str, str, str]:
+    return (
+        symbol.upper(),
+        direction.upper(),
+        decision.upper(),
+        source,
+        (market_regime or "UNKNOWN").upper(),
+    )
+
+
+def _existing_within_cooldown(
+    data: dict[str, dict[str, Any]],
+    *,
+    identity: tuple[str, str, str, str, str],
+    observed_at: str,
+) -> dict[str, Any] | None:
+    target_time = _parse(observed_at)
+    newest: tuple[datetime, dict[str, Any]] | None = None
+    for row in data.values():
+        row_identity = _dedup_identity(
+            symbol=str(row.get("symbol") or ""),
+            direction=str(row.get("direction") or ""),
+            decision=str(row.get("decision") or ""),
+            source=str(row.get("source") or ""),
+            market_regime=str(row.get("market_regime") or "UNKNOWN"),
+        )
+        if row_identity != identity:
+            continue
+        try:
+            row_time = _parse(str(row["observed_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        age = (target_time - row_time).total_seconds()
+        if age < 0 or age >= SHADOW_DEDUP_SECONDS:
+            continue
+        if newest is None or row_time > newest[0]:
+            newest = (row_time, row)
+    return dict(newest[1]) if newest is not None else None
+
+
 def record_shadow_candidate(
     *,
     symbol: str,
@@ -66,10 +114,22 @@ def record_shadow_candidate(
         raise ValueError("reference_price must be positive")
     ts = observed_at or _iso()
     key = _key(symbol, direction, ts, decision)
+    identity = _dedup_identity(
+        symbol=symbol,
+        direction=direction,
+        decision=decision,
+        source=source,
+        market_regime=market_regime,
+    )
     with registry_lock(LOCK_FILE):
         data = _load()
         if key in data:
             return dict(data[key])
+        existing = _existing_within_cooldown(data, identity=identity, observed_at=ts)
+        if existing is not None:
+            existing["deduplicated"] = True
+            existing["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
+            return existing
         row = {
             "record_key": key,
             "symbol": symbol.upper(),
@@ -129,8 +189,6 @@ def observe_due_shadows(
         except KrakenAPIError as exc:
             return {"status": "ERROR", "reason": str(exc), "records_checked": len(data), "prices_requested": len(due_by_symbol), "observations_added": 0}
 
-        # Kraken may return canonical pair names different from requested names.
-        # If batch-key matching is ambiguous, fall back to one ticker call for that symbol.
         observations_added = 0
         for symbol, due in due_by_symbol.items():
             ticker = tickers.get(symbol)
