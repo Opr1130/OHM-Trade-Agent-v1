@@ -28,6 +28,7 @@ from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.pending_setup_registry import PendingSetup, add_pending_setup
 from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
 from app.services.recommendation_gate import qualified_alerts
+from app.services.shadow_decision_capture import capture_snapshot_decision
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
 
@@ -132,6 +133,14 @@ def main():
                 f"Venue={candidate.margin_venue_symbol or 'N/A'} "
                 f"MaxLeverage={candidate.margin_max_leverage or 'N/A'}x"
             )
+            if str(candidate.margin_validation_status or "").upper() != "ELIGIBLE":
+                capture_snapshot_decision(
+                    candidate,
+                    decision="MARGIN_REJECT",
+                    market_regime=market_regime.regime,
+                    reason=f"margin status {candidate.margin_validation_status}",
+                    source="margin_eligibility_gate",
+                )
     candidates = keep_margin_tradeable_candidates(candidates)
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
@@ -160,11 +169,23 @@ def main():
         )
 
     execution_requested = len(candidates)
+    pre_execution_candidates = list(candidates)
     candidates = deep_validate_candidates(
         candidates,
         settings.account_equity,
         scan.universe.usdt_usd_rate if scan.universe else None,
     )
+    survived_execution_keys = {(c.symbol, c.trade_direction) for c in candidates}
+    for rejected in pre_execution_candidates:
+        if (rejected.symbol, rejected.trade_direction) not in survived_execution_keys:
+            capture_snapshot_decision(
+                rejected,
+                decision="EXECUTION_REJECT",
+                market_regime=market_regime.regime,
+                reason="filtered by deep execution validation",
+                source="execution_quality_gate",
+            )
+
     strict_execution_candidates = []
     for candidate in candidates:
         execution = candidate.execution_validation
@@ -172,6 +193,13 @@ def main():
             tradeable, reasons = short_execution_is_tradeable(candidate)
             if not tradeable:
                 print(f"SHORT EXECUTION REJECT {candidate.symbol}: {'; '.join(reasons)}")
+                capture_snapshot_decision(
+                    candidate,
+                    decision="EXECUTION_REJECT",
+                    market_regime=market_regime.regime,
+                    reason="; ".join(reasons),
+                    source="short_execution_quality_gate",
+                )
                 continue
         strict_execution_candidates.append(candidate)
         data_status = candidate.market_data_validation.status if candidate.market_data_validation is not None else "UNAVAILABLE"
@@ -295,10 +323,18 @@ def main():
         target_quality = _target_quality(plan, snapshot)
         if not target_quality.qualified:
             target_rejected += 1
+            rejection_reason = "; ".join(target_quality.rejection_reasons)
             print(
                 f"TARGET QUALITY REJECT {direction} {plan.symbol}: "
                 f"Score={target_quality.attainability_score} "
-                f"Reason={'; '.join(target_quality.rejection_reasons)}"
+                f"Reason={rejection_reason}"
+            )
+            capture_snapshot_decision(
+                snapshot,
+                decision="TARGET_REJECT",
+                market_regime=market_regime.regime,
+                reason=rejection_reason,
+                source="target_quality_gate",
             )
             continue
         target_passed += 1
@@ -316,6 +352,13 @@ def main():
         if not economic.qualified:
             economic_rejected += 1
             print(f"ECONOMIC REJECT {direction} {plan.symbol}: {economic.rejection_reason}")
+            capture_snapshot_decision(
+                snapshot,
+                decision="ECONOMIC_REJECT",
+                market_regime=market_regime.regime,
+                reason=str(economic.rejection_reason or "economic gate rejected"),
+                source="economic_quality_gate",
+            )
             continue
         economic_passed += 1
         print(
@@ -367,6 +410,15 @@ def main():
         direction = opportunity.snapshot.trade_direction
         alert["profit_rank"] = ranked.rank
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
+
+        capture_snapshot_decision(
+            opportunity.snapshot,
+            decision="ENTER_NOW" if plan.valid_now else "WAIT",
+            market_regime=market_regime.regime,
+            reason=plan.reason,
+            source="qualified_profit_rank",
+            profit_rank_score=ranked.profit_ranking.total_score,
+        )
 
         if not plan.valid_now:
             setup = PendingSetup(

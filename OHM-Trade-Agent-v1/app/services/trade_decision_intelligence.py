@@ -6,7 +6,9 @@ from typing import Any
 from app.services.capital_allocation import CapitalAllocation, recommend_capital
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.portfolio_risk import PortfolioRiskDecision, evaluate_portfolio_risk
+from app.services.profitability_learning import learned_multiplier
 from app.services.self_calibration import calibration_model, calibrated_multiplier
+from app.services.shadow_learning import record_shadow_candidate
 from app.services.trade_outcome_registry import get_outcomes
 
 
@@ -35,9 +37,50 @@ def _projected_net_edge_pct(candidate: dict[str, Any], account_capital: float) -
         return max(0.0, float(net_t2) / account_capital * 100.0)
     gross_move = candidate.get("economic_target_2_move_pct")
     if isinstance(gross_move, (int, float)):
-        # Conservative fallback when the economic gate did not expose dollar net.
         return max(0.0, float(gross_move) - 0.8)
     return 0.0
+
+
+def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: str) -> None:
+    reference_price = plan.entry_low if direction == "SHORT" else plan.entry_high
+    decision = "ENTER_NOW" if plan.valid_now else "WAIT"
+    try:
+        record_shadow_candidate(
+            symbol=plan.symbol,
+            direction=direction,
+            decision=decision,
+            reference_price=float(reference_price),
+            market_regime=candidate.get("market_regime"),
+            technical_score=(float(candidate["technical_score"]) if isinstance(candidate.get("technical_score"), (int, float)) else None),
+            profit_rank_score=(float(candidate["profit_rank_score"]) if isinstance(candidate.get("profit_rank_score"), (int, float)) else None),
+            reason=plan.reason,
+            source="qualified_trade_decision",
+        )
+    except Exception:
+        return
+
+
+def _effective_calibration_multiplier(
+    *,
+    legacy_model: dict[str, Any],
+    direction: str,
+    regime: str | None,
+) -> tuple[float, str]:
+    """Prefer the persisted net-profit learner once it has enough evidence.
+
+    Any profile read/storage failure falls back to the existing model so the
+    self-learning layer can never block or destabilize a live trade decision.
+    """
+    try:
+        persisted = learned_multiplier(direction=direction, regime=regime)
+    except Exception:
+        persisted = 1.0
+    if persisted != 1.0:
+        return persisted, "PROFITABILITY_PROFILE"
+    return (
+        calibrated_multiplier(legacy_model, direction=direction, regime=regime),
+        str(legacy_model.get("status") or "UNKNOWN"),
+    )
 
 
 def evaluate_trade_decision(
@@ -54,16 +97,16 @@ def evaluate_trade_decision(
     stop_distance_pct = abs(entry_reference - plan.stop_price) / entry_reference * 100.0
     net_edge_pct = _projected_net_edge_pct(candidate, account_capital)
 
+    _capture_shadow(candidate, plan, direction)
+
     records = outcomes if outcomes is not None else get_outcomes()
     model = calibration_model(records)
-    multiplier = calibrated_multiplier(
-        model,
+    multiplier, calibration_status = _effective_calibration_multiplier(
+        legacy_model=model,
         direction=direction,
         regime=candidate.get("market_regime"),
     )
 
-    # Profit Rank is deterministic and preferred for sizing. Technical score is
-    # the fallback. AI confidence is not treated as a probability.
     quality_score = candidate.get("profit_rank_score")
     if not isinstance(quality_score, (int, float)):
         quality_score = candidate.get("technical_score")
@@ -89,7 +132,7 @@ def evaluate_trade_decision(
     )
 
     return TradeDecisionIntelligence(
-        calibration_status=str(model.get("status") or "UNKNOWN"),
+        calibration_status=calibration_status,
         calibration_multiplier=multiplier,
         projected_net_edge_pct=round(net_edge_pct, 4),
         quality_score=round(float(quality_score), 2),
