@@ -6,6 +6,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from app.services.decision_learning import is_non_entry_decision
 from app.services.execution_learning_registry import get_execution_records
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 from app.services.shadow_learning import get_shadow_records
@@ -91,7 +92,7 @@ def _shadow_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
     for row, move in evaluable:
         decision = str(row.get("decision") or "UNKNOWN").upper()
         by_decision[decision].append(move)
-        if decision in {"REJECT", "WAIT", "NO_TRADE"}:
+        if is_non_entry_decision(decision):
             if move <= 0:
                 correct += 1
                 correct_rejects += 1
