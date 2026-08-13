@@ -9,12 +9,16 @@ from app.scanner.models import MarketSnapshot
 from app.services import (
     active_trade_registry,
     chief_alert_notifier,
+    order_intent_registry,
     pending_setup_notifier,
     pending_setup_registry,
     telegram_callback_listener,
+    trade_outcome_registry,
 )
+from app.services.active_trade_registry import ActiveTrade
 from app.services.confirm_entry import confirm_trade_id
 from app.services.entry_exit_advisor import EntryExitPlan, build_entry_exit_plan
+from app.services.order_intent_registry import OrderIntent
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
 
 
@@ -29,6 +33,21 @@ def registry_files(tmp_path, monkeypatch):
         active_trade_registry,
         "TRADE_FILE",
         tmp_path / "active.json",
+    )
+    monkeypatch.setattr(
+        order_intent_registry,
+        "ORDER_FILE",
+        tmp_path / "order_intents.json",
+    )
+    monkeypatch.setattr(
+        order_intent_registry,
+        "LOCK_FILE",
+        tmp_path / ".order_intents.lock",
+    )
+    monkeypatch.setattr(
+        trade_outcome_registry,
+        "OUTCOME_FILE",
+        tmp_path / "trade_outcomes.json",
     )
     monkeypatch.setattr(
         chief_alert_notifier,
@@ -215,6 +234,115 @@ def test_concurrent_filled_callbacks_create_one_active_record(registry_files):
         trades = list(executor.map(lambda _: confirm_trade_id(setup.trade_id), range(2)))
     assert trades[0] == trades[1]
     assert len(active_trade_registry.get_active_trades()) == 1
+
+
+def test_active_trade_cannot_be_silently_overwritten(registry_files):
+    original = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100.0,
+        stop_price=95.0,
+        target_1=110.0,
+        target_2=115.0,
+        risk_level="low",
+        trade_id="OHM-BTC-1",
+    )
+    active_trade_registry.add_trade(original)
+    replacement = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=101.0,
+        stop_price=90.0,
+        target_1=120.0,
+        target_2=130.0,
+        risk_level="medium",
+        trade_id="OHM-BTC-2",
+    )
+    with pytest.raises(ValueError, match="active trade already exists"):
+        active_trade_registry.add_trade(replacement)
+    assert active_trade_registry.get_trade("BTCUSD").trade_id == "OHM-BTC-1"
+    assert active_trade_registry.get_trade("BTCUSD").stop_price == 95.0
+
+
+def test_exact_same_trade_retry_is_idempotent(registry_files):
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100.0,
+        stop_price=95.0,
+        target_1=110.0,
+        target_2=115.0,
+        risk_level="low",
+        trade_id="OHM-BTC-SAME",
+    )
+    active_trade_registry.add_trade(trade)
+    active_trade_registry.add_trade(trade)
+    assert len(active_trade_registry.get_active_trades()) == 1
+    assert active_trade_registry.get_trade("BTCUSD").trade_id == "OHM-BTC-SAME"
+
+
+def test_orphaned_filled_intent_is_recovered(registry_files):
+    intent = order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol="ETHUSD",
+            direction="LONG",
+            limit_price=2000.0,
+            capital=250.0,
+            stop_price=1900.0,
+            target_1=2200.0,
+            target_2=2300.0,
+            trade_id="OHM-ETH-RECOVER",
+        )
+    )
+    with order_intent_registry.registry_lock(order_intent_registry.LOCK_FILE):
+        data = order_intent_registry._load()
+        row = data[intent.trade_id]
+        row["status"] = "FILLED"
+        row["filled_at"] = "2026-08-13T12:00:00+00:00"
+        row["updated_at"] = row["filled_at"]
+        row["fill_price"] = 1995.0
+        row["actual_entry_fee"] = 0.5
+        order_intent_registry._save(data)
+
+    assert active_trade_registry.get_trade("ETHUSD") is None
+    recovered, failures = order_intent_registry.recover_orphaned_filled_intents()
+    assert recovered == ("OHM-ETH-RECOVER",)
+    assert failures == ()
+    trade = active_trade_registry.get_trade("ETHUSD")
+    assert trade is not None
+    assert trade.trade_id == "OHM-ETH-RECOVER"
+    assert trade.entry_price == 1995.0
+    assert trade.actual_entry_fee == 0.5
+
+
+def test_crash_after_filled_persistence_self_heals(registry_files, monkeypatch):
+    intent = order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol="SOLUSD",
+            direction="LONG",
+            limit_price=150.0,
+            capital=200.0,
+            stop_price=140.0,
+            target_1=165.0,
+            target_2=175.0,
+            trade_id="OHM-SOL-CRASH",
+        )
+    )
+    original_add_trade = order_intent_registry.add_trade
+
+    def crash_once(_trade):
+        raise RuntimeError("simulated process crash window")
+
+    monkeypatch.setattr(order_intent_registry, "add_trade", crash_once)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        order_intent_registry.mark_order_filled(intent.trade_id, fill_price=149.5, actual_entry_fee=0.4)
+
+    stored = order_intent_registry.get_order_intent(intent.trade_id)
+    assert stored.status == "FILLED"
+    assert active_trade_registry.get_trade("SOLUSD") is None
+
+    monkeypatch.setattr(order_intent_registry, "add_trade", original_add_trade)
+    recovered, failures = order_intent_registry.recover_orphaned_filled_intents()
+    assert recovered == ("OHM-SOL-CRASH",)
+    assert failures == ()
+    assert active_trade_registry.get_trade("SOLUSD").trade_id == "OHM-SOL-CRASH"
 
 
 def test_generic_tradingview_webhook_has_no_confirmation_buttons(monkeypatch):
