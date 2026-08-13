@@ -34,10 +34,20 @@ def main() -> None:
     print("Evaluated shadows:", decision.get("evaluated", 0))
     print("Missed profitable opportunities:", decision.get("missed_profitable_opportunities", 0))
     print("Correct wait/reject decisions:", decision.get("correct_wait_or_reject", 0))
+    by_decision = decision.get("by_decision") or {}
+    if by_decision:
+        print("Decision coverage:")
+        for name, stats in by_decision.items():
+            print(
+                f"  {name}: samples={stats.get('count', 0)} "
+                f"missed={stats.get('missed', 0)} "
+                f"correct_avoid={stats.get('correct_avoid', 0)}"
+            )
     for horizon, stats in (decision.get("immediate_vs_wait") or {}).items():
         print(
             f"Wait {horizon}: samples={stats.get('samples', 0)} "
             f"avg delayed edge={stats.get('avg_delayed_edge_pct')}% "
+            f"better-rate={stats.get('wait_was_better_rate_pct')}% "
             f"sufficient={stats.get('sufficient_samples')}"
         )
     print()
