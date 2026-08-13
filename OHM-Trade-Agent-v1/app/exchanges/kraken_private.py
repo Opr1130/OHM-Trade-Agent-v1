@@ -79,10 +79,8 @@ class KrakenPrivateClient:
         self._last_nonce = max(candidate, self._last_nonce + 1)
         return self._last_nonce
 
-    def _signature(self, url_path: str, payload: dict[str, Any]) -> str:
-        nonce = str(payload["nonce"])
-        postdata = urlencode(payload)
-        encoded = (nonce + postdata).encode()
+    def _signature(self, url_path: str, postdata: str, nonce: int) -> str:
+        encoded = (str(nonce) + postdata).encode()
         message = url_path.encode() + hashlib.sha256(encoded).digest()
         try:
             secret = base64.b64decode(self.api_secret)
@@ -96,17 +94,23 @@ class KrakenPrivateClient:
             raise KrakenPrivateAPIError("Kraken private API credentials are not configured")
         url_path = f"/0/private/{endpoint}"
         payload = dict(params or {})
-        payload["nonce"] = self._nonce()
+        nonce = self._nonce()
+        payload["nonce"] = nonce
+
+        # Kraken signs the exact form-encoded POST body. Build it once and use
+        # the same bytes for both the signature and the HTTP request so bools,
+        # ordering, and future parameter types can never encode differently.
+        postdata = urlencode(payload)
         headers = {
             "API-Key": self.api_key,
-            "API-Sign": self._signature(url_path, payload),
+            "API-Sign": self._signature(url_path, postdata, nonce),
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
         }
         try:
             response = httpx.post(
                 f"{KRAKEN_API_BASE}{url_path}",
-                data=payload,
+                content=postdata.encode(),
                 headers=headers,
                 timeout=self.timeout_seconds,
             )
@@ -142,12 +146,12 @@ class KrakenPrivateClient:
         return {str(asset): float(amount) for asset, amount in result.items()}
 
     def get_open_orders(self) -> dict[str, dict[str, Any]]:
-        result = self._post("OpenOrders", {"trades": True}) or {}
+        result = self._post("OpenOrders", {"trades": "true"}) or {}
         rows = result.get("open", {}) if isinstance(result, dict) else {}
         return rows if isinstance(rows, dict) else {}
 
     def get_trades_history(self, *, start: int | None = None) -> dict[str, dict[str, Any]]:
-        params: dict[str, Any] = {"trades": True}
+        params: dict[str, Any] = {"trades": "true"}
         if start is not None:
             params["start"] = int(start)
         result = self._post("TradesHistory", params) or {}
@@ -155,5 +159,5 @@ class KrakenPrivateClient:
         return rows if isinstance(rows, dict) else {}
 
     def get_open_positions(self) -> dict[str, dict[str, Any]]:
-        result = self._post("OpenPositions", {"docalcs": True}) or {}
+        result = self._post("OpenPositions", {"docalcs": "true"}) or {}
         return result if isinstance(result, dict) else {}

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.exchanges import kraken_private
 from app.exchanges.kraken_private import KrakenPermissionError, KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade
 from app.services import execution_learning_registry as learning
@@ -37,6 +38,36 @@ def test_private_client_accepts_read_only_permissions(monkeypatch):
     info = client.assert_read_only()
     assert info.is_read_only is True
     assert info.name == "ohm-read-only"
+
+
+def test_private_client_signs_exact_post_body(monkeypatch):
+    client = KrakenPrivateClient(api_key="key", api_secret="c2VjcmV0")
+    monkeypatch.setattr(client, "_nonce", lambda: 123456789)
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"error": [], "result": {"open": {}}}
+
+    def fake_post(url, *, content, headers, timeout):
+        captured["url"] = url
+        captured["content"] = content
+        captured["headers"] = headers
+        return Response()
+
+    monkeypatch.setattr(kraken_private.httpx, "post", fake_post)
+    client.get_open_orders()
+
+    assert captured["content"] == b"trades=true&nonce=123456789"
+    expected = client._signature(
+        "/0/private/OpenOrders",
+        "trades=true&nonce=123456789",
+        123456789,
+    )
+    assert captured["headers"]["API-Sign"] == expected
 
 
 def _fake_client():
