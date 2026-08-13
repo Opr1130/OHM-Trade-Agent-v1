@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_opportunities import main as scan_main
+from app.services.external_order_review import review_external_open_orders
 from app.services.kraken_reconciliation import reconcile_kraken_account
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 
@@ -26,6 +27,18 @@ def main() -> None:
     print("Filled:", len(reconciliation.filled))
     if reconciliation.reason:
         print("Reconciliation reason:", reconciliation.reason)
+
+    # Unmatched Kraken orders are visible but remain external/unmanaged. Send
+    # a one-time informational review per Kraken order ID and persist the fact
+    # that it was reviewed so the unified minute cycle cannot spam Telegram.
+    external_review = review_external_open_orders()
+    print("OHM External Order Review")
+    print("Status:", external_review.status)
+    print("Unmatched orders:", external_review.unmatched_orders_seen)
+    print("New reviews:", external_review.new_reviews)
+    print("Notifications sent:", external_review.notifications_sent)
+    if external_review.reason:
+        print("External review reason:", external_review.reason)
 
     decision = get_operator_decision()
     print("OHM Unified Cycle")
