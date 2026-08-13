@@ -37,6 +37,64 @@ def test_shadow_learning_records_multi_horizon_directional_outcomes(monkeypatch,
     assert "1h" not in row["observations"]
 
 
+def test_shadow_learning_deduplicates_same_decision_within_four_hours(monkeypatch, tmp_path):
+    monkeypatch.setattr(shadow, "SHADOW_FILE", tmp_path / "shadow.json")
+    monkeypatch.setattr(shadow, "LOCK_FILE", tmp_path / ".shadow.lock")
+    start = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+    first = shadow.record_shadow_candidate(
+        symbol="ABCUSD",
+        direction="LONG",
+        decision="MARGIN_REJECT",
+        reference_price=100.0,
+        market_regime="RISK_OFF",
+        source="margin_eligibility_gate",
+        observed_at=start.isoformat(),
+    )
+    duplicate = shadow.record_shadow_candidate(
+        symbol="ABCUSD",
+        direction="LONG",
+        decision="MARGIN_REJECT",
+        reference_price=101.0,
+        market_regime="RISK_OFF",
+        source="margin_eligibility_gate",
+        observed_at=(start + timedelta(hours=1)).isoformat(),
+    )
+
+    assert len(shadow.get_shadow_records()) == 1
+    assert duplicate["record_key"] == first["record_key"]
+    assert duplicate["deduplicated"] is True
+
+
+def test_shadow_learning_records_new_sample_after_cooldown_or_regime_change(monkeypatch, tmp_path):
+    monkeypatch.setattr(shadow, "SHADOW_FILE", tmp_path / "shadow.json")
+    monkeypatch.setattr(shadow, "LOCK_FILE", tmp_path / ".shadow.lock")
+    start = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+    base = dict(
+        symbol="ABCUSD",
+        direction="LONG",
+        decision="WAIT",
+        reference_price=100.0,
+        source="chief_review",
+    )
+    shadow.record_shadow_candidate(
+        **base,
+        market_regime="RISK_OFF",
+        observed_at=start.isoformat(),
+    )
+    shadow.record_shadow_candidate(
+        **base,
+        market_regime="RISK_ON",
+        observed_at=(start + timedelta(hours=1)).isoformat(),
+    )
+    shadow.record_shadow_candidate(
+        **base,
+        market_regime="RISK_OFF",
+        observed_at=(start + timedelta(hours=4)).isoformat(),
+    )
+
+    assert len(shadow.get_shadow_records()) == 3
+
+
 def _outcome(i, *, direction="LONG", regime="RISK_ON", pnl=1.0):
     return {
         "trade_id": f"T{i}",
