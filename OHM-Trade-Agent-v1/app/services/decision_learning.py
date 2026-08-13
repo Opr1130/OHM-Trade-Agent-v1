@@ -14,6 +14,25 @@ def _num(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
+def is_non_entry_decision(decision: str | None) -> bool:
+    """Return True for an explicit decision that kept capital out of a trade.
+
+    The suffix rule deliberately future-proofs learning coverage: a new gate
+    named SOMETHING_REJECT should not silently disappear from profitability
+    analysis just because the analytics code predates that gate.
+    """
+    value = str(decision or "").upper()
+    if value in {
+        "WAIT",
+        "REJECT",
+        "NO_TRADE",
+        "AI_WATCH",
+        "AI_NOT_SELECTED",
+    }:
+        return True
+    return value.endswith("_REJECT")
+
+
 def _moves(row: dict[str, Any]) -> dict[str, float]:
     observations = row.get("observations") or {}
     result: dict[str, float] = {}
@@ -66,10 +85,7 @@ def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
 
     best = max(moves.values())
     worst = min(moves.values())
-    is_non_entry = decision in {
-        "WAIT", "REJECT", "TARGET_REJECT", "ECONOMIC_REJECT",
-        "EXECUTION_REJECT", "MARGIN_REJECT",
-    }
+    is_non_entry = is_non_entry_decision(decision)
     missed = is_non_entry and best >= MISS_THRESHOLD_PCT
     correct_avoid = is_non_entry and best < MISS_THRESHOLD_PCT and worst <= AVOIDED_LOSS_THRESHOLD_PCT
 
