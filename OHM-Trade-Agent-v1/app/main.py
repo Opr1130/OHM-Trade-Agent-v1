@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from app.api.dashboard import router as dashboard_router
 from app.api.routes import router
 from app.services.telegram_callback_listener import (
     start_telegram_callback_listener,
@@ -13,6 +14,7 @@ app = FastAPI(
 )
 
 app.include_router(router)
+app.include_router(dashboard_router)
 
 
 @app.on_event("startup")

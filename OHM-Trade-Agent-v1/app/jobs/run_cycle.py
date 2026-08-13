@@ -6,6 +6,7 @@ from app.jobs.scan_opportunities import main as scan_main
 from app.services.external_order_review import review_external_open_orders
 from app.services.kraken_reconciliation import reconcile_kraken_account
 from app.services.learning_scheduler import run_learning_cycle
+from app.services.operations_analytics import run_scan_with_telemetry
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 
 
@@ -103,7 +104,10 @@ def main() -> None:
         return
 
     mark_search_started()
-    scan_main()
+    # Capture the scanner's existing console report into structured telemetry
+    # while teeing it unchanged to stdout. Telemetry is fail-open and does not
+    # participate in trade decisions.
+    run_scan_with_telemetry(scan_main)
 
 
 if __name__ == "__main__":
