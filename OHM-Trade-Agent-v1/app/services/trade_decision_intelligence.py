@@ -6,6 +6,7 @@ from typing import Any
 from app.services.capital_allocation import CapitalAllocation, recommend_capital
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.portfolio_risk import PortfolioRiskDecision, evaluate_portfolio_risk
+from app.services.profitability_learning import learned_multiplier
 from app.services.self_calibration import calibration_model, calibrated_multiplier
 from app.services.shadow_learning import record_shadow_candidate
 from app.services.trade_outcome_registry import get_outcomes
@@ -42,12 +43,7 @@ def _projected_net_edge_pct(candidate: dict[str, Any], account_capital: float) -
 
 
 def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: str) -> None:
-    """Persist a free counterfactual for every qualified deterministic survivor.
-
-    For LONG plans entry_high is the scan price; for SHORT plans entry_low is the
-    scan price. This lets OHM later verify whether ENTER/WAIT judgments were
-    correct at 5m..24h horizons without placing a trade or calling the Chief.
-    """
+    """Persist a free counterfactual for every qualified deterministic survivor."""
     reference_price = plan.entry_low if direction == "SHORT" else plan.entry_high
     decision = "ENTER_NOW" if plan.valid_now else "WAIT"
     try:
@@ -65,6 +61,28 @@ def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: s
     except Exception:
         # Learning telemetry must never block a live trading decision.
         return
+
+
+def _effective_calibration_multiplier(
+    *,
+    legacy_model: dict[str, Any],
+    direction: str,
+    regime: str | None,
+) -> tuple[float, str]:
+    """Prefer the persisted net-profit learner once it has enough evidence.
+
+    The persisted profile is refreshed locally and can change future sizing
+    without code changes. Until it is calibrated, the existing historical
+    model remains the fallback. Both paths are bounded by existing sizing
+    guardrails and neither can alter qualification/risk rules.
+    """
+    persisted = learned_multiplier(direction=direction, regime=regime)
+    if persisted != 1.0:
+        return persisted, "PROFITABILITY_PROFILE"
+    return (
+        calibrated_multiplier(legacy_model, direction=direction, regime=regime),
+        str(legacy_model.get("status") or "UNKNOWN"),
+    )
 
 
 def evaluate_trade_decision(
@@ -85,8 +103,8 @@ def evaluate_trade_decision(
 
     records = outcomes if outcomes is not None else get_outcomes()
     model = calibration_model(records)
-    multiplier = calibrated_multiplier(
-        model,
+    multiplier, calibration_status = _effective_calibration_multiplier(
+        legacy_model=model,
         direction=direction,
         regime=candidate.get("market_regime"),
     )
@@ -118,7 +136,7 @@ def evaluate_trade_decision(
     )
 
     return TradeDecisionIntelligence(
-        calibration_status=str(model.get("status") or "UNKNOWN"),
+        calibration_status=calibration_status,
         calibration_multiplier=multiplier,
         projected_net_edge_pct=round(net_edge_pct, 4),
         quality_score=round(float(quality_score), 2),
