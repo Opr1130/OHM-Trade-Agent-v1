@@ -8,7 +8,11 @@ from typing import Any
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade, close_trade, get_active_trades
 from app.services.execution_learning_registry import record_execution_event
-from app.services.order_intent_registry import get_live_order_intents, mark_order_filled
+from app.services.order_intent_registry import (
+    get_live_order_intents,
+    mark_order_filled,
+    recover_orphaned_filled_intents,
+)
 
 
 @dataclass(frozen=True)
@@ -172,9 +176,25 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
     if not reconciliation_enabled():
         return ReconciliationSummary(status="DISABLED", mode=mode, reason="KRAKEN_RECONCILIATION_ENABLED is false")
 
+    recovery_note = ""
+    if mode == "apply":
+        try:
+            recovered, recovery_failures = recover_orphaned_filled_intents()
+            if recovered or recovery_failures:
+                recovery_note = (
+                    f"; orphan recovery recovered={len(recovered)} "
+                    f"failed={len(recovery_failures)}"
+                )
+        except Exception as exc:
+            recovery_note = f"; orphan recovery unavailable: {exc}"
+
     client = client or KrakenPrivateClient()
     if not client.enabled:
-        return ReconciliationSummary(status="UNAVAILABLE", mode=mode, reason="Kraken private credentials are not configured")
+        return ReconciliationSummary(
+            status="UNAVAILABLE",
+            mode=mode,
+            reason="Kraken private credentials are not configured" + recovery_note,
+        )
 
     try:
         key_info = client.assert_read_only()
@@ -188,7 +208,7 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
         trades = client.get_trades_history(start=history_start)
         positions = client.get_open_positions()
     except KrakenPrivateAPIError as exc:
-        return ReconciliationSummary(status="ERROR", mode=mode, reason=str(exc))
+        return ReconciliationSummary(status="ERROR", mode=mode, reason=str(exc) + recovery_note)
 
     would_close: list[str] = []
     closed: list[str] = []
@@ -293,5 +313,5 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
         would_fill=tuple(would_fill),
         filled=tuple(filled),
         unmatched_open_orders=max(0, len(open_orders) - len(matched_open_order_ids)),
-        reason="read-only account reconciliation complete",
+        reason="read-only account reconciliation complete" + recovery_note,
     )
