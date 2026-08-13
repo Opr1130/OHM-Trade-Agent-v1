@@ -41,10 +41,20 @@ def main() -> None:
     if external_review.reason:
         print("External review reason:", external_review.reason)
 
-    # Zero-paid-AI learning runs independently of trading mode. Most minute
-    # cycles make no market request because shadow observations are horizon-
-    # gated. The profitability calibration profile refreshes at most daily.
-    learning = run_learning_cycle()
+    # Learning is telemetry/adaptation, never a dependency for risk protection
+    # or scanning. Fail open if local storage/public market observation is not
+    # available so production lifecycle behavior is never blocked.
+    try:
+        learning = run_learning_cycle()
+    except Exception as exc:
+        learning = {
+            "status": "UNAVAILABLE",
+            "paid_ai_calls": 0,
+            "shadow": {"status": "UNAVAILABLE", "observations_added": 0},
+            "profile_refreshed": False,
+            "profile_status": "UNAVAILABLE",
+            "reason": str(exc),
+        }
     shadow = learning.get("shadow") or {}
     print("OHM Self-Learning")
     print("Status:", learning.get("status"))
@@ -53,6 +63,8 @@ def main() -> None:
     print("Shadow observations added:", shadow.get("observations_added", 0))
     print("Profile refreshed:", learning.get("profile_refreshed"))
     print("Profile status:", learning.get("profile_status"))
+    if learning.get("reason"):
+        print("Learning reason:", learning.get("reason"))
 
     decision = get_operator_decision()
     print("OHM Unified Cycle")
