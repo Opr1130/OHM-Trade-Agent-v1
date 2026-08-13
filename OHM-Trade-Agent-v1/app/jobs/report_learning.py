@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from app.services.decision_learning import decision_quality_summary
 from app.services.profitability_learning import build_profitability_profile
+from app.services.shadow_learning import get_shadow_records
 
 
 def main() -> None:
@@ -9,6 +11,7 @@ def main() -> None:
     shadow = profile.get("shadow_learning") or {}
     timing = profile.get("timing_learning") or {}
     loss = profile.get("loss_learning") or {}
+    decision = decision_quality_summary(get_shadow_records())
 
     print("===== OHM PROFITABILITY SELF-LEARNING =====")
     print("Generated:", profile.get("generated_at"))
@@ -26,6 +29,17 @@ def main() -> None:
     print("Decision accuracy %:", shadow.get("decision_accuracy_pct"))
     print("Missed profitable opportunities:", shadow.get("missed_profitable", 0))
     print("Correct rejections/waits:", shadow.get("correct_rejections", 0))
+    print()
+    print("DECISION QUALITY / IMMEDIATE VS WAIT")
+    print("Evaluated shadows:", decision.get("evaluated", 0))
+    print("Missed profitable opportunities:", decision.get("missed_profitable_opportunities", 0))
+    print("Correct wait/reject decisions:", decision.get("correct_wait_or_reject", 0))
+    for horizon, stats in (decision.get("immediate_vs_wait") or {}).items():
+        print(
+            f"Wait {horizon}: samples={stats.get('samples', 0)} "
+            f"avg delayed edge={stats.get('avg_delayed_edge_pct')}% "
+            f"sufficient={stats.get('sufficient_samples')}"
+        )
     print()
     print("EXECUTION TIMING")
     print("Financial samples:", timing.get("samples", 0))
