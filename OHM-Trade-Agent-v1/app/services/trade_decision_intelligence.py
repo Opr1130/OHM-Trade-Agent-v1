@@ -7,6 +7,7 @@ from app.services.capital_allocation import CapitalAllocation, recommend_capital
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.portfolio_risk import PortfolioRiskDecision, evaluate_portfolio_risk
 from app.services.self_calibration import calibration_model, calibrated_multiplier
+from app.services.shadow_learning import record_shadow_candidate
 from app.services.trade_outcome_registry import get_outcomes
 
 
@@ -40,6 +41,32 @@ def _projected_net_edge_pct(candidate: dict[str, Any], account_capital: float) -
     return 0.0
 
 
+def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: str) -> None:
+    """Persist a free counterfactual for every qualified deterministic survivor.
+
+    For LONG plans entry_high is the scan price; for SHORT plans entry_low is the
+    scan price. This lets OHM later verify whether ENTER/WAIT judgments were
+    correct at 5m..24h horizons without placing a trade or calling the Chief.
+    """
+    reference_price = plan.entry_low if direction == "SHORT" else plan.entry_high
+    decision = "ENTER_NOW" if plan.valid_now else "WAIT"
+    try:
+        record_shadow_candidate(
+            symbol=plan.symbol,
+            direction=direction,
+            decision=decision,
+            reference_price=float(reference_price),
+            market_regime=candidate.get("market_regime"),
+            technical_score=(float(candidate["technical_score"]) if isinstance(candidate.get("technical_score"), (int, float)) else None),
+            profit_rank_score=(float(candidate["profit_rank_score"]) if isinstance(candidate.get("profit_rank_score"), (int, float)) else None),
+            reason=plan.reason,
+            source="qualified_trade_decision",
+        )
+    except Exception:
+        # Learning telemetry must never block a live trading decision.
+        return
+
+
 def evaluate_trade_decision(
     *,
     candidate: dict[str, Any],
@@ -53,6 +80,8 @@ def evaluate_trade_decision(
     entry_reference = (plan.entry_low + plan.entry_high) / 2.0
     stop_distance_pct = abs(entry_reference - plan.stop_price) / entry_reference * 100.0
     net_edge_pct = _projected_net_edge_pct(candidate, account_capital)
+
+    _capture_shadow(candidate, plan, direction)
 
     records = outcomes if outcomes is not None else get_outcomes()
     model = calibration_model(records)
