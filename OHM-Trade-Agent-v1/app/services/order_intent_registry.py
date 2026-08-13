@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.services.active_trade_registry import ActiveTrade, add_trade
+from app.services.active_trade_registry import ActiveTrade, add_trade, get_trade
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -154,6 +154,67 @@ def cancel_order_intent(trade_id: str) -> OrderIntent:
         return _normalize(row)
 
 
+def _trade_from_filled_row(row: dict) -> ActiveTrade:
+    if row.get("stop_price") is None or row.get("target_1") is None or row.get("target_2") is None:
+        raise ValueError("filled intent is missing stop/target data")
+    fill_price = float(row.get("fill_price") or 0.0)
+    if fill_price <= 0:
+        raise ValueError("filled intent is missing a valid fill_price")
+    capital = float(row.get("capital") or 0.0)
+    if capital <= 0:
+        raise ValueError("filled intent is missing valid capital")
+    return ActiveTrade(
+        symbol=str(row.get("symbol") or "").upper(),
+        entry_price=fill_price,
+        stop_price=float(row["stop_price"]),
+        target_1=float(row["target_1"]),
+        target_2=float(row["target_2"]),
+        risk_level="manual",
+        trade_id=str(row.get("trade_id") or ""),
+        direction=str(row.get("direction") or "LONG").upper(),
+        margin_leverage=float(row.get("margin_leverage") or 1.0),
+        capital=capital,
+        actual_entry_fee=row.get("actual_entry_fee"),
+        opened_at=str(row.get("filled_at") or row.get("updated_at") or ""),
+    )
+
+
+def recover_orphaned_filled_intents() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Repair the crash window between FILLED intent persistence and active-trade creation.
+
+    FILLED intents are exchange/lifecycle truth. If one has no corresponding
+    active trade, reconstruct the active record from fields already persisted
+    with the fill. A conflicting different active trade is never overwritten.
+    """
+    with registry_lock(LOCK_FILE):
+        rows = [dict(row) for row in _load().values() if row.get("status") == "FILLED"]
+
+    recovered: list[str] = []
+    failures: list[str] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        trade_id = str(row.get("trade_id") or "")
+        if not symbol or not trade_id:
+            failures.append(f"{trade_id or symbol or 'UNKNOWN'}: filled intent missing identity")
+            continue
+        existing = get_trade(symbol)
+        if existing is not None and existing.status == "active":
+            if existing.trade_id == trade_id:
+                continue
+            failures.append(f"{trade_id}: conflicting active trade already exists for {symbol}")
+            continue
+        try:
+            trade = _trade_from_filled_row(row)
+            add_trade(trade)
+            from app.services.trade_outcome_registry import mark_trade_entered
+
+            mark_trade_entered(trade, entry_price_source="recovered_limit_fill")
+            recovered.append(trade_id)
+        except Exception as exc:
+            failures.append(f"{trade_id}: {exc}")
+    return tuple(recovered), tuple(failures)
+
+
 def mark_order_filled(
     trade_id: str,
     *,
@@ -179,22 +240,11 @@ def mark_order_filled(
         row["fill_price"] = fill_price
         row["actual_entry_fee"] = actual_entry_fee
         _save(data)
-        intent = _normalize(row)
+        persisted = dict(row)
 
-    trade = ActiveTrade(
-        symbol=intent.symbol,
-        entry_price=fill_price,
-        stop_price=float(intent.stop_price),
-        target_1=float(intent.target_1),
-        target_2=float(intent.target_2),
-        risk_level="manual",
-        trade_id=intent.trade_id,
-        direction=intent.direction,
-        margin_leverage=intent.margin_leverage,
-        capital=intent.capital,
-        actual_entry_fee=actual_entry_fee,
-    )
+    trade = _trade_from_filled_row(persisted)
     add_trade(trade)
     from app.services.trade_outcome_registry import mark_trade_entered
+
     mark_trade_entered(trade, entry_price_source="manual_limit_fill")
     return trade
