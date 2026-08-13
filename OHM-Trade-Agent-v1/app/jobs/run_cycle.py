@@ -5,6 +5,7 @@ from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_opportunities import main as scan_main
 from app.services.external_order_review import review_external_open_orders
 from app.services.kraken_reconciliation import reconcile_kraken_account
+from app.services.learning_scheduler import run_learning_cycle
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 
 
@@ -39,6 +40,19 @@ def main() -> None:
     print("Notifications sent:", external_review.notifications_sent)
     if external_review.reason:
         print("External review reason:", external_review.reason)
+
+    # Zero-paid-AI learning runs independently of trading mode. Most minute
+    # cycles make no market request because shadow observations are horizon-
+    # gated. The profitability calibration profile refreshes at most daily.
+    learning = run_learning_cycle()
+    shadow = learning.get("shadow") or {}
+    print("OHM Self-Learning")
+    print("Status:", learning.get("status"))
+    print("Paid AI calls:", learning.get("paid_ai_calls", 0))
+    print("Shadow status:", shadow.get("status"))
+    print("Shadow observations added:", shadow.get("observations_added", 0))
+    print("Profile refreshed:", learning.get("profile_refreshed"))
+    print("Profile status:", learning.get("profile_status"))
 
     decision = get_operator_decision()
     print("OHM Unified Cycle")
