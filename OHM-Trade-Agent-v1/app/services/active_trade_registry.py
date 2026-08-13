@@ -57,9 +57,20 @@ def _from_item(item: dict) -> ActiveTrade:
 
 
 def add_trade(trade: ActiveTrade) -> None:
+    trade.symbol = trade.symbol.upper()
     trade.direction = (trade.direction or "LONG").upper()
     with registry_lock(registry_lock_file()):
         data = _load_raw()
+        existing = data.get(trade.symbol)
+        if existing and existing.get("status") == "active":
+            existing_trade_id = str(existing.get("trade_id") or "")
+            incoming_trade_id = str(trade.trade_id or "")
+            # Recovery/retry of the exact same lifecycle transition is safe and
+            # idempotent. A different active trade on the same symbol must never
+            # be silently overwritten because that would orphan real exposure.
+            if existing_trade_id and incoming_trade_id and existing_trade_id == incoming_trade_id:
+                return
+            raise ValueError(f"active trade already exists for {trade.symbol}")
         if not trade.opened_at:
             trade.opened_at = datetime.now(timezone.utc).isoformat()
         data[trade.symbol] = asdict(trade)
@@ -68,7 +79,7 @@ def add_trade(trade: ActiveTrade) -> None:
 
 def get_trade(symbol: str) -> ActiveTrade | None:
     with registry_lock(registry_lock_file()):
-        item = _load_raw().get(symbol)
+        item = _load_raw().get(symbol.upper())
     return _from_item(item) if item else None
 
 
@@ -86,6 +97,7 @@ def close_trade(
     financing_fee: float | None = None,
     reason: str = "manual_close",
 ) -> bool:
+    symbol = symbol.upper()
     trade_id = ""
     closed = False
     final_price = close_price
