@@ -89,6 +89,7 @@ def test_summary_separates_today_and_all_time(monkeypatch, tmp_path):
 
 
 def test_dashboard_html_is_public_but_analytics_api_requires_secret(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_SECRET", "dashboard-test-secret")
     client = TestClient(app)
     page = client.get("/dashboard")
     assert page.status_code == 200
