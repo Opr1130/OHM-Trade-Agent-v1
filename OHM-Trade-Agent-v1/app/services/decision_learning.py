@@ -47,9 +47,9 @@ def _directional_return(direction: str, entry: float, exit_price: float) -> floa
 def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
     """Classify one shadow decision from future directional price movement.
 
-    This is outcome-observation evidence, not a claim of executable profit. For
-    ENTER decisions, delayed-entry edge is computed from actual observed prices
-    to the same terminal 24h price rather than by subtracting path percentages.
+    New shadow records use actual observed prices for delayed-entry comparison.
+    Older records that contain only directional moves retain the original
+    percentage-path approximation so historical learning remains usable.
     """
     decision = str(row.get("decision") or "UNKNOWN").upper()
     direction = str(row.get("direction") or "LONG").upper()
@@ -78,13 +78,18 @@ def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
         prices = _prices(row)
         reference = _num(row.get("reference_price"))
         terminal_price = prices.get("24h")
-        if reference and reference > 0 and terminal_price and terminal_price > 0:
-            immediate_return = _directional_return(direction, reference, terminal_price)
-            for horizon in ("5m", "15m", "30m", "1h"):
-                delayed_entry = prices.get(horizon)
-                if delayed_entry and delayed_entry > 0:
-                    delayed_return = _directional_return(direction, delayed_entry, terminal_price)
-                    immediate_vs_wait[horizon] = round(delayed_return - immediate_return, 6)
+        terminal_move = moves.get("24h")
+        for horizon in ("5m", "15m", "30m", "1h"):
+            if horizon not in moves:
+                continue
+            delayed_entry = prices.get(horizon)
+            if reference and reference > 0 and terminal_price and terminal_price > 0 and delayed_entry and delayed_entry > 0:
+                immediate_return = _directional_return(direction, reference, terminal_price)
+                delayed_return = _directional_return(direction, delayed_entry, terminal_price)
+                immediate_vs_wait[horizon] = round(delayed_return - immediate_return, 6)
+            elif terminal_move is not None:
+                # Compatibility for v1 shadow records that did not persist price.
+                immediate_vs_wait[horizon] = round(terminal_move - moves[horizon], 6)
 
     return {
         "status": "EVALUATED",
