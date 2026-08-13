@@ -37,13 +37,11 @@ def _projected_net_edge_pct(candidate: dict[str, Any], account_capital: float) -
         return max(0.0, float(net_t2) / account_capital * 100.0)
     gross_move = candidate.get("economic_target_2_move_pct")
     if isinstance(gross_move, (int, float)):
-        # Conservative fallback when the economic gate did not expose dollar net.
         return max(0.0, float(gross_move) - 0.8)
     return 0.0
 
 
 def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: str) -> None:
-    """Persist a free counterfactual for every qualified deterministic survivor."""
     reference_price = plan.entry_low if direction == "SHORT" else plan.entry_high
     decision = "ENTER_NOW" if plan.valid_now else "WAIT"
     try:
@@ -59,7 +57,6 @@ def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: s
             source="qualified_trade_decision",
         )
     except Exception:
-        # Learning telemetry must never block a live trading decision.
         return
 
 
@@ -71,12 +68,13 @@ def _effective_calibration_multiplier(
 ) -> tuple[float, str]:
     """Prefer the persisted net-profit learner once it has enough evidence.
 
-    The persisted profile is refreshed locally and can change future sizing
-    without code changes. Until it is calibrated, the existing historical
-    model remains the fallback. Both paths are bounded by existing sizing
-    guardrails and neither can alter qualification/risk rules.
+    Any profile read/storage failure falls back to the existing model so the
+    self-learning layer can never block or destabilize a live trade decision.
     """
-    persisted = learned_multiplier(direction=direction, regime=regime)
+    try:
+        persisted = learned_multiplier(direction=direction, regime=regime)
+    except Exception:
+        persisted = 1.0
     if persisted != 1.0:
         return persisted, "PROFITABILITY_PROFILE"
     return (
@@ -109,8 +107,6 @@ def evaluate_trade_decision(
         regime=candidate.get("market_regime"),
     )
 
-    # Profit Rank is deterministic and preferred for sizing. Technical score is
-    # the fallback. AI confidence is not treated as a probability.
     quality_score = candidate.get("profit_rank_score")
     if not isinstance(quality_score, (int, float)):
         quality_score = candidate.get("technical_score")
