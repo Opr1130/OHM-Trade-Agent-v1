@@ -7,6 +7,10 @@ from openai import OpenAI
 from app.scanner.models import MarketSnapshot
 from app.scanner.short_technical_scorer import score_short_snapshot
 from app.scanner.technical_scorer import score_snapshot
+from app.services.chief_learning_capture import (
+    capture_chief_review_decisions,
+    capture_prefilter_rejection,
+)
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
@@ -157,11 +161,17 @@ def review_candidates(
             continue
         unique_candidates.append(candidate)
 
+    chief_eligible_candidates: list[MarketSnapshot] = []
     for candidate in unique_candidates:
         quality_by_risk_level = None
         if account_equity is not None:
             quality_by_risk_level, viable = _quality_by_risk_level(candidate, account_equity)
             if not viable:
+                capture_prefilter_rejection(
+                    candidate,
+                    quality_by_risk_level=quality_by_risk_level,
+                    market_regime_context=market_regime_context,
+                )
                 continue
 
         direction = candidate.trade_direction.upper()
@@ -253,6 +263,7 @@ def review_candidates(
         if quality_by_risk_level is not None:
             candidate_context["deterministic_quality_by_risk_level"] = quality_by_risk_level
         payload.append(candidate_context)
+        chief_eligible_candidates.append(candidate)
 
     if account_equity is not None and not payload:
         return _no_trade_review(
@@ -301,4 +312,18 @@ def review_candidates(
     review = json.loads(response.output_text)
     review["chief_api_skipped"] = False
     review["chief_eligible_candidates"] = len(payload)
+    try:
+        review["learning_capture"] = capture_chief_review_decisions(
+            review,
+            eligible_candidates=chief_eligible_candidates,
+            market_regime_context=market_regime_context,
+        )
+    except Exception:
+        # Learning telemetry must never block or alter a live trading decision.
+        review["learning_capture"] = {
+            "captured": 0,
+            "qualified_alerts_deferred": 0,
+            "not_selected": 0,
+            "unmatched": 0,
+        }
     return review
