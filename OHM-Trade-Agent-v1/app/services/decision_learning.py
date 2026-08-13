@@ -26,14 +26,33 @@ def _moves(row: dict[str, Any]) -> dict[str, float]:
     return result
 
 
+def _prices(row: dict[str, Any]) -> dict[str, float]:
+    observations = row.get("observations") or {}
+    result: dict[str, float] = {}
+    for horizon, item in observations.items():
+        if not isinstance(item, dict):
+            continue
+        price = _num(item.get("price"))
+        if price is not None and price > 0:
+            result[str(horizon)] = price
+    return result
+
+
+def _directional_return(direction: str, entry: float, exit_price: float) -> float:
+    if direction.upper() == "SHORT":
+        return (entry / exit_price - 1.0) * 100.0
+    return (exit_price / entry - 1.0) * 100.0
+
+
 def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
     """Classify one shadow decision from future directional price movement.
 
-    This is intentionally outcome-observation only. It does not assert that a
-    missed move would have been executable or profitable after fees; it labels
-    candidates for later review and calibration evidence.
+    This is outcome-observation evidence, not a claim of executable profit. For
+    ENTER decisions, delayed-entry edge is computed from actual observed prices
+    to the same terminal 24h price rather than by subtracting path percentages.
     """
     decision = str(row.get("decision") or "UNKNOWN").upper()
+    direction = str(row.get("direction") or "LONG").upper()
     moves = _moves(row)
     if not moves:
         return {
@@ -47,20 +66,25 @@ def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
 
     best = max(moves.values())
     worst = min(moves.values())
-    is_non_entry = decision in {"WAIT", "REJECT", "TARGET_REJECT", "ECONOMIC_REJECT", "EXECUTION_REJECT", "MARGIN_REJECT"}
+    is_non_entry = decision in {
+        "WAIT", "REJECT", "TARGET_REJECT", "ECONOMIC_REJECT",
+        "EXECUTION_REJECT", "MARGIN_REJECT",
+    }
     missed = is_non_entry and best >= MISS_THRESHOLD_PCT
     correct_avoid = is_non_entry and best < MISS_THRESHOLD_PCT and worst <= AVOIDED_LOSS_THRESHOLD_PCT
 
-    # For ENTER decisions, compare immediate reference against delayed shadow
-    # points. Positive delayed edge means a later entry would have provided a
-    # better directional starting point for the same eventual move.
     immediate_vs_wait: dict[str, float] = {}
-    if decision in {"ENTER", "ENTER_NOW", "ALERT"}:
-        terminal = moves.get("24h")
-        if terminal is not None:
+    if decision in {"ENTER", "ENTER_NOW", "ALERT", "QUALIFIED"}:
+        prices = _prices(row)
+        reference = _num(row.get("reference_price"))
+        terminal_price = prices.get("24h")
+        if reference and reference > 0 and terminal_price and terminal_price > 0:
+            immediate_return = _directional_return(direction, reference, terminal_price)
             for horizon in ("5m", "15m", "30m", "1h"):
-                if horizon in moves:
-                    immediate_vs_wait[horizon] = round(terminal - moves[horizon], 6)
+                delayed_entry = prices.get(horizon)
+                if delayed_entry and delayed_entry > 0:
+                    delayed_return = _directional_return(direction, delayed_entry, terminal_price)
+                    immediate_vs_wait[horizon] = round(delayed_return - immediate_return, 6)
 
     return {
         "status": "EVALUATED",
@@ -109,6 +133,7 @@ def decision_quality_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any
             horizon: {
                 "samples": len(values),
                 "avg_delayed_edge_pct": round(mean(values), 6),
+                "wait_was_better_rate_pct": round(sum(v > 0 for v in values) / len(values) * 100.0, 2),
                 "sufficient_samples": len(values) >= MIN_BUCKET_SAMPLES,
             }
             for horizon, values in sorted(wait_edges.items())
