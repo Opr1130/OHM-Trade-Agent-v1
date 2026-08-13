@@ -20,7 +20,16 @@ class MonitorRunSummary:
 
 def run_active_trade_monitor() -> MonitorRunSummary:
     settings = get_settings()
-    trades = get_active_trades()
+    try:
+        trades = get_active_trades()
+    except Exception as exc:
+        return MonitorRunSummary(
+            active_trades=0,
+            checked=0,
+            monitor_notifications_sent=0,
+            emergency_notifications_sent=0,
+            failures=[f"active trade registry unavailable: {exc}"],
+        )
 
     checked = 0
     monitor_notifications_sent = 0
