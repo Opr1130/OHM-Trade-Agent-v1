@@ -5,13 +5,14 @@ from fastapi.responses import HTMLResponse
 
 from app.core.config import get_settings
 from app.services.operations_analytics import build_operations_summary
+from app.services.secret_auth import secret_matches
 
 
 router = APIRouter()
 
 
 def _require_secret(value: str | None) -> None:
-    if value != get_settings().webhook_secret:
+    if not secret_matches(value, get_settings().webhook_secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid dashboard secret")
 
 
