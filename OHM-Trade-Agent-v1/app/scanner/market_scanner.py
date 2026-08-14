@@ -23,6 +23,7 @@ from app.scanner.universe import (
 
 MIN_CANDLES_REQUIRED = 200
 MAX_WORKERS = 8
+EXECUTION_VALIDATION_MAX_POSITION_FRACTION = 0.20
 
 
 @dataclass
@@ -364,12 +365,17 @@ def confirm_secondary_markets(
 
 def deep_validate_candidates(
     candidates: list[MarketSnapshot],
-    validation_notional_usd: float,
+    account_equity_usd: float,
     usdt_usd_rate: float | None,
     client: KrakenClient | None = None,
 ) -> list[MarketSnapshot]:
     client = client or KrakenClient()
     validated: list[MarketSnapshot] = []
+    # Execution quality should model a plausible maximum posted position, not
+    # pretend every candidate will consume the entire account. The 20% ceiling
+    # matches the allocator's default max-position envelope and remains an
+    # upper-bound validation notional before final per-trade sizing exists.
+    validation_notional_usd = max(0.01, account_equity_usd * EXECUTION_VALIDATION_MAX_POSITION_FRACTION)
     for candidate in candidates[:8]:
         symbol = candidate.kraken_public_symbol or candidate.symbol
         try:
