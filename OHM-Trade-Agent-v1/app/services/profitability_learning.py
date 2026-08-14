@@ -42,14 +42,32 @@ def _financial_trade_rows(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _net_success(row: dict[str, Any]) -> float:
+    """Compatibility/reporting helper; sizing is driven by expectancy below."""
     net = _num(row.get("net_pnl"))
     return 1.0 if net is not None and net > 0 else 0.0
+
+
+def _expectancy_adjustment(bucket: list[dict[str, Any]], all_rows: list[dict[str, Any]]) -> tuple[float, float, float]:
+    """Return bounded-relative expectancy signal and the underlying means.
+
+    Dollar expectancy is the primary realized objective. The relative delta is
+    normalized by average absolute realized P/L so one unusually large trade
+    cannot create an unbounded live sizing change; the final weight is still
+    constrained by MAX_WEIGHT_ADJUSTMENT.
+    """
+    global_values = [float(row["net_pnl"]) for row in all_rows]
+    bucket_values = [float(row["net_pnl"]) for row in bucket]
+    baseline = mean(global_values)
+    bucket_expectancy = mean(bucket_values)
+    scale = max(1.0, mean(abs(value) for value in global_values))
+    return (bucket_expectancy - baseline) / scale, baseline, bucket_expectancy
 
 
 def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float], dict[str, Any]]:
     if len(rows) < MIN_TRADE_SAMPLES:
         return {}, {"status": "INSUFFICIENT_DATA", "samples": len(rows), "minimum_required": MIN_TRADE_SAMPLES}
-    baseline = mean(_net_success(row) for row in rows)
+    baseline_expectancy = mean(float(row["net_pnl"]) for row in rows)
+    baseline_win_rate = mean(_net_success(row) for row in rows)
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         buckets[f"direction:{str(row.get('direction') or 'UNKNOWN').upper()}"].append(row)
@@ -59,18 +77,23 @@ def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float],
     for name, bucket in buckets.items():
         if len(bucket) < MIN_BUCKET_SAMPLES:
             continue
+        expectancy_delta, _, bucket_expectancy = _expectancy_adjustment(bucket, rows)
         success = mean(_net_success(row) for row in bucket)
-        weights[name] = _bounded_weight(success - baseline)
-        net_values = [float(row["net_pnl"]) for row in bucket if _num(row.get("net_pnl")) is not None]
+        weights[name] = _bounded_weight(expectancy_delta)
+        net_values = [float(row["net_pnl"]) for row in bucket]
         evidence[name] = {
             "samples": len(bucket),
             "net_win_rate": round(success, 4),
-            "avg_net_pnl": round(mean(net_values), 8) if net_values else None,
+            "avg_net_pnl": round(bucket_expectancy, 8),
+            "net_pnl_sum": round(sum(net_values), 8),
+            "expectancy_delta_normalized": round(expectancy_delta, 6),
         }
     return weights, {
         "status": "CALIBRATED",
         "samples": len(rows),
-        "baseline_net_win_rate": round(baseline, 4),
+        "baseline_net_win_rate": round(baseline_win_rate, 4),
+        "baseline_avg_net_pnl": round(baseline_expectancy, 8),
+        "objective": "realized_net_pnl_expectancy_after_costs",
         "evidence": evidence,
     }
 
