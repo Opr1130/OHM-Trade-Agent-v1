@@ -31,9 +31,42 @@ def capture_entry_financials(trade: ActiveTrade) -> None:
         save_json_atomic(OUTCOME_FILE, data)
 
 
+def _mark_financing_unknown(trade: ActiveTrade) -> dict:
+    result = {
+        "status": "FINANCING_FEE_REQUIRED",
+        "symbol": trade.symbol,
+        "direction": trade.direction,
+        "net_pnl": None,
+    }
+    with registry_lock(registry_lock_file()):
+        data = load_json(OUTCOME_FILE)
+        key = _find_key(data, trade.trade_id, trade.symbol)
+        if key is None:
+            return result
+        item = data[key]
+        item.update({
+            "capital": trade.capital,
+            "actual_entry_fee": trade.actual_entry_fee,
+            "actual_exit_fee": trade.actual_exit_fee,
+            "financing_fee": None,
+            "net_pnl": None,
+            "net_pnl_pct_on_capital": None,
+            "net_profitable": None,
+            "fee_accounting_status": "FINANCING_FEE_REQUIRED",
+        })
+        save_json_atomic(OUTCOME_FILE, data)
+    return result
+
+
 def finalize_financial_outcome(trade: ActiveTrade) -> dict | None:
     if trade.close_price is None or trade.capital is None:
         return None
+    if trade.direction.upper() == "SHORT" and not trade.financing_fee_known:
+        # Zero is not silently assumed to be the actual margin financing cost.
+        # Keep the lifecycle closed but exclude the outcome from realized-P/L
+        # learning until an explicit financing amount is captured.
+        return _mark_financing_unknown(trade)
+
     pnl = calculate_fee_aware_pnl(
         direction=trade.direction,
         entry_price=trade.entry_price,
