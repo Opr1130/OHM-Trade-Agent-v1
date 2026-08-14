@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -54,7 +58,11 @@ def load_json(path: Path) -> dict:
         return {}
     try:
         return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError as exc:
+        logger.error("Malformed registry JSON at %s: %s", path, exc)
+        return {}
+    except OSError as exc:
+        logger.error("Registry read failed at %s: %s", path, exc)
         return {}
 
 
