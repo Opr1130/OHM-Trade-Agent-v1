@@ -94,7 +94,7 @@ def evaluate_economic_quality(
         and account_risk_at_stop_pct > max_account_risk_at_stop_pct
     ):
         rejection_reason = (
-            f"Stop exposure {account_risk_at_stop_pct:.2f}% exceeds "
+            f"stop exposure {account_risk_at_stop_pct:.2f}% exceeds "
             f"maximum {max_account_risk_at_stop_pct:.2f}% of account equity"
         )
 
