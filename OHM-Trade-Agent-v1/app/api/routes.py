@@ -52,7 +52,7 @@ class FillRequest(BaseModel):
 class CloseTradeRequest(BaseModel):
     close_price: float = Field(gt=0)
     actual_exit_fee: float | None = Field(default=None, ge=0)
-    financing_fee: float = Field(default=0.0, ge=0)
+    financing_fee: float | None = Field(default=None, ge=0)
     reason: str = "manual_close"
 
 
@@ -152,6 +152,8 @@ def operator_trade_pnl(symbol: str, request: PnLRequest, x_webhook_secret: str |
         raise HTTPException(status_code=404, detail="Active trade not found")
     if trade.capital is None:
         raise HTTPException(status_code=409, detail="Trade capital is unknown; fee-aware P/L cannot be computed")
+    if trade.direction.upper() == "SHORT" and not trade.financing_fee_known:
+        raise HTTPException(status_code=409, detail="Short financing cost is not yet known; exact net P/L is unavailable")
     return calculate_fee_aware_pnl(
         direction=trade.direction,
         entry_price=trade.entry_price,
