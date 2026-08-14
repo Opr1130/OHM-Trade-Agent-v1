@@ -18,6 +18,7 @@ from app.services.order_intent_registry import (
 )
 from app.services.risk import build_risk_plan
 from app.services.scoring import score_signal
+from app.services.secret_auth import secret_matches
 from app.services.telegram_notifier import format_trade_alert, send_telegram_message
 
 
@@ -60,7 +61,7 @@ class PnLRequest(BaseModel):
 
 
 def _require_operator_secret(x_webhook_secret: str | None) -> None:
-    if x_webhook_secret != get_settings().webhook_secret:
+    if not secret_matches(x_webhook_secret, get_settings().webhook_secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator secret")
 
 
@@ -186,7 +187,7 @@ def operator_close_trade(symbol: str, request: CloseTradeRequest, x_webhook_secr
 @router.post("/webhooks/tradingview", response_model=SignalDecision)
 def tradingview_webhook(signal: TradingSignal, x_webhook_secret: str | None = Header(default=None)) -> SignalDecision:
     settings = get_settings()
-    if x_webhook_secret != settings.webhook_secret:
+    if not secret_matches(x_webhook_secret, settings.webhook_secret):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid webhook secret")
 
     deterministic_score, reasons = score_signal(signal)
