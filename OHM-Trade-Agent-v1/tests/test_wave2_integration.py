@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from app.backtesting.historical_data import load_kraken_candles
 from app.models.signal import TradingSignal
 from app.services.drawdown_guard import DrawdownPolicy
+from app.services.edge_validation import build_edge_validation_report
 from app.services.execution_analytics import execution_quality_summary
 from app.services.historical_analytics import historical_summary
 from app.services.risk import build_risk_plan
@@ -108,3 +109,29 @@ def test_kraken_history_adapter_drops_forming_candle_and_sorts():
     assert len(candles) == 2
     assert [int(c.timestamp.timestamp()) for c in candles] == [100, 200]
     assert candles[0].close == 1.5
+
+
+def test_edge_report_never_auto_promotes_strategy():
+    outcomes = [
+        {"entered_trade": True, "terminal_status": "CLOSED", "net_pnl": 1.0}
+        for _ in range(5)
+    ]
+    execution = [
+        {"symbol": "BTCUSD", "direction": "LONG", "fill_vs_limit_pct": 0.01}
+        for _ in range(5)
+    ]
+    shadows = [
+        {
+            "decision": "WAIT",
+            "observations": {"1h": {"directional_move_pct": -2.5}},
+        }
+        for _ in range(8)
+    ]
+    report = build_edge_validation_report(
+        outcomes=outcomes,
+        shadow_records=shadows,
+        execution_records=execution,
+    )
+    assert report["status"] == "EVIDENCE_READY"
+    assert report["readiness"]["all"] is True
+    assert report["auto_promotion_allowed"] is False
