@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+from app.backtesting.historical_data import load_kraken_candles
 from app.models.signal import TradingSignal
 from app.services.drawdown_guard import DrawdownPolicy
 from app.services.execution_analytics import execution_quality_summary
@@ -86,3 +89,22 @@ def test_execution_quality_reports_slippage_latency_and_fees():
     assert overall["avg_order_to_first_fill_seconds"] == 4.0
     assert overall["total_fees"] == 12.5
     assert overall["sufficient_samples"] is True
+
+
+def test_kraken_history_adapter_drops_forming_candle_and_sorts():
+    rows = [
+        SimpleNamespace(timestamp=200, open=2, high=3, low=1, close=2.5, volume=20),
+        SimpleNamespace(timestamp=100, open=1, high=2, low=0.5, close=1.5, volume=10),
+        SimpleNamespace(timestamp=300, open=3, high=4, low=2, close=3.5, volume=30),
+    ]
+
+    class FakeClient:
+        def get_ohlc(self, pair, interval=60, since=None):
+            assert pair == "BTCUSD"
+            assert interval == 60
+            return rows
+
+    candles = load_kraken_candles("BTCUSD", client=FakeClient())
+    assert len(candles) == 2
+    assert [int(c.timestamp.timestamp()) for c in candles] == [100, 200]
+    assert candles[0].close == 1.5
