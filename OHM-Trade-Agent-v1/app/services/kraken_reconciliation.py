@@ -9,6 +9,7 @@ from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateCli
 from app.services.active_trade_registry import ActiveTrade, close_trade, get_active_trades
 from app.services.execution_learning_registry import record_execution_event
 from app.services.order_intent_registry import (
+    bind_exchange_order_txid,
     get_live_order_intents,
     mark_order_filled,
     recover_orphaned_filled_intents,
@@ -91,10 +92,13 @@ def _matching_fills(
     symbol: str,
     side: str,
     after_epoch: int | None,
+    order_txid: str | None = None,
 ) -> list[dict[str, Any]]:
     wanted_pair = _canonical_pair(symbol)
     result: list[dict[str, Any]] = []
     for txid, row in trades.items():
+        if order_txid is not None and str(row.get("ordertxid") or "") != order_txid:
+            continue
         if _canonical_pair(str(row.get("pair") or "")) != wanted_pair:
             continue
         if str(row.get("type") or "").lower() != side.lower():
@@ -257,17 +261,35 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
                 closed.append(trade.symbol)
 
     for intent in intents:
-        for order_id, row in open_orders.items():
-            if _order_matches_intent(row, intent):
-                matched_open_order_ids.add(order_id)
-                record_execution_event(
-                    intent.trade_id,
-                    symbol=intent.symbol,
-                    direction=intent.direction,
-                    signal_at=intent.created_at,
-                    order_placed_at=_epoch_to_iso(row.get("opentm")) or intent.created_at,
-                    limit_price=intent.limit_price,
-                )
+        matching_open_ids = [
+            order_id
+            for order_id, row in open_orders.items()
+            if _order_matches_intent(row, intent)
+        ]
+        matched_open_order_ids.update(matching_open_ids)
+
+        order_txid = intent.exchange_order_txid
+        if order_txid:
+            # A persisted exact binding is authoritative. Do not let a similar
+            # manual order on the same pair/side/time contaminate attribution.
+            matching_open_ids = [order_id for order_id in matching_open_ids if order_id == order_txid]
+        elif len(matching_open_ids) == 1:
+            # A unique open-order match can be used exactly for this cycle. In
+            # apply mode persist it so later closed-order fills stay exact.
+            order_txid = matching_open_ids[0]
+            if mode == "apply":
+                bind_exchange_order_txid(intent.trade_id, order_txid)
+
+        for order_id in matching_open_ids:
+            row = open_orders[order_id]
+            record_execution_event(
+                intent.trade_id,
+                symbol=intent.symbol,
+                direction=intent.direction,
+                signal_at=intent.created_at,
+                order_placed_at=_epoch_to_iso(row.get("opentm")) or intent.created_at,
+                limit_price=intent.limit_price,
+            )
 
         entry_side = "buy" if intent.direction.upper() == "LONG" else "sell"
         entry_fills = _matching_fills(
@@ -275,6 +297,7 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
             symbol=intent.symbol,
             side=entry_side,
             after_epoch=_iso_to_epoch(intent.created_at),
+            order_txid=order_txid,
         )
         qty, vwap, fee, first_at, last_at = _fill_stats(entry_fills)
         intended_notional = intent.capital * max(1.0, float(intent.margin_leverage or 1.0))
