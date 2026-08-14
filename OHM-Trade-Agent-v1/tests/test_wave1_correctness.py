@@ -47,7 +47,7 @@ def test_long_economic_gate_enforces_same_account_stop_risk_cap():
     result = evaluate_economic_quality(plan, 10_000, min_net_profit=1.0)
     assert not result.qualified
     assert result.account_risk_at_stop_pct == 10.0
-    assert "Stop exposure" in result.rejection_reason
+    assert "stop exposure" in result.rejection_reason.lower()
 
 
 def _financial_rows():
