@@ -25,6 +25,7 @@ class ActiveTrade:
     actual_entry_fee: float | None = None
     actual_exit_fee: float | None = None
     financing_fee: float = 0.0
+    financing_fee_known: bool = False
     closed_at: str | None = None
     close_price: float | None = None
     close_reason: str | None = None
@@ -50,6 +51,7 @@ def _from_item(item: dict) -> ActiveTrade:
     normalized.setdefault("actual_entry_fee", None)
     normalized.setdefault("actual_exit_fee", None)
     normalized.setdefault("financing_fee", 0.0)
+    normalized.setdefault("financing_fee_known", False)
     normalized.setdefault("closed_at", None)
     normalized.setdefault("close_price", None)
     normalized.setdefault("close_reason", None)
@@ -125,6 +127,9 @@ def close_trade(
             if financing_fee < 0:
                 raise ValueError("financing_fee cannot be negative")
             item["financing_fee"] = financing_fee
+            item["financing_fee_known"] = True
+        else:
+            item.setdefault("financing_fee_known", False)
         _save_raw(data)
         closed_trade = _from_item(item)
         closed = True
