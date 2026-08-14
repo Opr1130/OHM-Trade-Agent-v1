@@ -32,6 +32,7 @@ class OrderIntent:
     filled_at: str | None = None
     cancelled_at: str | None = None
     actual_entry_fee: float | None = None
+    exchange_order_txid: str | None = None
 
 
 def _now() -> str:
@@ -56,6 +57,7 @@ def _normalize(item: dict) -> OrderIntent:
     normalized.setdefault("filled_at", None)
     normalized.setdefault("cancelled_at", None)
     normalized.setdefault("actual_entry_fee", None)
+    normalized.setdefault("exchange_order_txid", None)
     normalized.pop("fill_price", None)
     return OrderIntent(**normalized)
 
@@ -100,6 +102,25 @@ def list_order_intents() -> list[OrderIntent]:
     with registry_lock(LOCK_FILE):
         data = _load()
     return [_normalize(row) for row in data.values()]
+
+
+def bind_exchange_order_txid(trade_id: str, order_txid: str) -> OrderIntent:
+    """Persist an exact exchange-order identity once reconciliation discovers it."""
+    order_txid = str(order_txid or "").strip()
+    if not order_txid:
+        raise ValueError("order_txid is required")
+    with registry_lock(LOCK_FILE):
+        data = _load()
+        if trade_id not in data:
+            raise KeyError(trade_id)
+        row = data[trade_id]
+        existing = str(row.get("exchange_order_txid") or "")
+        if existing and existing != order_txid:
+            raise ValueError(f"intent {trade_id} is already bound to a different exchange order")
+        row["exchange_order_txid"] = order_txid
+        row["updated_at"] = _now()
+        _save(data)
+        return _normalize(row)
 
 
 def update_limit_order(
