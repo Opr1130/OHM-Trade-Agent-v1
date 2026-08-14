@@ -45,13 +45,19 @@ def recommend_capital(
     # Stop risk is applied to leveraged notional, not only posted capital.
     risk_sized_capital = risk_budget / ((stop_distance_pct / 100.0) * leverage)
     cap = available_capital * max_position_pct / 100.0
-    recommended = min(cap, risk_sized_capital) * quality * edge_factor * calibration
-    recommended = max(0.0, min(cap, recommended))
+    hard_cap = min(cap, risk_sized_capital)
+
+    # Calibration may reduce or increase a recommendation inside the allowed
+    # envelope, but it must never increase posted capital past the hard stop-
+    # risk budget. This keeps learned sizing subordinate to deterministic risk.
+    recommended = hard_cap * quality * edge_factor * calibration
+    recommended = max(0.0, min(hard_cap, recommended))
     risk_dollars = recommended * leverage * stop_distance_pct / 100.0
+    risk_dollars = min(risk_budget, risk_dollars)
 
     return CapitalAllocation(
         round(recommended, 2),
         round(risk_dollars, 2),
         round(recommended / available_capital * 100, 2),
-        "risk-, quality-, edge-, leverage-, and calibration-adjusted",
+        "risk-, quality-, edge-, leverage-, and calibration-adjusted; hard risk budget enforced",
     )
