@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
+DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
+
+
 @dataclass
 class EconomicGateResult:
     qualified: bool
@@ -37,7 +40,7 @@ def evaluate_economic_quality(
     direction: str | None = None,
     leverage: float = 1.0,
     estimated_margin_cost_pct: float = 0.0,
-    max_account_risk_at_stop_pct: float | None = None,
+    max_account_risk_at_stop_pct: float | None = DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
 ) -> EconomicGateResult:
     direction = (direction or getattr(plan, "direction", "LONG") or "LONG").upper()
     if direction not in {"LONG", "SHORT"}:
@@ -91,7 +94,7 @@ def evaluate_economic_quality(
         and account_risk_at_stop_pct > max_account_risk_at_stop_pct
     ):
         rejection_reason = (
-            f"Leveraged stop exposure {account_risk_at_stop_pct:.2f}% exceeds "
+            f"stop exposure {account_risk_at_stop_pct:.2f}% exceeds "
             f"maximum {max_account_risk_at_stop_pct:.2f}% of account equity"
         )
 

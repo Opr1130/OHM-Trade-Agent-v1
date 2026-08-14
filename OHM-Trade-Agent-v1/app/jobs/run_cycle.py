@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_opportunities import main as scan_main
-from app.services.external_order_review import review_external_open_orders
-from app.services.kraken_reconciliation import reconcile_kraken_account
+from app.services.external_order_review import ExternalOrderReviewSummary, review_external_open_orders
+from app.services.kraken_reconciliation import ReconciliationSummary, reconcile_kraken_account
 from app.services.learning_scheduler import run_learning_cycle
 from app.services.operations_analytics import run_scan_with_telemetry
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
+from app.services.registry_io import registry_lock
 
 
-def main() -> None:
+CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
+
+
+def _run_cycle_once() -> None:
     # Reconcile the exchange first so stale OHM lifecycle state cannot drive
-    # monitoring, capacity decisions, or duplicate alerts. The integration is
-    # read-only at the Kraken boundary; mutation of OHM state is separately
-    # gated by KRAKEN_RECONCILIATION_MODE=apply.
-    reconciliation = reconcile_kraken_account()
+    # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
+    # important, but a local lock/storage failure must never prevent the active
+    # risk monitor from running later in this cycle.
+    try:
+        reconciliation = reconcile_kraken_account()
+    except Exception as exc:
+        reconciliation = ReconciliationSummary(
+            status="UNAVAILABLE",
+            mode="observe",
+            reason=f"reconciliation failed open: {type(exc).__name__}: {exc}",
+        )
     print("OHM Kraken Reconciliation")
     print("Status:", reconciliation.status)
     print("Mode:", reconciliation.mode)
@@ -30,10 +43,16 @@ def main() -> None:
     if reconciliation.reason:
         print("Reconciliation reason:", reconciliation.reason)
 
-    # Unmatched Kraken orders are visible but remain external/unmanaged. Send
-    # a one-time informational review per Kraken order ID and persist the fact
-    # that it was reviewed so the unified minute cycle cannot spam Telegram.
-    external_review = review_external_open_orders()
+    # Unmatched Kraken orders are informational. A failure in this optional
+    # review must not block learning, operator-state evaluation, or active risk
+    # protection.
+    try:
+        external_review = review_external_open_orders()
+    except Exception as exc:
+        external_review = ExternalOrderReviewSummary(
+            status="UNAVAILABLE",
+            reason=f"external order review failed open: {type(exc).__name__}: {exc}",
+        )
     print("OHM External Order Review")
     print("Status:", external_review.status)
     print("Unmatched orders:", external_review.unmatched_orders_seen)
@@ -108,6 +127,17 @@ def main() -> None:
     # while teeing it unchanged to stdout. Telemetry is fail-open and does not
     # participate in trade decisions.
     run_scan_with_telemetry(scan_main)
+
+
+def main() -> None:
+    # The unified cycle has cross-registry sequencing assumptions. Never allow
+    # two scheduled invocations to interleave. This is deliberately
+    # non-blocking: if a previous cycle is still running, skip the new one.
+    try:
+        with registry_lock(CYCLE_LOCK_FILE, timeout=0.0):
+            _run_cycle_once()
+    except TimeoutError:
+        print("OHM Unified Cycle skipped: previous cycle still running.")
 
 
 if __name__ == "__main__":

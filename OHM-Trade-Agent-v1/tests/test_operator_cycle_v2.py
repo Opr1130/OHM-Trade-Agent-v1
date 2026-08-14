@@ -19,9 +19,14 @@ def _decision(**overrides):
     return SimpleNamespace(**base)
 
 
-def test_maintenance_cycle_runs_nothing(monkeypatch):
+def _use_temp_cycle_lock(cycle, monkeypatch, tmp_path):
+    monkeypatch.setattr(cycle, "CYCLE_LOCK_FILE", tmp_path / ".unified_cycle.lock")
+
+
+def test_maintenance_cycle_runs_nothing(monkeypatch, tmp_path):
     import app.jobs.run_cycle as cycle
 
+    _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(cycle, "get_operator_decision", lambda: _decision(effective_mode="MAINTENANCE", search_allowed=False))
     monkeypatch.setattr(cycle, "monitor_active_main", lambda: calls.append("active"))
@@ -31,9 +36,10 @@ def test_maintenance_cycle_runs_nothing(monkeypatch):
     assert calls == []
 
 
-def test_quiet_hours_monitor_active_only(monkeypatch):
+def test_quiet_hours_monitor_active_only(monkeypatch, tmp_path):
     import app.jobs.run_cycle as cycle
 
+    _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(cycle, "get_operator_decision", lambda: _decision(effective_mode="MONITOR", quiet_hours=True, search_allowed=False))
     monkeypatch.setattr(cycle, "monitor_active_main", lambda: calls.append("active"))
@@ -43,9 +49,10 @@ def test_quiet_hours_monitor_active_only(monkeypatch):
     assert calls == ["active"]
 
 
-def test_search_cycle_runs_monitors_then_scan_when_due(monkeypatch):
+def test_search_cycle_runs_monitors_then_scan_when_due(monkeypatch, tmp_path):
     import app.jobs.run_cycle as cycle
 
+    _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
     calls = []
     decision = _decision()
     monkeypatch.setattr(cycle, "get_operator_decision", lambda: decision)
