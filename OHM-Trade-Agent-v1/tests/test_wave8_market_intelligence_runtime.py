@@ -8,7 +8,9 @@ from app.services.market_intelligence_models import (
 from app.services.market_intelligence_runtime import (
     build_configured_market_intelligence_providers,
     build_market_intelligence_assessments,
+    build_market_intelligence_evidence,
     merge_market_intelligence_results,
+    serialize_market_intelligence_evidence,
 )
 from app.services.market_intelligence_provider import ProviderResult
 
@@ -94,6 +96,62 @@ def test_runtime_caps_enrichment_to_finalist_budget():
     assert len(assessments) == 8
     assert len(provider.seen) == 8
     assert provider.seen == [f"COIN{i}USD" for i in range(8)]
+
+
+def test_runtime_retains_json_safe_evidence_without_provider_credentials():
+    now = datetime.now(timezone.utc)
+
+    class FakeProvider:
+        name = "fake"
+        api_key = "must-never-be-serialized"
+
+        def fetch(self, symbol):
+            return MarketIntelligenceBundle(
+                symbol=symbol,
+                derivatives=(
+                    DerivativesSnapshot(
+                        symbol="BTCUSDT_PERP.A",
+                        provider=self.name,
+                        observed_at=now,
+                        funding_rate_pct=0.01,
+                        open_interest_usd=123_000_000,
+                        open_interest_change_24h_pct=2.5,
+                    ),
+                ),
+            )
+
+    evidence = build_market_intelligence_evidence(
+        [("BTCUSD", "LONG")],
+        providers=(FakeProvider(),),
+    )["BTCUSD"]
+    serialized = serialize_market_intelligence_evidence(evidence)
+
+    assert serialized["direction"] == "LONG"
+    assert serialized["assessment"]["status"] == "AVAILABLE"
+    assert serialized["bundle"]["derivatives"][0]["open_interest_usd"] == 123_000_000
+    assert serialized["bundle"]["derivatives"][0]["observed_at"] == now.isoformat()
+    assert serialized["authority"] == "context_only_no_gate_override"
+    assert serialized["context_score_is_probability"] is False
+    assert "must-never-be-serialized" not in repr(serialized)
+
+
+def test_runtime_preserves_provider_failure_as_warning_evidence_without_stopping():
+    class BrokenProvider:
+        name = "broken"
+
+        def fetch(self, symbol):
+            raise RuntimeError("temporary upstream failure")
+
+    evidence = build_market_intelligence_evidence(
+        [("BTCUSD", "LONG")],
+        providers=(BrokenProvider(),),
+    )["BTCUSD"]
+    serialized = serialize_market_intelligence_evidence(evidence)
+
+    assert evidence.assessment.status == "UNAVAILABLE"
+    assert serialized["provider_errors"] == [
+        "broken: RuntimeError: temporary upstream failure"
+    ]
 
 
 def test_runtime_is_noop_without_configured_providers():
