@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime
+from typing import Any
 
 from app.services.coinalyze_market_intelligence import (
     CoinalyzeMarketIntelligenceProvider,
@@ -19,6 +22,16 @@ from app.services.market_intelligence_provider import (
 
 
 DEFAULT_EXTERNAL_ENRICHMENT_CANDIDATES = 8
+
+
+@dataclass(frozen=True)
+class MarketIntelligenceEvidence:
+    """Normalized finalist evidence retained for review and shadow learning."""
+
+    direction: str
+    bundle: MarketIntelligenceBundle
+    assessment: MarketIntelligenceAssessment
+    provider_errors: tuple[str, ...] = ()
 
 
 def build_configured_market_intelligence_providers(
@@ -84,6 +97,63 @@ def merge_market_intelligence_results(
     )
 
 
+def _selected_candidates(
+    candidates: Sequence[tuple[str, str]],
+    max_candidates: int,
+) -> list[tuple[str, str]]:
+    if max_candidates < 0:
+        raise ValueError("max_candidates cannot be negative")
+
+    selected: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_symbol, raw_direction in candidates:
+        symbol = raw_symbol.strip()
+        if not symbol or symbol in seen:
+            continue
+        selected.append((symbol, raw_direction.strip().upper() or "LONG"))
+        seen.add(symbol)
+        if len(selected) >= max_candidates:
+            break
+    return selected
+
+
+def build_market_intelligence_evidence(
+    candidates: Sequence[tuple[str, str]],
+    *,
+    providers: Sequence[MarketIntelligenceProvider] | None = None,
+    max_candidates: int = DEFAULT_EXTERNAL_ENRICHMENT_CANDIDATES,
+) -> dict[str, MarketIntelligenceEvidence]:
+    """Collect bounded finalist evidence without exposing provider credentials."""
+    configured = (
+        tuple(providers)
+        if providers is not None
+        else build_configured_market_intelligence_providers()
+    )
+    if not configured or max_candidates == 0:
+        if max_candidates < 0:
+            raise ValueError("max_candidates cannot be negative")
+        return {}
+
+    selected = _selected_candidates(candidates, max_candidates)
+    evidence: dict[str, MarketIntelligenceEvidence] = {}
+    for symbol, direction in selected:
+        results = collect_market_intelligence(symbol, list(configured))
+        bundle = merge_market_intelligence_results(symbol, results)
+        assessment = assess_market_intelligence(bundle, direction=direction)
+        provider_errors = tuple(
+            f"{result.provider}: {result.error or 'provider failed'}"
+            for result in results
+            if not result.ok
+        )
+        evidence[symbol] = MarketIntelligenceEvidence(
+            direction=direction,
+            bundle=bundle,
+            assessment=assessment,
+            provider_errors=provider_errors,
+        )
+    return evidence
+
+
 def build_market_intelligence_assessments(
     candidates: Sequence[tuple[str, str]],
     *,
@@ -96,28 +166,39 @@ def build_market_intelligence_assessments(
     scanner. The cap prevents broad-universe scans from exhausting external
     provider budgets. External intelligence remains optional context only.
     """
-    if max_candidates < 0:
-        raise ValueError("max_candidates cannot be negative")
+    evidence = build_market_intelligence_evidence(
+        candidates,
+        providers=providers,
+        max_candidates=max_candidates,
+    )
+    return {symbol: item.assessment for symbol, item in evidence.items()}
 
-    configured = tuple(providers) if providers is not None else build_configured_market_intelligence_providers()
-    if not configured or max_candidates == 0:
-        return {}
 
-    selected: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for raw_symbol, raw_direction in candidates:
-        symbol = raw_symbol.strip()
-        if not symbol or symbol in seen:
-            continue
-        selected.append((symbol, raw_direction.strip().upper() or "LONG"))
-        seen.add(symbol)
-        if len(selected) >= max_candidates:
-            break
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if is_dataclass(value):
+        return _json_safe(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    return value
 
-    assessments: dict[str, MarketIntelligenceAssessment] = {}
-    for symbol, direction in selected:
-        results = collect_market_intelligence(symbol, list(configured))
-        bundle = merge_market_intelligence_results(symbol, results)
-        assessments[symbol] = assess_market_intelligence(bundle, direction=direction)
 
-    return assessments
+def serialize_market_intelligence_evidence(
+    evidence: MarketIntelligenceEvidence,
+) -> dict[str, Any]:
+    """Return JSON-safe evidence suitable for Chief context and shadow storage.
+
+    The evidence object contains normalized market fields only. API keys live on
+    provider client objects and are never reachable from this serialized shape.
+    """
+    return {
+        "direction": evidence.direction,
+        "assessment": _json_safe(evidence.assessment),
+        "bundle": _json_safe(evidence.bundle),
+        "provider_errors": list(evidence.provider_errors),
+        "authority": "context_only_no_gate_override",
+        "context_score_is_probability": False,
+    }
