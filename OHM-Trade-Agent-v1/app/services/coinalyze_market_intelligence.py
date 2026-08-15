@@ -18,6 +18,11 @@ COINALYZE_API_BASE = "https://api.coinalyze.net/v1"
 COINALYZE_MAX_SYMBOLS_PER_REQUEST = 20
 COINALYZE_RATE_LIMIT_UNITS_PER_MINUTE = 40
 
+# Coinalyze exchange codes for the default representative derivatives venues.
+# A = Binance, 6 = Bybit, 3 = OKX. The order is deliberate: prefer a broad,
+# liquid major venue before falling back to any other supported stable perpetual.
+DEFAULT_PREFERRED_EXCHANGES: tuple[str, ...] = ("A", "6", "3")
+
 
 class CoinalyzeAPIError(RuntimeError):
     """Raised for expected Coinalyze network/API/response failures."""
@@ -241,7 +246,7 @@ class CoinalyzeMarketIntelligenceProvider:
         api_key: str | None = None,
         *,
         client: CoinalyzeClient | None = None,
-        preferred_exchanges: tuple[str, ...] = (),
+        preferred_exchanges: tuple[str, ...] | None = None,
         max_markets_per_asset: int = 1,
         market_cache_ttl_seconds: int = 3600,
     ) -> None:
@@ -253,7 +258,12 @@ class CoinalyzeMarketIntelligenceProvider:
             raise ValueError("max_markets_per_asset must be at least 1")
 
         self.client = client
-        self.preferred_exchanges = tuple(item.upper() for item in preferred_exchanges)
+        exchange_order = (
+            DEFAULT_PREFERRED_EXCHANGES
+            if preferred_exchanges is None
+            else preferred_exchanges
+        )
+        self.preferred_exchanges = tuple(item.upper() for item in exchange_order)
         self.max_markets_per_asset = max_markets_per_asset
         self.market_cache_ttl_seconds = market_cache_ttl_seconds
         self._market_cache: list[dict[str, Any]] | None = None
@@ -312,6 +322,12 @@ class CoinalyzeMarketIntelligenceProvider:
         start = int((now - timedelta(hours=24)).timestamp())
         warnings: list[str] = []
         observed_at: list[datetime] = []
+
+        selected_exchange = str(market.get("exchange") or "").upper()
+        if self.preferred_exchanges and selected_exchange not in self.preferred_exchanges:
+            warnings.append(
+                f"Coinalyze fallback exchange selected: {selected_exchange or 'UNKNOWN'}"
+            )
 
         funding_payload = self.client.get_funding_rates([api_symbol])
         funding_row = _current_for_symbol(funding_payload, api_symbol)
