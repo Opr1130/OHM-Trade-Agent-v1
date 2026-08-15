@@ -86,22 +86,38 @@ def enrich_finalist_market_intelligence(
     finalists = list(candidates[:finalist_count])
     tail = list(candidates[finalist_count:])
 
-    raw_evidence: dict[str, MarketIntelligenceEvidence] = (
-        build_market_intelligence_evidence(
-            [(candidate.symbol, candidate.trade_direction) for candidate in finalists],
-            max_candidates=max_candidates,
+    try:
+        raw_evidence: dict[str, MarketIntelligenceEvidence] = (
+            build_market_intelligence_evidence(
+                [(candidate.symbol, candidate.trade_direction) for candidate in finalists],
+                max_candidates=max_candidates,
+            )
+            if finalists and max_candidates > 0
+            else {}
         )
-        if finalists and max_candidates > 0
-        else {}
-    )
-    assessments = {
-        symbol: item.assessment
-        for symbol, item in raw_evidence.items()
-    }
-    serialized = {
-        symbol: serialize_market_intelligence_evidence(item)
-        for symbol, item in raw_evidence.items()
-    }
+        assessments = {
+            symbol: item.assessment
+            for symbol, item in raw_evidence.items()
+        }
+        serialized = {
+            symbol: serialize_market_intelligence_evidence(item)
+            for symbol, item in raw_evidence.items()
+        }
+    except Exception:
+        # External intelligence is advisory only. A provider/orchestration defect
+        # must degrade to the original finalist order rather than stop a scan.
+        assessments = {}
+        serialized = {}
+
+    for candidate in finalists:
+        # In-memory, sanitized evidence lets every downstream shadow decision --
+        # including Chief AI rejects captured in another module -- retain the
+        # same Wave 8 context without changing the MarketSnapshot schema.
+        setattr(
+            candidate,
+            "_wave8_market_intelligence",
+            serialized.get(candidate.symbol),
+        )
 
     any_available = any(
         assessment.status == "AVAILABLE"
@@ -110,14 +126,19 @@ def enrich_finalist_market_intelligence(
     ranked_finalists: tuple[RankedCandidate, ...] = ()
     ordered_finalists = finalists
     if any_available:
-        ranked_finalists = tuple(
-            rank_candidates_with_context(
-                finalists,
-                market_regime=market_regime,
-                external_market_intelligence=assessments,
+        try:
+            ranked_finalists = tuple(
+                rank_candidates_with_context(
+                    finalists,
+                    market_regime=market_regime,
+                    external_market_intelligence=assessments,
+                )
             )
-        )
-        ordered_finalists = [item.candidate for item in ranked_finalists]
+            ordered_finalists = [item.candidate for item in ranked_finalists]
+        except Exception:
+            # Ranking context is optional and cannot remove or block finalists.
+            ranked_finalists = ()
+            ordered_finalists = finalists
 
     return FinalistMarketIntelligence(
         candidates=tuple(ordered_finalists + tail),
