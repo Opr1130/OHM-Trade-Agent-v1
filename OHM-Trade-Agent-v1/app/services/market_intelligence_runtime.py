@@ -140,8 +140,10 @@ def build_market_intelligence_evidence(
         results = collect_market_intelligence(symbol, list(configured))
         bundle = merge_market_intelligence_results(symbol, results)
         assessment = assess_market_intelligence(bundle, direction=direction)
+        # Persist only provider identity/status. Raw exception text is deliberately
+        # excluded because third-party client errors are not guaranteed secret-safe.
         provider_errors = tuple(
-            f"{result.provider}: {result.error or 'provider failed'}"
+            f"{result.provider}: provider unavailable"
             for result in results
             if not result.ok
         )
