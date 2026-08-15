@@ -23,6 +23,9 @@ def capture_snapshot_decision(
     try:
         execution = getattr(snapshot, "execution_validation", None)
         spread_bps = getattr(execution, "spread_bps", None) if execution is not None else None
+        intelligence = market_intelligence
+        if intelligence is None:
+            intelligence = getattr(snapshot, "_wave8_market_intelligence", None)
         record_shadow_candidate(
             symbol=str(snapshot.symbol),
             direction=str(getattr(snapshot, "trade_direction", "LONG") or "LONG"),
@@ -35,7 +38,7 @@ def capture_snapshot_decision(
             spread_bps=spread_bps,
             reason=reason,
             source=source,
-            market_intelligence=market_intelligence,
+            market_intelligence=intelligence,
         )
         return True
     except Exception:
