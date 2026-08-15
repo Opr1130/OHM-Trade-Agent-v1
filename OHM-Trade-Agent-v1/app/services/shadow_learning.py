@@ -109,6 +109,7 @@ def record_shadow_candidate(
     reason: str | None = None,
     source: str = "opportunity_scan",
     observed_at: str | None = None,
+    market_intelligence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if reference_price <= 0:
         raise ValueError("reference_price must be positive")
@@ -144,6 +145,7 @@ def record_shadow_candidate(
             "volume_ratio": volume_ratio,
             "spread_bps": spread_bps,
             "reason": reason or "",
+            "market_intelligence": market_intelligence,
             "observations": {},
             "complete": False,
             "updated_at": ts,
