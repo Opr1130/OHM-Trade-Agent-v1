@@ -25,6 +25,7 @@ from app.services.chief_analyst import (
 )
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
+from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.pending_setup_registry import PendingSetup, add_pending_setup
 from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
 from app.services.recommendation_gate import qualified_alerts
@@ -272,12 +273,35 @@ def main():
         f"unavailable={catalyst_summary.unavailable}",
     )
 
+    intelligence = enrich_finalist_market_intelligence(candidates, market_regime)
+    candidates = list(intelligence.candidates)
+    print("===== OHM EXTERNAL MARKET INTELLIGENCE =====")
+    print("Evidence records:", len(intelligence.evidence))
+    print("Available assessments:", sum(
+        assessment.status == "AVAILABLE"
+        for assessment in intelligence.assessments.values()
+    ))
+    print("Finalist cap:", min(len(candidates), 8))
+    for candidate in candidates[:8]:
+        assessment = intelligence.assessments.get(candidate.symbol)
+        if assessment is None:
+            continue
+        print(
+            f"INTELLIGENCE {candidate.symbol}: Direction={candidate.trade_direction} "
+            f"Status={assessment.status} ContextScore={assessment.context_score} "
+            f"Derivatives={assessment.derivatives_bias} "
+            f"Volatility={assessment.volatility_regime} "
+            f"Macro={assessment.macro_regime} "
+            f"Flow={assessment.flow_bias} "
+            f"Sentiment={assessment.sentiment_bias}"
+        )
+
     review = review_candidates(
         candidates,
         settings.openai_model,
         settings.openai_api_key,
         settings.account_equity,
-        market_regime_context=market_regime,
+        market_regime_context=intelligence.chief_market_regime_context,
         coingecko_global_context=coingecko_global,
     )
     alerts = qualified_alerts(review)
