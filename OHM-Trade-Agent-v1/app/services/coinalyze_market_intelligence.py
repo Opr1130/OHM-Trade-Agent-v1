@@ -210,6 +210,12 @@ def _current_timestamp(row: dict[str, Any]) -> datetime | None:
     return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
 
 
+def _liquidation_value_usd(row: dict[str, Any]) -> float:
+    return float(_as_float(row.get("l")) or 0.0) + float(
+        _as_float(row.get("s")) or 0.0
+    )
+
+
 class CoinalyzeMarketIntelligenceProvider:
     """Normalize Coinalyze futures evidence into Wave 8 derivatives context.
 
@@ -363,21 +369,48 @@ class CoinalyzeMarketIntelligenceProvider:
             [api_symbol],
             start=start,
             end=end,
+            interval="5min",
         )
         liquidation_history = _history_for_symbol(liquidation_payload, api_symbol)
         liquidations_1h_usd: float | None = None
         liquidations_24h_usd: float | None = None
         if liquidation_history:
-            per_hour = [
-                float(_as_float(row.get("l")) or 0.0)
-                + float(_as_float(row.get("s")) or 0.0)
-                for row in liquidation_history
+            cutoff_1h = end - 60 * 60
+            rows_24h: list[dict[str, Any]] = []
+            rows_1h: list[dict[str, Any]] = []
+            for row in liquidation_history:
+                timestamp = _as_float(row.get("t"))
+                if timestamp is None:
+                    continue
+                if start <= timestamp <= end:
+                    rows_24h.append(row)
+                    if timestamp >= cutoff_1h:
+                        rows_1h.append(row)
+
+            if rows_24h:
+                liquidations_24h_usd = sum(
+                    _liquidation_value_usd(row) for row in rows_24h
+                )
+            if rows_1h:
+                liquidations_1h_usd = sum(
+                    _liquidation_value_usd(row) for row in rows_1h
+                )
+            else:
+                warnings.append(
+                    "Coinalyze liquidation observations unavailable in trailing 1h"
+                )
+
+            timestamped_rows = [
+                row for row in liquidation_history if _history_timestamp(row) is not None
             ]
-            liquidations_1h_usd = per_hour[-1]
-            liquidations_24h_usd = sum(per_hour)
-            latest_ts = _history_timestamp(liquidation_history[-1])
-            if latest_ts:
-                observed_at.append(latest_ts)
+            if timestamped_rows:
+                latest_row = max(
+                    timestamped_rows,
+                    key=lambda row: float(_as_float(row.get("t")) or 0.0),
+                )
+                latest_ts = _history_timestamp(latest_row)
+                if latest_ts:
+                    observed_at.append(latest_ts)
         else:
             warnings.append("Coinalyze liquidation history unavailable")
 
