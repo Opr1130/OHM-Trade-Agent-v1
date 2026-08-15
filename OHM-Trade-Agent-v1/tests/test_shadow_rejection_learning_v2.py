@@ -33,6 +33,33 @@ def test_capture_snapshot_decision_preserves_gate_context(monkeypatch):
     assert recorded[0]["spread_bps"] == 6.4
 
 
+def test_capture_snapshot_decision_forwards_wave8_market_intelligence(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(capture, "record_shadow_candidate", lambda **kwargs: recorded.append(kwargs) or kwargs)
+    snapshot = SimpleNamespace(
+        symbol="BTCUSD",
+        trade_direction="LONG",
+        last_price=100.0,
+        execution_validation=None,
+    )
+    evidence = {
+        "assessment": {"status": "AVAILABLE", "context_score": 55},
+        "authority": "context_only_no_gate_override",
+    }
+
+    ok = capture.capture_snapshot_decision(
+        snapshot,
+        decision="INTELLIGENCE_CONTEXT",
+        market_regime="NEUTRAL",
+        reason="bounded Wave 8 context",
+        source="wave8_market_intelligence",
+        market_intelligence=evidence,
+    )
+
+    assert ok is True
+    assert recorded[0]["market_intelligence"] == evidence
+
+
 def test_capture_is_fail_open(monkeypatch):
     monkeypatch.setattr(capture, "record_shadow_candidate", lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")))
     snapshot = SimpleNamespace(symbol="ABCUSD", trade_direction="LONG", last_price=100.0)
