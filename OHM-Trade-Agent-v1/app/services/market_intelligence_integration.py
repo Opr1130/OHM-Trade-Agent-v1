@@ -40,28 +40,50 @@ class FinalistMarketIntelligence:
     candidates: tuple[MarketSnapshot, ...]
     assessments: dict[str, MarketIntelligenceAssessment]
     evidence: dict[str, dict[str, Any]]
-    chief_market_regime_context: ChiefMarketRegimeContext
+    chief_market_regime_context: Any
     ranked_finalists: tuple[RankedCandidate, ...]
 
 
 def _chief_context(
     market_regime: MarketRegimeContext,
     evidence: dict[str, dict[str, Any]],
-) -> ChiefMarketRegimeContext:
+) -> Any:
+    # No external evidence must be an exact no-op for every existing Chief
+    # caller and extension seam. In particular, older tests and integrations may
+    # provide a lightweight namespace instead of the full MarketRegimeContext.
+    if not evidence:
+        return market_regime
+
     return ChiefMarketRegimeContext(
-        status=market_regime.status,
-        sample_size=market_regime.sample_size,
-        regime=market_regime.regime,
-        breadth_score=market_regime.breadth_score,
-        pct_above_ema20=market_regime.pct_above_ema20,
-        pct_above_ema50=market_regime.pct_above_ema50,
-        pct_above_ema200=market_regime.pct_above_ema200,
-        pct_positive_momentum_24h=market_regime.pct_positive_momentum_24h,
-        pct_positive_momentum_72h=market_regime.pct_positive_momentum_72h,
-        pct_bullish_trend=market_regime.pct_bullish_trend,
-        median_momentum_24h_pct=market_regime.median_momentum_24h_pct,
-        median_momentum_72h_pct=market_regime.median_momentum_72h_pct,
-        warnings=market_regime.warnings,
+        status=str(getattr(market_regime, "status", "AVAILABLE")),
+        sample_size=int(getattr(market_regime, "sample_size", 0) or 0),
+        regime=str(getattr(market_regime, "regime", "UNKNOWN")),
+        breadth_score=getattr(market_regime, "breadth_score", None),
+        pct_above_ema20=getattr(market_regime, "pct_above_ema20", None),
+        pct_above_ema50=getattr(market_regime, "pct_above_ema50", None),
+        pct_above_ema200=getattr(market_regime, "pct_above_ema200", None),
+        pct_positive_momentum_24h=getattr(
+            market_regime,
+            "pct_positive_momentum_24h",
+            None,
+        ),
+        pct_positive_momentum_72h=getattr(
+            market_regime,
+            "pct_positive_momentum_72h",
+            None,
+        ),
+        pct_bullish_trend=getattr(market_regime, "pct_bullish_trend", None),
+        median_momentum_24h_pct=getattr(
+            market_regime,
+            "median_momentum_24h_pct",
+            None,
+        ),
+        median_momentum_72h_pct=getattr(
+            market_regime,
+            "median_momentum_72h_pct",
+            None,
+        ),
+        warnings=tuple(getattr(market_regime, "warnings", ()) or ()),
         external_market_intelligence=evidence,
     )
 
