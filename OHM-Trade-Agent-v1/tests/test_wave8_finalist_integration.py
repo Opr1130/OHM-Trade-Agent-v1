@@ -50,21 +50,45 @@ def _candidate(symbol: str, direction: str = "LONG", score: float = 70.0):
     )
 
 
-def test_no_provider_evidence_preserves_exact_upstream_order(monkeypatch):
+def test_no_provider_evidence_preserves_exact_upstream_order_and_chief_context(monkeypatch):
     candidates = [_candidate("AUSD"), _candidate("BUSD", "SHORT"), _candidate("CUSD")]
+    regime = _regime()
     monkeypatch.setattr(
         "app.services.market_intelligence_integration.build_market_intelligence_evidence",
         lambda *args, **kwargs: {},
     )
 
-    result = enrich_finalist_market_intelligence(candidates, _regime())
+    result = enrich_finalist_market_intelligence(candidates, regime)
 
     assert list(result.candidates) == candidates
     assert result.assessments == {}
     assert result.evidence == {}
     assert result.ranked_finalists == ()
-    assert result.chief_market_regime_context.regime == "NEUTRAL"
-    assert result.chief_market_regime_context.external_market_intelligence == {}
+    assert result.chief_market_regime_context is regime
+
+
+def test_no_provider_supports_legacy_minimal_market_regime_namespace(monkeypatch):
+    candidates = [_candidate("AUSD")]
+    legacy_regime = SimpleNamespace(
+        sample_size=1,
+        regime="NEUTRAL",
+        breadth_score=50.0,
+        pct_above_ema20=50.0,
+        pct_above_ema50=50.0,
+        pct_above_ema200=50.0,
+        pct_positive_momentum_24h=50.0,
+        pct_positive_momentum_72h=50.0,
+        pct_bullish_trend=50.0,
+    )
+    monkeypatch.setattr(
+        "app.services.market_intelligence_integration.build_market_intelligence_evidence",
+        lambda *args, **kwargs: {},
+    )
+
+    result = enrich_finalist_market_intelligence(candidates, legacy_regime)
+
+    assert result.chief_market_regime_context is legacy_regime
+    assert list(result.candidates) == candidates
 
 
 def test_available_external_evidence_reorders_only_bounded_prefix_and_preserves_direction(monkeypatch):
@@ -178,6 +202,52 @@ def test_chief_context_preserves_breadth_and_contains_context_only_serialized_ev
     assert serialized["assessment"]["context_score"] == 60
     assert serialized["authority"] == "context_only_no_gate_override"
     assert serialized["context_score_is_probability"] is False
+
+
+def test_evidence_present_supports_legacy_minimal_market_regime_namespace(monkeypatch):
+    candidate = _candidate("BTCUSD")
+    legacy_regime = SimpleNamespace(
+        sample_size=1,
+        regime="NEUTRAL",
+        breadth_score=50.0,
+        pct_above_ema20=50.0,
+        pct_above_ema50=50.0,
+        pct_above_ema200=50.0,
+        pct_positive_momentum_24h=50.0,
+        pct_positive_momentum_72h=50.0,
+        pct_bullish_trend=50.0,
+    )
+    evidence = MarketIntelligenceEvidence(
+        direction="LONG",
+        bundle=MarketIntelligenceBundle(symbol="BTCUSD"),
+        assessment=_assessment(60),
+    )
+    monkeypatch.setattr(
+        "app.services.market_intelligence_integration.build_market_intelligence_evidence",
+        lambda *args, **kwargs: {"BTCUSD": evidence},
+    )
+    monkeypatch.setattr(
+        "app.services.market_intelligence_integration.rank_candidates_with_context",
+        lambda finalists, **kwargs: [
+            RankedCandidate(
+                candidate=finalists[0],
+                intelligence_score=75,
+                setup_type="TEST",
+                regime_alignment="NEUTRAL",
+                external_market_score=60,
+            )
+        ],
+    )
+
+    result = enrich_finalist_market_intelligence([candidate], legacy_regime)
+    context = result.chief_market_regime_context
+
+    assert context.status == "AVAILABLE"
+    assert context.sample_size == 1
+    assert context.median_momentum_24h_pct is None
+    assert context.median_momentum_72h_pct is None
+    assert context.warnings == ()
+    assert "BTCUSD" in context.external_market_intelligence
 
 
 def test_unavailable_evidence_is_retained_but_cannot_reorder(monkeypatch):
