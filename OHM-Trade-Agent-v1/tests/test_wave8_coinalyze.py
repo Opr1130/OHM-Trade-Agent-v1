@@ -65,20 +65,22 @@ class FakeCoinalyzeClient:
             {
                 "symbol": "BTCUSDT_PERP.A",
                 "history": [
-                    {"t": 1_786_658_400, "c": 100_000_000},
-                    {"t": 1_786_744_800, "c": 108_000_000},
+                    {"t": start + 300, "c": 100_000_000},
+                    {"t": end - 300, "c": 108_000_000},
                 ],
             }
         ]
 
     def get_liquidation_history(self, symbols, *, start, end, interval="1hour"):
         assert symbols == ["BTCUSDT_PERP.A"]
+        assert interval == "5min"
         return [
             {
                 "symbol": "BTCUSDT_PERP.A",
                 "history": [
-                    {"t": 1_786_741_200, "l": 1_000_000, "s": 500_000},
-                    {"t": 1_786_744_800, "l": 2_000_000, "s": 1_000_000},
+                    {"t": start + 300, "l": 1_000_000, "s": 500_000},
+                    {"t": end - 3_500, "l": 400_000, "s": 100_000},
+                    {"t": end - 1_200, "l": 2_000_000, "s": 1_000_000},
                 ],
             }
         ]
@@ -89,7 +91,7 @@ class FakeCoinalyzeClient:
             {
                 "symbol": "BTCUSDT_PERP.A",
                 "history": [
-                    {"t": 1_786_744_800, "r": 1.25, "l": 55.5, "s": 44.5}
+                    {"t": end - 300, "r": 1.25, "l": 55.5, "s": 44.5}
                 ],
             }
         ]
@@ -107,9 +109,30 @@ def test_provider_normalizes_funding_oi_liquidations_and_long_short_ratio():
     assert snapshot.funding_rate_pct == 0.04
     assert snapshot.open_interest_usd == 108_000_000
     assert snapshot.open_interest_change_24h_pct == pytest.approx(8.0)
-    assert snapshot.liquidations_1h_usd == 3_000_000
-    assert snapshot.liquidations_24h_usd == 4_500_000
+    assert snapshot.liquidations_1h_usd == 3_500_000
+    assert snapshot.liquidations_24h_usd == 5_000_000
     assert snapshot.long_short_ratio == 1.25
+
+
+def test_provider_does_not_fabricate_zero_when_trailing_hour_has_no_liquidation_rows():
+    class SparseLiquidations(FakeCoinalyzeClient):
+        def get_liquidation_history(self, symbols, *, start, end, interval="1hour"):
+            assert interval == "5min"
+            return [
+                {
+                    "symbol": "BTCUSDT_PERP.A",
+                    "history": [
+                        {"t": end - 7_200, "l": 100.0, "s": 50.0},
+                    ],
+                }
+            ]
+
+    provider = CoinalyzeMarketIntelligenceProvider(client=SparseLiquidations())
+    snapshot = provider.fetch("BTCUSD").derivatives[0]
+
+    assert snapshot.liquidations_1h_usd is None
+    assert snapshot.liquidations_24h_usd == 150.0
+    assert "Coinalyze liquidation observations unavailable in trailing 1h" in snapshot.warnings
 
 
 def test_provider_maps_kraken_xbt_to_btc_and_caches_market_catalog():
