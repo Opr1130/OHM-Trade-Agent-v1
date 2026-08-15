@@ -135,12 +135,12 @@ def test_runtime_retains_json_safe_evidence_without_provider_credentials():
     assert "must-never-be-serialized" not in repr(serialized)
 
 
-def test_runtime_preserves_provider_failure_as_warning_evidence_without_stopping():
+def test_runtime_sanitizes_provider_failure_text_before_persistence():
     class BrokenProvider:
         name = "broken"
 
         def fetch(self, symbol):
-            raise RuntimeError("temporary upstream failure")
+            raise RuntimeError("secret-like-value-must-not-persist")
 
     evidence = build_market_intelligence_evidence(
         [("BTCUSD", "LONG")],
@@ -149,9 +149,8 @@ def test_runtime_preserves_provider_failure_as_warning_evidence_without_stopping
     serialized = serialize_market_intelligence_evidence(evidence)
 
     assert evidence.assessment.status == "UNAVAILABLE"
-    assert serialized["provider_errors"] == [
-        "broken: RuntimeError: temporary upstream failure"
-    ]
+    assert serialized["provider_errors"] == ["broken: provider unavailable"]
+    assert "secret-like-value-must-not-persist" not in repr(serialized)
 
 
 def test_runtime_is_noop_without_configured_providers():
