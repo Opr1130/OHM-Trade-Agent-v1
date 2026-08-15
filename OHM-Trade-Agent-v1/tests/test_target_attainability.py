@@ -411,7 +411,6 @@ def test_target_quality_failure_suppresses_telegram(monkeypatch):
     )
     sent = []
     monkeypatch.setattr(scan_opportunities, "send_trade_plan", lambda **kwargs: sent.append(kwargs))
-    monkeypatch.setattr(scan_opportunities, "add_pending_setup", lambda setup: None)
 
     scan_opportunities.main()
     assert sent == []

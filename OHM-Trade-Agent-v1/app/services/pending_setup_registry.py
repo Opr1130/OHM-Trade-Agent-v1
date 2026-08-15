@@ -75,8 +75,34 @@ def get_pending_setup_by_trade_id(trade_id: str) -> PendingSetup | None:
 
 
 def terminalize_pending_setup(trade_id: str, status: str) -> bool:
-    if status not in {"skipped", "invalidated", "too_extended", "send_failed"}:
+    if status not in {
+        "skipped",
+        "invalidated",
+        "too_extended",
+        "send_failed",
+        "portfolio_risk_rejected",
+        "tracking_failed",
+    }:
         raise ValueError(f"Unsupported terminal status: {status}")
+    try:
+        from app.services.order_intent_registry import (
+            cancel_order_intent,
+            get_order_intent,
+        )
+
+        intent = get_order_intent(trade_id)
+        if intent is not None and intent.status == "FILLED":
+            # Exchange truth wins over a late local invalidation. Retire the
+            # pending view without terminalizing the now-entered trade.
+            mark_pending_setup_entered(trade_id)
+            return False
+        if intent is not None and intent.status == "LIMIT_PLACED":
+            # Cancel reconciliation eligibility before terminalizing the
+            # pending setup. If this write cannot complete, leave both records
+            # live so a later cycle can retry instead of creating split brain.
+            cancel_order_intent(trade_id)
+    except Exception:
+        return False
     terminalized = False
     with registry_lock(registry_lock_file()):
         data = _load_raw()
@@ -91,6 +117,24 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
         from app.services.trade_outcome_registry import terminalize_setup_outcome
         terminalize_setup_outcome(trade_id, status)
     return terminalized
+
+
+def mark_pending_setup_entered(trade_id: str) -> bool:
+    """Retire a pending setup after Kraken proves that its order filled.
+
+    Entering a trade is not a terminal trade outcome, so this deliberately
+    does not call terminalize_setup_outcome. The active-trade/outcome registry
+    becomes authoritative after the transition.
+    """
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
+        for item in data.values():
+            if item.get("trade_id") == trade_id and item.get("status") == "waiting":
+                item["status"] = "entered"
+                item["terminal_at"] = datetime.now(timezone.utc).isoformat()
+                _save_raw(data)
+                return True
+    return False
 
 
 def remove_pending_setup(symbol: str) -> bool:

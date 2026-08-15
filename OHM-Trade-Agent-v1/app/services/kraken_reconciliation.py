@@ -175,6 +175,48 @@ def _order_matches_intent(row: dict[str, Any], intent: Any) -> bool:
     return abs(order_price / intent.limit_price - 1.0) <= 0.01
 
 
+def _verified_unbound_entry_fills(
+    trades: dict[str, dict[str, Any]],
+    *,
+    intent: Any,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Resolve exactly one completed Kraken order for an unbound OHM intent.
+
+    TradeHistory includes the originating order txid. Grouping by that identity
+    prevents unrelated manual fills on the same pair from being aggregated into
+    an OHM fill. An unbound group must also match planned price and notional
+    within conservative tolerances before it can become authoritative.
+    """
+    entry_side = "buy" if intent.direction.upper() == "LONG" else "sell"
+    candidates = _matching_fills(
+        trades,
+        symbol=intent.symbol,
+        side=entry_side,
+        after_epoch=_iso_to_epoch(intent.created_at),
+    )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in candidates:
+        order_txid = str(row.get("ordertxid") or "").strip()
+        if order_txid:
+            groups.setdefault(order_txid, []).append(row)
+
+    intended_notional = intent.capital * max(1.0, float(intent.margin_leverage or 1.0))
+    qualified: list[tuple[str, list[dict[str, Any]]]] = []
+    for order_txid, rows in groups.items():
+        quantity, vwap, _, _, _ = _fill_stats(rows)
+        if vwap is None or intended_notional <= 0 or intent.limit_price <= 0:
+            continue
+        filled_notional = quantity * vwap
+        notional_ratio = filled_notional / intended_notional
+        price_aligned = abs(vwap / intent.limit_price - 1.0) <= 0.01
+        if price_aligned and 0.90 <= notional_ratio <= 1.10:
+            qualified.append((order_txid, rows))
+
+    if len(qualified) != 1:
+        return [], None
+    return qualified[0][1], qualified[0][0]
+
+
 def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> ReconciliationSummary:
     mode = reconciliation_mode()
     if not reconciliation_enabled():
@@ -292,13 +334,23 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
             )
 
         entry_side = "buy" if intent.direction.upper() == "LONG" else "sell"
-        entry_fills = _matching_fills(
-            trades,
-            symbol=intent.symbol,
-            side=entry_side,
-            after_epoch=_iso_to_epoch(intent.created_at),
-            order_txid=order_txid,
-        )
+        if order_txid:
+            entry_fills = _matching_fills(
+                trades,
+                symbol=intent.symbol,
+                side=entry_side,
+                after_epoch=_iso_to_epoch(intent.created_at),
+                order_txid=order_txid,
+            )
+        else:
+            entry_fills, inferred_order_txid = _verified_unbound_entry_fills(
+                trades,
+                intent=intent,
+            )
+            if inferred_order_txid:
+                order_txid = inferred_order_txid
+                if mode == "apply":
+                    bind_exchange_order_txid(intent.trade_id, order_txid)
         qty, vwap, fee, first_at, last_at = _fill_stats(entry_fills)
         intended_notional = intent.capital * max(1.0, float(intent.margin_leverage or 1.0))
         filled_notional = qty * vwap if vwap is not None else 0.0
@@ -319,7 +371,12 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
                 entry_fee=fee,
             )
             if mode == "apply":
-                mark_order_filled(intent.trade_id, fill_price=vwap, actual_entry_fee=fee)
+                mark_order_filled(
+                    intent.trade_id,
+                    fill_price=vwap,
+                    actual_entry_fee=fee,
+                    entry_price_source="kraken_reconciliation_fill",
+                )
                 filled.append(intent.trade_id)
 
     return ReconciliationSummary(

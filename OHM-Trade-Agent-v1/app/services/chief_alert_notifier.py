@@ -5,14 +5,24 @@ from typing import Any
 from app.core.config import get_settings
 from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.kraken_reconciliation import (
+    reconciliation_enabled,
+    reconciliation_mode,
+)
 from app.services.notification_policy import record_emitted, should_emit
+from app.services.order_intent_registry import (
+    OrderIntent,
+    get_order_intent,
+    register_order_intent,
+)
 from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
+    get_pending_setup_by_trade_id,
     get_pending_setups,
     terminalize_pending_setup,
 )
-from app.services.telegram_notifier import build_trade_confirmation_buttons, send_telegram_message
+from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
@@ -116,13 +126,20 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
             "Execution: MANUAL ONLY — verify live Kraken margin/opening/rollover fees before entry\n"
         )
 
+    fill_tracking_note = ""
+    if candidate.get("economic_qualified") is True:
+        fill_tracking_note = (
+            "Fill Tracking: Automatic via read-only Kraken reconciliation; "
+            "no Telegram confirmation required\n"
+        )
+
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
     return (
         f"{headline}\n\n{action_text}\n\n"
         f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
         f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
         f"Direction: {direction}\n"
-        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}"
+        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{fill_tracking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: {candidate.get('confidence', 0)}%\n"
         f"Technical Decision: {str(candidate.get('decision', '')).upper()}\n\n"
@@ -157,6 +174,73 @@ def _existing_setup_trade_id(symbol: str) -> str | None:
         if pending.symbol == symbol:
             return pending.trade_id or None
     return None
+
+
+def _reconciliation_limit_price(
+    plan: EntryExitPlan,
+    *,
+    action: str,
+    direction: str,
+) -> float:
+    if action == "PLACE_LIMIT":
+        return plan.entry_high if direction == "SHORT" else plan.entry_low
+    return plan.entry_low if direction == "SHORT" else plan.entry_high
+
+
+def _register_reconciliation_intent(
+    *,
+    candidate: dict[str, Any],
+    plan: EntryExitPlan,
+    action: str,
+    direction: str,
+    leverage: float,
+    trade_id: str,
+) -> None:
+    """Create the exchange-observation identity for a production alert."""
+    if candidate.get("economic_qualified") is not True:
+        return
+    if not reconciliation_enabled() or reconciliation_mode() != "apply":
+        raise RuntimeError("Kraken reconciliation apply mode is required")
+
+    capital = candidate.get("recommended_capital")
+    if not isinstance(capital, (int, float)) or float(capital) <= 0:
+        raise ValueError("recommended capital is required for Kraken fill tracking")
+
+    limit_price = _reconciliation_limit_price(
+        plan,
+        action=action,
+        direction=direction,
+    )
+    existing = get_order_intent(trade_id)
+    if existing is not None:
+        same_identity = (
+            existing.status == "LIMIT_PLACED"
+            and existing.symbol == plan.symbol.upper()
+            and existing.direction == direction
+            and existing.source == "ohm_actionable_signal"
+            and abs(existing.limit_price - limit_price) <= 1e-9
+            and abs(existing.capital - float(capital)) <= 1e-9
+        )
+        if same_identity:
+            return
+        raise ValueError(f"reconciliation intent {trade_id} does not match this alert")
+
+    register_order_intent(
+        OrderIntent(
+            symbol=plan.symbol,
+            direction=direction,
+            limit_price=limit_price,
+            capital=float(capital),
+            stop_price=plan.stop_price,
+            target_1=plan.target_1,
+            target_2=plan.target_2,
+            margin_leverage=leverage,
+            risk_level=plan.risk_level,
+            entry_action=action,
+            source="ohm_actionable_signal",
+            trade_id=trade_id,
+        )
+    )
 
 
 def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
@@ -205,10 +289,9 @@ def send_trade_plan(
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
     message = format_trade_plan(candidate=candidate, plan=plan, summary=summary)
-    reply_markup = None
-    setup = None
-
-    if action == "ENTER_NOW":
+    trade_id = str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+    setup = get_pending_setup_by_trade_id(trade_id) if trade_id else None
+    if setup is None:
         setup = add_pending_setup(
             PendingSetup(
                 symbol=plan.symbol,
@@ -223,21 +306,31 @@ def send_trade_plan(
                 confirmation_price=(plan.entry_low if direction == "SHORT" else plan.entry_high),
                 direction=direction,
                 margin_leverage=leverage,
+                trade_id=trade_id,
             )
         )
-        candidate["trade_id"] = setup.trade_id
-        reply_markup = build_trade_confirmation_buttons(setup.trade_id)
-
-    trade_id = (
-        setup.trade_id
-        if setup is not None
-        else str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
-    )
+        trade_id = setup.trade_id
     if trade_id:
         candidate["trade_id"] = trade_id
 
+    if candidate.get("economic_qualified") is True:
+        if not trade_id:
+            return False
+        try:
+            _register_reconciliation_intent(
+                candidate=candidate,
+                plan=plan,
+                action=action,
+                direction=direction,
+                leverage=leverage,
+                trade_id=trade_id,
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            terminalize_pending_setup(trade_id, "tracking_failed")
+            return False
+
     record_recommendation(trade_id=trade_id, candidate=candidate, plan=plan, action=action)
-    sent = send_telegram_message(bot_token, chat_id, message, reply_markup=reply_markup)
+    sent = send_telegram_message(bot_token, chat_id, message)
     if sent:
         key = _alert_state_key(candidate, plan)
         state = _load_state()
@@ -248,6 +341,6 @@ def send_trade_plan(
             event_type="OPPORTUNITY",
             fingerprint=key,
         )
-    elif action == "ENTER_NOW" and setup is not None:
-        terminalize_pending_setup(setup.trade_id, "send_failed")
+    elif trade_id:
+        terminalize_pending_setup(trade_id, "send_failed")
     return sent

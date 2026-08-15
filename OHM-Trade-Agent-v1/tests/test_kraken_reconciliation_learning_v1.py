@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -7,8 +8,16 @@ import pytest
 from app.exchanges import kraken_private
 from app.exchanges.kraken_private import KrakenPermissionError, KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade
-from app.services import execution_learning_registry as learning
+from app.services import (
+    active_trade_registry,
+    execution_learning_registry as learning,
+    order_intent_registry,
+    pending_setup_registry,
+    trade_outcome_registry,
+)
 from app.services import kraken_reconciliation as reconciliation
+from app.services.order_intent_registry import OrderIntent
+from app.services.pending_setup_registry import PendingSetup
 
 
 def test_private_client_rejects_dangerous_permissions(monkeypatch):
@@ -176,3 +185,132 @@ def test_execution_learning_derives_idea_order_fill_timing(monkeypatch, tmp_path
     assert row["order_to_first_fill_seconds"] == 60.0
     assert row["idea_to_full_fill_seconds"] == 240.0
     assert row["fill_vs_limit_pct"] == pytest.approx(0.2)
+
+
+def _isolate_lifecycle(monkeypatch, tmp_path):
+    monkeypatch.setattr(active_trade_registry, "TRADE_FILE", tmp_path / "active.json")
+    monkeypatch.setattr(order_intent_registry, "ORDER_FILE", tmp_path / "intents.json")
+    monkeypatch.setattr(order_intent_registry, "LOCK_FILE", tmp_path / ".intents.lock")
+    monkeypatch.setattr(pending_setup_registry, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(trade_outcome_registry, "OUTCOME_FILE", tmp_path / "outcomes.json")
+
+
+def test_apply_reconciliation_activates_verified_signal_fill_without_buttons(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setenv("KRAKEN_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("KRAKEN_RECONCILIATION_MODE", "apply")
+    monkeypatch.setattr(reconciliation, "record_execution_event", lambda *a, **k: {})
+    trade_id = "OHM-ADA-AUTO"
+    pending_setup_registry.add_pending_setup(
+        PendingSetup(
+            symbol="ADAUSD",
+            direction="LONG",
+            entry_low=0.99,
+            entry_high=1.0,
+            chase_limit=1.01,
+            stop_price=0.95,
+            target_1=1.1,
+            target_2=1.2,
+            risk_level="low",
+            confidence=90,
+            trade_id=trade_id,
+        )
+    )
+    intent = order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol="ADAUSD",
+            direction="LONG",
+            limit_price=1.0,
+            capital=100.0,
+            stop_price=0.95,
+            target_1=1.1,
+            target_2=1.2,
+            risk_level="low",
+            trade_id=trade_id,
+            source="ohm_actionable_signal",
+        )
+    )
+    fill_time = time.time() + 1
+
+    class Client:
+        enabled = True
+
+        def assert_read_only(self):
+            return SimpleNamespace(name="ohm-read-only")
+
+        def get_balance(self):
+            return {"ZUSD": 1000.0}
+
+        def get_open_orders(self):
+            return {}
+
+        def get_trades_history(self, *, start=None):
+            return {
+                "TRADE-ADA": {
+                    "ordertxid": "KRAKEN-ADA-ORDER",
+                    "pair": "ADAUSD",
+                    "type": "buy",
+                    "price": "1.0",
+                    "vol": "100.0",
+                    "fee": "0.25",
+                    "time": fill_time,
+                }
+            }
+
+        def get_open_positions(self):
+            return {}
+
+    result = reconciliation.reconcile_kraken_account(Client())
+
+    assert result.filled == (trade_id,)
+    stored_intent = order_intent_registry.get_order_intent(trade_id)
+    assert stored_intent.status == "FILLED"
+    assert stored_intent.exchange_order_txid == "KRAKEN-ADA-ORDER"
+    active = active_trade_registry.get_trade("ADAUSD")
+    assert active is not None
+    assert active.trade_id == trade_id
+    assert active.entry_price == pytest.approx(1.0)
+    assert pending_setup_registry.get_pending_setups() == []
+    outcome = trade_outcome_registry.get_outcomes()[0]
+    assert outcome["entry_price_source"] == "kraken_reconciliation_fill"
+
+
+def test_unbound_reconciliation_rejects_ambiguous_similar_orders():
+    now = time.time()
+    intent = SimpleNamespace(
+        symbol="ADAUSD",
+        direction="LONG",
+        created_at="1970-01-01T00:00:00+00:00",
+        limit_price=1.0,
+        capital=100.0,
+        margin_leverage=1.0,
+    )
+    trades = {
+        "T1": {
+            "ordertxid": "ORDER-1",
+            "pair": "ADAUSD",
+            "type": "buy",
+            "price": "1.0",
+            "vol": "100",
+            "time": now,
+        },
+        "T2": {
+            "ordertxid": "ORDER-2",
+            "pair": "ADAUSD",
+            "type": "buy",
+            "price": "1.0",
+            "vol": "100",
+            "time": now + 1,
+        },
+    }
+
+    rows, order_txid = reconciliation._verified_unbound_entry_fills(
+        trades,
+        intent=intent,
+    )
+
+    assert rows == []
+    assert order_txid is None

@@ -10,7 +10,7 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 OUTCOME_FILE = Path("/app/data/trade_outcomes.json")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def registry_lock_file() -> Path:
@@ -118,6 +118,7 @@ def record_recommendation(
             "economic_target_2_move_pct": candidate.get("economic_target_2_move_pct"),
             "economic_validation_net_t2": candidate.get("economic_validation_net_t2"),
             "market_regime": candidate.get("market_regime"),
+            "market_intelligence": candidate.get("market_intelligence"),
             "entered_trade": False,
             "setup_status": "recommended",
             "entered_at": None,

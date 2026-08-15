@@ -25,6 +25,9 @@ class OrderIntent:
     target_1: float | None = None
     target_2: float | None = None
     margin_leverage: float = 1.0
+    risk_level: str = "manual"
+    entry_action: str = "PLACE_LIMIT"
+    source: str = "operator_api"
     trade_id: str = ""
     status: str = "LIMIT_PLACED"
     created_at: str = ""
@@ -51,6 +54,9 @@ def _normalize(item: dict) -> OrderIntent:
     normalized = dict(item)
     normalized.setdefault("direction", "LONG")
     normalized.setdefault("margin_leverage", 1.0)
+    normalized.setdefault("risk_level", "manual")
+    normalized.setdefault("entry_action", "PLACE_LIMIT")
+    normalized.setdefault("source", "operator_api")
     normalized.setdefault("status", "LIMIT_PLACED")
     normalized.setdefault("created_at", "")
     normalized.setdefault("updated_at", "")
@@ -67,6 +73,10 @@ def register_order_intent(intent: OrderIntent) -> OrderIntent:
     intent.direction = intent.direction.upper()
     if intent.direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
+    intent.entry_action = str(intent.entry_action or "PLACE_LIMIT").upper()
+    if intent.entry_action not in {"ENTER_NOW", "PLACE_LIMIT"}:
+        raise ValueError("entry_action must be ENTER_NOW or PLACE_LIMIT")
+    intent.source = str(intent.source or "operator_api")
     if intent.limit_price <= 0 or intent.capital <= 0:
         raise ValueError("limit_price and capital must be positive")
     if intent.margin_leverage <= 0 or intent.margin_leverage > 3:
@@ -190,7 +200,7 @@ def _trade_from_filled_row(row: dict) -> ActiveTrade:
         stop_price=float(row["stop_price"]),
         target_1=float(row["target_1"]),
         target_2=float(row["target_2"]),
-        risk_level="manual",
+        risk_level=str(row.get("risk_level") or "manual"),
         trade_id=str(row.get("trade_id") or ""),
         direction=str(row.get("direction") or "LONG").upper(),
         margin_leverage=float(row.get("margin_leverage") or 1.0),
@@ -198,6 +208,17 @@ def _trade_from_filled_row(row: dict) -> ActiveTrade:
         actual_entry_fee=row.get("actual_entry_fee"),
         opened_at=str(row.get("filled_at") or row.get("updated_at") or ""),
     )
+
+
+def _retire_linked_pending_setup(trade_id: str) -> None:
+    try:
+        from app.services.pending_setup_registry import mark_pending_setup_entered
+
+        mark_pending_setup_entered(trade_id)
+    except Exception:
+        # A proved Kraken fill and active-trade record remain authoritative.
+        # The next recovery cycle will retry retiring stale pending state.
+        pass
 
 
 def recover_orphaned_filled_intents() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -221,6 +242,7 @@ def recover_orphaned_filled_intents() -> tuple[tuple[str, ...], tuple[str, ...]]
         existing = get_trade(symbol)
         if existing is not None and existing.status == "active":
             if existing.trade_id == trade_id:
+                _retire_linked_pending_setup(trade_id)
                 continue
             failures.append(f"{trade_id}: conflicting active trade already exists for {symbol}")
             continue
@@ -230,6 +252,7 @@ def recover_orphaned_filled_intents() -> tuple[tuple[str, ...], tuple[str, ...]]
             from app.services.trade_outcome_registry import mark_trade_entered
 
             mark_trade_entered(trade, entry_price_source="recovered_limit_fill")
+            _retire_linked_pending_setup(trade_id)
             recovered.append(trade_id)
         except Exception as exc:
             failures.append(f"{trade_id}: {exc}")
@@ -241,6 +264,7 @@ def mark_order_filled(
     *,
     fill_price: float,
     actual_entry_fee: float | None = None,
+    entry_price_source: str = "manual_limit_fill",
 ) -> ActiveTrade:
     if fill_price <= 0:
         raise ValueError("fill_price must be positive")
@@ -267,5 +291,6 @@ def mark_order_filled(
     add_trade(trade)
     from app.services.trade_outcome_registry import mark_trade_entered
 
-    mark_trade_entered(trade, entry_price_source="manual_limit_fill")
+    mark_trade_entered(trade, entry_price_source=entry_price_source)
+    _retire_linked_pending_setup(trade_id)
     return trade
