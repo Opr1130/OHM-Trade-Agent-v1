@@ -13,6 +13,7 @@ def capture_snapshot_decision(
     reason: str,
     source: str,
     profit_rank_score: float | None = None,
+    market_intelligence: dict[str, Any] | None = None,
 ) -> bool:
     """Persist a future-outcome shadow record without affecting trading flow.
 
@@ -34,6 +35,7 @@ def capture_snapshot_decision(
             spread_bps=spread_bps,
             reason=reason,
             source=source,
+            market_intelligence=market_intelligence,
         )
         return True
     except Exception:
