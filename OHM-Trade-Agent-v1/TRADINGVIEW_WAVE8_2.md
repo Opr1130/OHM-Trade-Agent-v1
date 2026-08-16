@@ -159,12 +159,16 @@ All of the following live in `app/core/config.py` and are read from `.env`
 
 ## Known limitations / honest gaps
 
-- **The Pine scripts are unverified.** Every Python file in this change was
-  compiled and exercised against hand-built test scenarios before being
-  committed. The two `.pine` files were authored and reasoned through
-  offline — no Pine compiler or runtime was available in the environment
-  this change was built in. Load them in TradingView's Pine Editor and
-  confirm they compile before relying on them for anything.
+- **Compiler verification is not strategy validation.** Both Pine v6 scripts
+  were compiled successfully in TradingView on a Kraken BTCUSD 15-minute
+  chart on 2026-08-16, including the dynamic `alert()` payload and the
+  uniformly closed 4H/1H series. The hosted run also exposed and corrected a
+  direction-asymmetry defect in the first draft's short trigger and scoring.
+  This is only syntax/runtime validation. The backtest companion defaults to
+  a conservative directional-quality gate and a 0.4% maker-fee baseline, but
+  it must still be evaluated across symbols, regimes, out-of-sample periods,
+  and the operator's actual Kraken fee/slippage assumptions. Keep the bridge
+  in paper observation until that evidence is acceptable.
 - **The bridge deliberately cannot create TradingView-only candidates.** Its
   value is earlier corroborating evidence on a native-qualified setup. This
   is a safety boundary, not an unfinished selector approximation.

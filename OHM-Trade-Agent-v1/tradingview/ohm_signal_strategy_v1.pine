@@ -1,7 +1,10 @@
 //@version=6
 strategy("OHM Signal Strategy v1 (backtest only)", overlay=true,
      default_qty_type=strategy.percent_of_equity, default_qty_value=10,
-     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true,
+     commission_type=strategy.commission.percent, commission_value=0.4)
+
+minimumTechnicalScore = input.float(70.0, "Minimum directional technical score", minval=50.0, maxval=90.0, step=1.0)
 
 // =============================================================================
 // OHM Signal Strategy v1 — backtest/paper-validation companion to
@@ -18,8 +21,11 @@ strategy("OHM Signal Strategy v1 (backtest only)", overlay=true,
 // match) OHM's live ATR/percentile-based entry_exit_advisor plan — see
 // app/services/entry_exit_advisor.py for the logic OHM actually trades on.
 //
-// NOT YET VERIFIED IN THE TRADINGVIEW PINE EDITOR — see the indicator file's
-// header for the same disclosure; it applies equally here.
+// HOSTED COMPILER VERIFIED on 2026-08-16 in TradingView Pine v6 on a Kraken
+// BTCUSD 15-minute chart. The default 0.4% commission is an optimistic maker-
+// fee baseline, not an account-specific assumption; set Strategy Properties
+// to the operator's actual Kraken tier and expected order type before using
+// any performance result. Compiler success is not evidence of predictive edge.
 // =============================================================================
 
 if timeframe.period != "15"
@@ -36,6 +42,8 @@ ema200 = ta.ema(close, 200)
 rsi14 = ta.rsi(close, 14)
 [macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
 atr14 = ta.atr(14)
+volAvg20 = ta.sma(volume, 20)
+relVolume = volAvg20 > 0 ? volume / volAvg20 : 0.0
 
 f_adx(len, smoothLen) =>
     [diPlusIgnored, diMinusIgnored, adxVal] = ta.dmi(len, smoothLen)
@@ -57,14 +65,19 @@ regime4h = (htf4Close > htf4Ema20 and htf4Ema20 > htf4Ema50 and htf4Ema50 > htf4
      lookahead = barmerge.lookahead_on)
 
 htf1PullbackPct = htf1Ema20 != 0 ? math.abs(htf1Close - htf1Ema20) / htf1Ema20 * 100 : 100.0
-setup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+longSetup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+     htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
+shortSetup1h = htf1Close < htf1Low20 * 1.001 ? "BREAKOUT" :
      htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
 
 priorHigh20 = ta.highest(high, 20)[1]
-entryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
+priorLow20 = ta.lowest(low, 20)[1]
+longEntryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
      (close > ema20 and close[1] <= ema20[1]) ? "RECLAIM" : "REVERSAL"
+shortEntryTrigger15m = close < priorLow20 ? "BREAKOUT" :
+     (close < ema20 and close[1] >= ema20[1]) ? "RECLAIM" : "REVERSAL"
 
-trendScore = math.max(0.0, math.min(100.0,
+longTrendScore = math.max(0.0, math.min(100.0,
      50.0
      + (close > ema20 ? 10.0 : -10.0)
      + (ema20 > ema50 ? 10.0 : -10.0)
@@ -72,14 +85,43 @@ trendScore = math.max(0.0, math.min(100.0,
      + (regime4h == "BULLISH" ? 10.0 : regime4h == "BEARISH" ? -10.0 : 0.0)
      + (adx14 > 25 ? 10.0 : 0.0)))
 
-momentumScore = math.max(0.0, math.min(100.0,
+shortTrendScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (close < ema20 ? 10.0 : -10.0)
+     + (ema20 < ema50 ? 10.0 : -10.0)
+     + (ema50 < ema200 ? 10.0 : -10.0)
+     + (regime4h == "BEARISH" ? 10.0 : regime4h == "BULLISH" ? -10.0 : 0.0)
+     + (adx14 > 25 ? 10.0 : 0.0)))
+
+longMomentumScore = math.max(0.0, math.min(100.0,
      50.0
      + (histLine > 0 ? 15.0 : -15.0)
      + (macdLine > signalLine ? 10.0 : -10.0)
      + ((rsi14 - 50.0) * 0.6)))
 
-longBias = regime4h != "BEARISH" and trendScore >= 60 and momentumScore >= 55 and entryTrigger15m != "REVERSAL"
-shortBias = regime4h != "BULLISH" and trendScore <= 40 and momentumScore <= 45 and entryTrigger15m != "REVERSAL"
+shortMomentumScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (histLine < 0 ? 15.0 : -15.0)
+     + (macdLine < signalLine ? 10.0 : -10.0)
+     + ((50.0 - rsi14) * 0.6)))
+
+volumeScore = math.max(0.0, math.min(100.0, relVolume * 40.0))
+
+longStructureScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (longSetup1h == "BREAKOUT" ? 15.0 : longSetup1h == "PULLBACK" ? 5.0 : -5.0)
+     + (longEntryTrigger15m == "BREAKOUT" ? 15.0 : longEntryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
+
+shortStructureScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (shortSetup1h == "BREAKOUT" ? 15.0 : shortSetup1h == "PULLBACK" ? 5.0 : -5.0)
+     + (shortEntryTrigger15m == "BREAKOUT" ? 15.0 : shortEntryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
+
+longTechnicalScore = (longTrendScore + longMomentumScore + volumeScore + longStructureScore) / 4.0
+shortTechnicalScore = (shortTrendScore + shortMomentumScore + volumeScore + shortStructureScore) / 4.0
+
+longBias = regime4h != "BEARISH" and longTrendScore >= 60 and longMomentumScore >= 55 and longEntryTrigger15m != "REVERSAL" and longTechnicalScore >= minimumTechnicalScore
+shortBias = regime4h != "BULLISH" and shortTrendScore >= 60 and shortMomentumScore >= 55 and shortEntryTrigger15m != "REVERSAL" and shortTechnicalScore >= minimumTechnicalScore
 
 // ---------------------------------------------------------------------------
 // Backtest-only trade management. 1.2R minimum first target mirrors the
