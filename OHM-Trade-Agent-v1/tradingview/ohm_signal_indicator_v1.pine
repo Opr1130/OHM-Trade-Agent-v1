@@ -34,11 +34,10 @@ indicator("OHM Signal Indicator v1", overlay=true, max_bars_back=500)
 //   the classifier two different points in time as if they were one. Keep
 //   the offset uniform within each tuple.
 //
-// NOT YET VERIFIED IN THE TRADINGVIEW PINE EDITOR. This file was authored and
-// reasoned through offline; no Pine compiler or runtime was available while
-// writing it. Before wiring it to OHM's webhook: load it on a real 15m chart,
-// confirm it compiles without error, and paper-watch a few sessions of its
-// alerts against the chart before trusting the payload.
+// HOSTED COMPILER VERIFIED on 2026-08-16 in TradingView Pine v6 on a Kraken
+// BTCUSD 15-minute chart. That verifies syntax and the runtime configuration
+// guards; it is not evidence of predictive edge. Paper-watch alerts for a few
+// sessions before pointing the script at OHM's production webhook.
 // =============================================================================
 
 if timeframe.period != "15"
@@ -47,6 +46,7 @@ if syminfo.prefix != "KRAKEN"
     runtime.error("OHM Signal Indicator v1 must be applied to a Kraken chart.")
 
 bridgeToken = input.string("", "OHM webhook token")
+minimumTechnicalScore = input.float(70.0, "Minimum directional technical score", minval=50.0, maxval=90.0, step=1.0)
 if str.length(bridgeToken) < 43
     runtime.error("Configure the per-deployment OHM webhook token (43+ characters).")
 
@@ -83,6 +83,8 @@ regime4h = (htf4Close > htf4Ema20 and htf4Ema20 > htf4Ema50 and htf4Ema50 > htf4
 
 // ---------------------------------------------------------------------------
 // 1H setup classification — every field offset to the last fully closed 1H bar.
+// Classify the same closed-bar snapshot separately for LONG and SHORT so a
+// close near the 20-bar low is not mislabeled with the long-side setup.
 // ---------------------------------------------------------------------------
 [htf1Close, htf1Ema20, htf1High20, htf1Low20] = request.security(
      syminfo.tickerid, "60",
@@ -90,22 +92,30 @@ regime4h = (htf4Close > htf4Ema20 and htf4Ema20 > htf4Ema50 and htf4Ema50 > htf4
      lookahead = barmerge.lookahead_on)
 
 htf1PullbackPct = htf1Ema20 != 0 ? math.abs(htf1Close - htf1Ema20) / htf1Ema20 * 100 : 100.0
-setup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+longSetup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+     htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
+shortSetup1h = htf1Close < htf1Low20 * 1.001 ? "BREAKOUT" :
      htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
 
 // ---------------------------------------------------------------------------
-// 15m entry trigger
+// 15m entry trigger. BREAKOUT and RECLAIM are directional labels: for a
+// short they mean a break below the prior low or a loss of EMA20. Keeping
+// separate long/short series prevents a bearish candidate from requiring a
+// bullish breakout/reclaim, which was an inversion in the first draft.
 // ---------------------------------------------------------------------------
 priorHigh20 = ta.highest(high, 20)[1]
-entryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
+priorLow20 = ta.lowest(low, 20)[1]
+longEntryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
      (close > ema20 and close[1] <= ema20[1]) ? "RECLAIM" : "REVERSAL"
+shortEntryTrigger15m = close < priorLow20 ? "BREAKOUT" :
+     (close < ema20 and close[1] >= ema20[1]) ? "RECLAIM" : "REVERSAL"
 
 // ---------------------------------------------------------------------------
 // Deterministic 0-100 scores. Bounded and explicit on purpose: this is
 // candidate evidence for OHM's own gates, not a replacement for them, so the
 // scoring here is intentionally simple rather than an opaque black box.
 // ---------------------------------------------------------------------------
-trendScore = math.max(0.0, math.min(100.0,
+longTrendScore = math.max(0.0, math.min(100.0,
      50.0
      + (close > ema20 ? 10.0 : -10.0)
      + (ema20 > ema50 ? 10.0 : -10.0)
@@ -113,26 +123,53 @@ trendScore = math.max(0.0, math.min(100.0,
      + (regime4h == "BULLISH" ? 10.0 : regime4h == "BEARISH" ? -10.0 : 0.0)
      + (adx14 > 25 ? 10.0 : 0.0)))
 
-momentumScore = math.max(0.0, math.min(100.0,
+shortTrendScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (close < ema20 ? 10.0 : -10.0)
+     + (ema20 < ema50 ? 10.0 : -10.0)
+     + (ema50 < ema200 ? 10.0 : -10.0)
+     + (regime4h == "BEARISH" ? 10.0 : regime4h == "BULLISH" ? -10.0 : 0.0)
+     + (adx14 > 25 ? 10.0 : 0.0)))
+
+longMomentumScore = math.max(0.0, math.min(100.0,
      50.0
      + (histLine > 0 ? 15.0 : -15.0)
      + (macdLine > signalLine ? 10.0 : -10.0)
      + ((rsi14 - 50.0) * 0.6)))
 
+shortMomentumScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (histLine < 0 ? 15.0 : -15.0)
+     + (macdLine < signalLine ? 10.0 : -10.0)
+     + ((50.0 - rsi14) * 0.6)))
+
 volumeScore = math.max(0.0, math.min(100.0, relVolume * 40.0))
 
-structureScore = math.max(0.0, math.min(100.0,
+longStructureScore = math.max(0.0, math.min(100.0,
      50.0
-     + (setup1h == "BREAKOUT" ? 15.0 : setup1h == "PULLBACK" ? 5.0 : -5.0)
-     + (entryTrigger15m == "BREAKOUT" ? 15.0 : entryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
+     + (longSetup1h == "BREAKOUT" ? 15.0 : longSetup1h == "PULLBACK" ? 5.0 : -5.0)
+     + (longEntryTrigger15m == "BREAKOUT" ? 15.0 : longEntryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
+
+shortStructureScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (shortSetup1h == "BREAKOUT" ? 15.0 : shortSetup1h == "PULLBACK" ? 5.0 : -5.0)
+     + (shortEntryTrigger15m == "BREAKOUT" ? 15.0 : shortEntryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
 
 volatilityScore = math.max(0.0, math.min(100.0, 100.0 - math.abs(atrPct - 2.0) * 15.0))
 
-technicalScore = (trendScore + momentumScore + volumeScore + structureScore) / 4.0
+longTechnicalScore = (longTrendScore + longMomentumScore + volumeScore + longStructureScore) / 4.0
+shortTechnicalScore = (shortTrendScore + shortMomentumScore + volumeScore + shortStructureScore) / 4.0
 
-longBias = regime4h != "BEARISH" and trendScore >= 60 and momentumScore >= 55 and entryTrigger15m != "REVERSAL"
-shortBias = regime4h != "BULLISH" and trendScore <= 40 and momentumScore <= 45 and entryTrigger15m != "REVERSAL"
+longBias = regime4h != "BEARISH" and longTrendScore >= 60 and longMomentumScore >= 55 and longEntryTrigger15m != "REVERSAL" and longTechnicalScore >= minimumTechnicalScore
+shortBias = regime4h != "BULLISH" and shortTrendScore >= 60 and shortMomentumScore >= 55 and shortEntryTrigger15m != "REVERSAL" and shortTechnicalScore >= minimumTechnicalScore
 direction = longBias ? "LONG" : shortBias ? "SHORT" : na
+
+setup1h = direction == "SHORT" ? shortSetup1h : longSetup1h
+entryTrigger15m = direction == "SHORT" ? shortEntryTrigger15m : longEntryTrigger15m
+trendScore = direction == "SHORT" ? shortTrendScore : longTrendScore
+momentumScore = direction == "SHORT" ? shortMomentumScore : longMomentumScore
+structureScore = direction == "SHORT" ? shortStructureScore : longStructureScore
+technicalScore = direction == "SHORT" ? shortTechnicalScore : longTechnicalScore
 
 // ---------------------------------------------------------------------------
 // Payload assembly — field names/types must match app.models.signal.TradingViewSignalV2 exactly.
