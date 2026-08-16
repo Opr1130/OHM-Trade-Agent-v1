@@ -154,8 +154,29 @@ def mark_search_started(now: datetime | None = None) -> None:
         _save_state(state)
 
 
+def _tradingview_v2_status() -> dict | None:
+    # Lazily/locally imported: tradingview_inbox imports get_operator_decision
+    # from this module, so importing it at module load time here would create
+    # an import cycle. This mirrors the existing lazy-import pattern used by
+    # _live_order_intents() above, and fails open (None) rather than ever
+    # blocking /operator/status on the optional bridge being present.
+    try:
+        from app.core.config import get_settings
+
+        if not get_settings().tradingview_v2_enabled:
+            return None
+        from app.services.tradingview_inbox import inbox_status
+
+        return inbox_status()
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def status_payload(now: datetime | None = None) -> dict:
     decision = get_operator_decision(now)
     payload = asdict(decision)
     payload["search_due"] = search_due(decision, now)
+    tradingview_v2 = _tradingview_v2_status()
+    if tradingview_v2 is not None:
+        payload["tradingview_v2"] = tradingview_v2
     return payload

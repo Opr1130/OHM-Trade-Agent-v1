@@ -49,18 +49,27 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             action = "TAKE_PROFIT"
             reasons.append("Short Target 1 reached")
 
+        # A single fast 1H oscillator flip (EMA20 reclaim, MACD cross, RSI
+        # swing) is common noise inside a still-intact trend and can fire
+        # while the trade is still comfortably profitable. Require at least
+        # two independent signals to corroborate each other before this
+        # escalates to a WARNING that looks like a reason to exit early.
+        # Single flips are still surfaced for visibility, just not as an
+        # actionable warning.
+        weak_signals: list[str] = []
         if current_price > ema20_value:
-            reasons.append("Price reclaimed EMA20 against short")
-            if action == "HOLD":
-                action = "WARNING"
+            weak_signals.append("Price reclaimed EMA20 against short")
         if macd_line > macd_signal:
-            reasons.append("MACD turned bullish against short")
-            if action == "HOLD":
-                action = "WARNING"
+            weak_signals.append("MACD turned bullish against short")
         if rsi_value > 60:
-            reasons.append("RSI momentum strengthened against short")
+            weak_signals.append("RSI momentum strengthened against short")
+        if len(weak_signals) >= 2:
+            reasons.extend(weak_signals)
             if action == "HOLD":
                 action = "WARNING"
+        elif len(weak_signals) == 1:
+            reasons.append(f"{weak_signals[0]} (single signal — monitoring, not a warning yet)")
+
         if vol_ratio >= 1.8 and current_price > trade.entry_price:
             reasons.append("Heavy buying volume detected against short")
             if action in {"HOLD", "WARNING"}:
@@ -76,18 +85,20 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             action = "TAKE_PROFIT"
             reasons.append("Target 1 reached")
 
+        weak_signals = []
         if current_price < ema20_value:
-            reasons.append("Price lost EMA20")
-            if action == "HOLD":
-                action = "WARNING"
+            weak_signals.append("Price lost EMA20")
         if macd_line < macd_signal:
-            reasons.append("MACD turned bearish")
-            if action == "HOLD":
-                action = "WARNING"
+            weak_signals.append("MACD turned bearish")
         if rsi_value < 40:
-            reasons.append("RSI momentum weakened")
+            weak_signals.append("RSI momentum weakened")
+        if len(weak_signals) >= 2:
+            reasons.extend(weak_signals)
             if action == "HOLD":
                 action = "WARNING"
+        elif len(weak_signals) == 1:
+            reasons.append(f"{weak_signals[0]} (single signal — monitoring, not a warning yet)")
+
         if vol_ratio >= 1.8 and current_price < trade.entry_price:
             reasons.append("Heavy selling volume detected")
             if action in {"HOLD", "WARNING"}:

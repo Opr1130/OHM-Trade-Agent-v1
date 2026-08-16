@@ -86,6 +86,17 @@ Restart the server. Never commit `.env` or API keys.
 
 TradingView must send JSON compatible with the local test body. TradingView cannot send a custom HTTP header, so production deployment should place the secret in the webhook URL or signed body through a secure gateway. The current header-based endpoint is intended for safe local testing first.
 
+## TradingView Intelligence Bridge (v2, optional)
+
+A second, optional webhook (`POST /webhooks/tradingview/v2`) accepts
+candidate evidence from a companion Pine indicator on a faster bar-close
+cadence than the native scanner polls. It is disabled by default
+(`TRADINGVIEW_V2_ENABLED=false`) and, like the legacy webhook above, can
+never place, confirm, or override anything — it only ever contributes
+context that still has to pass every one of OHM's existing gates. See
+[`TRADINGVIEW_WAVE8_2.md`](TRADINGVIEW_WAVE8_2.md) for the full design, the
+network-boundary setup required before enabling it, and known limitations.
+
 ## Run tests
 
 ```powershell

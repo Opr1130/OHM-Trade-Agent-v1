@@ -11,6 +11,7 @@ from app.services.learning_scheduler import run_learning_cycle
 from app.services.operations_analytics import run_scan_with_telemetry
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 from app.services.registry_io import registry_lock
+from app.core.config import get_settings
 
 
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
@@ -121,6 +122,28 @@ def _run_cycle_once() -> None:
     if not search_due(decision):
         print("Broad opportunity scan skipped: search cadence not due.")
         return
+
+    # Optional candidate evidence is processed only after active-trade and
+    # pending-setup protection has completed, and only immediately before a
+    # due native scan. The small bounded batch and Kraken timeout cap prevent
+    # the bridge from delaying risk protection or monopolizing a cycle.
+    settings = get_settings()
+    if settings.tradingview_v2_enabled:
+        try:
+            from app.services.tradingview_inbox import process_queued_events
+
+            tradingview_summary = process_queued_events()
+        except Exception as exc:
+            tradingview_summary = {"status": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
+            print("TradingView v2 inbox processing failed open:", tradingview_summary["reason"])
+        else:
+            print("OHM TradingView v2 Inbox")
+            print("Checked:", tradingview_summary.get("checked", 0))
+            print("Processed:", tradingview_summary.get("processed", 0))
+            print("Qualified:", tradingview_summary.get("qualified", 0))
+            print("Rejected:", tradingview_summary.get("rejected", 0))
+            print("Retried:", tradingview_summary.get("retried", 0))
+            print("Poisoned:", tradingview_summary.get("poisoned", 0))
 
     mark_search_started()
     # Capture the scanner's existing console report into structured telemetry

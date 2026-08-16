@@ -1,0 +1,201 @@
+//@version=6
+indicator("OHM Signal Indicator v1", overlay=true, max_bars_back=500)
+
+// =============================================================================
+// OHM Signal Indicator v1 — Wave 8.2 TradingView Intelligence Bridge
+//
+// TradingView is candidate evidence only. This script has no path to place an
+// order, confirm a fill, or override any OHM risk control. It only emits a
+// JSON alert payload matching app.models.signal.TradingViewSignalV2, which
+// OHM's own native pipeline (app/services/tradingview_inbox.py) independently
+// re-validates — schema, freshness, price divergence against Kraken, operator
+// mode, and the same deterministic target/economic gates every native
+// candidate must pass — before any of it can reach a Telegram alert.
+//
+// REQUIRED CHART SETTINGS
+//   - Apply this script to a 15-minute chart only. It emits timeframe="15"
+//     unconditionally and does not adapt to other chart intervals; the guard
+//     below raises a runtime error on any other interval so a misconfigured
+//     chart fails loudly instead of silently emitting a mislabeled signal.
+//   - Create the TradingView alert with "Once Per Bar Close". OHM's inbox
+//     independently re-checks bar freshness/consistency, but this setting is
+//     what keeps bar_confirmed meaningfully true at the moment of delivery.
+//
+// TEMPORAL CONSISTENCY (read this before editing)
+//   Every 4H field and every 1H field below comes from ONE request.security()
+//   call per timeframe, with every series inside that call uniformly offset
+//   to the last FULLY CLOSED bar on that timeframe (the trailing [1]). Do not
+//   add a new field to either tuple without the same [1] offset. An earlier
+//   draft of this bridge mixed a [1]-shifted (closed-bar) value with an
+//   unshifted (still-forming-bar) value inside what was supposed to be one
+//   coherent "regime as of this bar" snapshot — e.g. comparing today's live
+//   RSI against yesterday's already-closed EMA. That produces a temporally
+//   inconsistent picture, not a repainting bug per se, but it silently feeds
+//   the classifier two different points in time as if they were one. Keep
+//   the offset uniform within each tuple.
+//
+// NOT YET VERIFIED IN THE TRADINGVIEW PINE EDITOR. This file was authored and
+// reasoned through offline; no Pine compiler or runtime was available while
+// writing it. Before wiring it to OHM's webhook: load it on a real 15m chart,
+// confirm it compiles without error, and paper-watch a few sessions of its
+// alerts against the chart before trusting the payload.
+// =============================================================================
+
+if timeframe.period != "15"
+    runtime.error("OHM Signal Indicator v1 must be applied to a 15-minute chart.")
+if syminfo.prefix != "KRAKEN"
+    runtime.error("OHM Signal Indicator v1 must be applied to a Kraken chart.")
+
+bridgeToken = input.string("", "OHM webhook token")
+if str.length(bridgeToken) < 43
+    runtime.error("Configure the per-deployment OHM webhook token (43+ characters).")
+
+// ---------------------------------------------------------------------------
+// 15m core series
+// ---------------------------------------------------------------------------
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+rsi14 = ta.rsi(close, 14)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+atr14 = ta.atr(14)
+atrPct = close != 0 ? atr14 / close * 100 : 0.0
+volAvg20 = ta.sma(volume, 20)
+relVolume = volAvg20 > 0 ? volume / volAvg20 : 0.0
+vwapValue = ta.vwap(close)
+
+f_adx(len, smoothLen) =>
+    [diPlusIgnored, diMinusIgnored, adxVal] = ta.dmi(len, smoothLen)
+    adxVal
+
+adx14 = f_adx(14, 14)
+
+// ---------------------------------------------------------------------------
+// 4H regime — every field offset to the last fully closed 4H bar.
+// ---------------------------------------------------------------------------
+[htf4Close, htf4Ema20, htf4Ema50, htf4Ema200, htf4Adx] = request.security(
+     syminfo.tickerid, "240",
+     [close[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1], f_adx(14, 14)[1]],
+     lookahead = barmerge.lookahead_on)
+
+regime4h = (htf4Close > htf4Ema20 and htf4Ema20 > htf4Ema50 and htf4Ema50 > htf4Ema200 and htf4Adx > 20) ? "BULLISH" :
+     (htf4Close < htf4Ema20 and htf4Ema20 < htf4Ema50 and htf4Ema50 < htf4Ema200 and htf4Adx > 20) ? "BEARISH" : "NEUTRAL"
+
+// ---------------------------------------------------------------------------
+// 1H setup classification — every field offset to the last fully closed 1H bar.
+// ---------------------------------------------------------------------------
+[htf1Close, htf1Ema20, htf1High20, htf1Low20] = request.security(
+     syminfo.tickerid, "60",
+     [close[1], ta.ema(close, 20)[1], ta.highest(high, 20)[1], ta.lowest(low, 20)[1]],
+     lookahead = barmerge.lookahead_on)
+
+htf1PullbackPct = htf1Ema20 != 0 ? math.abs(htf1Close - htf1Ema20) / htf1Ema20 * 100 : 100.0
+setup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+     htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
+
+// ---------------------------------------------------------------------------
+// 15m entry trigger
+// ---------------------------------------------------------------------------
+priorHigh20 = ta.highest(high, 20)[1]
+entryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
+     (close > ema20 and close[1] <= ema20[1]) ? "RECLAIM" : "REVERSAL"
+
+// ---------------------------------------------------------------------------
+// Deterministic 0-100 scores. Bounded and explicit on purpose: this is
+// candidate evidence for OHM's own gates, not a replacement for them, so the
+// scoring here is intentionally simple rather than an opaque black box.
+// ---------------------------------------------------------------------------
+trendScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (close > ema20 ? 10.0 : -10.0)
+     + (ema20 > ema50 ? 10.0 : -10.0)
+     + (ema50 > ema200 ? 10.0 : -10.0)
+     + (regime4h == "BULLISH" ? 10.0 : regime4h == "BEARISH" ? -10.0 : 0.0)
+     + (adx14 > 25 ? 10.0 : 0.0)))
+
+momentumScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (histLine > 0 ? 15.0 : -15.0)
+     + (macdLine > signalLine ? 10.0 : -10.0)
+     + ((rsi14 - 50.0) * 0.6)))
+
+volumeScore = math.max(0.0, math.min(100.0, relVolume * 40.0))
+
+structureScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (setup1h == "BREAKOUT" ? 15.0 : setup1h == "PULLBACK" ? 5.0 : -5.0)
+     + (entryTrigger15m == "BREAKOUT" ? 15.0 : entryTrigger15m == "RECLAIM" ? 5.0 : -10.0)))
+
+volatilityScore = math.max(0.0, math.min(100.0, 100.0 - math.abs(atrPct - 2.0) * 15.0))
+
+technicalScore = (trendScore + momentumScore + volumeScore + structureScore) / 4.0
+
+longBias = regime4h != "BEARISH" and trendScore >= 60 and momentumScore >= 55 and entryTrigger15m != "REVERSAL"
+shortBias = regime4h != "BULLISH" and trendScore <= 40 and momentumScore <= 45 and entryTrigger15m != "REVERSAL"
+direction = longBias ? "LONG" : shortBias ? "SHORT" : na
+
+// ---------------------------------------------------------------------------
+// Payload assembly — field names/types must match app.models.signal.TradingViewSignalV2 exactly.
+// ---------------------------------------------------------------------------
+barClosedAtIso = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+signalId = str.replace_all(syminfo.tickerid, ":", "-") + "-" + str.tostring(time_close)
+
+warningsJson = "[]"
+if relVolume < 0.5
+    warningsJson := "[\"relative volume below 0.5x 20-bar average\"]"
+if atrPct > 8.0
+    warningsJson := "[\"ATR% above 8 -- elevated volatility regime\"]"
+
+f_num(x) => str.tostring(x, "0.####")
+
+payload = "{" +
+     "\"verification_token\":\"" + bridgeToken + "\"," +
+     "\"schema_version\":\"2\"," +
+     "\"script_version\":\"ohm-signal-v1\"," +
+     "\"signal_id\":\"" + signalId + "\"," +
+     "\"symbol\":\"" + syminfo.ticker + "\"," +
+     "\"exchange\":\"" + syminfo.prefix + "\"," +
+     "\"direction\":\"" + direction + "\"," +
+     "\"bar_closed_at\":\"" + barClosedAtIso + "\"," +
+     "\"timeframe\":\"15\"," +
+     "\"bar_confirmed\":true," +
+     "\"regime_4h\":\"" + regime4h + "\"," +
+     "\"setup_1h\":\"" + setup1h + "\"," +
+     "\"entry_trigger_15m\":\"" + entryTrigger15m + "\"," +
+     "\"technical_score\":" + f_num(technicalScore) + "," +
+     "\"trend_score\":" + f_num(trendScore) + "," +
+     "\"momentum_score\":" + f_num(momentumScore) + "," +
+     "\"volume_score\":" + f_num(volumeScore) + "," +
+     "\"structure_score\":" + f_num(structureScore) + "," +
+     "\"volatility_score\":" + f_num(volatilityScore) + "," +
+     "\"tradingview_close\":" + f_num(close) + "," +
+     "\"ema_20\":" + f_num(ema20) + "," +
+     "\"ema_50\":" + f_num(ema50) + "," +
+     "\"ema_200\":" + f_num(ema200) + "," +
+     "\"adx\":" + f_num(adx14) + "," +
+     "\"rsi\":" + f_num(rsi14) + "," +
+     "\"macd_histogram\":" + f_num(histLine) + "," +
+     "\"relative_volume\":" + f_num(relVolume) + "," +
+     "\"atr\":" + f_num(atr14) + "," +
+     "\"atr_percentage\":" + f_num(atrPct) + "," +
+     "\"vwap\":" + f_num(vwapValue) + "," +
+     "\"warnings\":" + warningsJson +
+     "}"
+
+longCondition = barstate.isconfirmed and direction == "LONG"
+shortCondition = barstate.isconfirmed and direction == "SHORT"
+
+plot(ema20, title="EMA20", color=color.new(color.blue, 0))
+plot(ema50, title="EMA50", color=color.new(color.orange, 0))
+plot(ema200, title="EMA200", color=color.new(color.red, 0))
+plotshape(longCondition, title="OHM LONG", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(shortCondition, title="OHM SHORT", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// alertcondition()'s message argument must be a compile-time constant in
+// Pine, so it cannot carry the dynamic JSON payload built above — only
+// alert() supports a fully dynamic, per-bar series string. Create the
+// TradingView alert on this script with condition "Any alert() function
+// call", not on a specific alertcondition, or the JSON body will not be the
+// one delivered.
+if longCondition or shortCondition
+    alert(payload, alert.freq_once_per_bar_close)

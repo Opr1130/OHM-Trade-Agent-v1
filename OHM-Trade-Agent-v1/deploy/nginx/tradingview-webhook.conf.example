@@ -1,0 +1,75 @@
+# Example reverse-proxy configuration for the Wave 8.2 TradingView
+# Intelligence Bridge (POST /webhooks/tradingview/v2).
+#
+# TradingView cannot be configured to send a custom HTTP header or a
+# client certificate, so the proxy authenticates the provider/network layer:
+# nginx is the only process allowed to reach OHM directly (bind OHM to
+# 127.0.0.1, not 0.0.0.0), and nginx itself only accepts TradingView's
+# published outbound webhook IP ranges on this path. The application also
+# requires a per-deployment bearer value inside the JSON body because source
+# IPs authenticate TradingView, not the individual TradingView account.
+# Look up the current
+# ranges before deploying — TradingView has changed them before:
+#   https://www.tradingview.com/support/solutions/43000529348-about-webhooks/
+# and replace the placeholder addresses below with the current list.
+#
+# This file is a starting point, not a drop-in. Review every line against
+# your actual TLS termination, log retention, and firewall setup.
+
+# --- TradingView webhook source allowlist (REPLACE with current ranges) ---
+geo $tradingview_source {
+    default 0;
+    52.89.214.238/32   1;
+    34.212.75.30/32    1;
+    54.218.53.128/32   1;
+    52.32.178.7/32     1;
+}
+
+# Rate limit sized for a 15-minute-bar strategy across a shortlisted
+# universe, not a single symbol: at most a handful of confirmed-bar signals
+# per minute in steady state, with short bursts when many 15m bars close at
+# once. 2 req/s with burst=5 undersizes this — a normal multi-symbol burst at
+# the top of an hour would spill into 429s. Size for genuine burst headroom
+# while still bounding worst case.
+limit_req_zone $binary_remote_addr zone=tradingview_webhook:10m rate=20r/m;
+
+server {
+    listen 443 ssl;
+    server_name your-ohm-host.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/your-ohm-host.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-ohm-host.example.com/privkey.pem;
+
+    # Reject every path except the v2 bridge from the public internet. All
+    # other OHM routes (operator control, legacy webhook) should be reached
+    # over a private network / VPN, never through this public server block.
+    location = /webhooks/tradingview/v2 {
+        if ($tradingview_source = 0) {
+            return 403;
+        }
+
+        limit_req zone=tradingview_webhook burst=10 nodelay;
+        limit_req_status 429;
+
+        # Defense in depth: even though $tradingview_source already
+        # allowlists the caller, cap the body size here too, ahead of
+        # OHM's own TRADINGVIEW_MAX_PAYLOAD_BYTES check.
+        client_max_body_size 32k;
+
+        # Stamped after the IP allowlist passes, so OHM can verify the
+        # request actually arrived through this proxy (and not from some
+        # other process that can reach it directly) rather than trusting
+        # network position alone. Must match TRADINGVIEW_INTERNAL_VERIFICATION_VALUE
+        # in OHM's .env, and must be rotated to a private, unique value before
+        # this is enabled in production — see TRADINGVIEW_WAVE8_2.md.
+        proxy_set_header X-Ohm-Internal-Verification "REPLACE-WITH-A-UNIQUE-SECRET-VALUE";
+
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_read_timeout 15s;
+    }
+
+    location / {
+        return 404;
+    }
+}
