@@ -76,6 +76,26 @@ def test_place_limit_is_setup_not_entered(monkeypatch, tmp_path):
     assert record["recommendation_action"] == "PLACE_LIMIT"
 
 
+def test_recommendation_persists_wave8_market_intelligence(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    evidence = {
+        "assessment": {"status": "AVAILABLE", "context_score": 60},
+        "authority": "context_only_no_gate_override",
+    }
+    item["market_intelligence"] = evidence
+
+    record = outcomes.record_recommendation(
+        trade_id="OHM-BTC-INTELLIGENCE",
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+
+    assert record["schema_version"] == 3
+    assert record["market_intelligence"] == evidence
+
+
 def test_mark_entered_records_explicit_entry_source(monkeypatch, tmp_path):
     isolate(monkeypatch, tmp_path)
     outcomes.record_recommendation(

@@ -516,12 +516,6 @@ def _configure_pipeline(monkeypatch, specifications):
         return real_rank(opportunities)
 
     monkeypatch.setattr(scan_opportunities, "rank_profit_opportunities", rank_all)
-    monkeypatch.setattr(
-        scan_opportunities,
-        "add_pending_setup",
-        lambda setup: events.append(f"pending:{setup.symbol}"),
-    )
-
     def send(**kwargs):
         events.append(f"send:{kwargs['plan'].symbol}")
         sent.append(kwargs["candidate"].copy())

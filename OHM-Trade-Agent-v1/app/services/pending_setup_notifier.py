@@ -34,15 +34,28 @@ def format_pending_setup_message(
     if result.status == "ENTRY_ZONE_REACHED":
         header = "🟢 OHM AI — ENTRY ZONE REACHED"
         action = "ENTRY CONDITIONS ARE NOW IN RANGE"
+        lifecycle_note = (
+            "OHM will verify any fill directly from Kraken before "
+            "active-trade monitoring begins."
+        )
     elif result.status == "INVALIDATED":
         header = "🔴 OHM AI — SETUP INVALIDATED"
         action = "DO NOT ENTER"
+        lifecycle_note = (
+            "Cancel any open Kraken order for this setup manually. "
+            "OHM uses a read-only Kraken key and cannot cancel exchange orders."
+        )
     elif result.status == "TOO_EXTENDED":
         header = "⚠️ OHM AI — DO NOT CHASE"
         action = "WAIT FOR A NEW SETUP"
+        lifecycle_note = (
+            "Cancel any open Kraken order for this setup manually. "
+            "OHM uses a read-only Kraken key and cannot cancel exchange orders."
+        )
     else:
         header = "ℹ️ OHM AI — SETUP UPDATE"
         action = "CONTINUE WAITING"
+        lifecycle_note = "OHM continues monitoring this setup against Kraken."
 
     return (
         f"{header}\n\n"
@@ -59,7 +72,7 @@ def format_pending_setup_message(
         f"Target 1: {setup.target_1}\n"
         f"Target 2: {setup.target_2}\n\n"
         f"Reason:\n{result.reason}\n\n"
-        f"Confirm your actual fill before OHM AI begins active-trade monitoring."
+        f"{lifecycle_note}"
     )
 
 

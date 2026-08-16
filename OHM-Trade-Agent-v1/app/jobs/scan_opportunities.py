@@ -28,7 +28,6 @@ from app.services.chief_analyst import (
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
-from app.services.pending_setup_registry import PendingSetup, add_pending_setup
 from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
 from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
@@ -364,6 +363,11 @@ def main():
         alert["secondary_pair"] = snapshot.secondary_pair
         alert["primary_quote_currency"] = snapshot.primary_quote_currency
         alert["market_regime"] = market_regime.regime
+        alert["market_intelligence"] = getattr(
+            snapshot,
+            "_wave8_market_intelligence",
+            None,
+        )
         if direction == "SHORT":
             alert["margin_leverage"] = SHORT_VALIDATION_LEVERAGE
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
@@ -468,24 +472,6 @@ def main():
             profit_rank_score=ranked.profit_ranking.total_score,
         )
 
-        if not plan.valid_now:
-            setup = PendingSetup(
-                symbol=plan.symbol,
-                entry_low=plan.entry_low,
-                entry_high=plan.entry_high,
-                chase_limit=plan.chase_limit,
-                stop_price=plan.stop_price,
-                target_1=plan.target_1,
-                target_2=plan.target_2,
-                risk_level=plan.risk_level,
-                confidence=int(alert.get("confidence", 0)),
-                direction=direction,
-                margin_leverage=(SHORT_VALIDATION_LEVERAGE if direction == "SHORT" else 1.0),
-            )
-            add_pending_setup(setup)
-            alert["trade_id"] = setup.trade_id
-            pending_saved += 1
-
         if send_trade_plan(
             candidate=alert,
             plan=plan,
@@ -494,6 +480,8 @@ def main():
             chat_id=settings.telegram_chat_id,
         ):
             sent += 1
+            if not plan.valid_now:
+                pending_saved += 1
 
     print("")
     print("===== OHM HIGH-CONVICTION SUMMARY =====")

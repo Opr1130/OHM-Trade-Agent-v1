@@ -8,6 +8,14 @@ from typing import Any
 
 from app.services.decision_learning import is_non_entry_decision
 from app.services.execution_learning_registry import get_execution_records
+from app.services.market_intelligence_attribution import (
+    MAX_COMBINED_MULTIPLIER as MAX_INTELLIGENCE_MULTIPLIER,
+    MAX_PROPOSED_WEIGHT_ADJUSTMENT as MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
+    MIN_ACTUAL_BUCKET_SAMPLES as MIN_INTELLIGENCE_BUCKET_SAMPLES,
+    MIN_ACTUAL_SAMPLES as MIN_INTELLIGENCE_TRADE_SAMPLES,
+    MIN_COMBINED_MULTIPLIER as MIN_INTELLIGENCE_MULTIPLIER,
+    build_market_intelligence_attribution,
+)
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 from app.services.shadow_learning import get_shadow_records
 from app.services.trade_outcome_registry import get_outcomes
@@ -224,10 +232,14 @@ def build_profitability_profile(
     shadow = _shadow_quality(shadows)
     timing = _timing_metrics(executions, outcomes)
     loss_learning = _loss_learning(financial_rows)
+    market_intelligence_attribution = build_market_intelligence_attribution(
+        outcomes=outcomes,
+        shadows=shadows,
+    )
 
     version = _now()
     profile = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": version,
         "objective": "maximize_realized_net_profit_after_costs_with_bounded_risk",
         "paid_ai_calls": 0,
@@ -236,6 +248,7 @@ def build_profitability_profile(
         "shadow_learning": shadow,
         "timing_learning": timing,
         "loss_learning": loss_learning,
+        "market_intelligence_attribution": market_intelligence_attribution,
         "guardrails": {
             "minimum_trade_samples": MIN_TRADE_SAMPLES,
             "minimum_bucket_samples": MIN_BUCKET_SAMPLES,
@@ -243,6 +256,14 @@ def build_profitability_profile(
             "max_weight_adjustment": MAX_WEIGHT_ADJUSTMENT,
             "hard_risk_rules_mutable": False,
             "ai_can_rewrite_code": False,
+            "leverage_mutable": False,
+            "minimum_market_intelligence_trade_samples": MIN_INTELLIGENCE_TRADE_SAMPLES,
+            "minimum_market_intelligence_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
+            "max_market_intelligence_weight_adjustment": MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
+            "market_intelligence_combined_multiplier_min": MIN_INTELLIGENCE_MULTIPLIER,
+            "market_intelligence_combined_multiplier_max": MAX_INTELLIGENCE_MULTIPLIER,
+            "market_intelligence_auto_promotion": False,
+            "market_intelligence_human_review_required": True,
         },
     }
     if persist:

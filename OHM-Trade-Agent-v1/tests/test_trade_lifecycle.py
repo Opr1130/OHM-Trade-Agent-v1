@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -148,7 +149,7 @@ def test_below_ema20_is_wait_and_never_valid_now():
     assert result.reason == "Price is below EMA20; wait for trend recovery."
 
 
-def test_actionable_setup_is_persisted_before_confirmation_button(
+def test_actionable_setup_is_persisted_without_confirmation_buttons(
     registry_files,
     monkeypatch,
 ):
@@ -156,8 +157,8 @@ def test_actionable_setup_is_persisted_before_confirmation_button(
 
     def send(*args, **kwargs):
         setup = pending_setup_registry.get_pending_setups()[0]
-        callback = kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
-        observed["matches"] = callback == f"trade_filled:{setup.trade_id}"
+        observed["trade_id"] = setup.trade_id
+        observed["has_reply_markup"] = "reply_markup" in kwargs
         return True
 
     monkeypatch.setattr(chief_alert_notifier, "send_telegram_message", send)
@@ -168,7 +169,90 @@ def test_actionable_setup_is_persisted_before_confirmation_button(
         "token",
         "chat",
     )
-    assert observed["matches"]
+    assert observed["trade_id"].startswith("OHM-BTC/USD-")
+    assert observed["has_reply_markup"] is False
+
+
+def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
+    registry_files,
+    monkeypatch,
+):
+    sent = {}
+
+    def allow_intelligence(candidate, plan):
+        candidate["recommended_capital"] = 250.0
+        return True
+
+    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", allow_intelligence)
+    monkeypatch.setattr(chief_alert_notifier, "reconciliation_enabled", lambda: True)
+    monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_telegram_message",
+        lambda *args, **kwargs: sent.update(kwargs) or True,
+    )
+    candidate = {
+        "confidence": 90,
+        "decision": "alert",
+        "economic_qualified": True,
+    }
+
+    assert chief_alert_notifier.send_trade_plan(
+        candidate,
+        _plan(),
+        "summary",
+        "token",
+        "chat",
+    )
+
+    setup = pending_setup_registry.get_pending_setups()[0]
+    intent = order_intent_registry.get_order_intent(setup.trade_id)
+    assert intent is not None
+    assert intent.trade_id == setup.trade_id
+    assert intent.limit_price == pytest.approx(100.0)
+    assert intent.capital == pytest.approx(250.0)
+    assert intent.entry_action == "ENTER_NOW"
+    assert intent.source == "ohm_actionable_signal"
+    assert "reply_markup" not in sent
+
+
+def test_place_limit_reuses_pending_trade_id_for_reconciliation(
+    registry_files,
+    monkeypatch,
+):
+    setup = pending_setup_registry.add_pending_setup(_setup())
+    plan = replace(_plan(), valid_now=False, entry_style="wait_for_pullback")
+
+    def allow_intelligence(candidate, plan):
+        candidate["recommended_capital"] = 200.0
+        return True
+
+    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", allow_intelligence)
+    monkeypatch.setattr(chief_alert_notifier, "reconciliation_enabled", lambda: True)
+    monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_telegram_message",
+        lambda *args, **kwargs: True,
+    )
+    candidate = {
+        "confidence": 90,
+        "decision": "alert",
+        "economic_qualified": True,
+        "trade_id": setup.trade_id,
+    }
+
+    assert chief_alert_notifier.send_trade_plan(
+        candidate,
+        plan,
+        "summary",
+        "token",
+        "chat",
+    )
+    intent = order_intent_registry.get_order_intent(setup.trade_id)
+    assert intent is not None
+    assert intent.limit_price == pytest.approx(plan.entry_low)
+    assert intent.entry_action == "PLACE_LIMIT"
 
 
 def test_trade_filled_moves_pending_setup_to_active(registry_files):
@@ -211,6 +295,113 @@ def test_terminal_market_status_cannot_resurrect(
     assert pending_setup_registry._load_raw()[setup.symbol]["status"] == stored_status
     with pytest.raises(ValueError, match="No confirmable pending setup"):
         confirm_trade_id(setup.trade_id)
+
+
+def test_terminal_setup_message_requires_manual_kraken_order_cancellation():
+    setup = _setup()
+    result = PendingSetupMonitorResult(
+        setup.symbol,
+        "INVALIDATED",
+        95.0,
+        "setup failed",
+    )
+
+    message = pending_setup_notifier.format_pending_setup_message(setup, result)
+
+    assert "Cancel any open Kraken order" in message
+    assert "read-only Kraken key" in message
+
+
+def test_pending_invalidation_cancels_linked_reconciliation_intent(
+    registry_files,
+):
+    setup = pending_setup_registry.add_pending_setup(_setup())
+    order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol=setup.symbol,
+            direction=setup.direction,
+            limit_price=setup.entry_low,
+            capital=100.0,
+            stop_price=setup.stop_price,
+            target_1=setup.target_1,
+            target_2=setup.target_2,
+            trade_id=setup.trade_id,
+            source="ohm_actionable_signal",
+        )
+    )
+
+    assert pending_setup_registry.terminalize_pending_setup(
+        setup.trade_id,
+        "invalidated",
+    )
+    assert order_intent_registry.get_order_intent(setup.trade_id).status == "CANCELLED"
+
+
+def test_pending_invalidation_does_not_split_state_when_intent_cancel_fails(
+    registry_files,
+    monkeypatch,
+):
+    setup = pending_setup_registry.add_pending_setup(_setup())
+    order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol=setup.symbol,
+            direction=setup.direction,
+            limit_price=setup.entry_low,
+            capital=100.0,
+            stop_price=setup.stop_price,
+            target_1=setup.target_1,
+            target_2=setup.target_2,
+            trade_id=setup.trade_id,
+            source="ohm_actionable_signal",
+        )
+    )
+    monkeypatch.setattr(
+        order_intent_registry,
+        "cancel_order_intent",
+        lambda trade_id: (_ for _ in ()).throw(OSError("registry unavailable")),
+    )
+
+    assert pending_setup_registry.terminalize_pending_setup(
+        setup.trade_id,
+        "invalidated",
+    ) is False
+    assert pending_setup_registry.get_pending_setups()[0].trade_id == setup.trade_id
+    assert order_intent_registry.get_order_intent(setup.trade_id).status == "LIMIT_PLACED"
+
+
+def test_verified_order_fill_retires_pending_setup_without_terminalizing_trade(
+    registry_files,
+):
+    setup = pending_setup_registry.add_pending_setup(_setup())
+    order_intent_registry.register_order_intent(
+        OrderIntent(
+            symbol=setup.symbol,
+            direction=setup.direction,
+            limit_price=100.0,
+            capital=100.0,
+            stop_price=setup.stop_price,
+            target_1=setup.target_1,
+            target_2=setup.target_2,
+            risk_level=setup.risk_level,
+            trade_id=setup.trade_id,
+            source="ohm_actionable_signal",
+        )
+    )
+
+    trade = order_intent_registry.mark_order_filled(
+        setup.trade_id,
+        fill_price=100.0,
+        actual_entry_fee=0.2,
+        entry_price_source="kraken_reconciliation_fill",
+    )
+
+    assert trade.trade_id == setup.trade_id
+    assert trade.risk_level == setup.risk_level
+    assert pending_setup_registry.get_pending_setups() == []
+    outcome = trade_outcome_registry.get_outcomes()[0]
+    assert outcome["entered_trade"] is True
+    assert outcome["terminal_status"] is None
+    assert outcome["entry_price_source"] == "kraken_reconciliation_fill"
 
 
 def test_duplicate_sequential_filled_callbacks_are_idempotent(
@@ -313,6 +504,20 @@ def test_orphaned_filled_intent_is_recovered(registry_files):
 
 
 def test_crash_after_filled_persistence_self_heals(registry_files, monkeypatch):
+    pending_setup_registry.add_pending_setup(
+        pending_setup_registry.PendingSetup(
+            symbol="SOLUSD",
+            entry_low=149.0,
+            entry_high=150.0,
+            chase_limit=151.0,
+            stop_price=140.0,
+            target_1=165.0,
+            target_2=175.0,
+            risk_level="low",
+            confidence=90,
+            trade_id="OHM-SOL-CRASH",
+        )
+    )
     intent = order_intent_registry.register_order_intent(
         OrderIntent(
             symbol="SOLUSD",
@@ -337,6 +542,11 @@ def test_crash_after_filled_persistence_self_heals(registry_files, monkeypatch):
     stored = order_intent_registry.get_order_intent(intent.trade_id)
     assert stored.status == "FILLED"
     assert active_trade_registry.get_trade("SOLUSD") is None
+    assert pending_setup_registry.terminalize_pending_setup(
+        intent.trade_id,
+        "invalidated",
+    ) is False
+    assert pending_setup_registry.get_pending_setups() == []
 
     monkeypatch.setattr(order_intent_registry, "add_trade", original_add_trade)
     recovered, failures = order_intent_registry.recover_orphaned_filled_intents()

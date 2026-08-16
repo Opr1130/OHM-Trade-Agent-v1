@@ -11,6 +11,10 @@ def main() -> None:
     shadow = profile.get("shadow_learning") or {}
     timing = profile.get("timing_learning") or {}
     loss = profile.get("loss_learning") or {}
+    attribution = profile.get("market_intelligence_attribution") or {}
+    actual_attribution = attribution.get("actual_trade_attribution") or {}
+    shadow_attribution = attribution.get("shadow_confirmation") or {}
+    promotion = attribution.get("promotion") or {}
     decision = decision_quality_summary(get_shadow_records())
 
     print("===== OHM PROFITABILITY SELF-LEARNING =====")
@@ -64,6 +68,14 @@ def main() -> None:
     print("Potentially avoidable:", loss.get("potentially_avoidable_losses", 0))
     print("Potentially avoidable loss $:", loss.get("potentially_avoidable_loss_dollars", 0.0))
     print("Heuristic only:", loss.get("heuristic_only", True))
+    print()
+    print("WAVE 8.1 MARKET INTELLIGENCE ATTRIBUTION")
+    print("Status:", attribution.get("status"))
+    print("Actual trade samples:", actual_attribution.get("samples", 0))
+    print("Shadow confirmation samples:", shadow_attribution.get("samples", 0))
+    print("Proposed review-only weights:", attribution.get("proposed_weights") or {})
+    print("Promotion status:", promotion.get("status"))
+    print("Automatically applied:", promotion.get("automatically_applied", False))
 
 
 if __name__ == "__main__":
