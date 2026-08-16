@@ -262,6 +262,14 @@ def review_candidates(
         }
         if quality_by_risk_level is not None:
             candidate_context["deterministic_quality_by_risk_level"] = quality_by_risk_level
+        # Wave 8.2: optional corroborating/candidate evidence attached by
+        # merge_native_candidate_evidence / tradingview_only_candidates
+        # (app/services/tradingview_inbox.py). Context only — the Chief AI
+        # review never receives this as a reason to bypass any deterministic
+        # gate, and it is absent whenever no matching evidence exists.
+        tradingview_evidence = getattr(candidate, "_tradingview_evidence", None)
+        if tradingview_evidence is not None:
+            candidate_context["tradingview_candidate_evidence"] = tradingview_evidence
         payload.append(candidate_context)
         chief_eligible_candidates.append(candidate)
 

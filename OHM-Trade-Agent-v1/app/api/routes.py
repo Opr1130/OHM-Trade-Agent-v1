@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Header, HTTPException, status
-from pydantic import BaseModel, Field
+import json
+
+from fastapi import APIRouter, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field, ValidationError
 
 from app.core.config import get_settings
-from app.models.signal import SignalDecision, TradingSignal
+from app.models.signal import SignalDecision, TradingSignal, TradingViewSignalV2
 from app.services.active_trade_registry import close_trade, get_active_trades, get_trade
 from app.services.ai_reviewer import review_signal
 from app.services.fee_pnl import calculate_fee_aware_pnl
@@ -20,9 +22,51 @@ from app.services.risk import build_risk_plan
 from app.services.scoring import score_signal
 from app.services.secret_auth import secret_matches
 from app.services.telegram_notifier import format_trade_alert, send_telegram_message
+from app.services.tradingview_inbox import TradingViewInboxFullError, enqueue, record_rejection
 
 
 router = APIRouter()
+
+# TradingView cannot be made to send a custom HTTP header, so the v2 bridge is
+# authenticated at the network layer instead: a reverse proxy (see
+# deploy/nginx/tradingview-webhook.conf.example) allowlists TradingView's
+# published webhook source IPs and is the only thing permitted to reach this
+# process directly, then stamps every forwarded request with this header so
+# the app can also verify the request actually came through that proxy and
+# not from some other process on the same host/network.
+TRADINGVIEW_VERIFICATION_HEADER = "x-ohm-internal-verification"
+
+
+def _classify_tradingview_policy_rejection(message: str) -> str:
+    if "resubmitted faster" in message:
+        return ""  # already counted inside enqueue(); do not double count
+    if "schema_version" in message or "ambiguous" in message:
+        return "schema"
+    if "script_version" in message:
+        return "version"
+    if "stale" in message:
+        return "stale"
+    if "future-dated" in message:
+        return "future"
+    return "policy"
+
+
+async def _read_bounded_body(request: Request, maximum_bytes: int) -> bytes:
+    """Read a request incrementally so the application never buffers an
+    arbitrarily large webhook body before enforcing its configured limit.
+    The reverse proxy also applies its own client_max_body_size boundary.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > maximum_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Payload too large",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class OrderIntentRequest(BaseModel):
@@ -230,3 +274,77 @@ def tradingview_webhook(signal: TradingSignal, x_webhook_secret: str | None = He
         message = format_trade_alert(signal, decision)
         send_telegram_message(settings.telegram_bot_token, settings.telegram_chat_id, message)
     return decision
+
+
+@router.post("/webhooks/tradingview/v2", status_code=status.HTTP_202_ACCEPTED)
+async def tradingview_webhook_v2(request: Request) -> dict:
+    """Wave 8.2 TradingView Intelligence Bridge inbound endpoint.
+
+    TradingView is candidate evidence only. This endpoint has no path to
+    place, confirm, or override an order, a fill, or portfolio/risk state —
+    it only ever writes a QUEUED row to the durable inbox
+    (app/services/tradingview_inbox.py) that a later native cycle revalidates
+    from scratch (price divergence, operator mode, target/economic gates)
+    before it can influence anything.
+    """
+    settings = get_settings()
+    if not settings.tradingview_v2_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    client_host = request.client.host if request.client else None
+    trusted_ips = {ip.strip() for ip in settings.tradingview_trusted_proxy_ips.split(",") if ip.strip()}
+    if client_host not in trusted_ips:
+        record_rejection("network_origin")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    if not secret_matches(request.headers.get(TRADINGVIEW_VERIFICATION_HEADER), settings.tradingview_internal_verification_value):
+        record_rejection("authentication")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    try:
+        body = await _read_bounded_body(request, settings.tradingview_max_payload_bytes)
+    except HTTPException:
+        record_rejection("payload_too_large")
+        raise
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        record_rejection("authentication")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found") from exc
+
+    # A TradingView source-IP allowlist authenticates TradingView as a service,
+    # not this user's TradingView account. Require a separate per-deployment
+    # bearer value before returning any schema/policy detail, then remove it so
+    # credentials can never enter the Pydantic model or durable inbox.
+    if not isinstance(payload, dict):
+        record_rejection("authentication")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    supplied_token = payload.pop("verification_token", None)
+    if not secret_matches(supplied_token, settings.tradingview_webhook_token or ""):
+        record_rejection("authentication")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    try:
+        signal = TradingViewSignalV2.model_validate(payload)
+    except ValidationError as exc:
+        record_rejection("schema")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
+
+    try:
+        row, is_new = enqueue(signal)
+    except TradingViewInboxFullError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook inbox temporarily unavailable",
+        ) from exc
+    except ValueError as exc:
+        rejection_kind = _classify_tradingview_policy_rejection(str(exc))
+        if rejection_kind:
+            record_rejection(rejection_kind)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    return {
+        "status": "accepted" if is_new else "duplicate",
+        "deduplication_key": row["deduplication_key"],
+    }

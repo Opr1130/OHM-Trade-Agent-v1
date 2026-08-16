@@ -1,0 +1,109 @@
+//@version=6
+strategy("OHM Signal Strategy v1 (backtest only)", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// =============================================================================
+// OHM Signal Strategy v1 — backtest/paper-validation companion to
+// ohm_signal_indicator_v1.pine. This script exists so the LONG/SHORT
+// classification rules can be visually and statistically backtested inside
+// TradingView; it has no connection to OHM at all and sends no webhook.
+//
+// It is deliberately kept rule-identical to the indicator's regime/setup/
+// entry-trigger logic. If you change the classification rules in one file,
+// change them the same way here — the two scripts drifting apart is exactly
+// what this comment exists to prevent. The indicator is still the only file
+// that talks to OHM; this file's stop/target handling is for TradingView's
+// own backtest engine and does NOT reflect (and must not be assumed to
+// match) OHM's live ATR/percentile-based entry_exit_advisor plan — see
+// app/services/entry_exit_advisor.py for the logic OHM actually trades on.
+//
+// NOT YET VERIFIED IN THE TRADINGVIEW PINE EDITOR — see the indicator file's
+// header for the same disclosure; it applies equally here.
+// =============================================================================
+
+if timeframe.period != "15"
+    runtime.error("OHM Signal Strategy v1 must be applied to a 15-minute chart.")
+if syminfo.prefix != "KRAKEN"
+    runtime.error("OHM Signal Strategy v1 must be applied to a Kraken chart.")
+
+// ---------------------------------------------------------------------------
+// Rule-identical regime/setup/trigger logic (kept in sync with the indicator).
+// ---------------------------------------------------------------------------
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+rsi14 = ta.rsi(close, 14)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+atr14 = ta.atr(14)
+
+f_adx(len, smoothLen) =>
+    [diPlusIgnored, diMinusIgnored, adxVal] = ta.dmi(len, smoothLen)
+    adxVal
+
+adx14 = f_adx(14, 14)
+
+[htf4Close, htf4Ema20, htf4Ema50, htf4Ema200, htf4Adx] = request.security(
+     syminfo.tickerid, "240",
+     [close[1], ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.ema(close, 200)[1], f_adx(14, 14)[1]],
+     lookahead = barmerge.lookahead_on)
+
+regime4h = (htf4Close > htf4Ema20 and htf4Ema20 > htf4Ema50 and htf4Ema50 > htf4Ema200 and htf4Adx > 20) ? "BULLISH" :
+     (htf4Close < htf4Ema20 and htf4Ema20 < htf4Ema50 and htf4Ema50 < htf4Ema200 and htf4Adx > 20) ? "BEARISH" : "NEUTRAL"
+
+[htf1Close, htf1Ema20, htf1High20, htf1Low20] = request.security(
+     syminfo.tickerid, "60",
+     [close[1], ta.ema(close, 20)[1], ta.highest(high, 20)[1], ta.lowest(low, 20)[1]],
+     lookahead = barmerge.lookahead_on)
+
+htf1PullbackPct = htf1Ema20 != 0 ? math.abs(htf1Close - htf1Ema20) / htf1Ema20 * 100 : 100.0
+setup1h = htf1Close > htf1High20 * 0.999 ? "BREAKOUT" :
+     htf1PullbackPct < 1.0 ? "PULLBACK" : "REVERSAL"
+
+priorHigh20 = ta.highest(high, 20)[1]
+entryTrigger15m = close > priorHigh20 ? "BREAKOUT" :
+     (close > ema20 and close[1] <= ema20[1]) ? "RECLAIM" : "REVERSAL"
+
+trendScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (close > ema20 ? 10.0 : -10.0)
+     + (ema20 > ema50 ? 10.0 : -10.0)
+     + (ema50 > ema200 ? 10.0 : -10.0)
+     + (regime4h == "BULLISH" ? 10.0 : regime4h == "BEARISH" ? -10.0 : 0.0)
+     + (adx14 > 25 ? 10.0 : 0.0)))
+
+momentumScore = math.max(0.0, math.min(100.0,
+     50.0
+     + (histLine > 0 ? 15.0 : -15.0)
+     + (macdLine > signalLine ? 10.0 : -10.0)
+     + ((rsi14 - 50.0) * 0.6)))
+
+longBias = regime4h != "BEARISH" and trendScore >= 60 and momentumScore >= 55 and entryTrigger15m != "REVERSAL"
+shortBias = regime4h != "BULLISH" and trendScore <= 40 and momentumScore <= 45 and entryTrigger15m != "REVERSAL"
+
+// ---------------------------------------------------------------------------
+// Backtest-only trade management. 1.2R minimum first target mirrors the
+// realism floor entry_exit_advisor.py now enforces on Target 1 (see
+// TARGET_1_MIN_RR_MULTIPLE); this script does not attempt to reproduce
+// OHM's percentile-based cap, since that requires the same rolling
+// scanner history OHM computes server-side, not something derivable from
+// chart bars alone.
+// ---------------------------------------------------------------------------
+stopAtrMultiple = 1.5
+targetRMultiple = 2.0
+
+if longBias and strategy.position_size == 0 and barstate.isconfirmed
+    stopPrice = close - atr14 * stopAtrMultiple
+    targetPrice = close + (close - stopPrice) * targetRMultiple
+    strategy.entry("OHM_LONG", strategy.long)
+    strategy.exit("OHM_LONG_EXIT", "OHM_LONG", stop=stopPrice, limit=targetPrice)
+
+if shortBias and strategy.position_size == 0 and barstate.isconfirmed
+    stopPrice = close + atr14 * stopAtrMultiple
+    targetPrice = close - (stopPrice - close) * targetRMultiple
+    strategy.entry("OHM_SHORT", strategy.short)
+    strategy.exit("OHM_SHORT_EXIT", "OHM_SHORT", stop=stopPrice, limit=targetPrice)
+
+plot(ema20, title="EMA20", color=color.new(color.blue, 0))
+plot(ema50, title="EMA50", color=color.new(color.orange, 0))
+plot(ema200, title="EMA200", color=color.new(color.red, 0))

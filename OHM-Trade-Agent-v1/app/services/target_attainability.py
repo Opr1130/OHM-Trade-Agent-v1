@@ -21,9 +21,12 @@ MIN_QUALIFYING_SCORE = 65
 NEAR_RESISTANCE_ATR = 0.25
 MIN_BREAKOUT_VOLUME_RATIO = 1.1
 
-# A move more than 10% above the asset's rolling p90 favorable upside excursion
-# is materially beyond an uncommon but historically observed long opportunity.
-MATERIAL_P90_EXCESS_RATIO = 1.10
+# A move beyond the asset's own rolling p90 favorable upside excursion is
+# already an uncommon event by definition; do not grant additional grace past
+# it. (Previously 1.10 — that 10% allowance let targets qualify that required
+# a historically rare move, which is a direct contributor to trades reaching
+# meaningful unrealized profit without ever tagging Target 1.)
+MATERIAL_P90_EXCESS_RATIO = 1.00
 
 # Recent 24h range near its rolling median indicates usable current movement.
 # Wider bands receive partial credit rather than silently becoming hard gates.
@@ -217,7 +220,8 @@ def evaluate_target_attainability(
             warnings.append(f"{label} is above the historical 90th percentile")
         elif state == "materially_above_p90":
             rejection_reasons.append(
-                f"{label} move {move_pct:.2f}% exceeds 1.10x historical p90 {p90:.2f}%"
+                f"{label} move {move_pct:.2f}% exceeds "
+                f"{MATERIAL_P90_EXCESS_RATIO:.2f}x historical p90 {p90:.2f}%"
             )
         else:
             rejection_reasons.append(f"{label} historical range data is unavailable")

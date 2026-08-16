@@ -174,7 +174,8 @@ def evaluate_short_target_attainability(
             warnings.append(f"{label} is above historical downside p90")
         elif state == "materially_above_p90":
             rejection_reasons.append(
-                f"{label} move {move_pct:.2f}% exceeds 1.10x historical downside p90 {p90:.2f}%"
+                f"{label} move {move_pct:.2f}% exceeds "
+                f"{MATERIAL_P90_EXCESS_RATIO:.2f}x historical downside p90 {p90:.2f}%"
             )
         else:
             rejection_reasons.append(f"{label} historical downside data is unavailable")

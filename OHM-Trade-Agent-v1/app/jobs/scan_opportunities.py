@@ -1,3 +1,5 @@
+import logging
+
 from app.core.config import get_settings
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
@@ -32,6 +34,9 @@ from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
+
+
+logger = logging.getLogger(__name__)
 
 
 # Backwards-compatible test/extension seam. Production default is the new mixed
@@ -70,6 +75,25 @@ def main():
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     market_regime = evaluate_market_regime(scan.snapshots)
     candidates = select_candidates(scan.snapshots)
+
+    # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
+    # tag existing native candidates with corroborating evidence. It cannot
+    # create or promote a candidate, change direction/score, or bypass the
+    # native selector's asset/direction/cap/ranking invariants. A failure here
+    # must never abort the scan.
+    if getattr(settings, "tradingview_v2_enabled", False):
+        try:
+            from app.services.tradingview_inbox import (
+                merge_native_candidate_evidence,
+            )
+
+            attached = merge_native_candidate_evidence(candidates)
+            print("===== OHM TRADINGVIEW v2 EVIDENCE =====")
+            print("Native candidates tagged with TradingView confirmation:", attached)
+        except Exception:
+            logger.exception(
+                "TradingView v2 evidence merge failed open; continuing with native candidates only"
+            )
 
     print("OHM AI Opportunity Scan")
     if scan.universe is not None:

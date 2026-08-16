@@ -3,6 +3,37 @@ from dataclasses import dataclass
 from app.scanner.models import MarketSnapshot
 
 
+# Target 1 is a partial-profit checkpoint, not the final economic target
+# (Target 2 remains a flat ATR multiple and is separately gated by
+# evaluate_economic_quality). Historically only ~25% of moves in a given
+# direction exceed a symbol's own rolling p75 excursion for the matching
+# lookback window (see target_attainability.py). Mechanically fixing Target 1
+# at a flat reward multiple regardless of what a symbol typically does means a
+# meaningful share of directionally-correct trades can never reach it before
+# mean reverting. TARGET_1_MIN_RR_MULTIPLE keeps a floor so a quiet symbol
+# never gets a target so close it is immediately eaten by noise/fees.
+TARGET_1_MIN_RR_MULTIPLE = 1.2
+
+
+def _realistic_target_1_multiple(
+    mechanical_multiple: float,
+    percentile_move_pct: float,
+    entry_reference: float,
+    risk_per_unit: float,
+) -> float:
+    """Cap (never raise) the mechanical Target 1 multiple to a move size the
+    symbol has actually shown itself capable of over the recent lookback
+    window, floored so the target never collapses to a fee-noise distance."""
+    if risk_per_unit <= 0 or entry_reference <= 0 or percentile_move_pct <= 0:
+        return mechanical_multiple
+    percentile_price_move = entry_reference * (percentile_move_pct / 100)
+    percentile_multiple = percentile_price_move / risk_per_unit
+    return max(
+        TARGET_1_MIN_RR_MULTIPLE,
+        min(mechanical_multiple, percentile_multiple),
+    )
+
+
 @dataclass
 class EntryExitPlan:
     symbol: str
@@ -59,7 +90,13 @@ def build_entry_exit_plan(
         entry_reference = (entry_low + entry_high) / 2
         stop_price = entry_reference - stop_distance
         risk_per_unit = entry_reference - stop_price
-        target_1 = entry_reference + risk_per_unit * target_1_multiple
+        target_1_multiple_effective = _realistic_target_1_multiple(
+            target_1_multiple,
+            snapshot.rolling_24h_upside_p75_pct,
+            entry_reference,
+            risk_per_unit,
+        )
+        target_1 = entry_reference + risk_per_unit * target_1_multiple_effective
         target_2 = entry_reference + risk_per_unit * target_2_multiple
         too_extended = price > snapshot.ema20 + (atr_value * 1.25)
         if too_extended:
@@ -88,7 +125,13 @@ def build_entry_exit_plan(
         entry_reference = (entry_low + entry_high) / 2
         stop_price = entry_reference + stop_distance
         risk_per_unit = stop_price - entry_reference
-        target_1 = entry_reference - risk_per_unit * target_1_multiple
+        target_1_multiple_effective = _realistic_target_1_multiple(
+            target_1_multiple,
+            snapshot.rolling_24h_downside_p75_pct,
+            entry_reference,
+            risk_per_unit,
+        )
+        target_1 = entry_reference - risk_per_unit * target_1_multiple_effective
         target_2 = entry_reference - risk_per_unit * target_2_multiple
         too_extended = price < snapshot.ema20 - (atr_value * 1.25)
         if too_extended:
