@@ -22,6 +22,7 @@ from app.services.pending_setup_registry import (
     get_pending_setups,
     terminalize_pending_setup,
 )
+from app.services.price_movement_radar import attach_actionable_plan
 from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
@@ -119,6 +120,28 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
             f"({float(candidate.get('calibration_multiplier') or 1.0):.2f}x sizing only)\n"
         )
 
+    movement_note = ""
+    movement = candidate.get("price_movement")
+    if isinstance(movement, dict) and movement.get("actionable") is True:
+        movement_note = (
+            "\n⚡ PRICE MOVEMENT INTELLIGENCE\n"
+            f"Class: {movement.get('signal_class', 'PRICE_MOVEMENT')} / "
+            f"{movement.get('subtype', 'VOLATILITY_EXPANSION')}\n"
+            f"Stage: {movement.get('stage', 'CONFIRMED')} | "
+            f"Readiness: {movement.get('readiness_score', 0)}/100 "
+            "(not probability)\n"
+            f"Timeframes: detect {movement.get('detection_timeframe', 'N/A')} | "
+            f"confirm {movement.get('confirmation_timeframe', 'N/A')} | "
+            f"regime {movement.get('regime_timeframe', '4H')}\n"
+            f"Expected Expansion: {movement.get('expected_move_low_atr', 0)}-"
+            f"{movement.get('expected_move_high_atr', 0)} ATR "
+            f"({movement.get('expected_move_low_pct', 0)}%-"
+            f"{movement.get('expected_move_high_pct', 0)}%)\n"
+            f"Expected Window: {movement.get('expected_window_primary', 'N/A')} "
+            f"then {movement.get('expected_window_secondary', 'N/A')}\n"
+            f"Entry Plan Expires: {movement.get('setup_expires_at', 'N/A')}\n"
+        )
+
     margin_note = ""
     if direction == "SHORT":
         margin_note = (
@@ -139,7 +162,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
         f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
         f"Direction: {direction}\n"
-        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{fill_tracking_note}"
+        f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{movement_note}{fill_tracking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
         f"AI Confidence: {candidate.get('confidence', 0)}%\n"
         f"Technical Decision: {str(candidate.get('decision', '')).upper()}\n\n"
@@ -285,6 +308,17 @@ def send_trade_plan(
         return False
     if not _apply_intelligence(candidate, plan):
         return False
+
+    # Movement levels become actionable only after the final allocation and
+    # portfolio-risk checks pass. Reuse the approved plan; never calculate a
+    # second set of entry/exit levels in the radar.
+    movement = attach_actionable_plan(
+        candidate.get("price_movement"),
+        plan=plan,
+        action=action,
+    )
+    if movement is not None:
+        candidate["price_movement"] = movement
 
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))

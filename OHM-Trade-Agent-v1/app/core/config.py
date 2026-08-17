@@ -35,6 +35,23 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
     telegram_enabled: bool = False
 
+    # PRICE_MOVEMENT_MODE: off disables the radar, shadow records evidence and
+    # outcomes without messages, alert additionally permits non-actionable
+    # WATCH/READY Telegram updates. Confirmed entries still require every
+    # existing OHM trade gate.
+    price_movement_mode: str = Field(
+        default="shadow",
+        pattern=r"^(off|shadow|alert)$",
+    )
+    price_movement_watch_score: int = Field(default=35, ge=0, le=100)
+    price_movement_ready_score: int = Field(default=70, ge=0, le=100)
+    price_movement_expiry_hours: int = Field(default=12, ge=1, le=72)
+    price_movement_alert_cooldown_seconds: int = Field(
+        default=21_600,
+        ge=300,
+        le=86_400,
+    )
+
     min_alert_score: int = Field(default=80, ge=0, le=100)
     account_equity: float = Field(default=10_000, gt=0)
     risk_per_trade_pct: float = Field(default=0.35, gt=0, le=1)
@@ -82,6 +99,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_tradingview_production_secret(self) -> "Settings":
+        if self.price_movement_watch_score > self.price_movement_ready_score:
+            raise ValueError(
+                "PRICE_MOVEMENT_WATCH_SCORE cannot exceed PRICE_MOVEMENT_READY_SCORE"
+            )
         if not self.tradingview_v2_enabled:
             return self
 

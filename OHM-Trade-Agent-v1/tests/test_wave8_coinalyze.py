@@ -114,6 +114,39 @@ def test_provider_normalizes_funding_oi_liquidations_and_long_short_ratio():
     assert snapshot.long_short_ratio == 1.25
 
 
+def test_provider_calculates_short_window_oi_acceleration_without_extra_call():
+    class ShortWindowOI(FakeCoinalyzeClient):
+        def get_open_interest_history(self, symbols, *, start, end, interval="1hour"):
+            assert interval == "15min"
+            history = [{"t": start, "c": 100_000_000}]
+            closes = [
+                101_000_000,
+                101_100_000,
+                101_200_000,
+                101_300_000,
+                101_400_000,
+                101_500_000,
+                101_600_000,
+                101_700_000,
+                103_500_000,
+            ]
+            history.extend(
+                {"t": end - (len(closes) - index - 1) * 900, "c": close}
+                for index, close in enumerate(closes)
+            )
+            return [{"symbol": "BTCUSDT_PERP.A", "history": history}]
+
+    snapshot = CoinalyzeMarketIntelligenceProvider(
+        client=ShortWindowOI()
+    ).fetch("BTCUSD").derivatives[0]
+
+    assert snapshot.open_interest_change_15m_pct == pytest.approx(
+        (103_500_000 / 101_700_000 - 1) * 100
+    )
+    assert snapshot.open_interest_change_1h_pct is not None
+    assert snapshot.open_interest_acceleration_zscore is not None
+
+
 def test_provider_does_not_fabricate_zero_when_trailing_hour_has_no_liquidation_rows():
     class SparseLiquidations(FakeCoinalyzeClient):
         def get_liquidation_history(self, symbols, *, start, end, interval="1hour"):

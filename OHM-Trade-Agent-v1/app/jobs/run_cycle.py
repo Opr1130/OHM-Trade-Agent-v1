@@ -72,16 +72,20 @@ def _run_cycle_once() -> None:
             "status": "UNAVAILABLE",
             "paid_ai_calls": 0,
             "shadow": {"status": "UNAVAILABLE", "observations_added": 0},
+            "price_movement": {"status": "UNAVAILABLE", "observations_added": 0},
             "profile_refreshed": False,
             "profile_status": "UNAVAILABLE",
             "reason": str(exc),
         }
     shadow = learning.get("shadow") or {}
+    movement_learning = learning.get("price_movement") or {}
     print("OHM Self-Learning")
     print("Status:", learning.get("status"))
     print("Paid AI calls:", learning.get("paid_ai_calls", 0))
     print("Shadow status:", shadow.get("status"))
     print("Shadow observations added:", shadow.get("observations_added", 0))
+    print("Movement learning status:", movement_learning.get("status"))
+    print("Movement observations added:", movement_learning.get("observations_added", 0))
     print("Profile refreshed:", learning.get("profile_refreshed"))
     print("Profile status:", learning.get("profile_status"))
     if learning.get("reason"):

@@ -119,6 +119,7 @@ def record_recommendation(
             "economic_validation_net_t2": candidate.get("economic_validation_net_t2"),
             "market_regime": candidate.get("market_regime"),
             "market_intelligence": candidate.get("market_intelligence"),
+            "price_movement": candidate.get("price_movement"),
             "entered_trade": False,
             "setup_status": "recommended",
             "entered_at": None,

@@ -18,7 +18,10 @@ class DerivativesSnapshot:
     observed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     funding_rate_pct: float | None = None
     open_interest_usd: float | None = None
+    open_interest_change_15m_pct: float | None = None
+    open_interest_change_1h_pct: float | None = None
     open_interest_change_24h_pct: float | None = None
+    open_interest_acceleration_zscore: float | None = None
     liquidations_1h_usd: float | None = None
     liquidations_24h_usd: float | None = None
     long_short_ratio: float | None = None
