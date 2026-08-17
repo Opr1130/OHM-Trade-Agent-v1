@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.services.profitability_learning import build_profitability_profile
+from app.services.price_movement_learning import observe_due_price_movements
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 from app.services.shadow_learning import observe_due_shadows
 
@@ -39,6 +40,14 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
     """
     now = now or _now()
     shadow = observe_due_shadows(now=now)
+    try:
+        movement = observe_due_price_movements(now=now)
+    except Exception as exc:
+        movement = {
+            "status": "UNAVAILABLE",
+            "observations_added": 0,
+            "reason": f"movement observation failed open: {type(exc).__name__}: {exc}",
+        }
     profile_refreshed = False
     profile_status = "NOT_DUE"
 
@@ -58,6 +67,7 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
         "status": "OK",
         "paid_ai_calls": 0,
         "shadow": shadow,
+        "price_movement": movement,
         "profile_refreshed": profile_refreshed,
         "profile_status": profile_status,
     }

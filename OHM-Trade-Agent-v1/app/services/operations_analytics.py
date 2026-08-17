@@ -14,6 +14,7 @@ from app.services.decision_learning import classify_shadow_decision
 from app.services.openai_usage_telemetry import USAGE_FILE
 from app.services.order_intent_registry import list_order_intents
 from app.services.pending_setup_registry import get_pending_setups
+from app.services.price_movement_learning import get_price_movement_records
 from app.services.registry_io import registry_lock
 from app.services.shadow_learning import get_shadow_records
 from app.services.trade_outcome_registry import get_outcomes
@@ -100,6 +101,11 @@ def parse_scan_output(text: str) -> dict[str, Any]:
         "economic_rejects": 0,
         "pending_saved": 0,
         "notifications_sent": 0,
+        "movement_watch": 0,
+        "movement_ready": 0,
+        "movement_confirmed": 0,
+        "movement_active": 0,
+        "movement_notifications_sent": 0,
     }
     patterns = {
         "requested": r"^Requested:\s*(\d+)",
@@ -115,6 +121,11 @@ def parse_scan_output(text: str) -> dict[str, Any]:
         "economic_rejects": r"^Economic rejects:\s*(\d+)",
         "pending_saved": r"^Pending setups saved:\s*(\d+)",
         "notifications_sent": r"^Telegram notifications sent:\s*(\d+)",
+        "movement_watch": r"^Price movement WATCH:\s*(\d+)",
+        "movement_ready": r"^Price movement READY:\s*(\d+)",
+        "movement_confirmed": r"^Price movement CONFIRMED:\s*(\d+)",
+        "movement_active": r"^Price movement ACTIVE:\s*(\d+)",
+        "movement_notifications_sent": r"^Price movement notifications sent:\s*(\d+)",
     }
     for line in text.splitlines():
         line = line.strip()
@@ -215,12 +226,17 @@ def build_operations_summary(scope: str = "today") -> dict[str, Any]:
     scans = _read_jsonl(SCAN_ACTIVITY_FILE)
     usage = _read_jsonl(USAGE_FILE)
     shadows = get_shadow_records()
+    movement_records = get_price_movement_records()
     outcomes = get_outcomes()
 
     if scope == "today":
         scans = [row for row in scans if _today_utc(row.get("timestamp_utc"))]
         usage = [row for row in usage if _today_utc(row.get("timestamp_utc"))]
         shadows = [row for row in shadows if _today_utc(row.get("observed_at"))]
+        movement_records = [
+            row for row in movement_records
+            if _today_utc(row.get("observed_at"))
+        ]
         outcomes = [row for row in outcomes if _today_utc(row.get("terminal_timestamp"))]
 
     observations = 0
@@ -235,6 +251,13 @@ def build_operations_summary(scope: str = "today") -> dict[str, Any]:
     latest_scan = scans[-1] if scans else {}
     decisions = _decision_counts(shadows)
     trading = _outcome_metrics(outcomes)
+    movement_stages = Counter(
+        str(row.get("stage") or "UNKNOWN").upper()
+        for row in movement_records
+    )
+    movement_observations = sum(
+        len(row.get("observations") or {}) for row in movement_records
+    )
 
     return {
         "generated_at_utc": _now().isoformat(),
@@ -250,6 +273,14 @@ def build_operations_summary(scope: str = "today") -> dict[str, Any]:
             "short_shortlist": _sum(scans, "short_shortlist"),
             "latest_regime": latest_scan.get("market_regime", "UNKNOWN"),
             "last_scan_utc": latest_scan.get("completed_at_utc"),
+            "movement_watch": _sum(scans, "movement_watch"),
+            "movement_ready": _sum(scans, "movement_ready"),
+            "movement_confirmed": _sum(scans, "movement_confirmed"),
+            "movement_active": _sum(scans, "movement_active"),
+            "movement_notifications_sent": _sum(
+                scans,
+                "movement_notifications_sent",
+            ),
         },
         "ai": {
             "chief_calls": len(usage),
@@ -279,6 +310,9 @@ def build_operations_summary(scope: str = "today") -> dict[str, Any]:
             "evaluated_decisions": len(evaluated),
             "correct_avoids": correct_avoid,
             "missed_profitable_opportunities": missed,
+            "movement_signals": len(movement_records),
+            "movement_observations": movement_observations,
+            "movement_by_stage": dict(sorted(movement_stages.items())),
         },
         "current": {
             "active_trades": len(get_active_trades()),

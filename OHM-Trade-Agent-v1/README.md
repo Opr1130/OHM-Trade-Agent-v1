@@ -97,6 +97,19 @@ context that still has to pass every one of OHM's existing gates. See
 [`TRADINGVIEW_WAVE8_2.md`](TRADINGVIEW_WAVE8_2.md) for the full design, the
 network-boundary setup required before enabling it, and known limitations.
 
+## Price Movement Radar
+
+The advisory-only Price Movement Radar classifies potential volatility expansion
+as `WATCH`, `READY`, `CONFIRMED`, `ACTIVE`, or `EXPIRED`. It combines
+symbol-relative BBW/ATR compression, short-window Coinalyze OI acceleration,
+volume, liquidation/funding context, and validated order-book asymmetry.
+
+The production-safe default is `PRICE_MOVEMENT_MODE=shadow`. Movement-only
+alerts are disabled, outcome observations use public Kraken data with zero paid
+AI calls, and entry/stop/T1/T2 details appear only after direction confirmation
+and all existing OHM gates pass. See
+[`PRICE_MOVEMENT_RADAR.md`](PRICE_MOVEMENT_RADAR.md).
+
 ## Run tests
 
 ```powershell

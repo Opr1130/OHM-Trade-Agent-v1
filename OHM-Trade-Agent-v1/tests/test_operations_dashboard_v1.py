@@ -28,6 +28,11 @@ Economic rejects: 0
 Qualified survivors: 0
 Pending setups saved: 0
 Telegram notifications sent: 0
+Price movement WATCH: 2
+Price movement READY: 1
+Price movement CONFIRMED: 1
+Price movement ACTIVE: 0
+Price movement notifications sent: 1
 """
     result = analytics.parse_scan_output(text)
     assert result["requested"] == 200
@@ -40,6 +45,10 @@ Telegram notifications sent: 0
     assert result["execution_rejects"] == 1
     assert result["qualified_alerts"] == 1
     assert result["target_rejects"] == 1
+    assert result["movement_watch"] == 2
+    assert result["movement_ready"] == 1
+    assert result["movement_confirmed"] == 1
+    assert result["movement_notifications_sent"] == 1
 
 
 def test_summary_separates_today_and_all_time(monkeypatch, tmp_path):

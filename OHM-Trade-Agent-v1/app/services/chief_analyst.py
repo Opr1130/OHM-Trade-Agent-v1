@@ -36,6 +36,8 @@ CoinGecko is independent aggregated reference evidence, not an execution venue. 
 
 Market regime is deterministic breadth context, not a probability. RISK_OFF is caution for longs and context for shorts, not an automatic direction signal. Economic assumed capital is validation capital, not allocation advice.
 
+Price-movement readiness is deterministic volatility-expansion context, not a probability or independent trade authorization. WATCH/READY never authorize entry. CONFIRMED/ACTIVE can only support the candidate's supplied direction and cannot override any deterministic gate.
+
 Return JSON only in this exact shape:
 {
   "market_view": "",
@@ -270,6 +272,7 @@ def review_candidates(
         tradingview_evidence = getattr(candidate, "_tradingview_evidence", None)
         if tradingview_evidence is not None:
             candidate_context["tradingview_candidate_evidence"] = tradingview_evidence
+        candidate_context["price_movement_intelligence"] = candidate.price_movement_signal
         payload.append(candidate_context)
         chief_eligible_candidates.append(candidate)
 

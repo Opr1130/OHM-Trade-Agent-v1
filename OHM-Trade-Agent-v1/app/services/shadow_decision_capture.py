@@ -39,6 +39,7 @@ def capture_snapshot_decision(
             reason=reason,
             source=source,
             market_intelligence=intelligence,
+            price_movement=getattr(snapshot, "price_movement_signal", None),
         )
         return True
     except Exception:

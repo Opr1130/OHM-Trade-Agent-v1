@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from statistics import mean, pstdev
 from time import monotonic
 from typing import Any
 
@@ -216,12 +217,62 @@ def _liquidation_value_usd(row: dict[str, Any]) -> float:
     )
 
 
+def _ordered_history_closes(
+    history: list[dict[str, Any]],
+) -> list[tuple[float, float]]:
+    rows: list[tuple[float, float]] = []
+    for row in history:
+        timestamp = _as_float(row.get("t"))
+        close = _as_float(row.get("c"))
+        if timestamp is None or close is None or close <= 0:
+            continue
+        rows.append((timestamp, close))
+    return sorted(rows)
+
+
+def _history_change_pct(
+    history: list[dict[str, Any]],
+    *,
+    seconds: int,
+) -> float | None:
+    rows = _ordered_history_closes(history)
+    if len(rows) < 2:
+        return None
+    latest_time, latest_close = rows[-1]
+    cutoff = latest_time - seconds
+    references = [item for item in rows[:-1] if item[0] <= cutoff]
+    if not references:
+        return None
+    reference_time, reference_close = references[-1]
+    # Do not label a many-hour gap as a 15m or 1h observation.
+    if latest_time - reference_time > seconds * 2:
+        return None
+    return ((latest_close / reference_close) - 1.0) * 100.0
+
+
+def _latest_change_zscore(
+    history: list[dict[str, Any]],
+) -> float | None:
+    rows = _ordered_history_closes(history)
+    changes = [
+        ((current / previous) - 1.0) * 100.0
+        for (_, previous), (_, current) in zip(rows, rows[1:])
+        if previous > 0
+    ]
+    if len(changes) < 8:
+        return None
+    deviation = pstdev(changes)
+    if deviation <= 0:
+        return 0.0
+    return (changes[-1] - mean(changes)) / deviation
+
+
 class CoinalyzeMarketIntelligenceProvider:
     """Normalize Coinalyze futures evidence into Wave 8 derivatives context.
 
     The default deliberately uses one stable-margined perpetual market per
     asset. Four symbol-call units are consumed for a fully enriched asset:
-    funding, 24h open-interest history, 24h liquidation history and long/short
+    funding, 15m-granularity open-interest history, liquidation history and long/short
     ratio history. This keeps enrichment of a short finalist list within the
     official 40-symbol-call/minute free-tier budget.
     """
@@ -349,14 +400,27 @@ class CoinalyzeMarketIntelligenceProvider:
             [api_symbol],
             start=start,
             end=end,
+            interval="15min",
         )
         oi_history = _history_for_symbol(oi_payload, api_symbol)
         open_interest_usd: float | None = None
+        oi_change_15m_pct: float | None = None
+        oi_change_1h_pct: float | None = None
         oi_change_24h_pct: float | None = None
+        oi_acceleration_zscore: float | None = None
         if oi_history:
             first_close = _as_float(oi_history[0].get("c"))
             last_close = _as_float(oi_history[-1].get("c"))
             open_interest_usd = last_close
+            oi_change_15m_pct = _history_change_pct(
+                oi_history,
+                seconds=15 * 60,
+            )
+            oi_change_1h_pct = _history_change_pct(
+                oi_history,
+                seconds=60 * 60,
+            )
+            oi_acceleration_zscore = _latest_change_zscore(oi_history)
             if first_close is not None and first_close > 0 and last_close is not None:
                 oi_change_24h_pct = ((last_close / first_close) - 1.0) * 100.0
             latest_ts = _history_timestamp(oi_history[-1])
@@ -437,7 +501,10 @@ class CoinalyzeMarketIntelligenceProvider:
             for value in (
                 funding_rate,
                 open_interest_usd,
+                oi_change_15m_pct,
+                oi_change_1h_pct,
                 oi_change_24h_pct,
+                oi_acceleration_zscore,
                 liquidations_1h_usd,
                 liquidations_24h_usd,
                 long_short_ratio,
@@ -453,7 +520,10 @@ class CoinalyzeMarketIntelligenceProvider:
             observed_at=max(observed_at) if observed_at else now,
             funding_rate_pct=funding_rate,
             open_interest_usd=open_interest_usd,
+            open_interest_change_15m_pct=oi_change_15m_pct,
+            open_interest_change_1h_pct=oi_change_1h_pct,
             open_interest_change_24h_pct=oi_change_24h_pct,
+            open_interest_acceleration_zscore=oi_acceleration_zscore,
             liquidations_1h_usd=liquidations_1h_usd,
             liquidations_24h_usd=liquidations_24h_usd,
             long_short_ratio=long_short_ratio,

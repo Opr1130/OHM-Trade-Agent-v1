@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.scanner.execution_validation import ExecutionValidation
@@ -39,6 +39,21 @@ class MarketSnapshot:
 
     technical_score: int
     trend: str
+
+    # Price Movement Radar observations. Defaults are intentionally neutral so
+    # legacy/test snapshots cannot be mistaken for volatility compression.
+    movement_timeframe: str = "1H"
+    movement_data_status: str = "UNAVAILABLE"
+    bollinger_bandwidth_pct: float = 0.0
+    bollinger_bandwidth_percentile: float = 100.0
+    atr_percentile: float = 100.0
+    movement_volume_ratio: float = 0.0
+    confirmed_close: float = 0.0
+    confirmed_price_change_1h_pct: float = 0.0
+    prior_24h_range_high: float = 0.0
+    prior_24h_range_low: float = 0.0
+    movement_warnings: list[str] | None = None
+    price_movement_signal: dict[str, Any] | None = None
 
     recent_24h_high: float = 0.0
     recent_24h_low: float = 0.0

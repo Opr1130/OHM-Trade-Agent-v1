@@ -1,8 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import Any
 
-from app.exchanges.kraken import KrakenClient
-from app.indicators.technical import atr, ema, macd, rsi, volume_ratio
+from app.exchanges.kraken import Candle, KrakenClient
+from app.indicators.technical import (
+    atr,
+    atr_percentage_series,
+    bollinger_bandwidth_series,
+    ema,
+    macd,
+    percentile_rank,
+    rsi,
+    volume_ratio,
+)
 from app.scanner.models import MarketSnapshot
 from app.scanner.execution_validation import (
     INVALID,
@@ -24,6 +34,8 @@ from app.scanner.universe import (
 MIN_CANDLES_REQUIRED = 200
 MAX_WORKERS = 8
 EXECUTION_VALIDATION_MAX_POSITION_FRACTION = 0.20
+MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE = 40.0
+MOVEMENT_MIN_CANDLES = 120
 
 
 @dataclass
@@ -46,6 +58,63 @@ class SecondaryConfirmationSummary:
     requested: int
     analyzed: int
     failed: int
+
+
+def _movement_metrics(
+    candles: list[Candle],
+    *,
+    interval_minutes: int,
+) -> dict[str, Any]:
+    """Calculate movement features from completed candles only."""
+    if len(candles) < MOVEMENT_MIN_CANDLES:
+        raise ValueError("insufficient candles for movement radar")
+    completed = candles[:-1]
+    closes = [item.close for item in completed]
+    highs = [item.high for item in completed]
+    lows = [item.low for item in completed]
+    volumes = [item.volume for item in candles]
+
+    bandwidths = bollinger_bandwidth_series(closes, 20, 2.0)
+    atr_percentages = atr_percentage_series(highs, lows, closes, 14)
+    current_bandwidth = bandwidths[-1]
+    current_atr_percent = atr_percentages[-1]
+
+    bars_24h = max(2, int(24 * 60 / interval_minutes))
+    if len(completed) < bars_24h + 1:
+        raise ValueError("insufficient completed candles for prior 24h range")
+    previous_highs = highs[-(bars_24h + 1):-1]
+    previous_lows = lows[-(bars_24h + 1):-1]
+
+    bars_1h = max(1, int(60 / interval_minutes))
+    if len(closes) < bars_1h + 1:
+        raise ValueError("insufficient completed candles for 1h change")
+    reference = closes[-(bars_1h + 1)]
+    confirmed_close = closes[-1]
+    price_change_1h = (
+        (confirmed_close / reference - 1.0) * 100.0
+        if reference > 0
+        else 0.0
+    )
+
+    return {
+        "movement_timeframe": "1H" if interval_minutes == 60 else f"{interval_minutes}M",
+        "movement_data_status": "AVAILABLE",
+        "bollinger_bandwidth_pct": current_bandwidth,
+        "bollinger_bandwidth_percentile": percentile_rank(
+            bandwidths,
+            current_bandwidth,
+        ),
+        "atr_percentile": percentile_rank(
+            atr_percentages,
+            current_atr_percent,
+        ),
+        "movement_volume_ratio": volume_ratio(volumes, 20),
+        "confirmed_close": confirmed_close,
+        "confirmed_price_change_1h_pct": price_change_1h,
+        "prior_24h_range_high": max(previous_highs),
+        "prior_24h_range_low": min(previous_lows),
+        "movement_warnings": [],
+    }
 
 
 def _percentage_change(current: float, previous: float) -> float:
@@ -179,6 +248,30 @@ def analyze_symbol(
         atr_pct = (atr_value / last_price) * 100
         volume_value = volume_ratio(volumes, 20)
 
+        hourly_movement = _movement_metrics(candles, interval_minutes=60)
+        movement = hourly_movement
+        movement_warnings: list[str] = []
+        compressed_hourly = (
+            hourly_movement["bollinger_bandwidth_percentile"]
+            <= MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE
+            or hourly_movement["atr_percentile"]
+            <= MOVEMENT_COMPRESSION_PREFILTER_PERCENTILE
+        )
+        if compressed_hourly:
+            try:
+                movement = _movement_metrics(
+                    client.get_ohlc(symbol, interval=15),
+                    interval_minutes=15,
+                )
+            except Exception as exc:
+                # The radar is advisory and must fail open to the existing 1H
+                # evidence instead of rejecting an otherwise valid market.
+                movement = dict(hourly_movement)
+                movement_warnings.append(
+                    f"15m movement evidence unavailable: {type(exc).__name__}"
+                )
+        movement["movement_warnings"] = movement_warnings
+
         recent_24h_high, recent_24h_low, realized_range_24h_pct, avg_hourly_24 = _window_metrics(highs, lows, closes, 24)
         recent_72h_high, recent_72h_low, realized_range_72h_pct, avg_hourly_72 = _window_metrics(highs, lows, closes, 72)
         rolling_24h_percentiles = _rolling_range_percentiles(highs, lows, closes, 24)
@@ -204,6 +297,17 @@ def analyze_symbol(
             volume_ratio=volume_value,
             technical_score=0,
             trend=trend,
+            movement_timeframe=movement["movement_timeframe"],
+            movement_data_status=movement["movement_data_status"],
+            bollinger_bandwidth_pct=movement["bollinger_bandwidth_pct"],
+            bollinger_bandwidth_percentile=movement["bollinger_bandwidth_percentile"],
+            atr_percentile=movement["atr_percentile"],
+            movement_volume_ratio=movement["movement_volume_ratio"],
+            confirmed_close=movement["confirmed_close"],
+            confirmed_price_change_1h_pct=movement["confirmed_price_change_1h_pct"],
+            prior_24h_range_high=movement["prior_24h_range_high"],
+            prior_24h_range_low=movement["prior_24h_range_low"],
+            movement_warnings=movement["movement_warnings"],
             recent_24h_high=recent_24h_high,
             recent_24h_low=recent_24h_low,
             recent_72h_high=recent_72h_high,

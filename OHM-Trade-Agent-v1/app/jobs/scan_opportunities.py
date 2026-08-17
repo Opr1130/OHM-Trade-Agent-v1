@@ -1,4 +1,5 @@
 import logging
+from collections import Counter
 
 from app.core.config import get_settings
 from app.scanner.directional_candidates import select_directional_candidates
@@ -28,6 +29,12 @@ from app.services.chief_analyst import (
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
+from app.services.price_movement_learning import (
+    get_latest_price_movement,
+    record_price_movement,
+)
+from app.services.price_movement_notifier import send_price_movement_update
+from app.services.price_movement_radar import evaluate_price_movement
 from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
 from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
@@ -69,10 +76,50 @@ def _economic_quality(plan, snapshot, account_equity):
     return evaluate_economic_quality(plan, available_capital=account_equity)
 
 
+def _assess_price_movement(snapshot, settings, market_intelligence=None):
+    """Evaluate and persist radar context without affecting candidate gates."""
+    if str(getattr(settings, "price_movement_mode", "shadow")).lower() == "off":
+        return None
+    try:
+        previous = get_latest_price_movement(snapshot.symbol)
+    except Exception:
+        previous = None
+    try:
+        signal = evaluate_price_movement(
+            snapshot,
+            market_intelligence=market_intelligence,
+            previous=previous,
+            watch_score=int(getattr(settings, "price_movement_watch_score", 35)),
+            ready_score=int(getattr(settings, "price_movement_ready_score", 70)),
+            expiry_hours=int(getattr(settings, "price_movement_expiry_hours", 12)),
+        )
+    except Exception:
+        return None
+    if signal is None:
+        return None
+    payload = signal.as_dict()
+    snapshot.price_movement_signal = payload
+    try:
+        record_price_movement(payload)
+    except Exception:
+        # Shadow persistence must never block scanning or an approved alert.
+        pass
+    return payload
+
+
 def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     market_regime = evaluate_market_regime(scan.snapshots)
+    local_movement_signals = [
+        signal
+        for snapshot in scan.snapshots
+        if (signal := _assess_price_movement(snapshot, settings)) is not None
+    ]
+    local_movement_counts = Counter(
+        str(signal.get("stage") or "UNKNOWN")
+        for signal in local_movement_signals
+    )
     candidates = select_candidates(scan.snapshots)
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
@@ -113,6 +160,12 @@ def main():
     print("Analyzed:", scan.analyzed)
     print("Skipped:", scan.skipped)
     print("Failed:", scan.failed)
+    print("===== OHM PRICE MOVEMENT RADAR =====")
+    print("Price movement mode:", getattr(settings, "price_movement_mode", "shadow"))
+    print("Price movement WATCH:", local_movement_counts.get("WATCH", 0))
+    print("Price movement READY:", local_movement_counts.get("READY", 0))
+    print("Price movement CONFIRMED:", local_movement_counts.get("CONFIRMED", 0))
+    print("Price movement ACTIVE:", local_movement_counts.get("ACTIVE", 0))
     print("===== OHM MARKET DATA VALIDATION =====")
     print("Validated:", scan.analyzed)
     print("Rejected:", scan.data_quality_rejected)
@@ -298,6 +351,39 @@ def main():
 
     intelligence = enrich_finalist_market_intelligence(candidates, market_regime)
     candidates = list(intelligence.candidates)
+    movement_notifications_sent = 0
+    enriched_movement_counts: Counter[str] = Counter()
+    for candidate in candidates:
+        movement = _assess_price_movement(
+            candidate,
+            settings,
+            getattr(candidate, "_wave8_market_intelligence", None),
+        )
+        if movement is None:
+            continue
+        enriched_movement_counts[str(movement.get("stage") or "UNKNOWN")] += 1
+        if (
+            str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
+            and settings.telegram_enabled
+            and settings.telegram_bot_token
+            and settings.telegram_chat_id
+        ):
+            try:
+                if send_price_movement_update(
+                    movement,
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    cooldown_seconds=int(
+                        getattr(
+                            settings,
+                            "price_movement_alert_cooldown_seconds",
+                            21_600,
+                        )
+                    ),
+                ):
+                    movement_notifications_sent += 1
+            except Exception:
+                pass
     print("===== OHM EXTERNAL MARKET INTELLIGENCE =====")
     print("Evidence records:", len(intelligence.evidence))
     print("Available assessments:", sum(
@@ -305,6 +391,13 @@ def main():
         for assessment in intelligence.assessments.values()
     ))
     print("Finalist cap:", min(len(candidates), 8))
+    print(
+        "Enriched movement stages:",
+        f"WATCH={enriched_movement_counts.get('WATCH', 0)}",
+        f"READY={enriched_movement_counts.get('READY', 0)}",
+        f"CONFIRMED={enriched_movement_counts.get('CONFIRMED', 0)}",
+        f"ACTIVE={enriched_movement_counts.get('ACTIVE', 0)}",
+    )
     for candidate in candidates[:8]:
         assessment = intelligence.assessments.get(candidate.symbol)
         if assessment is None:
@@ -368,6 +461,7 @@ def main():
             "_wave8_market_intelligence",
             None,
         )
+        alert["price_movement"] = snapshot.price_movement_signal
         if direction == "SHORT":
             alert["margin_leverage"] = SHORT_VALIDATION_LEVERAGE
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
@@ -491,6 +585,7 @@ def main():
     print("Target quality rejects:", target_rejected)
     print("Pending setups saved:", pending_saved)
     print("Telegram notifications sent:", sent)
+    print("Price movement notifications sent:", movement_notifications_sent)
 
 
 if __name__ == "__main__":

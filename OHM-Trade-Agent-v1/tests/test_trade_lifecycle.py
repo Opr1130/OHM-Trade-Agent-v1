@@ -173,6 +173,53 @@ def test_actionable_setup_is_persisted_without_confirmation_buttons(
     assert observed["has_reply_markup"] is False
 
 
+def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
+    registry_files,
+    monkeypatch,
+):
+    movement = {
+        "stage": "CONFIRMED",
+        "direction": "LONG",
+        "actionable": False,
+        "signal_class": "PRICE_MOVEMENT",
+        "subtype": "VOLATILITY_EXPANSION",
+    }
+    candidate = {
+        "confidence": 90,
+        "decision": "alert",
+        "price_movement": movement,
+    }
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
+    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", lambda *args: False)
+
+    assert not chief_alert_notifier.send_trade_plan(
+        candidate,
+        _plan(),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert candidate["price_movement"]["actionable"] is False
+    assert "entry" not in candidate["price_movement"]
+
+    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", lambda *args: True)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_telegram_message",
+        lambda *args, **kwargs: True,
+    )
+    assert chief_alert_notifier.send_trade_plan(
+        candidate,
+        _plan(),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert candidate["price_movement"]["actionable"] is True
+    assert candidate["price_movement"]["entry"]["zone_low"] == pytest.approx(99.0)
+    assert candidate["price_movement"]["exits"]["target_2"] == pytest.approx(115.0)
+
+
 def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
     registry_files,
     monkeypatch,

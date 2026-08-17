@@ -55,6 +55,7 @@ def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: s
             profit_rank_score=(float(candidate["profit_rank_score"]) if isinstance(candidate.get("profit_rank_score"), (int, float)) else None),
             reason=plan.reason,
             source="qualified_trade_decision",
+            price_movement=candidate.get("price_movement"),
         )
     except Exception:
         return
