@@ -269,6 +269,7 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
         qty, vwap, fee, first_at, last_at = _fill_stats(close_fills)
         expected = _expected_quantity(trade)
         should_close = False
+        verified_absent = False
 
         # Spot LONG reconciliation is intentionally conservative: an observed
         # sell after OHM's entry must cover nearly all expected quantity and
@@ -277,9 +278,27 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
             remaining = _balance_for_asset(balances, _base_asset(trade.symbol))
             should_close = remaining is not None and remaining <= expected * 0.10
 
+        # The registry is not proof of live exposure. Even without a matched
+        # exit fill (for example, a manual transfer or legacy stale record), a
+        # successful read-only balance query can prove that no meaningful spot
+        # position remains. Terminalize the local lifecycle without inventing
+        # an exit price or realized P/L.
+        if trade.direction.upper() == "LONG":
+            remaining = _balance_for_asset(balances, _base_asset(trade.symbol))
+            minimum = expected * 0.01 if expected is not None else 0.0
+            verified_absent = remaining is not None and remaining <= minimum
+
         # Margin positions are not auto-terminalized until OHM can bind the
         # Kraken position txid directly to the trade. Avoid guessing.
-        if should_close and vwap is not None:
+        if verified_absent and not (should_close and vwap is not None):
+            would_close.append(trade.symbol)
+            if mode == "apply":
+                close_trade(
+                    trade.symbol,
+                    reason="kraken_verified_no_position",
+                )
+                closed.append(trade.symbol)
+        elif should_close and vwap is not None:
             would_close.append(trade.symbol)
             record_execution_event(
                 trade.trade_id or f"LEGACY-{trade.symbol}",

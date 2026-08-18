@@ -15,6 +15,9 @@ def main():
         "Emergency notifications sent:",
         summary.emergency_notifications_sent,
     )
+    print("Positions verified:", summary.positions_verified)
+    print("Positions absent:", summary.positions_absent)
+    print("Positions unavailable:", summary.positions_unavailable)
 
     if summary.failures:
         print("Failures:")

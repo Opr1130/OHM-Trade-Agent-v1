@@ -115,4 +115,91 @@ def test_active_monitor_registry_failure_returns_failure_summary(monkeypatch):
     assert summary.checked == 0
     assert summary.monitor_notifications_sent == 0
     assert summary.emergency_notifications_sent == 0
+    assert summary.positions_verified == 0
+    assert summary.positions_absent == 0
+    assert summary.positions_unavailable == 0
     assert summary.failures == ["active trade registry unavailable: registry busy"]
+
+
+def _active_trade(symbol="WLDUSD"):
+    return SimpleNamespace(
+        symbol=symbol,
+        entry_price=0.3458,
+        stop_price=0.33840645,
+        target_1=0.36,
+        target_2=0.38,
+        risk_level="medium",
+        status="active",
+        trade_id="OHM-WLD",
+        direction="LONG",
+        margin_leverage=1.0,
+        capital=100.0,
+    )
+
+
+def test_active_monitor_suppresses_all_alerts_when_kraken_position_is_absent(monkeypatch):
+    trade = _active_trade()
+    calls = []
+
+    class Verifier:
+        def refresh(self):
+            return None
+
+        def verify(self, _trade):
+            return SimpleNamespace(
+                status="ABSENT",
+                verified=False,
+                reason="No meaningful WLD balance exists on Kraken",
+            )
+
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "get_settings",
+        lambda: SimpleNamespace(telegram_bot_token="", telegram_chat_id=""),
+    )
+    monkeypatch.setattr(active_trade_monitor_runner, "get_active_trades", lambda: [trade])
+    monkeypatch.setattr(active_trade_monitor_runner, "KrakenPositionVerifier", Verifier)
+    monkeypatch.setattr(active_trade_monitor_runner, "monitor_trade", lambda _trade: calls.append("monitor"))
+    monkeypatch.setattr(active_trade_monitor_runner, "detect_emergency_move", lambda _trade: calls.append("emergency"))
+
+    summary = active_trade_monitor_runner.run_active_trade_monitor()
+
+    assert calls == []
+    assert summary.active_trades == 1
+    assert summary.checked == 0
+    assert summary.positions_absent == 1
+    assert summary.monitor_notifications_sent == 0
+    assert summary.emergency_notifications_sent == 0
+
+
+def test_active_monitor_fails_closed_when_kraken_verification_is_unavailable(monkeypatch):
+    trade = _active_trade()
+    calls = []
+
+    class Verifier:
+        def refresh(self):
+            return None
+
+        def verify(self, _trade):
+            return SimpleNamespace(
+                status="UNAVAILABLE",
+                verified=False,
+                reason="Kraken private request failed",
+            )
+
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "get_settings",
+        lambda: SimpleNamespace(telegram_bot_token="", telegram_chat_id=""),
+    )
+    monkeypatch.setattr(active_trade_monitor_runner, "get_active_trades", lambda: [trade])
+    monkeypatch.setattr(active_trade_monitor_runner, "KrakenPositionVerifier", Verifier)
+    monkeypatch.setattr(active_trade_monitor_runner, "monitor_trade", lambda _trade: calls.append("monitor"))
+    monkeypatch.setattr(active_trade_monitor_runner, "detect_emergency_move", lambda _trade: calls.append("emergency"))
+
+    summary = active_trade_monitor_runner.run_active_trade_monitor()
+
+    assert calls == []
+    assert summary.positions_unavailable == 1
+    assert summary.monitor_notifications_sent == 0
+    assert summary.emergency_notifications_sent == 0
