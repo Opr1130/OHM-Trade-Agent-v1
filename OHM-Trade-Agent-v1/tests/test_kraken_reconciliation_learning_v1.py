@@ -167,6 +167,57 @@ def test_reconciliation_apply_terminalizes_confirmed_closed_spot_trade(monkeypat
     assert calls[0][1]["close_price"] == pytest.approx(0.0022)
 
 
+def test_reconciliation_apply_terminalizes_stale_trade_with_verified_zero_balance(monkeypatch):
+    monkeypatch.setenv("KRAKEN_RECONCILIATION_ENABLED", "true")
+    monkeypatch.setenv("KRAKEN_RECONCILIATION_MODE", "apply")
+    trade = ActiveTrade(
+        symbol="WLDUSD",
+        entry_price=0.3458,
+        stop_price=0.3384,
+        target_1=0.36,
+        target_2=0.38,
+        risk_level="medium",
+        trade_id="OHM-WLD",
+        capital=100.0,
+        opened_at="2026-08-17T10:00:00+00:00",
+    )
+    monkeypatch.setattr(reconciliation, "get_active_trades", lambda: [trade])
+    monkeypatch.setattr(reconciliation, "get_live_order_intents", lambda: [])
+    monkeypatch.setattr(reconciliation, "record_execution_event", lambda *a, **k: {})
+    calls = []
+    monkeypatch.setattr(
+        reconciliation,
+        "close_trade",
+        lambda *a, **k: calls.append((a, k)) or True,
+    )
+
+    class Client:
+        enabled = True
+
+        def assert_read_only(self):
+            return SimpleNamespace(name="ohm-read-only")
+
+        def get_balance(self):
+            return {"WLD": 0.0, "ZUSD": 500.0}
+
+        def get_open_orders(self):
+            return {}
+
+        def get_trades_history(self, *, start=None):
+            return {}
+
+        def get_open_positions(self):
+            return {}
+
+    result = reconciliation.reconcile_kraken_account(Client())
+
+    assert result.would_close == ("WLDUSD",)
+    assert result.closed == ("WLDUSD",)
+    assert calls == [
+        (("WLDUSD",), {"reason": "kraken_verified_no_position"})
+    ]
+
+
 def test_execution_learning_derives_idea_order_fill_timing(monkeypatch, tmp_path):
     monkeypatch.setattr(learning, "EXECUTION_FILE", tmp_path / "execution_learning.json")
     monkeypatch.setattr(learning, "LOCK_FILE", tmp_path / ".execution_learning.lock")
