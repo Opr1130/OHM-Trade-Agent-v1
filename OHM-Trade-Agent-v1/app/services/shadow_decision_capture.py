@@ -31,21 +31,16 @@ def capture_snapshot_decision(
     try:
         execution = getattr(snapshot, "execution_validation", None)
         spread_bps = getattr(execution, "spread_bps", None) if execution is not None else None
-        explicit_intelligence = market_intelligence is not None
         intelligence = market_intelligence
         if intelligence is None:
             intelligence = getattr(snapshot, "_wave8_market_intelligence", None)
-        intelligence_payload = dict(intelligence) if isinstance(intelligence, dict) else {}
 
-        # Target v2 is evidence-only. Attach its proposal to existing shadow
-        # records for Chief AI non-entry decisions, production target rejects,
-        # and qualified survivors. Explicit intelligence is caller-owned and
-        # must pass through unchanged.
-        if not explicit_intelligence and source in TARGET_V2_SHADOW_SOURCES:
+        target_v2_shadow = None
+        if source in TARGET_V2_SHADOW_SOURCES:
             try:
-                intelligence_payload["target_v2_shadow"] = evaluate_target_v2_shadow(snapshot).as_dict()
+                target_v2_shadow = evaluate_target_v2_shadow(snapshot).as_dict()
             except Exception:
-                pass
+                target_v2_shadow = None
 
         record_shadow_candidate(
             symbol=str(snapshot.symbol),
@@ -59,8 +54,9 @@ def capture_snapshot_decision(
             spread_bps=spread_bps,
             reason=reason,
             source=source,
-            market_intelligence=intelligence_payload or None,
+            market_intelligence=intelligence,
             price_movement=getattr(snapshot, "price_movement_signal", None),
+            target_v2_shadow=target_v2_shadow,
         )
         return True
     except Exception:
