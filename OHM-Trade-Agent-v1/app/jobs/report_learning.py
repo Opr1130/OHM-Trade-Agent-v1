@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.services.counterfactual_gate_audit import build_counterfactual_gate_audit
 from app.services.decision_learning import decision_quality_summary
 from app.services.profitability_learning import build_profitability_profile
 from app.services.shadow_learning import get_shadow_records
@@ -16,8 +17,10 @@ def main() -> None:
     actual_attribution = attribution.get("actual_trade_attribution") or {}
     shadow_attribution = attribution.get("shadow_confirmation") or {}
     promotion = attribution.get("promotion") or {}
-    decision = decision_quality_summary(get_shadow_records())
+    shadow_records = get_shadow_records()
+    decision = decision_quality_summary(shadow_records)
     signal_quality = build_signal_quality_audit()
+    counterfactual = build_counterfactual_gate_audit(shadow_records)
 
     print("===== OHM PROFITABILITY SELF-LEARNING =====")
     print("Generated:", profile.get("generated_at"))
@@ -42,6 +45,35 @@ def main() -> None:
     print("Average MAE %:", signal_quality.get("average_mae_pct"))
     print("Failure reasons:", signal_quality.get("failure_reasons") or {})
     print("Automatic tuning applied:", signal_quality.get("automatic_tuning_applied", False))
+    print()
+    print("COUNTERFACTUAL GATE AUDIT V1.1")
+    print("Status:", counterfactual.get("status"))
+    print("Evaluated rejections:", counterfactual.get("evaluated_rejections", 0))
+    print("Pending rejections:", counterfactual.get("pending_rejections", 0))
+    print("Classifications:", counterfactual.get("classifications") or {})
+    print("Gate-family attribution:")
+    for family, stats in (counterfactual.get("by_gate_family") or {}).items():
+        print(
+            f"  {family}: samples={stats.get('samples', 0)} "
+            f"false-like={stats.get('false_reject_like', 0)} "
+            f"false-like-rate={stats.get('false_reject_like_rate_pct')}% "
+            f"good={stats.get('good_rejects', 0)} "
+            f"safety-upside={stats.get('safety_rejects_with_later_upside', 0)}"
+        )
+    print("Decision attribution:")
+    for name, stats in (counterfactual.get("by_decision") or {}).items():
+        print(
+            f"  {name}: samples={stats.get('samples', 0)} "
+            f"false-like={stats.get('false_reject_like', 0)} "
+            f"false-like-rate={stats.get('false_reject_like_rate_pct')}% "
+            f"good={stats.get('good_rejects', 0)} "
+            f"safety-upside={stats.get('safety_rejects_with_later_upside', 0)}"
+        )
+    interpretation = counterfactual.get("interpretation") or {}
+    print("Heuristic only:", interpretation.get("heuristic_only", True))
+    print("Price path is execution proof:", not interpretation.get("price_path_is_not_execution_proof", True))
+    print("Safety gates remain authoritative:", interpretation.get("safety_gates_remain_authoritative", True))
+    print("Automatic tuning applied:", interpretation.get("automatic_tuning_applied", False))
     print()
     print("SHADOW / MISSED OPPORTUNITY LEARNING")
     print("Samples:", shadow.get("samples", 0))
