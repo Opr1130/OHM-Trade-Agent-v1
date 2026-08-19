@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 from app.services import shadow_learning
 
 
@@ -24,12 +26,17 @@ def _base_row():
     }
 
 
+def _isolate_registry(monkeypatch, data, saves):
+    monkeypatch.setattr(shadow_learning, "registry_lock", lambda _: nullcontext())
+    monkeypatch.setattr(shadow_learning, "_load", lambda: data)
+    monkeypatch.setattr(shadow_learning, "_save", lambda payload: saves.append(payload.copy()))
+
+
 def test_dedup_backfills_target_v2_without_changing_original_measurement(monkeypatch):
     row = _base_row()
     data = {row["record_key"]: row}
     saves = []
-    monkeypatch.setattr(shadow_learning, "_load", lambda: data)
-    monkeypatch.setattr(shadow_learning, "_save", lambda payload: saves.append(payload.copy()))
+    _isolate_registry(monkeypatch, data, saves)
 
     target_v2 = {
         "target_class": "FULL_TARGET",
@@ -65,8 +72,7 @@ def test_dedup_does_not_overwrite_existing_target_v2(monkeypatch):
     row["target_v2_shadow"] = original
     data = {row["record_key"]: row}
     saves = []
-    monkeypatch.setattr(shadow_learning, "_load", lambda: data)
-    monkeypatch.setattr(shadow_learning, "_save", lambda payload: saves.append(payload.copy()))
+    _isolate_registry(monkeypatch, data, saves)
 
     result = shadow_learning.record_shadow_candidate(
         symbol="BTCUSD",
