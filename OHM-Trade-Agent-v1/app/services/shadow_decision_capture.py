@@ -24,15 +24,20 @@ def capture_snapshot_decision(
     try:
         execution = getattr(snapshot, "execution_validation", None)
         spread_bps = getattr(execution, "spread_bps", None) if execution is not None else None
+        explicit_intelligence = market_intelligence is not None
         intelligence = market_intelligence
         if intelligence is None:
             intelligence = getattr(snapshot, "_wave8_market_intelligence", None)
         intelligence_payload = dict(intelligence) if isinstance(intelligence, dict) else {}
 
         # Target v2 is evidence-only. Attach its proposal to the existing shadow
-        # record for production target rejects and qualified survivors so the
-        # normal 5m->24h shadow observer validates it without a parallel data path.
-        if source in {"target_quality_gate", "qualified_profit_rank"}:
+        # record for normal production target captures so the 5m->24h observer
+        # validates it without a parallel data path. Explicit intelligence is a
+        # caller-owned override and must pass through unchanged.
+        if (
+            not explicit_intelligence
+            and source in {"target_quality_gate", "qualified_profit_rank"}
+        ):
             try:
                 intelligence_payload["target_v2_shadow"] = evaluate_target_v2_shadow(snapshot).as_dict()
             except Exception:
