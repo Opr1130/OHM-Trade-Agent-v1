@@ -95,6 +95,35 @@ def _existing_within_cooldown(
     return dict(newest[1]) if newest is not None else None
 
 
+def _enrich_deduplicated_shadow(
+    data: dict[str, dict[str, Any]],
+    existing: dict[str, Any],
+    *,
+    target_v2_shadow: dict[str, Any] | None,
+    updated_at: str,
+) -> dict[str, Any]:
+    """Backfill new non-authoritative evidence onto a deduplicated shadow row.
+
+    Deduplication must preserve the original decision timestamp, reference price,
+    and observations. It may add newly introduced learning-only metadata so a
+    software rollout does not create a multi-hour measurement blind spot.
+    """
+    record_key = str(existing.get("record_key") or "")
+    stored = data.get(record_key)
+    enriched_fields: list[str] = []
+    if stored is not None and target_v2_shadow is not None and stored.get("target_v2_shadow") is None:
+        stored["target_v2_shadow"] = target_v2_shadow
+        stored["updated_at"] = updated_at
+        enriched_fields.append("target_v2_shadow")
+        _save(data)
+        existing = dict(stored)
+    existing["deduplicated"] = True
+    existing["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
+    if enriched_fields:
+        existing["dedup_enriched_fields"] = enriched_fields
+    return existing
+
+
 def record_shadow_candidate(
     *,
     symbol: str,
@@ -130,9 +159,12 @@ def record_shadow_candidate(
             return dict(data[key])
         existing = _existing_within_cooldown(data, identity=identity, observed_at=ts)
         if existing is not None:
-            existing["deduplicated"] = True
-            existing["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
-            return existing
+            return _enrich_deduplicated_shadow(
+                data,
+                existing,
+                target_v2_shadow=target_v2_shadow,
+                updated_at=ts,
+            )
         row = {
             "record_key": key,
             "symbol": symbol.upper(),
