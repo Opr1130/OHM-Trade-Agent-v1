@@ -16,11 +16,15 @@ AI_DECISIONS = {
 
 
 def _payload(row: dict[str, Any]) -> dict[str, Any] | None:
+    direct = row.get("target_v2_shadow")
+    if isinstance(direct, dict):
+        return direct
     intelligence = row.get("market_intelligence")
-    if not isinstance(intelligence, dict):
-        return None
-    value = intelligence.get("target_v2_shadow")
-    return value if isinstance(value, dict) else None
+    if isinstance(intelligence, dict):
+        legacy = intelligence.get("target_v2_shadow")
+        if isinstance(legacy, dict):
+            return legacy
+    return None
 
 
 def _best_move(row: dict[str, Any]) -> float | None:
@@ -70,6 +74,7 @@ def _stats(entries: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict[str, An
 
 
 def build_target_v2_coverage_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    all_entries: list[tuple[dict[str, Any], dict[str, Any]]] = []
     segmented: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     by_ai_decision: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
 
@@ -77,17 +82,21 @@ def build_target_v2_coverage_summary(records: Iterable[dict[str, Any]]) -> dict[
         payload = _payload(row)
         if payload is None:
             continue
+        entry = (row, payload)
+        all_entries.append(entry)
         segment = _segment(row)
-        segmented[segment].append((row, payload))
+        segmented[segment].append(entry)
         decision = str(row.get("decision") or "").upper()
         if segment == "AI_NON_ENTRY":
-            by_ai_decision[decision].append((row, payload))
+            by_ai_decision[decision].append(entry)
 
     return {
         "version": "target-v2-shadow-coverage-v1",
-        "status": "OK" if segmented else "NO_SHADOW_SAMPLES",
+        "status": "OK" if all_entries else "NO_SHADOW_SAMPLES",
+        "overall": _stats(all_entries),
         "segments": {name: _stats(rows) for name, rows in sorted(segmented.items())},
         "ai_decisions": {name: _stats(rows) for name, rows in sorted(by_ai_decision.items())},
+        "production_target_gate_changed": False,
         "production_decisions_changed": False,
         "automatic_promotion": False,
         "shadow_only": True,
