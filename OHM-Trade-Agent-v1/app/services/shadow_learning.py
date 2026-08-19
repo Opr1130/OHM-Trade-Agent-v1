@@ -111,6 +111,7 @@ def record_shadow_candidate(
     observed_at: str | None = None,
     market_intelligence: dict[str, Any] | None = None,
     price_movement: dict[str, Any] | None = None,
+    target_v2_shadow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if reference_price <= 0:
         raise ValueError("reference_price must be positive")
@@ -148,6 +149,7 @@ def record_shadow_candidate(
             "reason": reason or "",
             "market_intelligence": market_intelligence,
             "price_movement": price_movement,
+            "target_v2_shadow": target_v2_shadow,
             "observations": {},
             "complete": False,
             "updated_at": ts,
