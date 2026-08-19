@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.shadow_learning import record_shadow_candidate
+from app.services.target_attainability_v2_shadow import evaluate_target_v2_shadow
 
 
 def capture_snapshot_decision(
@@ -26,6 +27,17 @@ def capture_snapshot_decision(
         intelligence = market_intelligence
         if intelligence is None:
             intelligence = getattr(snapshot, "_wave8_market_intelligence", None)
+        intelligence_payload = dict(intelligence) if isinstance(intelligence, dict) else {}
+
+        # Target v2 is evidence-only. Attach its proposal to the existing shadow
+        # record for production target rejects and qualified survivors so the
+        # normal 5m->24h shadow observer validates it without a parallel data path.
+        if source in {"target_quality_gate", "qualified_profit_rank"}:
+            try:
+                intelligence_payload["target_v2_shadow"] = evaluate_target_v2_shadow(snapshot).as_dict()
+            except Exception:
+                pass
+
         record_shadow_candidate(
             symbol=str(snapshot.symbol),
             direction=str(getattr(snapshot, "trade_direction", "LONG") or "LONG"),
@@ -38,7 +50,7 @@ def capture_snapshot_decision(
             spread_bps=spread_bps,
             reason=reason,
             source=source,
-            market_intelligence=intelligence,
+            market_intelligence=intelligence_payload or None,
             price_movement=getattr(snapshot, "price_movement_signal", None),
         )
         return True
