@@ -16,11 +16,14 @@ AMBIGUOUS = "AMBIGUOUS"
 STALE = "STALE"
 UNAVAILABLE = "UNAVAILABLE"
 UNIQUE = "UNIQUE"
+PRICE_DISAMBIGUATED = "PRICE_DISAMBIGUATED"
 
-# Informational reference boundaries only; neither value is a trading gate.
 REFERENCE_WARN_DIVERGENCE_PCT = 2.0
 REFERENCE_MATERIAL_DIVERGENCE_PCT = 5.0
 REFERENCE_STALE_SECONDS = 300.0
+PRICE_IDENTITY_MAX_DIVERGENCE_PCT = 2.0
+PRICE_IDENTITY_MIN_RUNNER_UP_DIVERGENCE_PCT = 5.0
+PRICE_IDENTITY_MIN_SEPARATION_PCT = 3.0
 SYMBOL_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 
@@ -81,6 +84,35 @@ def _unavailable(api_mode: str, warning: str) -> ReferenceMarketValidation:
     )
 
 
+def _valid_reference_price(item: dict[str, Any]) -> float | None:
+    value = item.get("current_price")
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
+
+
+def _price_disambiguate(matches: list[dict[str, Any]], kraken_price: float) -> dict[str, Any] | None:
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for item in matches:
+        price = _valid_reference_price(item)
+        if price is None:
+            continue
+        divergence = abs(price - kraken_price) / kraken_price * 100.0
+        ranked.append((divergence, item))
+    ranked.sort(key=lambda value: value[0])
+    if len(ranked) < 2:
+        return None
+    best_divergence, best = ranked[0]
+    runner_up_divergence = ranked[1][0]
+    if (
+        best_divergence <= PRICE_IDENTITY_MAX_DIVERGENCE_PCT
+        and runner_up_divergence >= PRICE_IDENTITY_MIN_RUNNER_UP_DIVERGENCE_PCT
+        and runner_up_divergence - best_divergence >= PRICE_IDENTITY_MIN_SEPARATION_PCT
+    ):
+        return best
+    return None
+
+
 def evaluate_reference_market(
     candidate: MarketSnapshot,
     market_rows: list[dict[str, Any]],
@@ -90,12 +122,10 @@ def evaluate_reference_market(
 ) -> ReferenceMarketValidation:
     now = now or datetime.now(timezone.utc)
     wanted = _candidate_symbol(candidate)
-    matches = [
-        item for item in market_rows
-        if _symbol(str(item.get("symbol", ""))) == wanted
-    ]
+    matches = [item for item in market_rows if _symbol(str(item.get("symbol", ""))) == wanted]
     if not matches:
         return _unavailable(api_mode, f"No CoinGecko match for {wanted}")
+
     kraken_price = candidate.ticker_last or candidate.last_price
     if candidate.primary_quote_currency == "USDT":
         if usdt_usd_rate is None or usdt_usd_rate <= 0:
@@ -104,27 +134,39 @@ def evaluate_reference_market(
     if not math.isfinite(kraken_price) or kraken_price <= 0:
         return _unavailable(api_mode, "Kraken normalized USD price unavailable")
 
+    mapping_status = UNIQUE
+    identity_warning: str | None = None
     if len(matches) > 1:
-        return ReferenceMarketValidation(
-            status=AMBIGUOUS,
-            available=True,
-            mapping_status=AMBIGUOUS,
-            api_mode=api_mode,
-            matched_candidate_count=len(matches),
-            kraken_normalized_price_usd=kraken_price,
-            warnings=(
-                f"{len(matches)} CoinGecko assets share ticker {wanted}; "
-                "no external identity was selected",
-            ),
+        selected = _price_disambiguate(matches, kraken_price)
+        if selected is None:
+            return ReferenceMarketValidation(
+                status=AMBIGUOUS,
+                available=True,
+                mapping_status=AMBIGUOUS,
+                api_mode=api_mode,
+                matched_candidate_count=len(matches),
+                kraken_normalized_price_usd=kraken_price,
+                warnings=(
+                    f"{len(matches)} CoinGecko assets share ticker {wanted}; "
+                    "no external identity was selected because no uniquely price-consistent match exists",
+                ),
+            )
+        mapping_status = PRICE_DISAMBIGUATED
+        identity_warning = (
+            f"{len(matches)} CoinGecko assets share ticker {wanted}; identity was "
+            "resolved only because one reference price uniquely matched Kraken"
         )
+    else:
+        selected = matches[0]
 
-    selected = matches[0]
     warnings: list[str] = []
-    reference_price = selected.get("current_price")
-    if not isinstance(reference_price, (int, float)) or not math.isfinite(reference_price) or reference_price <= 0:
+    if identity_warning:
+        warnings.append(identity_warning)
+    reference_price = _valid_reference_price(selected)
+    if reference_price is None:
         return _unavailable(api_mode, "Selected CoinGecko reference has no valid USD price")
 
-    absolute_difference = abs(float(reference_price) - kraken_price)
+    absolute_difference = abs(reference_price - kraken_price)
     divergence = absolute_difference / kraken_price * 100
     last_updated = selected.get("last_updated")
     age: float | None = None
@@ -153,12 +195,12 @@ def evaluate_reference_market(
     return ReferenceMarketValidation(
         status=status,
         available=True,
-        mapping_status=UNIQUE,
+        mapping_status=mapping_status,
         api_mode=api_mode,
         coingecko_id=str(selected.get("id")) if selected.get("id") else None,
         coingecko_name=str(selected.get("name")) if selected.get("name") else None,
         matched_candidate_count=len(matches),
-        reference_price_usd=float(reference_price),
+        reference_price_usd=reference_price,
         kraken_normalized_price_usd=kraken_price,
         absolute_price_difference_usd=absolute_difference,
         price_divergence_pct=divergence,
@@ -188,14 +230,10 @@ def validate_finalist_references(
     except CoinGeckoAPIError:
         rows = []
         for candidate in requested:
-            candidate.independent_market_reference = _unavailable(
-                api_mode, "CoinGecko batch request unavailable"
-            )
+            candidate.independent_market_reference = _unavailable(api_mode, "CoinGecko batch request unavailable")
     else:
         for candidate in requested:
-            candidate.independent_market_reference = evaluate_reference_market(
-                candidate, rows, usdt_usd_rate, api_mode, now
-            )
+            candidate.independent_market_reference = evaluate_reference_market(candidate, rows, usdt_usd_rate, api_mode, now)
     references = [item.independent_market_reference for item in requested]
     return ReferenceValidationSummary(
         requested=len(requested),
