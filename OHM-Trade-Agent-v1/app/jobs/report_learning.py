@@ -5,6 +5,7 @@ from app.services.decision_learning import decision_quality_summary
 from app.services.profitability_learning import build_profitability_profile
 from app.services.shadow_learning import get_shadow_records
 from app.services.signal_quality_audit import build_signal_quality_audit
+from app.services.target_attainability_v2_shadow import build_target_v2_shadow_summary
 
 
 def main() -> None:
@@ -21,6 +22,7 @@ def main() -> None:
     decision = decision_quality_summary(shadow_records)
     signal_quality = build_signal_quality_audit()
     counterfactual = build_counterfactual_gate_audit(shadow_records)
+    target_v2 = build_target_v2_shadow_summary(shadow_records)
 
     print("===== OHM PROFITABILITY SELF-LEARNING =====")
     print("Generated:", profile.get("generated_at"))
@@ -74,6 +76,21 @@ def main() -> None:
     print("Price path is execution proof:", not interpretation.get("price_path_is_not_execution_proof", True))
     print("Safety gates remain authoritative:", interpretation.get("safety_gates_remain_authoritative", True))
     print("Automatic tuning applied:", interpretation.get("automatic_tuning_applied", False))
+    print()
+    print("TARGET ATTAINABILITY V2 SHADOW CHALLENGER")
+    print("Status:", target_v2.get("status"))
+    print("Shadow samples:", target_v2.get("samples", 0))
+    print("Validated samples:", target_v2.get("validated_samples", 0))
+    for target_class, stats in (target_v2.get("by_target_class") or {}).items():
+        print(
+            f"  {target_class}: samples={stats.get('samples', 0)} "
+            f"validated={stats.get('validated', 0)} "
+            f"T1-hit-rate={stats.get('t1_shadow_hit_rate_pct')}% "
+            f"avg-confidence={stats.get('average_confidence_score')}"
+        )
+    print("Production target gate changed:", target_v2.get("production_target_gate_changed", False))
+    print("Automatic promotion:", target_v2.get("automatic_promotion", False))
+    print("Shadow only:", target_v2.get("shadow_only", True))
     print()
     print("SHADOW / MISSED OPPORTUNITY LEARNING")
     print("Samples:", shadow.get("samples", 0))
