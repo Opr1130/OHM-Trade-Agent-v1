@@ -6,6 +6,13 @@ from app.services.shadow_learning import record_shadow_candidate
 from app.services.target_attainability_v2_shadow import evaluate_target_v2_shadow
 
 
+TARGET_V2_SHADOW_SOURCES = {
+    "target_quality_gate",
+    "qualified_profit_rank",
+    "chief_ai_review",
+}
+
+
 def capture_snapshot_decision(
     snapshot: Any,
     *,
@@ -30,14 +37,11 @@ def capture_snapshot_decision(
             intelligence = getattr(snapshot, "_wave8_market_intelligence", None)
         intelligence_payload = dict(intelligence) if isinstance(intelligence, dict) else {}
 
-        # Target v2 is evidence-only. Attach its proposal to the existing shadow
-        # record for normal production target captures so the 5m->24h observer
-        # validates it without a parallel data path. Explicit intelligence is a
-        # caller-owned override and must pass through unchanged.
-        if (
-            not explicit_intelligence
-            and source in {"target_quality_gate", "qualified_profit_rank"}
-        ):
+        # Target v2 is evidence-only. Attach its proposal to existing shadow
+        # records for Chief AI non-entry decisions, production target rejects,
+        # and qualified survivors. Explicit intelligence is caller-owned and
+        # must pass through unchanged.
+        if not explicit_intelligence and source in TARGET_V2_SHADOW_SOURCES:
             try:
                 intelligence_payload["target_v2_shadow"] = evaluate_target_v2_shadow(snapshot).as_dict()
             except Exception:
