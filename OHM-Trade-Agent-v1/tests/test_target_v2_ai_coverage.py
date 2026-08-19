@@ -37,26 +37,27 @@ def _snapshot():
     )
 
 
-def test_chief_ai_review_capture_gets_target_v2_shadow(monkeypatch):
+def test_chief_ai_review_capture_gets_separate_target_v2_shadow(monkeypatch):
     recorded = []
     monkeypatch.setattr(
         capture,
         "record_shadow_candidate",
         lambda **kwargs: recorded.append(kwargs) or kwargs,
     )
+    snapshot = _snapshot()
+    original_intelligence = snapshot._wave8_market_intelligence
 
     assert capture.capture_snapshot_decision(
-        _snapshot(),
+        snapshot,
         decision="AI_WATCH",
         market_regime="RISK_OFF",
         reason="watch",
         source="chief_ai_review",
     )
 
-    intelligence = recorded[0]["market_intelligence"]
-    assert intelligence["assessment"]["context_score"] == 50
-    assert intelligence["target_v2_shadow"]["shadow_only"] is True
-    assert intelligence["target_v2_shadow"]["production_authoritative"] is False
+    assert recorded[0]["market_intelligence"] == original_intelligence
+    assert recorded[0]["target_v2_shadow"]["shadow_only"] is True
+    assert recorded[0]["target_v2_shadow"]["production_authoritative"] is False
 
 
 def test_coverage_summary_segments_ai_target_and_survivor_records():
@@ -69,30 +70,53 @@ def test_coverage_summary_segments_ai_target_and_survivor_records():
         {
             "decision": "AI_WATCH",
             "source": "chief_ai_review",
-            "market_intelligence": {"target_v2_shadow": payload},
+            "target_v2_shadow": payload,
             "observations": {"24h": {"directional_move_pct": 2.5}},
         },
         {
             "decision": "TARGET_REJECT",
             "source": "target_quality_gate",
-            "market_intelligence": {"target_v2_shadow": payload},
+            "target_v2_shadow": payload,
             "observations": {"24h": {"directional_move_pct": 1.0}},
         },
         {
             "decision": "ENTER_NOW",
             "source": "qualified_profit_rank",
-            "market_intelligence": {"target_v2_shadow": payload},
+            "target_v2_shadow": payload,
             "observations": {"24h": {"directional_move_pct": 3.0}},
         },
     ]
 
     summary = build_target_v2_coverage_summary(records)
 
+    assert summary["overall"]["samples"] == 3
+    assert summary["overall"]["validated"] == 3
     assert summary["segments"]["AI_NON_ENTRY"]["samples"] == 1
     assert summary["segments"]["AI_NON_ENTRY"]["t1_shadow_hit_rate_pct"] == 100.0
     assert summary["segments"]["TARGET_V1_REJECT"]["t1_shadow_hit_rate_pct"] == 0.0
     assert summary["segments"]["QUALIFIED_SURVIVOR"]["t1_shadow_hit_rate_pct"] == 100.0
     assert summary["ai_decisions"]["AI_WATCH"]["samples"] == 1
+    assert summary["production_target_gate_changed"] is False
     assert summary["production_decisions_changed"] is False
     assert summary["automatic_promotion"] is False
     assert summary["shadow_only"] is True
+
+
+def test_coverage_summary_reads_legacy_nested_v2_payloads():
+    summary = build_target_v2_coverage_summary([
+        {
+            "decision": "TARGET_REJECT",
+            "source": "target_quality_gate",
+            "market_intelligence": {
+                "target_v2_shadow": {
+                    "target_class": "SCALP_TARGET",
+                    "confidence_score": 45,
+                    "proposed_t1_move_pct": 1.0,
+                }
+            },
+            "observations": {"24h": {"directional_move_pct": 1.2}},
+        }
+    ])
+
+    assert summary["overall"]["samples"] == 1
+    assert summary["overall"]["t1_shadow_hit_rate_pct"] == 100.0
