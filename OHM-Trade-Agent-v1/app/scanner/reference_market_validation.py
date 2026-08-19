@@ -18,13 +18,9 @@ UNAVAILABLE = "UNAVAILABLE"
 UNIQUE = "UNIQUE"
 PRICE_DISAMBIGUATED = "PRICE_DISAMBIGUATED"
 
-# Informational reference boundaries only; neither value is a trading gate.
 REFERENCE_WARN_DIVERGENCE_PCT = 2.0
 REFERENCE_MATERIAL_DIVERGENCE_PCT = 5.0
 REFERENCE_STALE_SECONDS = 300.0
-# A duplicate ticker may be resolved only when one CoinGecko price is tightly
-# consistent with Kraken and every alternative is materially farther away.
-# This is evidence attribution only; it never changes candidate eligibility.
 PRICE_IDENTITY_MAX_DIVERGENCE_PCT = 2.0
 PRICE_IDENTITY_MIN_RUNNER_UP_DIVERGENCE_PCT = 5.0
 PRICE_IDENTITY_MIN_SEPARATION_PCT = 3.0
@@ -152,7 +148,7 @@ def evaluate_reference_market(
                 kraken_normalized_price_usd=kraken_price,
                 warnings=(
                     f"{len(matches)} CoinGecko assets share ticker {wanted}; "
-                    "no uniquely price-consistent external identity was selected",
+                    "no external identity was selected because no uniquely price-consistent match exists",
                 ),
             )
         mapping_status = PRICE_DISAMBIGUATED
