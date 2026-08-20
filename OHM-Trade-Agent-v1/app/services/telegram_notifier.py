@@ -5,6 +5,7 @@ import httpx
 
 from app.models.signal import SignalDecision, TradingSignal
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,31 +31,12 @@ def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
     )
 
 
-def build_trade_confirmation_buttons(
-    trade_id: str,
-) -> dict:
-    """
-    Build Telegram inline buttons for manually confirming
-    or skipping a trade.
-
-    IMPORTANT:
-    These buttons do NOT place an order on Kraken.
-    They are only intended for the OHM testing/monitoring workflow.
-    """
+def build_trade_confirmation_buttons(trade_id: str) -> dict:
+    """Build local lifecycle buttons; these never place a Kraken order."""
     return {
         "inline_keyboard": [
-            [
-                {
-                    "text": "✅ TRADE FILLED",
-                    "callback_data": f"trade_filled:{trade_id}",
-                }
-            ],
-            [
-                {
-                    "text": "❌ SKIP TRADE",
-                    "callback_data": f"trade_skip:{trade_id}",
-                }
-            ],
+            [{"text": "✅ TRADE FILLED", "callback_data": f"trade_filled:{trade_id}"}],
+            [{"text": "❌ SKIP TRADE", "callback_data": f"trade_skip:{trade_id}"}],
         ]
     }
 
@@ -65,32 +47,25 @@ def send_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
-    """
-    Send a Telegram message.
-
-    reply_markup is optional so existing OHM notifications
-    continue to work exactly as before.
-    """
-
+    """Send Telegram without ever logging the token-bearing request URL."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-    }
-
+    payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
-
     try:
-        response = httpx.post(
-            url,
-            data=payload,
-            timeout=10.0,
-        )
+        response = httpx.post(url, data=payload, timeout=10.0)
         response.raise_for_status()
         return True
-
-    except httpx.HTTPError:
-        logger.exception("Telegram notification failed")
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Telegram notification failed endpoint=sendMessage status=%s error=%s",
+            exc.response.status_code if exc.response is not None else "unknown",
+            type(exc).__name__,
+        )
+        return False
+    except httpx.HTTPError as exc:
+        logger.error(
+            "Telegram notification failed endpoint=sendMessage error=%s",
+            type(exc).__name__,
+        )
         return False
