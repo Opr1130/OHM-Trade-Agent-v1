@@ -1,5 +1,6 @@
 from app.core.config import get_settings
-from app.services.movement_discovery_v2 import append_detection_snapshots, scan_early_movers, send_early_mover_update
+from app.services.movement_discovery_learning_capture import capture_movement_detections
+from app.services.movement_discovery_v2 import scan_early_movers, send_early_mover_update
 
 
 def main() -> None:
@@ -25,7 +26,7 @@ def main() -> None:
         )
 
     try:
-        print("Movement learning detections captured:", append_detection_snapshots(signals))
+        print("Movement learning detections captured:", capture_movement_detections(signals, coarse))
     except Exception as exc:
         print("Movement learning capture: fail-soft", type(exc).__name__)
 

@@ -1,11 +1,12 @@
 from app.core.config import get_settings
 from app.services.pending_setup_monitor import monitor_pending_setup
 from app.services.pending_setup_notifier import send_pending_setup_update
-from app.services.pending_setup_registry import get_pending_setups
+from app.services.pending_setup_registry import expire_due_pending_setups, get_pending_setups
 
 
 def main():
     settings = get_settings()
+    expired = expire_due_pending_setups()
     setups = get_pending_setups()
 
     checked = 0
@@ -25,17 +26,13 @@ def main():
             ):
                 notifications_sent += 1
 
-            print(
-                setup.symbol,
-                result.status,
-                result.current_price,
-            )
-
+            print(setup.symbol, result.status, result.current_price)
         except Exception as exc:
             failures.append(f"{setup.symbol}: {exc}")
 
     print()
     print("OHM AI Pending Setup Monitor")
+    print("Expired stale setups:", expired)
     print("Pending setups:", len(setups))
     print("Checked:", checked)
     print("Notifications sent:", notifications_sent)

@@ -7,9 +7,16 @@ from openai import OpenAI
 from app.scanner.models import MarketSnapshot
 from app.scanner.short_technical_scorer import score_short_snapshot
 from app.scanner.technical_scorer import score_snapshot
+from app.services.candidate_trace import trace_candidate_event
 from app.services.chief_learning_capture import (
     capture_chief_review_decisions,
     capture_prefilter_rejection,
+)
+from app.services.chief_runtime_guard import (
+    budget_block_reason,
+    build_chief_fingerprint,
+    get_cached_review,
+    store_cached_review,
 )
 from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.entry_exit_advisor import build_entry_exit_plan
@@ -82,10 +89,7 @@ def _max_output_tokens() -> int:
     return value
 
 
-def _quality_by_risk_level(
-    candidate: MarketSnapshot,
-    account_equity: float,
-) -> tuple[dict, bool]:
+def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> tuple[dict, bool]:
     quality_by_risk_level: dict = {}
     viable_any = False
     direction = candidate.trade_direction.upper()
@@ -124,22 +128,48 @@ def _quality_by_risk_level(
             "economic_rejection": economic.rejection_reason,
             "economic_assumed_capital": economic.recommended_capital,
             "economic_validation_leverage": getattr(economic, "leverage", 1.0),
-            "economic_account_risk_at_stop_pct": getattr(
-                economic, "account_risk_at_stop_pct", 0.0
-            ),
+            "economic_account_risk_at_stop_pct": getattr(economic, "account_risk_at_stop_pct", 0.0),
             "hypothetical_target_2_net_profit_at_assumed_capital": economic.target_2_net_profit,
         }
     return quality_by_risk_level, viable_any
 
 
-def _no_trade_review(reason: str) -> dict:
-    return {
+def _no_trade_review(reason: str, *, failure_code: str | None = None, eligible_candidates: int = 0) -> dict:
+    review = {
         "market_view": "",
         "recommended_action": "no_trade",
         "top_candidates": [],
         "summary": reason,
         "chief_api_skipped": True,
-        "chief_eligible_candidates": 0,
+        "chief_eligible_candidates": int(eligible_candidates),
+    }
+    if failure_code:
+        review["chief_failure_code"] = failure_code
+    return review
+
+
+def _trace_chief_failure(candidates: list[MarketSnapshot], *, reason_code: str, detail: str) -> None:
+    for candidate in candidates:
+        try:
+            trace_candidate_event(
+                symbol=candidate.symbol,
+                direction=candidate.trade_direction or "LONG",
+                stage="CHIEF",
+                reason_code=reason_code,
+                details={"detail": detail},
+            )
+        except Exception:
+            pass
+
+
+def _request_payload(payload: list[dict], *, market_regime_context: object | None, coingecko_global_context: object | None) -> dict:
+    return {
+        "candidate_count": len(payload),
+        "market_regime_context": {
+            "ohm_breadth": asdict(market_regime_context) if is_dataclass(market_regime_context) else None,
+            "coingecko_global": asdict(coingecko_global_context) if is_dataclass(coingecko_global_context) else None,
+        },
+        "candidates": payload,
     }
 
 
@@ -264,11 +294,6 @@ def review_candidates(
         }
         if quality_by_risk_level is not None:
             candidate_context["deterministic_quality_by_risk_level"] = quality_by_risk_level
-        # Wave 8.2: optional corroborating/candidate evidence attached by
-        # merge_native_candidate_evidence / tradingview_only_candidates
-        # (app/services/tradingview_inbox.py). Context only — the Chief AI
-        # review never receives this as a reason to bypass any deterministic
-        # gate, and it is absent whenever no matching evidence exists.
         tradingview_evidence = getattr(candidate, "_tradingview_evidence", None)
         if tradingview_evidence is not None:
             candidate_context["tradingview_candidate_evidence"] = tradingview_evidence
@@ -281,48 +306,83 @@ def review_candidates(
             "Chief API skipped: no LONG/SHORT finalist can pass both deterministic target and economic gates under low or medium risk."
         )
 
-    effort = _reasoning_effort()
-    max_output_tokens = _max_output_tokens()
-    client = OpenAI(api_key=api_key)
-    response = client.responses.create(
-        model=model,
-        reasoning={"effort": effort},
-        max_output_tokens=max_output_tokens,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps({
-                    "candidate_count": len(payload),
-                    "market_regime_context": {
-                        "ohm_breadth": asdict(market_regime_context) if is_dataclass(market_regime_context) else None,
-                        "coingecko_global": asdict(coingecko_global_context) if is_dataclass(coingecko_global_context) else None,
-                    },
-                    "candidates": payload,
-                }),
-            },
-        ],
+    request_payload = _request_payload(
+        payload,
+        market_regime_context=market_regime_context,
+        coingecko_global_context=coingecko_global_context,
     )
+    fingerprint = build_chief_fingerprint(request_payload)
+    cached = get_cached_review(fingerprint)
+    if cached is not None:
+        cached["chief_api_skipped"] = True
+        cached["chief_cache_reused"] = True
+        cached["chief_eligible_candidates"] = len(payload)
+        return cached
 
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        record = append_usage_record(
+    blocked = budget_block_reason()
+    if blocked:
+        _trace_chief_failure(
+            chief_eligible_candidates,
+            reason_code="CHIEF_BUDGET_LIMIT",
+            detail=blocked,
+        )
+        return _no_trade_review(
+            f"Chief API skipped: {blocked}.",
+            failure_code="CHIEF_BUDGET_LIMIT",
+            eligible_candidates=len(payload),
+        )
+
+    try:
+        effort = _reasoning_effort()
+        max_output_tokens = _max_output_tokens()
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
             model=model,
-            reasoning_effort=effort,
-            candidate_count=len(payload),
-            usage=usage,
-        )
-        print(
-            "OPENAI USAGE "
-            f"Model={record['model']} Candidates={record['candidate_count']} "
-            f"Input={record['input_tokens']} Cached={record['cached_input_tokens']} "
-            f"Output={record['output_tokens']} Reasoning={record['reasoning_tokens']} "
-            f"Total={record['total_tokens']}"
+            reasoning={"effort": effort},
+            max_output_tokens=max_output_tokens,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(request_payload)},
+            ],
         )
 
-    review = json.loads(response.output_text)
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            record = append_usage_record(
+                model=model,
+                reasoning_effort=effort,
+                candidate_count=len(payload),
+                usage=usage,
+            )
+            print(
+                "OPENAI USAGE "
+                f"Model={record['model']} Candidates={record['candidate_count']} "
+                f"Input={record['input_tokens']} Cached={record['cached_input_tokens']} "
+                f"Output={record['output_tokens']} Reasoning={record['reasoning_tokens']} "
+                f"Total={record['total_tokens']}"
+            )
+
+        review = json.loads(response.output_text)
+        if not isinstance(review, dict):
+            raise ValueError("Chief response JSON was not an object")
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        _trace_chief_failure(
+            chief_eligible_candidates,
+            reason_code="CHIEF_UNAVAILABLE",
+            detail=detail,
+        )
+        print(f"CHIEF SUPPRESSED Reason=CHIEF_UNAVAILABLE Error={type(exc).__name__}")
+        return _no_trade_review(
+            f"Chief unavailable; fail-closed: {type(exc).__name__}.",
+            failure_code="CHIEF_UNAVAILABLE",
+            eligible_candidates=len(payload),
+        )
+
     review["chief_api_skipped"] = False
+    review["chief_cache_reused"] = False
     review["chief_eligible_candidates"] = len(payload)
+    store_cached_review(fingerprint, review)
     try:
         review["learning_capture"] = capture_chief_review_decisions(
             review,
@@ -330,7 +390,6 @@ def review_candidates(
             market_regime_context=market_regime_context,
         )
     except Exception:
-        # Learning telemetry must never block or alter a live trading decision.
         review["learning_capture"] = {
             "captured": 0,
             "qualified_alerts_deferred": 0,

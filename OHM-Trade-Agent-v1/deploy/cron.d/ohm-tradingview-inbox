@@ -1,0 +1,8 @@
+# OHM TradingView v2 inbox drain
+# Install as /etc/cron.d/ohm-tradingview-inbox only after operator approval.
+# This processes already-authenticated evidence independently of the slower
+# opportunity scan; it does not trigger Chief, Telegram, or trade authority.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * * root flock -n /var/run/ohm-tradingview-inbox.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.drain_tradingview_inbox >> /var/log/ohm-tradingview-inbox.log 2>&1'

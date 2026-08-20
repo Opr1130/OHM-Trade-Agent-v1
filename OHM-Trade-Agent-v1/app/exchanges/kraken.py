@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
-
-KRAKEN_API_BASE = "https://api.kraken.com/0/public"
+from app.services.kraken_transport import (
+    KrakenPublicTransport,
+    KrakenTransportError,
+    get_shared_kraken_transport,
+)
 
 
 class KrakenAPIError(RuntimeError):
@@ -48,28 +49,27 @@ class PublicTrade:
 
 
 class KrakenClient:
-    def __init__(self, timeout_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        timeout_seconds: float = 15.0,
+        *,
+        transport: KrakenPublicTransport | None = None,
+    ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.transport = transport or get_shared_kraken_transport()
 
     def _get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
-            response = httpx.get(
-                f"{KRAKEN_API_BASE}/{endpoint}",
-                params=params,
-                timeout=self.timeout_seconds,
+            return self.transport.request(
+                endpoint,
+                params,
+                timeout_seconds=self.timeout_seconds,
             )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise KrakenAPIError(f"Kraken request failed: {exc}") from exc
+        except KrakenTransportError as exc:
+            raise KrakenAPIError(str(exc)) from exc
 
-        payload = response.json()
-        errors = payload.get("error", [])
-        if errors:
-            raise KrakenAPIError(f"Kraken API error: {', '.join(errors)}")
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise KrakenAPIError("Kraken response did not contain a valid result")
-        return result
+    def transport_telemetry(self) -> dict[str, float | int]:
+        return self.transport.telemetry_snapshot()
 
     def get_asset_pairs(
         self,
