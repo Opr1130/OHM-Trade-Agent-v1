@@ -1,7 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
 
 from app.api.dashboard import router as dashboard_router
 from app.api.routes import router
+from app.core.config import get_settings
+from app.services.legacy_tradingview_guard import evaluate_legacy_tradingview_request
 from app.services.telegram_callback_listener import (
     start_telegram_callback_listener,
     stop_telegram_callback_listener,
@@ -12,6 +16,30 @@ app = FastAPI(
     version="0.1.0",
     description="Alert-only trade signal scoring and risk-validation service.",
 )
+
+
+@app.middleware("http")
+async def fence_legacy_tradingview(request: Request, call_next):
+    if request.url.path == "/webhooks/tradingview":
+        settings = get_settings()
+        decision = evaluate_legacy_tradingview_request(
+            app_env=settings.app_env,
+            supplied_legacy_secret=request.headers.get("x-legacy-tradingview-secret"),
+        )
+        if not decision.allowed:
+            return JSONResponse(
+                status_code=decision.status_code,
+                content={"detail": decision.reason},
+            )
+        if decision.inject_operator_secret:
+            # The legacy third-party secret is checked above. The old route's
+            # operator-secret dependency is then satisfied only inside the app,
+            # so an external legacy sender never receives the operator secret.
+            headers = MutableHeaders(scope=request.scope)
+            headers["x-webhook-secret"] = settings.webhook_secret
+
+    return await call_next(request)
+
 
 app.include_router(router)
 app.include_router(dashboard_router)
