@@ -77,6 +77,10 @@ def test_exceptional_candidate_must_materially_beat_weakest_incumbent():
     assert decision.weakest_incumbent_symbol == "BBBUSD"
     assert decision.estimated_rotation_edge_pct == 10.0
     assert decision.recommendation == "REVIEW_ROTATION"
+    assert decision.confidence_is_probability is False
+    assert decision.shadow_only is True
+    assert decision.production_decision_changed is False
+    assert decision.trade_authority_changed is False
 
 
 def test_small_rotation_advantage_prefers_holding():
