@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.explosion_learning import observe_due_explosion_outcomes
 from app.services.movement_discovery_outcomes import observe_due_movement_discovery_outcomes
 from app.services.profitability_learning import build_profitability_profile
 from app.services.price_movement_learning import observe_due_price_movements
@@ -33,7 +34,12 @@ def _parse(value: str | None) -> datetime | None:
 
 
 def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
-    """Run free/local learning work with no paid AI calls."""
+    """Run free/local learning work with no paid AI calls.
+
+    Every observer is telemetry-only and fail-open. Wave 5 explosion-state
+    outcomes are labeled prospectively after their fixed horizon is due; they
+    never feed live qualification, execution, risk or notification authority.
+    """
     now = now or _now()
     shadow = observe_due_shadows(now=now)
     try:
@@ -51,6 +57,14 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
             "status": "UNAVAILABLE",
             "observations_added": 0,
             "reason": f"v2.1 movement outcome observation failed open: {type(exc).__name__}: {exc}",
+        }
+    try:
+        explosion = observe_due_explosion_outcomes(now=now)
+    except Exception as exc:
+        explosion = {
+            "status": "UNAVAILABLE",
+            "outcomes_added": 0,
+            "reason": f"Wave 5 explosion outcome observation failed open: {type(exc).__name__}: {exc}",
         }
 
     profile_refreshed = False
@@ -73,6 +87,7 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
         "shadow": shadow,
         "price_movement": movement,
         "movement_discovery_v2_1": discovery,
+        "wave5_explosion_learning": explosion,
         "profile_refreshed": profile_refreshed,
         "profile_status": profile_status,
     }
