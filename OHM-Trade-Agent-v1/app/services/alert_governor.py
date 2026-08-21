@@ -8,17 +8,23 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 STATE_FILE = Path("/app/data/alert_governor_state.json")
-LOCK_FILE = STATE_FILE.parent / ".alert_governor_state.lock"
 DEFAULT_REPEAT_COOLDOWN_SECONDS = 6 * 60 * 60
-DEFAULT_TRANSITION_COOLDOWN_SECONDS = 60 * 60
-DEFAULT_MAX_IMMEDIATE_ALERTS_24H = 8
+DEFAULT_MAX_NEW_CARDS_24H = 8
 
 
 @dataclass(frozen=True)
 class AlertGovernorDecision:
-    allow_immediate: bool
+    action: str
     reason: str
-    suppressed_to_digest: bool = False
+    message_id: int | None = None
+
+    @property
+    def allow_immediate(self) -> bool:
+        return self.action in {"CREATE", "EDIT"}
+
+    @property
+    def suppressed_to_digest(self) -> bool:
+        return self.action == "SUPPRESS"
 
 
 def _now() -> datetime:
@@ -43,15 +49,14 @@ def evaluate_opportunity_alert(
     transition_key: str,
     now: datetime | None = None,
     repeat_cooldown_seconds: int = DEFAULT_REPEAT_COOLDOWN_SECONDS,
-    transition_cooldown_seconds: int = DEFAULT_TRANSITION_COOLDOWN_SECONDS,
-    max_immediate_alerts_24h: int = DEFAULT_MAX_IMMEDIATE_ALERTS_24H,
+    max_new_cards_24h: int = DEFAULT_MAX_NEW_CARDS_24H,
     state_file: Path | None = None,
 ) -> AlertGovernorDecision:
-    """Decide whether an opportunity alert deserves immediate delivery.
+    """Choose CREATE, EDIT, or SUPPRESS for an opportunity card.
 
-    This governor is for opportunity/noise reduction only. Critical held-position
-    risk events never call this function and remain governed by their existing
-    unrestricted critical-event path.
+    The budget applies only to creation of new Telegram cards. Once a symbol has
+    a card, a meaningful state transition edits that card and does not consume a
+    new-card budget slot. Critical held-position risk events do not use this path.
     """
     now = now or _now()
     if now.tzinfo is None:
@@ -65,35 +70,44 @@ def evaluate_opportunity_alert(
             state = load_json(target)
             identities = state.get("identities") or {}
             previous = identities.get(identity) or {}
-            previous_at = _parse(previous.get("sent_at"))
             previous_transition = str(previous.get("transition_key") or "")
+            previous_at = _parse(previous.get("updated_at") or previous.get("sent_at"))
+            raw_message_id = previous.get("message_id")
+            try:
+                message_id = int(raw_message_id) if raw_message_id is not None else None
+            except (TypeError, ValueError):
+                message_id = None
 
-            if previous_at is not None:
-                age = (now - previous_at).total_seconds()
-                if previous_transition == transition_key and age < repeat_cooldown_seconds:
-                    return AlertGovernorDecision(False, "REPEAT_STATE_COOLDOWN", True)
-                if previous_transition != transition_key and age < transition_cooldown_seconds:
-                    return AlertGovernorDecision(False, "TRANSITION_COOLDOWN", True)
+            if message_id is not None:
+                if previous_transition == transition_key:
+                    if previous_at is None:
+                        return AlertGovernorDecision("SUPPRESS", "SAME_STATE", message_id)
+                    age = (now - previous_at).total_seconds()
+                    if age < repeat_cooldown_seconds:
+                        return AlertGovernorDecision("SUPPRESS", "SAME_STATE_COOLDOWN", message_id)
+                    return AlertGovernorDecision("EDIT", "PERIODIC_REFRESH", message_id)
+                return AlertGovernorDecision("EDIT", "MEANINGFUL_TRANSITION", message_id)
 
             cutoff = now - timedelta(hours=24)
-            history = []
-            for raw in state.get("immediate_history") or []:
+            history: list[datetime] = []
+            for raw in state.get("new_card_history") or state.get("immediate_history") or []:
                 parsed = _parse(raw)
                 if parsed is not None and parsed >= cutoff:
                     history.append(parsed)
-            if len(history) >= max(1, int(max_immediate_alerts_24h)):
-                return AlertGovernorDecision(False, "DAILY_IMMEDIATE_BUDGET", True)
+            if len(history) >= max(1, int(max_new_cards_24h)):
+                return AlertGovernorDecision("SUPPRESS", "NEW_CARD_DAILY_BUDGET")
     except OSError:
-        # Fail open for advisory opportunity delivery if local state is unavailable.
-        return AlertGovernorDecision(True, "STATE_UNAVAILABLE_FAIL_OPEN", False)
+        return AlertGovernorDecision("CREATE", "STATE_UNAVAILABLE_FAIL_OPEN")
 
-    return AlertGovernorDecision(True, "IMMEDIATE_ALLOWED", False)
+    return AlertGovernorDecision("CREATE", "NEW_SYMBOL")
 
 
 def record_opportunity_alert(
     *,
     identity: str,
     transition_key: str,
+    message_id: int,
+    created_new: bool,
     now: datetime | None = None,
     state_file: Path | None = None,
 ) -> None:
@@ -108,19 +122,26 @@ def record_opportunity_alert(
         with registry_lock(lock):
             state = load_json(target)
             identities = state.get("identities") or {}
+            previous = identities.get(identity) or {}
+            first_sent_at = previous.get("first_sent_at") or previous.get("sent_at") or now.isoformat()
             identities[identity] = {
                 "transition_key": transition_key,
-                "sent_at": now.isoformat(),
+                "message_id": int(message_id),
+                "first_sent_at": first_sent_at,
+                "updated_at": now.isoformat(),
             }
+            state["identities"] = identities
+
             cutoff = now - timedelta(hours=24)
-            history = []
-            for raw in state.get("immediate_history") or []:
+            history: list[str] = []
+            for raw in state.get("new_card_history") or state.get("immediate_history") or []:
                 parsed = _parse(raw)
                 if parsed is not None and parsed >= cutoff:
                     history.append(parsed.isoformat())
-            history.append(now.isoformat())
-            state["identities"] = identities
-            state["immediate_history"] = history[-200:]
+            if created_new:
+                history.append(now.isoformat())
+            state["new_card_history"] = history[-200:]
+            state.pop("immediate_history", None)
             save_json_atomic(target, state)
     except OSError:
         return
