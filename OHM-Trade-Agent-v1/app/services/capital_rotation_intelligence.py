@@ -175,7 +175,7 @@ def evaluate_rotation(
     else:
         status = "HIGH_CONVICTION_ROTATION_CANDIDATE"
         recommendation = "REVIEW_ROTATION"
-        reasons.append(f"candidate passes exceptional score/upside gate")
+        reasons.append("candidate passes exceptional score/upside gate")
         reasons.append(
             f"candidate quality proxy exceeds {weakest.symbol} by approximately {rotation_edge:+.2f}%"
         )
