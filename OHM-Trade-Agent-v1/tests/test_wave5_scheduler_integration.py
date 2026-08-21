@@ -72,7 +72,7 @@ def test_wave5_outcome_failure_is_fail_open(monkeypatch):
         lambda now: {"status": "OK", "observations_added": 0},
     )
 
-    def fail(_now):
+    def fail(*, now):
         raise RuntimeError("test failure")
 
     monkeypatch.setattr(learning_scheduler, "observe_due_explosion_outcomes", fail)
