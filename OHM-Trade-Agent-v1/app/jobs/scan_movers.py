@@ -1,6 +1,18 @@
 from app.core.config import get_settings
+from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers, send_early_mover_update
+
+
+def _transition_key(signal) -> str:
+    return ":".join(
+        (
+            str(signal.stage),
+            str(signal.entry_recommendation),
+            str(signal.momentum_state),
+            "EXTENDED" if signal.extended_move else "NOT_EXTENDED",
+        )
+    )
 
 
 def main() -> None:
@@ -31,24 +43,50 @@ def main() -> None:
         print("Movement learning capture: fail-soft", type(exc).__name__)
 
     notifications = 0
+    governed_suppressed = 0
     if (
         str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
         and settings.telegram_bot_token
         and settings.telegram_chat_id
     ):
-        for signal in [item for item in signals if item.alert_eligible][:5]:
+        repeat_cooldown = max(
+            int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
+            21600,
+        )
+        for signal in [item for item in signals if item.alert_eligible][:10]:
+            transition_key = _transition_key(signal)
+            identity = f"EARLY_MOVER:{signal.symbol}"
+            decision = evaluate_opportunity_alert(
+                identity=identity,
+                transition_key=transition_key,
+                repeat_cooldown_seconds=repeat_cooldown,
+                transition_cooldown_seconds=3600,
+                max_immediate_alerts_24h=8,
+            )
+            if not decision.allow_immediate:
+                governed_suppressed += 1
+                print(
+                    f"Alert governor suppressed {signal.symbol}: {decision.reason} "
+                    f"transition={transition_key}"
+                )
+                continue
+            # Governor owns opportunity timing. Keep legacy notification-policy
+            # fingerprint dedupe, but do not apply a second cooldown that would
+            # block a genuinely meaningful state transition.
             if send_early_mover_update(
                 signal,
                 bot_token=settings.telegram_bot_token,
                 chat_id=settings.telegram_chat_id,
-                cooldown_seconds=min(
-                    int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
-                    1800,
-                ),
+                cooldown_seconds=0,
             ):
+                record_opportunity_alert(
+                    identity=identity,
+                    transition_key=transition_key,
+                )
                 notifications += 1
     print("Early-mover Telegram notifications sent:", notifications)
+    print("Alert-governor opportunity notifications suppressed:", governed_suppressed)
 
 
 if __name__ == "__main__":
