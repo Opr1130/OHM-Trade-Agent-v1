@@ -20,13 +20,18 @@ def _vector(symbol="TESTUSD", price=100.0):
         momentum_acceleration=0.55,
         relative_volume=1.8,
         volume_expansion=0.8,
+        relative_volume_change=0.4,
         atr_pct=1.5,
         atr_percentile=35.0,
+        atr_percentile_change=12.0,
         bandwidth_percentile=30.0,
+        bandwidth_percentile_change=10.0,
         compression_release_score=0.6,
         distance_to_24h_high_pct=1.0,
         distance_to_24h_low_pct=6.0,
+        distance_to_high_velocity_pct=2.0,
         base_displacement_pct=6.0,
+        base_displacement_velocity_pct=2.5,
         trend="bullish",
         ema_structure_score=2,
         trade_count_acceleration=1.7,
@@ -77,6 +82,9 @@ def test_wave5_outcomes_use_fixed_horizon_ohlc(tmp_path):
     assert '"mfe_pct"' in text
     assert '"mae_pct"' in text
     assert '"time_to_mfe_minutes"' in text
+    assert '"relative_volume_change": 0.4' in text
+    assert '"atr_percentile_change": 12.0' in text
+    assert '"distance_to_high_velocity_pct": 2.0' in text
 
 
 class GainerClient:
