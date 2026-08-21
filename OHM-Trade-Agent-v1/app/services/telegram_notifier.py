@@ -104,9 +104,7 @@ def send_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
-    return send_telegram_message_with_id(
-        bot_token,
-        chat_id,
-        message,
-        reply_markup=reply_markup,
-    ) is not None
+    payload = {"chat_id": chat_id, "text": message}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    return _telegram_post(bot_token, "sendMessage", payload) is not None
