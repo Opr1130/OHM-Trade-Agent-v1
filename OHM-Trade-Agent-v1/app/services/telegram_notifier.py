@@ -41,31 +41,70 @@ def build_trade_confirmation_buttons(trade_id: str) -> dict:
     }
 
 
+def _telegram_post(bot_token: str, method: str, payload: dict) -> dict | None:
+    """Call Telegram without ever logging the token-bearing request URL."""
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    try:
+        response = httpx.post(url, data=payload, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) and data.get("ok") is True else None
+    except (ValueError, httpx.HTTPStatusError, httpx.HTTPError) as exc:
+        status = None
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            status = exc.response.status_code
+        logger.error(
+            "Telegram notification failed endpoint=%s status=%s error=%s",
+            method,
+            status or "unknown",
+            type(exc).__name__,
+        )
+        return None
+
+
+def send_telegram_message_with_id(
+    bot_token: str,
+    chat_id: str,
+    message: str,
+    reply_markup: dict | None = None,
+) -> int | None:
+    payload = {"chat_id": chat_id, "text": message}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    data = _telegram_post(bot_token, "sendMessage", payload)
+    if data is None:
+        return None
+    result = data.get("result") or {}
+    try:
+        return int(result.get("message_id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def edit_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    message_id: int,
+    message: str,
+    reply_markup: dict | None = None,
+) -> bool:
+    payload = {
+        "chat_id": chat_id,
+        "message_id": int(message_id),
+        "text": message,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    return _telegram_post(bot_token, "editMessageText", payload) is not None
+
+
 def send_telegram_message(
     bot_token: str,
     chat_id: str,
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
-    """Send Telegram without ever logging the token-bearing request URL."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
-    try:
-        response = httpx.post(url, data=payload, timeout=10.0)
-        response.raise_for_status()
-        return True
-    except httpx.HTTPStatusError as exc:
-        logger.error(
-            "Telegram notification failed endpoint=sendMessage status=%s error=%s",
-            exc.response.status_code if exc.response is not None else "unknown",
-            type(exc).__name__,
-        )
-        return False
-    except httpx.HTTPError as exc:
-        logger.error(
-            "Telegram notification failed endpoint=sendMessage error=%s",
-            type(exc).__name__,
-        )
-        return False
+    return _telegram_post(bot_token, "sendMessage", payload) is not None
