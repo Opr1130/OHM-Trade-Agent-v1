@@ -1,0 +1,8 @@
+# OHM Wave 5 explosion-state learning (shadow only)
+# Install as /etc/cron.d/ohm-wave5-explosion-learning only after operator approval.
+# Captures decision-time exploration features for prospective learning. It does
+# not call Chief, send Telegram alerts, modify production thresholds, or trade.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/10 * * * * root flock -n /var/run/ohm-wave5-explosion-learning.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.scan_explosion_learning >> /var/log/ohm-wave5-explosion-learning.log 2>&1'
