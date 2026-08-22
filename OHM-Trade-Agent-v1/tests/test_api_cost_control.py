@@ -62,7 +62,10 @@ def install_quality(monkeypatch, mapping):
     def target_eval(plan, candidate):
         return target(mapping[(candidate.symbol, plan.risk_level)][0])
 
-    def economic_eval(plan, capital):
+    def economic_eval(plan, capital, **kwargs):
+        assert kwargs.get("max_capital_fraction") == pytest.approx(
+            chief_analyst.PRODUCTION_MAX_CAPITAL_FRACTION
+        )
         return economic(mapping[(plan.symbol, plan.risk_level)][1])
 
     monkeypatch.setattr(chief_analyst, "evaluate_target_attainability", target_eval)
