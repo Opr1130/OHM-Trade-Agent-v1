@@ -55,19 +55,19 @@ def _transition_to_active(
             )
 
         if existing_trade is None:
-            setup_item = next(
-                (
-                    item
-                    for item in pending.values()
-                    if item.get("status") == "waiting"
-                    and (
-                        (trade_id and item.get("trade_id") == trade_id)
-                        or (symbol and item.get("symbol") == symbol)
-                    )
-                ),
-                None,
-            )
-            if setup_item is None:
+            pending_key: str | None = None
+            setup_item: dict | None = None
+            for key, item in pending.items():
+                if item.get("status") != "waiting":
+                    continue
+                if (trade_id and item.get("trade_id") == trade_id) or (
+                    symbol and item.get("symbol") == symbol
+                ):
+                    pending_key = key
+                    setup_item = item
+                    break
+
+            if setup_item is None or pending_key is None:
                 identifier = trade_id or symbol
                 raise ValueError(f"No confirmable pending setup found for {identifier}")
 
@@ -96,7 +96,7 @@ def _transition_to_active(
             )
             active[created_trade.symbol] = asdict(created_trade)
             active_trade_registry._save_raw(active)
-            pending.pop(setup.symbol, None)
+            pending.pop(pending_key, None)
             pending_setup_registry._save_raw(pending)
 
     trade = existing_trade or created_trade
