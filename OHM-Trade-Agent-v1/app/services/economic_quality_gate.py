@@ -1,7 +1,7 @@
 import math
-import os
 from dataclasses import dataclass
 
+from app.core.config import get_settings
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
@@ -39,18 +39,26 @@ def _invalid_result(direction: str, leverage: float, reason: str) -> EconomicGat
     )
 
 
-def _resolved_capital_fraction(value: float | None) -> float:
-    """Use the live 20% envelope in production while preserving reusable defaults.
+def _conservative_runtime() -> bool:
+    """Return False only for explicitly configured development/test runtimes."""
+    try:
+        app_env = (get_settings().app_env or "").strip().lower()
+    except Exception:
+        return True
+    return app_env not in {"development", "dev", "test", "testing"}
 
-    Direct/unit callers outside production retain the historical 100% default.
-    Production cannot validate a dollar-profit floor on five times the capital
-    that the live allocator is allowed to recommend.
+
+def _resolved_capital_fraction(value: float | None) -> float:
+    """Use the live 20% envelope unless a reusable caller opts out explicitly.
+
+    Direct callers may pass a fraction. When omitted, only an explicitly
+    configured development/test runtime keeps the historical 100% sandbox
+    behavior; unknown/staging/production environments fail conservatively to
+    the same 20% envelope used by live allocation.
     """
     if value is not None:
         return float(value)
-    if os.getenv("APP_ENV", "").strip().lower() == "production":
-        return PRODUCTION_MAX_CAPITAL_FRACTION
-    return DEFAULT_MAX_CAPITAL_FRACTION
+    return PRODUCTION_MAX_CAPITAL_FRACTION if _conservative_runtime() else DEFAULT_MAX_CAPITAL_FRACTION
 
 
 def evaluate_economic_quality(
