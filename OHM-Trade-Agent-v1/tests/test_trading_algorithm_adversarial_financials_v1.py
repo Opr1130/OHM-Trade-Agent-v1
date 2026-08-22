@@ -116,12 +116,12 @@ def test_economic_gate_rejects_non_finite_plan_geometry(field):
     assert "finite" in result.rejection_reason.lower() or "invalid" in result.rejection_reason.lower()
 
 
-def test_production_economic_gate_uses_twenty_percent_capital_envelope(monkeypatch):
-    monkeypatch.setenv("APP_ENV", "production")
+def test_explicit_production_economic_envelope_uses_twenty_percent_capital():
     result = evaluate_economic_quality(
         _plan(),
         available_capital=10_000.0,
         min_net_profit=1.0,
+        max_capital_fraction=0.20,
     )
     assert result.recommended_capital == pytest.approx(2_000.0)
     assert result.position_notional == pytest.approx(2_000.0)
