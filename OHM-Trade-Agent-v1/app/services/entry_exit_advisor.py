@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 from app.scanner.models import MarketSnapshot
@@ -21,9 +22,10 @@ def _realistic_target_1_multiple(
     entry_reference: float,
     risk_per_unit: float,
 ) -> float:
-    """Cap (never raise) the mechanical Target 1 multiple to a move size the
-    symbol has actually shown itself capable of over the recent lookback
-    window, floored so the target never collapses to a fee-noise distance."""
+    """Cap (never raise) Target 1 to a historically plausible excursion."""
+    values = (mechanical_multiple, percentile_move_pct, entry_reference, risk_per_unit)
+    if not all(math.isfinite(float(value)) for value in values):
+        return mechanical_multiple
     if risk_per_unit <= 0 or entry_reference <= 0 or percentile_move_pct <= 0:
         return mechanical_multiple
     percentile_price_move = entry_reference * (percentile_move_pct / 100)
@@ -56,19 +58,105 @@ class EntryExitPlan:
     direction: str = "LONG"
 
 
+def _invalid_plan(
+    snapshot: MarketSnapshot,
+    risk_level: str,
+    direction: str,
+    reason: str,
+) -> EntryExitPlan:
+    price = float(snapshot.last_price) if math.isfinite(float(snapshot.last_price)) else 0.0
+    price = max(0.0, price)
+    return EntryExitPlan(
+        symbol=snapshot.symbol,
+        valid_now=False,
+        entry_style="wait",
+        entry_low=price,
+        entry_high=price,
+        chase_limit=price,
+        # Zero-valued risk geometry is an explicit invalid sentinel. Downstream
+        # economic/target gates reject it; it can never be an ENTER-NOW plan.
+        stop_price=0.0,
+        target_1=0.0,
+        target_2=0.0,
+        reward_to_risk_1=0.0,
+        reward_to_risk_2=0.0,
+        risk_level=risk_level,
+        reason=reason,
+        direction=direction,
+    )
+
+
+def _geometry_is_valid(
+    *,
+    direction: str,
+    entry_low: float,
+    entry_high: float,
+    chase_limit: float,
+    entry_reference: float,
+    stop_price: float,
+    target_1: float,
+    target_2: float,
+    risk_per_unit: float,
+) -> bool:
+    values = (
+        entry_low,
+        entry_high,
+        chase_limit,
+        entry_reference,
+        stop_price,
+        target_1,
+        target_2,
+        risk_per_unit,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    if any(float(value) <= 0 for value in values):
+        return False
+    if entry_low > entry_high or risk_per_unit <= 0:
+        return False
+    if direction == "LONG":
+        return (
+            stop_price < entry_reference
+            and target_1 > entry_reference
+            and target_2 > target_1
+            and chase_limit >= entry_high
+        )
+    return (
+        stop_price > entry_reference
+        and 0 < target_2 < target_1 < entry_reference
+        and 0 < chase_limit <= entry_low
+    )
+
+
 def build_entry_exit_plan(
     snapshot: MarketSnapshot,
     risk_level: str,
     direction: str | None = None,
 ) -> EntryExitPlan:
-    price = snapshot.last_price
-    atr_value = snapshot.atr
+    price = float(snapshot.last_price)
+    atr_value = float(snapshot.atr)
+    ema20_value = float(snapshot.ema20)
     direction = (direction or snapshot.trade_direction or "LONG").upper()
 
     if risk_level not in {"low", "medium"}:
         raise ValueError("Entry/exit plans are only supported for low or medium risk")
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
+
+    if (
+        not math.isfinite(price)
+        or not math.isfinite(atr_value)
+        or not math.isfinite(ema20_value)
+        or price <= 0
+        or ema20_value <= 0
+        or atr_value <= 0
+    ):
+        return _invalid_plan(
+            snapshot,
+            risk_level,
+            direction,
+            "Invalid or non-positive market geometry; no entry is authorized.",
+        )
 
     if risk_level == "low":
         stop_distance = atr_value * 1.5
@@ -84,7 +172,7 @@ def build_entry_exit_plan(
         pullback_atr = 0.25
 
     if direction == "LONG":
-        entry_low = min(snapshot.ema20, price - (atr_value * pullback_atr))
+        entry_low = min(ema20_value, price - (atr_value * pullback_atr))
         entry_high = price
         chase_limit = price + (atr_value * chase_atr)
         entry_reference = (entry_low + entry_high) / 2
@@ -98,7 +186,7 @@ def build_entry_exit_plan(
         )
         target_1 = entry_reference + risk_per_unit * target_1_multiple_effective
         target_2 = entry_reference + risk_per_unit * target_2_multiple
-        too_extended = price > snapshot.ema20 + (atr_value * 1.25)
+        too_extended = price > ema20_value + (atr_value * 1.25)
         if too_extended:
             entry_style = "wait_for_pullback"
             valid_now = False
@@ -106,7 +194,7 @@ def build_entry_exit_plan(
                 "Price is extended above EMA20 relative to ATR. "
                 "Wait for a pullback instead of chasing."
             )
-        elif price >= snapshot.ema20:
+        elif price >= ema20_value:
             entry_style = "pullback_or_retest"
             valid_now = True
             reason = (
@@ -120,7 +208,7 @@ def build_entry_exit_plan(
     else:
         # Shorts seek a controlled rebound/retest rather than chasing a dump.
         entry_low = price
-        entry_high = max(snapshot.ema20, price + (atr_value * pullback_atr))
+        entry_high = max(ema20_value, price + (atr_value * pullback_atr))
         chase_limit = price - (atr_value * chase_atr)
         entry_reference = (entry_low + entry_high) / 2
         stop_price = entry_reference + stop_distance
@@ -133,7 +221,7 @@ def build_entry_exit_plan(
         )
         target_1 = entry_reference - risk_per_unit * target_1_multiple_effective
         target_2 = entry_reference - risk_per_unit * target_2_multiple
-        too_extended = price < snapshot.ema20 - (atr_value * 1.25)
+        too_extended = price < ema20_value - (atr_value * 1.25)
         if too_extended:
             entry_style = "wait_for_rebound"
             valid_now = False
@@ -141,7 +229,7 @@ def build_entry_exit_plan(
                 "Price is extended below EMA20 relative to ATR. "
                 "Wait for a rebound/retest instead of chasing the breakdown."
             )
-        elif price <= snapshot.ema20:
+        elif price <= ema20_value:
             entry_style = "rebound_or_retest"
             valid_now = True
             reason = (
@@ -153,10 +241,21 @@ def build_entry_exit_plan(
             valid_now = False
             reason = "Price is above EMA20; wait for bearish structure to recover."
 
-    if target_2 <= 0:
+    geometry_valid = _geometry_is_valid(
+        direction=direction,
+        entry_low=entry_low,
+        entry_high=entry_high,
+        chase_limit=chase_limit,
+        entry_reference=entry_reference,
+        stop_price=stop_price,
+        target_1=target_1,
+        target_2=target_2,
+        risk_per_unit=risk_per_unit,
+    )
+    if not geometry_valid:
         valid_now = False
         entry_style = "wait"
-        reason = "ATR-derived short target is non-positive; setup is invalid."
+        reason = "ATR-derived plan geometry is invalid; no entry is authorized."
 
     rr1 = abs(target_1 - entry_reference) / risk_per_unit if risk_per_unit > 0 else 0
     rr2 = abs(target_2 - entry_reference) / risk_per_unit if risk_per_unit > 0 else 0

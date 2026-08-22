@@ -17,12 +17,16 @@ from app.services.telegram_notifier import send_telegram_message
 NON_ACTIONABLE_STAGES = {WATCH, READY, EXPIRED}
 
 
-def _movement_potential_band(signal: dict[str, Any], confidence: float) -> tuple[float, float]:
-    """Return a useful upside scenario band for presentation.
+def _movement_potential_band(
+    signal: dict[str, Any],
+    confidence: float,
+) -> tuple[float, float, bool]:
+    """Return the presentation band and whether it is a generic fallback.
 
     Explicit move estimates are preserved only when they form a valid positive
-    range. Missing, zero, negative, or inverted values fall back to the shared
-    heuristic scenario band so alerts never render meaningless +0% to +0%.
+    range. Missing, zero, negative, non-finite, or inverted values fall back to
+    the shared heuristic scenario band. The caller must disclose that fallback
+    so a generic scenario is never mistaken for a market-derived estimate.
     """
     try:
         raw_low = float(signal.get("expected_move_low_pct"))
@@ -33,9 +37,10 @@ def _movement_potential_band(signal: dict[str, Any], confidence: float) -> tuple
     except (TypeError, ValueError):
         raw_high = 0.0
 
-    if raw_low > 0.0 and raw_high >= raw_low:
-        return raw_low, raw_high
-    return tuple(float(value) for value in explosion_band(confidence))
+    if raw_low > 0.0 and raw_high >= raw_low and raw_low < float("inf") and raw_high < float("inf"):
+        return raw_low, raw_high, False
+    low, high = explosion_band(confidence)
+    return float(low), float(high), True
 
 
 def format_price_movement_message(signal: dict[str, Any]) -> str:
@@ -50,10 +55,10 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
 
     confidence = float(signal.get("readiness_score") or 0.0)
     risk = heuristic_risk_score(confidence)
-    low, high = _movement_potential_band(signal, confidence)
+    low, high, fallback = _movement_potential_band(signal, confidence)
     reason = one_line_reason(*(signal.get("reasons") or []))
     action = "REVIEW" if stage == READY else "MONITOR ONLY — no entry is authorized"
-    return format_watch_alert(
+    message = format_watch_alert(
         symbol=symbol,
         potential_low_pct=low,
         potential_high_pct=high,
@@ -64,6 +69,11 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
         action=action,
         title="OHM MOVEMENT WATCH",
     )
+    if fallback:
+        plain = f"Potential: +{low:.0f}% to +{high:.0f}%"
+        disclosed = plain + " (heuristic fallback; not market-derived)"
+        message = message.replace(plain, disclosed, 1)
+    return message
 
 
 def send_price_movement_update(

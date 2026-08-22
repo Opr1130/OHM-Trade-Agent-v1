@@ -1,50 +1,41 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
-from app.services.explosion_learning import OUTCOME_FILE
-from app.services.explosion_precursor_learning import precursor_outcome_rows, read_precursor_observations
+from app.services.explosion_precursor_learning import read_precursor_observations
+from app.services.prospective_signal_evaluation import build_precursor_watch_comparison
 
 
-def _pct(count: int, total: int) -> str:
-    return "n/a" if total <= 0 else f"{count / total * 100.0:.1f}%"
+def _pct(value) -> str:
+    return "n/a" if value is None else f"{float(value) * 100.0:+.1f}pp"
 
 
 def main() -> None:
     observations = read_precursor_observations()
-    outcomes = precursor_outcome_rows(outcome_file=OUTCOME_FILE)
+    report = build_precursor_watch_comparison()
 
-    print("===== OHM WAVE 5.1 LATENT PRECURSOR LEARNING =====")
+    print("===== OHM WAVE 5.1 PRECURSOR — WATCH VS NO_WATCH =====")
     print("Precursor observations:", len(observations))
-    print("Precursor watches:", sum(1 for row in observations if row.get("watch") is True))
-    print("Prospectively joined outcomes:", len(outcomes))
+    print("Prospectively joined outcomes:", report["joined_outcome_rows"])
+    print("Minimum samples per WATCH/NO_WATCH bucket:", report["minimum_samples_per_bucket"])
+    print("Same-cohort baseline:", report["same_cohort_baseline"])
 
-    grouped = defaultdict(list)
-    for row in outcomes:
-        phase = str(row.get("phase") or "UNKNOWN")
-        if phase not in {"DORMANT", "IGNITION"}:
-            continue
-        label = "WATCH" if row.get("precursor_watch") is True else "NO_WATCH"
-        horizon = str(row.get("horizon") or "unknown")
-        grouped[(label, horizon)].append(row)
-
-    for label in ("WATCH", "NO_WATCH"):
-        for horizon in ("1h", "4h", "12h", "24h"):
-            rows = grouped.get((label, horizon), [])
-            if not rows:
-                continue
-            avg_mfe = sum(float(row.get("mfe_pct") or 0.0) for row in rows) / len(rows)
-            avg_mae = sum(float(row.get("mae_pct") or 0.0) for row in rows) / len(rows)
-            hit2 = sum(1 for row in rows if row.get("hit_2pct"))
-            hit5 = sum(1 for row in rows if row.get("hit_5pct"))
-            hit10 = sum(1 for row in rows if row.get("hit_10pct"))
+    for horizon, comparison in report["horizons"].items():
+        watch = comparison["watch"]
+        baseline = comparison["no_watch"]
+        print(
+            f"{horizon}: WATCH n={watch['samples']} MFE={watch['avg_mfe_pct']} MAE={watch['avg_mae_pct']} "
+            f"vs NO_WATCH n={baseline['samples']} MFE={baseline['avg_mfe_pct']} MAE={baseline['avg_mae_pct']}"
+        )
+        if comparison["sufficient_for_comparison"]:
             print(
-                f"{label} {horizon}: samples={len(rows)} avg_MFE={avg_mfe:.2f}% avg_MAE={avg_mae:.2f}% "
-                f"+2={_pct(hit2, len(rows))} +5={_pct(hit5, len(rows))} +10={_pct(hit10, len(rows))}"
+                f"  separation: MFE={comparison['mfe_delta_pct']:+.2f}pp "
+                f"hit+5={_pct(comparison['hit_5_delta'])} hit+10={_pct(comparison['hit_10_delta'])}"
             )
+        else:
+            print("  separation: INSUFFICIENT DATA")
 
-    print("Promotion status: NOT ELIGIBLE until prospective separation is demonstrated")
-    print("Production phase thresholds changed: False")
+    print("Promotion status:", report["status"])
+    print("Auto promotion allowed:", report["auto_promotion_allowed"])
+    print("Production phase thresholds changed:", report["production_thresholds_changed"])
     print("Trade authority changed: False")
 
 

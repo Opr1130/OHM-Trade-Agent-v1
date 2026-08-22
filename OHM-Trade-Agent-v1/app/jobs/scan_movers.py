@@ -3,7 +3,6 @@ from app.services.alert_governor import evaluate_opportunity_alert, record_oppor
 from app.services.compact_alerts import (
     downside_scenario_pct,
     explosion_band,
-    format_watch_alert,
     heuristic_risk_score,
     one_line_reason,
 )
@@ -12,6 +11,7 @@ from app.services.full_market_observation import (
     MarketTransition,
     process_full_market_observations,
 )
+from app.services.full_market_transition_learning import build_full_market_transition_summary
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
 from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
@@ -76,22 +76,16 @@ def _observation_reason(transition: MarketTransition) -> str:
 
 
 def _observation_card(transition: MarketTransition) -> str:
-    low, high = explosion_band(transition.score)
-    risk = heuristic_risk_score(
-        transition.score,
-        liquidity_usd=transition.liquidity_24h_usd_approx,
-    )
-    downside = downside_scenario_pct(risk)
-    action = "REVIEW ENTRY" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
-    return format_watch_alert(
-        symbol=transition.symbol,
-        potential_low_pct=low,
-        potential_high_pct=high,
-        confidence_pct=transition.score,
-        risk_pct=risk,
-        downside_pct=downside,
-        reason=_observation_reason(transition),
-        action=action,
+    pattern = str(transition.pattern).replace("_", " ").title()
+    action = "DEEP REVIEW" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
+    return (
+        f"🌐 OHM BROAD WATCH — {transition.symbol}\n"
+        f"Pattern: {pattern}\n"
+        f"Transition score*: {transition.score}/100\n"
+        f"Liquidity: ${transition.liquidity_24h_usd_approx:,.0f} / 24h\n"
+        f"Reason: {_observation_reason(transition)}\n"
+        f"Action: {action} — no entry is authorized\n"
+        "*Heuristic transition score, not probability. Prospective outcome calibration is still building."
     )
 
 
@@ -111,6 +105,15 @@ def main() -> None:
         print("Full-market assets observed:", full_market.observed_markets)
         print("Full-market learning events persisted:", full_market.persisted_events)
         print("Broad transition watches detected:", len(full_market.transition_alerts))
+        try:
+            evidence = build_full_market_transition_summary()
+            print(
+                "Full-market prospective evidence:",
+                evidence["status"],
+                f"({evidence['outcome_rows']} outcome rows; min {evidence['minimum_samples_per_bucket']}/bucket)",
+            )
+        except Exception as exc:
+            print("Full-market evidence summary: fail-soft", type(exc).__name__)
     print("Full-universe coarse movers:", len(coarse))
     print("Deep-qualified early movers:", len(signals))
     print("Telegram-eligible early movers:", sum(1 for signal in signals if signal.alert_eligible))

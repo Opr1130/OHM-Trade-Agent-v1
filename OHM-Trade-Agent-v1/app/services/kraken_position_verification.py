@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,8 @@ class KrakenPositionVerifier:
             # Any malformed/private-account response must fail closed. The
             # monitor runner will surface this as verification unavailable and
             # must not turn uncertain account state into an actionable alert.
+            self._balances = None
+            self._positions = None
             self._unavailable_reason = str(exc)
 
     def verify(self, trade: ActiveTrade) -> PositionVerification:
@@ -55,6 +58,11 @@ class KrakenPositionVerifier:
             )
 
         direction = (trade.direction or "LONG").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return PositionVerification(
+                status="UNAVAILABLE",
+                reason=f"Unsupported active-trade direction {direction!r}",
+            )
         if direction == "SHORT":
             return self._verify_short(trade)
         return self._verify_spot_long(trade)
@@ -62,22 +70,38 @@ class KrakenPositionVerifier:
     def _verify_spot_long(self, trade: ActiveTrade) -> PositionVerification:
         asset = _base_asset(trade.symbol)
         quantity = _balance_for_asset(self._balances or {}, asset)
-        if quantity is None:
+        if quantity is None or not math.isfinite(float(quantity)) or quantity < 0:
             return PositionVerification(
                 status="UNAVAILABLE",
-                reason=f"Could not resolve the base asset for {trade.symbol}",
+                reason=f"Kraken balance for {trade.symbol} is unresolved or non-finite",
             )
 
         # When OHM knows planned capital, ignore residual dust below 1% of the
         # expected entry quantity. Legacy records without capital still require
         # a strictly positive balance; zero is never a valid active position.
         expected = None
-        if trade.capital is not None and trade.capital > 0 and trade.entry_price > 0:
-            expected = (
-                trade.capital
-                * max(1.0, float(trade.margin_leverage or 1.0))
-                / trade.entry_price
-            )
+        if trade.capital is not None:
+            try:
+                capital = float(trade.capital)
+                leverage = float(trade.margin_leverage or 1.0)
+                entry = float(trade.entry_price)
+            except (TypeError, ValueError):
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Active-trade sizing state for {trade.symbol} is malformed",
+                )
+            if not all(math.isfinite(value) for value in (capital, leverage, entry)):
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Active-trade sizing state for {trade.symbol} is non-finite",
+                )
+            if capital < 0 or leverage <= 0 or entry <= 0:
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Active-trade sizing state for {trade.symbol} is invalid",
+                )
+            if capital > 0:
+                expected = capital * leverage / entry
         minimum = expected * 0.01 if expected is not None else 0.0
         if quantity <= minimum:
             return PositionVerification(
@@ -93,7 +117,14 @@ class KrakenPositionVerifier:
 
     def _verify_short(self, trade: ActiveTrade) -> PositionVerification:
         wanted_pair = _canonical_pair(trade.symbol)
+        if not wanted_pair:
+            return PositionVerification(
+                status="UNAVAILABLE",
+                reason=f"Could not canonicalize {trade.symbol}",
+            )
+
         remaining = 0.0
+        matched = False
         for row in (self._positions or {}).values():
             if not isinstance(row, dict):
                 continue
@@ -102,13 +133,32 @@ class KrakenPositionVerifier:
             side = str(row.get("type") or descr.get("type") or "").lower()
             if _canonical_pair(str(pair or "")) != wanted_pair or side != "sell":
                 continue
+            matched = True
             try:
                 volume = float(row.get("vol") or 0)
                 closed = float(row.get("vol_closed") or 0)
             except (TypeError, ValueError):
-                continue
-            remaining += max(0.0, volume - closed)
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Kraken short quantity for {trade.symbol} is malformed",
+                )
+            if not all(math.isfinite(value) for value in (volume, closed)):
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Kraken short quantity for {trade.symbol} is non-finite",
+                )
+            if volume < 0 or closed < 0 or closed > volume:
+                return PositionVerification(
+                    status="UNAVAILABLE",
+                    reason=f"Kraken short quantity for {trade.symbol} is inconsistent",
+                )
+            remaining += volume - closed
 
+        if matched and not math.isfinite(remaining):
+            return PositionVerification(
+                status="UNAVAILABLE",
+                reason=f"Kraken short quantity for {trade.symbol} is non-finite",
+            )
         if remaining <= 0:
             return PositionVerification(
                 status="ABSENT",

@@ -186,7 +186,7 @@ def test_chief_payload_labels_hypothetical_economics_and_uses_one_call(monkeypat
         "OpenAI",
         lambda api_key: SimpleNamespace(responses=responses),
     )
-    chief_analyst.review_candidates([snapshot()], "model", "key", 2_000)
+    chief_analyst.review_candidates([snapshot()], "model", "key", 10_000)
     payload = json.loads(responses.input[1]["content"])
     low_quality = payload["candidates"][0][
         "deterministic_quality_by_risk_level"

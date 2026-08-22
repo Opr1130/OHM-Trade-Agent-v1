@@ -1,26 +1,25 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from statistics import mean
 from typing import Any, Iterable
 
 
-MIN_BUCKET_SAMPLES = 8
+MIN_BUCKET_SAMPLES = 30
 MISS_THRESHOLD_PCT = 2.0
 AVOIDED_LOSS_THRESHOLD_PCT = -2.0
 
 
 def _num(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) else None
+    if not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
 
 
 def is_non_entry_decision(decision: str | None) -> bool:
-    """Return True for an explicit decision that kept capital out of a trade.
-
-    The suffix rule deliberately future-proofs learning coverage: a new gate
-    named SOMETHING_REJECT should not silently disappear from profitability
-    analysis just because the analytics code predates that gate.
-    """
+    """Return True for an explicit decision that kept capital out of a trade."""
     value = str(decision or "").upper()
     if value in {
         "WAIT",
@@ -58,18 +57,15 @@ def _prices(row: dict[str, Any]) -> dict[str, float]:
 
 
 def _directional_return(direction: str, entry: float, exit_price: float) -> float:
+    if not all(math.isfinite(value) and value > 0 for value in (entry, exit_price)):
+        raise ValueError("entry and exit prices must be finite and positive")
     if direction.upper() == "SHORT":
-        return (entry / exit_price - 1.0) * 100.0
-    return (exit_price / entry - 1.0) * 100.0
+        return (entry - exit_price) / entry * 100.0
+    return (exit_price - entry) / entry * 100.0
 
 
 def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
-    """Classify one shadow decision from future directional price movement.
-
-    New shadow records use actual observed prices for delayed-entry comparison.
-    Older records that contain only directional moves retain the original
-    percentage-path approximation so historical learning remains usable.
-    """
+    """Classify one shadow decision from future directional price movement."""
     decision = str(row.get("decision") or "UNKNOWN").upper()
     direction = str(row.get("direction") or "LONG").upper()
     moves = _moves(row)
@@ -104,7 +100,6 @@ def classify_shadow_decision(row: dict[str, Any]) -> dict[str, Any]:
                 delayed_return = _directional_return(direction, delayed_entry, terminal_price)
                 immediate_vs_wait[horizon] = round(delayed_return - immediate_return, 6)
             elif terminal_move is not None:
-                # Compatibility for v1 shadow records that did not persist price.
                 immediate_vs_wait[horizon] = round(terminal_move - moves[horizon], 6)
 
     return {

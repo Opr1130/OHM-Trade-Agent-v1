@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import Any
 
-from app.exchanges.kraken import KrakenClient, KrakenAPIError
+from app.exchanges.kraken import KrakenClient
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -19,6 +20,9 @@ HORIZONS_SECONDS = {
     "4h": 4 * 60 * 60,
     "24h": 24 * 60 * 60,
 }
+OUTCOME_INTERVAL_MINUTES = 5
+OUTCOME_INTERVAL_SECONDS = OUTCOME_INTERVAL_MINUTES * 60
+MAX_OUTCOME_LAG_SECONDS = OUTCOME_INTERVAL_SECONDS
 
 
 def _now() -> datetime:
@@ -102,26 +106,14 @@ def _enrich_deduplicated_shadow(
     target_v2_shadow: dict[str, Any] | None,
     updated_at: str,
 ) -> dict[str, Any]:
-    """Backfill new non-authoritative evidence onto a deduplicated shadow row.
-
-    Deduplication must preserve the original decision timestamp, reference price,
-    and observations. It may add newly introduced learning-only metadata so a
-    software rollout does not create a multi-hour measurement blind spot.
-    """
-    record_key = str(existing.get("record_key") or "")
-    stored = data.get(record_key)
-    enriched_fields: list[str] = []
-    if stored is not None and target_v2_shadow is not None and stored.get("target_v2_shadow") is None:
-        stored["target_v2_shadow"] = target_v2_shadow
-        stored["updated_at"] = updated_at
-        enriched_fields.append("target_v2_shadow")
-        _save(data)
-        existing = dict(stored)
-    existing["deduplicated"] = True
-    existing["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
-    if enriched_fields:
-        existing["dedup_enriched_fields"] = enriched_fields
-    return existing
+    """Return the original immutable decision row without hindsight backfill."""
+    result = dict(existing)
+    result["deduplicated"] = True
+    result["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
+    if target_v2_shadow is not None and existing.get("target_v2_shadow") is None:
+        result["dedup_enrichment_skipped"] = True
+        result["dedup_enrichment_reason"] = "preserve decision-time feature/reference alignment"
+    return result
 
 
 def record_shadow_candidate(
@@ -142,8 +134,8 @@ def record_shadow_candidate(
     price_movement: dict[str, Any] | None = None,
     target_v2_shadow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if reference_price <= 0:
-        raise ValueError("reference_price must be positive")
+    if not math.isfinite(float(reference_price)) or reference_price <= 0:
+        raise ValueError("reference_price must be finite and positive")
     ts = observed_at or _iso()
     key = _key(symbol, direction, ts, decision)
     identity = _dedup_identity(
@@ -192,9 +184,35 @@ def record_shadow_candidate(
 
 
 def _directional_move_pct(direction: str, start: float, end: float) -> float:
+    if not all(math.isfinite(value) and value > 0 for value in (start, end)):
+        raise ValueError("shadow outcome prices must be finite and positive")
     if direction.upper() == "SHORT":
-        return (start / end - 1.0) * 100.0
-    return (end / start - 1.0) * 100.0
+        return (start - end) / start * 100.0
+    return (end - start) / start * 100.0
+
+
+def _horizon_price(candles: list[Any], due_at: datetime) -> float | None:
+    """Return the latest 5m close that was actually known by ``due_at``."""
+    due_ts = due_at.timestamp()
+    eligible: list[tuple[float, Any]] = []
+    for item in candles:
+        try:
+            opened = float(item.timestamp)
+        except (TypeError, ValueError):
+            continue
+        closed = opened + OUTCOME_INTERVAL_SECONDS
+        if closed <= due_ts:
+            eligible.append((closed, item))
+    if not eligible:
+        return None
+    closed_at, candle = max(eligible, key=lambda pair: pair[0])
+    if due_ts - closed_at > MAX_OUTCOME_LAG_SECONDS:
+        return None
+    try:
+        price = float(candle.close)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
 
 
 def observe_due_shadows(
@@ -202,50 +220,65 @@ def observe_due_shadows(
     client: KrakenClient | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    """Label due shadows from historical 5m OHLC, never delayed live tickers."""
     now = now or _now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
     client = client or KrakenClient()
     with registry_lock(LOCK_FILE):
         data = _load()
-        due_by_symbol: dict[str, list[tuple[str, str]]] = {}
+        due_by_symbol: dict[str, list[tuple[str, str, datetime, datetime]]] = {}
         for key, row in data.items():
             if row.get("complete"):
                 continue
             try:
-                age = (now - _parse(str(row["observed_at"]))).total_seconds()
+                observed_at = _parse(str(row["observed_at"]))
             except (KeyError, TypeError, ValueError):
                 continue
             observations = row.get("observations") or {}
             for horizon, seconds in HORIZONS_SECONDS.items():
-                if horizon not in observations and age >= seconds:
-                    due_by_symbol.setdefault(str(row["symbol"]), []).append((key, horizon))
+                due_at = observed_at + timedelta(seconds=seconds)
+                if horizon not in observations and now >= due_at:
+                    due_by_symbol.setdefault(str(row["symbol"]), []).append(
+                        (key, horizon, observed_at, due_at)
+                    )
 
         if not due_by_symbol:
             return {"status": "NOT_DUE", "records_checked": len(data), "prices_requested": 0, "observations_added": 0}
 
-        try:
-            tickers = client.get_tickers(sorted(due_by_symbol))
-        except KrakenAPIError as exc:
-            return {"status": "ERROR", "reason": str(exc), "records_checked": len(data), "prices_requested": len(due_by_symbol), "observations_added": 0}
-
         observations_added = 0
+        unavailable = 0
         for symbol, due in due_by_symbol.items():
-            ticker = tickers.get(symbol)
-            if ticker is None:
-                try:
-                    ticker = client.get_ticker(symbol)
-                except KrakenAPIError:
+            earliest = min(item[2] for item in due) - timedelta(minutes=OUTCOME_INTERVAL_MINUTES)
+            try:
+                candles = client.get_ohlc(
+                    symbol,
+                    interval=OUTCOME_INTERVAL_MINUTES,
+                    since=int(earliest.timestamp()),
+                )
+            except Exception:
+                unavailable += len(due)
+                continue
+            for key, horizon, _observed_at, due_at in due:
+                price = _horizon_price(candles, due_at)
+                if price is None:
+                    unavailable += 1
                     continue
-            price = float(ticker["last"])
-            for key, horizon in due:
                 row = data[key]
-                start = float(row["reference_price"])
-                move = _directional_move_pct(str(row["direction"]), start, price)
+                try:
+                    start = float(row["reference_price"])
+                    move = _directional_move_pct(str(row["direction"]), start, price)
+                except (KeyError, TypeError, ValueError):
+                    unavailable += 1
+                    continue
                 row.setdefault("observations", {})[horizon] = {
-                    "observed_at": _iso(now),
+                    "observed_at": due_at.isoformat(),
+                    "labelled_at": now.isoformat(),
                     "price": price,
                     "directional_move_pct": round(move, 6),
                 }
-                row["updated_at"] = _iso(now)
+                row["updated_at"] = now.isoformat()
                 observations_added += 1
                 if all(h in row["observations"] for h in HORIZONS_SECONDS):
                     row["complete"] = True
@@ -255,6 +288,7 @@ def observe_due_shadows(
             "records_checked": len(data),
             "prices_requested": len(due_by_symbol),
             "observations_added": observations_added,
+            "unavailable_horizons": unavailable,
         }
 
 

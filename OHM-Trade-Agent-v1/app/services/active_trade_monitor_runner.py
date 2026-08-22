@@ -1,10 +1,13 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.services.active_trade_registry import get_active_trades
 from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
 from app.services.kraken_position_verification import KrakenPositionVerifier
+from app.services.notification_policy import record_emitted, should_emit
+from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_monitor import monitor_trade
 from app.services.trade_monitor_notifier import send_monitor_update
 from app.services.trade_outcome_registry import update_active_observation
@@ -22,11 +25,53 @@ class MonitorRunSummary:
     failures: list[str]
 
 
+def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_TRADE_MONITOR") -> bool:
+    """Make loss of the monitoring safety net visible to the operator.
+
+    One message per hour is allowed while degradation persists. This is a
+    lifecycle-critical operational alert and does not consume opportunity-card
+    attention budget.
+    """
+    now = datetime.now(timezone.utc)
+    hour_bucket = now.strftime("%Y%m%dT%H")
+    fingerprint = f"{hour_bucket}:{reason}"
+    if not should_emit(
+        identity=identity,
+        event_type="MONITOR_DEGRADED",
+        fingerprint=fingerprint,
+        cooldown_seconds=3600,
+        now=now,
+    ):
+        return False
+    message = (
+        "🚨 OHM MONITORING DEGRADED\n"
+        f"Reason: {reason}\n"
+        "Protection: stop/target/emergency monitoring may be incomplete\n"
+        "Action: VERIFY KRAKEN READ-ONLY CONNECTIVITY / POSITION STATE\n"
+        "No order was placed or changed."
+    )
+    sent = send_telegram_message(
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        message,
+    )
+    if sent:
+        record_emitted(
+            identity=identity,
+            event_type="MONITOR_DEGRADED",
+            fingerprint=fingerprint,
+            now=now,
+        )
+    return sent
+
+
 def run_active_trade_monitor() -> MonitorRunSummary:
     settings = get_settings()
     try:
         trades = get_active_trades()
     except Exception as exc:
+        reason = f"active trade registry unavailable: {exc}"
+        _notify_monitor_degraded(settings=settings, reason=reason)
         return MonitorRunSummary(
             active_trades=0,
             checked=0,
@@ -35,7 +80,7 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             positions_verified=0,
             positions_absent=0,
             positions_unavailable=0,
-            failures=[f"active trade registry unavailable: {exc}"],
+            failures=[reason],
         )
 
     checked = 0
@@ -59,19 +104,38 @@ def run_active_trade_monitor() -> MonitorRunSummary:
         )
 
     verifier = KrakenPositionVerifier()
-    verifier.refresh()
+    try:
+        verifier.refresh()
+    except Exception as exc:
+        positions_unavailable = len(trades)
+        reason = f"Kraken position verification refresh failed for {len(trades)} active trade(s): {exc}"
+        failures.append(reason)
+        _notify_monitor_degraded(settings=settings, reason=reason)
+        return MonitorRunSummary(
+            active_trades=len(trades),
+            checked=0,
+            monitor_notifications_sent=0,
+            emergency_notifications_sent=0,
+            positions_verified=0,
+            positions_absent=0,
+            positions_unavailable=positions_unavailable,
+            failures=failures,
+        )
 
+    degraded_symbols: list[str] = []
     for trade in trades:
         try:
             verification = verifier.verify(trade)
             if verification.status == "ABSENT":
                 positions_absent += 1
+                degraded_symbols.append(f"{trade.symbol}:ABSENT")
                 failures.append(
                     f"{trade.symbol}: active registry entry skipped; {verification.reason}"
                 )
                 continue
             if not verification.verified:
                 positions_unavailable += 1
+                degraded_symbols.append(f"{trade.symbol}:UNAVAILABLE")
                 failures.append(
                     f"{trade.symbol}: position verification unavailable; {verification.reason}"
                 )
@@ -105,7 +169,15 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             checked += 1
 
         except Exception as exc:
+            degraded_symbols.append(f"{trade.symbol}:ERROR")
             failures.append(f"{trade.symbol}: {exc}")
+
+    if degraded_symbols:
+        reason = (
+            f"{len(degraded_symbols)} active trade(s) not fully protected: "
+            + ", ".join(degraded_symbols[:8])
+        )
+        _notify_monitor_degraded(settings=settings, reason=reason)
 
     return MonitorRunSummary(
         active_trades=len(trades),

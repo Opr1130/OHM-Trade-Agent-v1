@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.core.config import get_settings
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_opportunities import main as scan_main
+from app.services.active_trade_monitor_runner import _notify_monitor_degraded
 from app.services.external_order_review import ExternalOrderReviewSummary, review_external_open_orders
 from app.services.kraken_reconciliation import ReconciliationSummary, reconcile_kraken_account
 from app.services.learning_scheduler import run_learning_cycle
 from app.services.operations_analytics import run_scan_with_telemetry
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
 from app.services.registry_io import registry_lock
-from app.core.config import get_settings
 
 
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
@@ -91,7 +92,22 @@ def _run_cycle_once() -> None:
     if learning.get("reason"):
         print("Learning reason:", learning.get("reason"))
 
-    decision = get_operator_decision()
+    # Operator/capacity state reads span several registries. If any of them are
+    # quarantined or temporarily unavailable, do not let that abort the cycle
+    # before active positions receive their independent risk monitor pass.
+    try:
+        decision = get_operator_decision()
+    except Exception as exc:
+        reason = f"operator/capacity state unavailable: {type(exc).__name__}: {exc}"
+        print("OHM Unified Cycle degraded:", reason)
+        try:
+            _notify_monitor_degraded(settings=get_settings(), reason=reason, identity="UNIFIED_CYCLE_STATE")
+        except Exception as notify_exc:
+            print("OHM degradation alert failed:", notify_exc)
+        monitor_active_main()
+        print("Discovery/pending workflows skipped until operator state is readable.")
+        return
+
     print("OHM Unified Cycle")
     print("Override mode:", decision.override_mode)
     print("Effective mode:", decision.effective_mode)

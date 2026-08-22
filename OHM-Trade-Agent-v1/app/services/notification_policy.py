@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.services.attention_budget import allow_new_noncritical, record_new_noncritical
-from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 
 
 STATE_FILE = Path("/app/data/notification_state.json")
@@ -21,6 +21,7 @@ CRITICAL_EVENTS = {
     "EXIT_NOW",
     "INVALIDATED",
     "TOO_EXTENDED",
+    "MONITOR_DEGRADED",
 }
 
 
@@ -38,6 +39,10 @@ def _parse(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _shared_budget_file() -> Path:
+    return STATE_FILE.parent / "attention_budget_state.json"
 
 
 def should_emit(
@@ -61,10 +66,15 @@ def should_emit(
             if event_type not in CRITICAL_EVENTS and last_at is not None:
                 if (now - last_at).total_seconds() < cooldown_seconds:
                     return False
-    except OSError:
-        return True
+    except (OSError, TimeoutError, RegistryIOError):
+        # Lifecycle-critical alerts remain fail-open; ordinary attention cards
+        # fail closed so a broken state registry cannot bypass flood controls.
+        return event_type in CRITICAL_EVENTS
 
-    if event_type not in CRITICAL_EVENTS and not allow_new_noncritical(now=now):
+    if event_type not in CRITICAL_EVENTS and not allow_new_noncritical(
+        now=now,
+        state_file=_shared_budget_file(),
+    ):
         return False
     return True
 
@@ -84,8 +94,12 @@ def record_emitted(
             state = load_json(STATE_FILE)
             state[key] = {"fingerprint": fingerprint, "sent_at": now.isoformat()}
             save_json_atomic(STATE_FILE, state)
-    except OSError:
+    except (OSError, TimeoutError, RegistryIOError):
         return
 
     if event_type not in CRITICAL_EVENTS:
-        record_new_noncritical(kind=event_type, now=now)
+        record_new_noncritical(
+            kind=event_type,
+            now=now,
+            state_file=_shared_budget_file(),
+        )

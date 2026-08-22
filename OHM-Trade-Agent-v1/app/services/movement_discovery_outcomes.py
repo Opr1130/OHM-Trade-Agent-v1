@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 OUTCOME_FILE = Path("/app/data/movement_discovery_v2_1_outcomes.jsonl")
 STATE_FILE = Path("/app/data/movement_discovery_v2_1_outcome_state.json")
 LOCK_FILE = OUTCOME_FILE.parent / ".movement_discovery_v2_1_outcome.lock"
+CANDLE_INTERVAL_SECONDS = 15 * 60
 HORIZONS = {
     "1h": timedelta(hours=1),
     "4h": timedelta(hours=4),
@@ -60,25 +62,32 @@ def _window_metrics(
     reference_price: float,
     direction: str,
 ) -> dict[str, Any] | None:
+    start_ts = start.timestamp()
+    end_ts = end.timestamp()
     selected = [
         candle
         for candle in candles
-        if start.timestamp() <= candle.timestamp <= end.timestamp()
+        if start_ts <= candle.timestamp and candle.timestamp + CANDLE_INTERVAL_SECONDS <= end_ts
     ]
-    if not selected or reference_price <= 0:
+    if not selected or not math.isfinite(float(reference_price)) or reference_price <= 0:
         return None
-    close_price = float(selected[-1].close)
+    values = [float(selected[-1].close)] + [float(candle.high) for candle in selected] + [float(candle.low) for candle in selected]
+    if not all(math.isfinite(value) and value > 0 for value in values):
+        return None
+    close_price = values[0]
     highest = max(float(candle.high) for candle in selected)
     lowest = min(float(candle.low) for candle in selected)
     direction = direction.upper()
     if direction == "SHORT":
-        close_return = (reference_price / close_price - 1.0) * 100.0 if close_price > 0 else 0.0
-        mfe = (reference_price / lowest - 1.0) * 100.0 if lowest > 0 else 0.0
-        mae = -((highest / reference_price - 1.0) * 100.0)
+        close_return = (reference_price - close_price) / reference_price * 100.0
+        mfe = (reference_price - lowest) / reference_price * 100.0
+        mae = -((highest - reference_price) / reference_price * 100.0)
+    elif direction == "LONG":
+        close_return = (close_price - reference_price) / reference_price * 100.0
+        mfe = (highest - reference_price) / reference_price * 100.0
+        mae = (lowest - reference_price) / reference_price * 100.0
     else:
-        close_return = (close_price / reference_price - 1.0) * 100.0
-        mfe = (highest / reference_price - 1.0) * 100.0
-        mae = (lowest / reference_price - 1.0) * 100.0
+        return None
     return {
         "close_price": round(close_price, 12),
         "close_return_pct": round(close_return, 6),
@@ -91,6 +100,13 @@ def _window_metrics(
     }
 
 
+def _append_completed_key(completed_order: list[str], completed: set[str], key: str) -> None:
+    if key in completed:
+        return
+    completed.add(key)
+    completed_order.append(key)
+
+
 def observe_due_movement_discovery_outcomes(
     *,
     now: datetime | None = None,
@@ -99,11 +115,7 @@ def observe_due_movement_discovery_outcomes(
     outcome_file: Path | None = None,
     state_file: Path | None = None,
 ) -> dict[str, Any]:
-    """Label v2.1 detections only after fixed horizons are due.
-
-    Uses historical 15-minute OHLC so downtime does not smear a 1h label into
-    a later ticker observation. MFE/MAE are computed from candle highs/lows.
-    """
+    """Label v2.1 detections only after fixed horizons are due."""
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -113,16 +125,12 @@ def observe_due_movement_discovery_outcomes(
     state_target = state_file or STATE_FILE
     rows = _read_detections(detections_path)
     if not rows:
-        return {
-            "status": "OK",
-            "detections": 0,
-            "observations_added": 0,
-            "pending_horizons": 0,
-            "legacy_unobservable": 0,
-        }
+        return {"status": "OK", "detections": 0, "observations_added": 0, "pending_horizons": 0, "legacy_unobservable": 0}
 
     state = load_json(state_target)
-    completed = set(str(item) for item in (state.get("completed") or []))
+    completed_order = [str(item) for item in (state.get("completed") or [])]
+    completed_order = list(dict.fromkeys(completed_order))
+    completed = set(completed_order)
     legacy_unobservable = 0
     pending = 0
     due_by_symbol: dict[str, list[tuple[dict[str, Any], str, datetime, datetime]]] = defaultdict(list)
@@ -134,7 +142,7 @@ def observe_due_movement_discovery_outcomes(
             reference_price = float(row.get("reference_price") or 0.0)
         except (TypeError, ValueError):
             reference_price = 0.0
-        if not detection_id or detected_at is None or reference_price <= 0:
+        if not detection_id or detected_at is None or not math.isfinite(reference_price) or reference_price <= 0:
             legacy_unobservable += 1
             continue
         symbol = str(row.get("symbol") or "").upper()
@@ -162,41 +170,24 @@ def observe_due_movement_discovery_outcomes(
             unavailable += len(due)
             continue
         for row, horizon, start, end in due:
-            metrics = _window_metrics(
-                candles,
-                start=start,
-                end=end,
-                reference_price=float(row["reference_price"]),
-                direction=str(row.get("direction") or "LONG"),
-            )
+            metrics = _window_metrics(candles, start=start, end=end, reference_price=float(row["reference_price"]), direction=str(row.get("direction") or "LONG"))
             if metrics is None:
                 unavailable += 1
                 continue
             key = f"{row['detection_id']}:{horizon}"
             observation = {
-                "record_type": "OUTCOME",
-                "detection_id": row["detection_id"],
-                "symbol": symbol,
-                "direction": str(row.get("direction") or "LONG").upper(),
-                "detected_at": start.isoformat(),
-                "outcome_as_of": end.isoformat(),
-                "observed_at": now.isoformat(),
-                "horizon": horizon,
-                "reference_price": float(row["reference_price"]),
-                **metrics,
-                "stage": row.get("stage"),
-                "entry_recommendation": row.get("entry_recommendation"),
-                "momentum_state": row.get("momentum_state"),
-                "continuation_confidence": row.get("continuation_confidence"),
-                "entry_quality": row.get("entry_quality"),
-                "relative_volume": row.get("relative_volume"),
-                "liquidity_24h_usd_approx": row.get("liquidity_24h_usd_approx"),
-                "version": row.get("version"),
-                "shadow_only": True,
-                "production_decision_changed": False,
+                "record_type": "OUTCOME", "detection_id": row["detection_id"], "symbol": symbol,
+                "direction": str(row.get("direction") or "LONG").upper(), "detected_at": start.isoformat(),
+                "outcome_as_of": end.isoformat(), "observed_at": now.isoformat(), "horizon": horizon,
+                "reference_price": float(row["reference_price"]), **metrics, "stage": row.get("stage"),
+                "entry_recommendation": row.get("entry_recommendation"), "momentum_state": row.get("momentum_state"),
+                "continuation_confidence": row.get("continuation_confidence"), "entry_quality": row.get("entry_quality"),
+                "alert_eligible": row.get("alert_eligible"),
+                "relative_volume": row.get("relative_volume"), "liquidity_24h_usd_approx": row.get("liquidity_24h_usd_approx"),
+                "version": row.get("version"), "shadow_only": True, "production_decision_changed": False,
             }
             observations.append(observation)
-            completed.add(key)
+            _append_completed_key(completed_order, completed, key)
 
     if observations:
         outcomes_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,17 +195,14 @@ def observe_due_movement_discovery_outcomes(
         with registry_lock(lock_target):
             with outcomes_path.open("a", encoding="utf-8") as handle:
                 for row in observations:
-                    handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+                    handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
                 handle.flush()
-            state["completed"] = sorted(completed)[-20000:]
+            state["completed"] = completed_order[-20000:]
             state["last_observed_at"] = now.isoformat()
             save_json_atomic(state_target, state)
 
     return {
-        "status": "OK",
-        "detections": len(rows),
-        "observations_added": len(observations),
-        "pending_horizons": pending,
-        "legacy_unobservable": legacy_unobservable,
+        "status": "OK", "detections": len(rows), "observations_added": len(observations),
+        "pending_horizons": pending, "legacy_unobservable": legacy_unobservable,
         "unavailable_horizons": unavailable,
     }

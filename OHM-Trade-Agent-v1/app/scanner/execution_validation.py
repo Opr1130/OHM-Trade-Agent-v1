@@ -189,6 +189,8 @@ def _trade_context(
     if not trades:
         return WARN, None, None, ["PostTrade returned no recent trades"]
     latest = max(trades, key=lambda trade: trade.trade_timestamp)
+    if not math.isfinite(float(latest.price)) or latest.price <= 0:
+        return WARN, None, None, ["latest public trade price is invalid"]
     try:
         trade_time = datetime.fromisoformat(latest.trade_timestamp.replace("Z", "+00:00"))
         age = max(0.0, (now - trade_time).total_seconds())
@@ -216,6 +218,23 @@ def evaluate_execution(
 ) -> ExecutionValidation:
     now = now or datetime.now(timezone.utc)
     warnings: list[str] = []
+
+    numeric_inputs = (validation_notional_usd, ticker_last, quote_to_usd_rate)
+    if not all(math.isfinite(float(value)) for value in numeric_inputs):
+        return ExecutionValidation(
+            status=INVALID,
+            book_coverage_status=UNAVAILABLE,
+            warnings=["execution validation inputs must be finite"],
+            validation_notional_usd=validation_notional_usd if math.isfinite(float(validation_notional_usd)) else 0.0,
+        )
+    if validation_notional_usd <= 0 or ticker_last <= 0 or quote_to_usd_rate <= 0:
+        return ExecutionValidation(
+            status=INVALID,
+            book_coverage_status=UNAVAILABLE,
+            warnings=["execution validation notional, ticker, and quote conversion must be positive"],
+            validation_notional_usd=max(0.0, validation_notional_usd),
+        )
+
     if not _validate_levels(book.bids) or not _validate_levels(book.asks):
         return ExecutionValidation(
             status=INVALID, book_coverage_status=UNAVAILABLE,
@@ -243,7 +262,6 @@ def evaluate_execution(
 
     quote_notional = validation_notional_usd / quote_to_usd_rate
 
-    # Existing LONG path: spend a fixed quote notional, then sell the acquired base.
     buy = simulate_buy(asks, quote_notional, mid)
     sell = simulate_sell(bids, buy.filled_quantity, mid)
     if not buy.fully_covered:
@@ -254,9 +272,6 @@ def evaluate_execution(
     if buy.fully_covered and sell.fully_covered and buy.vwap and sell.vwap:
         drag = (buy.vwap - sell.vwap) / buy.vwap * 100
 
-    # SHORT path: sell a base quantity worth the requested notional at mid, then
-    # buy back that exact quantity. This avoids treating the long buy-first path
-    # as a proxy for short execution quality.
     short_quantity = quote_notional / mid if mid > 0 else 0.0
     short_sell = simulate_sell(bids, short_quantity, mid)
     short_cover = simulate_buy_quantity(asks, short_sell.filled_quantity, mid)

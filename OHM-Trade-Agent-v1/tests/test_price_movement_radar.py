@@ -217,12 +217,26 @@ def test_movement_learning_records_absolute_and_atr_outcomes(monkeypatch, tmp_pa
     assert signal is not None
     learning.record_price_movement(signal.as_dict())
 
+    class Candle:
+        def __init__(self, timestamp, close):
+            self.timestamp = timestamp
+            self.close = close
+
     class Client:
+        def get_ohlc(self, pair, interval, since=None):
+            assert interval == 15
+            return [
+                Candle((started + timedelta(minutes=45)).timestamp(), 104.0),
+                # This candle opens exactly at the 1h horizon and closes later;
+                # it must never be used as the 1h outcome.
+                Candle((started + timedelta(hours=1)).timestamp(), 150.0),
+            ]
+
         def get_tickers(self, pairs):
-            return {"BTCUSD": {"last": 104.0}}
+            return {"BTCUSD": {"last": 150.0}}
 
         def get_ticker(self, pair):
-            return {"last": 104.0}
+            return {"last": 150.0}
 
     result = learning.observe_due_price_movements(
         client=Client(),
@@ -230,6 +244,7 @@ def test_movement_learning_records_absolute_and_atr_outcomes(monkeypatch, tmp_pa
     )
     assert result["observations_added"] == 1
     row = learning.get_price_movement_records()[0]
+    assert row["observations"]["1h"]["price"] == pytest.approx(104.0)
     assert row["observations"]["1h"]["absolute_move_pct"] == pytest.approx(4.0)
     assert row["observations"]["1h"]["move_atr"] == pytest.approx(2.0)
     assert row["observations"]["1h"]["directional_move_pct"] is None

@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 from typing import Any
 
@@ -19,16 +18,17 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
-    get_pending_setups,
     terminalize_pending_setup,
 )
 from app.services.price_movement_radar import attach_actionable_plan
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
 
 STATE_FILE = Path("/app/data/alert_state.json")
+STATE_LOCK_FILE = STATE_FILE.parent / ".alert_state.lock"
 
 
 def _pretty_entry_style(value: str) -> str:
@@ -36,17 +36,13 @@ def _pretty_entry_style(value: str) -> str:
 
 
 def _load_state() -> dict[str, str]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+    with registry_lock(STATE_LOCK_FILE):
+        return {str(key): str(value) for key, value in load_json(STATE_FILE).items()}
 
 
 def _save_state(state: dict[str, str]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with registry_lock(STATE_LOCK_FILE):
+        save_json_atomic(STATE_FILE, state)
 
 
 def _action_type(plan: EntryExitPlan) -> str | None:
@@ -152,8 +148,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     fill_tracking_note = ""
     if candidate.get("economic_qualified") is True:
         fill_tracking_note = (
-            "Fill Tracking: Automatic via read-only Kraken reconciliation; "
-            "no Telegram confirmation required\n"
+            "Fill Tracking: read-only Kraken reconciliation; OHM sends a monitoring-degraded alert if position verification is unavailable\n"
         )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
@@ -181,7 +176,11 @@ def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bo
     if action is None:
         return False
     current_key = _alert_state_key(candidate, plan)
-    state = _load_state()
+    try:
+        state = _load_state()
+    except (OSError, TimeoutError, RegistryIOError):
+        # Opportunity notifications fail closed when dedup state is unhealthy.
+        return False
     if state.get(plan.symbol) == current_key:
         return False
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
@@ -190,13 +189,6 @@ def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bo
         event_type="OPPORTUNITY",
         fingerprint=current_key,
     )
-
-
-def _existing_setup_trade_id(symbol: str) -> str | None:
-    for pending in get_pending_setups():
-        if pending.symbol == symbol:
-            return pending.trade_id or None
-    return None
 
 
 def _reconciliation_limit_price(
@@ -267,9 +259,6 @@ def _register_reconciliation_intent(
 
 
 def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
-    # Only deterministic survivors from scan_opportunities carry this flag.
-    # Legacy/direct unit callers retain the old behavior and do not require a
-    # fully populated production Settings object.
     if candidate.get("economic_qualified") is not True:
         return True
 
@@ -287,13 +276,7 @@ def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
     candidate["calibration_multiplier"] = intelligence.calibration_multiplier
     candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
     candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
-
-    if intelligence.allowed:
-        return True
-    existing_trade_id = _existing_setup_trade_id(plan.symbol)
-    if existing_trade_id:
-        terminalize_pending_setup(existing_trade_id, "portfolio_risk_rejected")
-    return False
+    return intelligence.allowed
 
 
 def send_trade_plan(
@@ -309,9 +292,6 @@ def send_trade_plan(
     if not _apply_intelligence(candidate, plan):
         return False
 
-    # Movement levels become actionable only after the final allocation and
-    # portfolio-risk checks pass. Reuse the approved plan; never calculate a
-    # second set of entry/exit levels in the radar.
     movement = attach_actionable_plan(
         candidate.get("price_movement"),
         plan=plan,
@@ -323,7 +303,10 @@ def send_trade_plan(
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
     message = format_trade_plan(candidate=candidate, plan=plan, summary=summary)
-    trade_id = str(candidate.get("trade_id") or "") or _existing_setup_trade_id(plan.symbol)
+
+    # A materially new plan must receive a new immutable lifecycle id. Never
+    # reuse another waiting setup merely because the symbol is the same.
+    trade_id = str(candidate.get("trade_id") or "")
     setup = get_pending_setup_by_trade_id(trade_id) if trade_id else None
     if setup is None:
         setup = add_pending_setup(
@@ -367,9 +350,16 @@ def send_trade_plan(
     sent = send_telegram_message(bot_token, chat_id, message)
     if sent:
         key = _alert_state_key(candidate, plan)
-        state = _load_state()
-        state[plan.symbol] = key
-        _save_state(state)
+        try:
+            with registry_lock(STATE_LOCK_FILE):
+                state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
+                state[plan.symbol] = key
+                save_json_atomic(STATE_FILE, state)
+        except (OSError, TimeoutError, RegistryIOError):
+            # The alert was already delivered; report failure through the
+            # normal notification policy state on the next cycle rather than
+            # pretending dedup persistence succeeded.
+            pass
         record_emitted(
             identity=f"{direction}:{plan.symbol}",
             event_type="OPPORTUNITY",

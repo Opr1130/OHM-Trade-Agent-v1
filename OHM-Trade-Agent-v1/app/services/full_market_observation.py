@@ -53,6 +53,7 @@ class MarketTransition:
     distance_from_24h_high_pct: float
     liquidity_24h_usd_approx: float
     alert_tier: str
+    reference_price: float = 0.0
     trade_authority_changed: bool = False
     production_execution_gate_changed: bool = False
 
@@ -69,8 +70,15 @@ class FullMarketResult:
     transition_alerts: tuple[MarketTransition, ...]
 
 
+def _finite(*values: float) -> bool:
+    return all(math.isfinite(float(value)) for value in values)
+
+
 def _pct(current: float, reference: float) -> float:
-    return 0.0 if reference <= 0 else (current / reference - 1.0) * 100.0
+    if not _finite(current, reference) or reference <= 0:
+        return 0.0
+    result = (current / reference - 1.0) * 100.0
+    return result if math.isfinite(result) else 0.0
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -86,12 +94,7 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 def collect_full_market_observations(client: KrakenClient | None = None) -> list[MarketObservation]:
-    """Observe every eligible Kraken spot base asset without tradeability filtering.
-
-    This is deliberately broader than Movement Discovery. Low-liquidity assets
-    remain observable for learning even when they would never be eligible for
-    an actionable trade alert.
-    """
+    """Observe every eligible Kraken spot base asset without tradeability filtering."""
     client = client or KrakenClient()
     pair_details = client.get_asset_pairs()
     markets: list[tuple[str, str, str, str, str]] = []
@@ -124,13 +127,22 @@ def collect_full_market_observations(client: KrakenClient | None = None) -> list
 
     rows: list[MarketObservation] = []
     for _, _, display_pair, base, quote, ticker in by_asset.values():
-        last = float(ticker.get("last") or 0.0)
-        high = float(ticker.get("high_24h") or 0.0)
-        low = float(ticker.get("low_24h") or 0.0)
-        volume = float(ticker.get("volume_24h") or 0.0)
+        try:
+            last = float(ticker.get("last") or 0.0)
+            high = float(ticker.get("high_24h") or 0.0)
+            low = float(ticker.get("low_24h") or 0.0)
+            volume = float(ticker.get("volume_24h") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not _finite(last, high, low, volume):
+            continue
         if min(last, high, low) <= 0 or high < low or volume <= 0:
             continue
         notional = last * volume
+        lift = _pct(last, low)
+        distance = max(0.0, (high - last) / last * 100.0)
+        if not _finite(notional, lift, distance):
+            continue
         rows.append(MarketObservation(
             version=VERSION,
             base_asset=base,
@@ -141,17 +153,31 @@ def collect_full_market_observations(client: KrakenClient | None = None) -> list
             notional_24h_usd_approx=round(notional, 2),
             high_24h=round(high, 12),
             low_24h=round(low, 12),
-            lift_from_24h_low_pct=round(_pct(last, low), 6),
-            distance_from_24h_high_pct=round(max(0.0, (high - last) / last * 100.0), 6),
+            lift_from_24h_low_pct=round(lift, 6),
+            distance_from_24h_high_pct=round(distance, 6),
         ))
     rows.sort(key=lambda row: row.base_asset)
     return rows
 
 
 def _notional_ratio(current: float, previous: float) -> float:
-    if current <= 0 or previous <= 0:
+    if not _finite(current, previous) or current <= 0 or previous <= 0:
         return 1.0
-    return max(current / previous, previous / current)
+    ratio = max(current / previous, previous / current)
+    return ratio if math.isfinite(ratio) else 1.0
+
+
+def _previous_finite(previous: dict[str, Any], *keys: str) -> tuple[float, ...] | None:
+    values: list[float] = []
+    try:
+        for key in keys:
+            value = float(previous.get(key) or 0.0)
+            if not math.isfinite(value):
+                return None
+            values.append(value)
+    except (TypeError, ValueError):
+        return None
+    return tuple(values)
 
 
 def _should_persist(current: MarketObservation, previous: dict[str, Any] | None, now: datetime) -> tuple[bool, str]:
@@ -160,10 +186,16 @@ def _should_persist(current: MarketObservation, previous: dict[str, Any] | None,
     previous_at = _parse_time(previous.get("recorded_at"))
     if previous_at is None or (now - previous_at).total_seconds() >= HEARTBEAT_SECONDS:
         return True, "HEARTBEAT"
-    prior_price = float(previous.get("last_price") or 0.0)
-    prior_lift = float(previous.get("lift_from_24h_low_pct") or 0.0)
-    prior_distance = float(previous.get("distance_from_24h_high_pct") or 0.0)
-    prior_notional = float(previous.get("notional_24h_usd_approx") or 0.0)
+    parsed = _previous_finite(
+        previous,
+        "last_price",
+        "lift_from_24h_low_pct",
+        "distance_from_24h_high_pct",
+        "notional_24h_usd_approx",
+    )
+    if parsed is None:
+        return True, "INVALID_PRIOR_STATE"
+    prior_price, prior_lift, prior_distance, prior_notional = parsed
     if abs(_pct(current.last_price, prior_price)) >= MIN_PERSIST_PRICE_CHANGE_PCT:
         return True, "PRICE_CHANGE"
     if abs(current.lift_from_24h_low_pct - prior_lift) >= MIN_PERSIST_LIFT_CHANGE_PCT:
@@ -178,13 +210,25 @@ def _should_persist(current: MarketObservation, previous: dict[str, Any] | None,
 def _transition(current: MarketObservation, previous: dict[str, Any] | None) -> MarketTransition | None:
     if previous is None:
         return None
-    prior_price = float(previous.get("last_price") or 0.0)
-    prior_lift = float(previous.get("lift_from_24h_low_pct") or 0.0)
+    current_values = (
+        current.last_price,
+        current.notional_24h_usd_approx,
+        current.lift_from_24h_low_pct,
+        current.distance_from_24h_high_pct,
+    )
+    if not _finite(*current_values):
+        return None
+    parsed = _previous_finite(previous, "last_price", "lift_from_24h_low_pct")
+    if parsed is None:
+        return None
+    prior_price, prior_lift = parsed
     if prior_price <= 0:
         return None
     price_change = _pct(current.last_price, prior_price)
     lift_change = current.lift_from_24h_low_pct - prior_lift
     near_high = current.distance_from_24h_high_pct
+    if not _finite(price_change, lift_change, near_high):
+        return None
 
     pattern: str | None = None
     if prior_lift <= 3.0 and current.lift_from_24h_low_pct >= 4.0 and lift_change >= 3.0 and near_high <= 4.0:
@@ -208,12 +252,12 @@ def _transition(current: MarketObservation, previous: dict[str, Any] | None) -> 
         score += 7.0
     else:
         score += max(0.0, min(4.0, math.log10(max(current.notional_24h_usd_approx, 1.0))))
+    if not math.isfinite(score):
+        return None
     bounded = int(round(max(0.0, min(100.0, score))))
     if bounded < 60:
         return None
 
-    # Broad-market discovery never grants trade authority. Higher-liquidity
-    # states are marked for deep review; thin states remain explicit watch-only.
     alert_tier = "DEEP_REVIEW" if current.notional_24h_usd_approx >= 250_000 and bounded >= 75 else "WATCH_ONLY"
     return MarketTransition(
         version=VERSION,
@@ -226,6 +270,7 @@ def _transition(current: MarketObservation, previous: dict[str, Any] | None) -> 
         distance_from_24h_high_pct=current.distance_from_24h_high_pct,
         liquidity_24h_usd_approx=current.notional_24h_usd_approx,
         alert_tier=alert_tier,
+        reference_price=current.last_price,
     )
 
 
@@ -236,18 +281,14 @@ def process_full_market_observations(
     observation_file: Path | None = None,
     state_file: Path | None = None,
 ) -> FullMarketResult:
-    """Capture broad market evidence and derive high-signal transition watches.
-
-    Storage is event-driven: first observation, meaningful changes, and hourly
-    heartbeats only. This keeps learning coverage broad without an uncontrolled
-    append-only storage bill.
-    """
+    """Capture broad market evidence and derive high-signal transition watches."""
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
     target = observation_file or OBSERVATION_FILE
     state_target = state_file or STATE_FILE
+    client = client or KrakenClient()
     observations = collect_full_market_observations(client)
     target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.parent / f".{target.name}.lock"
@@ -257,15 +298,17 @@ def process_full_market_observations(
     with registry_lock(lock):
         state = load_json(state_target)
         latest = state.get("latest_by_symbol") or {}
+        if not isinstance(latest, dict):
+            raise ValueError("full-market latest_by_symbol state must be an object")
         with target.open("a", encoding="utf-8") as handle:
             for observation in observations:
                 key = observation.symbol.upper()
                 previous = latest.get(key)
-                transition = _transition(observation, previous)
+                transition = _transition(observation, previous if isinstance(previous, dict) else None)
                 if transition is not None:
                     transitions.append(transition)
 
-                should_persist, reason = _should_persist(observation, previous, now)
+                should_persist, reason = _should_persist(observation, previous if isinstance(previous, dict) else None, now)
                 if not should_persist:
                     continue
                 payload = {
@@ -277,7 +320,7 @@ def process_full_market_observations(
                     "trade_authority_changed": False,
                     "production_execution_gate_changed": False,
                 }
-                handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+                handle.write(json.dumps(payload, sort_keys=True, default=str, allow_nan=False) + "\n")
                 handle.flush()
                 latest[key] = {**observation.as_dict(), "recorded_at": now.isoformat()}
                 persisted += 1
@@ -287,6 +330,24 @@ def process_full_market_observations(
         save_json_atomic(state_target, state)
 
     transitions.sort(key=lambda row: (-row.score, -row.liquidity_24h_usd_approx, row.symbol))
+
+    # Production/default storage closes the previously missing Full-Market
+    # outcome loop. Custom paths are used heavily by unit tests; do not write to
+    # unrelated default registries when a caller explicitly isolates storage.
+    if observation_file is None and state_file is None:
+        try:
+            from app.services.full_market_transition_learning import (
+                capture_full_market_transitions,
+                observe_due_full_market_transition_outcomes,
+            )
+
+            capture_full_market_transitions(transitions, now=now)
+            observe_due_full_market_transition_outcomes(now=now, client=client)
+        except Exception as exc:
+            # Learning is never allowed to break market observation or change
+            # trading authority. The calling job already reports scan health.
+            print("Full-market transition learning: fail-soft", type(exc).__name__)
+
     return FullMarketResult(
         observed_markets=len(observations),
         persisted_events=persisted,

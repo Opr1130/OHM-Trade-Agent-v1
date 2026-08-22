@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 from app.exchanges.kraken import KrakenClient
@@ -19,24 +20,28 @@ def monitor_pending_setup(
 ) -> PendingSetupMonitorResult:
     client = KrakenClient()
     ticker = client.get_ticker(setup.symbol)
-    current = ticker["last"]
+    current = float(ticker["last"])
     direction = (setup.direction or "LONG").upper()
 
-    # Invalidation is direction-aware and always wins over timing advice.
-    if direction == "SHORT" and current > setup.stop_price:
+    if not math.isfinite(current) or current <= 0:
+        raise ValueError(f"{setup.symbol}: current ticker price must be finite and positive")
+
+    # Invalidation is direction-aware and always wins over timing advice. The
+    # stop boundary itself is invalid: equality is not a safe waiting state.
+    if direction == "SHORT" and current >= setup.stop_price:
         return PendingSetupMonitorResult(
             symbol=setup.symbol,
             status="INVALIDATED",
             current_price=round(current, 8),
-            reason="Price moved above the planned short invalidation level.",
+            reason="Price reached or moved above the planned short invalidation level.",
             timing_score=0,
         )
-    if direction != "SHORT" and current < setup.stop_price:
+    if direction != "SHORT" and current <= setup.stop_price:
         return PendingSetupMonitorResult(
             symbol=setup.symbol,
             status="INVALIDATED",
             current_price=round(current, 8),
-            reason="Price moved below the planned invalidation level.",
+            reason="Price reached or moved below the planned invalidation level.",
             timing_score=0,
         )
 

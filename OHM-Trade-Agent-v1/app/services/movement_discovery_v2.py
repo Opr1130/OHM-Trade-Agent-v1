@@ -174,19 +174,28 @@ def discover_coarse_movers(client: KrakenClient | None = None, *, max_candidates
 
     movers: list[CoarseMover] = []
     for _, _, display_pair, base, quote, ticker in by_asset.values():
-        last = float(ticker.get("last") or 0.0)
-        high = float(ticker.get("high_24h") or 0.0)
-        low = float(ticker.get("low_24h") or 0.0)
-        volume = float(ticker.get("volume_24h") or 0.0)
+        try:
+            last = float(ticker.get("last") or 0.0)
+            high = float(ticker.get("high_24h") or 0.0)
+            low = float(ticker.get("low_24h") or 0.0)
+            volume = float(ticker.get("volume_24h") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (last, high, low, volume)):
+            continue
         if min(last, high, low) <= 0 or high < low or volume <= 0:
             continue
         notional = last * volume
         lift = _pct(last, low)
         distance = max(0.0, (high - last) / last * 100.0)
+        if not all(math.isfinite(value) for value in (notional, lift, distance)):
+            continue
         if notional < min_notional_usd or lift < MIN_COARSE_LIFT_FROM_24H_LOW_PCT or distance > MAX_COARSE_DISTANCE_FROM_24H_HIGH_PCT:
             continue
         liquidity_component = max(0.0, min(15.0, math.log10(max(notional, 1.0)) * 2.0))
         coarse_score = lift * 4.0 + max(0.0, 6.0 - distance) * 2.0 + liquidity_component
+        if not math.isfinite(coarse_score):
+            continue
         movers.append(CoarseMover(base, display_pair, f"{base}/{quote}", last, volume, notional,
                                   high, low, lift, distance, round(coarse_score, 4)))
 
@@ -228,11 +237,20 @@ def _optional_adjustment(flow: FlowEvidence | None, whale: WhaleEvidence | None,
 def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_evidence: FlowEvidence | None = None,
                          whale_evidence: WhaleEvidence | None = None, social_evidence: SocialEvidence | None = None) -> EarlyMoverSignal | None:
     """Score discovery separately from continuation and entry quality."""
-    one_hour = float(snapshot.confirmed_price_change_1h_pct)
-    six_hour = float(snapshot.momentum_6h_pct)
-    day = float(snapshot.momentum_24h_pct)
-    volume = float(snapshot.movement_volume_ratio or snapshot.volume_ratio or 0.0)
-    near_high = float(snapshot.distance_to_24h_high_pct)
+    try:
+        one_hour = float(snapshot.confirmed_price_change_1h_pct)
+        six_hour = float(snapshot.momentum_6h_pct)
+        day = float(snapshot.momentum_24h_pct)
+        volume = float(snapshot.movement_volume_ratio or snapshot.volume_ratio or 0.0)
+        near_high = float(snapshot.distance_to_24h_high_pct)
+        liquidity = float(coarse.notional_24h_usd_approx)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (one_hour, six_hour, day, volume, near_high, liquidity)):
+        return None
+    if volume < 0 or near_high < 0 or liquidity < 0:
+        return None
+
     score = 0
     reasons: list[str] = []
     warnings: list[str] = []
@@ -267,9 +285,9 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         continuation -= 18; warnings.append(f"relative volume is weak at {volume:.2f}x")
     elif volume < 1.00:
         continuation -= 8; warnings.append(f"relative volume is below baseline at {volume:.2f}x")
-    if coarse.notional_24h_usd_approx < 50_000:
+    if liquidity < 50_000:
         continuation -= 20; warnings.append("low approximate 24h liquidity; execution risk may be extreme")
-    elif coarse.notional_24h_usd_approx < 250_000:
+    elif liquidity < 250_000:
         continuation -= 8; warnings.append("limited approximate 24h liquidity; execution quality requires validation")
     if state == MOMENTUM_ACCELERATING:
         continuation += 8; reasons.append("multi-horizon momentum is accelerating")
@@ -290,10 +308,10 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
     entry_quality += 8 if near_high <= 1.0 else (-8 if near_high > 4.0 else 0)
     entry_quality += 8 if snapshot.trend == "bullish" else 0
     entry_quality -= 30 if extended else 0
-    entry_quality -= 25 if coarse.notional_24h_usd_approx < 50_000 else (8 if coarse.notional_24h_usd_approx < 250_000 else 0)
+    entry_quality -= 25 if liquidity < 50_000 else (8 if liquidity < 250_000 else 0)
     entry_quality = max(0, min(100, entry_quality))
 
-    if coarse.notional_24h_usd_approx < 50_000:
+    if liquidity < 50_000:
         recommendation = ENTRY_HIGH_RISK
     elif extended and entry_quality < 55:
         recommendation = ENTRY_TOO_EXTENDED
@@ -306,13 +324,13 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
     else:
         recommendation = ENTRY_WATCH
 
-    stage = READY if (continuation >= 65 and coarse.notional_24h_usd_approx >= 50_000 and volume >= 0.50) else WATCH
+    stage = READY if (continuation >= 65 and liquidity >= 50_000 and volume >= 0.50) else WATCH
     alert_eligible = (stage == READY and entry_quality >= 55 and recommendation not in {ENTRY_TOO_EXTENDED, ENTRY_HIGH_RISK})
 
     return EarlyMoverSignal(VERSION, snapshot.symbol, coarse.base_asset, stage, "LONG", score, False,
                             continuation, False, entry_quality, recommendation, state, round(one_hour, 4),
                             round(six_hour, 4), round(day, 4), round(volume, 4), round(near_high, 4),
-                            round(coarse.notional_24h_usd_approx, 2), extended, statuses[0], statuses[1],
+                            round(liquidity, 2), extended, statuses[0], statuses[1],
                             statuses[2], alert_eligible, False, tuple(reasons), tuple(warnings))
 
 

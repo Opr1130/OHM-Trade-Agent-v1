@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from app.services.market_intelligence_attribution import (
     MIN_COMBINED_MULTIPLIER as MIN_INTELLIGENCE_MULTIPLIER,
     build_market_intelligence_attribution,
 )
-from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.shadow_learning import get_shadow_records
 from app.services.trade_outcome_registry import get_outcomes
 
@@ -24,7 +25,7 @@ from app.services.trade_outcome_registry import get_outcomes
 PROFILE_FILE = Path("/app/data/strategy_calibration_profile.json")
 LOCK_FILE = PROFILE_FILE.parent / ".strategy_calibration_profile.lock"
 MIN_TRADE_SAMPLES = 30
-MIN_BUCKET_SAMPLES = 8
+MIN_BUCKET_SAMPLES = 30
 MIN_SHADOW_SAMPLES = 12
 MAX_WEIGHT_ADJUSTMENT = 0.15
 MAX_TIMING_ADJUSTMENT = 0.12
@@ -35,10 +36,15 @@ def _now() -> str:
 
 
 def _num(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) else None
+    if not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
 
 
 def _bounded_weight(delta: float, ceiling: float = MAX_WEIGHT_ADJUSTMENT) -> float:
+    if not math.isfinite(float(delta)):
+        return 1.0
     return round(1.0 + max(-ceiling, min(ceiling, delta)), 4)
 
 
@@ -56,15 +62,11 @@ def _net_success(row: dict[str, Any]) -> float:
 
 
 def _expectancy_adjustment(bucket: list[dict[str, Any]], all_rows: list[dict[str, Any]]) -> tuple[float, float, float]:
-    """Return bounded-relative expectancy signal and the underlying means.
-
-    Dollar expectancy is the primary realized objective. The relative delta is
-    normalized by average absolute realized P/L so one unusually large trade
-    cannot create an unbounded live sizing change; the final weight is still
-    constrained by MAX_WEIGHT_ADJUSTMENT.
-    """
-    global_values = [float(row["net_pnl"]) for row in all_rows]
-    bucket_values = [float(row["net_pnl"]) for row in bucket]
+    """Return bounded-relative expectancy signal and the underlying means."""
+    global_values = [float(row["net_pnl"]) for row in all_rows if _num(row.get("net_pnl")) is not None]
+    bucket_values = [float(row["net_pnl"]) for row in bucket if _num(row.get("net_pnl")) is not None]
+    if not global_values or not bucket_values:
+        return 0.0, 0.0, 0.0
     baseline = mean(global_values)
     bucket_expectancy = mean(bucket_values)
     scale = max(1.0, mean(abs(value) for value in global_values))
@@ -72,6 +74,7 @@ def _expectancy_adjustment(bucket: list[dict[str, Any]], all_rows: list[dict[str
 
 
 def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float], dict[str, Any]]:
+    rows = _financial_trade_rows(rows)
     if len(rows) < MIN_TRADE_SAMPLES:
         return {}, {"status": "INSUFFICIENT_DATA", "samples": len(rows), "minimum_required": MIN_TRADE_SAMPLES}
     baseline_expectancy = mean(float(row["net_pnl"]) for row in rows)
@@ -83,6 +86,7 @@ def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float],
     weights: dict[str, float] = {}
     evidence: dict[str, Any] = {}
     for name, bucket in buckets.items():
+        bucket = _financial_trade_rows(bucket)
         if len(bucket) < MIN_BUCKET_SAMPLES:
             continue
         expectancy_delta, _, bucket_expectancy = _expectancy_adjustment(bucket, rows)
@@ -102,6 +106,7 @@ def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float],
         "baseline_net_win_rate": round(baseline_win_rate, 4),
         "baseline_avg_net_pnl": round(baseline_expectancy, 8),
         "objective": "realized_net_pnl_expectancy_after_costs",
+        "minimum_bucket_samples": MIN_BUCKET_SAMPLES,
         "evidence": evidence,
     }
 
@@ -111,8 +116,9 @@ def _shadow_quality(records: list[dict[str, Any]]) -> dict[str, Any]:
     for row in records:
         obs = row.get("observations") or {}
         final = obs.get("24h") or obs.get("4h") or obs.get("1h")
-        if final and _num(final.get("directional_move_pct")) is not None:
-            evaluable.append((row, float(final["directional_move_pct"])))
+        move = _num(final.get("directional_move_pct")) if isinstance(final, dict) else None
+        if move is not None:
+            evaluable.append((row, move))
     if not evaluable:
         return {"status": "NO_DATA", "samples": 0, "decision_accuracy_pct": None, "missed_profitable": 0, "correct_rejections": 0}
 
@@ -154,9 +160,10 @@ def _timing_metrics(executions: list[dict[str, Any]], outcomes: list[dict[str, A
     rows = []
     for execution in executions:
         outcome = outcome_by_id.get(str(execution.get("trade_id")))
-        if not outcome or _num(outcome.get("net_pnl")) is None:
+        pnl = _num(outcome.get("net_pnl")) if outcome else None
+        if pnl is None:
             continue
-        rows.append((execution, float(outcome["net_pnl"])))
+        rows.append((execution, pnl))
     if not rows:
         return {"status": "NO_FINANCIAL_EXECUTIONS", "samples": 0}
 
@@ -175,8 +182,10 @@ def _timing_metrics(executions: list[dict[str, Any]], outcomes: list[dict[str, A
         fill_price = _num(execution.get("fill_price"))
         if holding and holding > 0 and quantity and fill_price:
             capital = quantity * fill_price
-            if capital > 0:
-                capital_efficiency.append(pnl / (capital * (holding / 3600.0)))
+            if math.isfinite(capital) and capital > 0:
+                efficiency = pnl / (capital * (holding / 3600.0))
+                if math.isfinite(efficiency):
+                    capital_efficiency.append(efficiency)
 
     return {
         "status": "OK",
@@ -192,7 +201,8 @@ def _timing_metrics(executions: list[dict[str, Any]], outcomes: list[dict[str, A
 
 
 def _loss_learning(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    losses = [row for row in rows if float(row.get("net_pnl") or 0.0) < 0]
+    rows = _financial_trade_rows(rows)
+    losses = [row for row in rows if float(row["net_pnl"]) < 0]
     avoidable = 0
     avoidable_dollars = 0.0
     reasons: dict[str, int] = defaultdict(int)
@@ -228,42 +238,33 @@ def build_profitability_profile(
     executions = executions if executions is not None else get_execution_records()
     shadows = shadows if shadows is not None else get_shadow_records()
     financial_rows = _financial_trade_rows(outcomes)
-    weights, calibration = _trade_bucket_weights(financial_rows)
-    shadow = _shadow_quality(shadows)
-    timing = _timing_metrics(executions, outcomes)
-    loss_learning = _loss_learning(financial_rows)
-    market_intelligence_attribution = build_market_intelligence_attribution(
-        outcomes=outcomes,
-        shadows=shadows,
-    )
-
-    version = _now()
+    weights, trade_evidence = _trade_bucket_weights(financial_rows)
+    intelligence = build_market_intelligence_attribution(outcomes=outcomes, shadows=shadows)
     profile = {
         "schema_version": 2,
-        "generated_at": version,
-        "objective": "maximize_realized_net_profit_after_costs_with_bounded_risk",
+        "generated_at": _now(),
+        "version": "profitability-learning-v2",
+        "objective": "maximize realized net P/L expectancy after known costs while preserving hard risk rules",
         "paid_ai_calls": 0,
-        "trade_calibration": calibration,
+        "trade_calibration": trade_evidence,
+        "shadow_learning": _shadow_quality(shadows),
+        "timing_learning": _timing_metrics(executions, outcomes),
+        "loss_learning": _loss_learning(financial_rows),
+        "market_intelligence_attribution": intelligence,
         "weights": weights,
-        "shadow_learning": shadow,
-        "timing_learning": timing,
-        "loss_learning": loss_learning,
-        "market_intelligence_attribution": market_intelligence_attribution,
         "guardrails": {
+            "max_live_weight_adjustment": MAX_WEIGHT_ADJUSTMENT,
             "minimum_trade_samples": MIN_TRADE_SAMPLES,
             "minimum_bucket_samples": MIN_BUCKET_SAMPLES,
-            "minimum_shadow_samples": MIN_SHADOW_SAMPLES,
-            "max_weight_adjustment": MAX_WEIGHT_ADJUSTMENT,
             "hard_risk_rules_mutable": False,
-            "ai_can_rewrite_code": False,
+            "automatic_gate_or_threshold_changes": False,
             "leverage_mutable": False,
-            "minimum_market_intelligence_trade_samples": MIN_INTELLIGENCE_TRADE_SAMPLES,
-            "minimum_market_intelligence_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
-            "max_market_intelligence_weight_adjustment": MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
-            "market_intelligence_combined_multiplier_min": MIN_INTELLIGENCE_MULTIPLIER,
-            "market_intelligence_combined_multiplier_max": MAX_INTELLIGENCE_MULTIPLIER,
             "market_intelligence_auto_promotion": False,
             "market_intelligence_human_review_required": True,
+            "market_intelligence_max_combined_multiplier": MAX_INTELLIGENCE_MULTIPLIER,
+            "market_intelligence_max_weight_adjustment": MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
+            "market_intelligence_min_actual_trade_samples": MIN_INTELLIGENCE_TRADE_SAMPLES,
+            "market_intelligence_min_actual_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
         },
     }
     if persist:
@@ -272,21 +273,29 @@ def build_profitability_profile(
     return profile
 
 
-def get_profitability_profile() -> dict[str, Any]:
-    with registry_lock(LOCK_FILE):
-        return load_json(PROFILE_FILE)
-
-
 def learned_multiplier(*, direction: str, regime: str | None) -> float:
-    profile = get_profitability_profile()
+    try:
+        with registry_lock(LOCK_FILE):
+            profile = load_json(PROFILE_FILE)
+    except (OSError, TimeoutError, RegistryIOError):
+        return 1.0
+
     calibration = profile.get("trade_calibration") or {}
     if calibration.get("status") != "CALIBRATED":
         return 1.0
     weights = profile.get("weights") or {}
-    values = [float(weights.get(f"direction:{direction.upper()}", 1.0))]
+    values = [weights.get(f"direction:{direction.upper()}", 1.0)]
     if regime:
-        values.append(float(weights.get(f"regime:{regime.upper()}", 1.0)))
-    product = 1.0
+        values.append(weights.get(f"regime:{regime.upper()}", 1.0))
+    result = 1.0
     for value in values:
-        product *= value
-    return round(max(0.75, min(1.25, product)), 4)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(numeric) or not 0.75 <= numeric <= 1.25:
+            return 1.0
+        result *= numeric
+    if not math.isfinite(result):
+        return 1.0
+    return round(max(0.75, min(1.25, result)), 4)

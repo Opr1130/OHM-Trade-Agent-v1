@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 
@@ -26,10 +27,30 @@ def recommend_capital(
     leverage: float = 1.0,
     quality_score: float | None = None,
 ) -> CapitalAllocation:
+    values = {
+        "available_capital": available_capital,
+        "stop_distance_pct": stop_distance_pct,
+        "confidence_score": confidence_score,
+        "net_edge_pct": net_edge_pct,
+        "calibration_multiplier": calibration_multiplier,
+        "max_position_pct": max_position_pct,
+        "risk_per_trade_pct": risk_per_trade_pct,
+        "leverage": leverage,
+    }
+    if quality_score is not None:
+        values["quality_score"] = quality_score
+    non_finite = [name for name, value in values.items() if not math.isfinite(float(value))]
+    if non_finite:
+        raise ValueError(f"capital allocation inputs must be finite: {', '.join(non_finite)}")
+
     if available_capital <= 0 or stop_distance_pct <= 0:
         raise ValueError("available_capital and stop_distance_pct must be positive")
     if leverage <= 0:
         raise ValueError("leverage must be positive")
+    if not 0 < max_position_pct <= 100:
+        raise ValueError("max_position_pct must be in (0, 100]")
+    if risk_per_trade_pct <= 0:
+        raise ValueError("risk_per_trade_pct must be positive")
     if net_edge_pct <= 0:
         return CapitalAllocation(0.0, 0.0, 0.0, "non-positive projected net edge")
 
@@ -42,14 +63,10 @@ def recommend_capital(
     calibration = max(0.75, min(1.25, calibration_multiplier))
 
     risk_budget = available_capital * risk_per_trade_pct / 100.0
-    # Stop risk is applied to leveraged notional, not only posted capital.
     risk_sized_capital = risk_budget / ((stop_distance_pct / 100.0) * leverage)
     cap = available_capital * max_position_pct / 100.0
     hard_cap = min(cap, risk_sized_capital)
 
-    # Calibration may reduce or increase a recommendation inside the allowed
-    # envelope, but it must never increase posted capital past the hard stop-
-    # risk budget. This keeps learned sizing subordinate to deterministic risk.
     recommended = hard_cap * quality * edge_factor * calibration
     recommended = max(0.0, min(hard_cap, recommended))
     risk_dollars = recommended * leverage * stop_distance_pct / 100.0

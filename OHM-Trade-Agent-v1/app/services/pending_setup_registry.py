@@ -63,6 +63,7 @@ def _ttl_hours() -> int:
 
 
 def add_pending_setup(setup: PendingSetup) -> PendingSetup:
+    """Persist each live setup by immutable trade_id, not mutable market symbol."""
     setup.direction = (setup.direction or "LONG").upper()
     with registry_lock(registry_lock_file()):
         data = _load_raw()
@@ -73,9 +74,15 @@ def add_pending_setup(setup: PendingSetup) -> PendingSetup:
         if not setup.expires_at:
             created = _parse(setup.created_at) or datetime.now(timezone.utc)
             setup.expires_at = (created + timedelta(hours=_ttl_hours())).isoformat()
-        # Preserve historical symbol-keyed storage for compatibility. trade_id
-        # is the canonical lifecycle identity used by terminal transitions.
-        data[setup.symbol] = asdict(setup)
+        # If this exact lifecycle came from a legacy symbol-keyed row, migrate it
+        # rather than keeping two waiting copies. Different trade_ids on the same
+        # symbol intentionally coexist.
+        for key, item in list(data.items()):
+            if key == setup.trade_id:
+                continue
+            if item.get("status") == "waiting" and item.get("trade_id") == setup.trade_id:
+                del data[key]
+        data[setup.trade_id] = asdict(setup)
         _save_raw(data)
     return setup
 
@@ -91,7 +98,18 @@ def _from_item(item: dict) -> PendingSetup:
 def get_pending_setups() -> list[PendingSetup]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-    return [_from_item(item) for item in data.values() if item.get("status") == "waiting"]
+    seen: set[str] = set()
+    result: list[PendingSetup] = []
+    for item in data.values():
+        if item.get("status") != "waiting":
+            continue
+        trade_id = str(item.get("trade_id") or "")
+        if trade_id and trade_id in seen:
+            continue
+        if trade_id:
+            seen.add(trade_id)
+        result.append(_from_item(item))
+    return result
 
 
 def get_pending_setup_by_trade_id(trade_id: str) -> PendingSetup | None:
@@ -121,15 +139,40 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
     traced_direction = "LONG"
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-        for item in data.values():
+        terminal_at = datetime.now(timezone.utc).isoformat()
+        terminal_key = ""
+        for key, item in data.items():
             if item.get("trade_id") == trade_id and item.get("status") == "waiting":
                 item["status"] = status
-                item["terminal_at"] = datetime.now(timezone.utc).isoformat()
+                item["terminal_at"] = terminal_at
                 traced_symbol = str(item.get("symbol") or "")
                 traced_direction = str(item.get("direction") or "LONG")
-                _save_raw(data)
+                terminal_key = key
                 terminalized = True
                 break
+        if terminalized:
+            # Migration-only compatibility: old diagnostics looked up terminal
+            # status by symbol. Keep a non-waiting tombstone without using symbol
+            # as the canonical live lifecycle key, so same-symbol setups cannot
+            # overwrite one another. Never clobber a different legacy waiting
+            # lifecycle that still occupies the symbol compatibility slot.
+            if traced_symbol and terminal_key != traced_symbol:
+                existing_symbol_row = data.get(traced_symbol)
+                different_waiting_setup = (
+                    isinstance(existing_symbol_row, dict)
+                    and existing_symbol_row.get("status") == "waiting"
+                    and existing_symbol_row.get("trade_id") != trade_id
+                )
+                if not different_waiting_setup:
+                    data[traced_symbol] = {
+                        "symbol": traced_symbol,
+                        "trade_id": trade_id,
+                        "direction": traced_direction,
+                        "status": status,
+                        "terminal_at": terminal_at,
+                        "legacy_symbol_tombstone": True,
+                    }
+            _save_raw(data)
     if terminalized:
         from app.services.trade_outcome_registry import terminalize_setup_outcome
 
@@ -182,10 +225,16 @@ def mark_pending_setup_entered(trade_id: str) -> bool:
 
 
 def remove_pending_setup(symbol: str) -> bool:
+    """Backward-compatible symbol cleanup; remove every row for that market."""
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-        if symbol not in data:
+        keys = [
+            key for key, item in data.items()
+            if key == symbol or str(item.get("symbol") or "").upper() == symbol.upper()
+        ]
+        if not keys:
             return False
-        del data[symbol]
+        for key in keys:
+            del data[key]
         _save_raw(data)
         return True

@@ -1,64 +1,48 @@
 from __future__ import annotations
 
-import json
-from collections import defaultdict
-
-from app.services.movement_discovery_outcomes import OUTCOME_FILE
+from app.services.prospective_signal_evaluation import build_movement_discovery_comparison
 
 
-def _pct(count: int, total: int) -> str:
-    return "n/a" if total <= 0 else f"{count / total * 100.0:.1f}%"
+def _pct(value) -> str:
+    return "n/a" if value is None else f"{float(value) * 100.0:+.1f}pp"
 
 
 def main() -> None:
-    rows = []
-    if OUTCOME_FILE.exists():
-        for line in OUTCOME_FILE.read_text(encoding="utf-8").splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("record_type") == "OUTCOME":
-                rows.append(row)
+    report = build_movement_discovery_comparison()
 
-    print("===== MOVEMENT DISCOVERY V2.1 LEARNING =====")
-    print("Outcome samples:", len(rows))
-    by_horizon = defaultdict(list)
-    for row in rows:
-        by_horizon[str(row.get("horizon") or "unknown")].append(row)
-    for horizon in ("1h", "4h", "12h", "24h"):
-        bucket = by_horizon.get(horizon, [])
-        if not bucket:
-            print(f"{horizon}: samples=0")
-            continue
-        avg_mfe = sum(float(row.get("mfe_pct") or 0.0) for row in bucket) / len(bucket)
-        avg_mae = sum(float(row.get("mae_pct") or 0.0) for row in bucket) / len(bucket)
-        hit5 = sum(1 for row in bucket if row.get("hit_5pct"))
-        hit10 = sum(1 for row in bucket if row.get("hit_10pct"))
-        hit20 = sum(1 for row in bucket if row.get("hit_20pct"))
-        print(
-            f"{horizon}: samples={len(bucket)} avg_MFE={avg_mfe:.2f}% avg_MAE={avg_mae:.2f}% "
-            f"+5={_pct(hit5, len(bucket))} +10={_pct(hit10, len(bucket))} +20={_pct(hit20, len(bucket))}"
-        )
+    print("===== MOVEMENT DISCOVERY V2.1 — READY VS WATCH =====")
+    print("Prospective outcome rows:", report["outcome_rows"])
+    print("Minimum samples per bucket:", report["minimum_samples_per_bucket"])
 
-    confidence_buckets = defaultdict(list)
-    for row in rows:
-        try:
-            confidence = int(row.get("continuation_confidence"))
-        except (TypeError, ValueError):
-            continue
-        confidence_buckets[(confidence // 5) * 5].append(row)
-    print("Continuation buckets (all horizons):")
-    for bucket in sorted(confidence_buckets):
-        group = confidence_buckets[bucket]
-        hit5 = sum(1 for row in group if row.get("hit_5pct"))
-        hit10 = sum(1 for row in group if row.get("hit_10pct"))
+    for horizon, comparison in report["horizons"].items():
+        ready = comparison["ready"]
+        watch = comparison["watch"]
+        eligible = comparison["alert_eligible"]
+        not_eligible = comparison["not_alert_eligible"]
         print(
-            f"  {bucket:02d}-{bucket + 4:02d}: samples={len(group)} "
-            f"+5={_pct(hit5, len(group))} +10={_pct(hit10, len(group))}"
+            f"{horizon}: READY n={ready['samples']} MFE={ready['avg_mfe_pct']} MAE={ready['avg_mae_pct']} "
+            f"vs WATCH n={watch['samples']} MFE={watch['avg_mfe_pct']} MAE={watch['avg_mae_pct']}"
         )
+        if comparison["ready_vs_watch_sufficient"]:
+            print(
+                f"  READY separation: MFE={comparison['ready_mfe_delta_pct']:+.2f}pp "
+                f"hit+5={_pct(comparison['ready_hit_5_delta'])}"
+            )
+        else:
+            print("  READY separation: INSUFFICIENT DATA")
+        print(
+            f"  alert eligibility: eligible n={eligible['samples']} vs not-eligible n={not_eligible['samples']}"
+        )
+        for band, metrics in comparison["liquidity_bands"].items():
+            print(
+                f"  liquidity {band}: n={metrics['samples']} MFE={metrics['avg_mfe_pct']} "
+                f"MAE={metrics['avg_mae_pct']} hit+5={metrics['hit_5pct_rate']}"
+            )
+
+    print("Review status:", report["status"])
+    print("Auto promotion allowed:", report["auto_promotion_allowed"])
     print("Scores remain heuristic ranks, not calibrated probabilities.")
-    print("Production decisions changed: False")
+    print("Production decisions changed:", report["production_thresholds_changed"])
 
 
 if __name__ == "__main__":
