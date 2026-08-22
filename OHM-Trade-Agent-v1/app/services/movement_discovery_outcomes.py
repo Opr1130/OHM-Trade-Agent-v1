@@ -64,9 +64,6 @@ def _window_metrics(
 ) -> dict[str, Any] | None:
     start_ts = start.timestamp()
     end_ts = end.timestamp()
-    # Kraken timestamps a candle by its OPEN. A 15m candle whose open equals
-    # horizon_end contains 15 minutes of future information. Include only bars
-    # fully closed by the requested horizon.
     selected = [
         candle
         for candle in candles
@@ -82,7 +79,6 @@ def _window_metrics(
     lowest = min(float(candle.low) for candle in selected)
     direction = direction.upper()
     if direction == "SHORT":
-        # Use the same denominator as realized short P/L: (entry-exit)/entry.
         close_return = (reference_price - close_price) / reference_price * 100.0
         mfe = (reference_price - lowest) / reference_price * 100.0
         mae = -((highest - reference_price) / reference_price * 100.0)
@@ -133,7 +129,6 @@ def observe_due_movement_discovery_outcomes(
 
     state = load_json(state_target)
     completed_order = [str(item) for item in (state.get("completed") or [])]
-    # Preserve persisted insertion order while removing accidental duplicates.
     completed_order = list(dict.fromkeys(completed_order))
     completed = set(completed_order)
     legacy_unobservable = 0
@@ -187,6 +182,7 @@ def observe_due_movement_discovery_outcomes(
                 "reference_price": float(row["reference_price"]), **metrics, "stage": row.get("stage"),
                 "entry_recommendation": row.get("entry_recommendation"), "momentum_state": row.get("momentum_state"),
                 "continuation_confidence": row.get("continuation_confidence"), "entry_quality": row.get("entry_quality"),
+                "alert_eligible": row.get("alert_eligible"),
                 "relative_volume": row.get("relative_volume"), "liquidity_24h_usd_approx": row.get("liquidity_24h_usd_approx"),
                 "version": row.get("version"), "shadow_only": True, "production_decision_changed": False,
             }
