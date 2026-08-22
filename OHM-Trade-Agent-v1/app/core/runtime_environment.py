@@ -4,14 +4,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class RuntimeEnvironmentSettings(BaseSettings):
-    """Read only runtime-mode fields using the same .env semantics as Settings.
+    """Read only runtime-mode fields using the same .env semantics as Settings."""
 
-    Safety gates need APP_ENV without depending on unrelated secret validation
-    or a cached full Settings object. This prevents tests/runtime reloads from
-    seeing stale environment state and keeps .env-file behavior consistent.
-    """
-
-    app_env: str = "development"
+    app_env: str = "unknown"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -21,7 +16,7 @@ class RuntimeEnvironmentSettings(BaseSettings):
 
 
 def get_runtime_app_env() -> str:
-    return (RuntimeEnvironmentSettings().app_env or "development").strip().lower()
+    return (RuntimeEnvironmentSettings().app_env or "unknown").strip().lower()
 
 
 def conservative_runtime() -> bool:
