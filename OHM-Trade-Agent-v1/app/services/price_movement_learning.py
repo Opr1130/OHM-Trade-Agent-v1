@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from app.exchanges.kraken import KrakenAPIError, KrakenClient
+from app.exchanges.kraken import KrakenClient
 from app.services.price_movement_radar import EXPIRED
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
@@ -17,7 +17,6 @@ HORIZONS_SECONDS = {"1h": 60 * 60, "4h": 4 * 60 * 60, "12h": 12 * 60 * 60}
 OBSERVATION_INTERVAL_MINUTES = 15
 OBSERVATION_INTERVAL_SECONDS = OBSERVATION_INTERVAL_MINUTES * 60
 MAX_HORIZON_PRICE_LAG_SECONDS = OBSERVATION_INTERVAL_SECONDS
-NEAR_DUE_TICKER_FALLBACK_SECONDS = 5 * 60
 
 
 def _now() -> datetime:
@@ -114,23 +113,6 @@ def get_price_movement_records() -> list[dict[str, Any]]:
         return []
 
 
-def _ticker_price(client: KrakenClient, symbol: str) -> float | None:
-    try:
-        ticker = client.get_ticker(symbol)
-    except Exception:
-        try:
-            ticker = client.get_tickers([symbol]).get(symbol)
-        except Exception:
-            return None
-    if not isinstance(ticker, dict):
-        return None
-    try:
-        price = float(ticker.get("last") or 0.0)
-    except (TypeError, ValueError):
-        return None
-    return price if math.isfinite(price) and price > 0 else None
-
-
 def _price_at_horizon(
     client: KrakenClient,
     symbol: str,
@@ -141,11 +123,12 @@ def _price_at_horizon(
 ) -> float | None:
     """Return the latest 15m close that was actually known by the horizon.
 
-    Historical OHLC is authoritative. A current ticker is used only when the
-    observer is running within five minutes of the due timestamp and the
-    client cannot provide historical OHLC; delayed runs never relabel a later
-    price as 1h/4h/12h evidence.
+    Historical OHLC is authoritative. If exact historical evidence is not
+    available, return ``None`` so the horizon remains unresolved and can be
+    retried later. A live ticker is never substituted because any post-horizon
+    price would contaminate prospective outcome measurement.
     """
+    del labelled_at  # kept in the call contract for compatibility/audit metadata
     try:
         candles = client.get_ohlc(
             symbol,
@@ -153,9 +136,6 @@ def _price_at_horizon(
             since=int((observed_at - timedelta(minutes=OBSERVATION_INTERVAL_MINUTES)).timestamp()),
         )
     except Exception:
-        lag = (labelled_at - due_at).total_seconds()
-        if 0 <= lag <= NEAR_DUE_TICKER_FALLBACK_SECONDS:
-            return _ticker_price(client, symbol)
         return None
 
     due_ts = due_at.timestamp()
