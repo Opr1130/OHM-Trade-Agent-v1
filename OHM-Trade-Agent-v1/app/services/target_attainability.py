@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 
 from app.scanner.models import MarketSnapshot
@@ -22,6 +23,8 @@ NORMAL_VOLATILITY_MIN_RATIO = 0.75
 NORMAL_VOLATILITY_MAX_RATIO = 1.50
 USABLE_VOLATILITY_MIN_RATIO = 0.50
 USABLE_VOLATILITY_MAX_RATIO = 2.00
+MAX_LONG_SPREAD_BPS = 30.0
+MAX_LONG_ROUND_TRIP_DRAG_PCT = 0.75
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,37 @@ def _valid_long_geometry(plan: EntryExitPlan, entry: float, atr_value: float) ->
         and plan.reward_to_risk_1 > 0
         and plan.reward_to_risk_2 > 0
     )
+
+
+def _long_execution_rejections(snapshot: MarketSnapshot) -> list[str]:
+    """Apply executable-cost limits to LONGs before targets can qualify."""
+    execution = snapshot.execution_validation
+    production = os.getenv("APP_ENV", "").strip().lower() == "production"
+    if execution is None:
+        return ["LONG execution evidence is unavailable"] if production else []
+
+    reasons: list[str] = []
+    if str(execution.status or "").upper() in {"INVALID", "UNAVAILABLE"} and production:
+        reasons.append(f"LONG execution validation status is {execution.status}")
+
+    spread = execution.spread_bps
+    if spread is None or not math.isfinite(float(spread)):
+        if production:
+            reasons.append("LONG spread evidence is unavailable")
+    elif float(spread) > MAX_LONG_SPREAD_BPS:
+        reasons.append(
+            f"LONG spread {float(spread):.2f}bps exceeds quality limit {MAX_LONG_SPREAD_BPS:.2f}bps"
+        )
+
+    drag = execution.estimated_visible_round_trip_market_drag_pct
+    if drag is None or not math.isfinite(float(drag)):
+        if production:
+            reasons.append("LONG round-trip drag evidence is unavailable")
+    elif float(drag) > MAX_LONG_ROUND_TRIP_DRAG_PCT:
+        reasons.append(
+            f"LONG round-trip drag {float(drag):.2f}% exceeds quality limit {MAX_LONG_ROUND_TRIP_DRAG_PCT:.2f}%"
+        )
+    return reasons
 
 
 def _aligned_momentum(snapshot: MarketSnapshot) -> bool:
@@ -183,6 +217,8 @@ def evaluate_target_attainability(
 
     if not _valid_long_geometry(plan, entry, snapshot.atr):
         return _reject(plan, "Invalid LONG target/stop geometry or non-finite plan values")
+
+    rejection_reasons.extend(_long_execution_rejections(snapshot))
 
     t1_move_pct = (plan.target_1 - entry) / entry * 100
     t2_move_pct = (plan.target_2 - entry) / entry * 100
