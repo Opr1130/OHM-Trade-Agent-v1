@@ -1,17 +1,29 @@
+import json
 import logging
+import queue
 import threading
 import time
+from collections import deque
 
 import httpx
 
 from app.core.config import get_settings
 from app.services.confirm_entry import confirm_trade_id
 from app.services.pending_setup_registry import terminalize_pending_setup
+from app.services.telegram_command_center import process_command_message, refresh_market_watches
 from app.services.telegram_notifier import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
 _stop_event = threading.Event()
+_thread_lock = threading.Lock()
+_rate_lock = threading.Lock()
+_listener_thread: threading.Thread | None = None
+_watch_thread: threading.Thread | None = None
+_command_thread: threading.Thread | None = None
+_command_times: deque[float] = deque()
+_COMMAND_QUEUE_MAX = 4
+_command_queue: queue.Queue[tuple[dict, object]] = queue.Queue(maxsize=_COMMAND_QUEUE_MAX)
 
 
 def answer_callback_query(
@@ -36,6 +48,28 @@ def answer_callback_query(
         logger.exception("Failed to answer Telegram callback query")
 
 
+def _authorized_actor(*, chat_id: str, sender_id: str, settings) -> bool:
+    if chat_id != str(settings.telegram_chat_id or ""):
+        return False
+    configured_user = str(getattr(settings, "telegram_command_user_id", None) or "").strip()
+    if configured_user and sender_id != configured_user:
+        return False
+    return True
+
+
+def _command_rate_allowed(settings) -> bool:
+    limit = int(getattr(settings, "telegram_command_rate_limit_per_minute", 12) or 12)
+    limit = max(1, min(60, limit))
+    now = time.monotonic()
+    with _rate_lock:
+        while _command_times and now - _command_times[0] >= 60.0:
+            _command_times.popleft()
+        if len(_command_times) >= limit:
+            return False
+        _command_times.append(now)
+        return True
+
+
 def process_callback(update: dict) -> None:
     settings = get_settings()
 
@@ -48,7 +82,9 @@ def process_callback(update: dict) -> None:
 
     message = callback.get("message", {})
     chat = message.get("chat", {})
+    sender = callback.get("from", {})
     callback_chat_id = str(chat.get("id", ""))
+    callback_sender_id = str(sender.get("id", ""))
 
     if not (
         settings.telegram_bot_token
@@ -59,14 +95,17 @@ def process_callback(update: dict) -> None:
         )
         return
 
-    #
-    # SECURITY:
-    # Only accept button presses from the configured OHM Telegram chat.
-    #
-    if callback_chat_id != str(settings.telegram_chat_id):
+    # SECURITY: only the configured OHM chat may mutate local lifecycle state.
+    # An optional TELEGRAM_COMMAND_USER_ID further restricts group-chat use.
+    if not _authorized_actor(
+        chat_id=callback_chat_id,
+        sender_id=callback_sender_id,
+        settings=settings,
+    ):
         logger.warning(
-            "Unauthorized Telegram callback from chat_id=%s",
+            "Unauthorized Telegram callback chat_id=%s sender_id=%s",
             callback_chat_id,
+            callback_sender_id,
         )
 
         if callback_id:
@@ -161,16 +200,85 @@ def process_callback(update: dict) -> None:
         )
 
 
+def _queue_command(update: dict, settings) -> bool:
+    try:
+        _command_queue.put_nowait((dict(update), settings))
+        return True
+    except queue.Full:
+        send_telegram_message(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            "⚠️ OHM COMMAND BUSY — several requests are already queued. Try again shortly.",
+        )
+        return False
+
+
+def process_message(update: dict) -> None:
+    settings = get_settings()
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return
+    text = str(message.get("text") or "").strip()
+    if not text.startswith("/"):
+        return
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+    chat_id = str(chat.get("id", ""))
+    sender_id = str(sender.get("id", ""))
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return
+    if not _authorized_actor(chat_id=chat_id, sender_id=sender_id, settings=settings):
+        logger.warning(
+            "Unauthorized Telegram command chat_id=%s sender_id=%s",
+            chat_id,
+            sender_id,
+        )
+        return
+    if not _command_rate_allowed(settings):
+        send_telegram_message(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            "⚠️ OHM COMMAND RATE LIMIT — wait a moment before requesting another scan.",
+        )
+        return
+    _queue_command(update, settings)
+
+
+def process_update(update: dict) -> None:
+    # Callback handling remains synchronous/high-priority. Commands are only
+    # enqueued here, so a slow Kraken market scan can never delay a lifecycle
+    # button press or the next Telegram getUpdates poll.
+    if "callback_query" in update:
+        process_callback(update)
+    if "message" in update:
+        process_message(update)
+
+
+def telegram_command_worker_loop() -> None:
+    logger.info("OHM Telegram command worker started")
+    while not _stop_event.is_set():
+        try:
+            update, settings = _command_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            process_command_message(update, settings=settings)
+        except Exception:
+            logger.exception("Telegram command worker failed safely")
+        finally:
+            _command_queue.task_done()
+
+
 def telegram_callback_loop() -> None:
     settings = get_settings()
 
     if not settings.telegram_enabled:
-        logger.info("Telegram callback listener disabled")
+        logger.info("Telegram callback/command listener disabled")
         return
 
     if not settings.telegram_bot_token:
         logger.warning(
-            "Telegram callback listener cannot start: bot token missing"
+            "Telegram callback/command listener cannot start: bot token missing"
         )
         return
 
@@ -181,12 +289,12 @@ def telegram_callback_loop() -> None:
 
     offset = None
 
-    logger.info("OHM Telegram callback listener started")
+    logger.info("OHM Telegram callback/command listener started")
 
     while not _stop_event.is_set():
         params = {
             "timeout": 25,
-            "allowed_updates": '["callback_query"]',
+            "allowed_updates": json.dumps(["callback_query", "message"]),
         }
 
         if offset is not None:
@@ -203,49 +311,102 @@ def telegram_callback_loop() -> None:
 
             payload = response.json()
 
-            if not payload.get("ok"):
-                logger.error(
-                    "Telegram getUpdates returned error: %s",
-                    payload,
-                )
-                time.sleep(5)
+            if not isinstance(payload, dict) or not payload.get("ok"):
+                logger.error("Telegram getUpdates returned a non-OK response")
+                _stop_event.wait(5)
                 continue
 
-            for update in payload.get("result", []):
+            results = payload.get("result", [])
+            if not isinstance(results, list):
+                logger.error("Telegram getUpdates returned invalid result shape")
+                _stop_event.wait(5)
+                continue
+
+            for update in results:
+                if not isinstance(update, dict):
+                    continue
                 update_id = update.get("update_id")
 
                 if update_id is not None:
-                    offset = update_id + 1
+                    try:
+                        offset = int(update_id) + 1
+                    except (TypeError, ValueError):
+                        logger.warning("Telegram update had invalid update_id")
 
                 try:
-                    process_callback(update)
+                    process_update(update)
 
                 except Exception:
                     logger.exception(
-                        "Failed processing Telegram callback update"
+                        "Failed processing Telegram update"
                     )
 
         except httpx.HTTPError:
             logger.exception(
-                "Telegram callback polling failed"
+                "Telegram polling failed"
             )
-            time.sleep(5)
+            _stop_event.wait(5)
 
         except Exception:
             logger.exception(
-                "Unexpected Telegram callback listener error"
+                "Unexpected Telegram listener error"
             )
-            time.sleep(5)
+            _stop_event.wait(5)
+
+
+def telegram_watch_loop() -> None:
+    settings = get_settings()
+    if not settings.telegram_enabled or not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return
+    logger.info("OHM Telegram market-watch refresher started")
+    while not _stop_event.wait(30):
+        try:
+            refresh_market_watches(settings=settings)
+        except Exception:
+            # Watch refresh is informational/advisory and must never terminate
+            # the primary Telegram command/callback listener.
+            logger.exception("Telegram market-watch refresh failed safely")
+
+
+def _drain_command_queue() -> None:
+    while True:
+        try:
+            _command_queue.get_nowait()
+        except queue.Empty:
+            return
+        else:
+            _command_queue.task_done()
 
 
 def start_telegram_callback_listener() -> None:
-    thread = threading.Thread(
-        target=telegram_callback_loop,
-        name="ohm-telegram-callback-listener",
-        daemon=True,
-    )
-
-    thread.start()
+    global _listener_thread, _watch_thread, _command_thread
+    with _thread_lock:
+        if any(
+            thread is not None and thread.is_alive()
+            for thread in (_listener_thread, _watch_thread, _command_thread)
+        ):
+            logger.info("Telegram listener already running")
+            return
+        _drain_command_queue()
+        _stop_event.clear()
+        _listener_thread = threading.Thread(
+            target=telegram_callback_loop,
+            name="ohm-telegram-callback-command-listener",
+            daemon=True,
+        )
+        _command_thread = threading.Thread(
+            target=telegram_command_worker_loop,
+            name="ohm-telegram-command-worker",
+            daemon=True,
+        )
+        _watch_thread = threading.Thread(
+            target=telegram_watch_loop,
+            name="ohm-telegram-market-watch-refresher",
+            daemon=True,
+        )
+        _listener_thread.start()
+        _command_thread.start()
+        _watch_thread.start()
 
 
 def stop_telegram_callback_listener() -> None:
