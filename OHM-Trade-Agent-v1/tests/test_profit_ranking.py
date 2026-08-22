@@ -496,7 +496,10 @@ def _configure_pipeline(monkeypatch, specifications):
             qualified=specification.get("target_pass", True),
         )
 
-    def economic_gate(plan, available_capital):
+    def economic_gate(plan, available_capital, **kwargs):
+        assert kwargs["max_capital_fraction"] == pytest.approx(
+            scan_opportunities.PRODUCTION_MAX_CAPITAL_FRACTION
+        )
         events.append(f"economic:{plan.symbol}")
         specification = by_symbol[plan.symbol]
         return _economic(
