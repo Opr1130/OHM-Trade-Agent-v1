@@ -5,7 +5,7 @@ from statistics import mean
 from typing import Any
 
 MIN_GLOBAL_SAMPLES = 30
-MIN_BUCKET_SAMPLES = 8
+MIN_BUCKET_SAMPLES = 30
 MAX_ADJUSTMENT = 0.15
 
 
@@ -91,9 +91,9 @@ def _live_multiplier(model: dict[str, Any], *, direction: str, regime: str | Non
 
 
 def calibrated_multiplier(model: dict[str, Any], *, direction: str, regime: str | None) -> float:
-    # The daily profitability profile allows behavior to improve from data
-    # without code edits. It is generated locally and has the same hard bounds.
-    # If it is not mature or not present, preserve the existing live model.
+    # The daily profitability profile is bounded sizing-only learning. Both the
+    # persisted profile and this model now require >=30 resolved financial
+    # samples per bucket before any live sizing multiplier can move.
     try:
         from app.services.profitability_learning import learned_multiplier
 
