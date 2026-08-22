@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 from app.scanner.models import MarketSnapshot
@@ -39,7 +40,6 @@ class ShortTargetAttainabilityResult:
     warnings: list[str]
     rejection_reasons: list[str]
 
-    # Compatibility properties used by shared ranking/logging code.
     @property
     def clearance_to_24h_resistance_pct(self) -> float:
         return self.clearance_to_24h_support_pct
@@ -49,20 +49,50 @@ class ShortTargetAttainabilityResult:
         return self.clearance_to_72h_support_pct
 
 
-def _negative_momentum(snapshot: MarketSnapshot) -> bool:
-    return all(
-        value < 0
-        for value in (
-            snapshot.momentum_6h_pct,
-            snapshot.momentum_24h_pct,
-            snapshot.momentum_72h_pct,
-        )
+def _reject(plan: EntryExitPlan, reason: str) -> ShortTargetAttainabilityResult:
+    return ShortTargetAttainabilityResult(
+        plan.symbol, False, 0, 0, 0, 0, 0, 0,
+        "unavailable", "unavailable", 0, [], [], [reason],
     )
+
+
+def _valid_short_geometry(plan: EntryExitPlan, entry: float, atr_value: float) -> bool:
+    values = (
+        plan.entry_low,
+        plan.entry_high,
+        plan.chase_limit,
+        plan.stop_price,
+        plan.target_1,
+        plan.target_2,
+        plan.reward_to_risk_1,
+        plan.reward_to_risk_2,
+        entry,
+        atr_value,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    return (
+        0 < plan.chase_limit <= plan.entry_low <= plan.entry_high
+        and 0 < plan.target_2 < plan.target_1 < entry < plan.stop_price
+        and atr_value > 0
+        and plan.reward_to_risk_1 > 0
+        and plan.reward_to_risk_2 > 0
+    )
+
+
+def _negative_momentum(snapshot: MarketSnapshot) -> bool:
+    values = (
+        snapshot.momentum_6h_pct,
+        snapshot.momentum_24h_pct,
+        snapshot.momentum_72h_pct,
+    )
+    return all(math.isfinite(float(value)) and value < 0 for value in values)
 
 
 def _healthy_bearish_structure(snapshot: MarketSnapshot) -> bool:
     return (
-        snapshot.trend == "bearish"
+        all(math.isfinite(float(value)) for value in (snapshot.last_price, snapshot.ema20, snapshot.ema50))
+        and snapshot.trend == "bearish"
         and snapshot.last_price <= snapshot.ema20
         and snapshot.ema20 < snapshot.ema50
     )
@@ -72,6 +102,7 @@ def _breakdown_confirmed(snapshot: MarketSnapshot) -> bool:
     return (
         _negative_momentum(snapshot)
         and _healthy_bearish_structure(snapshot)
+        and math.isfinite(float(snapshot.volume_ratio))
         and snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO
     )
 
@@ -83,6 +114,8 @@ def _support_points(
     weight: int,
     breakdown_confirmed: bool,
 ) -> tuple[int, str]:
+    if not all(math.isfinite(float(value)) for value in (target, support, atr_value)):
+        return 0, "unavailable"
     if support <= 0 or atr_value <= 0:
         return 0, "unavailable"
     clearance_atr = (target - support) / atr_value
@@ -102,6 +135,8 @@ def _historical_points(
     p90_pct: float,
     weight: int,
 ) -> tuple[int, str]:
+    if not all(math.isfinite(float(value)) for value in (move_pct, median_pct, p75_pct, p90_pct)):
+        return 0, "unavailable"
     if min(median_pct, p75_pct, p90_pct) < 0 or not median_pct <= p75_pct <= p90_pct:
         return 0, "unavailable"
     if p90_pct == 0:
@@ -126,12 +161,8 @@ def evaluate_short_target_attainability(
     warnings: list[str] = []
     rejection_reasons: list[str] = []
     entry = (plan.entry_low + plan.entry_high) / 2
-    if entry <= 0 or snapshot.atr <= 0:
-        return ShortTargetAttainabilityResult(
-            plan.symbol, False, 0, 0, 0, 0, 0, 0,
-            "unavailable", "unavailable", 0, [], [],
-            ["Invalid entry reference or ATR"],
-        )
+    if not _valid_short_geometry(plan, entry, snapshot.atr):
+        return _reject(plan, "Invalid SHORT target/stop geometry or non-finite plan values")
 
     t1_move_pct = (entry - plan.target_1) / entry * 100
     t2_move_pct = (entry - plan.target_2) / entry * 100
@@ -181,7 +212,10 @@ def evaluate_short_target_attainability(
             rejection_reasons.append(f"{label} historical downside data is unavailable")
 
     momentum = (snapshot.momentum_6h_pct, snapshot.momentum_24h_pct, snapshot.momentum_72h_pct)
-    if _negative_momentum(snapshot):
+    if not all(math.isfinite(float(value)) for value in momentum):
+        momentum_context = "unavailable due to non-finite momentum evidence"
+        rejection_reasons.append("Momentum evidence contains non-finite values")
+    elif _negative_momentum(snapshot):
         score += MOMENTUM_WEIGHT
         momentum_context = "negative across 6h, 24h, and 72h"
         strengths.append("Short- and medium-term bearish momentum agree")
@@ -201,29 +235,32 @@ def evaluate_short_target_attainability(
         momentum_context = "positive across 6h, 24h, and 72h"
         warnings.append("Momentum does not support bearish continuation")
 
-    if snapshot.volume_ratio >= 1.5:
-        score += VOLUME_WEIGHT
-        strengths.append("Strong volume confirms bearish continuation")
-    elif snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO:
-        score += 4
-        strengths.append("Above-average volume supports bearish continuation")
-    elif snapshot.volume_ratio >= 0.8:
-        score += 2
-        warnings.append("Volume is only near average")
+    if math.isfinite(float(snapshot.volume_ratio)):
+        if snapshot.volume_ratio >= 1.5:
+            score += VOLUME_WEIGHT
+            strengths.append("Strong volume confirms bearish continuation")
+        elif snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO:
+            score += 4
+            strengths.append("Above-average volume supports bearish continuation")
+        elif snapshot.volume_ratio >= 0.8:
+            score += 2
+            warnings.append("Volume is only near average")
+        else:
+            warnings.append("Below-average volume does not confirm continuation")
     else:
-        warnings.append("Below-average volume does not confirm continuation")
+        rejection_reasons.append("Volume evidence contains a non-finite value")
 
     if _healthy_bearish_structure(snapshot):
         score += VOLUME_CONTINUATION_WEIGHT - VOLUME_WEIGHT
         strengths.append("Trend structure supports bearish continuation")
-    elif snapshot.last_price <= snapshot.ema20:
+    elif all(math.isfinite(float(value)) for value in (snapshot.last_price, snapshot.ema20)) and snapshot.last_price <= snapshot.ema20:
         score += 2
         warnings.append("Bearish continuation structure is only partially aligned")
     else:
         warnings.append("Trend structure does not support bearish continuation")
 
     median_24h = snapshot.rolling_24h_range_median_pct
-    if median_24h > 0:
+    if math.isfinite(float(median_24h)) and math.isfinite(float(snapshot.realized_range_24h_pct)) and median_24h > 0:
         volatility_ratio = snapshot.realized_range_24h_pct / median_24h
         if NORMAL_VOLATILITY_MIN_RATIO <= volatility_ratio <= NORMAL_VOLATILITY_MAX_RATIO:
             score += VOLATILITY_WEIGHT
