@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 
@@ -18,8 +19,17 @@ def evaluate_entry_timing(*, direction: str, current_price: float, entry_low: fl
     direction = direction.upper()
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
-    if min(current_price, entry_low, entry_high, chase_limit) <= 0:
+
+    prices = (current_price, entry_low, entry_high, chase_limit)
+    if not all(math.isfinite(float(value)) for value in prices):
+        raise ValueError("prices must be finite")
+    if min(prices) <= 0:
         raise ValueError("prices must be positive")
+    if spread_bps is not None and not math.isfinite(float(spread_bps)):
+        raise ValueError("spread_bps must be finite")
+    if recent_trade_age_seconds is not None and not math.isfinite(float(recent_trade_age_seconds)):
+        raise ValueError("recent_trade_age_seconds must be finite")
+
     lo, hi = sorted((entry_low, entry_high))
     score = 100
     reasons: list[str] = []
