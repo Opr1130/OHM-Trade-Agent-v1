@@ -31,7 +31,7 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
     low = max(0.0, float(signal.get("expected_move_low_pct") or 0.0))
     high = max(low, float(signal.get("expected_move_high_pct") or low))
     reason = one_line_reason(*(signal.get("reasons") or []))
-    action = "REVIEW" if stage == READY else "MONITOR ONLY"
+    action = "REVIEW" if stage == READY else "MONITOR ONLY — no entry is authorized"
     return format_watch_alert(
         symbol=symbol,
         potential_low_pct=low,
