@@ -118,18 +118,20 @@ def test_profitability_profile_uses_actual_net_pnl_and_bounded_weights(monkeypat
     monkeypatch.setattr(learning, "PROFILE_FILE", tmp_path / "profile.json")
     monkeypatch.setattr(learning, "LOCK_FILE", tmp_path / ".profile.lock")
     outcomes = []
-    for i in range(20):
+    for i in range(30):
         outcomes.append(_outcome(i, direction="LONG", regime="RISK_ON", pnl=2.0))
-    for i in range(20, 40):
+    for i in range(30, 60):
         outcomes.append(_outcome(i, direction="SHORT", regime="RISK_OFF", pnl=-1.0))
 
     profile = learning.build_profitability_profile(outcomes=outcomes, executions=[], shadows=[], persist=True)
     assert profile["paid_ai_calls"] == 0
     assert profile["trade_calibration"]["status"] == "CALIBRATED"
+    assert profile["trade_calibration"]["minimum_bucket_samples"] == 30
     assert profile["weights"]["direction:LONG"] == pytest.approx(1.15)
     assert profile["weights"]["direction:SHORT"] == pytest.approx(0.85)
-    assert profile["loss_learning"]["losing_trades"] == 20
-    assert profile["loss_learning"]["potentially_avoidable_losses"] == 20
+    assert profile["loss_learning"]["losing_trades"] == 30
+    assert profile["loss_learning"]["potentially_avoidable_losses"] == 30
+    assert profile["guardrails"]["minimum_bucket_samples"] == 30
     assert profile["guardrails"]["hard_risk_rules_mutable"] is False
 
 
