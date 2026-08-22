@@ -1,7 +1,6 @@
 import math
 from dataclasses import dataclass
 
-from app.core.runtime_environment import conservative_runtime
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
@@ -40,15 +39,16 @@ def _invalid_result(direction: str, leverage: float, reason: str) -> EconomicGat
 
 
 def _resolved_capital_fraction(value: float | None) -> float:
-    """Use the live 20% envelope in conservative runtimes.
+    """Resolve the reusable gate's capital envelope.
 
-    Runtime mode is read through a tiny uncached pydantic-settings model so it
-    follows the same `.env` semantics as the application without depending on
-    unrelated secret validation or a stale cached Settings object.
+    The shared economic gate is deliberately environment-agnostic so tests,
+    analysis and non-production callers retain the historical full-capital
+    default. Production decision pipelines must pass their explicit allocation
+    envelope; OHM Chief uses ``PRODUCTION_MAX_CAPITAL_FRACTION`` (20%).
     """
     if value is not None:
         return float(value)
-    return PRODUCTION_MAX_CAPITAL_FRACTION if conservative_runtime() else DEFAULT_MAX_CAPITAL_FRACTION
+    return DEFAULT_MAX_CAPITAL_FRACTION
 
 
 def evaluate_economic_quality(
