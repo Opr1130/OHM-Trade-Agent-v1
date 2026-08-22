@@ -84,7 +84,7 @@ class _FakeKraken:
         return self.candles
 
 
-def test_outcome_observer_uses_candle_high_low_for_true_mfe_mae(tmp_path):
+def test_outcome_observer_uses_only_candles_fully_inside_horizon(tmp_path):
     detected = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
     detections = tmp_path / "detections.jsonl"
     outcomes = tmp_path / "outcomes.jsonl"
@@ -109,6 +109,8 @@ def test_outcome_observer_uses_candle_high_low_for_true_mfe_mae(tmp_path):
         Candle(int((detected + timedelta(minutes=15)).timestamp()), 100, 103, 99, 102, 101, 10, 20),
         Candle(int((detected + timedelta(minutes=30)).timestamp()), 102, 106, 95, 101, 101, 12, 25),
         Candle(int((detected + timedelta(minutes=45)).timestamp()), 101, 104, 100, 103, 102, 9, 18),
+        # This candle opens exactly at the 1h horizon and therefore extends
+        # beyond it. It must not contribute its close/high/low to the 1h label.
         Candle(int((detected + timedelta(hours=1)).timestamp()), 103, 105, 102, 104, 103, 8, 15),
     ]
     result = observe_due_movement_discovery_outcomes(
@@ -121,11 +123,12 @@ def test_outcome_observer_uses_candle_high_low_for_true_mfe_mae(tmp_path):
     assert result["observations_added"] == 1
     row = json.loads(outcomes.read_text().strip())
     assert row["horizon"] == "1h"
-    assert row["close_return_pct"] == 4.0
+    assert row["close_return_pct"] == 3.0
     assert row["mfe_pct"] == 6.0
     assert row["mae_pct"] == -5.0
     assert row["hit_5pct"] is True
     assert row["hit_10pct"] is False
+    assert row["sample_candles"] == 3
 
 
 def test_outcome_observer_never_labels_future_horizon(tmp_path):
