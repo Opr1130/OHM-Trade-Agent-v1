@@ -1,7 +1,7 @@
 import math
-import os
 from dataclasses import dataclass
 
+from app.core.config import get_settings
 from app.scanner.models import MarketSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -91,20 +91,28 @@ def _valid_long_geometry(plan: EntryExitPlan, entry: float, atr_value: float) ->
     )
 
 
+def _conservative_runtime() -> bool:
+    try:
+        app_env = (get_settings().app_env or "").strip().lower()
+    except Exception:
+        return True
+    return app_env not in {"development", "dev", "test", "testing"}
+
+
 def _long_execution_rejections(snapshot: MarketSnapshot) -> list[str]:
     """Apply executable-cost limits to LONGs before targets can qualify."""
     execution = snapshot.execution_validation
-    production = os.getenv("APP_ENV", "").strip().lower() == "production"
+    conservative = _conservative_runtime()
     if execution is None:
-        return ["LONG execution evidence is unavailable"] if production else []
+        return ["LONG execution evidence is unavailable"] if conservative else []
 
     reasons: list[str] = []
-    if str(execution.status or "").upper() in {"INVALID", "UNAVAILABLE"} and production:
+    if str(execution.status or "").upper() in {"INVALID", "UNAVAILABLE"} and conservative:
         reasons.append(f"LONG execution validation status is {execution.status}")
 
     spread = execution.spread_bps
     if spread is None or not math.isfinite(float(spread)):
-        if production:
+        if conservative:
             reasons.append("LONG spread evidence is unavailable")
     elif float(spread) > MAX_LONG_SPREAD_BPS:
         reasons.append(
@@ -113,7 +121,7 @@ def _long_execution_rejections(snapshot: MarketSnapshot) -> list[str]:
 
     drag = execution.estimated_visible_round_trip_market_drag_pct
     if drag is None or not math.isfinite(float(drag)):
-        if production:
+        if conservative:
             reasons.append("LONG round-trip drag evidence is unavailable")
     elif float(drag) > MAX_LONG_ROUND_TRIP_DRAG_PCT:
         reasons.append(
