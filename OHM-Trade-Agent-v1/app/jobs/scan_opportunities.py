@@ -26,7 +26,10 @@ from app.services.chief_analyst import (
     SHORT_VALIDATION_LEVERAGE,
     review_candidates,
 )
-from app.services.economic_quality_gate import evaluate_economic_quality
+from app.services.economic_quality_gate import (
+    PRODUCTION_MAX_CAPITAL_FRACTION,
+    evaluate_economic_quality,
+)
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
@@ -68,12 +71,17 @@ def _economic_quality(plan, snapshot, account_equity):
         return evaluate_economic_quality(
             plan,
             available_capital=account_equity,
+            max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
             direction="SHORT",
             leverage=SHORT_VALIDATION_LEVERAGE,
             estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
             max_account_risk_at_stop_pct=SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
         )
-    return evaluate_economic_quality(plan, available_capital=account_equity)
+    return evaluate_economic_quality(
+        plan,
+        available_capital=account_equity,
+        max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+    )
 
 
 def _assess_price_movement(snapshot, settings, market_intelligence=None):
