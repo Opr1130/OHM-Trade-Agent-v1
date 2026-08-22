@@ -115,8 +115,8 @@ def test_price_movement_delayed_scheduler_uses_exact_horizon_not_current_ticker(
 
         def get_ohlc(self, symbol, interval, since=None):
             return [
-                _candle(45, close=104.0),
-                _candle(60, close=105.0),
+                _candle(45, close=104.0),  # closes exactly at the 1h horizon
+                _candle(60, close=105.0),  # opens at horizon, closes 15m later
                 _candle(75, close=150.0),
             ]
 
@@ -127,6 +127,6 @@ def test_price_movement_delayed_scheduler_uses_exact_horizon_not_current_ticker(
     assert result["observations_added"] == 1
     row = movement_learning.get_price_movement_records()[0]
     observation = row["observations"]["1h"]
-    assert observation["price"] == 105.0
-    assert observation["directional_move_pct"] == pytest.approx(5.0)
+    assert observation["price"] == 104.0
+    assert observation["directional_move_pct"] == pytest.approx(4.0)
     assert observation["observed_at"] == (BASE + timedelta(hours=1)).isoformat()
