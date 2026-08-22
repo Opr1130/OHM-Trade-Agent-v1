@@ -78,8 +78,8 @@ def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float],
     baseline_win_rate = mean(_net_success(row) for row in rows)
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        buckets[f"direction:{str(row.get('direction') or 'UNKNOWN').upper()}"].append(row)
-        buckets[f"regime:{str(row.get('market_regime') or 'UNKNOWN').upper()}"].append(row)
+        buckets[f"direction:{str(row.get('direction') or 'UNKNOWN').upper()}"] .append(row)
+        buckets[f"regime:{str(row.get('market_regime') or 'UNKNOWN').upper()}"] .append(row)
     weights: dict[str, float] = {}
     evidence: dict[str, Any] = {}
     for name, bucket in buckets.items():
@@ -230,7 +230,7 @@ def build_profitability_profile(
     shadows = shadows if shadows is not None else get_shadow_records()
     financial_rows = _financial_trade_rows(outcomes)
     weights, trade_evidence = _trade_bucket_weights(financial_rows)
-    intelligence = build_market_intelligence_attribution(outcomes)
+    intelligence = build_market_intelligence_attribution(outcomes=outcomes, shadows=shadows)
     profile = {
         "generated_at": _now(),
         "version": "profitability-learning-v2",
