@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
+from app.services.compact_alerts import one_line_reason
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_notifier import send_telegram_message
 from app.services.trade_monitor import TradeMonitorResult
@@ -24,6 +25,15 @@ def _save_state(state: dict[str, str]) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def _stop_downside_pct(trade: ActiveTrade, current_price: float) -> float:
+    if current_price <= 0:
+        return 0.0
+    direction = str(trade.direction or "LONG").upper()
+    if direction == "SHORT":
+        return max(0.0, (float(trade.stop_price) / current_price - 1.0) * 100.0)
+    return max(0.0, (1.0 - float(trade.stop_price) / current_price) * 100.0)
+
+
 def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> str:
     icon = {
         "HOLD": "✅",
@@ -31,29 +41,16 @@ def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> st
         "TAKE_PROFIT": "🎯",
         "EXIT_NOW": "🛑",
     }.get(result.action, "ℹ️")
-    reasons = "\n".join(f"• {reason}" for reason in result.reasons)
-    pnl_note = ""
-    if result.net_pnl is not None:
-        pnl_note = (
-            f"Gross P/L: ${result.gross_pnl:.2f}\n"
-            f"Est. Trading Costs: ${result.estimated_total_costs:.2f}\n"
-            f"NET P/L: ${result.net_pnl:.2f} ({result.net_pnl_pct:.2f}%)\n"
-            f"Break-even Move: {result.break_even_move_pct:.3f}%\n"
-            f"Fee Basis: {result.fee_source}\n\n"
-        )
+    pnl_pct = result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct
+    downside = _stop_downside_pct(trade, float(result.current_price))
+    reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM AI — TRADE MONITOR\n\n"
-        f"Symbol: {trade.symbol}\n"
-        f"Action: {result.action.replace('_', ' ')}\n"
-        f"Risk: {trade.risk_level.upper()}\n\n"
-        f"Entry: {trade.entry_price}\n"
-        f"Current: {result.current_price}\n"
-        f"Price Move P/L: {result.unrealized_pct}%\n"
-        f"{pnl_note}"
-        f"Stop: {trade.stop_price}\n"
-        f"Target 1: {trade.target_1}\n"
-        f"Target 2: {trade.target_2}\n\n"
-        f"Reasons:\n{reasons}"
+        f"{icon} OHM TRADE — {trade.symbol}\n"
+        f"P/L: {float(pnl_pct):+.2f}%\n"
+        f"Risk: {trade.risk_level.upper()}\n"
+        f"Downside to stop: {downside:.1f}%\n"
+        f"Reason: {reason}\n"
+        f"Action: {result.action.replace('_', ' ')}"
     )
 
 
