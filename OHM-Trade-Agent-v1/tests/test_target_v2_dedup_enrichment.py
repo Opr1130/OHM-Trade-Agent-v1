@@ -32,7 +32,7 @@ def _isolate_registry(monkeypatch, data, saves):
     monkeypatch.setattr(shadow_learning, "_save", lambda payload: saves.append(payload.copy()))
 
 
-def test_dedup_backfills_target_v2_without_changing_original_measurement(monkeypatch):
+def test_dedup_skips_late_target_v2_enrichment_to_preserve_measurement_alignment(monkeypatch):
     row = _base_row()
     data = {row["record_key"]: row}
     saves = []
@@ -56,14 +56,15 @@ def test_dedup_backfills_target_v2_without_changing_original_measurement(monkeyp
     )
 
     stored = data[row["record_key"]]
-    assert stored["target_v2_shadow"] == target_v2
+    assert "target_v2_shadow" not in stored
     assert stored["reference_price"] == 100.0
     assert stored["observed_at"] == "2026-08-19T04:00:00+00:00"
     assert stored["observations"] == {"5m": {"directional_move_pct": 0.2}}
     assert stored["market_intelligence"] == {"assessment": {"context_score": 50}}
     assert result["deduplicated"] is True
-    assert result["dedup_enriched_fields"] == ["target_v2_shadow"]
-    assert saves
+    assert result["dedup_enrichment_skipped"] is True
+    assert "decision-time" in result["dedup_enrichment_reason"]
+    assert saves == []
 
 
 def test_dedup_does_not_overwrite_existing_target_v2(monkeypatch):
