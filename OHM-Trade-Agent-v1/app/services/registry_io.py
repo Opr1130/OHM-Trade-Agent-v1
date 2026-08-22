@@ -4,10 +4,26 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
+
+
+class RegistryIOError(RuntimeError):
+    """A persistent registry could not be read safely."""
+
+
+class RegistryCorruptionError(RegistryIOError):
+    """A registry contained malformed or structurally invalid JSON."""
+
+    def __init__(self, path: Path, quarantine_path: Path | None, reason: str) -> None:
+        self.path = path
+        self.quarantine_path = quarantine_path
+        self.reason = reason
+        location = f"; quarantined at {quarantine_path}" if quarantine_path else ""
+        super().__init__(f"Registry corruption at {path}: {reason}{location}")
 
 
 @contextmanager
@@ -53,17 +69,53 @@ def registry_lock(lock_file: Path, timeout: float = 10.0):
         handle.close()
 
 
+def _quarantine_corrupt_registry(path: Path) -> Path | None:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    quarantine = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, quarantine)
+        return quarantine
+    except OSError as exc:
+        logger.critical(
+            "Failed to quarantine corrupt registry %s: %s",
+            path,
+            exc,
+        )
+        return None
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        logger.error("Malformed registry JSON at %s: %s", path, exc)
-        return {}
+        raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.error("Registry read failed at %s: %s", path, exc)
-        return {}
+        logger.critical("Registry read failed at %s: %s", path, exc)
+        raise RegistryIOError(f"Registry read failed at {path}: {exc}") from exc
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        quarantine = _quarantine_corrupt_registry(path)
+        logger.critical(
+            "Malformed registry JSON at %s: %s; quarantine=%s",
+            path,
+            exc,
+            quarantine,
+        )
+        raise RegistryCorruptionError(path, quarantine, str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        quarantine = _quarantine_corrupt_registry(path)
+        reason = f"expected JSON object, got {type(payload).__name__}"
+        logger.critical(
+            "Structurally invalid registry at %s: %s; quarantine=%s",
+            path,
+            reason,
+            quarantine,
+        )
+        raise RegistryCorruptionError(path, quarantine, reason)
+    return payload
 
 
 def save_json_atomic(path: Path, data: dict) -> None:
@@ -75,7 +127,9 @@ def save_json_atomic(path: Path, data: dict) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
+            # Python's JSON encoder otherwise serializes NaN/Infinity even
+            # though those are not valid JSON and can poison learning/state.
+            json.dump(data, handle, indent=2, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
