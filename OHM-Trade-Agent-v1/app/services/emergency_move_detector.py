@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 from app.exchanges.kraken import KrakenClient
@@ -29,7 +30,12 @@ def detect_emergency_move(trade: ActiveTrade) -> EmergencyMoveResult:
     if len(candles_5m) < 4:
         raise ValueError("Not enough 5-minute candles for emergency monitoring")
 
-    closes = [c.close for c in candles_5m]
+    closes = [float(c.close) for c in candles_5m]
+    if not all(math.isfinite(value) and value > 0 for value in closes[-4:]):
+        raise ValueError(f"{trade.symbol}: emergency-monitor prices must be finite and positive")
+    if not math.isfinite(float(trade.stop_price)) or trade.stop_price <= 0:
+        raise ValueError(f"{trade.symbol}: stop price must be finite and positive")
+
     current = closes[-1]
     five_minutes_ago = closes[-2]
     fifteen_minutes_ago = closes[-4]
