@@ -24,10 +24,12 @@ def test_shadow_learning_records_multi_horizon_directional_outcomes(monkeypatch,
         def get_ohlc(self, pair, interval=5, since=None):
             assert pair == "ABCUSD"
             assert interval == 5
+            # Kraken timestamps bars by OPEN. These bars close exactly at the
+            # 5m, 15m and 30m due horizons respectively.
             return [
-                Candle(int((start + timedelta(minutes=5)).timestamp()), 100, 105, 100, 105, 103, 10, 10),
-                Candle(int((start + timedelta(minutes=15)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
-                Candle(int((start + timedelta(minutes=30)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
+                Candle(int(start.timestamp()), 100, 105, 100, 105, 105, 10, 10),
+                Candle(int((start + timedelta(minutes=10)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
+                Candle(int((start + timedelta(minutes=25)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
             ]
 
     result = shadow.observe_due_shadows(client=FakeClient(), now=start + timedelta(minutes=31))
@@ -137,18 +139,9 @@ def test_profitability_profile_uses_actual_net_pnl_and_bounded_weights(monkeypat
 
 def test_shadow_quality_counts_correct_rejects_and_missed_profit():
     shadows = [
-        {
-            "decision": "WAIT",
-            "observations": {"24h": {"directional_move_pct": 4.0}},
-        },
-        {
-            "decision": "REJECT",
-            "observations": {"24h": {"directional_move_pct": -3.0}},
-        },
-        {
-            "decision": "ENTER_NOW",
-            "observations": {"24h": {"directional_move_pct": 2.0}},
-        },
+        {"decision": "WAIT", "observations": {"24h": {"directional_move_pct": 4.0}}},
+        {"decision": "REJECT", "observations": {"24h": {"directional_move_pct": -3.0}}},
+        {"decision": "ENTER_NOW", "observations": {"24h": {"directional_move_pct": 2.0}}},
     ]
     result = learning.build_profitability_profile(outcomes=[], executions=[], shadows=shadows, persist=False)
     metrics = result["shadow_learning"]
@@ -159,29 +152,10 @@ def test_shadow_quality_counts_correct_rejects_and_missed_profit():
 
 
 def test_timing_learning_compares_profitable_and_losing_fills():
-    outcomes = [
-        _outcome(1, pnl=10.0),
-        _outcome(2, pnl=-5.0),
-    ]
+    outcomes = [_outcome(1, pnl=10.0), _outcome(2, pnl=-5.0)]
     executions = [
-        {
-            "trade_id": "T1",
-            "idea_to_order_seconds": 30.0,
-            "order_to_first_fill_seconds": 20.0,
-            "fill_vs_limit_pct": 0.1,
-            "holding_seconds": 3600.0,
-            "quantity": 10.0,
-            "fill_price": 10.0,
-        },
-        {
-            "trade_id": "T2",
-            "idea_to_order_seconds": 300.0,
-            "order_to_first_fill_seconds": 200.0,
-            "fill_vs_limit_pct": 1.0,
-            "holding_seconds": 7200.0,
-            "quantity": 10.0,
-            "fill_price": 10.0,
-        },
+        {"trade_id": "T1", "idea_to_order_seconds": 30.0, "order_to_first_fill_seconds": 20.0, "fill_vs_limit_pct": 0.1, "holding_seconds": 3600.0, "quantity": 10.0, "fill_price": 10.0},
+        {"trade_id": "T2", "idea_to_order_seconds": 300.0, "order_to_first_fill_seconds": 200.0, "fill_vs_limit_pct": 1.0, "holding_seconds": 7200.0, "quantity": 10.0, "fill_price": 10.0},
     ]
     result = learning.build_profitability_profile(outcomes=outcomes, executions=executions, shadows=[], persist=False)
     timing = result["timing_learning"]
