@@ -24,7 +24,7 @@ from app.services.trade_outcome_registry import get_outcomes
 PROFILE_FILE = Path("/app/data/strategy_calibration_profile.json")
 LOCK_FILE = PROFILE_FILE.parent / ".strategy_calibration_profile.lock"
 MIN_TRADE_SAMPLES = 30
-MIN_BUCKET_SAMPLES = 8
+MIN_BUCKET_SAMPLES = 30
 MIN_SHADOW_SAMPLES = 12
 MAX_WEIGHT_ADJUSTMENT = 0.15
 MAX_TIMING_ADJUSTMENT = 0.12
@@ -102,6 +102,7 @@ def _trade_bucket_weights(rows: list[dict[str, Any]]) -> tuple[dict[str, float],
         "baseline_net_win_rate": round(baseline_win_rate, 4),
         "baseline_avg_net_pnl": round(baseline_expectancy, 8),
         "objective": "realized_net_pnl_expectancy_after_costs",
+        "minimum_bucket_samples": MIN_BUCKET_SAMPLES,
         "evidence": evidence,
     }
 
@@ -228,42 +229,29 @@ def build_profitability_profile(
     executions = executions if executions is not None else get_execution_records()
     shadows = shadows if shadows is not None else get_shadow_records()
     financial_rows = _financial_trade_rows(outcomes)
-    weights, calibration = _trade_bucket_weights(financial_rows)
-    shadow = _shadow_quality(shadows)
-    timing = _timing_metrics(executions, outcomes)
-    loss_learning = _loss_learning(financial_rows)
-    market_intelligence_attribution = build_market_intelligence_attribution(
-        outcomes=outcomes,
-        shadows=shadows,
-    )
-
-    version = _now()
+    weights, trade_evidence = _trade_bucket_weights(financial_rows)
+    intelligence = build_market_intelligence_attribution(outcomes)
     profile = {
-        "schema_version": 2,
-        "generated_at": version,
-        "objective": "maximize_realized_net_profit_after_costs_with_bounded_risk",
+        "generated_at": _now(),
+        "version": "profitability-learning-v2",
+        "objective": "maximize realized net P/L expectancy after known costs while preserving hard risk rules",
         "paid_ai_calls": 0,
-        "trade_calibration": calibration,
+        "trade_calibration": trade_evidence,
+        "shadow_learning": _shadow_quality(shadows),
+        "timing_learning": _timing_metrics(executions, outcomes),
+        "loss_learning": _loss_learning(financial_rows),
+        "market_intelligence_attribution": intelligence,
         "weights": weights,
-        "shadow_learning": shadow,
-        "timing_learning": timing,
-        "loss_learning": loss_learning,
-        "market_intelligence_attribution": market_intelligence_attribution,
         "guardrails": {
+            "max_live_weight_adjustment": MAX_WEIGHT_ADJUSTMENT,
             "minimum_trade_samples": MIN_TRADE_SAMPLES,
             "minimum_bucket_samples": MIN_BUCKET_SAMPLES,
-            "minimum_shadow_samples": MIN_SHADOW_SAMPLES,
-            "max_weight_adjustment": MAX_WEIGHT_ADJUSTMENT,
             "hard_risk_rules_mutable": False,
-            "ai_can_rewrite_code": False,
-            "leverage_mutable": False,
-            "minimum_market_intelligence_trade_samples": MIN_INTELLIGENCE_TRADE_SAMPLES,
-            "minimum_market_intelligence_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
-            "max_market_intelligence_weight_adjustment": MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
-            "market_intelligence_combined_multiplier_min": MIN_INTELLIGENCE_MULTIPLIER,
-            "market_intelligence_combined_multiplier_max": MAX_INTELLIGENCE_MULTIPLIER,
-            "market_intelligence_auto_promotion": False,
-            "market_intelligence_human_review_required": True,
+            "automatic_gate_or_threshold_changes": False,
+            "market_intelligence_max_combined_multiplier": MAX_INTELLIGENCE_MULTIPLIER,
+            "market_intelligence_max_weight_adjustment": MAX_INTELLIGENCE_WEIGHT_ADJUSTMENT,
+            "market_intelligence_min_actual_trade_samples": MIN_INTELLIGENCE_TRADE_SAMPLES,
+            "market_intelligence_min_actual_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
         },
     }
     if persist:
@@ -272,21 +260,17 @@ def build_profitability_profile(
     return profile
 
 
-def get_profitability_profile() -> dict[str, Any]:
-    with registry_lock(LOCK_FILE):
-        return load_json(PROFILE_FILE)
-
-
 def learned_multiplier(*, direction: str, regime: str | None) -> float:
-    profile = get_profitability_profile()
-    calibration = profile.get("trade_calibration") or {}
-    if calibration.get("status") != "CALIBRATED":
+    try:
+        with registry_lock(LOCK_FILE):
+            profile = load_json(PROFILE_FILE)
+    except (OSError, TimeoutError):
         return 1.0
     weights = profile.get("weights") or {}
-    values = [float(weights.get(f"direction:{direction.upper()}", 1.0))]
+    values = [weights.get(f"direction:{direction.upper()}", 1.0)]
     if regime:
-        values.append(float(weights.get(f"regime:{regime.upper()}", 1.0)))
-    product = 1.0
+        values.append(weights.get(f"regime:{regime.upper()}", 1.0))
+    result = 1.0
     for value in values:
-        product *= value
-    return round(max(0.75, min(1.25, product)), 4)
+        result *= float(value)
+    return round(max(0.75, min(1.25, result)), 4)
