@@ -49,11 +49,11 @@ def format_pending_setup_message(
     elif result.status == "INVALIDATED":
         icon = "🔴"
         title = "OHM SETUP INVALID"
-        action = "DO NOT ENTER — Cancel any open Kraken order manually"
+        action = "DO NOT ENTER — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
     elif result.status == "TOO_EXTENDED":
         icon = "⚠️"
         title = "OHM DO NOT CHASE"
-        action = "WAIT FOR NEW SETUP — Cancel any open Kraken order manually"
+        action = "WAIT — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
     else:
         icon = "ℹ️"
         title = "OHM SETUP UPDATE"
