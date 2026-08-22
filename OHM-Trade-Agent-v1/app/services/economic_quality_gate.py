@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 
-from app.core.config import get_settings
+from app.core.runtime_environment import conservative_runtime
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
@@ -39,26 +39,16 @@ def _invalid_result(direction: str, leverage: float, reason: str) -> EconomicGat
     )
 
 
-def _conservative_runtime() -> bool:
-    """Return False only for explicitly configured development/test runtimes."""
-    try:
-        app_env = (get_settings().app_env or "").strip().lower()
-    except Exception:
-        return True
-    return app_env not in {"development", "dev", "test", "testing"}
-
-
 def _resolved_capital_fraction(value: float | None) -> float:
-    """Use the live 20% envelope unless a reusable caller opts out explicitly.
+    """Use the live 20% envelope in conservative runtimes.
 
-    Direct callers may pass a fraction. When omitted, only an explicitly
-    configured development/test runtime keeps the historical 100% sandbox
-    behavior; unknown/staging/production environments fail conservatively to
-    the same 20% envelope used by live allocation.
+    Runtime mode is read through a tiny uncached pydantic-settings model so it
+    follows the same `.env` semantics as the application without depending on
+    unrelated secret validation or a stale cached Settings object.
     """
     if value is not None:
         return float(value)
-    return PRODUCTION_MAX_CAPITAL_FRACTION if _conservative_runtime() else DEFAULT_MAX_CAPITAL_FRACTION
+    return PRODUCTION_MAX_CAPITAL_FRACTION if conservative_runtime() else DEFAULT_MAX_CAPITAL_FRACTION
 
 
 def evaluate_economic_quality(
