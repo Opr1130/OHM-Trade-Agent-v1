@@ -63,6 +63,12 @@ def _ttl_hours() -> int:
 
 
 def add_pending_setup(setup: PendingSetup) -> PendingSetup:
+    """Persist each setup by immutable trade_id, not mutable market symbol.
+
+    Existing symbol-keyed rows remain readable during migration. New rows use
+    trade_id so a second opportunity on the same market cannot orphan the first
+    setup/outcome lifecycle.
+    """
     setup.direction = (setup.direction or "LONG").upper()
     with registry_lock(registry_lock_file()):
         data = _load_raw()
@@ -73,9 +79,7 @@ def add_pending_setup(setup: PendingSetup) -> PendingSetup:
         if not setup.expires_at:
             created = _parse(setup.created_at) or datetime.now(timezone.utc)
             setup.expires_at = (created + timedelta(hours=_ttl_hours())).isoformat()
-        # Preserve historical symbol-keyed storage for compatibility. trade_id
-        # is the canonical lifecycle identity used by terminal transitions.
-        data[setup.symbol] = asdict(setup)
+        data[setup.trade_id] = asdict(setup)
         _save_raw(data)
     return setup
 
@@ -182,10 +186,16 @@ def mark_pending_setup_entered(trade_id: str) -> bool:
 
 
 def remove_pending_setup(symbol: str) -> bool:
+    """Backward-compatible symbol cleanup; remove every row for that market."""
     with registry_lock(registry_lock_file()):
         data = _load_raw()
-        if symbol not in data:
+        keys = [
+            key for key, item in data.items()
+            if key == symbol or str(item.get("symbol") or "").upper() == symbol.upper()
+        ]
+        if not keys:
             return False
-        del data[symbol]
+        for key in keys:
+            del data[key]
         _save_raw(data)
         return True
