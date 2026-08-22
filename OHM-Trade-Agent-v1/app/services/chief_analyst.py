@@ -18,7 +18,10 @@ from app.services.chief_runtime_guard import (
     get_cached_review,
     store_cached_review,
 )
-from app.services.economic_quality_gate import evaluate_economic_quality
+from app.services.economic_quality_gate import (
+    PRODUCTION_MAX_CAPITAL_FRACTION,
+    evaluate_economic_quality,
+)
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
 from app.services.short_target_attainability import evaluate_short_target_attainability
@@ -104,6 +107,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
             economic = evaluate_economic_quality(
                 plan,
                 account_equity,
+                max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
                 direction="SHORT",
                 leverage=SHORT_VALIDATION_LEVERAGE,
                 estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
@@ -111,7 +115,11 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
             )
         else:
             target = evaluate_target_attainability(plan, candidate)
-            economic = evaluate_economic_quality(plan, account_equity)
+            economic = evaluate_economic_quality(
+                plan,
+                account_equity,
+                max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            )
         viable = target.qualified and economic.qualified
         viable_any = viable_any or viable
         quality_by_risk_level[risk_level] = {
