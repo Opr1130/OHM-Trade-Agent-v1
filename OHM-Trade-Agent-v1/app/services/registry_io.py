@@ -108,8 +108,10 @@ def _first_nonfinite_path(value: Any, path: str = "$") -> str | None:
 
 def _raise_corrupt(path: Path, reason: str, exc: Exception | None = None) -> None:
     quarantine = _quarantine_corrupt_registry(path)
+    # Keep the historical log phrase so operators/tests have one searchable
+    # corruption signature for syntax, structure and legacy non-finite state.
     logger.critical(
-        "Invalid registry JSON at %s: %s; quarantine=%s",
+        "Malformed registry JSON at %s: %s; quarantine=%s",
         path,
         reason,
         quarantine,
@@ -152,8 +154,6 @@ def save_json_atomic(path: Path, data: dict) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            # Python's JSON encoder otherwise serializes NaN/Infinity even
-            # though those are not valid JSON and can poison learning/state.
             json.dump(data, handle, indent=2, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
