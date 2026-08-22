@@ -19,6 +19,8 @@ CRITICAL_EVENTS = {
     "FILLED",
     "TAKE_PROFIT",
     "EXIT_NOW",
+    "INVALIDATED",
+    "TOO_EXTENDED",
 }
 
 
