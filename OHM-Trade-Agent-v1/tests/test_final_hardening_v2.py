@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -9,8 +10,13 @@ from app.core.config import get_settings
 from app.core.runtime_environment import conservative_runtime
 from app.exchanges.kraken_identity import balance_quantity_for_asset, canonicalize_pair
 from app.indicators.technical import volume_ratio
-from app.jobs import run_cycle
-from app.services import active_trade_registry, pending_setup_registry
+from app.jobs import run_cycle, scan_opportunities
+from app.services import (
+    active_trade_registry,
+    order_intent_registry,
+    pending_setup_registry,
+    trade_outcome_registry,
+)
 from app.services.economic_quality_gate import PRODUCTION_MAX_CAPITAL_FRACTION
 from app.services.pending_setup_registry import PendingSetup
 from app.services.target_attainability import _conservative_runtime
@@ -57,6 +63,26 @@ def test_missing_app_env_defaults_to_conservative_runtime(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("APP_ENV", raising=False)
     assert conservative_runtime() is True
+
+
+@pytest.mark.parametrize("direction", ["LONG", "SHORT"])
+def test_scan_alert_economic_gate_uses_twenty_percent_capital_envelope(monkeypatch, direction):
+    calls: list[dict] = []
+
+    def fake_economic_quality(plan, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(qualified=True)
+
+    monkeypatch.setattr(scan_opportunities, "evaluate_economic_quality", fake_economic_quality)
+    snapshot = SimpleNamespace(trade_direction=direction)
+
+    scan_opportunities._economic_quality(SimpleNamespace(), snapshot, 10_000.0)
+
+    assert len(calls) == 1
+    assert calls[0]["available_capital"] == pytest.approx(10_000.0)
+    assert calls[0]["max_capital_fraction"] == pytest.approx(PRODUCTION_MAX_CAPITAL_FRACTION)
+    if direction == "SHORT":
+        assert calls[0]["direction"] == "SHORT"
 
 
 class _TickerOnlyClient:
@@ -112,6 +138,29 @@ def test_symbol_confirmation_refuses_ambiguity_when_multiple_setups_exist(tmp_pa
 
     with pytest.raises(ValueError, match="confirm by trade_id"):
         confirm_entry_module.confirm_entry("BTCUSD", 100.0)
+
+
+def test_terminal_tombstone_does_not_clobber_different_legacy_waiting_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(pending_setup_registry, "PENDING_FILE", tmp_path / "pending.json")
+    monkeypatch.setattr(order_intent_registry, "get_order_intent", lambda trade_id: None)
+    monkeypatch.setattr(trade_outcome_registry, "terminalize_setup_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pending_setup_registry, "trace_candidate_event", lambda *args, **kwargs: None)
+
+    legacy = _setup("T-LEGACY")
+    modern = _setup("T-NEW")
+    pending_setup_registry._save_raw(
+        {
+            "BTCUSD": asdict(legacy),
+            "T-NEW": asdict(modern),
+        }
+    )
+
+    assert pending_setup_registry.terminalize_pending_setup("T-NEW", "skipped") is True
+    raw = pending_setup_registry._load_raw()
+
+    assert raw["BTCUSD"]["trade_id"] == "T-LEGACY"
+    assert raw["BTCUSD"]["status"] == "waiting"
+    assert raw["T-NEW"]["status"] == "skipped"
 
 
 def test_unified_cycle_runs_active_monitor_when_operator_state_is_corrupt(monkeypatch):
