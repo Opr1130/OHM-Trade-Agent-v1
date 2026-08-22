@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,11 +60,7 @@ class ProfitRankingResult:
     strengths: list[str]
     warnings: list[str]
     measured_execution_drag_pct: float | None = None
-    _unrounded_total_score: float = field(
-        default=0.0,
-        repr=False,
-        compare=False,
-    )
+    _unrounded_total_score: float = field(default=0.0, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -83,18 +80,24 @@ class RankedOpportunity:
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    value = float(value)
+    if not math.isfinite(value):
+        return minimum
     return max(minimum, min(maximum, value))
 
 
-def _economic_score(economic: EconomicGateResult) -> float:
-    return (
-        _clamp(economic.target_2_move_pct / ECONOMIC_FULL_CREDIT_MOVE_PCT)
-        * ECONOMIC_WEIGHT
-    )
+def _economic_score(economic: EconomicGateResult) -> tuple[float, str | None]:
+    move = float(economic.target_2_move_pct)
+    if not math.isfinite(move):
+        return 0.0, "Economic target move is non-finite; no economic ranking points awarded"
+    return _clamp(move / ECONOMIC_FULL_CREDIT_MOVE_PCT) * ECONOMIC_WEIGHT, None
 
 
-def _target_score(target: TargetAttainabilityResult) -> float:
-    return _clamp(target.attainability_score / 100.0) * TARGET_QUALITY_WEIGHT
+def _target_score(target: TargetAttainabilityResult) -> tuple[float, str | None]:
+    score = float(target.attainability_score)
+    if not math.isfinite(score):
+        return 0.0, "Target attainability score is non-finite; no target ranking points awarded"
+    return _clamp(score / 100.0) * TARGET_QUALITY_WEIGHT, None
 
 
 def _execution_score(snapshot: MarketSnapshot) -> tuple[float, list[str], list[str]]:
@@ -110,17 +113,19 @@ def _execution_score(snapshot: MarketSnapshot) -> tuple[float, list[str], list[s
     if drag is None:
         drag_points = MISSING_EXECUTION_DRAG_POINTS
         warnings.append("Measured round-trip execution drag is unavailable")
+    elif not math.isfinite(float(drag)):
+        drag_points = 0.0
+        warnings.append("Measured round-trip execution drag is non-finite; no drag points awarded")
+    elif drag < 0:
+        drag_points = 0.0
+        warnings.append("Measured round-trip execution drag is invalid; no drag points awarded")
     else:
-        drag_points = _clamp(
-            1.0 - drag / EXECUTION_DRAG_FULL_PENALTY_PCT
-        ) * 12.0
+        drag_points = _clamp(1.0 - drag / EXECUTION_DRAG_FULL_PENALTY_PCT) * 12.0
         strengths.append("Measured round-trip execution drag is available")
         if drag >= EXECUTION_DRAG_FULL_PENALTY_PCT:
             warnings.append("Measured round-trip execution drag earns no points")
 
-    coverage_points = BOOK_COVERAGE_POINTS.get(
-        execution.book_coverage_status, 0.0
-    )
+    coverage_points = BOOK_COVERAGE_POINTS.get(execution.book_coverage_status, 0.0)
     if execution.book_coverage_status == "COMPLETE":
         strengths.append("Visible book coverage is complete")
     elif execution.book_coverage_status != "PARTIAL":
@@ -140,8 +145,11 @@ def _execution_score(snapshot: MarketSnapshot) -> tuple[float, list[str], list[s
     return score, strengths, warnings
 
 
-def _technical_score(snapshot: MarketSnapshot) -> float:
-    return _clamp(snapshot.technical_score / 100.0) * TECHNICAL_QUALITY_WEIGHT
+def _technical_score(snapshot: MarketSnapshot) -> tuple[float, str | None]:
+    score = float(snapshot.technical_score)
+    if not math.isfinite(score):
+        return 0.0, "Technical score is non-finite; no technical ranking points awarded"
+    return _clamp(score / 100.0) * TECHNICAL_QUALITY_WEIGHT, None
 
 
 def _evidence_score(snapshot: MarketSnapshot) -> tuple[float, list[str], list[str]]:
@@ -158,9 +166,7 @@ def _evidence_score(snapshot: MarketSnapshot) -> tuple[float, list[str], list[st
     else:
         warnings.append("Independent CoinGecko identity is not uniquely corroborated")
 
-    cross_pair_points = CROSS_PAIR_POINTS.get(
-        snapshot.cross_pair_confirmation_status, 0.0
-    )
+    cross_pair_points = CROSS_PAIR_POINTS.get(snapshot.cross_pair_confirmation_status, 0.0)
     if snapshot.cross_pair_confirmation_status == "CONFIRMED":
         strengths.append("Kraken cross-pair evidence is confirmed")
     elif snapshot.cross_pair_confirmation_status == "SINGLE_MARKET":
@@ -177,33 +183,27 @@ def evaluate_profit_ranking(
     economic_quality: EconomicGateResult,
 ) -> ProfitRankingResult:
     """Score one survivor without recalculating or overriding existing gates."""
-    economic_score = _economic_score(economic_quality)
-    target_score = _target_score(target_quality)
-    execution_score, execution_strengths, execution_warnings = _execution_score(
-        snapshot
-    )
-    technical_score = _technical_score(snapshot)
+    economic_score, economic_warning = _economic_score(economic_quality)
+    target_score, target_warning = _target_score(target_quality)
+    execution_score, execution_strengths, execution_warnings = _execution_score(snapshot)
+    technical_score, technical_warning = _technical_score(snapshot)
     evidence_score, evidence_strengths, evidence_warnings = _evidence_score(snapshot)
     unrounded_total = _clamp(
-        economic_score
-        + target_score
-        + execution_score
-        + technical_score
-        + evidence_score,
+        economic_score + target_score + execution_score + technical_score + evidence_score,
         minimum=0.0,
         maximum=100.0,
     )
     strengths = execution_strengths + evidence_strengths
     warnings = execution_warnings + evidence_warnings
+    for warning in (economic_warning, target_warning, technical_warning):
+        if warning:
+            warnings.append(warning)
     if economic_score == ECONOMIC_WEIGHT:
         strengths.append("Target 2 move earns maximum economic-opportunity points")
 
     execution = snapshot.execution_validation
-    drag = (
-        execution.estimated_visible_round_trip_market_drag_pct
-        if execution is not None
-        else None
-    )
+    raw_drag = execution.estimated_visible_round_trip_market_drag_pct if execution is not None else None
+    drag = raw_drag if raw_drag is not None and math.isfinite(float(raw_drag)) else None
     return ProfitRankingResult(
         symbol=snapshot.symbol,
         total_score=round(unrounded_total, 2),
@@ -219,59 +219,35 @@ def evaluate_profit_ranking(
     )
 
 
-def _ranking_key(
-    opportunity: QualifiedOpportunity,
-    result: ProfitRankingResult,
-) -> tuple[Any, ...]:
+def _ranking_key(opportunity: QualifiedOpportunity, result: ProfitRankingResult) -> tuple[Any, ...]:
     drag = result.measured_execution_drag_pct
+    target_score = float(opportunity.target_quality.attainability_score)
+    technical_score = float(opportunity.snapshot.technical_score)
     return (
         -result._unrounded_total_score,
-        -opportunity.target_quality.attainability_score,
+        -(target_score if math.isfinite(target_score) else 0.0),
         drag is None,
         drag if drag is not None else float("inf"),
-        -opportunity.snapshot.technical_score,
+        -(technical_score if math.isfinite(technical_score) else 0.0),
         result.symbol,
     )
 
 
-def _attach_outcome_metadata(
-    opportunity: QualifiedOpportunity,
-) -> None:
+def _attach_outcome_metadata(opportunity: QualifiedOpportunity) -> None:
     """Expose already-computed facts for later outcome capture; no new scoring."""
-    opportunity.alert.setdefault(
-        "technical_score", opportunity.snapshot.technical_score
-    )
-    opportunity.alert.setdefault(
-        "target_attainability_score",
-        opportunity.target_quality.attainability_score,
-    )
-    opportunity.alert.setdefault(
-        "target_quality_qualified", opportunity.target_quality.qualified
-    )
-    opportunity.alert.setdefault(
-        "economic_qualified", opportunity.economic_quality.qualified
-    )
-    opportunity.alert.setdefault(
-        "economic_target_2_move_pct",
-        opportunity.economic_quality.target_2_move_pct,
-    )
-    opportunity.alert.setdefault(
-        "economic_validation_net_t2",
-        opportunity.economic_quality.target_2_net_profit,
-    )
+    opportunity.alert.setdefault("technical_score", opportunity.snapshot.technical_score)
+    opportunity.alert.setdefault("target_attainability_score", opportunity.target_quality.attainability_score)
+    opportunity.alert.setdefault("target_quality_qualified", opportunity.target_quality.qualified)
+    opportunity.alert.setdefault("economic_qualified", opportunity.economic_quality.qualified)
+    opportunity.alert.setdefault("economic_target_2_move_pct", opportunity.economic_quality.target_2_move_pct)
+    opportunity.alert.setdefault("economic_validation_net_t2", opportunity.economic_quality.target_2_net_profit)
 
 
-def rank_profit_opportunities(
-    opportunities: list[QualifiedOpportunity],
-) -> list[RankedOpportunity]:
+def rank_profit_opportunities(opportunities: list[QualifiedOpportunity]) -> list[RankedOpportunity]:
     scored = []
     for opportunity in opportunities:
         _attach_outcome_metadata(opportunity)
-        result = evaluate_profit_ranking(
-            opportunity.snapshot,
-            opportunity.target_quality,
-            opportunity.economic_quality,
-        )
+        result = evaluate_profit_ranking(opportunity.snapshot, opportunity.target_quality, opportunity.economic_quality)
         scored.append((opportunity, result))
     scored.sort(key=lambda item: _ranking_key(item[0], item[1]))
     return [
