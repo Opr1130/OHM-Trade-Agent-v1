@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
+from app.services.compact_alerts import one_line_reason
 from app.services.emergency_move_detector import EmergencyMoveResult
 from app.services.telegram_notifier import send_telegram_message
 
@@ -35,30 +36,19 @@ def format_emergency_message(
     result: EmergencyMoveResult,
 ) -> str:
     icon = "🛑" if result.severity == "critical" else "⚠️"
-
-    reasons = "\n".join(
-        f"• {reason}"
-        for reason in result.reasons
-    )
-
     action = (
-        "CLOSE / REDUCE POSITION NOW"
+        "CLOSE / REDUCE NOW"
         if result.severity == "critical"
-        else "REVIEW POSITION IMMEDIATELY"
+        else "REVIEW POSITION NOW"
     )
-
+    reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM AI — EMERGENCY RISK ALERT\n\n"
-        f"Symbol: {trade.symbol}\n"
-        f"Severity: {result.severity.upper()}\n"
-        f"Action: {action}\n\n"
-        f"Entry: {trade.entry_price}\n"
-        f"Current: {result.current_price}\n"
-        f"Stop: {trade.stop_price}\n\n"
-        f"5m Change: {result.change_5m_pct}%\n"
-        f"15m Change: {result.change_15m_pct}%\n"
-        f"Distance to Stop: {result.stop_distance_pct}%\n\n"
-        f"Reasons:\n{reasons}"
+        f"{icon} OHM RISK — {trade.symbol}\n"
+        f"Risk: {result.severity.upper()}\n"
+        f"Distance to stop: {float(result.stop_distance_pct):.1f}%\n"
+        f"5m / 15m: {float(result.change_5m_pct):+.1f}% / {float(result.change_15m_pct):+.1f}%\n"
+        f"Reason: {reason}\n"
+        f"Action: {action}"
     )
 
 
