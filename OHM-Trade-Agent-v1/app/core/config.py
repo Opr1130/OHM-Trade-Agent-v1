@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_enabled: bool = False
+    # Optional second boundary for group chats. When set, Telegram commands
+    # and lifecycle callback buttons are accepted only from this Telegram user
+    # inside the already-configured chat.
+    telegram_command_user_id: str | None = None
+    telegram_command_rate_limit_per_minute: int = Field(default=12, ge=1, le=60)
 
     # PRICE_MOVEMENT_MODE: off disables the radar, shadow records evidence and
     # outcomes without messages, alert additionally permits non-actionable
