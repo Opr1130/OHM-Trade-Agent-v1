@@ -40,7 +40,8 @@ def _best_signal_reason(signal) -> str:
         reasons.append("move already extended")
     if signal.liquidity_24h_usd_approx < 250_000:
         reasons.append("liquidity needs caution")
-    return one_line_reason(" + ".join(reasons), *signal.reasons)
+    fallback_reasons = getattr(signal, "reasons", ()) or ()
+    return one_line_reason(" + ".join(reasons), *fallback_reasons)
 
 
 def _compact_card(signal) -> str:
