@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 from app.exchanges.kraken import KrakenClient
@@ -21,16 +22,44 @@ class TradeMonitorResult:
     fee_source: str | None = None
 
 
+def _require_finite_trade_geometry(trade: ActiveTrade) -> None:
+    values = (
+        trade.entry_price,
+        trade.stop_price,
+        trade.target_1,
+        trade.target_2,
+        trade.margin_leverage,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError(f"{trade.symbol}: active trade geometry contains non-finite values")
+    if min(float(trade.entry_price), float(trade.stop_price), float(trade.target_1), float(trade.target_2)) <= 0:
+        raise ValueError(f"{trade.symbol}: active trade geometry contains non-positive prices")
+
+
 def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
+    _require_finite_trade_geometry(trade)
     client = KrakenClient()
     candles = client.get_ohlc(trade.symbol, interval=60)
-    closes = [c.close for c in candles]
-    volumes = [c.volume for c in candles]
+    if len(candles) < 36:
+        raise ValueError(f"{trade.symbol}: insufficient OHLC history for active-trade monitoring")
+
+    closes = [float(c.close) for c in candles]
+    volumes = [float(c.volume) for c in candles]
+    if not all(math.isfinite(value) and value > 0 for value in closes):
+        raise ValueError(f"{trade.symbol}: OHLC close data must be finite and positive")
+    if not all(math.isfinite(value) and value >= 0 for value in volumes):
+        raise ValueError(f"{trade.symbol}: OHLC volume data must be finite and non-negative")
+
     current_price = closes[-1]
-    ema20_value = ema(closes, 20)
-    rsi_value = rsi(closes, 14)
-    macd_line, macd_signal, _ = macd(closes)
-    vol_ratio = volume_ratio(volumes, 20)
+    # Current price is live monitoring evidence; technical corroboration is
+    # intentionally based on completed bars so a partial 1H candle cannot
+    # repaint EMA/MACD/RSI state while the monitor is running.
+    completed_closes = closes[:-1]
+    completed_volumes = volumes[:-1]
+    ema20_value = ema(completed_closes, 20)
+    rsi_value = rsi(completed_closes, 14)
+    macd_line, macd_signal, _ = macd(completed_closes)
+    vol_ratio = volume_ratio(completed_volumes, 20)
     direction = (trade.direction or "LONG").upper()
 
     raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
@@ -49,13 +78,6 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             action = "TAKE_PROFIT"
             reasons.append("Short Target 1 reached")
 
-        # A single fast 1H oscillator flip (EMA20 reclaim, MACD cross, RSI
-        # swing) is common noise inside a still-intact trend and can fire
-        # while the trade is still comfortably profitable. Require at least
-        # two independent signals to corroborate each other before this
-        # escalates to a WARNING that looks like a reason to exit early.
-        # Single flips are still surfaced for visibility, just not as an
-        # actionable warning.
         weak_signals: list[str] = []
         if current_price > ema20_value:
             weak_signals.append("Price reclaimed EMA20 against short")
@@ -106,6 +128,8 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
 
     pnl = None
     if trade.capital is not None and trade.capital > 0:
+        if not math.isfinite(float(trade.capital)):
+            raise ValueError(f"{trade.symbol}: capital must be finite")
         pnl = calculate_fee_aware_pnl(
             direction=direction,
             entry_price=trade.entry_price,
