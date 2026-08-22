@@ -105,13 +105,7 @@ def _enrich_deduplicated_shadow(
     target_v2_shadow: dict[str, Any] | None,
     updated_at: str,
 ) -> dict[str, Any]:
-    """Return the original immutable decision row without hindsight backfill.
-
-    Earlier code attached a Target-v2 feature vector computed at T+delta to a
-    record whose reference price/outcomes started at T. That contaminated the
-    future Target-v2 hit-rate summary. Dedup now preserves the old row exactly;
-    a later scan must wait for a new cooldown bucket to create a new observation.
-    """
+    """Return the original immutable decision row without hindsight backfill."""
     result = dict(existing)
     result["deduplicated"] = True
     result["dedup_cooldown_seconds"] = SHADOW_DEDUP_SECONDS
@@ -286,3 +280,8 @@ def observe_due_shadows(
             "observations_added": observations_added,
             "unavailable_horizons": unavailable,
         }
+
+
+def get_shadow_records() -> list[dict[str, Any]]:
+    with registry_lock(LOCK_FILE):
+        return [dict(row) for row in _load().values()]
