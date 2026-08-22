@@ -33,7 +33,7 @@ def _best_signal_reason(signal) -> str:
     if str(signal.momentum_state).upper() == "ACCELERATING":
         reasons.append("Momentum accelerating")
     if signal.relative_volume >= 1.5:
-        reasons.append(f"volume expanding {signal.relative_volume:.1f}x")
+        reasons.append(f"Volume expanding {signal.relative_volume:.1f}x")
     if signal.distance_to_24h_high_pct <= 1.5:
         reasons.append("holding near the 24h high")
     if signal.extended_move:
@@ -57,16 +57,14 @@ def _compact_card(signal) -> str:
         if str(signal.entry_recommendation).upper() == "BREAKOUT_ENTRY_POSSIBLE"
         else "WATCH FOR PULLBACK"
     )
-    return format_watch_alert(
-        symbol=signal.symbol,
-        potential_low_pct=low,
-        potential_high_pct=high,
-        confidence_pct=signal.continuation_confidence,
-        risk_pct=risk,
-        downside_pct=downside,
-        reason=_best_signal_reason(signal),
-        action=action,
-        title="OHM OPPORTUNITY",
+    return (
+        f"🚀 OHM OPPORTUNITY — {signal.symbol} — {signal.stage}\n"
+        f"Potential: +{low}% to +{high}%\n"
+        f"Confidence*: {signal.continuation_confidence}% | Risk*: {risk}%\n"
+        f"Downside if wrong*: up to -{downside}%\n"
+        f"Reason: {_best_signal_reason(signal)}\n"
+        f"Entry: {signal.entry_recommendation} | Action: {action}\n"
+        "*Heuristic scenario scores, not probabilities."
     )
 
 
