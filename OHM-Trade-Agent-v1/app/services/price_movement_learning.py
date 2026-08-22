@@ -16,6 +16,7 @@ DEDUP_SECONDS = 4 * 60 * 60
 HORIZONS_SECONDS = {"1h": 60 * 60, "4h": 4 * 60 * 60, "12h": 12 * 60 * 60}
 OBSERVATION_INTERVAL_MINUTES = 15
 MAX_HORIZON_PRICE_LAG_SECONDS = OBSERVATION_INTERVAL_MINUTES * 60
+NEAR_DUE_TICKER_FALLBACK_SECONDS = 5 * 60
 
 
 def _now() -> datetime:
@@ -112,7 +113,38 @@ def get_price_movement_records() -> list[dict[str, Any]]:
         return []
 
 
-def _price_at_horizon(client: KrakenClient, symbol: str, observed_at: datetime, due_at: datetime) -> float | None:
+def _ticker_price(client: KrakenClient, symbol: str) -> float | None:
+    try:
+        ticker = client.get_ticker(symbol)
+    except Exception:
+        try:
+            ticker = client.get_tickers([symbol]).get(symbol)
+        except Exception:
+            return None
+    if not isinstance(ticker, dict):
+        return None
+    try:
+        price = float(ticker.get("last") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def _price_at_horizon(
+    client: KrakenClient,
+    symbol: str,
+    observed_at: datetime,
+    due_at: datetime,
+    *,
+    labelled_at: datetime,
+) -> float | None:
+    """Return a price representative of the declared horizon without smearing.
+
+    Historical 15m OHLC is authoritative. A current ticker is used only when
+    the observer is running within five minutes of the due timestamp and the
+    client cannot provide historical OHLC; this preserves legacy/lightweight
+    clients without allowing a delayed run to relabel a later price as 1h/4h.
+    """
     try:
         candles = client.get_ohlc(
             symbol,
@@ -120,14 +152,19 @@ def _price_at_horizon(client: KrakenClient, symbol: str, observed_at: datetime, 
             since=int((observed_at - timedelta(minutes=OBSERVATION_INTERVAL_MINUTES)).timestamp()),
         )
     except Exception:
+        lag = (labelled_at - due_at).total_seconds()
+        if 0 <= lag <= NEAR_DUE_TICKER_FALLBACK_SECONDS:
+            return _ticker_price(client, symbol)
         return None
+
     due_ts = due_at.timestamp()
+    # Kraken timestamps candles by bar open. Only candles whose open is at or
+    # before the horizon are candidates for the point-in-time close; the lag
+    # guard below prevents a stale candle from masquerading as the horizon.
     eligible = [candle for candle in candles if float(candle.timestamp) <= due_ts]
     if not eligible:
         return None
     candle = max(eligible, key=lambda item: float(item.timestamp))
-    # Do not relabel a stale sample as the exact horizon if the closest candle
-    # is more than one observation interval away.
     if due_ts - float(candle.timestamp) > MAX_HORIZON_PRICE_LAG_SECONDS:
         return None
     try:
@@ -167,7 +204,7 @@ def observe_due_price_movements(*, client: KrakenClient | None = None, now: date
         added = 0
         for symbol, due in due_by_symbol.items():
             for key, horizon, observed_at, due_at in due:
-                price = _price_at_horizon(client, symbol, observed_at, due_at)
+                price = _price_at_horizon(client, symbol, observed_at, due_at, labelled_at=now)
                 if price is None:
                     continue
                 row = records[key]
@@ -188,8 +225,11 @@ def observe_due_price_movements(*, client: KrakenClient | None = None, now: date
                 elif direction == "SHORT":
                     directional_move_pct = (reference - price) / reference * 100.0
                 row.setdefault("observations", {})[horizon] = {
-                    "observed_at": due_at.isoformat(), "labelled_at": now.isoformat(), "price": price,
-                    "absolute_move_pct": round(absolute_move_pct, 6), "move_atr": round(move_atr, 6),
+                    "observed_at": due_at.isoformat(),
+                    "labelled_at": now.isoformat(),
+                    "price": price,
+                    "absolute_move_pct": round(absolute_move_pct, 6),
+                    "move_atr": round(move_atr, 6),
                     "directional_move_pct": round(directional_move_pct, 6) if directional_move_pct is not None else None,
                     "met_expected_low_atr": move_atr >= float(row.get("expected_move_low_atr") or 0.0),
                 }
