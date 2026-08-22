@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.services.attention_budget import allow_new_noncritical, record_new_noncritical
-from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 
 
 STATE_FILE = Path("/app/data/alert_governor_state.json")
@@ -42,6 +42,10 @@ def _parse(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _shared_budget_file(target: Path) -> Path:
+    return target.parent / "attention_budget_state.json"
 
 
 def evaluate_opportunity_alert(
@@ -98,10 +102,10 @@ def evaluate_opportunity_alert(
                     history.append(parsed)
             if len(history) >= max(1, int(max_new_cards_24h)):
                 return AlertGovernorDecision("SUPPRESS", "NEW_CARD_DAILY_BUDGET")
-    except OSError:
-        return AlertGovernorDecision("CREATE", "STATE_UNAVAILABLE_FAIL_OPEN")
+    except (OSError, TimeoutError, RegistryIOError):
+        return AlertGovernorDecision("SUPPRESS", "STATE_UNAVAILABLE_FAIL_CLOSED")
 
-    if not allow_new_noncritical(now=now):
+    if not allow_new_noncritical(now=now, state_file=_shared_budget_file(target)):
         return AlertGovernorDecision("SUPPRESS", "GLOBAL_ATTENTION_BUDGET")
 
     return AlertGovernorDecision("CREATE", "NEW_SYMBOL")
@@ -148,8 +152,12 @@ def record_opportunity_alert(
             state["new_card_history"] = history[-200:]
             state.pop("immediate_history", None)
             save_json_atomic(target, state)
-    except OSError:
+    except (OSError, TimeoutError, RegistryIOError):
         return
 
     if created_new:
-        record_new_noncritical(kind="OPPORTUNITY_CARD", now=now)
+        record_new_noncritical(
+            kind="OPPORTUNITY_CARD",
+            now=now,
+            state_file=_shared_budget_file(target),
+        )
