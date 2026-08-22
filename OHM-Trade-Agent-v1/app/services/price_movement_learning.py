@@ -15,7 +15,8 @@ LOCK_FILE = MOVEMENT_FILE.parent / ".price_movement_learning.lock"
 DEDUP_SECONDS = 4 * 60 * 60
 HORIZONS_SECONDS = {"1h": 60 * 60, "4h": 4 * 60 * 60, "12h": 12 * 60 * 60}
 OBSERVATION_INTERVAL_MINUTES = 15
-MAX_HORIZON_PRICE_LAG_SECONDS = OBSERVATION_INTERVAL_MINUTES * 60
+OBSERVATION_INTERVAL_SECONDS = OBSERVATION_INTERVAL_MINUTES * 60
+MAX_HORIZON_PRICE_LAG_SECONDS = OBSERVATION_INTERVAL_SECONDS
 NEAR_DUE_TICKER_FALLBACK_SECONDS = 5 * 60
 
 
@@ -138,12 +139,12 @@ def _price_at_horizon(
     *,
     labelled_at: datetime,
 ) -> float | None:
-    """Return a price representative of the declared horizon without smearing.
+    """Return the latest 15m close that was actually known by the horizon.
 
-    Historical 15m OHLC is authoritative. A current ticker is used only when
-    the observer is running within five minutes of the due timestamp and the
-    client cannot provide historical OHLC; this preserves legacy/lightweight
-    clients without allowing a delayed run to relabel a later price as 1h/4h.
+    Historical OHLC is authoritative. A current ticker is used only when the
+    observer is running within five minutes of the due timestamp and the
+    client cannot provide historical OHLC; delayed runs never relabel a later
+    price as 1h/4h/12h evidence.
     """
     try:
         candles = client.get_ohlc(
@@ -158,14 +159,19 @@ def _price_at_horizon(
         return None
 
     due_ts = due_at.timestamp()
-    # Kraken timestamps candles by bar open. Only candles whose open is at or
-    # before the horizon are candidates for the point-in-time close; the lag
-    # guard below prevents a stale candle from masquerading as the horizon.
-    eligible = [candle for candle in candles if float(candle.timestamp) <= due_ts]
+    eligible: list[tuple[float, Any]] = []
+    for candle in candles:
+        try:
+            opened = float(candle.timestamp)
+        except (TypeError, ValueError):
+            continue
+        closed = opened + OBSERVATION_INTERVAL_SECONDS
+        if closed <= due_ts:
+            eligible.append((closed, candle))
     if not eligible:
         return None
-    candle = max(eligible, key=lambda item: float(item.timestamp))
-    if due_ts - float(candle.timestamp) > MAX_HORIZON_PRICE_LAG_SECONDS:
+    closed_at, candle = max(eligible, key=lambda pair: pair[0])
+    if due_ts - closed_at > MAX_HORIZON_PRICE_LAG_SECONDS:
         return None
     try:
         price = float(candle.close)
