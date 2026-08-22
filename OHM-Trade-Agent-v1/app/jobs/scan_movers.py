@@ -1,5 +1,10 @@
 from app.core.config import get_settings
 from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
+from app.services.full_market_observation import (
+    ALERT_GOVERNOR_STATE_FILE as FULL_MARKET_ALERT_STATE_FILE,
+    MarketTransition,
+    process_full_market_observations,
+)
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
 from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
@@ -53,11 +58,35 @@ def _compact_card(signal) -> str:
     )
 
 
+def _observation_card(transition: MarketTransition) -> str:
+    action = "DEEP REVIEW REQUIRED" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
+    return (
+        f"👀 OHM MARKET WATCH — {transition.symbol}\n"
+        f"Pattern: {transition.pattern} | Score {transition.score}/100*\n"
+        f"Since prior: {transition.price_change_since_prior_pct:+.2f}% | Lift Δ {transition.lift_change_since_prior_pct:+.2f}%\n"
+        f"24h-low lift: {transition.lift_from_24h_low_pct:+.2f}% | Near high: {transition.distance_from_24h_high_pct:.2f}%\n"
+        f"Liquidity: ${transition.liquidity_24h_usd_approx:,.0f}\n"
+        f"Action: {action} — broad-market detection, not trade approval.\n"
+        "*Heuristic transition score, not probability."
+    )
+
+
 def main() -> None:
     settings = get_settings()
+
+    try:
+        full_market = process_full_market_observations()
+    except Exception as exc:
+        full_market = None
+        print("Full-market observation: fail-soft", type(exc).__name__)
+
     coarse, signals = scan_early_movers()
 
-    print("===== OHM MOVEMENT DISCOVERY V2.1 =====")
+    print("===== OHM MOVEMENT DISCOVERY V2.1 + WAVE 5.2 =====")
+    if full_market is not None:
+        print("Full-market assets observed:", full_market.observed_markets)
+        print("Full-market learning events persisted:", full_market.persisted_events)
+        print("Broad transition watches detected:", len(full_market.transition_alerts))
     print("Full-universe coarse movers:", len(coarse))
     print("Deep-qualified early movers:", len(signals))
     print("Telegram-eligible early movers:", sum(1 for signal in signals if signal.alert_eligible))
@@ -83,6 +112,9 @@ def main() -> None:
     created = 0
     edited = 0
     suppressed = 0
+    broad_created = 0
+    broad_edited = 0
+    broad_suppressed = 0
     if (
         str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
@@ -93,7 +125,9 @@ def main() -> None:
             int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
             21600,
         )
-        for signal in [item for item in signals if item.alert_eligible][:10]:
+        eligible_signals = [item for item in signals if item.alert_eligible]
+        deep_alert_symbols = {item.symbol.upper() for item in eligible_signals}
+        for signal in eligible_signals[:10]:
             transition_key = _transition_key(signal)
             identity = f"EARLY_MOVER:{signal.symbol}"
             decision = evaluate_opportunity_alert(
@@ -140,9 +174,69 @@ def main() -> None:
                 )
                 created += 1
 
+        # Wave 5.2 broad-market alerts are intentionally a separate governor
+        # budget so watch-only discoveries cannot consume the opportunity-card
+        # budget. Symbols already receiving a deep-qualified card are omitted to
+        # prevent duplicate Telegram noise.
+        broad_candidates = [] if full_market is None else [
+            item for item in full_market.transition_alerts
+            if item.symbol.upper() not in deep_alert_symbols
+        ]
+        for transition in broad_candidates[:4]:
+            identity = f"FULL_MARKET_WATCH:{transition.symbol}"
+            decision = evaluate_opportunity_alert(
+                identity=identity,
+                transition_key=transition.transition_key,
+                repeat_cooldown_seconds=repeat_cooldown,
+                max_new_cards_24h=4,
+                state_file=FULL_MARKET_ALERT_STATE_FILE,
+            )
+            if decision.action == "SUPPRESS":
+                broad_suppressed += 1
+                print(f"Broad-watch governor suppressed {transition.symbol}: {decision.reason}")
+                continue
+
+            message = _observation_card(transition)
+            if decision.action == "EDIT" and decision.message_id is not None:
+                if edit_telegram_message(
+                    settings.telegram_bot_token,
+                    settings.telegram_chat_id,
+                    decision.message_id,
+                    message,
+                ):
+                    record_opportunity_alert(
+                        identity=identity,
+                        transition_key=transition.transition_key,
+                        message_id=decision.message_id,
+                        created_new=False,
+                        state_file=FULL_MARKET_ALERT_STATE_FILE,
+                    )
+                    broad_edited += 1
+                else:
+                    print(f"Telegram broad-watch edit failed for {transition.symbol}; card retained.")
+                continue
+
+            message_id = send_telegram_message_with_id(
+                settings.telegram_bot_token,
+                settings.telegram_chat_id,
+                message,
+            )
+            if message_id is not None:
+                record_opportunity_alert(
+                    identity=identity,
+                    transition_key=transition.transition_key,
+                    message_id=message_id,
+                    created_new=True,
+                    state_file=FULL_MARKET_ALERT_STATE_FILE,
+                )
+                broad_created += 1
+
     print("Early-mover Telegram cards created:", created)
     print("Early-mover Telegram cards edited:", edited)
     print("Alert-governor opportunity updates suppressed:", suppressed)
+    print("Broad-market watch cards created:", broad_created)
+    print("Broad-market watch cards edited:", broad_edited)
+    print("Broad-market watch updates suppressed:", broad_suppressed)
 
 
 if __name__ == "__main__":
