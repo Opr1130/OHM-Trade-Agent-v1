@@ -1,5 +1,12 @@
 from app.core.config import get_settings
 from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
+from app.services.compact_alerts import (
+    downside_scenario_pct,
+    explosion_band,
+    format_watch_alert,
+    heuristic_risk_score,
+    one_line_reason,
+)
 from app.services.full_market_observation import (
     ALERT_GOVERNOR_STATE_FILE as FULL_MARKET_ALERT_STATE_FILE,
     MarketTransition,
@@ -21,53 +28,71 @@ def _transition_key(signal) -> str:
     )
 
 
-def _compact_reasons(signal) -> list[str]:
+def _best_signal_reason(signal) -> str:
     reasons: list[str] = []
     if str(signal.momentum_state).upper() == "ACCELERATING":
         reasons.append("Momentum accelerating")
-    elif signal.momentum_1h_pct >= 1.0:
-        reasons.append(f"1h momentum +{signal.momentum_1h_pct:.1f}%")
-
     if signal.relative_volume >= 1.5:
-        reasons.append(f"Volume expanding {signal.relative_volume:.1f}x")
-    elif signal.relative_volume < 0.5:
-        reasons.append(f"Volume still light {signal.relative_volume:.1f}x")
-
+        reasons.append(f"volume expanding {signal.relative_volume:.1f}x")
     if signal.distance_to_24h_high_pct <= 1.5:
-        reasons.append("Price holding near 24h high")
-
+        reasons.append("holding near the 24h high")
     if signal.extended_move:
-        reasons.append("Move already extended")
-
+        reasons.append("move already extended")
     if signal.liquidity_24h_usd_approx < 250_000:
-        reasons.append("Liquidity needs caution")
-
-    return reasons[:3] or ["Qualified multi-factor movement state"]
+        reasons.append("liquidity needs caution")
+    return one_line_reason(" + ".join(reasons), *signal.reasons)
 
 
 def _compact_card(signal) -> str:
-    why = " | ".join(_compact_reasons(signal))
-    return (
-        f"🚀 OHM {signal.symbol} — {signal.stage}\n"
-        f"1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | Vol {signal.relative_volume:.2f}x\n"
-        f"Momentum: {signal.momentum_state}\n"
-        f"Entry: {signal.entry_recommendation}\n"
-        f"Why: {why}\n"
-        f"Quality: {signal.entry_quality}/100 | Continuation: {signal.continuation_confidence}/100*\n"
-        "*Heuristic, not probability. MONITOR ONLY."
+    low, high = explosion_band(signal.continuation_confidence, extended=signal.extended_move)
+    risk = heuristic_risk_score(
+        signal.continuation_confidence,
+        liquidity_usd=signal.liquidity_24h_usd_approx,
+        extended=signal.extended_move,
+    )
+    downside = downside_scenario_pct(risk)
+    action = (
+        "REVIEW ENTRY"
+        if str(signal.entry_recommendation).upper() == "BREAKOUT_ENTRY_POSSIBLE"
+        else "WATCH FOR PULLBACK"
+    )
+    return format_watch_alert(
+        symbol=signal.symbol,
+        potential_low_pct=low,
+        potential_high_pct=high,
+        confidence_pct=signal.continuation_confidence,
+        risk_pct=risk,
+        downside_pct=downside,
+        reason=_best_signal_reason(signal),
+        action=action,
+        title="OHM OPPORTUNITY",
+    )
+
+
+def _observation_reason(transition: MarketTransition) -> str:
+    pattern = str(transition.pattern).replace("_", " ").title()
+    return one_line_reason(
+        f"{pattern} with {transition.price_change_since_prior_pct:+.1f}% acceleration since prior scan"
     )
 
 
 def _observation_card(transition: MarketTransition) -> str:
-    action = "DEEP REVIEW REQUIRED" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
-    return (
-        f"👀 OHM MARKET WATCH — {transition.symbol}\n"
-        f"Pattern: {transition.pattern} | Score {transition.score}/100*\n"
-        f"Since prior: {transition.price_change_since_prior_pct:+.2f}% | Lift Δ {transition.lift_change_since_prior_pct:+.2f}%\n"
-        f"24h-low lift: {transition.lift_from_24h_low_pct:+.2f}% | Near high: {transition.distance_from_24h_high_pct:.2f}%\n"
-        f"Liquidity: ${transition.liquidity_24h_usd_approx:,.0f}\n"
-        f"Action: {action} — broad-market detection, not trade approval.\n"
-        "*Heuristic transition score, not probability."
+    low, high = explosion_band(transition.score)
+    risk = heuristic_risk_score(
+        transition.score,
+        liquidity_usd=transition.liquidity_24h_usd_approx,
+    )
+    downside = downside_scenario_pct(risk)
+    action = "REVIEW ENTRY" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
+    return format_watch_alert(
+        symbol=transition.symbol,
+        potential_low_pct=low,
+        potential_high_pct=high,
+        confidence_pct=transition.score,
+        risk_pct=risk,
+        downside_pct=downside,
+        reason=_observation_reason(transition),
+        action=action,
     )
 
 
@@ -174,10 +199,6 @@ def main() -> None:
                 )
                 created += 1
 
-        # Wave 5.2 broad-market alerts are intentionally a separate governor
-        # budget so watch-only discoveries cannot consume the opportunity-card
-        # budget. Symbols already receiving a deep-qualified card are omitted to
-        # prevent duplicate Telegram noise.
         broad_candidates = [] if full_market is None else [
             item for item in full_market.transition_alerts
             if item.symbol.upper() not in deep_alert_symbols
