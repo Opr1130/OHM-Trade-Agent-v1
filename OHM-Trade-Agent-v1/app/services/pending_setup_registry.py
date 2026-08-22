@@ -154,16 +154,24 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
             # Migration-only compatibility: old diagnostics looked up terminal
             # status by symbol. Keep a non-waiting tombstone without using symbol
             # as the canonical live lifecycle key, so same-symbol setups cannot
-            # overwrite one another.
+            # overwrite one another. Never clobber a different legacy waiting
+            # lifecycle that still occupies the symbol compatibility slot.
             if traced_symbol and terminal_key != traced_symbol:
-                data[traced_symbol] = {
-                    "symbol": traced_symbol,
-                    "trade_id": trade_id,
-                    "direction": traced_direction,
-                    "status": status,
-                    "terminal_at": terminal_at,
-                    "legacy_symbol_tombstone": True,
-                }
+                existing_symbol_row = data.get(traced_symbol)
+                different_waiting_setup = (
+                    isinstance(existing_symbol_row, dict)
+                    and existing_symbol_row.get("status") == "waiting"
+                    and existing_symbol_row.get("trade_id") != trade_id
+                )
+                if not different_waiting_setup:
+                    data[traced_symbol] = {
+                        "symbol": traced_symbol,
+                        "trade_id": trade_id,
+                        "direction": traced_direction,
+                        "status": status,
+                        "terminal_at": terminal_at,
+                        "legacy_symbol_tombstone": True,
+                    }
             _save_raw(data)
     if terminalized:
         from app.services.trade_outcome_registry import terminalize_setup_outcome
