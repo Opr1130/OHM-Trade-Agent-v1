@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 
 
 STATE_FILE = Path("/app/data/attention_budget_state.json")
@@ -44,6 +44,12 @@ def allow_new_noncritical(
     max_new_24h: int = DEFAULT_MAX_NEW_NONCRITICAL_24H,
     state_file: Path | None = None,
 ) -> bool:
+    """Fail closed for ordinary cards if budget state cannot be trusted.
+
+    Lifecycle-critical notifications bypass this helper in notification_policy,
+    so suppressing here protects the user from an alert flood without hiding
+    STOP/TARGET/EMERGENCY/MONITOR_DEGRADED events.
+    """
     now = now or _now()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -54,8 +60,8 @@ def allow_new_noncritical(
         with registry_lock(lock):
             state = load_json(target)
             return len(_recent_history(state, now)) < max(1, int(max_new_24h))
-    except OSError:
-        return True
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
 
 
 def record_new_noncritical(
@@ -77,5 +83,5 @@ def record_new_noncritical(
             history.append({"at": now.isoformat(), "kind": str(kind).upper()})
             state["history"] = history[-200:]
             save_json_atomic(target, state)
-    except OSError:
+    except (OSError, TimeoutError, RegistryIOError):
         return
