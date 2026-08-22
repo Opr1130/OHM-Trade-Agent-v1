@@ -21,7 +21,8 @@ HORIZONS_SECONDS = {
     "24h": 24 * 60 * 60,
 }
 OUTCOME_INTERVAL_MINUTES = 5
-MAX_OUTCOME_LAG_SECONDS = OUTCOME_INTERVAL_MINUTES * 60
+OUTCOME_INTERVAL_SECONDS = OUTCOME_INTERVAL_MINUTES * 60
+MAX_OUTCOME_LAG_SECONDS = OUTCOME_INTERVAL_SECONDS
 
 
 def _now() -> datetime:
@@ -191,12 +192,21 @@ def _directional_move_pct(direction: str, start: float, end: float) -> float:
 
 
 def _horizon_price(candles: list[Any], due_at: datetime) -> float | None:
+    """Return the latest 5m close that was actually known by ``due_at``."""
     due_ts = due_at.timestamp()
-    eligible = [item for item in candles if float(item.timestamp) <= due_ts]
+    eligible: list[tuple[float, Any]] = []
+    for item in candles:
+        try:
+            opened = float(item.timestamp)
+        except (TypeError, ValueError):
+            continue
+        closed = opened + OUTCOME_INTERVAL_SECONDS
+        if closed <= due_ts:
+            eligible.append((closed, item))
     if not eligible:
         return None
-    candle = max(eligible, key=lambda item: float(item.timestamp))
-    if due_ts - float(candle.timestamp) > MAX_OUTCOME_LAG_SECONDS:
+    closed_at, candle = max(eligible, key=lambda pair: pair[0])
+    if due_ts - closed_at > MAX_OUTCOME_LAG_SECONDS:
         return None
     try:
         price = float(candle.close)
