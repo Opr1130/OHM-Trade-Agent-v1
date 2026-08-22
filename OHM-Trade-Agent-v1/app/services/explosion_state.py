@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 from app.scanner.models import MarketSnapshot
@@ -63,18 +64,40 @@ class ExplosionStateVector:
         return asdict(self)
 
 
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _finite_optional(value: Any) -> float | None:
+    if value is None:
+        return None
+    parsed = _finite(value, math.nan)
+    return parsed if math.isfinite(parsed) else None
+
+
 def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+    safe = _finite(value, low)
+    return max(low, min(high, safe))
 
 
 def _ema_structure_score(snapshot: MarketSnapshot) -> int:
-    if snapshot.last_price > snapshot.ema20 > snapshot.ema50 > snapshot.ema200:
+    last = _finite(snapshot.last_price)
+    ema20 = _finite(snapshot.ema20)
+    ema50 = _finite(snapshot.ema50)
+    ema200 = _finite(snapshot.ema200)
+    if min(last, ema20, ema50, ema200) <= 0:
+        return 0
+    if last > ema20 > ema50 > ema200:
         return 2
-    if snapshot.last_price > snapshot.ema20 > snapshot.ema50:
+    if last > ema20 > ema50:
         return 1
-    if snapshot.last_price < snapshot.ema20 < snapshot.ema50 < snapshot.ema200:
+    if last < ema20 < ema50 < ema200:
         return -2
-    if snapshot.last_price < snapshot.ema20 < snapshot.ema50:
+    if last < ema20 < ema50:
         return -1
     return 0
 
@@ -173,18 +196,26 @@ def build_explosion_state_vector(
     native_flow: NativeFlowMetrics | None = None,
     previous: ExplosionStateVector | None = None,
 ) -> ExplosionStateVector:
-    """Build a decision-time-only state vector for early expansion learning.
+    """Build a decision-time-only state vector for early expansion learning."""
+    raw_core = (
+        snapshot.last_price,
+        snapshot.confirmed_price_change_1h_pct,
+        snapshot.momentum_6h_pct,
+        snapshot.momentum_24h_pct,
+        snapshot.momentum_72h_pct,
+        snapshot.movement_volume_ratio or snapshot.volume_ratio or 0.0,
+        snapshot.atr_pct,
+        snapshot.atr_percentile,
+        snapshot.bollinger_bandwidth_percentile,
+        snapshot.distance_to_24h_high_pct,
+        snapshot.distance_to_24h_low_pct,
+    )
+    invalid_core = any(not math.isfinite(_finite(value, math.nan)) for value in raw_core)
 
-    The function consumes only current/previous observations and completed-candle
-    features already present on MarketSnapshot. It must never inspect future
-    prices or outcome labels. When a prior observation exists, level features
-    are converted into explicit change features so the learner can distinguish
-    an actual transition from a merely high current value.
-    """
-    one_hour = float(snapshot.confirmed_price_change_1h_pct)
-    six_hour = float(snapshot.momentum_6h_pct)
-    day = float(snapshot.momentum_24h_pct)
-    seventy_two = float(snapshot.momentum_72h_pct)
+    one_hour = _finite(snapshot.confirmed_price_change_1h_pct)
+    six_hour = _finite(snapshot.momentum_6h_pct)
+    day = _finite(snapshot.momentum_24h_pct)
+    seventy_two = _finite(snapshot.momentum_72h_pct)
     hourly_from_6h = six_hour / 6.0
     hourly_from_24h = day / 24.0
     velocity_1h = one_hour
@@ -193,12 +224,12 @@ def build_explosion_state_vector(
     medium_acceleration = velocity_6h - hourly_from_24h
     acceleration = short_acceleration * 0.7 + medium_acceleration * 0.3
 
-    relative_volume = float(snapshot.movement_volume_ratio or snapshot.volume_ratio or 0.0)
+    relative_volume = max(0.0, _finite(snapshot.movement_volume_ratio or snapshot.volume_ratio or 0.0))
     volume_expansion = max(0.0, relative_volume - 1.0)
-    atr_pctile = float(snapshot.atr_percentile)
-    bandwidth_pctile = float(snapshot.bollinger_bandwidth_percentile)
-    near_high = float(snapshot.distance_to_24h_high_pct)
-    distance_low = float(snapshot.distance_to_24h_low_pct)
+    atr_pctile = _clamp(_finite(snapshot.atr_percentile), 0.0, 100.0)
+    bandwidth_pctile = _clamp(_finite(snapshot.bollinger_bandwidth_percentile), 0.0, 100.0)
+    near_high = max(0.0, _finite(snapshot.distance_to_24h_high_pct))
+    distance_low = max(0.0, _finite(snapshot.distance_to_24h_low_pct))
     base_displacement = distance_low
 
     relative_volume_change: float | None = None
@@ -209,18 +240,18 @@ def build_explosion_state_vector(
 
     previous_same_symbol = previous is not None and previous.symbol.upper() == snapshot.symbol.upper()
     if previous_same_symbol and previous is not None:
-        relative_volume_change = relative_volume - previous.relative_volume
-        atr_percentile_change = atr_pctile - previous.atr_percentile
-        bandwidth_percentile_change = bandwidth_pctile - previous.bandwidth_percentile
-        distance_to_high_velocity = previous.distance_to_24h_high_pct - near_high
-        base_displacement_velocity = base_displacement - previous.base_displacement_pct
+        relative_volume_change = relative_volume - _finite(previous.relative_volume)
+        atr_percentile_change = atr_pctile - _finite(previous.atr_percentile)
+        bandwidth_percentile_change = bandwidth_pctile - _finite(previous.bandwidth_percentile)
+        distance_to_high_velocity = _finite(previous.distance_to_24h_high_pct) - near_high
+        base_displacement_velocity = base_displacement - _finite(previous.base_displacement_pct)
 
     current_compression_depth = max(0.0, (40.0 - min(bandwidth_pctile, atr_pctile)) / 40.0)
     directional_expansion = _clamp(max(one_hour, 0.0) / 2.0, 0.0, 1.0)
     if previous_same_symbol and previous is not None:
         prior_compression_depth = max(
             0.0,
-            (40.0 - min(previous.bandwidth_percentile, previous.atr_percentile)) / 40.0,
+            (40.0 - min(_finite(previous.bandwidth_percentile), _finite(previous.atr_percentile))) / 40.0,
         )
         percentile_release = _clamp(
             max(
@@ -245,35 +276,38 @@ def build_explosion_state_vector(
         )
 
     ema_score = _ema_structure_score(snapshot)
-    trade_accel = native_flow.trade_count_acceleration if native_flow is not None else None
-    aggressor = native_flow.aggressor_imbalance if native_flow is not None else None
-    large_print = native_flow.large_print_concentration if native_flow is not None else None
-    book_imbalance = native_flow.book_notional_imbalance if native_flow is not None else None
+    trade_accel = _finite_optional(native_flow.trade_count_acceleration) if native_flow is not None else None
+    aggressor = _finite_optional(native_flow.aggressor_imbalance) if native_flow is not None else None
+    large_print = _finite_optional(native_flow.large_print_concentration) if native_flow is not None else None
+    book_imbalance = _finite_optional(native_flow.book_notional_imbalance) if native_flow is not None else None
 
     persistence = 0
     if previous_same_symbol and previous is not None:
-        persistence += int(one_hour > 0 and previous.momentum_1h_pct > 0)
-        persistence += int(acceleration > 0 and previous.momentum_acceleration > 0)
-        persistence += int(relative_volume >= 1.0 and previous.relative_volume >= 1.0)
+        persistence += int(one_hour > 0 and _finite(previous.momentum_1h_pct) > 0)
+        persistence += int(acceleration > 0 and _finite(previous.momentum_acceleration) > 0)
+        persistence += int(relative_volume >= 1.0 and _finite(previous.relative_volume) >= 1.0)
         persistence += int(ema_score > 0 and previous.ema_structure_score > 0)
 
-    phase, phase_score, reasons, warnings = _phase_from_features(
-        one_hour=one_hour,
-        six_hour=six_hour,
-        day=day,
-        acceleration=acceleration,
-        relative_volume=relative_volume,
-        relative_volume_change=relative_volume_change,
-        compression_release=compression_release,
-        atr_percentile_change=atr_percentile_change,
-        bandwidth_percentile_change=bandwidth_percentile_change,
-        near_high=near_high,
-        distance_to_high_velocity=distance_to_high_velocity,
-        ema_score=ema_score,
-        trade_accel=trade_accel,
-        aggressor=aggressor,
-        persistence_score=persistence,
-    )
+    if invalid_core:
+        phase, phase_score, reasons, warnings = "DORMANT", 0, (), ("non-finite core market evidence sanitized; state forced dormant",)
+    else:
+        phase, phase_score, reasons, warnings = _phase_from_features(
+            one_hour=one_hour,
+            six_hour=six_hour,
+            day=day,
+            acceleration=acceleration,
+            relative_volume=relative_volume,
+            relative_volume_change=relative_volume_change,
+            compression_release=compression_release,
+            atr_percentile_change=atr_percentile_change,
+            bandwidth_percentile_change=bandwidth_percentile_change,
+            near_high=near_high,
+            distance_to_high_velocity=distance_to_high_velocity,
+            ema_score=ema_score,
+            trade_accel=trade_accel,
+            aggressor=aggressor,
+            persistence_score=persistence,
+        )
 
     if native_flow is None:
         warnings = (*warnings, "Kraken-native flow unavailable for this observation")
@@ -283,7 +317,7 @@ def build_explosion_state_vector(
     return ExplosionStateVector(
         version=VERSION,
         symbol=snapshot.symbol.upper(),
-        reference_price=float(snapshot.last_price),
+        reference_price=max(0.0, _finite(snapshot.last_price)),
         momentum_1h_pct=round(one_hour, 6),
         momentum_6h_pct=round(six_hour, 6),
         momentum_24h_pct=round(day, 6),
@@ -294,7 +328,7 @@ def build_explosion_state_vector(
         relative_volume=round(relative_volume, 6),
         volume_expansion=round(volume_expansion, 6),
         relative_volume_change=round(relative_volume_change, 6) if relative_volume_change is not None else None,
-        atr_pct=round(float(snapshot.atr_pct), 6),
+        atr_pct=round(max(0.0, _finite(snapshot.atr_pct)), 6),
         atr_percentile=round(atr_pctile, 6),
         atr_percentile_change=round(atr_percentile_change, 6) if atr_percentile_change is not None else None,
         bandwidth_percentile=round(bandwidth_pctile, 6),
