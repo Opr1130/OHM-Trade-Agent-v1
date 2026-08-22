@@ -5,7 +5,8 @@ from app.services.entry_exit_advisor import EntryExitPlan
 
 
 DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
-DEFAULT_MAX_CAPITAL_FRACTION = 0.20
+DEFAULT_MAX_CAPITAL_FRACTION = 1.0
+PRODUCTION_MAX_CAPITAL_FRACTION = 0.20
 
 
 @dataclass
@@ -80,46 +81,51 @@ def evaluate_economic_quality(
     if estimated_round_trip_cost_pct < 0 or estimated_margin_cost_pct < 0:
         return _invalid_result(direction, leverage, "Estimated costs cannot be negative")
 
+    entry_low = float(getattr(plan, "entry_low", 0.0))
+    entry_high = float(getattr(plan, "entry_high", 0.0))
+    entry_reference = (entry_low + entry_high) / 2
+    chase_limit = float(getattr(plan, "chase_limit", entry_high if direction == "LONG" else entry_low))
+    stop_price = float(getattr(plan, "stop_price", 0.0))
+    target_1 = float(getattr(plan, "target_1", 0.0))
+    target_2 = float(getattr(plan, "target_2", 0.0))
+    reward_to_risk_1 = float(getattr(plan, "reward_to_risk_1", 0.0))
+    reward_to_risk_2 = float(getattr(plan, "reward_to_risk_2", 0.0))
+
     plan_values = (
-        plan.entry_low,
-        plan.entry_high,
-        plan.chase_limit,
-        plan.stop_price,
-        plan.target_1,
-        plan.target_2,
-        plan.reward_to_risk_1,
-        plan.reward_to_risk_2,
+        entry_low,
+        entry_high,
+        chase_limit,
+        stop_price,
+        target_1,
+        target_2,
+        reward_to_risk_1,
+        reward_to_risk_2,
     )
-    if not all(math.isfinite(float(value)) for value in plan_values):
+    if not all(math.isfinite(value) for value in plan_values):
         return _invalid_result(direction, leverage, "Invalid non-finite plan geometry")
 
-    entry_reference = (plan.entry_low + plan.entry_high) / 2
-    if entry_reference <= 0 or min(plan.entry_low, plan.entry_high, plan.chase_limit, plan.stop_price, plan.target_1, plan.target_2) <= 0:
+    if entry_reference <= 0 or min(entry_low, entry_high, chase_limit, stop_price, target_1, target_2) <= 0:
         return _invalid_result(direction, leverage, "Invalid non-positive plan geometry")
 
     if direction == "SHORT":
-        geometry_valid = 0 < plan.target_2 < plan.target_1 < entry_reference < plan.stop_price
+        geometry_valid = 0 < target_2 < target_1 < entry_reference < stop_price
     else:
-        geometry_valid = 0 < plan.stop_price < entry_reference < plan.target_1 < plan.target_2
+        geometry_valid = 0 < stop_price < entry_reference < target_1 < target_2
     if not geometry_valid:
         return _invalid_result(direction, leverage, "Invalid target/stop geometry")
 
-    stop_pct = abs(entry_reference - plan.stop_price) / entry_reference * 100
+    stop_pct = abs(entry_reference - stop_price) / entry_reference * 100
     if direction == "SHORT":
-        target_1_move_pct = (entry_reference - plan.target_1) / entry_reference * 100
-        target_2_move_pct = (entry_reference - plan.target_2) / entry_reference * 100
+        target_1_move_pct = (entry_reference - target_1) / entry_reference * 100
+        target_2_move_pct = (entry_reference - target_2) / entry_reference * 100
     else:
-        target_1_move_pct = (plan.target_1 - entry_reference) / entry_reference * 100
-        target_2_move_pct = (plan.target_2 - entry_reference) / entry_reference * 100
+        target_1_move_pct = (target_1 - entry_reference) / entry_reference * 100
+        target_2_move_pct = (target_2 - entry_reference) / entry_reference * 100
 
     calculated = (stop_pct, target_1_move_pct, target_2_move_pct)
     if not all(math.isfinite(value) and value > 0 for value in calculated):
         return _invalid_result(direction, leverage, "Invalid calculated economic geometry")
 
-    # Economic validation must use the same maximum posted-capital envelope as
-    # the production allocator. Previously the default was 100% of equity while
-    # allocation is capped at 20%, which could overstate the dollar profit floor
-    # by roughly 5x.
     recommended_capital = available_capital * max_capital_fraction
     position_notional = recommended_capital * leverage
     target_1_gross_profit = position_notional * target_1_move_pct / 100
@@ -131,9 +137,9 @@ def evaluate_economic_quality(
     account_risk_at_stop_pct = stop_pct * leverage * max_capital_fraction
 
     rejection_reason = None
-    if plan.reward_to_risk_2 < min_reward_to_risk:
+    if reward_to_risk_2 < min_reward_to_risk:
         rejection_reason = (
-            f"Reward/risk {plan.reward_to_risk_2:.2f}:1 is below minimum "
+            f"Reward/risk {reward_to_risk_2:.2f}:1 is below minimum "
             f"{min_reward_to_risk:.2f}:1"
         )
     elif target_2_move_pct < min_target_2_move_pct:
