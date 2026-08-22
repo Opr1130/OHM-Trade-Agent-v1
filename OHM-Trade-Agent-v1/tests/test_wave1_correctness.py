@@ -13,7 +13,7 @@ from app.services.economic_quality_gate import evaluate_economic_quality
 from app.services.kraken_reconciliation import _matching_fills
 from app.services.outcome_financials import finalize_financial_outcome
 from app.services.profitability_learning import _trade_bucket_weights
-from app.services.registry_io import load_json
+from app.services.registry_io import RegistryCorruptionError, load_json
 from app.services.secret_auth import secret_matches
 from app.services.self_calibration import calibration_model
 
@@ -158,12 +158,17 @@ def test_unknown_short_financing_is_not_recorded_as_zero_profitability(tmp_path,
     assert result["net_pnl"] is None
 
 
-def test_malformed_registry_json_is_logged(tmp_path, caplog):
+def test_malformed_registry_json_is_quarantined_and_raised(tmp_path, caplog):
     path = tmp_path / "broken.json"
     path.write_text("{broken")
-    with caplog.at_level(logging.ERROR):
-        assert load_json(path) == {}
+    with caplog.at_level(logging.CRITICAL), pytest.raises(RegistryCorruptionError) as exc_info:
+        load_json(path)
     assert "Malformed registry JSON" in caplog.text
+    assert not path.exists()
+    quarantine = exc_info.value.quarantine_path
+    assert quarantine is not None
+    assert quarantine.exists()
+    assert quarantine.read_text() == "{broken"
 
 
 def test_secret_comparison_rejects_missing_and_accepts_exact():
