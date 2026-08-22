@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import pytest
 
 from app.exchanges.kraken import Candle
-from app.services import pending_setup_monitor, trade_monitor
+from app.services import emergency_move_detector, pending_setup_monitor, trade_monitor
 from app.services.active_trade_registry import ActiveTrade
+from app.services.emergency_move_detector import detect_emergency_move
 from app.services.entry_timing import evaluate_entry_timing
 from app.services.pending_setup_monitor import monitor_pending_setup
 from app.services.pending_setup_registry import PendingSetup
@@ -46,7 +47,7 @@ def _setup(direction: str = "LONG") -> PendingSetup:
     )
 
 
-def _candles(last_close: float) -> list[Candle]:
+def _candles(last_close: float, *, interval_seconds: int = 3600) -> list[Candle]:
     base = int(datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc).timestamp())
     rows = []
     for index in range(30):
@@ -55,7 +56,7 @@ def _candles(last_close: float) -> list[Candle]:
             close = last_close
         rows.append(
             Candle(
-                timestamp=base + index * 3600,
+                timestamp=base + index * interval_seconds,
                 open=100.0,
                 high=101.0,
                 low=99.0,
@@ -122,3 +123,14 @@ def test_active_trade_monitor_does_not_hold_when_price_is_non_finite(monkeypatch
     monkeypatch.setattr(trade_monitor, "KrakenClient", Client)
     with pytest.raises(ValueError, match="finite"):
         monitor_trade(_trade())
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_emergency_monitor_rejects_non_finite_market_price(monkeypatch, value):
+    class Client:
+        def get_ohlc(self, symbol, interval):
+            return _candles(value, interval_seconds=300)
+
+    monkeypatch.setattr(emergency_move_detector, "KrakenClient", Client)
+    with pytest.raises(ValueError, match="finite"):
+        detect_emergency_move(_trade())
