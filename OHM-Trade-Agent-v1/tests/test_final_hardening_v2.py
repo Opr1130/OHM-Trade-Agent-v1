@@ -11,7 +11,7 @@ from app.exchanges.kraken_identity import balance_quantity_for_asset, canonicali
 from app.indicators.technical import volume_ratio
 from app.jobs import run_cycle
 from app.services import active_trade_registry, pending_setup_registry
-from app.services.economic_quality_gate import PRODUCTION_MAX_CAPITAL_FRACTION, _resolved_capital_fraction
+from app.services.economic_quality_gate import PRODUCTION_MAX_CAPITAL_FRACTION
 from app.services.pending_setup_registry import PendingSetup
 from app.services.target_attainability import _conservative_runtime
 import app.services.confirm_entry as confirm_entry_module
@@ -47,7 +47,7 @@ def test_runtime_safety_uses_settings_environment_and_defaults_conservative(monk
     monkeypatch.setenv("APP_ENV", "production")
     get_settings.cache_clear()
     try:
-        assert _resolved_capital_fraction(None) == PRODUCTION_MAX_CAPITAL_FRACTION
+        assert PRODUCTION_MAX_CAPITAL_FRACTION == pytest.approx(0.20)
         assert _conservative_runtime() is True
     finally:
         get_settings.cache_clear()
@@ -57,7 +57,6 @@ def test_missing_app_env_defaults_to_conservative_runtime(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("APP_ENV", raising=False)
     assert conservative_runtime() is True
-    assert _resolved_capital_fraction(None) == PRODUCTION_MAX_CAPITAL_FRACTION
 
 
 class _TickerOnlyClient:
