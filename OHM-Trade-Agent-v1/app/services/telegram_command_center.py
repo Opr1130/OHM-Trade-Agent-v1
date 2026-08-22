@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime, timezone
 import math
 from pathlib import Path
@@ -36,6 +35,7 @@ WATCH_LOCK = WATCH_FILE.parent / ".telegram_market_watches.lock"
 MAX_WATCHES = 8
 WATCH_REFRESH_SECONDS = 300
 WATCH_PRICE_CHANGE_PCT = 2.0
+MAX_WATCH_REFRESH_PER_PASS = 2
 MAX_COMMAND_LENGTH = 96
 MAX_ORDERS_DISPLAY = 10
 MAX_POSITIONS_DISPLAY = 10
@@ -105,6 +105,22 @@ def _require_symbol(args: tuple[str, ...], command: str) -> str:
     if len(args) != 1:
         raise TelegramCommandError(f"Usage: /{command} COIN")
     return args[0]
+
+
+def _canonical_watch_symbol(value: str) -> str:
+    """Normalize a watch key locally so /unwatch works during Kraken outages."""
+    cleaned = str(value or "").strip().upper().lstrip("$#")
+    if not cleaned or len(cleaned) > 24 or not re.fullmatch(r"[A-Z0-9._/\-]+", cleaned):
+        raise TelegramCommandError("Invalid coin symbol")
+    pair = canonicalize_pair(cleaned)
+    for quote in ("USDT", "USD"):
+        if pair.endswith(quote) and len(pair) > len(quote):
+            pair = pair[: -len(quote)]
+            break
+    symbol = canonicalize_asset(pair)
+    if not symbol:
+        raise TelegramCommandError("Invalid coin symbol")
+    return symbol
 
 
 def _load_watches(path: Path = WATCH_FILE) -> dict[str, dict[str, Any]]:
@@ -307,13 +323,23 @@ def positions_report() -> str:
         return "⚠️ OHM POSITIONS — Kraken private account data is temporarily unavailable."
 
     public = KrakenClient(timeout_seconds=5.0)
+    try:
+        pair_directory = public.get_asset_pairs()
+    except Exception:
+        pair_directory = {}
+
+    class _DirectoryClient:
+        def get_asset_pairs(self):
+            return pair_directory
+
+    resolver = _DirectoryClient()
     rows: list[tuple[float, str, float, str]] = []
     unpriced: list[tuple[str, float]] = []
     for asset, quantity in balances.items():
         if quantity <= 0 or asset in FIAT_ASSETS or asset == "USDT":
             continue
         try:
-            identity = resolve_market(asset, public)
+            identity = resolve_market(asset, resolver)  # type: ignore[arg-type]
             price = _finite(public.get_ticker(identity.altname).get("last"))
         except Exception:
             price = None
@@ -419,12 +445,11 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
 
 def _handle_unwatch(settings: Any, symbol_query: str) -> None:
     try:
-        symbol = resolve_market(symbol_query).base_asset
-    except (MarketResolutionError, MarketInsightUnavailable) as exc:
-        _send(settings, f"⚠️ OHM UNWATCH — {str(exc)[:180]}")
-        return
-    try:
+        symbol = _canonical_watch_symbol(symbol_query)
         removed = _delete_watch(symbol)
+    except TelegramCommandError as exc:
+        _send(settings, f"⚠️ OHM UNWATCH — {exc}")
+        return
     except (RegistryIOError, OSError, TimeoutError):
         _send(settings, "⚠️ OHM UNWATCH — watch registry is unavailable; no change was made.")
         return
@@ -441,7 +466,11 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
     message = update.get("message") if isinstance(update, dict) else None
     if not isinstance(message, dict):
         return False
-    parsed = parse_command(message.get("text"))
+    try:
+        parsed = parse_command(message.get("text"))
+    except TelegramCommandError as exc:
+        _send(settings, f"⚠️ {exc}")
+        return True
     if parsed is None:
         return False
     command, args = parsed
@@ -501,6 +530,7 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
     except RegistryIOError:
         return 0
     changed = 0
+    processed = 0
     now = datetime.now(timezone.utc)
     for symbol, row in sorted(watches.items()):
         if not force:
@@ -512,6 +542,9 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
             if checked is not None and checked.tzinfo is not None:
                 if (now - checked).total_seconds() < WATCH_REFRESH_SECONDS:
                     continue
+            if processed >= MAX_WATCH_REFRESH_PER_PASS:
+                break
+        processed += 1
         try:
             insight = analyze_market(symbol)
         except Exception:
