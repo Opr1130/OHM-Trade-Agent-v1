@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
 import pytest
 
 from app.services import active_trade_registry, pending_setup_registry, profitability_learning, shadow_learning
 from app.services.active_trade_registry import ActiveTrade
+from app.services.kraken_position_verification import KrakenPositionVerifier
 from app.services.pending_setup_registry import PendingSetup
 from app.services.registry_io import RegistryCorruptionError, load_json
 from app.services.trade_monitor import _require_finite_trade_geometry
@@ -146,3 +146,48 @@ def test_price_movement_horizon_price_never_uses_bar_closing_after_due_time():
         labelled_at=datetime(2026, 8, 22, 12, 30, tzinfo=timezone.utc),
     )
     assert price == 105.0
+
+
+@pytest.mark.parametrize("quantity", [float("nan"), float("inf"), float("-inf")])
+def test_spot_position_verification_fails_closed_on_nonfinite_private_balance(quantity):
+    verifier = KrakenPositionVerifier()
+    verifier._balances = {"XXDG": quantity}
+    verifier._positions = {}
+    trade = ActiveTrade(
+        "DOGEUSD",
+        0.20,
+        0.18,
+        0.24,
+        0.28,
+        "low",
+        trade_id="DOGE-LONG",
+        direction="LONG",
+    )
+    result = verifier.verify(trade)
+    assert result.status == "UNAVAILABLE"
+
+
+@pytest.mark.parametrize("volume", ["NaN", "Infinity", "-Infinity"])
+def test_short_position_verification_fails_closed_on_nonfinite_open_position(volume):
+    verifier = KrakenPositionVerifier()
+    verifier._balances = {}
+    verifier._positions = {
+        "P1": {
+            "pair": "XXRPZUSD",
+            "type": "sell",
+            "vol": volume,
+            "vol_closed": "0",
+        }
+    }
+    trade = ActiveTrade(
+        "XRPUSD",
+        0.60,
+        0.66,
+        0.54,
+        0.48,
+        "medium",
+        trade_id="XRP-SHORT",
+        direction="SHORT",
+    )
+    result = verifier.verify(trade)
+    assert result.status == "UNAVAILABLE"
