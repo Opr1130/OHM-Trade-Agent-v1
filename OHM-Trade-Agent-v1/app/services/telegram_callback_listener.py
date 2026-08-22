@@ -1,5 +1,6 @@
 import json
 import logging
+import queue
 import threading
 import time
 from collections import deque
@@ -19,7 +20,10 @@ _thread_lock = threading.Lock()
 _rate_lock = threading.Lock()
 _listener_thread: threading.Thread | None = None
 _watch_thread: threading.Thread | None = None
+_command_thread: threading.Thread | None = None
 _command_times: deque[float] = deque()
+_COMMAND_QUEUE_MAX = 4
+_command_queue: queue.Queue[tuple[dict, object]] = queue.Queue(maxsize=_COMMAND_QUEUE_MAX)
 
 
 def answer_callback_query(
@@ -196,6 +200,19 @@ def process_callback(update: dict) -> None:
         )
 
 
+def _queue_command(update: dict, settings) -> bool:
+    try:
+        _command_queue.put_nowait((dict(update), settings))
+        return True
+    except queue.Full:
+        send_telegram_message(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            "⚠️ OHM COMMAND BUSY — several requests are already queued. Try again shortly.",
+        )
+        return False
+
+
 def process_message(update: dict) -> None:
     settings = get_settings()
     message = update.get("message")
@@ -224,14 +241,32 @@ def process_message(update: dict) -> None:
             "⚠️ OHM COMMAND RATE LIMIT — wait a moment before requesting another scan.",
         )
         return
-    process_command_message(update, settings=settings)
+    _queue_command(update, settings)
 
 
 def process_update(update: dict) -> None:
+    # Callback handling remains synchronous/high-priority. Commands are only
+    # enqueued here, so a slow Kraken market scan can never delay a lifecycle
+    # button press or the next Telegram getUpdates poll.
     if "callback_query" in update:
         process_callback(update)
     if "message" in update:
         process_message(update)
+
+
+def telegram_command_worker_loop() -> None:
+    logger.info("OHM Telegram command worker started")
+    while not _stop_event.is_set():
+        try:
+            update, settings = _command_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            process_command_message(update, settings=settings)
+        except Exception:
+            logger.exception("Telegram command worker failed safely")
+        finally:
+            _command_queue.task_done()
 
 
 def telegram_callback_loop() -> None:
@@ -333,16 +368,35 @@ def telegram_watch_loop() -> None:
             logger.exception("Telegram market-watch refresh failed safely")
 
 
+def _drain_command_queue() -> None:
+    while True:
+        try:
+            _command_queue.get_nowait()
+        except queue.Empty:
+            return
+        else:
+            _command_queue.task_done()
+
+
 def start_telegram_callback_listener() -> None:
-    global _listener_thread, _watch_thread
+    global _listener_thread, _watch_thread, _command_thread
     with _thread_lock:
-        if _listener_thread is not None and _listener_thread.is_alive():
+        if any(
+            thread is not None and thread.is_alive()
+            for thread in (_listener_thread, _watch_thread, _command_thread)
+        ):
             logger.info("Telegram listener already running")
             return
+        _drain_command_queue()
         _stop_event.clear()
         _listener_thread = threading.Thread(
             target=telegram_callback_loop,
             name="ohm-telegram-callback-command-listener",
+            daemon=True,
+        )
+        _command_thread = threading.Thread(
+            target=telegram_command_worker_loop,
+            name="ohm-telegram-command-worker",
             daemon=True,
         )
         _watch_thread = threading.Thread(
@@ -351,6 +405,7 @@ def start_telegram_callback_listener() -> None:
             daemon=True,
         )
         _listener_thread.start()
+        _command_thread.start()
         _watch_thread.start()
 
 
