@@ -116,6 +116,30 @@ def test_economic_gate_rejects_non_finite_plan_geometry(field):
     assert "finite" in result.rejection_reason.lower() or "invalid" in result.rejection_reason.lower()
 
 
+def test_production_economic_gate_uses_twenty_percent_capital_envelope(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    result = evaluate_economic_quality(
+        _plan(),
+        available_capital=10_000.0,
+        min_net_profit=1.0,
+    )
+    assert result.recommended_capital == pytest.approx(2_000.0)
+    assert result.position_notional == pytest.approx(2_000.0)
+    assert result.target_2_gross_profit == pytest.approx(300.0)
+    assert result.estimated_costs == pytest.approx(12.0)
+    assert result.target_2_net_profit == pytest.approx(288.0)
+
+
+def test_nonproduction_economic_gate_preserves_reusable_full_capital_default(monkeypatch):
+    monkeypatch.delenv("APP_ENV", raising=False)
+    result = evaluate_economic_quality(
+        _plan(),
+        available_capital=10_000.0,
+        min_net_profit=1.0,
+    )
+    assert result.recommended_capital == pytest.approx(10_000.0)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
