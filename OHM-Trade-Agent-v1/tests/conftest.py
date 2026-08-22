@@ -1,7 +1,7 @@
 import pytest
 
 from app.jobs import scan_opportunities
-from app.services import chief_analyst, trade_outcome_registry
+from app.services import chief_alert_notifier, trade_outcome_registry
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +22,7 @@ def preserve_legacy_chief_payload_test_scope(request, monkeypatch):
         return
 
     monkeypatch.setattr(
-        chief_analyst,
+        chief_alert_notifier,
         "_quality_by_risk_level",
         lambda candidate, account_equity: ({}, True),
     )
@@ -39,4 +39,9 @@ def isolate_outcome_registry_with_existing_trade_fixtures(request, monkeypatch):
         trade_outcome_registry,
         "OUTCOME_FILE",
         tmp_path / "trade_outcomes.json",
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "STATE_LOCK_FILE",
+        tmp_path / ".alert_state.lock",
     )
