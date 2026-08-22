@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.services.attention_budget import allow_new_noncritical, record_new_noncritical
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -18,6 +19,8 @@ CRITICAL_EVENTS = {
     "FILLED",
     "TAKE_PROFIT",
     "EXIT_NOW",
+    "INVALIDATED",
+    "TOO_EXTENDED",
 }
 
 
@@ -60,6 +63,9 @@ def should_emit(
                     return False
     except OSError:
         return True
+
+    if event_type not in CRITICAL_EVENTS and not allow_new_noncritical(now=now):
+        return False
     return True
 
 
@@ -71,7 +77,8 @@ def record_emitted(
     now: datetime | None = None,
 ) -> None:
     now = now or _now()
-    key = f"{identity}:{event_type.upper()}"
+    event_type = event_type.upper()
+    key = f"{identity}:{event_type}"
     try:
         with registry_lock(LOCK_FILE):
             state = load_json(STATE_FILE)
@@ -79,3 +86,6 @@ def record_emitted(
             save_json_atomic(STATE_FILE, state)
     except OSError:
         return
+
+    if event_type not in CRITICAL_EVENTS:
+        record_new_noncritical(kind=event_type, now=now)

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.compact_alerts import (
+    downside_scenario_pct,
+    format_watch_alert,
+    heuristic_risk_score,
+    one_line_reason,
+)
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.price_movement_radar import EXPIRED, READY, WATCH
 from app.services.telegram_notifier import send_telegram_message
@@ -12,45 +18,30 @@ NON_ACTIONABLE_STAGES = {WATCH, READY, EXPIRED}
 
 def format_price_movement_message(signal: dict[str, Any]) -> str:
     stage = str(signal.get("stage") or "UNKNOWN").upper()
+    symbol = str(signal.get("symbol") or "UNKNOWN").upper()
     if stage == EXPIRED:
         return (
-            "⚪ OHM PRICE MOVEMENT — WATCH EXPIRED\n\n"
-            f"Market: {signal.get('symbol', 'UNKNOWN')}\n"
-            "Action: NO TRADE\n"
-            "The volatility-expansion setup expired without directional confirmation."
+            f"⚪ OHM WATCH EXPIRED — {symbol}\n"
+            "Reason: Setup expired without directional confirmation\n"
+            "Action: NO TRADE"
         )
 
-    icon = "⚡" if stage == READY else "🔎"
-    components = signal.get("components") or {}
-    reasons = "\n".join(
-        f"• {reason}" for reason in (signal.get("reasons") or [])[:6]
-    )
-    return (
-        f"{icon} OHM PRICE MOVEMENT — {stage}\n\n"
-        f"Market: {signal.get('symbol', 'UNKNOWN')}\n"
-        f"Class: {signal.get('signal_class', 'PRICE_MOVEMENT')} / "
-        f"{signal.get('subtype', 'VOLATILITY_EXPANSION')}\n"
-        f"Direction: {signal.get('direction', 'UNCONFIRMED')}\n"
-        f"Readiness: {signal.get('readiness_score', 0)}/100 "
-        "(deterministic score, not probability)\n"
-        f"Detection: {signal.get('detection_timeframe', 'N/A')} | "
-        f"Confirmation: {signal.get('confirmation_timeframe', 'N/A')} | "
-        f"Regime: {signal.get('regime_timeframe', '4H')}\n"
-        f"Expected Window: {signal.get('expected_window_primary', 'N/A')} "
-        f"then {signal.get('expected_window_secondary', 'N/A')}\n"
-        f"Expected Expansion: {signal.get('expected_move_low_atr', 0)}-"
-        f"{signal.get('expected_move_high_atr', 0)} ATR "
-        f"({signal.get('expected_move_low_pct', 0)}%-"
-        f"{signal.get('expected_move_high_pct', 0)}%)\n"
-        f"Expires: {signal.get('expires_at', 'N/A')}\n\n"
-        "Score Components:\n"
-        f"• Compression: {components.get('compression', 0)}/30\n"
-        f"• Leverage: {components.get('leverage', 0)}/25\n"
-        f"• Participation: {components.get('participation', 0)}/20\n"
-        f"• Liquidation Fuel: {components.get('liquidation_fuel', 0)}/15\n"
-        f"• Order-Book Fragility: {components.get('order_book_fragility', 0)}/10\n\n"
-        f"Evidence:\n{reasons or '• Evidence is incomplete'}\n\n"
-        "Action: MONITOR ONLY — no entry is authorized until direction is confirmed and all OHM trade gates pass."
+    confidence = float(signal.get("readiness_score") or 0.0)
+    risk = heuristic_risk_score(confidence)
+    low = max(0.0, float(signal.get("expected_move_low_pct") or 0.0))
+    high = max(low, float(signal.get("expected_move_high_pct") or low))
+    reason = one_line_reason(*(signal.get("reasons") or []))
+    action = "REVIEW" if stage == READY else "MONITOR ONLY — no entry is authorized"
+    return format_watch_alert(
+        symbol=symbol,
+        potential_low_pct=low,
+        potential_high_pct=high,
+        confidence_pct=confidence,
+        risk_pct=risk,
+        downside_pct=downside_scenario_pct(risk),
+        reason=reason,
+        action=action,
+        title="OHM MOVEMENT WATCH",
     )
 
 

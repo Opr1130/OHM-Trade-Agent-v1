@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from app.services.compact_alerts import one_line_reason
+from app.services.notification_policy import record_emitted, should_emit
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
 from app.services.pending_setup_registry import (
     PendingSetup,
@@ -27,52 +29,45 @@ def _save_state(state: dict[str, str]) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def _stop_downside_pct(setup: PendingSetup, current_price: float) -> float:
+    if current_price <= 0:
+        return 0.0
+    direction = str(setup.direction or "LONG").upper()
+    if direction == "SHORT":
+        return max(0.0, (float(setup.stop_price) / current_price - 1.0) * 100.0)
+    return max(0.0, (1.0 - float(setup.stop_price) / current_price) * 100.0)
+
+
 def format_pending_setup_message(
     setup: PendingSetup,
     result: PendingSetupMonitorResult,
 ) -> str:
     if result.status == "ENTRY_ZONE_REACHED":
-        header = "🟢 OHM AI — ENTRY ZONE REACHED"
-        action = "ENTRY CONDITIONS ARE NOW IN RANGE"
-        lifecycle_note = (
-            "OHM will verify any fill directly from Kraken before "
-            "active-trade monitoring begins."
-        )
+        icon = "🟢"
+        title = "OHM ENTRY READY"
+        action = "REVIEW ENTRY"
     elif result.status == "INVALIDATED":
-        header = "🔴 OHM AI — SETUP INVALIDATED"
-        action = "DO NOT ENTER"
-        lifecycle_note = (
-            "Cancel any open Kraken order for this setup manually. "
-            "OHM uses a read-only Kraken key and cannot cancel exchange orders."
-        )
+        icon = "🔴"
+        title = "OHM SETUP INVALID"
+        action = "DO NOT ENTER — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
     elif result.status == "TOO_EXTENDED":
-        header = "⚠️ OHM AI — DO NOT CHASE"
-        action = "WAIT FOR A NEW SETUP"
-        lifecycle_note = (
-            "Cancel any open Kraken order for this setup manually. "
-            "OHM uses a read-only Kraken key and cannot cancel exchange orders."
-        )
+        icon = "⚠️"
+        title = "OHM DO NOT CHASE"
+        action = "WAIT — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
     else:
-        header = "ℹ️ OHM AI — SETUP UPDATE"
-        action = "CONTINUE WAITING"
-        lifecycle_note = "OHM continues monitoring this setup against Kraken."
+        icon = "ℹ️"
+        title = "OHM SETUP UPDATE"
+        action = "WAIT"
 
+    downside = _stop_downside_pct(setup, float(result.current_price))
     return (
-        f"{header}\n\n"
-        f"Symbol: {setup.symbol}\n"
-        f"Action: {action}\n"
+        f"{icon} {title} — {setup.symbol}\n"
+        f"Confidence*: {int(setup.confidence)}%\n"
         f"Risk: {setup.risk_level.upper()}\n"
-        f"AI Confidence: {setup.confidence}%\n\n"
-        f"Current Price: {result.current_price}\n\n"
-        f"📍 ENTRY PLAN\n"
-        f"Entry Zone: {setup.entry_low} - {setup.entry_high}\n"
-        f"Do Not Chase Above: {setup.chase_limit}\n"
-        f"Stop: {setup.stop_price}\n\n"
-        f"🎯 TARGETS\n"
-        f"Target 1: {setup.target_1}\n"
-        f"Target 2: {setup.target_2}\n\n"
-        f"Reason:\n{result.reason}\n\n"
-        f"{lifecycle_note}"
+        f"Downside to stop: {downside:.1f}%\n"
+        f"Reason: {one_line_reason(result.reason)}\n"
+        f"Action: {action}\n"
+        "*Heuristic confidence, not probability."
     )
 
 
@@ -82,7 +77,6 @@ def send_pending_setup_update(
     bot_token: str,
     chat_id: str,
 ) -> bool:
-    # WAITING and NEAR_ENTRY stay silent.
     if result.status in {"WAITING", "NEAR_ENTRY"}:
         return False
 
@@ -99,6 +93,14 @@ def send_pending_setup_update(
             terminalize_pending_setup(setup.trade_id, terminal_status)
         return False
 
+    fingerprint = f"{setup.direction}:{result.status}"
+    if not should_emit(
+        identity=f"PENDING_SETUP:{setup.trade_id or setup.symbol}",
+        event_type=result.status,
+        fingerprint=fingerprint,
+    ):
+        return False
+
     sent = send_telegram_message(
         bot_token,
         chat_id,
@@ -108,6 +110,11 @@ def send_pending_setup_update(
     if sent:
         state[setup.symbol] = result.status
         _save_state(state)
+        record_emitted(
+            identity=f"PENDING_SETUP:{setup.trade_id or setup.symbol}",
+            event_type=result.status,
+            fingerprint=fingerprint,
+        )
 
     if terminal_status:
         terminalize_pending_setup(setup.trade_id, terminal_status)

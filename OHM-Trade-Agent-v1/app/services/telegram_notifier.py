@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 import httpx
 
@@ -9,25 +10,30 @@ from app.models.signal import SignalDecision, TradingSignal
 logger = logging.getLogger(__name__)
 
 
+def _price_pct(target: float, reference: float, side: str) -> float:
+    if reference <= 0:
+        return 0.0
+    if side.upper() == "SHORT":
+        return max(0.0, (1.0 - target / reference) * 100.0)
+    return max(0.0, (target / reference - 1.0) * 100.0)
+
+
 def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
+    side = signal.side.upper()
+    potential = _price_pct(float(signal.target_price), float(signal.price), side)
+    downside = _price_pct(float(signal.stop_price), float(signal.price), "SHORT" if side == "LONG" else "LONG")
+    confidence = float(decision.final_score)
+    risk_pct = max(10.0, min(90.0, 100.0 - confidence + downside * 2.0))
+    reason = " ".join(str(decision.summary or "Qualified OHM trade setup").split())[:140]
     return (
-        "🚨 OHM TRADE ALERT\n\n"
-        f"Symbol: {decision.symbol}\n"
-        f"Asset: {signal.asset_class.upper()}\n"
-        f"Side: {signal.side.upper()}\n"
-        f"Timeframe: {signal.timeframe}\n\n"
-        f"Entry: {signal.price}\n"
-        f"Stop: {signal.stop_price}\n"
-        f"Target: {signal.target_price}\n"
-        f"Reward/Risk: {decision.risk.reward_to_risk:.2f}:1\n"
-        f"Position Size: {decision.risk.position_size:.6f}\n"
-        f"Risk Dollars: ${decision.risk.risk_dollars:.2f}\n\n"
-        f"Technical Score: {decision.deterministic_score}/100\n"
-        f"AI Score: "
-        f"{decision.ai_score if decision.ai_score is not None else 'N/A'}\n"
-        f"Final Score: {decision.final_score}/100\n"
-        f"Action: {decision.action.upper()}\n\n"
-        f"Analysis:\n{decision.summary}"
+        f"🚨 OHM TRADE — {decision.symbol}\n"
+        f"Potential: +{potential:.1f}%\n"
+        f"Confidence*: {confidence:.0f}%\n"
+        f"Risk*: {risk_pct:.0f}%\n"
+        f"Downside to stop: {downside:.1f}%\n"
+        f"Reason: {reason}\n"
+        f"Action: {decision.action.upper()}\n"
+        "*Heuristic score, not probability."
     )
 
 
@@ -39,6 +45,83 @@ def build_trade_confirmation_buttons(trade_id: str) -> dict:
             [{"text": "❌ SKIP TRADE", "callback_data": f"trade_skip:{trade_id}"}],
         ]
     }
+
+
+def _line_value(message: str, label: str) -> str | None:
+    prefix = f"{label}:"
+    for line in message.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return None
+
+
+def _number(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", value.replace(",", ""))
+    return float(match.group(0)) if match else None
+
+
+def _compact_legacy_chief(message: str) -> str:
+    if "OHM CHIEF" not in message:
+        return message
+
+    market = _line_value(message, "Market") or _line_value(message, "Asset") or "UNKNOWN"
+    direction = (_line_value(message, "Direction") or "LONG").upper()
+    confidence = _number(_line_value(message, "AI Confidence")) or 0.0
+    risk_label = (_line_value(message, "Risk") or "UNKNOWN").upper()
+    entry_zone = _line_value(message, "Entry Zone")
+    stop = _number(_line_value(message, "Stop"))
+    target1 = _number(_line_value(message, "Target 1"))
+    target2 = _number(_line_value(message, "Target 2"))
+
+    entry_ref = None
+    if entry_zone:
+        nums = re.findall(r"\d+(?:\.\d+)?", entry_zone.replace(",", ""))
+        if nums:
+            vals = [float(item) for item in nums[:2]]
+            entry_ref = sum(vals) / len(vals)
+
+    low = high = 0.0
+    downside = 0.0
+    if entry_ref and entry_ref > 0:
+        potential = [
+            _price_pct(value, entry_ref, direction)
+            for value in (target1, target2)
+            if value is not None
+        ]
+        if potential:
+            low, high = min(potential), max(potential)
+        if stop is not None:
+            downside = (
+                max(0.0, (stop / entry_ref - 1.0) * 100.0)
+                if direction == "SHORT"
+                else max(0.0, (1.0 - stop / entry_ref) * 100.0)
+            )
+
+    lines = message.splitlines()
+    reason = "Qualified OHM trade setup"
+    for index, line in enumerate(lines):
+        if line.strip() == "Reason:":
+            for candidate in lines[index + 1:index + 4]:
+                candidate = " ".join(candidate.split()).strip()
+                if candidate:
+                    reason = candidate[:140]
+                    break
+            break
+
+    headline = lines[0].upper() if lines else ""
+    action = "ENTER NOW" if "ENTER NOW" in headline else "SET LIMIT / WAIT"
+    return (
+        f"🔥 OHM TRADE — {market}\n"
+        f"Potential: +{low:.1f}% to +{high:.1f}%\n"
+        f"Confidence*: {confidence:.0f}%\n"
+        f"Risk: {risk_label}\n"
+        f"Downside to stop: {downside:.1f}%\n"
+        f"Reason: {reason}\n"
+        f"Action: {action}\n"
+        "*Heuristic confidence, not probability."
+    )
 
 
 def _telegram_post(bot_token: str, method: str, payload: dict) -> dict | None:
@@ -68,6 +151,7 @@ def send_telegram_message_with_id(
     message: str,
     reply_markup: dict | None = None,
 ) -> int | None:
+    message = _compact_legacy_chief(message)
     payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
@@ -88,6 +172,7 @@ def edit_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
+    message = _compact_legacy_chief(message)
     payload = {
         "chat_id": chat_id,
         "message_id": int(message_id),
@@ -104,6 +189,7 @@ def send_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
+    message = _compact_legacy_chief(message)
     payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
