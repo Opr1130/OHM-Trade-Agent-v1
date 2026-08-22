@@ -1,11 +1,10 @@
+import math
 from dataclasses import dataclass
 
 from app.scanner.models import MarketSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
 
 
-# Market-derived score weights. ATR multiples are deliberately excluded from
-# scoring because EntryExitPlan fixes them mechanically by risk level.
 RESISTANCE_WEIGHT = 30
 HISTORICAL_MOVE_WEIGHT = 30
 MOMENTUM_WEIGHT = 20
@@ -16,20 +15,9 @@ T1_HISTORICAL_MOVE_WEIGHT = 12
 VOLUME_WEIGHT = 6
 
 MIN_QUALIFYING_SCORE = 65
-
-# A target closer than 0.25 ATR to a prior high has little execution clearance.
 NEAR_RESISTANCE_ATR = 0.25
 MIN_BREAKOUT_VOLUME_RATIO = 1.1
-
-# A move beyond the asset's own rolling p90 favorable upside excursion is
-# already an uncommon event by definition; do not grant additional grace past
-# it. (Previously 1.10 — that 10% allowance let targets qualify that required
-# a historically rare move, which is a direct contributor to trades reaching
-# meaningful unrealized profit without ever tagging Target 1.)
 MATERIAL_P90_EXCESS_RATIO = 1.00
-
-# Recent 24h range near its rolling median indicates usable current movement.
-# Wider bands receive partial credit rather than silently becoming hard gates.
 NORMAL_VOLATILITY_MIN_RATIO = 0.75
 NORMAL_VOLATILITY_MAX_RATIO = 1.50
 USABLE_VOLATILITY_MIN_RATIO = 0.50
@@ -54,20 +42,68 @@ class TargetAttainabilityResult:
     rejection_reasons: list[str]
 
 
-def _aligned_momentum(snapshot: MarketSnapshot) -> bool:
-    return all(
-        value > 0
-        for value in (
-            snapshot.momentum_6h_pct,
-            snapshot.momentum_24h_pct,
-            snapshot.momentum_72h_pct,
-        )
+def _reject(plan: EntryExitPlan, reason: str) -> TargetAttainabilityResult:
+    return TargetAttainabilityResult(
+        symbol=plan.symbol,
+        qualified=False,
+        target_1_move_pct=0.0,
+        target_2_move_pct=0.0,
+        target_1_atr_multiple=0.0,
+        target_2_atr_multiple=0.0,
+        clearance_to_24h_resistance_pct=0.0,
+        clearance_to_72h_resistance_pct=0.0,
+        momentum_context="unavailable",
+        volatility_context="unavailable",
+        attainability_score=0,
+        strengths=[],
+        warnings=[],
+        rejection_reasons=[reason],
     )
+
+
+def _valid_long_geometry(plan: EntryExitPlan, entry: float, atr_value: float) -> bool:
+    values = (
+        plan.entry_low,
+        plan.entry_high,
+        plan.chase_limit,
+        plan.stop_price,
+        plan.target_1,
+        plan.target_2,
+        plan.reward_to_risk_1,
+        plan.reward_to_risk_2,
+        entry,
+        atr_value,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    return (
+        plan.entry_low > 0
+        and plan.entry_high > 0
+        and plan.entry_low <= plan.entry_high
+        and plan.chase_limit >= plan.entry_high
+        and 0 < plan.stop_price < entry < plan.target_1 < plan.target_2
+        and atr_value > 0
+        and plan.reward_to_risk_1 > 0
+        and plan.reward_to_risk_2 > 0
+    )
+
+
+def _aligned_momentum(snapshot: MarketSnapshot) -> bool:
+    values = (
+        snapshot.momentum_6h_pct,
+        snapshot.momentum_24h_pct,
+        snapshot.momentum_72h_pct,
+    )
+    return all(math.isfinite(float(value)) and value > 0 for value in values)
 
 
 def _healthy_structure(snapshot: MarketSnapshot) -> bool:
     return (
-        snapshot.trend == "bullish"
+        all(
+            math.isfinite(float(value))
+            for value in (snapshot.last_price, snapshot.ema20, snapshot.ema50)
+        )
+        and snapshot.trend == "bullish"
         and snapshot.last_price >= snapshot.ema20
         and snapshot.ema20 > snapshot.ema50
     )
@@ -77,6 +113,7 @@ def _breakout_confirmed(snapshot: MarketSnapshot) -> bool:
     return (
         _aligned_momentum(snapshot)
         and _healthy_structure(snapshot)
+        and math.isfinite(float(snapshot.volume_ratio))
         and snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO
     )
 
@@ -88,6 +125,8 @@ def _resistance_points(
     weight: int,
     breakout_confirmed: bool,
 ) -> tuple[int, str]:
+    if not all(math.isfinite(float(value)) for value in (target, resistance, atr_value)):
+        return 0, "unavailable"
     if resistance <= 0 or atr_value <= 0:
         return 0, "unavailable"
     clearance_atr = (resistance - target) / atr_value
@@ -107,6 +146,9 @@ def _historical_move_points(
     p90_pct: float,
     weight: int,
 ) -> tuple[int, str]:
+    values = (move_pct, median_pct, p75_pct, p90_pct)
+    if not all(math.isfinite(float(value)) for value in values):
+        return 0, "unavailable"
     if (
         min(median_pct, p75_pct, p90_pct) < 0
         or not median_pct <= p75_pct <= p90_pct
@@ -139,17 +181,8 @@ def evaluate_target_attainability(
     rejection_reasons: list[str] = []
     entry = (plan.entry_low + plan.entry_high) / 2
 
-    if entry <= 0 or snapshot.atr <= 0:
-        return TargetAttainabilityResult(
-            symbol=plan.symbol, qualified=False,
-            target_1_move_pct=0.0, target_2_move_pct=0.0,
-            target_1_atr_multiple=0.0, target_2_atr_multiple=0.0,
-            clearance_to_24h_resistance_pct=0.0,
-            clearance_to_72h_resistance_pct=0.0,
-            momentum_context="unavailable", volatility_context="unavailable",
-            attainability_score=0, strengths=[], warnings=[],
-            rejection_reasons=["Invalid entry reference or ATR"],
-        )
+    if not _valid_long_geometry(plan, entry, snapshot.atr):
+        return _reject(plan, "Invalid LONG target/stop geometry or non-finite plan values")
 
     t1_move_pct = (plan.target_1 - entry) / entry * 100
     t2_move_pct = (plan.target_2 - entry) / entry * 100
@@ -161,22 +194,10 @@ def evaluate_target_attainability(
 
     confirmed_breakout = _breakout_confirmed(snapshot)
     for target, resistance, weight, label in (
-        (
-            plan.target_1,
-            snapshot.recent_24h_high,
-            T1_RESISTANCE_WEIGHT,
-            "T1/24h",
-        ),
-        (
-            plan.target_2,
-            snapshot.recent_72h_high,
-            RESISTANCE_WEIGHT - T1_RESISTANCE_WEIGHT,
-            "T2/72h",
-        ),
+        (plan.target_1, snapshot.recent_24h_high, T1_RESISTANCE_WEIGHT, "T1/24h"),
+        (plan.target_2, snapshot.recent_72h_high, RESISTANCE_WEIGHT - T1_RESISTANCE_WEIGHT, "T2/72h"),
     ):
-        points, state = _resistance_points(
-            target, resistance, snapshot.atr, weight, confirmed_breakout
-        )
+        points, state = _resistance_points(target, resistance, snapshot.atr, weight, confirmed_breakout)
         score += points
         if state == "clear":
             strengths.append(f"{label} has resistance clearance")
@@ -188,27 +209,11 @@ def evaluate_target_attainability(
             warnings.append(f"{label} crosses resistance without deterministic breakout confirmation")
 
     historical_specs = (
-        (
-            t1_move_pct,
-            snapshot.rolling_24h_upside_median_pct,
-            snapshot.rolling_24h_upside_p75_pct,
-            snapshot.rolling_24h_upside_p90_pct,
-            T1_HISTORICAL_MOVE_WEIGHT,
-            "Target 1/24h",
-        ),
-        (
-            t2_move_pct,
-            snapshot.rolling_72h_upside_median_pct,
-            snapshot.rolling_72h_upside_p75_pct,
-            snapshot.rolling_72h_upside_p90_pct,
-            HISTORICAL_MOVE_WEIGHT - T1_HISTORICAL_MOVE_WEIGHT,
-            "Target 2/72h",
-        ),
+        (t1_move_pct, snapshot.rolling_24h_upside_median_pct, snapshot.rolling_24h_upside_p75_pct, snapshot.rolling_24h_upside_p90_pct, T1_HISTORICAL_MOVE_WEIGHT, "Target 1/24h"),
+        (t2_move_pct, snapshot.rolling_72h_upside_median_pct, snapshot.rolling_72h_upside_p75_pct, snapshot.rolling_72h_upside_p90_pct, HISTORICAL_MOVE_WEIGHT - T1_HISTORICAL_MOVE_WEIGHT, "Target 2/72h"),
     )
     for move_pct, median, p75, p90, weight, label in historical_specs:
-        points, state = _historical_move_points(
-            move_pct, median, p75, p90, weight
-        )
+        points, state = _historical_move_points(move_pct, median, p75, p90, weight)
         score += points
         if state == "normal":
             strengths.append(f"{label} fits the median historical move")
@@ -231,7 +236,10 @@ def evaluate_target_attainability(
         snapshot.momentum_24h_pct,
         snapshot.momentum_72h_pct,
     )
-    if _aligned_momentum(snapshot):
+    if not all(math.isfinite(float(value)) for value in momentum):
+        momentum_context = "unavailable due to non-finite momentum evidence"
+        rejection_reasons.append("Momentum evidence contains non-finite values")
+    elif _aligned_momentum(snapshot):
         score += MOMENTUM_WEIGHT
         momentum_context = "positive across 6h, 24h, and 72h"
         strengths.append("Short- and medium-term momentum agree")
@@ -251,29 +259,32 @@ def evaluate_target_attainability(
         momentum_context = "negative across 6h, 24h, and 72h"
         warnings.append("Momentum does not support bullish continuation")
 
-    if snapshot.volume_ratio >= 1.5:
-        score += VOLUME_WEIGHT
-        strengths.append("Strong volume confirms continuation")
-    elif snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO:
-        score += 4
-        strengths.append("Above-average volume supports continuation")
-    elif snapshot.volume_ratio >= 0.8:
-        score += 2
-        warnings.append("Volume is only near average")
+    if math.isfinite(float(snapshot.volume_ratio)):
+        if snapshot.volume_ratio >= 1.5:
+            score += VOLUME_WEIGHT
+            strengths.append("Strong volume confirms continuation")
+        elif snapshot.volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO:
+            score += 4
+            strengths.append("Above-average volume supports continuation")
+        elif snapshot.volume_ratio >= 0.8:
+            score += 2
+            warnings.append("Volume is only near average")
+        else:
+            warnings.append("Below-average volume does not confirm continuation")
     else:
-        warnings.append("Below-average volume does not confirm continuation")
+        rejection_reasons.append("Volume evidence contains a non-finite value")
 
     if _healthy_structure(snapshot):
         score += VOLUME_CONTINUATION_WEIGHT - VOLUME_WEIGHT
         strengths.append("Trend structure supports continuation")
-    elif snapshot.last_price >= snapshot.ema20:
+    elif all(math.isfinite(float(value)) for value in (snapshot.last_price, snapshot.ema20)) and snapshot.last_price >= snapshot.ema20:
         score += 2
         warnings.append("Continuation structure is only partially aligned")
     else:
         warnings.append("Trend structure does not support continuation")
 
     median_24h = snapshot.rolling_24h_range_median_pct
-    if median_24h > 0:
+    if math.isfinite(float(median_24h)) and math.isfinite(float(snapshot.realized_range_24h_pct)) and median_24h > 0:
         volatility_ratio = snapshot.realized_range_24h_pct / median_24h
         if NORMAL_VOLATILITY_MIN_RATIO <= volatility_ratio <= NORMAL_VOLATILITY_MAX_RATIO:
             score += VOLATILITY_WEIGHT
@@ -302,9 +313,7 @@ def evaluate_target_attainability(
 
     score = max(0, min(100, score))
     if score < MIN_QUALIFYING_SCORE:
-        rejection_reasons.append(
-            f"Attainability score {score} is below minimum {MIN_QUALIFYING_SCORE}"
-        )
+        rejection_reasons.append(f"Attainability score {score} is below minimum {MIN_QUALIFYING_SCORE}")
 
     return TargetAttainabilityResult(
         symbol=plan.symbol,
