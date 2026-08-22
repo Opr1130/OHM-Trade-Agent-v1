@@ -61,7 +61,7 @@ def _financial_rows():
                 "market_regime": "NEUTRAL",
                 "net_pnl": win_value,
             }
-            for _ in range(10)
+            for _ in range(20)
         )
         rows.extend(
             {
@@ -71,7 +71,7 @@ def _financial_rows():
                 "market_regime": "NEUTRAL",
                 "net_pnl": -1.0,
             }
-            for _ in range(5)
+            for _ in range(10)
         )
     return rows
 
@@ -82,12 +82,14 @@ def test_self_calibration_uses_expectancy_not_only_win_rate():
     assert model["evidence"]["direction:LONG"]["success_rate"] == model["evidence"]["direction:SHORT"]["success_rate"]
     assert model["weights"]["direction:SHORT"] > 1.0
     assert model["weights"]["direction:LONG"] < 1.0
+    assert model["guardrail"]["minimum_bucket_samples"] == 30
     assert model["objective"] == "realized_net_pnl_expectancy_after_costs"
 
 
 def test_profitability_profile_weights_use_expectancy_magnitude():
     weights, evidence = _trade_bucket_weights(_financial_rows())
     assert evidence["status"] == "CALIBRATED"
+    assert evidence["minimum_bucket_samples"] == 30
     assert weights["direction:SHORT"] > weights["direction:LONG"]
     assert evidence["evidence"]["direction:SHORT"]["net_win_rate"] == evidence["evidence"]["direction:LONG"]["net_win_rate"]
 
