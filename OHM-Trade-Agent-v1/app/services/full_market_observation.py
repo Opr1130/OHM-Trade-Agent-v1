@@ -53,6 +53,7 @@ class MarketTransition:
     distance_from_24h_high_pct: float
     liquidity_24h_usd_approx: float
     alert_tier: str
+    reference_price: float = 0.0
     trade_authority_changed: bool = False
     production_execution_gate_changed: bool = False
 
@@ -269,6 +270,7 @@ def _transition(current: MarketObservation, previous: dict[str, Any] | None) -> 
         distance_from_24h_high_pct=current.distance_from_24h_high_pct,
         liquidity_24h_usd_approx=current.notional_24h_usd_approx,
         alert_tier=alert_tier,
+        reference_price=current.last_price,
     )
 
 
@@ -286,6 +288,7 @@ def process_full_market_observations(
     now = now.astimezone(timezone.utc)
     target = observation_file or OBSERVATION_FILE
     state_target = state_file or STATE_FILE
+    client = client or KrakenClient()
     observations = collect_full_market_observations(client)
     target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.parent / f".{target.name}.lock"
@@ -327,6 +330,24 @@ def process_full_market_observations(
         save_json_atomic(state_target, state)
 
     transitions.sort(key=lambda row: (-row.score, -row.liquidity_24h_usd_approx, row.symbol))
+
+    # Production/default storage closes the previously missing Full-Market
+    # outcome loop. Custom paths are used heavily by unit tests; do not write to
+    # unrelated default registries when a caller explicitly isolates storage.
+    if observation_file is None and state_file is None:
+        try:
+            from app.services.full_market_transition_learning import (
+                capture_full_market_transitions,
+                observe_due_full_market_transition_outcomes,
+            )
+
+            capture_full_market_transitions(transitions, now=now)
+            observe_due_full_market_transition_outcomes(now=now, client=client)
+        except Exception as exc:
+            # Learning is never allowed to break market observation or change
+            # trading authority. The calling job already reports scan health.
+            print("Full-market transition learning: fail-soft", type(exc).__name__)
+
     return FullMarketResult(
         observed_markets=len(observations),
         persisted_events=persisted,
