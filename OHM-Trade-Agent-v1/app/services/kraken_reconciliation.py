@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from app.exchanges.kraken_identity import balance_quantity_for_asset, canonicalize_pair
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade, close_trade, get_active_trades
 from app.services.execution_learning_registry import record_execution_event
@@ -66,16 +67,7 @@ def _epoch_to_iso(value: Any) -> str | None:
 
 
 def _canonical_pair(pair: str) -> str:
-    value = str(pair or "").upper().replace("/", "").replace("-", "").replace("_", "")
-    aliases = {
-        "XXBTZUSD": "BTCUSD",
-        "XBTUSD": "BTCUSD",
-        "XXBTZUSDT": "BTCUSDT",
-        "XBTUSDT": "BTCUSDT",
-        "XETHZUSD": "ETHUSD",
-        "ETHUSD": "ETHUSD",
-    }
-    return aliases.get(value, value)
+    return canonicalize_pair(pair)
 
 
 def _base_asset(symbol: str) -> str | None:
@@ -149,13 +141,7 @@ def _expected_quantity(trade: ActiveTrade) -> float | None:
 
 
 def _balance_for_asset(balances: dict[str, float], asset: str | None) -> float | None:
-    if not asset:
-        return None
-    aliases = {asset, f"X{asset}", f"Z{asset}"}
-    if asset == "BTC":
-        aliases.update({"XBT", "XXBT"})
-    values = [float(amount) for key, amount in balances.items() if str(key).upper() in aliases]
-    return sum(values) if values else 0.0
+    return balance_quantity_for_asset(balances, asset)
 
 
 def _order_matches_intent(row: dict[str, Any], intent: Any) -> bool:
@@ -183,7 +169,7 @@ def _verified_unbound_entry_fills(
     """Resolve exactly one completed Kraken order for an unbound OHM intent.
 
     TradeHistory includes the originating order txid. Grouping by that identity
-    prevents unrelated manual fills on the same pair from being aggregated into
+    prevents unrelated manual fills on the same pair/side/time from being aggregated into
     an OHM fill. An unbound group must also match planned price and notional
     within conservative tolerances before it can become authoritative.
     """
