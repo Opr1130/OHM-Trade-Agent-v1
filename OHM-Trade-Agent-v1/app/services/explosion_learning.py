@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -15,11 +16,10 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 SNAPSHOT_FILE = Path("/app/data/explosion_state_snapshots.jsonl")
 OUTCOME_FILE = Path("/app/data/explosion_state_outcomes.jsonl")
 STATE_FILE = Path("/app/data/explosion_state_outcome_state.json")
+CANDLE_INTERVAL_SECONDS = 15 * 60
 HORIZONS = {
-    "1h": timedelta(hours=1),
-    "4h": timedelta(hours=4),
-    "12h": timedelta(hours=12),
-    "24h": timedelta(hours=24),
+    "1h": timedelta(hours=1), "4h": timedelta(hours=4),
+    "12h": timedelta(hours=12), "24h": timedelta(hours=24),
 }
 
 
@@ -35,40 +35,23 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def append_explosion_state(
-    vector: ExplosionStateVector,
-    *,
-    path: Path | None = None,
-    observed_at: datetime | None = None,
-    source_cohort: str | None = None,
-) -> str:
-    """Persist one immutable decision-time feature snapshot for later labeling."""
+def append_explosion_state(vector: ExplosionStateVector, *, path: Path | None = None, observed_at: datetime | None = None, source_cohort: str | None = None) -> str:
     observed_at = observed_at or datetime.now(timezone.utc)
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     target = path or SNAPSHOT_FILE
     target.parent.mkdir(parents=True, exist_ok=True)
     observation_id = uuid.uuid4().hex
-    payload = {
-        "record_type": "EXPLOSION_STATE",
-        "observation_id": observation_id,
-        "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
-        "source_cohort": source_cohort,
-        **vector.as_dict(),
-    }
+    payload = {"record_type": "EXPLOSION_STATE", "observation_id": observation_id, "observed_at": observed_at.astimezone(timezone.utc).isoformat(), "source_cohort": source_cohort, **vector.as_dict()}
     lock = target.parent / f".{target.name}.lock"
     with registry_lock(lock):
         with target.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+            handle.write(json.dumps(payload, sort_keys=True, default=str, allow_nan=False) + "\n")
             handle.flush()
     return observation_id
 
 
-def read_recent_explosion_states(
-    *,
-    path: Path | None = None,
-    limit: int = 5000,
-) -> list[dict[str, Any]]:
+def read_recent_explosion_states(*, path: Path | None = None, limit: int = 5000) -> list[dict[str, Any]]:
     target = path or SNAPSHOT_FILE
     if not target.exists():
         return []
@@ -101,51 +84,33 @@ def latest_state_by_symbol(*, path: Path | None = None) -> dict[str, dict[str, A
     return latest
 
 
-def _window_metrics(
-    candles: list[Candle],
-    *,
-    start: datetime,
-    end: datetime,
-    reference_price: float,
-) -> dict[str, Any] | None:
-    selected = [
-        candle for candle in candles
-        if start.timestamp() <= candle.timestamp <= end.timestamp()
-    ]
-    if not selected or reference_price <= 0:
+def _window_metrics(candles: list[Candle], *, start: datetime, end: datetime, reference_price: float) -> dict[str, Any] | None:
+    start_ts, end_ts = start.timestamp(), end.timestamp()
+    selected = [candle for candle in candles if start_ts <= candle.timestamp and candle.timestamp + CANDLE_INTERVAL_SECONDS <= end_ts]
+    if not selected or not math.isfinite(float(reference_price)) or reference_price <= 0:
         return None
-    highest = max(float(candle.high) for candle in selected)
-    lowest = min(float(candle.low) for candle in selected)
+    numeric = [float(selected[-1].close)] + [float(c.high) for c in selected] + [float(c.low) for c in selected]
+    if not all(math.isfinite(value) and value > 0 for value in numeric):
+        return None
+    highest = max(float(c.high) for c in selected)
+    lowest = min(float(c.low) for c in selected)
     close_price = float(selected[-1].close)
-    mfe = (highest / reference_price - 1.0) * 100.0
-    mae = (lowest / reference_price - 1.0) * 100.0
-    close_return = (close_price / reference_price - 1.0) * 100.0
-
+    mfe = (highest - reference_price) / reference_price * 100.0
+    mae = (lowest - reference_price) / reference_price * 100.0
+    close_return = (close_price - reference_price) / reference_price * 100.0
     max_candle = max(selected, key=lambda candle: float(candle.high))
     time_to_mfe_minutes = max(0.0, (max_candle.timestamp - start.timestamp()) / 60.0)
     return {
-        "close_price": round(close_price, 12),
-        "close_return_pct": round(close_return, 6),
-        "mfe_pct": round(mfe, 6),
-        "mae_pct": round(mae, 6),
+        "close_price": round(close_price, 12), "close_return_pct": round(close_return, 6),
+        "mfe_pct": round(mfe, 6), "mae_pct": round(mae, 6),
         "time_to_mfe_minutes": round(time_to_mfe_minutes, 2),
-        "hit_2pct": mfe >= 2.0,
-        "hit_5pct": mfe >= 5.0,
-        "hit_10pct": mfe >= 10.0,
-        "hit_20pct": mfe >= 20.0,
+        "hit_2pct": mfe >= 2.0, "hit_5pct": mfe >= 5.0,
+        "hit_10pct": mfe >= 10.0, "hit_20pct": mfe >= 20.0,
         "sample_candles": len(selected),
     }
 
 
-def observe_due_explosion_outcomes(
-    *,
-    now: datetime | None = None,
-    client: KrakenClient | None = None,
-    snapshot_file: Path | None = None,
-    outcome_file: Path | None = None,
-    state_file: Path | None = None,
-) -> dict[str, Any]:
-    """Prospectively label explosion states after fixed horizons are fully due."""
+def observe_due_explosion_outcomes(*, now: datetime | None = None, client: KrakenClient | None = None, snapshot_file: Path | None = None, outcome_file: Path | None = None, state_file: Path | None = None) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -154,11 +119,11 @@ def observe_due_explosion_outcomes(
     target = outcome_file or OUTCOME_FILE
     state_target = state_file or STATE_FILE
     state = load_json(state_target)
-    completed = set(str(item) for item in (state.get("completed") or []))
+    completed_order = list(dict.fromkeys(str(item) for item in (state.get("completed") or [])))
+    completed = set(completed_order)
 
     due_by_symbol: dict[str, list[tuple[dict[str, Any], str, datetime, datetime]]] = defaultdict(list)
-    pending = 0
-    invalid = 0
+    pending = invalid = 0
     for row in snapshots:
         observation_id = str(row.get("observation_id") or "")
         observed_at = _parse_time(row.get("observed_at"))
@@ -167,7 +132,7 @@ def observe_due_explosion_outcomes(
             reference_price = float(row.get("reference_price") or 0.0)
         except (TypeError, ValueError):
             reference_price = 0.0
-        if not observation_id or observed_at is None or not symbol or reference_price <= 0:
+        if not observation_id or observed_at is None or not symbol or not math.isfinite(reference_price) or reference_price <= 0:
             invalid += 1
             continue
         for horizon, delta in HORIZONS.items():
@@ -191,50 +156,29 @@ def observe_due_explosion_outcomes(
             unavailable += len(due)
             continue
         for row, horizon, start, end in due:
-            metrics = _window_metrics(
-                candles,
-                start=start,
-                end=end,
-                reference_price=float(row["reference_price"]),
-            )
+            metrics = _window_metrics(candles, start=start, end=end, reference_price=float(row["reference_price"]))
             if metrics is None:
                 unavailable += 1
                 continue
             key = f"{row['observation_id']}:{horizon}"
             outcomes.append({
-                "record_type": "EXPLOSION_OUTCOME",
-                "observation_id": row["observation_id"],
-                "symbol": symbol,
-                "phase": row.get("phase"),
-                "phase_score": row.get("phase_score"),
-                "source_cohort": row.get("source_cohort"),
-                "observed_at": start.isoformat(),
-                "outcome_as_of": end.isoformat(),
-                "horizon": horizon,
-                "reference_price": float(row["reference_price"]),
-                "momentum_1h_pct": row.get("momentum_1h_pct"),
-                "momentum_6h_pct": row.get("momentum_6h_pct"),
-                "momentum_24h_pct": row.get("momentum_24h_pct"),
-                "momentum_acceleration": row.get("momentum_acceleration"),
-                "relative_volume": row.get("relative_volume"),
-                "relative_volume_change": row.get("relative_volume_change"),
-                "atr_percentile": row.get("atr_percentile"),
-                "atr_percentile_change": row.get("atr_percentile_change"),
-                "bandwidth_percentile": row.get("bandwidth_percentile"),
-                "bandwidth_percentile_change": row.get("bandwidth_percentile_change"),
-                "compression_release_score": row.get("compression_release_score"),
-                "distance_to_high_velocity_pct": row.get("distance_to_high_velocity_pct"),
-                "base_displacement_velocity_pct": row.get("base_displacement_velocity_pct"),
-                "trade_count_acceleration": row.get("trade_count_acceleration"),
-                "aggressor_imbalance": row.get("aggressor_imbalance"),
-                "large_print_concentration": row.get("large_print_concentration"),
-                "book_notional_imbalance": row.get("book_notional_imbalance"),
-                "persistence_score": row.get("persistence_score"),
-                **metrics,
-                "shadow_only": True,
-                "production_decision_changed": False,
+                "record_type": "EXPLOSION_OUTCOME", "observation_id": row["observation_id"], "symbol": symbol,
+                "phase": row.get("phase"), "phase_score": row.get("phase_score"), "source_cohort": row.get("source_cohort"),
+                "observed_at": start.isoformat(), "outcome_as_of": end.isoformat(), "horizon": horizon,
+                "reference_price": float(row["reference_price"]), "momentum_1h_pct": row.get("momentum_1h_pct"),
+                "momentum_6h_pct": row.get("momentum_6h_pct"), "momentum_24h_pct": row.get("momentum_24h_pct"),
+                "momentum_acceleration": row.get("momentum_acceleration"), "relative_volume": row.get("relative_volume"),
+                "relative_volume_change": row.get("relative_volume_change"), "atr_percentile": row.get("atr_percentile"),
+                "atr_percentile_change": row.get("atr_percentile_change"), "bandwidth_percentile": row.get("bandwidth_percentile"),
+                "bandwidth_percentile_change": row.get("bandwidth_percentile_change"), "compression_release_score": row.get("compression_release_score"),
+                "distance_to_high_velocity_pct": row.get("distance_to_high_velocity_pct"), "base_displacement_velocity_pct": row.get("base_displacement_velocity_pct"),
+                "trade_count_acceleration": row.get("trade_count_acceleration"), "aggressor_imbalance": row.get("aggressor_imbalance"),
+                "large_print_concentration": row.get("large_print_concentration"), "book_notional_imbalance": row.get("book_notional_imbalance"),
+                "persistence_score": row.get("persistence_score"), **metrics, "shadow_only": True, "production_decision_changed": False,
             })
-            completed.add(key)
+            if key not in completed:
+                completed.add(key)
+                completed_order.append(key)
 
     if outcomes:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -242,17 +186,10 @@ def observe_due_explosion_outcomes(
         with registry_lock(lock):
             with target.open("a", encoding="utf-8") as handle:
                 for row in outcomes:
-                    handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+                    handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
                 handle.flush()
-            state["completed"] = sorted(completed)[-50000:]
+            state["completed"] = completed_order[-50000:]
             state["last_observed_at"] = now.isoformat()
             save_json_atomic(state_target, state)
 
-    return {
-        "status": "OK",
-        "snapshots": len(snapshots),
-        "outcomes_added": len(outcomes),
-        "pending_horizons": pending,
-        "invalid_snapshots": invalid,
-        "unavailable_horizons": unavailable,
-    }
+    return {"status": "OK", "snapshots": len(snapshots), "outcomes_added": len(outcomes), "pending_horizons": pending, "invalid_snapshots": invalid, "unavailable_horizons": unavailable}
