@@ -127,13 +127,18 @@ def volume_ratio(
     volumes: Sequence[float],
     period: int = 20,
 ) -> float:
+    """Compare the last completed bar with the preceding completed baseline.
+
+    Callers pass completed-only series. The numerator therefore must be
+    ``volumes[-1]``; using ``[-2]`` would delay all volume evidence by one bar.
+    """
     if len(volumes) < period + 1:
         raise ValueError(
             f"Volume ratio requires at least {period + 1} values"
         )
 
-    current_volume = volumes[-2]
-    average_volume = sum(volumes[-(period + 2):-2]) / period
+    current_volume = volumes[-1]
+    average_volume = sum(volumes[-(period + 1):-1]) / period
 
     if average_volume == 0:
         return 0.0
