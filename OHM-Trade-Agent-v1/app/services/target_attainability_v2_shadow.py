@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+import math
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from statistics import mean
 from typing import Any, Iterable
@@ -9,6 +10,7 @@ from typing import Any, Iterable
 MIN_SCALP_MOVE_PCT = 0.75
 MIN_FULL_CONFIDENCE_SCORE = 70
 MIN_REDUCED_CONFIDENCE_SCORE = 55
+HORIZON_ORDER = {"1h": 1, "4h": 4, "12h": 12, "24h": 24, "72h": 72}
 
 
 @dataclass(frozen=True)
@@ -29,32 +31,27 @@ class TargetV2ShadowResult:
         return asdict(self)
 
 
+def _reject(symbol: str, direction: str, reason: str) -> TargetV2ShadowResult:
+    return TargetV2ShadowResult(symbol, direction, "REJECT", 0, None, None, "UNAVAILABLE", [reason], [])
+
+
+def _finite_values(values: Iterable[float]) -> bool:
+    return all(math.isfinite(float(value)) for value in values)
+
+
 def _directional_percentiles(snapshot: Any, direction: str) -> tuple[float, float, float, float, float, float]:
-    if direction == "SHORT":
-        return (
-            float(getattr(snapshot, "rolling_24h_downside_median_pct", 0.0) or 0.0),
-            float(getattr(snapshot, "rolling_24h_downside_p75_pct", 0.0) or 0.0),
-            float(getattr(snapshot, "rolling_24h_downside_p90_pct", 0.0) or 0.0),
-            float(getattr(snapshot, "rolling_72h_downside_median_pct", 0.0) or 0.0),
-            float(getattr(snapshot, "rolling_72h_downside_p75_pct", 0.0) or 0.0),
-            float(getattr(snapshot, "rolling_72h_downside_p90_pct", 0.0) or 0.0),
-        )
-    return (
-        float(getattr(snapshot, "rolling_24h_upside_median_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "rolling_24h_upside_p75_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "rolling_24h_upside_p90_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "rolling_72h_upside_median_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "rolling_72h_upside_p75_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "rolling_72h_upside_p90_pct", 0.0) or 0.0),
+    names = (
+        ("rolling_24h_downside_median_pct", "rolling_24h_downside_p75_pct", "rolling_24h_downside_p90_pct", "rolling_72h_downside_median_pct", "rolling_72h_downside_p75_pct", "rolling_72h_downside_p90_pct")
+        if direction == "SHORT"
+        else ("rolling_24h_upside_median_pct", "rolling_24h_upside_p75_pct", "rolling_24h_upside_p90_pct", "rolling_72h_upside_median_pct", "rolling_72h_upside_p75_pct", "rolling_72h_upside_p90_pct")
     )
+    return tuple(float(getattr(snapshot, name, 0.0) or 0.0) for name in names)  # type: ignore[return-value]
 
 
 def _aligned_momentum(snapshot: Any, direction: str) -> tuple[int, str]:
-    values = [
-        float(getattr(snapshot, "momentum_6h_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "momentum_24h_pct", 0.0) or 0.0),
-        float(getattr(snapshot, "momentum_72h_pct", 0.0) or 0.0),
-    ]
+    values = [float(getattr(snapshot, name, 0.0) or 0.0) for name in ("momentum_6h_pct", "momentum_24h_pct", "momentum_72h_pct")]
+    if not _finite_values(values):
+        return 0, "momentum evidence is non-finite"
     signs = [value < 0 if direction == "SHORT" else value > 0 for value in values]
     count = sum(signs)
     if count == 3:
@@ -70,6 +67,8 @@ def _structure_score(snapshot: Any, direction: str) -> tuple[int, str]:
     price = float(getattr(snapshot, "last_price", 0.0) or 0.0)
     ema20 = float(getattr(snapshot, "ema20", 0.0) or 0.0)
     ema50 = float(getattr(snapshot, "ema50", 0.0) or 0.0)
+    if not _finite_values((price, ema20, ema50)) or min(price, ema20, ema50) <= 0:
+        return 0, "structure evidence is invalid or non-finite"
     trend = str(getattr(snapshot, "trend", "") or "").lower()
     if direction == "SHORT":
         healthy = trend == "bearish" and price <= ema20 < ema50
@@ -85,113 +84,90 @@ def _structure_score(snapshot: Any, direction: str) -> tuple[int, str]:
 
 
 def evaluate_target_v2_shadow(snapshot: Any) -> TargetV2ShadowResult:
-    """Shadow-only target challenger. It never changes production qualification."""
     symbol = str(getattr(snapshot, "symbol", "UNKNOWN"))
     direction = str(getattr(snapshot, "trade_direction", "LONG") or "LONG").upper()
-    p50_24, p75_24, p90_24, p50_72, p75_72, p90_72 = _directional_percentiles(snapshot, direction)
+    if direction not in {"LONG", "SHORT"}:
+        return _reject(symbol, direction, "trade direction must be LONG or SHORT")
+
+    try:
+        percentiles = _directional_percentiles(snapshot, direction)
+    except (TypeError, ValueError):
+        return _reject(symbol, direction, "directional historical excursion percentiles are malformed")
+    if not _finite_values(percentiles) or min(percentiles) <= 0:
+        return _reject(symbol, direction, "directional historical excursion percentiles unavailable or non-finite")
+    p50_24, p75_24, p90_24, p50_72, p75_72, p90_72 = percentiles
+    if not (p50_24 <= p75_24 <= p90_24 and p50_72 <= p75_72 <= p90_72):
+        return _reject(symbol, direction, "directional excursion percentiles are not monotonic")
+
     reasons: list[str] = []
     warnings: list[str] = []
-
-    if min(p50_24, p75_24, p90_24, p50_72, p75_72, p90_72) <= 0:
-        return TargetV2ShadowResult(
-            symbol=symbol,
-            direction=direction,
-            target_class="REJECT",
-            confidence_score=0,
-            proposed_t1_move_pct=None,
-            proposed_t2_move_pct=None,
-            estimated_time_horizon="UNAVAILABLE",
-            reasons=["directional historical excursion percentiles unavailable"],
-            warnings=[],
-        )
-
     score = 0
     momentum_score, momentum_reason = _aligned_momentum(snapshot, direction)
+    if "non-finite" in momentum_reason:
+        return _reject(symbol, direction, momentum_reason)
     score += momentum_score
     reasons.append(momentum_reason)
 
     structure_score, structure_reason = _structure_score(snapshot, direction)
+    if "invalid" in structure_reason or "non-finite" in structure_reason:
+        return _reject(symbol, direction, structure_reason)
     score += structure_score
     reasons.append(structure_reason)
 
     volume_ratio = float(getattr(snapshot, "volume_ratio", 0.0) or 0.0)
+    realized_24 = float(getattr(snapshot, "realized_range_24h_pct", 0.0) or 0.0)
+    median_range = float(getattr(snapshot, "rolling_24h_range_median_pct", 0.0) or 0.0)
+    technical = float(getattr(snapshot, "technical_score", 0.0) or 0.0)
+    if not _finite_values((volume_ratio, realized_24, median_range, technical)):
+        return _reject(symbol, direction, "target-v2 decision inputs contain non-finite values")
+
     if volume_ratio >= 1.5:
-        score += 15
-        reasons.append("strong relative volume")
+        score += 15; reasons.append("strong relative volume")
     elif volume_ratio >= 1.1:
-        score += 10
-        reasons.append("above-average relative volume")
+        score += 10; reasons.append("above-average relative volume")
     elif volume_ratio >= 0.8:
-        score += 5
-        warnings.append("volume is only near average")
+        score += 5; warnings.append("volume is only near average")
     else:
         warnings.append("below-average volume")
 
-    realized_24 = float(getattr(snapshot, "realized_range_24h_pct", 0.0) or 0.0)
-    median_range = float(getattr(snapshot, "rolling_24h_range_median_pct", 0.0) or 0.0)
     if median_range > 0:
         ratio = realized_24 / median_range
         if 0.75 <= ratio <= 1.5:
-            score += 15
-            reasons.append("realized range is near historical norm")
+            score += 15; reasons.append("realized range is near historical norm")
         elif 0.5 <= ratio <= 2.0:
-            score += 9
-            warnings.append("realized range is usable but outside preferred band")
+            score += 9; warnings.append("realized range is usable but outside preferred band")
         else:
-            score += 3
-            warnings.append("realized range is abnormal")
+            score += 3; warnings.append("realized range is abnormal")
     else:
         warnings.append("rolling range baseline unavailable")
 
-    technical = float(getattr(snapshot, "technical_score", 0.0) or 0.0)
     score += 15 if technical >= 80 else 10 if technical >= 70 else 5 if technical >= 60 else 0
     if technical < 60:
         warnings.append("technical score is weak")
-
     score = max(0, min(100, int(round(score))))
 
-    # Targets are intentionally derived from observed excursion distributions,
-    # not flat ATR multiples. P75 is the ceiling for normal target proposals;
-    # P90 is diagnostic only and never used as a default shadow target.
     t1 = round(min(p50_24, p75_24), 2)
-    t2 = round(min(p75_72, p90_72), 2)
+    t2: float | None = round(min(p75_72, p90_72), 2)
+    if not _finite_values((t1, t2)):
+        return _reject(symbol, direction, "proposed target is non-finite")
 
     if score >= MIN_FULL_CONFIDENCE_SCORE and t1 >= MIN_SCALP_MOVE_PCT and t2 >= max(t1, MIN_SCALP_MOVE_PCT * 1.5):
-        target_class = "FULL_TARGET"
-        horizon = "24H_TO_72H"
+        target_class, horizon = "FULL_TARGET", "24H_TO_72H"
     elif score >= MIN_REDUCED_CONFIDENCE_SCORE and t1 >= MIN_SCALP_MOVE_PCT:
         target_class = "REDUCED_TARGET"
         t2 = round(max(t1, min(p50_72, p75_72)), 2)
         horizon = "24H_TO_72H"
         warnings.append("use reduced target profile versus production mechanical target")
     elif t1 >= MIN_SCALP_MOVE_PCT:
-        target_class = "SCALP_TARGET"
-        t2 = None
-        horizon = "UP_TO_24H"
+        target_class, t2, horizon = "SCALP_TARGET", None, "UP_TO_24H"
         warnings.append("only a smaller directional move is supported")
     elif momentum_score >= 16 or structure_score >= 10:
-        target_class = "WATCH_FOR_ENTRY"
-        t1 = None
-        t2 = None
-        horizon = "REASSESS"
+        target_class, t1, t2, horizon = "WATCH_FOR_ENTRY", None, None, "REASSESS"
         warnings.append("directional context exists but current move budget is too small")
     else:
-        target_class = "REJECT"
-        t1 = None
-        t2 = None
-        horizon = "NONE"
+        target_class, t1, t2, horizon = "REJECT", None, None, "NONE"
 
-    return TargetV2ShadowResult(
-        symbol=symbol,
-        direction=direction,
-        target_class=target_class,
-        confidence_score=score,
-        proposed_t1_move_pct=t1,
-        proposed_t2_move_pct=t2,
-        estimated_time_horizon=horizon,
-        reasons=reasons,
-        warnings=warnings,
-    )
+    return TargetV2ShadowResult(symbol, direction, target_class, score, t1, t2, horizon, reasons, warnings)
 
 
 def _shadow_payload(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -202,62 +178,62 @@ def _shadow_payload(row: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _best_move(row: dict[str, Any]) -> float | None:
-    values = []
-    for item in (row.get("observations") or {}).values():
-        if isinstance(item, dict) and isinstance(item.get("directional_move_pct"), (int, float)):
-            values.append(float(item["directional_move_pct"]))
+def _allowed_horizon_hours(payload: dict[str, Any]) -> int | None:
+    horizon = str(payload.get("estimated_time_horizon") or "").upper()
+    if horizon == "UP_TO_24H":
+        return 24
+    if horizon == "24H_TO_72H":
+        return 72
+    return None
+
+
+def _best_move(row: dict[str, Any], payload: dict[str, Any]) -> float | None:
+    max_hours = _allowed_horizon_hours(payload)
+    values: list[float] = []
+    for horizon, item in (row.get("observations") or {}).items():
+        if not isinstance(item, dict) or not isinstance(item.get("directional_move_pct"), (int, float)):
+            continue
+        hours = HORIZON_ORDER.get(str(horizon).lower())
+        if max_hours is not None and (hours is None or hours > max_hours):
+            continue
+        value = float(item["directional_move_pct"])
+        if math.isfinite(value):
+            values.append(value)
     return max(values) if values else None
 
 
 def build_target_v2_shadow_summary(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    rows = []
-    for row in records:
-        payload = _shadow_payload(row)
-        if payload is not None:
-            rows.append((row, payload))
-
+    rows = [(row, payload) for row in records if (payload := _shadow_payload(row)) is not None]
     by_class: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     validated = 0
-    class_hits = Counter()
     for row, payload in rows:
-        label = str(payload.get("target_class") or "UNKNOWN")
-        by_class[label].append((row, payload))
-        best = _best_move(row)
+        by_class[str(payload.get("target_class") or "UNKNOWN")].append((row, payload))
+        best = _best_move(row, payload)
         proposed = payload.get("proposed_t1_move_pct")
-        if best is not None and isinstance(proposed, (int, float)):
+        if best is not None and isinstance(proposed, (int, float)) and math.isfinite(float(proposed)):
             validated += 1
-            if best >= float(proposed):
-                class_hits[label] += 1
 
     breakdown = {}
     for label, entries in sorted(by_class.items()):
-        hit_denominator = 0
-        hits = 0
-        scores = []
+        hit_denominator = hits = 0
+        scores: list[float] = []
         for row, payload in entries:
             score = payload.get("confidence_score")
-            if isinstance(score, (int, float)):
+            if isinstance(score, (int, float)) and math.isfinite(float(score)):
                 scores.append(float(score))
-            best = _best_move(row)
+            best = _best_move(row, payload)
             proposed = payload.get("proposed_t1_move_pct")
-            if best is not None and isinstance(proposed, (int, float)):
+            if best is not None and isinstance(proposed, (int, float)) and math.isfinite(float(proposed)):
                 hit_denominator += 1
                 hits += int(best >= float(proposed))
         breakdown[label] = {
-            "samples": len(entries),
-            "validated": hit_denominator,
+            "samples": len(entries), "validated": hit_denominator,
             "t1_shadow_hit_rate_pct": round(hits / hit_denominator * 100.0, 2) if hit_denominator else None,
             "average_confidence_score": round(mean(scores), 2) if scores else None,
         }
 
     return {
-        "version": "target-attainability-v2-shadow",
-        "status": "OK" if rows else "NO_SHADOW_SAMPLES",
-        "samples": len(rows),
-        "validated_samples": validated,
-        "by_target_class": breakdown,
-        "production_target_gate_changed": False,
-        "automatic_promotion": False,
-        "shadow_only": True,
+        "version": "target-attainability-v2-shadow", "status": "OK" if rows else "NO_SHADOW_SAMPLES",
+        "samples": len(rows), "validated_samples": validated, "by_target_class": breakdown,
+        "production_target_gate_changed": False, "automatic_promotion": False, "shadow_only": True,
     }
