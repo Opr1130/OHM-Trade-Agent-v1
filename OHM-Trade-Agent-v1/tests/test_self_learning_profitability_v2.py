@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.exchanges.kraken import Candle
 from app.services import profitability_learning as learning
 from app.services import shadow_learning as shadow
 
@@ -20,11 +21,14 @@ def test_shadow_learning_records_multi_horizon_directional_outcomes(monkeypatch,
     )
 
     class FakeClient:
-        def get_tickers(self, pairs):
-            return {"ABCUSD": {"last": 105.0}}
-
-        def get_ticker(self, pair):
-            return {"last": 105.0}
+        def get_ohlc(self, pair, interval=5, since=None):
+            assert pair == "ABCUSD"
+            assert interval == 5
+            return [
+                Candle(int((start + timedelta(minutes=5)).timestamp()), 100, 105, 100, 105, 103, 10, 10),
+                Candle(int((start + timedelta(minutes=15)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
+                Candle(int((start + timedelta(minutes=30)).timestamp()), 105, 106, 104, 105, 105, 10, 10),
+            ]
 
     result = shadow.observe_due_shadows(client=FakeClient(), now=start + timedelta(minutes=31))
     assert result["status"] == "OK"
@@ -34,6 +38,7 @@ def test_shadow_learning_records_multi_horizon_directional_outcomes(monkeypatch,
     assert row["observations"]["5m"]["directional_move_pct"] == pytest.approx(5.0)
     assert row["observations"]["15m"]["directional_move_pct"] == pytest.approx(5.0)
     assert row["observations"]["30m"]["directional_move_pct"] == pytest.approx(5.0)
+    assert row["observations"]["5m"]["observed_at"] == (start + timedelta(minutes=5)).isoformat()
     assert "1h" not in row["observations"]
 
 
