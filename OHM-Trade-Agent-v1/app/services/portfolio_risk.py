@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 
@@ -30,6 +31,9 @@ def evaluate_portfolio_risk(
     max_same_direction: int = 2,
 ) -> PortfolioRiskDecision:
     direction = proposed_direction.upper()
+    numeric = (account_capital, proposed_capital, proposed_leverage, max_gross_exposure_pct)
+    if not all(math.isfinite(float(value)) for value in numeric):
+        raise ValueError("invalid non-finite capital or leverage")
     if account_capital <= 0 or proposed_capital < 0 or proposed_leverage <= 0:
         raise ValueError("invalid capital or leverage")
     if direction not in {"LONG", "SHORT"}:
@@ -39,11 +43,36 @@ def evaluate_portfolio_risk(
         t for t in active_trades
         if getattr(t, "status", "active") == "active"
     ]
-    gross = sum(
-        float(getattr(t, "capital", 0.0) or 0.0)
-        * float(getattr(t, "margin_leverage", 1.0) or 1.0)
-        for t in positions
-    )
+
+    known_exposures: list[float] = []
+    unknown_exposure = False
+    for trade in positions:
+        capital = getattr(trade, "capital", None)
+        leverage = getattr(trade, "margin_leverage", 1.0) or 1.0
+        try:
+            leverage_value = float(leverage)
+        except (TypeError, ValueError):
+            unknown_exposure = True
+            continue
+        if capital is None:
+            unknown_exposure = True
+            continue
+        try:
+            capital_value = float(capital)
+        except (TypeError, ValueError):
+            unknown_exposure = True
+            continue
+        if (
+            not math.isfinite(capital_value)
+            or not math.isfinite(leverage_value)
+            or capital_value < 0
+            or leverage_value <= 0
+        ):
+            unknown_exposure = True
+            continue
+        known_exposures.append(capital_value * leverage_value)
+
+    gross = sum(known_exposures)
     proposed = proposed_capital * proposed_leverage
     total = gross + proposed
     base = dict(
@@ -58,6 +87,12 @@ def evaluate_portfolio_risk(
         for t in positions
     ):
         return PortfolioRiskDecision(False, "symbol already active", **base)
+    if unknown_exposure:
+        return PortfolioRiskDecision(
+            False,
+            "active position exposure is unknown; refusing additional capital until reconciled",
+            **base,
+        )
     if len(positions) >= max_positions:
         return PortfolioRiskDecision(False, "maximum simultaneous positions reached", **base)
     same_direction = sum(
