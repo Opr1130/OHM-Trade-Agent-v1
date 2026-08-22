@@ -73,6 +73,19 @@ def _finite(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _safe_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _safe_message_id(value: Any) -> int:
+    parsed = _safe_nonnegative_int(value)
+    return parsed if parsed > 0 else 0
+
+
 def _fmt_price(value: float | None) -> str:
     if value is None or not math.isfinite(value):
         return "N/A"
@@ -114,12 +127,18 @@ def _canonical_watch_symbol(value: str) -> str:
     quoted = re.fullmatch(r"[A-Z0-9]{1,18}[/_.-](?:USD|USDT)", cleaned)
     if not cleaned or (plain is None and quoted is None):
         raise TelegramCommandError("Invalid coin symbol")
-    pair = canonicalize_pair(cleaned)
-    for quote in ("USDT", "USD"):
-        if pair.endswith(quote) and len(pair) > len(quote):
-            pair = pair[: -len(quote)]
-            break
-    symbol = canonicalize_asset(pair)
+    # A separator is an explicit pair request, so strip its quote locally.
+    # A plain symbol is treated as the base asset exactly as typed. This avoids
+    # corrupting legitimate asset tickers that themselves end in USD/USDT.
+    if quoted is not None:
+        pair = canonicalize_pair(cleaned)
+        for quote in ("USDT", "USD"):
+            if pair.endswith(quote) and len(pair) > len(quote):
+                pair = pair[: -len(quote)]
+                break
+        symbol = canonicalize_asset(pair)
+    else:
+        symbol = canonicalize_asset(cleaned)
     if not symbol or not re.fullmatch(r"[A-Z0-9]{1,20}", symbol):
         raise TelegramCommandError("Invalid coin symbol")
     return symbol
@@ -130,11 +149,12 @@ def _load_watches(path: Path = WATCH_FILE) -> dict[str, dict[str, Any]]:
     watches = payload.get("watches", payload)
     if not isinstance(watches, dict):
         raise RegistryIOError("Telegram watch registry has invalid structure")
-    return {
-        str(symbol).upper(): dict(row)
-        for symbol, row in watches.items()
-        if isinstance(row, dict)
-    }
+    normalized: dict[str, dict[str, Any]] = {}
+    for symbol, row in watches.items():
+        if not isinstance(symbol, str) or not isinstance(row, dict):
+            raise RegistryIOError("Telegram watch registry contains an invalid row")
+        normalized[symbol.upper()] = dict(row)
+    return normalized
 
 
 def _save_watches(watches: dict[str, dict[str, Any]], path: Path = WATCH_FILE) -> None:
@@ -174,13 +194,25 @@ def _watch_row(insight: MarketInsight, message_id: int, *, failures: int = 0) ->
         "action": insight.action,
         "risk": insight.risk,
         "tradeability": insight.tradeability,
+        # last_price is intentionally the last successfully DELIVERED price.
+        # Non-material observations do not move this baseline, otherwise a
+        # gradual move could evade the cumulative WATCH_PRICE_CHANGE_PCT gate.
         "last_price": float(insight.current_price),
         "last_checked_at": _now_iso(),
         "consecutive_failures": int(failures),
     }
 
 
+def _touch_watch_row(row: dict[str, Any], *, failures: int = 0) -> dict[str, Any]:
+    updated = dict(row)
+    updated["last_checked_at"] = _now_iso()
+    updated["consecutive_failures"] = int(max(0, failures))
+    return updated
+
+
 def _is_material_watch_change(row: dict[str, Any], insight: MarketInsight) -> bool:
+    if _safe_message_id(row.get("message_id")) <= 0:
+        return True
     previous_signature = (
         str(row.get("state") or ""),
         str(row.get("action") or ""),
@@ -420,7 +452,7 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
     text = format_market_insight(insight, watch=True)
     message_id: int | None = None
     if existing is not None:
-        old_id = int(existing.get("message_id") or 0)
+        old_id = _safe_message_id(existing.get("message_id"))
         if old_id > 0 and edit_telegram_message(
             settings.telegram_bot_token,
             settings.telegram_chat_id,
@@ -525,11 +557,15 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
 
 
 def refresh_market_watches(settings: Any | None = None, *, force: bool = False) -> int:
-    """Refresh persistent watch cards and edit only on material state changes."""
+    """Refresh persistent watch cards and edit only on material delivered changes."""
     settings = settings or get_settings()
     try:
         watches = get_watches()
     except RegistryIOError:
+        _send(
+            settings,
+            "⚠️ OHM WATCH DEGRADED — watch registry is unavailable or corrupt. Existing Telegram cards may be stale.",
+        )
         return 0
     changed = 0
     processed = 0
@@ -550,11 +586,9 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
         try:
             insight = analyze_market(symbol)
         except Exception:
-            failures = int(row.get("consecutive_failures") or 0) + 1
-            row["consecutive_failures"] = failures
-            row["last_checked_at"] = _now_iso()
+            failures = _safe_nonnegative_int(row.get("consecutive_failures")) + 1
             try:
-                _put_watch(symbol, row)
+                _put_watch(symbol, _touch_watch_row(row, failures=failures))
             except Exception:
                 pass
             if failures == 3:
@@ -562,29 +596,45 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
             continue
 
         material = _is_material_watch_change(row, insight)
-        message_id = int(row.get("message_id") or 0)
-        if material:
-            text = format_market_insight(insight, watch=True)
-            edited = message_id > 0 and edit_telegram_message(
+        if not material:
+            # Preserve the last successfully delivered price/signature so the
+            # 2% threshold remains cumulative from what the user actually saw.
+            try:
+                _put_watch(symbol, _touch_watch_row(row, failures=0))
+            except Exception:
+                pass
+            continue
+
+        message_id = _safe_message_id(row.get("message_id"))
+        delivered = False
+        if message_id > 0:
+            delivered = edit_telegram_message(
                 settings.telegram_bot_token,
                 settings.telegram_chat_id,
                 message_id,
-                text,
+                format_market_insight(insight, watch=True),
             )
-            if not edited:
-                replacement = send_telegram_message_with_id(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    text,
-                )
-                if replacement is not None:
-                    message_id = replacement
-                    edited = True
-            if edited:
-                changed += 1
-        if message_id > 0:
+        if not delivered:
+            replacement = send_telegram_message_with_id(
+                settings.telegram_bot_token,
+                settings.telegram_chat_id,
+                format_market_insight(insight, watch=True),
+            )
+            if replacement is not None:
+                message_id = replacement
+                delivered = True
+
+        if delivered and message_id > 0:
+            changed += 1
             try:
                 _put_watch(symbol, _watch_row(insight, message_id))
+            except Exception:
+                pass
+        else:
+            # Telegram did not receive the new state. Never advance the stored
+            # delivered baseline; keep it eligible for retry on the next pass.
+            try:
+                _put_watch(symbol, _touch_watch_row(row, failures=0))
             except Exception:
                 pass
     return changed
