@@ -41,6 +41,10 @@ def _parse(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _shared_budget_file() -> Path:
+    return STATE_FILE.parent / "attention_budget_state.json"
+
+
 def should_emit(
     *,
     identity: str,
@@ -67,7 +71,10 @@ def should_emit(
         # fail closed so a broken state registry cannot bypass flood controls.
         return event_type in CRITICAL_EVENTS
 
-    if event_type not in CRITICAL_EVENTS and not allow_new_noncritical(now=now):
+    if event_type not in CRITICAL_EVENTS and not allow_new_noncritical(
+        now=now,
+        state_file=_shared_budget_file(),
+    ):
         return False
     return True
 
@@ -91,4 +98,8 @@ def record_emitted(
         return
 
     if event_type not in CRITICAL_EVENTS:
-        record_new_noncritical(kind=event_type, now=now)
+        record_new_noncritical(
+            kind=event_type,
+            now=now,
+            state_file=_shared_budget_file(),
+        )
