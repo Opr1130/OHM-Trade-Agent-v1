@@ -110,7 +110,9 @@ def _require_symbol(args: tuple[str, ...], command: str) -> str:
 def _canonical_watch_symbol(value: str) -> str:
     """Normalize a watch key locally so /unwatch works during Kraken outages."""
     cleaned = str(value or "").strip().upper().lstrip("$#")
-    if not cleaned or len(cleaned) > 24 or not re.fullmatch(r"[A-Z0-9._/\-]+", cleaned):
+    plain = re.fullmatch(r"[A-Z0-9]{1,24}", cleaned)
+    quoted = re.fullmatch(r"[A-Z0-9]{1,18}[/_.-](?:USD|USDT)", cleaned)
+    if not cleaned or (plain is None and quoted is None):
         raise TelegramCommandError("Invalid coin symbol")
     pair = canonicalize_pair(cleaned)
     for quote in ("USDT", "USD"):
@@ -118,7 +120,7 @@ def _canonical_watch_symbol(value: str) -> str:
             pair = pair[: -len(quote)]
             break
     symbol = canonicalize_asset(pair)
-    if not symbol:
+    if not symbol or not re.fullmatch(r"[A-Z0-9]{1,20}", symbol):
         raise TelegramCommandError("Invalid coin symbol")
     return symbol
 
