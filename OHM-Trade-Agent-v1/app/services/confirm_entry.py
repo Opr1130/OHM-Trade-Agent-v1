@@ -26,6 +26,17 @@ def _validate_fill(setup: PendingSetup, actual_fill_price: float) -> None:
             raise ValueError("Fill price is already at or below the setup stop")
 
 
+def _active_by_trade_id(active: dict, trade_id: str) -> ActiveTrade | None:
+    return next(
+        (
+            active_trade_registry._from_item(item)
+            for item in active.values()
+            if item.get("trade_id") == trade_id
+        ),
+        None,
+    )
+
+
 def _transition_to_active(
     *,
     trade_id: str | None = None,
@@ -45,32 +56,27 @@ def _transition_to_active(
         active = active_trade_registry._load_raw()
 
         if trade_id:
-            existing_trade = next(
-                (
-                    active_trade_registry._from_item(item)
-                    for item in active.values()
-                    if item.get("trade_id") == trade_id
-                ),
-                None,
-            )
+            existing_trade = _active_by_trade_id(active, trade_id)
 
         if existing_trade is None:
-            pending_key: str | None = None
-            setup_item: dict | None = None
+            matches: list[tuple[str, dict]] = []
             for key, item in pending.items():
                 if item.get("status") != "waiting":
                     continue
-                if (trade_id and item.get("trade_id") == trade_id) or (
-                    symbol and item.get("symbol") == symbol
-                ):
-                    pending_key = key
-                    setup_item = item
-                    break
+                if trade_id and item.get("trade_id") == trade_id:
+                    matches.append((key, item))
+                elif symbol and str(item.get("symbol") or "").upper() == symbol.upper():
+                    matches.append((key, item))
 
-            if setup_item is None or pending_key is None:
+            if symbol and not trade_id and len(matches) > 1:
+                raise ValueError(
+                    f"Multiple waiting setups exist for {symbol.upper()}; confirm by trade_id"
+                )
+            if not matches:
                 identifier = trade_id or symbol
                 raise ValueError(f"No confirmable pending setup found for {identifier}")
 
+            pending_key, setup_item = matches[0]
             normalized_setup = dict(setup_item)
             normalized_setup.setdefault("direction", "LONG")
             normalized_setup.setdefault("margin_leverage", 1.0)
@@ -82,22 +88,32 @@ def _transition_to_active(
                 raise ValueError(f"Trade ID {setup.trade_id} has no confirmation price")
             _validate_fill(setup, fill_price)
 
-            created_trade = ActiveTrade(
-                symbol=setup.symbol,
-                entry_price=fill_price,
-                stop_price=setup.stop_price,
-                target_1=setup.target_1,
-                target_2=setup.target_2,
-                risk_level=setup.risk_level,
-                opened_at=datetime.now(timezone.utc).isoformat(),
-                trade_id=setup.trade_id,
-                direction=setup.direction,
-                margin_leverage=setup.margin_leverage,
-            )
-            active[created_trade.symbol] = asdict(created_trade)
-            active_trade_registry._save_raw(active)
-            pending.pop(pending_key, None)
-            pending_setup_registry._save_raw(pending)
+            symbol_key = setup.symbol.upper()
+            existing_symbol = active.get(symbol_key)
+            if existing_symbol and existing_symbol.get("status") == "active":
+                existing_id = str(existing_symbol.get("trade_id") or "")
+                if existing_id and existing_id == str(setup.trade_id or ""):
+                    existing_trade = active_trade_registry._from_item(existing_symbol)
+                else:
+                    raise ValueError(f"active trade already exists for {symbol_key}")
+
+            if existing_trade is None:
+                created_trade = ActiveTrade(
+                    symbol=symbol_key,
+                    entry_price=fill_price,
+                    stop_price=setup.stop_price,
+                    target_1=setup.target_1,
+                    target_2=setup.target_2,
+                    risk_level=setup.risk_level,
+                    opened_at=datetime.now(timezone.utc).isoformat(),
+                    trade_id=setup.trade_id,
+                    direction=setup.direction,
+                    margin_leverage=setup.margin_leverage,
+                )
+                active[symbol_key] = asdict(created_trade)
+                active_trade_registry._save_raw(active)
+                pending.pop(pending_key, None)
+                pending_setup_registry._save_raw(pending)
 
     trade = existing_trade or created_trade
     if trade is None:
