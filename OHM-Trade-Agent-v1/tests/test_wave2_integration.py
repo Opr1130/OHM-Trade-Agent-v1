@@ -132,6 +132,6 @@ def test_edge_report_never_auto_promotes_strategy():
         shadow_records=shadows,
         execution_records=execution,
     )
-    assert report["status"] == "EVIDENCE_READY"
-    assert report["readiness"]["all"] is True
+    assert report["status"] == "BUILDING_EVIDENCE"
+    assert report["readiness"]["all"] is False
     assert report["auto_promotion_allowed"] is False
