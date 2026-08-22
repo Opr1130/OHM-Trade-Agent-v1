@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from app.services.attention_budget import allow_new_noncritical, record_new_noncritical
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -54,9 +55,10 @@ def evaluate_opportunity_alert(
 ) -> AlertGovernorDecision:
     """Choose CREATE, EDIT, or SUPPRESS for an opportunity card.
 
-    The budget applies only to creation of new Telegram cards. Once a symbol has
-    a card, a meaningful state transition edits that card and does not consume a
-    new-card budget slot. Critical held-position risk events do not use this path.
+    The local budget applies only to creation of new cards for this alert
+    family. A shared attention budget also caps new non-critical notifications
+    across OHM. Existing-card edits remain allowed and do not consume either
+    budget. Critical held-position risk events do not use this path.
     """
     now = now or _now()
     if now.tzinfo is None:
@@ -98,6 +100,9 @@ def evaluate_opportunity_alert(
                 return AlertGovernorDecision("SUPPRESS", "NEW_CARD_DAILY_BUDGET")
     except OSError:
         return AlertGovernorDecision("CREATE", "STATE_UNAVAILABLE_FAIL_OPEN")
+
+    if not allow_new_noncritical(now=now):
+        return AlertGovernorDecision("SUPPRESS", "GLOBAL_ATTENTION_BUDGET")
 
     return AlertGovernorDecision("CREATE", "NEW_SYMBOL")
 
@@ -145,3 +150,6 @@ def record_opportunity_alert(
             save_json_atomic(target, state)
     except OSError:
         return
+
+    if created_new:
+        record_new_noncritical(kind="OPPORTUNITY_CARD", now=now)
