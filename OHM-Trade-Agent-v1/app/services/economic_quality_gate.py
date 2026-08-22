@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 
 from app.services.entry_exit_advisor import EntryExitPlan
@@ -38,6 +39,20 @@ def _invalid_result(direction: str, leverage: float, reason: str) -> EconomicGat
     )
 
 
+def _resolved_capital_fraction(value: float | None) -> float:
+    """Use the live 20% envelope in production while preserving reusable defaults.
+
+    Direct/unit callers outside production retain the historical 100% default.
+    Production cannot validate a dollar-profit floor on five times the capital
+    that the live allocator is allowed to recommend.
+    """
+    if value is not None:
+        return float(value)
+    if os.getenv("APP_ENV", "").strip().lower() == "production":
+        return PRODUCTION_MAX_CAPITAL_FRACTION
+    return DEFAULT_MAX_CAPITAL_FRACTION
+
+
 def evaluate_economic_quality(
     plan: EntryExitPlan,
     available_capital: float,
@@ -47,7 +62,7 @@ def evaluate_economic_quality(
     min_net_profit: float = 75.0,
     min_reward_to_risk: float = 2.5,
     estimated_round_trip_cost_pct: float = 0.60,
-    max_capital_fraction: float = DEFAULT_MAX_CAPITAL_FRACTION,
+    max_capital_fraction: float | None = None,
     direction: str | None = None,
     leverage: float = 1.0,
     estimated_margin_cost_pct: float = 0.0,
@@ -56,6 +71,7 @@ def evaluate_economic_quality(
     direction = (direction or getattr(plan, "direction", "LONG") or "LONG").upper()
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
+    max_capital_fraction = _resolved_capital_fraction(max_capital_fraction)
 
     scalar_values = (
         available_capital,
