@@ -166,6 +166,49 @@ def test_watch_notification_never_contains_an_entry_instruction():
     assert "Entry Zone" not in message
 
 
+def test_watch_notification_falls_back_when_move_estimate_is_zero():
+    signal = evaluate_price_movement(snapshot())
+    assert signal is not None
+    payload = signal.as_dict()
+    payload["readiness_score"] = 44
+    payload["expected_move_low_pct"] = 0
+    payload["expected_move_high_pct"] = 0
+    message = format_price_movement_message(payload)
+    assert "Potential: +5% to +15%" in message
+    assert "Potential: +0% to +0%" not in message
+
+
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [
+        (None, None),
+        (-5, -1),
+        (10, 5),
+        ("bad", "data"),
+    ],
+)
+def test_watch_notification_falls_back_for_invalid_move_ranges(low, high):
+    signal = evaluate_price_movement(snapshot())
+    assert signal is not None
+    payload = signal.as_dict()
+    payload["readiness_score"] = 44
+    payload["expected_move_low_pct"] = low
+    payload["expected_move_high_pct"] = high
+    message = format_price_movement_message(payload)
+    assert "Potential: +5% to +15%" in message
+    assert "Potential: +0% to +0%" not in message
+
+
+def test_watch_notification_preserves_valid_move_range():
+    signal = evaluate_price_movement(snapshot())
+    assert signal is not None
+    payload = signal.as_dict()
+    payload["expected_move_low_pct"] = 3.5
+    payload["expected_move_high_pct"] = 8.5
+    message = format_price_movement_message(payload)
+    assert "Potential: +4% to +8%" in message
+
+
 def test_movement_learning_records_absolute_and_atr_outcomes(monkeypatch, tmp_path):
     monkeypatch.setattr(learning, "MOVEMENT_FILE", tmp_path / "movement.json")
     monkeypatch.setattr(learning, "LOCK_FILE", tmp_path / ".movement.lock")
