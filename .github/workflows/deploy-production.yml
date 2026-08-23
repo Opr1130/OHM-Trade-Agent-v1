@@ -16,7 +16,7 @@ on:
 permissions:
   contents: read
   actions: read
-  issues: read
+  issues: write
 
 concurrency:
   group: ohm-production
@@ -115,13 +115,15 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy exact approved and tested main commit
+        id: production_deploy
+        continue-on-error: true
         env:
           OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
           OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
           OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
-          set -euo pipefail
+          set +e
           PORT="${OHM_DEPLOY_PORT:-22}"
           ssh \
             -i ~/.ssh/ohm_deploy \
@@ -130,4 +132,64 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -p "$PORT" \
             "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
-            "deploy $TARGET_SHA"
+            "deploy $TARGET_SHA" 2>&1 | tee deploy.log
+          RC=${PIPESTATUS[0]}
+
+          if [[ "$RC" -eq 0 ]] && grep -q 'OHM deployment succeeded' deploy.log && grep -q '"status":"ok"' deploy.log; then
+            RESULT="SUCCESS"
+            HEALTH="OK"
+            ROLLBACK="NO"
+          elif grep -q 'rollback health check passed' deploy.log; then
+            RESULT="ROLLED BACK"
+            HEALTH="PREVIOUS RELEASE OK"
+            ROLLBACK="YES"
+          else
+            RESULT="FAILED"
+            HEALTH="NOT CONFIRMED"
+            ROLLBACK="UNKNOWN OR FAILED"
+          fi
+
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "health=$HEALTH" >> "$GITHUB_OUTPUT"
+          echo "rollback=$ROLLBACK" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish deployment receipt to approval issue
+        if: always() && steps.target.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          DEPLOY_RESULT: ${{ steps.production_deploy.outputs.result }}
+          HEALTH_RESULT: ${{ steps.production_deploy.outputs.health }}
+          ROLLBACK_RESULT: ${{ steps.production_deploy.outputs.rollback }}
+          DEPLOY_RC: ${{ steps.production_deploy.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RESULT="${DEPLOY_RESULT:-FAILED BEFORE SSH}"
+          HEALTH="${HEALTH_RESULT:-NOT CONFIRMED}"
+          ROLLBACK="${ROLLBACK_RESULT:-NOT RUN}"
+          RC="${DEPLOY_RC:-N/A}"
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          BODY=$(cat <<EOF
+          ## OHM Production Deployment Receipt
+          - **Result:** $RESULT
+          - **SHA:** \`$TARGET_SHA\`
+          - **Health:** $HEALTH
+          - **Rollback:** $ROLLBACK
+          - **Deploy exit code:** $RC
+          - **Workflow run:** $RUN_URL
+          EOF
+          )
+
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/64/comments" \
+            -f body="$BODY" >/dev/null
+
+      - name: Fail workflow if production deploy did not succeed
+        if: always() && steps.production_deploy.outputs.result != 'SUCCESS'
+        run: |
+          echo "Production deploy result: ${{ steps.production_deploy.outputs.result }}" >&2
+          exit 1
