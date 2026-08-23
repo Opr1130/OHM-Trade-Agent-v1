@@ -13,6 +13,21 @@ if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 64
 fi
 
+if [[ ! -d "$REPO_ROOT/.git" ]]; then
+  echo "repository not found at $REPO_ROOT" >&2
+  exit 69
+fi
+
+REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git")"
+if [[ -z "$REPO_OWNER" || "$REPO_OWNER" == "UNKNOWN" ]]; then
+  echo "unable to determine repository owner" >&2
+  exit 69
+fi
+
+gitrepo() {
+  sudo -u "$REPO_OWNER" git -C "$REPO_ROOT" "$@"
+}
+
 install -d -m 0755 "$STATE_DIR"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -20,26 +35,24 @@ if ! flock -n 9; then
   exit 75
 fi
 
-cd "$REPO_ROOT"
-
-git fetch --prune origin main
-REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
+gitrepo fetch --prune origin main
+REMOTE_MAIN_SHA="$(gitrepo rev-parse origin/main)"
 if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
   echo "refusing deploy: target is not current origin/main" >&2
   echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
   exit 65
 fi
 
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+if [[ -n "$(gitrepo status --porcelain --untracked-files=no)" ]]; then
   echo "refusing deploy: tracked production worktree is dirty" >&2
-  git status --short >&2
+  gitrepo status --short >&2
   exit 66
 fi
 
-PREVIOUS_SHA="$(git rev-parse main)"
+PREVIOUS_SHA="$(gitrepo rev-parse main)"
 if [[ -s "$LAST_GOOD_FILE" ]]; then
   RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
-  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
+  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] && gitrepo cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
     PREVIOUS_SHA="$RECORDED_SHA"
   fi
 fi
@@ -48,9 +61,8 @@ rollback() {
   rc=$?
   trap - ERR
   echo "deployment failed; rolling back to $PREVIOUS_SHA" >&2
-  cd "$REPO_ROOT"
-  git checkout -f main
-  git reset --hard "$PREVIOUS_SHA"
+  gitrepo checkout -f main
+  gitrepo reset --hard "$PREVIOUS_SHA"
   cd "$APP_ROOT"
   docker compose build ohm-trade-agent
   docker compose up -d --remove-orphans ohm-trade-agent
@@ -66,8 +78,8 @@ rollback() {
 }
 trap rollback ERR
 
-git checkout -f main
-git reset --hard "$TARGET_SHA"
+gitrepo checkout -f main
+gitrepo reset --hard "$TARGET_SHA"
 
 cd "$APP_ROOT"
 docker compose build ohm-trade-agent
