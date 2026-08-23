@@ -60,4 +60,4 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -p "$PORT" \
             "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
-            "sudo /usr/local/sbin/ohm-deploy '$TARGET_SHA'"
+            "deploy $TARGET_SHA"
