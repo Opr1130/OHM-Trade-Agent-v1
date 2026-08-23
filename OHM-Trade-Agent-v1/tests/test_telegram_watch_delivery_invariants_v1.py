@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.services import telegram_command_center as commands
@@ -101,10 +102,15 @@ def test_successful_material_delivery_advances_delivered_state(monkeypatch):
 
 def test_corrupt_watch_registry_emits_degraded_alert(monkeypatch):
     sent = []
+    error = RegistryCorruptionError(
+        Path("/app/data/telegram_market_watches.json"),
+        Path("/app/data/telegram_market_watches.json.corrupt-test"),
+        "watch registry corrupt",
+    )
     monkeypatch.setattr(
         commands,
         "get_watches",
-        lambda: (_ for _ in ()).throw(RegistryCorruptionError("watch registry corrupt")),
+        lambda: (_ for _ in ()).throw(error),
     )
     monkeypatch.setattr(commands, "_send", lambda settings, text: sent.append(text) or True)
 
