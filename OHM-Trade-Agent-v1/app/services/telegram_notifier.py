@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from functools import lru_cache
 
@@ -22,6 +23,9 @@ _ALERT_HEADLINE_MARKERS = (
     "OHM EMERGENCY",
 )
 _QUOTE_SUFFIXES = ("USDT", "USD")
+_PRICE_IDENTITY_MAX_DIVERGENCE_PCT = 2.0
+_PRICE_IDENTITY_MIN_RUNNER_UP_DIVERGENCE_PCT = 5.0
+_PRICE_IDENTITY_MIN_SEPARATION_PCT = 3.0
 
 
 def _price_pct(target: float, reference: float, side: str) -> float:
@@ -42,46 +46,98 @@ def _base_symbol(value: str) -> str | None:
     return token
 
 
-@lru_cache(maxsize=512)
-def _resolved_coin_name(symbol: str) -> str | None:
-    """Resolve a display name only when CoinGecko has one unambiguous symbol match.
+def _finite_positive(value) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
 
-    Tickers are not globally unique. If a symbol maps to zero or multiple assets,
-    OHM deliberately returns None rather than guessing the project's identity.
+
+@lru_cache(maxsize=512)
+def _coin_market_rows(symbol: str) -> tuple[tuple[str, float | None], ...]:
+    """Cache candidate display names and USD prices for one ticker.
+
+    Tickers are not globally unique, so callers must still disambiguate multiple
+    rows before selecting a name.
     """
     base = _base_symbol(symbol)
     if not base:
-        return None
+        return ()
     try:
         rows = CoinGeckoClient(timeout_seconds=4.0).get_markets_by_symbols([base])
     except CoinGeckoAPIError:
-        return None
-    exact = [
-        row for row in rows
-        if str(row.get("symbol") or "").strip().upper() == base
-        and str(row.get("name") or "").strip()
-    ]
-    if len(exact) != 1:
-        return None
-    return str(exact[0]["name"]).strip()
+        return ()
+    matches: list[tuple[str, float | None]] = []
+    for row in rows:
+        if str(row.get("symbol") or "").strip().upper() != base:
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        matches.append((name, _finite_positive(row.get("current_price"))))
+    return tuple(matches)
 
 
-def _identity_label(token: str) -> str:
+def _resolved_coin_name(symbol: str, kraken_price: float | None = None) -> str | None:
+    """Resolve a name only when ticker identity is unambiguous.
+
+    A duplicate ticker may be resolved by price only when one CoinGecko asset is
+    within 2% of Kraken, the runner-up is at least 5% away, and the separation is
+    at least 3 percentage points. These thresholds mirror OHM's existing
+    reference-market identity policy. Otherwise no project name is guessed.
+    """
+    candidates = _coin_market_rows(symbol)
+    if len(candidates) == 1:
+        return candidates[0][0]
+    price = _finite_positive(kraken_price)
+    if len(candidates) < 2 or price is None:
+        return None
+
+    ranked: list[tuple[float, str]] = []
+    for name, candidate_price in candidates:
+        if candidate_price is None:
+            continue
+        divergence = abs(candidate_price - price) / price * 100.0
+        ranked.append((divergence, name))
+    ranked.sort(key=lambda item: item[0])
+    if len(ranked) < 2:
+        return None
+    best_divergence, best_name = ranked[0]
+    runner_up_divergence = ranked[1][0]
+    if (
+        best_divergence <= _PRICE_IDENTITY_MAX_DIVERGENCE_PCT
+        and runner_up_divergence >= _PRICE_IDENTITY_MIN_RUNNER_UP_DIVERGENCE_PCT
+        and runner_up_divergence - best_divergence >= _PRICE_IDENTITY_MIN_SEPARATION_PCT
+    ):
+        return best_name
+    return None
+
+
+def _identity_label(token: str, *, kraken_price: float | None = None) -> str:
     base = _base_symbol(token)
     if not base:
         return token
-    name = _resolved_coin_name(base)
+    name = _resolved_coin_name(base, kraken_price)
     if name:
         return f"{name} ({base})"
     return f"{base} (coin name unresolved)"
+
+
+def _message_price(message: str) -> float | None:
+    for line in message.splitlines()[1:]:
+        match = re.match(r"(?:Price|Current|Entry(?: Price)?):\s*\$?([0-9][0-9,]*(?:\.[0-9]+)?)", line.strip(), re.IGNORECASE)
+        if match:
+            return _finite_positive(match.group(1).replace(",", ""))
+    return None
 
 
 def _enrich_alert_identity(message: str) -> str:
     """Add human-readable coin identity to alert headlines without guessing.
 
     This is intentionally limited to alert-like headlines. Account reports such
-    as OHM POSITIONS or OHM ORDERS are not rewritten here because their body can
-    contain many assets and is formatted by its own report code.
+    as OHM POSITIONS or OHM ORDERS can contain many assets and remain under their
+    own report formatter.
     """
     lines = message.splitlines()
     if not lines:
@@ -95,12 +151,11 @@ def _enrich_alert_identity(message: str) -> str:
     if re.search(r"\([A-Z0-9]{2,20}\)\s*(?:—|-)", headline):
         return message
 
-    # Standard alert headlines end with an asset or pair after an em dash.
     match = re.search(r"(?P<prefix>.*?\s—\s)(?P<token>[A-Z0-9]{2,30})(?P<tail>\s*)$", headline)
     if not match:
         return message
     token = match.group("token")
-    label = _identity_label(token)
+    label = _identity_label(token, kraken_price=_message_price(message))
     if label == token:
         return message
 
@@ -122,6 +177,7 @@ def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
     reason = " ".join(str(decision.summary or "Qualified OHM trade setup").split())[:140]
     return (
         f"🚨 OHM TRADE — {decision.symbol}\n"
+        f"Price: {float(signal.price):.10g}\n"
         f"Potential: +{potential:.1f}%\n"
         f"Confidence*: {confidence:.0f}%\n"
         f"Risk*: {risk_pct:.0f}%\n"
@@ -207,8 +263,10 @@ def _compact_legacy_chief(message: str) -> str:
 
     headline = lines[0].upper() if lines else ""
     action = "ENTER NOW" if "ENTER NOW" in headline else "SET LIMIT / WAIT"
+    price_line = f"Price: {entry_ref:.10g}\n" if entry_ref and entry_ref > 0 else ""
     return (
         f"🔥 OHM TRADE — {market}\n"
+        f"{price_line}"
         f"Potential: +{low:.1f}% to +{high:.1f}%\n"
         f"Confidence*: {confidence:.0f}%\n"
         f"Risk: {risk_label}\n"
