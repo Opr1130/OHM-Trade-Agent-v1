@@ -24,6 +24,18 @@ _command_thread: threading.Thread | None = None
 _command_times: deque[float] = deque()
 _COMMAND_QUEUE_MAX = 4
 _command_queue: queue.Queue[tuple[dict, object]] = queue.Queue(maxsize=_COMMAND_QUEUE_MAX)
+_RESERVED_COMMANDS = {
+    "start",
+    "help",
+    "scan",
+    "why",
+    "watch",
+    "unwatch",
+    "watchlist",
+    "orders",
+    "positions",
+    "market",
+}
 
 
 def answer_callback_query(
@@ -68,6 +80,39 @@ def _command_rate_allowed(settings) -> bool:
             return False
         _command_times.append(now)
         return True
+
+
+def _normalize_mobile_command_text(text: str) -> str | None:
+    """Normalize a small set of mobile-friendly command forms.
+
+    Formal slash commands are preserved. A single-token slash form such as
+    /CAP is treated as shorthand for /scan CAP. Plain `scan CAP` is accepted
+    case-insensitively. All other ordinary chat text remains ignored.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("/"):
+        parts = raw.split()
+        token = parts[0][1:]
+        command_token = token.split("@", 1)[0]
+        command = command_token.casefold()
+        if command in _RESERVED_COMMANDS:
+            return raw
+        if (
+            len(parts) == 1
+            and command_token
+            and 1 <= len(command_token) <= 20
+            and command_token.isalnum()
+        ):
+            return f"/scan {command_token.upper()}"
+        return raw
+
+    parts = raw.split()
+    if len(parts) == 2 and parts[0].casefold() == "scan":
+        return f"/scan {parts[1]}"
+    return None
 
 
 def process_callback(update: dict) -> None:
@@ -219,8 +264,14 @@ def process_message(update: dict) -> None:
     if not isinstance(message, dict):
         return
     text = str(message.get("text") or "").strip()
-    if not text.startswith("/"):
+    normalized = _normalize_mobile_command_text(text)
+    if normalized is None:
         return
+    if normalized != text:
+        message = dict(message)
+        message["text"] = normalized
+        update = dict(update)
+        update["message"] = message
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     sender = message.get("from") if isinstance(message.get("from"), dict) else {}
     chat_id = str(chat.get("id", ""))
