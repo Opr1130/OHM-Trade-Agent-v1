@@ -1,7 +1,11 @@
 # Signal Quality / Explosion Detection v1 — Phase 1
 
 **Status: shipped dark.** `SIGNAL_QUALITY_V1_ENABLED` defaults to `false`. With
-the flag off, the Broad Watch path behaves exactly as it did before this change.
+the flag off, the Broad Watch path behaves exactly as it did before this
+change — including on disk. Dark mode is a hard branch, not a filter applied at
+the end: while disabled, Phase 1 performs no schema migration, writes no
+`history_by_symbol`, writes no `schema_version`, adds nothing to the state file,
+derives no features and scores nothing. See §3.
 
 **Everything numeric in this document is an interpretable prior, not a
 calibrated value.** Nothing here has been fitted to outcome data. Phase 1 had no
@@ -64,6 +68,16 @@ Two boundaries are deliberate and load-bearing:
 keeps its exact schema-1 semantics, so the legacy transition detector and its
 consumers are unaffected, and an existing schema-1 file seeds a one-element
 history rather than being discarded.
+
+**All of it is gated on `SIGNAL_QUALITY_V1_ENABLED`.** A disabled deployment
+never migrates, never writes the schema-2 keys, and leaves the state file
+shaped exactly as schema 1 — so enabling the feature is the only event that
+changes persisted state. Migration on first enablement is idempotent: re-running
+the same timestamped scan replaces its snapshot rather than duplicating it.
+
+Disabling *after* an enabled run is **not** a destructive rollback. Existing
+`history_by_symbol` and `schema_version` are retained verbatim and simply stop
+being updated or read; re-enabling resumes from the retained history.
 
 The critical distinction:
 
@@ -141,14 +155,32 @@ derivable features**, not only transition candidates. Ranking inside an
 already-filtered set makes the percentile selection-biased by construction.
 
 **`explosion_potential_score`** — 30% price acceleration + 25% volume proxy +
-20% relative strength + 15% persistence + 10% structural breakout, minus the
-exhaustion penalty. An early-pattern resemblance heuristic, **not a
-probability**.
+20% relative strength + 15% persistence + 10% structural breakout. Measured
+**before** the exhaustion penalty. An early-pattern resemblance heuristic,
+**not a probability**.
 
 **`opportunity_score`** — 30% explosion potential + 25% tradeability + 20%
-pattern strength + 15% relative strength + 10% persistence, minus the exhaustion
-penalty. The hard gate runs before this, so a $4k market can never reach a
-serious ranking regardless of acceleration.
+pattern strength + 15% relative strength + 10% persistence, **minus the
+exhaustion penalty**. The hard gate runs before this, so a $4k market can never
+reach a serious ranking regardless of acceleration.
+
+### Exhaustion is applied exactly once
+
+The penalty is subtracted only at the opportunity layer. Explosion potential
+stays pre-exhaustion deliberately, so the two scores answer different
+questions and a configured penalty costs exactly its nominal points:
+
+| | Early strong mover | Late parabolic mover |
+| --- | --- | --- |
+| `explosion_potential_score` | high | **still high** |
+| `exhaustion_penalty` | ~0 | large |
+| `opportunity_score` | high | reduced |
+| Stage | may progress | downgraded / suppressed |
+
+A market can therefore read as genuinely explosive while being a poor thing to
+look at *right now* because it is already extended. Both numbers are retained
+on the candidate and in the leaderboard, which is what Phase 2 needs in order
+to calibrate the penalty against real outcomes.
 
 ## 6. Exhaustion / chase penalty
 
@@ -166,6 +198,8 @@ mover collects no chase penalty at all. The objective is to separate *early
 strong acceleration* from *late parabolic extension*.
 
 Reason codes: `EXTENDED_MOVE`, `MOMENTUM_DECELERATING`, `BLOW_OFF_RISK`.
+
+The penalty is applied once, at the opportunity layer only (see §5).
 
 ## 7. Stage machine
 

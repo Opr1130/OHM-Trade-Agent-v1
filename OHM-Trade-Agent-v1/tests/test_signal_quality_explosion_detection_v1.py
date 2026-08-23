@@ -511,6 +511,149 @@ def test_lift_from_24h_low_alone_cannot_dominate_exhaustion():
 
 
 # ---------------------------------------------------------------------------
+# Exhaustion is applied exactly once, at the opportunity layer.
+# ---------------------------------------------------------------------------
+
+
+def test_explosion_potential_is_measured_before_exhaustion():
+    """The same setup scores the same potential regardless of extension.
+
+    explosion_potential_score answers "does this resemble an explosive setup?",
+    which does not change because the move is late.
+    """
+    from app.services.signal_scoring import explosion_potential_score
+
+    parts = dict(
+        price_acceleration=70.0,
+        volume_acceleration=60.0,
+        relative_strength=80.0,
+        persistence=75.0,
+        structural_breakout=65.0,
+    )
+    weights = CONFIG.weights
+    expected = (
+        weights.explosion_price_acceleration * parts["price_acceleration"]
+        + weights.explosion_volume_acceleration * parts["volume_acceleration"]
+        + weights.explosion_relative_strength * parts["relative_strength"]
+        + weights.explosion_persistence * parts["persistence"]
+        + weights.explosion_structural_breakout * parts["structural_breakout"]
+    )
+
+    # The plain weighted composite, with no exhaustion term of any kind: the
+    # function no longer accepts one.
+    assert explosion_potential_score(**parts, config=CONFIG) == pytest.approx(expected)
+    with pytest.raises(TypeError):
+        explosion_potential_score(**parts, config=CONFIG, exhaustion_penalty=20.0)
+
+
+def test_higher_exhaustion_lowers_opportunity_but_not_explosion_potential():
+    from app.services.signal_scoring import explosion_potential_score, opportunity_score
+
+    explosion = explosion_potential_score(
+        price_acceleration=70.0,
+        volume_acceleration=60.0,
+        relative_strength=80.0,
+        persistence=75.0,
+        structural_breakout=65.0,
+        config=CONFIG,
+    )
+    calm = opportunity_score(
+        explosion_potential=explosion,
+        tradeability=90.0,
+        pattern_strength=70.0,
+        relative_strength=80.0,
+        persistence=75.0,
+        exhaustion_penalty=0.0,
+        config=CONFIG,
+    )
+    extended = opportunity_score(
+        explosion_potential=explosion,
+        tradeability=90.0,
+        pattern_strength=70.0,
+        relative_strength=80.0,
+        persistence=75.0,
+        exhaustion_penalty=30.0,
+        config=CONFIG,
+    )
+
+    assert extended < calm
+    # Subtracted once and only once: the delta equals the nominal penalty.
+    assert calm - extended == pytest.approx(30.0)
+
+
+def test_exhaustion_is_subtracted_exactly_once_end_to_end():
+    """Guards the regression directly: the effective cost must equal nominal.
+
+    The earlier implementation subtracted the penalty inside explosion
+    potential *and* again in opportunity, so a 20-point penalty cost about 26
+    points of opportunity.
+    """
+    from app.services.signal_scoring import explosion_potential_score, opportunity_score
+
+    inputs = dict(
+        price_acceleration=70.0,
+        volume_acceleration=60.0,
+        relative_strength=80.0,
+        persistence=75.0,
+        structural_breakout=65.0,
+        config=CONFIG,
+    )
+    explosion = explosion_potential_score(**inputs)
+
+    for penalty in (0.0, 5.0, 12.5, 20.0, 30.0):
+        scored = opportunity_score(
+            explosion_potential=explosion,
+            tradeability=90.0,
+            pattern_strength=70.0,
+            relative_strength=80.0,
+            persistence=75.0,
+            exhaustion_penalty=penalty,
+            config=CONFIG,
+        )
+        unpenalised = opportunity_score(
+            explosion_potential=explosion,
+            tradeability=90.0,
+            pattern_strength=70.0,
+            relative_strength=80.0,
+            persistence=75.0,
+            exhaustion_penalty=0.0,
+            config=CONFIG,
+        )
+        assert unpenalised - scored == pytest.approx(penalty)
+
+
+def test_early_strong_mover_is_not_pushed_below_stage_thresholds():
+    """The mover this system exists to catch must survive scoring intact."""
+    universe = _universe(BIGUSD=_leader_history(5_000_000.0))
+    leader = _evaluate(universe)["BIGUSD"]
+
+    assert leader.exhaustion_penalty == 0
+    assert leader.stage in {STAGE_BREAKOUT_CANDIDATE, STAGE_ACTIONABLE_REVIEW}
+    assert leader.explosion_potential_score >= CONFIG.breakout_explosion
+    assert leader.opportunity_score >= CONFIG.breakout_opportunity
+
+
+def test_extended_mover_keeps_high_explosion_potential_but_loses_its_stage():
+    """The distinction the single-subtraction design preserves.
+
+    A parabolic market still *resembles* an explosive setup; what it loses is
+    the claim on our attention right now. Phase 2 needs both numbers.
+    """
+    parabolic = [100.0, 112.0, 128.0, 146.0, 158.0, 163.0]
+    universe = _universe(
+        HOTUSD=_history(parabolic, [5_000_000.0] * len(parabolic)),
+    )
+    candidate = _evaluate(universe)["HOTUSD"]
+
+    assert candidate.exhaustion_penalty >= 20
+    assert candidate.explosion_potential_score >= 50
+    assert candidate.stage not in {STAGE_ACTIONABLE_REVIEW, STAGE_BREAKOUT_CANDIDATE}
+    assert REASON_EXTENDED_MOVE in candidate.reasons
+    # The penalty is visible on the row rather than silently folded into a score.
+    assert candidate.exhaustion_band in {"HIGH", "BLOW_OFF"}
+
+
+# ---------------------------------------------------------------------------
 # Stage machine and leaderboard
 # ---------------------------------------------------------------------------
 

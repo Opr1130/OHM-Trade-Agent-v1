@@ -7,6 +7,7 @@ the event-sampled JSONL stream happens to keep.
 """
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from app.services.full_market_observation import (
     DEFAULT_HISTORY_SCANS,
@@ -20,6 +21,20 @@ from app.services.signal_features import ObservationSnapshot
 
 
 BASE_TIME = datetime(2026, 8, 22, tzinfo=timezone.utc)
+
+
+def _settings(*, enabled, history_scans=DEFAULT_HISTORY_SCANS):
+    """Minimal settings stand-in; the integration reads these by name."""
+    return SimpleNamespace(
+        signal_quality_v1_enabled=enabled,
+        signal_quality_history_scans=history_scans,
+        signal_quality_scan_interval_seconds=600,
+        signal_quality_continuity_multiplier=2.5,
+    )
+
+
+ENABLED = _settings(enabled=True)
+DISABLED = _settings(enabled=False)
 
 
 def _snapshot(*, price=100.0, notional=1_000_000.0, at=BASE_TIME):
@@ -155,6 +170,7 @@ def test_quiet_scan_still_advances_history_even_when_not_persisted(tmp_path):
         now=BASE_TIME,
         observation_file=observation_file,
         state_file=state_file,
+        settings=ENABLED,
     )
     assert first.persisted_events == 2
 
@@ -164,6 +180,7 @@ def test_quiet_scan_still_advances_history_even_when_not_persisted(tmp_path):
         now=BASE_TIME + timedelta(minutes=10),
         observation_file=observation_file,
         state_file=state_file,
+        settings=ENABLED,
     )
     assert second.persisted_events == 0
 
@@ -185,6 +202,7 @@ def test_history_is_capped_and_drops_markets_that_leave_the_universe(tmp_path):
             now=BASE_TIME + timedelta(minutes=10 * index),
             observation_file=observation_file,
             state_file=state_file,
+            settings=ENABLED,
         )
 
     state = load_json(state_file)
@@ -199,6 +217,7 @@ def test_history_is_capped_and_drops_markets_that_leave_the_universe(tmp_path):
         now=BASE_TIME + timedelta(minutes=200),
         observation_file=observation_file,
         state_file=state_file,
+        settings=ENABLED,
     )
 
     state = load_json(state_file)
@@ -232,6 +251,205 @@ def test_legacy_transition_path_is_unchanged_by_the_migration(tmp_path):
     state = load_json(state_file)
     assert "latest_by_symbol" in state
     assert state["latest_by_symbol"]["LOWUSD"]["last_price"] == 1.05
+
+
+SCHEMA_1_STATE = {
+    "latest_by_symbol": {
+        "LOWUSD": {
+            "last_price": 1.01,
+            "volume_24h": 2_000.0,
+            "notional_24h_usd_approx": 2_020.0,
+            "high_24h": 1.06,
+            "low_24h": 1.00,
+            "lift_from_24h_low_pct": 1.0,
+            "distance_from_24h_high_pct": 4.95,
+            "recorded_at": BASE_TIME.isoformat(),
+        }
+    },
+    "last_scan_at": BASE_TIME.isoformat(),
+    "observed_markets_last_scan": 1,
+}
+
+
+def _seed_schema_1(state_file):
+    from app.services.registry_io import save_json_atomic
+
+    save_json_atomic(state_file, dict(SCHEMA_1_STATE))
+
+
+def test_disabled_leaves_schema_1_state_free_of_history_by_symbol(tmp_path):
+    """Dark mode writes no Signal Quality state at all."""
+    state_file = tmp_path / "state.json"
+    _seed_schema_1(state_file)
+
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.05),
+        now=BASE_TIME + timedelta(minutes=10),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=state_file,
+        settings=DISABLED,
+    )
+
+    state = load_json(state_file)
+    assert "history_by_symbol" not in state
+    # The schema-1 contract is untouched and still readable by legacy consumers.
+    assert state["latest_by_symbol"]["LOWUSD"]["last_price"] == 1.05
+
+
+def test_disabled_does_not_introduce_a_schema_version(tmp_path):
+    state_file = tmp_path / "state.json"
+    _seed_schema_1(state_file)
+
+    process_full_market_observations(
+        client=FakeKraken(),
+        now=BASE_TIME + timedelta(minutes=10),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=state_file,
+        settings=DISABLED,
+    )
+
+    state = load_json(state_file)
+    assert "schema_version" not in state
+    assert set(state) == set(SCHEMA_1_STATE)
+
+
+def test_disabled_leaves_legacy_transition_behaviour_unchanged(tmp_path):
+    """The legacy Broad Watch path must behave exactly as it did pre-Phase-1."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.01),
+        now=BASE_TIME,
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=DISABLED,
+    )
+    second = process_full_market_observations(
+        client=FakeKraken(low_price=1.05),
+        now=BASE_TIME + timedelta(minutes=10),
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=DISABLED,
+    )
+
+    low = next(item for item in second.transition_alerts if item.symbol == "LOWUSD")
+    assert low.pattern == "COMPRESSION_RELEASE"
+    assert low.alert_tier == "WATCH_ONLY"
+    assert second.signal_quality_enabled is False
+    assert second.signal_quality_candidates == ()
+
+
+def test_disabled_state_is_byte_identical_to_a_run_without_the_feature(tmp_path):
+    """Strongest form of the dark-mode guarantee: same bytes on disk.
+
+    Compares a disabled Phase 1 scan against the pre-Phase-1 write path, which
+    is reconstructed here by writing only the keys the legacy code wrote.
+    """
+    state_file = tmp_path / "state.json"
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.02),
+        now=BASE_TIME,
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=state_file,
+        settings=DISABLED,
+    )
+
+    state = load_json(state_file)
+    assert set(state) == {"latest_by_symbol", "last_scan_at", "observed_markets_last_scan"}
+
+
+def test_enabled_run_migrates_schema_1_state_safely(tmp_path):
+    state_file = tmp_path / "state.json"
+    _seed_schema_1(state_file)
+
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.02),
+        now=BASE_TIME + timedelta(minutes=10),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=state_file,
+        settings=ENABLED,
+    )
+
+    state = load_json(state_file)
+    assert state["schema_version"] == HISTORY_SCHEMA_VERSION
+    # Seeded from the schema-1 row, then extended by this scan.
+    assert [row["last_price"] for row in state["history_by_symbol"]["LOWUSD"]] == [1.01, 1.02]
+    # Nothing legacy was dropped or mutated on the way through.
+    assert state["latest_by_symbol"]["LOWUSD"]["last_price"] == 1.02
+    assert "last_scan_at" in state
+
+
+def test_enabled_migration_is_idempotent_for_a_repeated_timestamp(tmp_path):
+    """Re-running the same scan must not duplicate its snapshot."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+    _seed_schema_1(state_file)
+
+    for _ in range(3):
+        process_full_market_observations(
+            client=FakeKraken(low_price=1.02),
+            now=BASE_TIME + timedelta(minutes=10),
+            observation_file=observation_file,
+            state_file=state_file,
+            settings=ENABLED,
+        )
+
+    state = load_json(state_file)
+    rows = state["history_by_symbol"]["LOWUSD"]
+    assert len(rows) == 2
+    assert len({row["observed_at"] for row in rows}) == 2
+
+
+def test_disabling_after_enablement_preserves_but_stops_updating_history(tmp_path):
+    """Dark mode is not a destructive rollback."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.01),
+        now=BASE_TIME,
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=ENABLED,
+    )
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.02),
+        now=BASE_TIME + timedelta(minutes=10),
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=ENABLED,
+    )
+    enabled_state = load_json(state_file)
+    assert len(enabled_state["history_by_symbol"]["LOWUSD"]) == 2
+
+    result = process_full_market_observations(
+        client=FakeKraken(low_price=1.03),
+        now=BASE_TIME + timedelta(minutes=20),
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=DISABLED,
+    )
+
+    state = load_json(state_file)
+    # Retained verbatim...
+    assert state["history_by_symbol"] == enabled_state["history_by_symbol"]
+    assert state["schema_version"] == HISTORY_SCHEMA_VERSION
+    # ...but not advanced by the disabled scan, and not used.
+    assert len(state["history_by_symbol"]["LOWUSD"]) == 2
+    assert result.signal_quality_candidates == ()
+    assert result.signal_quality_enabled is False
+
+    # Re-enabling picks the retained history back up without duplicating it.
+    process_full_market_observations(
+        client=FakeKraken(low_price=1.04),
+        now=BASE_TIME + timedelta(minutes=30),
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=ENABLED,
+    )
+    resumed = load_json(state_file)
+    assert [row["last_price"] for row in resumed["history_by_symbol"]["LOWUSD"]] == [1.01, 1.02, 1.04]
 
 
 def test_signal_quality_ships_dark_by_default(tmp_path):

@@ -16,6 +16,11 @@ Three separations carry the design:
 * ``opportunity_score`` answers "how much attention should OHM give this now?"
   and is the only score that combines the others.
 
+``explosion_potential_score`` is measured *before* the exhaustion penalty, and
+``opportunity_score`` applies that penalty exactly once. A mover can therefore
+read as highly explosive while scoring poorly on attention because it is
+already extended - a distinction worth keeping for audit and Phase 2.
+
 The hard liquidity gate runs *before* scoring, so no amount of pattern strength
 can lift an untradeable market into a serious ranking.
 
@@ -610,19 +615,27 @@ def explosion_potential_score(
     relative_strength: float,
     persistence: float,
     structural_breakout: float,
-    exhaustion_penalty: float,
     config: SignalQualityConfig,
 ) -> float:
-    """Early-pattern resemblance heuristic. Explicitly not a probability."""
+    """Resemblance to an explosive setup, *before* any chase adjustment.
+
+    Deliberately pre-exhaustion. Keeping the two separate preserves a
+    distinction that matters for audit and for Phase 2 calibration: a mover can
+    genuinely look explosive (high potential) while being a poor thing to look
+    at right now because it is already extended (low opportunity). Folding the
+    penalty in here would erase that difference and, because opportunity also
+    consumes this score, would charge the penalty twice.
+
+    Explicitly not a probability.
+    """
     weights = config.weights
-    raw = (
+    return _clamp(
         weights.explosion_price_acceleration * price_acceleration
         + weights.explosion_volume_acceleration * volume_acceleration
         + weights.explosion_relative_strength * relative_strength
         + weights.explosion_persistence * persistence
         + weights.explosion_structural_breakout * structural_breakout
     )
-    return _clamp(raw - exhaustion_penalty)
 
 
 def opportunity_score(
@@ -636,6 +649,10 @@ def opportunity_score(
     config: SignalQualityConfig,
 ) -> float:
     """How much attention OHM should give this setup now.
+
+    This is the single place the exhaustion penalty is applied. Every input
+    below is pre-exhaustion, so the configured penalty costs exactly its
+    nominal points here and nowhere else.
 
     The hard liquidity gate has already run by the time this is reached, so a
     thin market cannot arrive here at all - which is what keeps a $4k pump off
@@ -801,7 +818,6 @@ def evaluate_candidate(
         relative_strength=relative_strength,
         persistence=persistence,
         structural_breakout=breakout_component,
-        exhaustion_penalty=exhaustion.penalty,
         config=config,
     )
     opportunity = opportunity_score(

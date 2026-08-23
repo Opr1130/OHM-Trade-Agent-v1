@@ -38,10 +38,13 @@ HEARTBEAT_SECONDS = 60 * 60
 # the JSONL stream is deliberately event-sampled, and a quiet scan that is not
 # worth an event still belongs in a temporal feature series.
 #
-# The migration is non-destructive. latest_by_symbol keeps its exact schema-1
-# semantics so the existing transition detector and its consumers are
-# unaffected, and an existing state file is seeded into history rather than
-# discarded.
+# The migration is non-destructive in both directions. latest_by_symbol keeps
+# its exact schema-1 semantics so the existing transition detector and its
+# consumers are unaffected; an existing state file is seeded into history
+# rather than discarded; and schema 2 is only ever written while
+# signal_quality_v1_enabled is set, so a disabled deployment stays byte-shaped
+# like schema 1. Disabling after an enabled run stops updating the history but
+# never deletes it.
 HISTORY_SCHEMA_VERSION = 2
 DEFAULT_HISTORY_SCANS = 8
 MIN_PERSIST_PRICE_CHANGE_PCT = 1.0
@@ -464,17 +467,26 @@ def process_full_market_observations(
             settings = get_settings()
         except Exception:
             settings = None
+    # Dark mode is a hard branch, not a filter at the end. While the flag is
+    # off, Signal Quality v1 performs no state migration, writes no new state
+    # keys, derives no features and scores nothing - the scan is operationally
+    # identical to pre-Phase-1 behaviour.
+    signal_quality_enabled = bool(getattr(settings, "signal_quality_v1_enabled", False))
     history_scans = int(getattr(settings, "signal_quality_history_scans", DEFAULT_HISTORY_SCANS) or DEFAULT_HISTORY_SCANS)
 
     persisted = 0
     transitions: list[MarketTransition] = []
     candidates: tuple[SignalQualityCandidate, ...] = ()
+    history: dict[str, list[ObservationSnapshot]] = {}
     with registry_lock(lock):
         state = load_json(state_target)
         latest = state.get("latest_by_symbol") or {}
         if not isinstance(latest, dict):
             raise ValueError("full-market latest_by_symbol state must be an object")
-        history = load_history_state(state, history_scans=history_scans)
+        if signal_quality_enabled:
+            # First enabled scan seeds from latest_by_symbol; later scans read
+            # back the schema-2 block. Both paths are idempotent.
+            history = load_history_state(state, history_scans=history_scans)
         observed_keys: set[str] = set()
         with target.open("a", encoding="utf-8") as handle:
             for observation in observations:
@@ -484,10 +496,11 @@ def process_full_market_observations(
                 if transition is not None:
                     transitions.append(transition)
 
-                # Feature state advances on every runtime scan, before and
-                # independently of the JSONL persistence decision below.
-                observed_keys.add(key)
-                _append_history(history, key, _snapshot(observation, now), history_scans=history_scans)
+                if signal_quality_enabled:
+                    # Feature state advances on every runtime scan, before and
+                    # independently of the JSONL persistence decision below.
+                    observed_keys.add(key)
+                    _append_history(history, key, _snapshot(observation, now), history_scans=history_scans)
 
                 should_persist, reason = _should_persist(observation, previous if isinstance(previous, dict) else None, now)
                 if not should_persist:
@@ -505,26 +518,30 @@ def process_full_market_observations(
                 handle.flush()
                 latest[key] = {**observation.as_dict(), "recorded_at": now.isoformat()}
                 persisted += 1
-        # Drop symbols that fell out of the observable universe so the state
-        # file cannot accumulate delisted markets forever.
-        history = {key: rows for key, rows in history.items() if key in observed_keys}
-
         state["latest_by_symbol"] = latest
-        state["history_by_symbol"] = _serialise_history(history, history_scans=history_scans)
-        state["schema_version"] = HISTORY_SCHEMA_VERSION
+        if signal_quality_enabled:
+            # Drop symbols that fell out of the observable universe so the
+            # state file cannot accumulate delisted markets forever.
+            history = {key: rows for key, rows in history.items() if key in observed_keys}
+            state["history_by_symbol"] = _serialise_history(history, history_scans=history_scans)
+            state["schema_version"] = HISTORY_SCHEMA_VERSION
+        # When disabled, any history written by an earlier enabled run is left
+        # exactly as it is. Dark mode means no new Signal Quality mutation, not
+        # a destructive rollback of state the operator already accumulated.
         state["last_scan_at"] = now.isoformat()
         state["observed_markets_last_scan"] = len(observations)
         save_json_atomic(state_target, state)
 
-    # Scoring is pure CPU over an in-memory copy, so it runs outside the
-    # registry lock rather than holding it across the whole universe.
-    try:
-        candidates = evaluate_signal_quality(history, settings=settings)
-    except Exception as exc:
-        # Advisory scoring must never break market observation or the learning
-        # stream it feeds.
-        candidates = ()
-        print("Signal Quality v1: fail-soft", type(exc).__name__)
+    if signal_quality_enabled:
+        # Scoring is pure CPU over an in-memory copy, so it runs outside the
+        # registry lock rather than holding it across the whole universe.
+        try:
+            candidates = evaluate_signal_quality(history, settings=settings)
+        except Exception as exc:
+            # Advisory scoring must never break market observation or the
+            # learning stream it feeds.
+            candidates = ()
+            print("Signal Quality v1: fail-soft", type(exc).__name__)
 
     transitions.sort(key=lambda row: (-row.score, -row.liquidity_24h_usd_approx, row.symbol))
 
@@ -550,5 +567,5 @@ def process_full_market_observations(
         persisted_events=persisted,
         transition_alerts=tuple(transitions),
         signal_quality_candidates=candidates,
-        signal_quality_enabled=bool(getattr(settings, "signal_quality_v1_enabled", False)),
+        signal_quality_enabled=signal_quality_enabled,
     )
