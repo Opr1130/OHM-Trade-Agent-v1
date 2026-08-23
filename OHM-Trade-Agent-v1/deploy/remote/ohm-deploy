@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TARGET_SHA="${1:-}"
+REPO_ROOT="/opt/OHM-Trade-Agent-v1"
+APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
+LOCK_FILE="/var/lock/ohm-deploy.lock"
+STATE_DIR="/var/lib/ohm-deploy"
+LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
+
+if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "invalid target sha" >&2
+  exit 64
+fi
+
+install -d -m 0755 "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "another deployment is already running" >&2
+  exit 75
+fi
+
+cd "$REPO_ROOT"
+
+git fetch --prune origin main
+REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
+if [[ "$TARGET_SHA" != "$REMOTE_MAIN_SHA" ]]; then
+  echo "refusing deploy: target is not current origin/main" >&2
+  echo "target=$TARGET_SHA origin/main=$REMOTE_MAIN_SHA" >&2
+  exit 65
+fi
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  echo "refusing deploy: tracked production worktree is dirty" >&2
+  git status --short >&2
+  exit 66
+fi
+
+PREVIOUS_SHA="$(git rev-parse main)"
+if [[ -s "$LAST_GOOD_FILE" ]]; then
+  RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
+  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
+    PREVIOUS_SHA="$RECORDED_SHA"
+  fi
+fi
+
+rollback() {
+  rc=$?
+  trap - ERR
+  echo "deployment failed; rolling back to $PREVIOUS_SHA" >&2
+  cd "$REPO_ROOT"
+  git checkout -f main
+  git reset --hard "$PREVIOUS_SHA"
+  cd "$APP_ROOT"
+  docker compose build ohm-trade-agent
+  docker compose up -d --remove-orphans ohm-trade-agent
+  for _ in $(seq 1 30); do
+    if curl --fail --silent --show-error http://127.0.0.1:8000/health | grep -q '"status":"ok"'; then
+      echo "rollback health check passed" >&2
+      exit "$rc"
+    fi
+    sleep 2
+  done
+  echo "rollback health check failed" >&2
+  exit "$rc"
+}
+trap rollback ERR
+
+git checkout -f main
+git reset --hard "$TARGET_SHA"
+
+cd "$APP_ROOT"
+docker compose build ohm-trade-agent
+docker compose up -d --remove-orphans ohm-trade-agent
+
+healthy=0
+for _ in $(seq 1 30); do
+  if curl --fail --silent --show-error http://127.0.0.1:8000/health | grep -q '"status":"ok"'; then
+    healthy=1
+    break
+  fi
+  sleep 2
+done
+
+if [[ "$healthy" != "1" ]]; then
+  echo "production health check failed" >&2
+  false
+fi
+
+printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
+trap - ERR
+
+echo "OHM deployment succeeded"
+echo "sha=$TARGET_SHA"
+docker compose ps
+curl --fail --silent --show-error http://127.0.0.1:8000/health
+echo
