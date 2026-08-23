@@ -1,13 +1,27 @@
 import json
 import logging
 import re
+from functools import lru_cache
 
 import httpx
 
 from app.models.signal import SignalDecision, TradingSignal
+from app.services.coingecko import CoinGeckoAPIError, CoinGeckoClient
 
 
 logger = logging.getLogger(__name__)
+
+_ALERT_HEADLINE_MARKERS = (
+    "OHM TRADE",
+    "OHM SCAN",
+    "OHM WATCH",
+    "OHM ENTRY",
+    "OHM EXIT",
+    "OHM RISK",
+    "EMERGENCY RISK ALERT",
+    "OHM EMERGENCY",
+)
+_QUOTE_SUFFIXES = ("USDT", "USD")
 
 
 def _price_pct(target: float, reference: float, side: str) -> float:
@@ -16,6 +30,87 @@ def _price_pct(target: float, reference: float, side: str) -> float:
     if side.upper() == "SHORT":
         return max(0.0, (1.0 - target / reference) * 100.0)
     return max(0.0, (target / reference - 1.0) * 100.0)
+
+
+def _base_symbol(value: str) -> str | None:
+    token = str(value or "").strip().upper().replace("/", "").replace("-", "")
+    if not re.fullmatch(r"[A-Z0-9]{2,30}", token):
+        return None
+    for quote in _QUOTE_SUFFIXES:
+        if token.endswith(quote) and len(token) > len(quote):
+            return token[: -len(quote)]
+    return token
+
+
+@lru_cache(maxsize=512)
+def _resolved_coin_name(symbol: str) -> str | None:
+    """Resolve a display name only when CoinGecko has one unambiguous symbol match.
+
+    Tickers are not globally unique. If a symbol maps to zero or multiple assets,
+    OHM deliberately returns None rather than guessing the project's identity.
+    """
+    base = _base_symbol(symbol)
+    if not base:
+        return None
+    try:
+        rows = CoinGeckoClient(timeout_seconds=4.0).get_markets_by_symbols([base])
+    except CoinGeckoAPIError:
+        return None
+    exact = [
+        row for row in rows
+        if str(row.get("symbol") or "").strip().upper() == base
+        and str(row.get("name") or "").strip()
+    ]
+    if len(exact) != 1:
+        return None
+    return str(exact[0]["name"]).strip()
+
+
+def _identity_label(token: str) -> str:
+    base = _base_symbol(token)
+    if not base:
+        return token
+    name = _resolved_coin_name(base)
+    if name:
+        return f"{name} ({base})"
+    return f"{base} (coin name unresolved)"
+
+
+def _enrich_alert_identity(message: str) -> str:
+    """Add human-readable coin identity to alert headlines without guessing.
+
+    This is intentionally limited to alert-like headlines. Account reports such
+    as OHM POSITIONS or OHM ORDERS are not rewritten here because their body can
+    contain many assets and is formatted by its own report code.
+    """
+    lines = message.splitlines()
+    if not lines:
+        return message
+    headline = lines[0]
+    upper = headline.upper()
+    if not any(marker in upper for marker in _ALERT_HEADLINE_MARKERS):
+        return message
+
+    # Already enriched by an upstream formatter.
+    if re.search(r"\([A-Z0-9]{2,20}\)\s*(?:—|-)", headline):
+        return message
+
+    # Standard alert headlines end with an asset or pair after an em dash.
+    match = re.search(r"(?P<prefix>.*?\s—\s)(?P<token>[A-Z0-9]{2,30})(?P<tail>\s*)$", headline)
+    if not match:
+        return message
+    token = match.group("token")
+    label = _identity_label(token)
+    if label == token:
+        return message
+
+    pair = token if any(token.endswith(q) and len(token) > len(q) for q in _QUOTE_SUFFIXES) else None
+    replacement = f"{match.group('prefix')}{label}"
+    if pair:
+        replacement += f" — {pair}"
+    replacement += match.group("tail")
+    lines[0] = replacement
+    return "\n".join(lines)
 
 
 def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
@@ -145,13 +240,17 @@ def _telegram_post(bot_token: str, method: str, payload: dict) -> dict | None:
         return None
 
 
+def _prepare_message(message: str) -> str:
+    return _enrich_alert_identity(_compact_legacy_chief(message))
+
+
 def send_telegram_message_with_id(
     bot_token: str,
     chat_id: str,
     message: str,
     reply_markup: dict | None = None,
 ) -> int | None:
-    message = _compact_legacy_chief(message)
+    message = _prepare_message(message)
     payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
@@ -172,7 +271,7 @@ def edit_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
-    message = _compact_legacy_chief(message)
+    message = _prepare_message(message)
     payload = {
         "chat_id": chat_id,
         "message_id": int(message_id),
@@ -189,7 +288,7 @@ def send_telegram_message(
     message: str,
     reply_markup: dict | None = None,
 ) -> bool:
-    message = _compact_legacy_chief(message)
+    message = _prepare_message(message)
     payload = {"chat_id": chat_id, "text": message}
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup)
