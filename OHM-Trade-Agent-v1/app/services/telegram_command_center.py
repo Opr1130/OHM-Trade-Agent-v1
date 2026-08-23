@@ -44,15 +44,17 @@ FIAT_ASSETS = {"USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF"}
 
 _HELP = (
     "🤖 OHM TELEGRAM COMMANDS\n\n"
-    "/scan VVV — deterministic Kraken/OHM market read\n"
-    "/why VVV — deeper scan details\n"
-    "/watch VVV — create/update a monitored Telegram card\n"
-    "/unwatch VVV — stop monitoring\n"
+    "/COIN — quick scan of any Kraken-supported USD/USDT spot coin\n"
+    "/scan COIN — deterministic Kraken/OHM market read\n"
+    "/why COIN — deeper scan details\n"
+    "/watch COIN — create/update a monitored Telegram card\n"
+    "/unwatch COIN — stop monitoring\n"
     "/watchlist — show monitored coins\n"
     "/orders — review current Kraken open orders\n"
     "/positions — review Kraken spot balances/margin positions\n"
     "/market — BTC-led market regime read\n"
     "/help — show commands\n\n"
+    "Examples: /CAP, /BTC, /ETH, /scan VVV\n\n"
     "Read-only/advisory: Telegram commands never place, cancel, modify, or confirm Kraken orders."
 )
 
@@ -230,7 +232,7 @@ def _is_material_watch_change(row: dict[str, Any], insight: MarketInsight) -> bo
 
 def _format_watchlist(watches: dict[str, dict[str, Any]]) -> str:
     if not watches:
-        return "👁 OHM WATCHLIST\nNo coins are being watched. Use /watch VVV."
+        return "👁 OHM WATCHLIST\nNo coins are being watched. Use /watch COIN."
     lines = [f"👁 OHM WATCHLIST — {len(watches)}/{MAX_WATCHES}"]
     for symbol, row in sorted(watches.items()):
         lines.append(
