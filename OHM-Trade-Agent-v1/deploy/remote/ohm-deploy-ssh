@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
+
+if [[ "$ORIGINAL" =~ ^deploy[[:space:]]+([0-9a-f]{40})$ ]]; then
+  TARGET_SHA="${BASH_REMATCH[1]}"
+else
+  echo "refusing command" >&2
+  exit 64
+fi
+
+exec sudo /usr/local/sbin/ohm-deploy "$TARGET_SHA"
