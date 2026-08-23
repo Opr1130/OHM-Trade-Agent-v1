@@ -136,6 +136,18 @@ class Settings(BaseSettings):
     # A persistence chain survives a gap of up to interval * multiplier, so one
     # late scan does not reset it but a real outage does.
     signal_quality_continuity_multiplier: float = Field(default=2.5, ge=1.0, le=10.0)
+    # How long a symbol's history survives without being observed.
+    # collect_full_market_observations fail-softs on a ticker batch error, so a
+    # symbol can vanish from a scan for reasons that have nothing to do with
+    # delisting. Retaining its history across that gap is what stops a
+    # transient Kraken error from silently erasing feature state.
+    #
+    # This is deliberately NOT the continuity window: retention decides whether
+    # the evidence is kept, continuity decides whether it still earns
+    # persistence credit. A returning symbol keeps its snapshots and loses its
+    # chain. The prior is one hour (6 scans at the default cadence); the
+    # validator below requires it to outlast the continuity window.
+    signal_quality_stale_history_retention_seconds: int = Field(default=3600, ge=300, le=86_400)
 
     signal_quality_max_cards_per_scan: int = Field(default=4, ge=1, le=20)
 
@@ -215,6 +227,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SIGNAL_QUALITY_HISTORY_SCANS must retain at least one scan more "
                 "than ACTIONABLE_MIN_PERSISTENCE_SCANS or the top stage is unreachable"
+            )
+        continuity_window = (
+            self.signal_quality_scan_interval_seconds * self.signal_quality_continuity_multiplier
+        )
+        if self.signal_quality_stale_history_retention_seconds < continuity_window:
+            raise ValueError(
+                "SIGNAL_QUALITY_STALE_HISTORY_RETENTION_SECONDS must outlast the "
+                "continuity window (SCAN_INTERVAL_SECONDS * CONTINUITY_MULTIPLIER = "
+                f"{continuity_window:.0f}s). Pruning history before continuity can even "
+                "break would delete the evidence a returning symbol needs."
             )
         return self
 

@@ -425,10 +425,18 @@ def near_high_component(features: SymbolFeatures) -> float:
 def classify_pattern(features: SymbolFeatures, *, config: SignalQualityConfig) -> str | None:
     """Match the inherited structural patterns, or None.
 
+    Requires intact continuity. The structural boundaries below are raw
+    interval deltas inherited from the legacy detector, so across an outage a
+    move that merely *accumulated* while OHM was not looking would satisfy them
+    exactly as a genuine acceleration does. A pattern is a claim that OHM
+    observed a transition happen; it cannot be made about an interval OHM did
+    not observe. Broken continuity therefore yields None, and the market keeps
+    its leaderboard row for audit without collecting pattern-quality credit.
+
     Takes features only. Coin identity is not an input and must never become
     one.
     """
-    if not features.valid:
+    if not features.valid or not features.continuity_intact:
         return None
     limits = config.patterns
     lift = features.lift_from_24h_low_pct

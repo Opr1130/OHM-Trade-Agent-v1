@@ -80,6 +80,35 @@ def test_history_must_retain_enough_scans_to_reach_the_top_stage():
         )
 
 
+def test_stale_history_retention_defaults_to_six_scans():
+    settings = _settings()
+
+    assert settings.signal_quality_stale_history_retention_seconds == 3600
+    # Six scans at the default cadence, and comfortably past the continuity
+    # window, so evidence outlives the credit it can earn.
+    assert settings.signal_quality_stale_history_retention_seconds >= (
+        6 * settings.signal_quality_scan_interval_seconds
+    )
+
+
+def test_retention_shorter_than_the_continuity_window_is_rejected():
+    """Pruning before continuity can break would delete what a return needs."""
+    with pytest.raises(ValidationError, match="RETENTION_SECONDS must outlast"):
+        _settings(
+            signal_quality_scan_interval_seconds=1800,
+            signal_quality_stale_history_retention_seconds=3600,
+        )
+
+
+def test_a_slower_cadence_requires_an_explicitly_longer_retention():
+    settings = _settings(
+        signal_quality_scan_interval_seconds=1800,
+        signal_quality_stale_history_retention_seconds=10_800,
+    )
+
+    assert settings.signal_quality_stale_history_retention_seconds == 10_800
+
+
 def test_scoring_config_maps_cleanly_from_flat_settings():
     settings = _settings(
         signal_quality_v1_enabled=True,

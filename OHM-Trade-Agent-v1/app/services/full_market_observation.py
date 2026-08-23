@@ -47,6 +47,10 @@ HEARTBEAT_SECONDS = 60 * 60
 # never deletes it.
 HISTORY_SCHEMA_VERSION = 2
 DEFAULT_HISTORY_SCANS = 8
+# One hour, i.e. six scans at the default cadence. Retention bounds how long
+# unobserved evidence is kept; it is deliberately longer than the continuity
+# window, which bounds how long a persistence chain survives a gap.
+DEFAULT_STALE_HISTORY_RETENTION_SECONDS = 3600.0
 MIN_PERSIST_PRICE_CHANGE_PCT = 1.0
 MIN_PERSIST_LIFT_CHANGE_PCT = 0.75
 MIN_PERSIST_HIGH_DISTANCE_CHANGE_PCT = 0.75
@@ -335,10 +339,42 @@ def _snapshot(observation: MarketObservation, now: datetime) -> ObservationSnaps
     )
 
 
+def prune_stale_history(
+    history: dict[str, list[ObservationSnapshot]],
+    *,
+    now: datetime,
+    retention_seconds: float,
+) -> dict[str, list[ObservationSnapshot]]:
+    """Drop only symbols unobserved for longer than the retention window.
+
+    Absence from a single scan is not evidence of delisting.
+    ``collect_full_market_observations`` fail-softs on a ticker batch error, so
+    a transient Kraken fault, a malformed response or a network gap all look
+    identical to a symbol disappearing. Pruning on presence would let any of
+    them silently erase a symbol's feature history, reset its persistence and
+    make its return look like a first observation.
+
+    Retention is a bound on evidence, not on credit: a symbol that returns
+    after a dropout keeps its snapshots, but the continuity check in
+    ``derive_symbol_features`` still severs its persistence chain because the
+    elapsed gap exceeds the continuity window. Genuinely delisted markets age
+    out once the window passes, so state stays bounded.
+    """
+    window = max(0.0, float(retention_seconds))
+    retained: dict[str, list[ObservationSnapshot]] = {}
+    for key, rows in history.items():
+        if not rows:
+            continue
+        if (now - rows[-1].observed_at).total_seconds() <= window:
+            retained[key] = rows
+    return retained
+
+
 def evaluate_signal_quality(
     history: dict[str, list[ObservationSnapshot]],
     *,
     settings: Any = None,
+    observed_symbols: set[str] | None = None,
 ) -> tuple[SignalQualityCandidate, ...]:
     """Run the Phase 1 two-pass pipeline over the current scan history.
 
@@ -347,6 +383,11 @@ def evaluate_signal_quality(
     market with derivable features - not only transition candidates - because
     ranking inside an already-filtered set makes the percentile
     selection-biased by construction.
+
+    ``observed_symbols`` restricts scoring to markets seen in the current scan.
+    Retained-but-absent symbols keep their history for when they return, but
+    must not be scored or ranked from stale snapshots as though they were
+    current observations.
     """
     if settings is None:
         try:
@@ -368,7 +409,12 @@ def evaluate_signal_quality(
         qualifying=QualifyingConditions(),
         run_up_window_scans=int(getattr(settings, "signal_quality_history_scans", DEFAULT_HISTORY_SCANS)),
     )
-    features = derive_features_for_universe(history, config=feature_config)
+    scored = (
+        history
+        if observed_symbols is None
+        else {key: rows for key, rows in history.items() if key in observed_symbols}
+    )
+    features = derive_features_for_universe(scored, config=feature_config)
     percentiles = derive_universe_percentiles(features)
     return evaluate_universe(features, percentiles, config=config)
 
@@ -473,6 +519,10 @@ def process_full_market_observations(
     # identical to pre-Phase-1 behaviour.
     signal_quality_enabled = bool(getattr(settings, "signal_quality_v1_enabled", False))
     history_scans = int(getattr(settings, "signal_quality_history_scans", DEFAULT_HISTORY_SCANS) or DEFAULT_HISTORY_SCANS)
+    stale_history_retention_seconds = float(
+        getattr(settings, "signal_quality_stale_history_retention_seconds", None)
+        or DEFAULT_STALE_HISTORY_RETENTION_SECONDS
+    )
 
     persisted = 0
     transitions: list[MarketTransition] = []
@@ -520,9 +570,12 @@ def process_full_market_observations(
                 persisted += 1
         state["latest_by_symbol"] = latest
         if signal_quality_enabled:
-            # Drop symbols that fell out of the observable universe so the
-            # state file cannot accumulate delisted markets forever.
-            history = {key: rows for key, rows in history.items() if key in observed_keys}
+            # Age-based, not presence-based: a symbol missing from this scan
+            # because of a fail-soft ticker error keeps its history, while a
+            # genuinely delisted market ages out and state stays bounded.
+            history = prune_stale_history(
+                history, now=now, retention_seconds=stale_history_retention_seconds
+            )
             state["history_by_symbol"] = _serialise_history(history, history_scans=history_scans)
             state["schema_version"] = HISTORY_SCHEMA_VERSION
         # When disabled, any history written by an earlier enabled run is left
@@ -536,7 +589,9 @@ def process_full_market_observations(
         # Scoring is pure CPU over an in-memory copy, so it runs outside the
         # registry lock rather than holding it across the whole universe.
         try:
-            candidates = evaluate_signal_quality(history, settings=settings)
+            candidates = evaluate_signal_quality(
+                history, settings=settings, observed_symbols=observed_keys
+            )
         except Exception as exc:
             # Advisory scoring must never break market observation or the
             # learning stream it feeds.

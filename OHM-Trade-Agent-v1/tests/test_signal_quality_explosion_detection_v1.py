@@ -511,6 +511,118 @@ def test_lift_from_24h_low_alone_cannot_dominate_exhaustion():
 
 
 # ---------------------------------------------------------------------------
+# A long scan gap must not manufacture a pattern.
+# ---------------------------------------------------------------------------
+
+# Each pair below classifies cleanly on-cadence. The structural boundaries are
+# raw interval deltas inherited from the legacy detector, so the identical
+# move accumulated across an outage would satisfy them too - which is exactly
+# what the continuity requirement exists to prevent.
+PATTERN_FIXTURES = {
+    "COMPRESSION_RELEASE": [101.0, 105.0],
+    "REACCELERATION": [105.0, 108.0],
+    "PROGRESSIVE_EXPANSION": [106.0, 107.7],
+}
+
+# Well beyond the continuity window (600s x 2.5 = 1500s).
+OUTAGE_SECONDS = SCAN_INTERVAL * 10
+
+
+@pytest.mark.parametrize("expected,prices", sorted(PATTERN_FIXTURES.items()))
+def test_on_cadence_move_still_classifies(expected, prices):
+    from app.services.signal_scoring import classify_pattern
+
+    features = _features(_history(prices, interval_seconds=SCAN_INTERVAL))
+
+    assert features.continuity_intact is True
+    assert classify_pattern(features, config=CONFIG) == expected
+
+
+@pytest.mark.parametrize("expected,prices", sorted(PATTERN_FIXTURES.items()))
+def test_same_move_across_an_outage_does_not_classify(expected, prices):
+    """The move is identical; only the observation gap differs.
+
+    OHM did not watch this transition happen, so it must not claim to have.
+    """
+    from app.services.signal_scoring import classify_pattern
+
+    features = _features(_history(prices, interval_seconds=OUTAGE_SECONDS))
+
+    # The raw deltas the legacy boundaries test are unchanged...
+    assert features.price_change_since_prior_pct == pytest.approx(
+        _features(_history(prices, interval_seconds=SCAN_INTERVAL)).price_change_since_prior_pct
+    )
+    # ...but continuity is broken, so no pattern is claimed.
+    assert features.continuity_intact is False
+    assert classify_pattern(features, config=CONFIG) is None
+
+
+def test_broken_continuity_forfeits_pattern_quality_credit():
+    """Losing the pattern must actually cost pattern-strength points."""
+    from app.services.signal_scoring import classify_pattern, pattern_strength_score
+
+    prices = PATTERN_FIXTURES["REACCELERATION"]
+    live = _features(_history(prices, interval_seconds=SCAN_INTERVAL))
+    gapped = _features(_history(prices, interval_seconds=OUTAGE_SECONDS))
+
+    live_score = pattern_strength_score(live, classify_pattern(live, config=CONFIG), config=CONFIG)
+    gapped_score = pattern_strength_score(
+        gapped, classify_pattern(gapped, config=CONFIG), config=CONFIG
+    )
+
+    assert live_score > gapped_score
+
+
+def test_broken_continuity_gains_no_persistence_credit():
+    prices = [102.0, 104.0, 106.1, 108.2, 110.4]
+    gapped = _features(_history(prices, interval_seconds=OUTAGE_SECONDS))
+
+    assert gapped.continuity_intact is False
+    assert gapped.consecutive_qualifying_scans == 0
+    assert persistence_score(gapped.consecutive_qualifying_scans) == 0.0
+
+
+def test_gapped_market_is_still_scored_for_audit_but_not_promoted():
+    """It keeps a leaderboard row; it just cannot claim a live transition."""
+    universe = _universe(
+        GAPUSD=_history(
+            PATTERN_FIXTURES["REACCELERATION"],
+            [5_000_000.0, 5_000_000.0],
+            interval_seconds=OUTAGE_SECONDS,
+        ),
+    )
+    candidate = _evaluate(universe)["GAPUSD"]
+
+    assert candidate.pattern is None
+    assert candidate.stage not in {STAGE_ACTIONABLE_REVIEW, STAGE_BREAKOUT_CANDIDATE}
+    assert candidate.persistence_scans == 0
+
+
+def test_no_lookahead_still_holds_with_the_continuity_requirement():
+    """The continuity guard reads only the prefix it is given."""
+    series = _history(
+        [100.0, 101.0, 103.0, 102.5, 106.0, 109.0, 108.0, 113.0],
+        _growing_notionals(3_000_000.0, 8),
+    )
+    from app.services.signal_scoring import classify_pattern
+
+    for index in range(MIN_SCANS_FOR_FEATURES, len(series) + 1):
+        prefix = series[:index]
+        expected = derive_symbol_features(prefix, config=FEATURE_CONFIG)
+        poisoned = list(prefix) + _history(
+            [9_999.0, 0.01],
+            [1e12, 1.0],
+            start=prefix[-1].observed_at + timedelta(seconds=OUTAGE_SECONDS),
+        )
+        replayed = derive_symbol_features(poisoned[:index], config=FEATURE_CONFIG)
+
+        assert replayed == expected
+        assert classify_pattern(replayed, config=CONFIG) == classify_pattern(
+            expected, config=CONFIG
+        )
+
+
+# ---------------------------------------------------------------------------
 # Exhaustion is applied exactly once, at the opportunity layer.
 # ---------------------------------------------------------------------------
 

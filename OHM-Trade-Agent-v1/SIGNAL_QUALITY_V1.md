@@ -90,8 +90,37 @@ independently of the `_should_persist()` decision. A quiet scan that never
 reaches the JSONL stream still occupies its place in the temporal series.
 
 History is a bounded ring buffer (`SIGNAL_QUALITY_HISTORY_SCANS`, default 8),
-symbols that leave the observable universe are dropped, and an out-of-order or
-replayed scan replaces the newest row rather than fabricating an interval.
+and an out-of-order or replayed scan replaces the newest row rather than
+fabricating an interval.
+
+### Retention vs. continuity
+
+`collect_full_market_observations` fail-softs on a ticker batch exception, so a
+transient Kraken error, a malformed response or a network gap are all
+indistinguishable from a symbol disappearing. Pruning history on *presence*
+would let any of them silently erase a symbol's feature state, reset its
+persistence, and make its return look like a first observation.
+
+History is therefore pruned on **age**, not presence
+(`SIGNAL_QUALITY_STALE_HISTORY_RETENTION_SECONDS`, default 3600 — six scans at
+the default cadence). The two windows answer different questions:
+
+| | Bounds | Default | Effect when exceeded |
+| --- | --- | --- | --- |
+| Continuity window | how long a **persistence chain** survives a gap | 1500s (interval × 2.5) | chain resets to 0; no pattern is classified |
+| Retention window | how long **evidence** is kept without observation | 3600s | the symbol's history is deleted |
+
+Retention is validated at boot to be longer than continuity — pruning evidence
+before continuity can even break would delete exactly what a returning symbol
+needs. So a symbol that vanishes for a scan or two keeps its snapshots and
+loses its credit: it returns with its history intact, `continuity_intact`
+False, and a persistence chain of 0.
+
+Symbols retained but absent from the current scan are **not scored**. They keep
+their history for when they return, but stale snapshots must never be ranked as
+though they were current observations. Genuinely delisted markets age out once
+the retention window passes, so state stays bounded in both depth (ring buffer)
+and breadth (retention age).
 
 `full_market_transition_learning.py` keeps its own separate state file and is
 untouched. Learning state and live feature state stay conceptually separate.
@@ -138,6 +167,13 @@ expansion + 20% position near the 24h high + 15% pattern-specific bonus.
 this worth our attention?". The three structural patterns
 (`COMPRESSION_RELEASE`, `REACCELERATION`, `PROGRESSIVE_EXPANSION`) are inherited
 unchanged from the legacy detector; what changed is the consequence.
+
+**Classification requires intact continuity.** The inherited boundaries are raw
+interval deltas, so across an outage a move that merely *accumulated* while OHM
+was not looking would satisfy them exactly as a live acceleration does. A
+pattern is a claim that OHM observed a transition happen, so
+`classify_pattern` returns `None` when `continuity_intact` is False. The market
+keeps its leaderboard row for audit and forfeits the pattern-quality credit.
 
 **`volume_acceleration_score`** — from the rolling growth proxy above. Bands:
 flat/falling 0–20, modest 20–45, clearly accelerating 45–70, extreme *and
@@ -250,7 +286,9 @@ shipped scan-class schedule is `deploy/cron.d/ohm-wave5-explosion-learning`
 The continuity window is `interval × SIGNAL_QUALITY_CONTINUITY_MULTIPLIER`
 (2.5 → 1500s): one late scan does not reset a persistence chain, a real outage
 does. **If the deployed cadence differs, set this to the real value** — every
-rate normalisation and continuity decision keys off it.
+rate normalisation, continuity decision and retention check keys off it, and
+the boot validator will reject a retention window that no longer outlasts
+continuity.
 
 ## 11. Phase 2
 

@@ -23,13 +23,14 @@ from app.services.signal_features import ObservationSnapshot
 BASE_TIME = datetime(2026, 8, 22, tzinfo=timezone.utc)
 
 
-def _settings(*, enabled, history_scans=DEFAULT_HISTORY_SCANS):
+def _settings(*, enabled, history_scans=DEFAULT_HISTORY_SCANS, retention_seconds=3600):
     """Minimal settings stand-in; the integration reads these by name."""
     return SimpleNamespace(
         signal_quality_v1_enabled=enabled,
         signal_quality_history_scans=history_scans,
         signal_quality_scan_interval_seconds=600,
         signal_quality_continuity_multiplier=2.5,
+        signal_quality_stale_history_retention_seconds=retention_seconds,
     )
 
 
@@ -192,7 +193,8 @@ def test_quiet_scan_still_advances_history_even_when_not_persisted(tmp_path):
     assert [row.last_price for row in history["LOWUSD"]] == [1.01, 1.0102]
 
 
-def test_history_is_capped_and_drops_markets_that_leave_the_universe(tmp_path):
+def test_history_is_capped_and_ages_out_markets_that_leave_the_universe(tmp_path):
+    """Depth is bounded per symbol; breadth is bounded by the retention age."""
     state_file = tmp_path / "state.json"
     observation_file = tmp_path / "observations.jsonl"
 
@@ -251,6 +253,186 @@ def test_legacy_transition_path_is_unchanged_by_the_migration(tmp_path):
     state = load_json(state_file)
     assert "latest_by_symbol" in state
     assert state["latest_by_symbol"]["LOWUSD"]["last_price"] == 1.05
+
+
+class DroppingKraken(FakeKraken):
+    """A Kraken whose ticker batch fail-softs for one symbol.
+
+    Reproduces the real failure mode: collect_full_market_observations swallows
+    batch exceptions, so a transient fault is indistinguishable from the symbol
+    disappearing. LOWUSD stays in get_asset_pairs - it is not delisted, its
+    ticker simply did not come back.
+    """
+
+    def get_tickers(self, pairs):
+        data = super().get_tickers(pairs)
+        data.pop("LOWUSD", None)
+        return data
+
+
+def _scan(client, minutes, state_file, observation_file, settings):
+    return process_full_market_observations(
+        client=client,
+        now=BASE_TIME + timedelta(minutes=minutes),
+        observation_file=observation_file,
+        state_file=state_file,
+        settings=settings,
+    )
+
+
+def test_single_missing_scan_does_not_delete_history(tmp_path):
+    """A transient ticker dropout must not look like a delisting."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.02), 10, state_file, observation_file, ENABLED)
+    before = load_json(state_file)["history_by_symbol"]["LOWUSD"]
+    assert len(before) == 2
+
+    # LOWUSD's ticker fails on this scan only.
+    result = _scan(DroppingKraken(), 20, state_file, observation_file, ENABLED)
+    assert result.observed_markets == 1
+
+    state = load_json(state_file)
+    assert state["history_by_symbol"]["LOWUSD"] == before
+    # Absent this scan, so not scored from stale snapshots either.
+    assert "LOWUSD" not in {row.symbol for row in result.signal_quality_candidates}
+
+
+def test_repeated_dropouts_within_retention_do_not_delete_history(tmp_path):
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.02), 10, state_file, observation_file, ENABLED)
+    before = load_json(state_file)["history_by_symbol"]["LOWUSD"]
+
+    # Four consecutive dropouts: 40 minutes, still inside the 60-minute window.
+    for minutes in (20, 30, 40, 50):
+        _scan(DroppingKraken(), minutes, state_file, observation_file, ENABLED)
+        assert load_json(state_file)["history_by_symbol"]["LOWUSD"] == before
+
+
+def test_symbol_returning_after_dropout_retains_its_snapshots(tmp_path):
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.02), 10, state_file, observation_file, ENABLED)
+    _scan(DroppingKraken(), 20, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.03), 30, state_file, observation_file, ENABLED)
+
+    rows = load_json(state_file)["history_by_symbol"]["LOWUSD"]
+    # The pre-dropout evidence survived and the new observation extends it.
+    assert [row["last_price"] for row in rows] == [1.01, 1.02, 1.03]
+
+
+def test_persistence_still_resets_across_an_excessive_gap(tmp_path):
+    """Retention preserves evidence; it must not preserve credit.
+
+    The 30-minute gap exceeds the continuity window (600s * 2.5 = 1500s), so
+    the chain breaks even though every snapshot was kept.
+    """
+    from app.services.full_market_observation import evaluate_signal_quality
+    from app.services.signal_features import (
+        FeatureDerivationConfig,
+        derive_symbol_features,
+    )
+
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.02), 10, state_file, observation_file, ENABLED)
+    for minutes in (20, 30, 40):
+        _scan(DroppingKraken(), minutes, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.03), 50, state_file, observation_file, ENABLED)
+
+    history = load_history_state(load_json(state_file))
+    assert len(history["LOWUSD"]) == 3  # evidence retained
+
+    features = derive_symbol_features(
+        history["LOWUSD"],
+        config=FeatureDerivationConfig(nominal_interval_seconds=600.0),
+    )
+    assert features.continuity_intact is False
+    assert features.consecutive_qualifying_scans == 0
+
+
+def test_genuinely_stale_history_is_eventually_pruned(tmp_path):
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, ENABLED)
+    _scan(FakeKraken(low_price=1.02), 10, state_file, observation_file, ENABLED)
+    assert "LOWUSD" in load_json(state_file)["history_by_symbol"]
+
+    # Still inside the 60-minute retention window.
+    _scan(DroppingKraken(), 60, state_file, observation_file, ENABLED)
+    assert "LOWUSD" in load_json(state_file)["history_by_symbol"]
+
+    # Now past it: a market gone this long is treated as delisted.
+    _scan(DroppingKraken(), 90, state_file, observation_file, ENABLED)
+    state = load_json(state_file)
+    assert "LOWUSD" not in state["history_by_symbol"]
+    assert "BIGUSD" in state["history_by_symbol"]
+
+
+def test_retention_keeps_state_bounded(tmp_path):
+    """Retention is a bound, not an accumulator."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    class RotatingKraken(FakeKraken):
+        """A different short-lived symbol every scan."""
+
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def get_asset_pairs(self):
+            pairs = super().get_asset_pairs()
+            pairs[f"EPH{self.index}USD"] = {
+                "altname": f"EPH{self.index}USD",
+                "wsname": f"EPH{self.index}/USD",
+            }
+            return pairs
+
+        def get_tickers(self, pairs):
+            data = super().get_tickers(pairs)
+            key = f"EPH{self.index}USD"
+            if key in pairs:
+                data[key] = {"last": 2.0, "high_24h": 2.1, "low_24h": 1.9, "volume_24h": 1_000.0}
+            return data
+
+    for index in range(30):
+        _scan(RotatingKraken(index), 10 * index, state_file, observation_file, ENABLED)
+
+    history = load_json(state_file)["history_by_symbol"]
+    # 60-minute retention at a 10-minute cadence holds at most ~7 ephemeral
+    # symbols, not all 30.
+    ephemeral = [key for key in history if key.startswith("EPH")]
+    assert len(ephemeral) <= 8
+    for rows in history.values():
+        assert len(rows) <= DEFAULT_HISTORY_SCANS
+
+
+def test_dropout_handling_is_inert_while_the_feature_is_disabled(tmp_path):
+    """Dark mode is unaffected by any of the retention machinery."""
+    state_file = tmp_path / "state.json"
+    observation_file = tmp_path / "observations.jsonl"
+
+    _scan(FakeKraken(low_price=1.01), 0, state_file, observation_file, DISABLED)
+    _scan(DroppingKraken(), 10, state_file, observation_file, DISABLED)
+    result = _scan(FakeKraken(low_price=1.05), 20, state_file, observation_file, DISABLED)
+
+    state = load_json(state_file)
+    assert set(state) == {"latest_by_symbol", "last_scan_at", "observed_markets_last_scan"}
+    assert result.signal_quality_candidates == ()
+    # The legacy transition path is still driven by latest_by_symbol alone.
+    low = next(item for item in result.transition_alerts if item.symbol == "LOWUSD")
+    assert low.pattern == "COMPRESSION_RELEASE"
 
 
 SCHEMA_1_STATE = {
