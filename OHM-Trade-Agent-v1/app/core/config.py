@@ -102,6 +102,144 @@ class Settings(BaseSettings):
     tradingview_kraken_timeout_seconds: float = Field(default=5.0, ge=1.0, le=10.0)
     tradingview_max_inbox_events: int = Field(default=5000, ge=100, le=50000)
 
+    # ---------------------------------------------------------------------
+    # Signal Quality / Explosion Detection v1 (Phase 1)
+    #
+    # Every numeric value below is an INTERPRETABLE PRIOR, not a calibrated
+    # figure. Phase 1 has no access to a scored production observation history,
+    # so nothing here has been fitted to outcomes. Phase 2 replays
+    # full_market_observations.jsonl (correcting for its event-sampling bias)
+    # to decide whether these priors actually separate explosive movers from
+    # failed pumps. Until then the whole feature ships dark: enabling it only
+    # changes which advisory Broad Watch cards are rendered, never trade
+    # authority, order placement, or any execution gate.
+    # ---------------------------------------------------------------------
+    signal_quality_v1_enabled: bool = False
+    # Optional widening of the main Broad Watch feed to the earliest stage.
+    # Off by default: EARLY_BUILDING is explicitly a pre-confirmation tier.
+    signal_quality_early_alerts_enabled: bool = False
+
+    # Hard tradeability bands (24h USD notional). Below the minimum a market is
+    # suppressed outright no matter how strong its pattern is.
+    signal_quality_min_liquidity_usd: float = Field(default=100_000.0, gt=0)
+    signal_quality_observation_liquidity_usd: float = Field(default=250_000.0, gt=0)
+    signal_quality_preferred_liquidity_usd: float = Field(default=1_000_000.0, gt=0)
+
+    # Runtime scan history. Retained per symbol for temporal features; this is
+    # feature state, deliberately separate from the event-sampled JSONL
+    # learning stream.
+    signal_quality_history_scans: int = Field(default=8, ge=2, le=64)
+    # Nominal cadence used to time-normalise per-scan rates. The repository
+    # ships no cron entry for app.jobs.scan_movers; 600s mirrors the only
+    # shipped scan-class schedule (deploy/cron.d/ohm-wave5-explosion-learning).
+    signal_quality_scan_interval_seconds: int = Field(default=600, ge=30, le=7200)
+    # A persistence chain survives a gap of up to interval * multiplier, so one
+    # late scan does not reset it but a real outage does.
+    signal_quality_continuity_multiplier: float = Field(default=2.5, ge=1.0, le=10.0)
+    # How long a symbol's history survives without being observed.
+    # collect_full_market_observations fail-softs on a ticker batch error, so a
+    # symbol can vanish from a scan for reasons that have nothing to do with
+    # delisting. Retaining its history across that gap is what stops a
+    # transient Kraken error from silently erasing feature state.
+    #
+    # This is deliberately NOT the continuity window: retention decides whether
+    # the evidence is kept, continuity decides whether it still earns
+    # persistence credit. A returning symbol keeps its snapshots and loses its
+    # chain. The prior is one hour (6 scans at the default cadence); the
+    # validator below requires it to outlast the continuity window.
+    signal_quality_stale_history_retention_seconds: int = Field(default=3600, ge=300, le=86_400)
+
+    signal_quality_max_cards_per_scan: int = Field(default=4, ge=1, le=20)
+
+    # Stage-machine entry priors. All advisory; ACTIONABLE_REVIEW authorises
+    # human review only and never an entry.
+    signal_quality_early_building_opportunity: int = Field(default=55, ge=0, le=100)
+    signal_quality_early_building_explosion: int = Field(default=50, ge=0, le=100)
+    signal_quality_early_building_tradeability: int = Field(default=20, ge=0, le=100)
+    signal_quality_breakout_opportunity: int = Field(default=70, ge=0, le=100)
+    signal_quality_breakout_explosion: int = Field(default=65, ge=0, le=100)
+    signal_quality_breakout_tradeability: int = Field(default=40, ge=0, le=100)
+    signal_quality_breakout_min_persistence_scans: int = Field(default=2, ge=1, le=32)
+    signal_quality_breakout_max_exhaustion: int = Field(default=25, ge=0, le=100)
+    signal_quality_actionable_opportunity: int = Field(default=80, ge=0, le=100)
+    signal_quality_actionable_explosion: int = Field(default=75, ge=0, le=100)
+    signal_quality_actionable_tradeability: int = Field(default=70, ge=0, le=100)
+    signal_quality_actionable_min_persistence_scans: int = Field(default=3, ge=1, le=32)
+    signal_quality_actionable_max_exhaustion: int = Field(default=20, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def validate_signal_quality_bands(self) -> "Settings":
+        """Keep the Phase 1 priors internally ordered.
+
+        A misordered band would silently invert the gate it exists to enforce
+        (for example an observation floor below the hard-suppression floor),
+        so this refuses to boot rather than degrading quietly.
+        """
+        if not (
+            self.signal_quality_min_liquidity_usd
+            <= self.signal_quality_observation_liquidity_usd
+            <= self.signal_quality_preferred_liquidity_usd
+        ):
+            raise ValueError(
+                "SIGNAL_QUALITY liquidity bands must be ordered: "
+                "MIN <= OBSERVATION <= PREFERRED"
+            )
+        ladder = (
+            (
+                "opportunity",
+                self.signal_quality_early_building_opportunity,
+                self.signal_quality_breakout_opportunity,
+                self.signal_quality_actionable_opportunity,
+            ),
+            (
+                "explosion",
+                self.signal_quality_early_building_explosion,
+                self.signal_quality_breakout_explosion,
+                self.signal_quality_actionable_explosion,
+            ),
+            (
+                "tradeability",
+                self.signal_quality_early_building_tradeability,
+                self.signal_quality_breakout_tradeability,
+                self.signal_quality_actionable_tradeability,
+            ),
+        )
+        for name, early, breakout, actionable in ladder:
+            if not (early <= breakout <= actionable):
+                raise ValueError(
+                    f"SIGNAL_QUALITY {name} stage thresholds must increase: "
+                    "EARLY_BUILDING <= BREAKOUT <= ACTIONABLE"
+                )
+        if (
+            self.signal_quality_breakout_min_persistence_scans
+            > self.signal_quality_actionable_min_persistence_scans
+        ):
+            raise ValueError(
+                "SIGNAL_QUALITY_ACTIONABLE_MIN_PERSISTENCE_SCANS cannot be below "
+                "SIGNAL_QUALITY_BREAKOUT_MIN_PERSISTENCE_SCANS"
+            )
+        if self.signal_quality_actionable_max_exhaustion > self.signal_quality_breakout_max_exhaustion:
+            raise ValueError(
+                "SIGNAL_QUALITY_ACTIONABLE_MAX_EXHAUSTION cannot exceed "
+                "SIGNAL_QUALITY_BREAKOUT_MAX_EXHAUSTION"
+            )
+        if self.signal_quality_history_scans < self.signal_quality_actionable_min_persistence_scans + 1:
+            raise ValueError(
+                "SIGNAL_QUALITY_HISTORY_SCANS must retain at least one scan more "
+                "than ACTIONABLE_MIN_PERSISTENCE_SCANS or the top stage is unreachable"
+            )
+        continuity_window = (
+            self.signal_quality_scan_interval_seconds * self.signal_quality_continuity_multiplier
+        )
+        if self.signal_quality_stale_history_retention_seconds < continuity_window:
+            raise ValueError(
+                "SIGNAL_QUALITY_STALE_HISTORY_RETENTION_SECONDS must outlast the "
+                "continuity window (SCAN_INTERVAL_SECONDS * CONTINUITY_MULTIPLIER = "
+                f"{continuity_window:.0f}s). Pruning history before continuity can even "
+                "break would delete the evidence a returning symbol needs."
+            )
+        return self
+
     @model_validator(mode="after")
     def validate_tradingview_production_secret(self) -> "Settings":
         if self.price_movement_watch_score > self.price_movement_ready_score:
