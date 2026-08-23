@@ -95,14 +95,63 @@ def _clean_query(value: str) -> str:
 def resolve_market(query: str, client: KrakenClient | None = None) -> MarketIdentity:
     """Resolve a user symbol from Kraken's live spot-pair table.
 
-    Bare assets prefer USD and then USDT. Explicit USD/USDT requests preserve
-    the requested quote. Dynamic AssetPairs resolution avoids brittle symbol
-    suffix surgery for modern assets such as XTZ/REZ and Kraken legacy aliases.
+    Bare assets prefer an exact live base-asset match before suffix parsing,
+    then prefer USD and USDT. Explicit USD/USDT requests preserve the requested
+    quote. Exact-base-first avoids treating a legitimate asset whose ticker ends
+    in USD/USDT as if the suffix were necessarily a quote currency.
     """
     client = client or KrakenClient(timeout_seconds=5.0)
     cleaned = _clean_query(query)
-    canonical = canonicalize_pair(cleaned)
 
+    try:
+        pair_details = client.get_asset_pairs()
+    except Exception as exc:
+        raise MarketInsightUnavailable(f"Kraken pair directory unavailable ({type(exc).__name__})") from exc
+
+    def collect_candidates(requested_base: str, explicit_quote: str | None) -> list[MarketIdentity]:
+        candidates: list[MarketIdentity] = []
+        for pair_id, details in pair_details.items():
+            if not isinstance(details, dict) or _is_excluded_market(details):
+                continue
+            base = canonicalize_asset(str(details.get("base") or ""))
+            quote = canonicalize_asset(str(details.get("quote") or ""))
+            if base != requested_base or quote not in SUPPORTED_QUOTES:
+                continue
+            if explicit_quote is not None and quote != explicit_quote:
+                continue
+            altname = str(details.get("altname") or pair_id).upper()
+            ws_symbol = str(details.get("wsname") or f"{base}/{quote}").upper()
+            candidates.append(
+                MarketIdentity(
+                    base_asset=base,
+                    quote_asset=quote,
+                    pair_id=str(pair_id),
+                    altname=altname,
+                    display_pair=f"{base}{quote}",
+                    ws_symbol=ws_symbol,
+                )
+            )
+        candidates.sort(
+            key=lambda item: (
+                item.quote_asset != "USD",
+                ".D" in item.altname,
+                item.altname,
+                item.pair_id,
+            )
+        )
+        return candidates
+
+    # A plain ticker is first treated as a base asset exactly as written after
+    # Kraken identity normalization. This protects assets such as BUSD from
+    # being misread as B/USD while preserving XBT -> BTC alias behavior.
+    if re.fullmatch(r"[A-Z0-9]+", cleaned):
+        exact_base = canonicalize_asset(cleaned)
+        if exact_base:
+            exact_candidates = collect_candidates(exact_base, None)
+            if exact_candidates:
+                return exact_candidates[0]
+
+    canonical = canonicalize_pair(cleaned)
     explicit_quote: str | None = None
     requested_base = canonical
     for quote in ("USDT", "USD"):
@@ -114,46 +163,10 @@ def resolve_market(query: str, client: KrakenClient | None = None) -> MarketIden
     if not requested_base:
         raise MarketResolutionError("Coin symbol is empty")
 
-    candidates: list[MarketIdentity] = []
-    try:
-        pair_details = client.get_asset_pairs()
-    except Exception as exc:
-        raise MarketInsightUnavailable(f"Kraken pair directory unavailable ({type(exc).__name__})") from exc
-
-    for pair_id, details in pair_details.items():
-        if not isinstance(details, dict) or _is_excluded_market(details):
-            continue
-        base = canonicalize_asset(str(details.get("base") or ""))
-        quote = canonicalize_asset(str(details.get("quote") or ""))
-        if base != requested_base or quote not in SUPPORTED_QUOTES:
-            continue
-        if explicit_quote is not None and quote != explicit_quote:
-            continue
-        altname = str(details.get("altname") or pair_id).upper()
-        ws_symbol = str(details.get("wsname") or f"{base}/{quote}").upper()
-        candidates.append(
-            MarketIdentity(
-                base_asset=base,
-                quote_asset=quote,
-                pair_id=str(pair_id),
-                altname=altname,
-                display_pair=f"{base}{quote}",
-                ws_symbol=ws_symbol,
-            )
-        )
-
+    candidates = collect_candidates(requested_base, explicit_quote)
     if not candidates:
         quote_text = explicit_quote or "USD/USDT"
         raise MarketResolutionError(f"No online Kraken {quote_text} spot market found for {requested_base}")
-
-    candidates.sort(
-        key=lambda item: (
-            item.quote_asset != "USD",
-            ".D" in item.altname,
-            item.altname,
-            item.pair_id,
-        )
-    )
     return candidates[0]
 
 
