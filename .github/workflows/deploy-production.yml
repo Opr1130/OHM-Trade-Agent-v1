@@ -1,0 +1,63 @@
+name: deploy-production
+
+on:
+  workflow_run:
+    workflows: [pytest]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ohm-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate deploy secrets
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_SSH_KEY: ${{ secrets.OHM_DEPLOY_SSH_KEY }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$OHM_DEPLOY_HOST"
+          test -n "$OHM_DEPLOY_USER"
+          test -n "$OHM_DEPLOY_SSH_KEY"
+          test -n "$OHM_DEPLOY_KNOWN_HOSTS"
+
+      - name: Configure SSH
+        env:
+          OHM_DEPLOY_SSH_KEY: ${{ secrets.OHM_DEPLOY_SSH_KEY }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$OHM_DEPLOY_SSH_KEY" > ~/.ssh/ohm_deploy
+          chmod 600 ~/.ssh/ohm_deploy
+          printf '%s\n' "$OHM_DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy exact tested main commit
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          PORT="${OHM_DEPLOY_PORT:-22}"
+          ssh \
+            -i ~/.ssh/ohm_deploy \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
+            "sudo /usr/local/sbin/ohm-deploy '$TARGET_SHA'"
