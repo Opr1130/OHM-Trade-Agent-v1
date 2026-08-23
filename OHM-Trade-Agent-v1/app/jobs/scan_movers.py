@@ -14,6 +14,12 @@ from app.services.full_market_observation import (
 from app.services.full_market_transition_learning import build_full_market_transition_summary
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
+from app.services.signal_scoring import (
+    SignalQualityCandidate,
+    SignalQualityConfig,
+    main_feed_candidates,
+    volume_growth_proxy_label,
+)
 from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
 
 
@@ -89,6 +95,145 @@ def _observation_card(transition: MarketTransition) -> str:
     )
 
 
+def _compact_usd(value: float) -> str:
+    amount = float(value or 0.0)
+    for unit, size in (("B", 1_000_000_000.0), ("M", 1_000_000.0), ("K", 1_000.0)):
+        if abs(amount) >= size:
+            return f"${amount / size:.1f}{unit}"
+    return f"${amount:,.0f}"
+
+
+def _ordinal(value: float) -> str:
+    number = int(round(value))
+    if 10 <= number % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
+def _signal_quality_transition_key(candidate: SignalQualityCandidate) -> str:
+    """Identity for the alert governor: a card is edited, not re-sent, until
+    the assessment genuinely moves."""
+    return ":".join(
+        (
+            str(candidate.stage),
+            str(candidate.pattern or "NONE"),
+            str(candidate.opportunity_score // 10 * 10),
+            str(candidate.exhaustion_band),
+        )
+    )
+
+
+def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
+    """Render a Signal Quality v1 card.
+
+    Every score carries a heuristic marker and the action line states plainly
+    that no entry is authorised. ACTIONABLE_REVIEW is the top advisory stage,
+    not a trade instruction.
+    """
+    pattern = str(candidate.pattern or "UNCLASSIFIED").replace("_", " ").title()
+    stage = str(candidate.stage).replace("_", " ")
+    return (
+        f"🚀 OHM EARLY WATCH — {candidate.symbol}\n"
+        f"Stage: {stage}\n"
+        f"Pattern: {pattern}\n"
+        f"Pattern strength*: {candidate.pattern_strength_score}/100\n"
+        f"Tradeability*: {candidate.tradeability_score}/100\n"
+        f"Explosion potential*: {candidate.explosion_potential_score}/100\n"
+        f"Opportunity score*: {candidate.opportunity_score}/100\n"
+        f"Liquidity: {_compact_usd(candidate.liquidity_24h_usd_approx)} / 24h\n"
+        f"Relative strength: {_ordinal(candidate.relative_strength_percentile)} percentile\n"
+        f"Persistence: {candidate.persistence_scans} consecutive scans\n"
+        f"Volume growth proxy: {volume_growth_proxy_label(candidate.volume_acceleration_score)}\n"
+        f"Exhaustion: {candidate.exhaustion_band}\n"
+        "Action: HUMAN REVIEW ONLY — no entry is authorized\n"
+        "*Heuristic scores, not probabilities; Phase 2 calibration pending."
+    )
+
+
+def _print_signal_quality_leaderboard(candidates, *, limit: int = 10) -> None:
+    """Log the leaderboard, suppressed rows included.
+
+    Suppressed candidates stay visible here precisely because they are kept out
+    of the Telegram feed: the audit trail has to show what the gate rejected
+    and why.
+    """
+    for candidate in candidates[:limit]:
+        reasons = ",".join(candidate.reasons) or "-"
+        print(
+            f"SIGNAL_QUALITY {candidate.symbol}: Stage={candidate.stage} "
+            f"Opportunity={candidate.opportunity_score} "
+            f"Explosion={candidate.explosion_potential_score} "
+            f"Tradeability={candidate.tradeability_score} "
+            f"Pattern={candidate.pattern_strength_score} "
+            f"RelStrength={candidate.relative_strength_score} "
+            f"Persistence={candidate.persistence_scans} "
+            f"Exhaustion={candidate.exhaustion_penalty} "
+            f"Liquidity=${candidate.liquidity_24h_usd_approx:,.0f} "
+            f"Reasons={reasons}"
+        )
+    for candidate in candidates:
+        if candidate.suppressed:
+            print(
+                f"SIGNAL_QUALITY SUPPRESSED {candidate.symbol}: "
+                f"Status: SUPPRESSED Reason: {','.join(candidate.reasons) or 'UNSPECIFIED'}"
+            )
+
+
+def _broad_watch_feed(
+    full_market,
+    *,
+    settings,
+    excluded_symbols: set[str],
+) -> list[tuple[str, str, str]]:
+    """Decide what the main Broad Watch Telegram feed is allowed to send.
+
+    Returns (symbol, transition_key, message) triples.
+
+    The previous implementation sliced ``transition_alerts[:4]`` directly. That
+    truncated an unfiltered list, so a handful of thin WATCH_ONLY markets could
+    occupy every slot and starve the tier the feed exists to surface. Filtering
+    now happens before the cap.
+
+    With Signal Quality v1 enabled, only BREAKOUT_CANDIDATE and
+    ACTIONABLE_REVIEW reach the feed (plus EARLY_BUILDING behind its own flag).
+    SUPPRESSED never does - it stays in the leaderboard and the logs. While the
+    flag is off the legacy path is preserved byte for byte, because Phase 1
+    ships dark.
+    """
+    if full_market is None:
+        return []
+
+    if getattr(full_market, "signal_quality_enabled", False):
+        config = SignalQualityConfig.from_settings(settings)
+        eligible = main_feed_candidates(
+            [
+                candidate
+                for candidate in full_market.signal_quality_candidates
+                if candidate.symbol.upper() not in excluded_symbols
+            ],
+            config=config,
+        )
+        return [
+            (
+                candidate.symbol,
+                _signal_quality_transition_key(candidate),
+                _signal_quality_card(candidate),
+            )
+            for candidate in eligible
+        ]
+
+    legacy = [
+        item for item in full_market.transition_alerts
+        if item.symbol.upper() not in excluded_symbols
+    ]
+    return [
+        (item.symbol, item.transition_key, _observation_card(item))
+        for item in legacy[:4]
+    ]
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -114,6 +259,15 @@ def main() -> None:
             )
         except Exception as exc:
             print("Full-market evidence summary: fail-soft", type(exc).__name__)
+        print("Signal Quality v1 enabled:", full_market.signal_quality_enabled)
+        if full_market.signal_quality_candidates:
+            candidates = full_market.signal_quality_candidates
+            print("Signal Quality candidates scored:", len(candidates))
+            print(
+                "Signal Quality suppressed:",
+                sum(1 for item in candidates if item.suppressed),
+            )
+            _print_signal_quality_leaderboard(candidates)
     print("Full-universe coarse movers:", len(coarse))
     print("Deep-qualified early movers:", len(signals))
     print("Telegram-eligible early movers:", sum(1 for signal in signals if signal.alert_eligible))
@@ -201,25 +355,25 @@ def main() -> None:
                 )
                 created += 1
 
-        broad_candidates = [] if full_market is None else [
-            item for item in full_market.transition_alerts
-            if item.symbol.upper() not in deep_alert_symbols
-        ]
-        for transition in broad_candidates[:4]:
-            identity = f"FULL_MARKET_WATCH:{transition.symbol}"
+        broad_feed = _broad_watch_feed(
+            full_market,
+            settings=settings,
+            excluded_symbols=deep_alert_symbols,
+        )
+        for symbol, transition_key, message in broad_feed:
+            identity = f"FULL_MARKET_WATCH:{symbol}"
             decision = evaluate_opportunity_alert(
                 identity=identity,
-                transition_key=transition.transition_key,
+                transition_key=transition_key,
                 repeat_cooldown_seconds=repeat_cooldown,
                 max_new_cards_24h=4,
                 state_file=FULL_MARKET_ALERT_STATE_FILE,
             )
             if decision.action == "SUPPRESS":
                 broad_suppressed += 1
-                print(f"Broad-watch governor suppressed {transition.symbol}: {decision.reason}")
+                print(f"Broad-watch governor suppressed {symbol}: {decision.reason}")
                 continue
 
-            message = _observation_card(transition)
             if decision.action == "EDIT" and decision.message_id is not None:
                 if edit_telegram_message(
                     settings.telegram_bot_token,
@@ -229,14 +383,14 @@ def main() -> None:
                 ):
                     record_opportunity_alert(
                         identity=identity,
-                        transition_key=transition.transition_key,
+                        transition_key=transition_key,
                         message_id=decision.message_id,
                         created_new=False,
                         state_file=FULL_MARKET_ALERT_STATE_FILE,
                     )
                     broad_edited += 1
                 else:
-                    print(f"Telegram broad-watch edit failed for {transition.symbol}; card retained.")
+                    print(f"Telegram broad-watch edit failed for {symbol}; card retained.")
                 continue
 
             message_id = send_telegram_message_with_id(
@@ -247,7 +401,7 @@ def main() -> None:
             if message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
-                    transition_key=transition.transition_key,
+                    transition_key=transition_key,
                     message_id=message_id,
                     created_new=True,
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
