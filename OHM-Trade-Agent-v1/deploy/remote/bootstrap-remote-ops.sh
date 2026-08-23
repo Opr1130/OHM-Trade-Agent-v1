@@ -14,7 +14,6 @@ SSH_GATEWAY_SRC="$APP_ROOT/deploy/remote/ohm-deploy-ssh"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 SUDOERS_FILE="/etc/sudoers.d/ohmdeploy"
-SERVER_HOST_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run this bootstrap with sudo" >&2
@@ -35,11 +34,6 @@ fi
 
 if [[ ! -f "$DEPLOY_SCRIPT_SRC" || ! -f "$SSH_GATEWAY_SRC" ]]; then
   echo "remote deploy scripts are missing from $APP_ROOT/deploy/remote" >&2
-  exit 69
-fi
-
-if [[ ! -f "$SERVER_HOST_KEY" ]]; then
-  echo "server ED25519 SSH host key not found at $SERVER_HOST_KEY" >&2
   exit 69
 fi
 
@@ -83,9 +77,17 @@ if [[ -z "$HOST" ]]; then
   HOST="<YOUR_DROPLET_PUBLIC_IP_OR_DNS>"
 fi
 PORT="${OHM_DEPLOY_PORT:-22}"
-HOST_ALGO="$(awk '{print $1}' "$SERVER_HOST_KEY")"
-HOST_KEY="$(awk '{print $2}' "$SERVER_HOST_KEY")"
-KNOWN_HOSTS="$HOST $HOST_ALGO $HOST_KEY"
+HOST_KEY_LINE=""
+if [[ -r /etc/ssh/ssh_host_ed25519_key.pub ]]; then
+  read -r KEY_TYPE KEY_DATA _ < /etc/ssh/ssh_host_ed25519_key.pub
+  if [[ -n "${KEY_TYPE:-}" && -n "${KEY_DATA:-}" ]]; then
+    if [[ "$PORT" == "22" ]]; then
+      HOST_KEY_LINE="$HOST $KEY_TYPE $KEY_DATA"
+    else
+      HOST_KEY_LINE="[$HOST]:$PORT $KEY_TYPE $KEY_DATA"
+    fi
+  fi
+fi
 
 cat <<EOF
 
@@ -96,17 +98,19 @@ GitHub production secrets to configure:
 OHM_DEPLOY_HOST=$HOST
 OHM_DEPLOY_USER=$DEPLOY_USER
 OHM_DEPLOY_PORT=$PORT
-OHM_DEPLOY_KNOWN_HOSTS=$KNOWN_HOSTS
 
-OHM_DEPLOY_SSH_KEY (copy the complete private-key contents below, without the OHM marker lines):
+OHM_DEPLOY_SSH_KEY (copy the complete block below):
 -----BEGIN OHM_DEPLOY_SSH_KEY-----
 $(cat "$PRIVATE_KEY")
 -----END OHM_DEPLOY_SSH_KEY-----
 
+OHM_DEPLOY_KNOWN_HOSTS (copy the line below):
+${HOST_KEY_LINE:-<host ed25519 key unavailable; obtain it from the droplet console or a trusted machine>}
+
 IMPORTANT:
+- Verify OHM_DEPLOY_HOST is the intended production droplet before saving GitHub secrets.
 - The deploy SSH key is forced-command only: it cannot open an interactive shell.
 - Deployment accepts only an exact 40-character commit SHA that equals current origin/main.
-- The known-hosts value above comes directly from this server's ED25519 host key.
 - Kraken credentials and trading permissions are not changed by this bootstrap.
 
 Private deploy key is retained root-only at:
