@@ -89,6 +89,8 @@ if [[ -r /etc/ssh/ssh_host_ed25519_key.pub ]]; then
   fi
 fi
 
+KEY_FINGERPRINT="$(ssh-keygen -lf "$PUBLIC_KEY" | awk '{print $2}')"
+
 cat <<EOF
 
 OHM remote operations bootstrap: INSTALLED
@@ -98,23 +100,19 @@ GitHub production secrets to configure:
 OHM_DEPLOY_HOST=$HOST
 OHM_DEPLOY_USER=$DEPLOY_USER
 OHM_DEPLOY_PORT=$PORT
+OHM_DEPLOY_KNOWN_HOSTS=${HOST_KEY_LINE:-<host ed25519 key unavailable; obtain it from the droplet console or a trusted machine>}
 
-OHM_DEPLOY_SSH_KEY (copy the complete block below):
------BEGIN OHM_DEPLOY_SSH_KEY-----
-$(cat "$PRIVATE_KEY")
------END OHM_DEPLOY_SSH_KEY-----
-
-OHM_DEPLOY_KNOWN_HOSTS (copy the line below):
-${HOST_KEY_LINE:-<host ed25519 key unavailable; obtain it from the droplet console or a trusted machine>}
+OHM_DEPLOY_SSH_KEY is intentionally NOT printed.
+Copy it directly from this root-only file into the GitHub secret field:
+$PRIVATE_KEY
+Expected public-key fingerprint: $KEY_FINGERPRINT
 
 IMPORTANT:
+- Never paste the private deploy key into chat, logs, tickets, or shell history.
 - Verify OHM_DEPLOY_HOST is the intended production droplet before saving GitHub secrets.
 - The deploy SSH key is forced-command only: it cannot open an interactive shell.
 - Deployment accepts only an exact 40-character commit SHA that equals current origin/main.
 - Kraken credentials and trading permissions are not changed by this bootstrap.
-
-Private deploy key is retained root-only at:
-$PRIVATE_KEY
 
 After GitHub secrets are configured, the deploy workflow can operate end-to-end.
 EOF
