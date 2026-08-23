@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.services import telegram_callback_listener as listener
-from app.services import telegram_command_center as commands
 
 
 def _settings():
@@ -27,21 +26,29 @@ def _update(text: str):
 
 
 def test_slash_asset_shorthand_normalizes_to_scan():
-    assert commands.parse_command("/CAP") == ("scan", ("CAP",))
+    assert listener._normalize_mobile_command_text("/CAP") == "/scan CAP"
+    assert listener._normalize_mobile_command_text("/cap") == "/scan CAP"
 
 
 def test_plain_scan_phrase_normalizes_to_scan():
-    assert commands.parse_command("scan CAP") == ("scan", ("CAP",))
-    assert commands.parse_command("Scan CAP") == ("scan", ("CAP",))
+    assert listener._normalize_mobile_command_text("scan CAP") == "/scan CAP"
+    assert listener._normalize_mobile_command_text("Scan CAP") == "/scan CAP"
 
 
-def test_reserved_unknown_command_is_not_reinterpreted_as_asset():
-    assert commands.parse_command("/help") == ("help", ())
-    assert commands.parse_command("/orders") == ("orders", ())
+def test_reserved_commands_are_preserved():
+    assert listener._normalize_mobile_command_text("/help") == "/help"
+    assert listener._normalize_mobile_command_text("/orders") == "/orders"
+    assert listener._normalize_mobile_command_text("/scan CAP") == "/scan CAP"
 
 
 def test_plain_chat_message_is_still_ignored():
-    assert commands.parse_command("hello CAP") is None
+    assert listener._normalize_mobile_command_text("hello CAP") is None
+    assert listener._normalize_mobile_command_text("CAP looks good") is None
+
+
+def test_malformed_or_multiword_slash_shorthand_is_not_rewritten():
+    assert listener._normalize_mobile_command_text("/CAP extra") == "/CAP extra"
+    assert listener._normalize_mobile_command_text("/../../etc/passwd") == "/../../etc/passwd"
 
 
 def test_listener_accepts_plain_scan_phrase(monkeypatch):
@@ -53,9 +60,22 @@ def test_listener_accepts_plain_scan_phrase(monkeypatch):
     listener.process_message(_update("Scan CAP"))
 
     assert len(queued) == 1
+    assert queued[0]["message"]["text"] == "/scan CAP"
 
 
-def test_listener_ignores_unrelated_plain_message(monkeypatch):
+def test_listener_accepts_slash_asset_shorthand(monkeypatch):
+    queued = []
+    monkeypatch.setattr(listener, "get_settings", lambda: _settings())
+    monkeypatch.setattr(listener, "_command_rate_allowed", lambda settings: True)
+    monkeypatch.setattr(listener, "_queue_command", lambda update, settings: queued.append(update) or True)
+
+    listener.process_message(_update("/CAP"))
+
+    assert len(queued) == 1
+    assert queued[0]["message"]["text"] == "/scan CAP"
+
+
+def test_listener_ignores_unrelated_plain_message_before_rate_limit(monkeypatch):
     monkeypatch.setattr(listener, "get_settings", lambda: _settings())
     monkeypatch.setattr(listener, "_command_rate_allowed", lambda settings: (_ for _ in ()).throw(AssertionError("rate called")))
 
