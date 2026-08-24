@@ -32,10 +32,10 @@ DEFAULT_HISTORY_SCANS = 8
 DEFAULT_MAX_CARRY_SECONDS = 3600
 DEFAULT_OUTCOME_HORIZON_HOURS = 24
 OUTCOME_THRESHOLDS = (20.0, 50.0, 100.0, 200.0, 300.0)
-STAGE_ORDER = {
-    STAGE_ACTIONABLE_REVIEW: 3,
-    STAGE_BREAKOUT_CANDIDATE: 2,
-    STAGE_EARLY_BUILDING: 1,
+ELIGIBLE_STAGES = {
+    STAGE_EARLY_BUILDING,
+    STAGE_BREAKOUT_CANDIDATE,
+    STAGE_ACTIONABLE_REVIEW,
 }
 
 
@@ -101,6 +101,28 @@ def _floor_time(moment: datetime, interval_seconds: int) -> datetime:
     return datetime.fromtimestamp(epoch - epoch % interval_seconds, tz=timezone.utc)
 
 
+def _snapshot_at(snapshot: ObservationSnapshot, observed_at: datetime) -> ObservationSnapshot:
+    """Impute a fixed-grid scan from the latest event known at that time.
+
+    The values are last-observation-carried-forward, but the timestamp is the
+    reconstructed runtime scan. This is deliberate: the live system scans every
+    ten minutes even when JSONL persistence is quiet. Replaying only persisted
+    event timestamps would make active periods appear to have more scans and
+    would corrupt persistence. A carried flat value therefore becomes a real
+    reconstructed scan and naturally breaks momentum persistence.
+    """
+    return ObservationSnapshot(
+        observed_at=observed_at,
+        last_price=snapshot.last_price,
+        volume_24h=snapshot.volume_24h,
+        notional_24h_usd_approx=snapshot.notional_24h_usd_approx,
+        high_24h=snapshot.high_24h,
+        low_24h=snapshot.low_24h,
+        lift_from_24h_low_pct=snapshot.lift_from_24h_low_pct,
+        distance_from_24h_high_pct=snapshot.distance_from_24h_high_pct,
+    )
+
+
 def read_observations(path: Path | None = None) -> list[ReplayObservation]:
     target = path or DEFAULT_OBSERVATION_FILE
     if not target.exists():
@@ -130,12 +152,12 @@ def reconstruct_scan_frames(
     interval_seconds: int = DEFAULT_SCAN_INTERVAL_SECONDS,
     max_carry_seconds: int = DEFAULT_MAX_CARRY_SECONDS,
 ) -> list[tuple[datetime, dict[str, ObservationSnapshot]]]:
-    """Reconstruct a regular grid without replaying each event as a scan.
+    """Convert event-sampled observations to a regular, past-only scan grid.
 
-    The persisted JSONL stream is event-sampled: active periods have many rows,
-    quiet periods mostly heartbeats. Treating every row as a scan would
-    overweight volatility. Fixed buckets neutralise that bias. Only events at
-    or before the frame boundary are visible; future rows are never consulted.
+    Active periods persist more JSONL events than quiet periods. Fixed buckets
+    prevent those events from being mistaken for extra runtime scans. At each
+    boundary the latest observation at or before the boundary may be carried
+    forward for a bounded time. No future row can enter an earlier frame.
     """
     rows = sorted(observations, key=lambda row: (row.observed_at, row.symbol))
     if not rows:
@@ -149,14 +171,14 @@ def reconstruct_scan_frames(
     cursor = start
     while cursor <= end:
         frame_end = cursor + timedelta(seconds=interval_seconds)
-        while index < len(rows) and rows[index].observed_at < frame_end:
+        while index < len(rows) and rows[index].observed_at <= frame_end:
             latest[rows[index].symbol] = rows[index]
             index += 1
         active: dict[str, ObservationSnapshot] = {}
         for symbol, row in latest.items():
             age = (frame_end - row.observed_at).total_seconds()
             if 0 <= age <= max_carry_seconds:
-                active[symbol] = row.snapshot
+                active[symbol] = _snapshot_at(row.snapshot, frame_end)
         frames.append((frame_end, active))
         cursor = frame_end
     return frames
@@ -169,6 +191,7 @@ def replay_signal_quality(
     config: SignalQualityConfig | None = None,
     interval_seconds: int = DEFAULT_SCAN_INTERVAL_SECONDS,
 ) -> list[ReplayDetection]:
+    """Replay the exact Phase 1 feature/scoring functions on reconstructed scans."""
     config = config or SignalQualityConfig(enabled=True, early_alerts_enabled=True)
     feature_config = FeatureDerivationConfig(
         nominal_interval_seconds=float(interval_seconds),
@@ -177,23 +200,17 @@ def replay_signal_quality(
         run_up_window_scans=history_scans,
     )
     history: dict[str, deque[ObservationSnapshot]] = defaultdict(lambda: deque(maxlen=history_scans))
-    last_appended: dict[str, datetime] = {}
     detections: list[ReplayDetection] = []
     for scan_at, frame in frames:
         for symbol, snapshot in frame.items():
-            # Carry-forward is for universe reconstruction only. Re-appending a
-            # stale persisted row would manufacture runtime persistence.
-            if last_appended.get(symbol) == snapshot.observed_at:
-                continue
             history[symbol].append(snapshot)
-            last_appended[symbol] = snapshot.observed_at
         universe = {symbol: list(rows) for symbol, rows in history.items() if symbol in frame}
         features = derive_features_for_universe(universe, config=feature_config)
         if not features:
             continue
         percentiles = derive_universe_percentiles(features)
         for candidate in evaluate_universe(features, percentiles, config=config):
-            if candidate.stage not in STAGE_ORDER:
+            if candidate.stage not in ELIGIBLE_STAGES:
                 continue
             snapshot = frame.get(candidate.symbol)
             if snapshot is None or snapshot.last_price <= 0:
@@ -232,11 +249,11 @@ def label_outcomes(
     *,
     horizon_hours: int = DEFAULT_OUTCOME_HORIZON_HOURS,
 ) -> list[OutcomeLabel]:
-    """Label future moves using only later persisted prices.
+    """Create prospective windows from each persisted decision-time row.
 
-    This is intentionally conservative. Event sampling can miss an intraperiod
-    high, so a major mover may be under-labelled; the harness reports that
-    limitation and must not auto-tune production from these labels.
+    Labels may inspect later persisted last prices because they are outcomes,
+    never features. Event sampling can miss an intraperiod peak, so these are a
+    conservative proxy and are not sufficient to auto-tune production.
     """
     by_symbol: dict[str, list[ReplayObservation]] = defaultdict(list)
     for row in observations:
@@ -332,15 +349,15 @@ def build_phase2_report(
             "median_total_move_completed_at_first_detection_pct": round(median(move_completed_pct), 2) if move_completed_pct else None,
         }
 
-    matched_flags: list[bool] = []
-    for detection in detections:
-        matched_flags.append(any(
+    matched_flags = [
+        any(
             label.symbol == detection.symbol
             and label.start_at <= detection.observed_at <= label.start_at + horizon
             and label.max_move_pct >= 20.0
             for label in labels
-        ))
-
+        )
+        for detection in detections
+    ]
     score_buckets: dict[str, dict[str, Any]] = {}
     for low in range(0, 101, 10):
         rows = [
@@ -362,10 +379,11 @@ def build_phase2_report(
         "version": VERSION,
         "status": "PROVISIONAL_EVENT_SAMPLED_REPLAY",
         "methodology": {
-            "scan_reconstruction": "fixed-time grid with past-only bounded carry-forward",
+            "scan_reconstruction": "fixed-time grid; latest past event carried forward and time-stamped as the reconstructed scan",
+            "event_sampling_bias_corrected": True,
             "no_lookahead": True,
             "outcome_source": "future persisted last_price observations only",
-            "outcome_limitation": "event-sampled labels can miss intraperiod peaks; OHLC validation required before adopting calibration",
+            "outcome_limitation": "event-sampled labels can miss intraperiod peaks; OHLC validation required before calibration is adopted",
             "automatic_tuning_applied": False,
             "production_thresholds_changed": False,
             "advisory_only": True,
