@@ -24,10 +24,10 @@ Deterministic, no-lookahead structure primitives over completed observations onl
 - confirmed swing highs / lows
 - bullish structure break (close above confirmed swing high)
 - bearish structure break (close below confirmed swing low)
-- structure change / CHoCH-style transition using objective HH/HL vs LH/LL sequencing
+- conservative CHoCH-style transition only when a complete HH/HL relation flips to a complete LH/LL relation, or vice versa; mixed compression such as LH + HL is MIXED but not CHoCH
 - measurable imbalance / FVG-style low-overlap zones
 - liquidity sweep of prior swing/equal high/low followed by reclaim
-- breakout retest / level hold
+- breakout retest / level hold, with later close-through invalidating an earlier held retest for that breakout event
 - distance from most recent structural breakout
 - current structural bias: BULLISH / BEARISH / MIXED / INSUFFICIENT_DATA
 
@@ -60,6 +60,20 @@ Output:
 - advisory_only: True
 
 The assessment must be deterministic and explainable. It must not authorize a trade.
+
+### Provisional chase-risk priors
+
+All chase-risk weights, bands, and the current `late_entry` cutoff are **uncalibrated Phase 3B priors**, not production policy and not estimated probabilities.
+
+Independent review identified intentional overlaps that must be measured before any later integration:
+
+- extension from breakout and proximity to recent/24h high can both represent run-up magnitude;
+- extension from breakout and Phase 3A move-completed fraction can be correlated by construction;
+- lift from 24h low and move-completed fraction may also overlap;
+- persistence, exhaustion, and the `NOT_SEEN` retest adjustment can overlap with extension;
+- the `HELD` retest deduction and score=60 `late_entry` boundary are provisional heuristics.
+
+Phase 3B does **not** resolve these by auto-tuning. The purpose of the initial implementation is to create deterministic, auditable features that can be evaluated on the Phase 3A population. Volatility-normalized extension (ATR/recent-range normalization) is a candidate future experiment, not an adopted requirement.
 
 ## Safety boundary
 
@@ -121,11 +135,13 @@ Tests must cover at minimum:
 
 - strict no-lookahead: future observations cannot alter structure at decision time
 - swing confirmation only after required completed bars
+- flat/plateau highs and lows do not become confirmed pivots accidentally
 - exact BOS boundary behavior
 - HH/HL and LH/LL sequence transitions
+- mixed compression is not mislabeled as CHoCH
 - FVG/imbalance detection and non-detection cases
 - sweep-and-reclaim detection
-- breakout retest success / failure
+- breakout retest success / failure, including later invalidation of an earlier held retest
 - chase score monotonicity for increasing extension with otherwise identical inputs
 - near-high risk increases only when supported by actual point-in-time data
 - missing-data degradation to INSUFFICIENT_DATA / neutral risk rather than invented certainty
@@ -133,6 +149,21 @@ Tests must cover at minimum:
 - spot-only safety invariants
 - no imports from execution / PendingSetup / Telegram callback modules
 - Phase 1 / Phase 2 / Phase 3A regression remains clean
+
+## Population validation plan
+
+Before Phase 3C/3D integration, evaluate Phase 3B against Phase 3A telemetry/replay using:
+
+1. chronological train/validation/test segmentation rather than random shuffling;
+2. episode deduplication so repeated scans from one move are not treated as independent evidence;
+3. 15m / 30m / 60m / 4h forward returns plus 24h MFE, MAE and time-to-extreme where observable;
+4. chase-score buckets and component ablations;
+5. structure-bias and retest-state buckets;
+6. false-positive analysis for high chase scores followed by continued favorable returns;
+7. regime and liquidity stratification;
+8. bootstrap/confidence intervals or comparable uncertainty estimates when sample sizes support them.
+
+The key test is empirical monotonicity: higher chase-risk buckets should demonstrate measurably worse entry timing or risk-adjusted forward outcomes before the score is allowed to influence ranking or alerts. If that relationship does not hold out-of-sample, weights/components must be revised rather than rationalized after the fact.
 
 ## Evidence rule
 
