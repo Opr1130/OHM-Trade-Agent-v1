@@ -1,9 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
 from app.services.technical_structure import (
+    BIAS_BEARISH,
     BIAS_INSUFFICIENT,
+    BIAS_MIXED,
+    RETEST_FAILED,
     RETEST_HELD,
     StructureBar,
+    SwingPoint,
+    _structure_sequence_bias,
     analyze_technical_structure,
     confirmed_swings,
     latest_fvg_zone,
@@ -15,6 +20,10 @@ BASE = datetime(2026, 8, 24, tzinfo=timezone.utc)
 
 def b(i, o, h, l, c):
     return StructureBar(BASE + timedelta(minutes=10 * i), o, h, l, c)
+
+
+def sp(i, price, kind):
+    return SwingPoint(i, BASE + timedelta(minutes=10 * i), price, kind)
 
 
 def test_future_bar_cannot_change_decision_time_structure():
@@ -37,6 +46,17 @@ def test_swing_requires_right_side_confirmation():
     assert [s.price for s in highs] == [110]
     highs_unconfirmed, _ = confirmed_swings(bars[:2], left=1, right=1)
     assert highs_unconfirmed == ()
+
+
+def test_flat_plateau_is_not_confirmed_swing():
+    bars = [
+        b(0, 100, 102, 99, 101),
+        b(1, 101, 105, 100, 104),
+        b(2, 104, 105, 101, 103),
+        b(3, 103, 102, 99, 100),
+    ]
+    highs, _ = confirmed_swings(bars, left=1, right=1)
+    assert highs == ()
 
 
 def test_fvg_is_mechanical_three_bar_non_overlap():
@@ -75,6 +95,33 @@ def test_breakout_retest_can_be_reported_as_held():
     ctx = analyze_technical_structure("TESTUSD", bars, decision_at=bars[-1].observed_at, swing_left=1, swing_right=1)
     assert ctx.bullish_break_level == 110
     assert ctx.retest_state == RETEST_HELD
+
+
+def test_held_retest_becomes_failed_after_later_close_through_level():
+    bars = [
+        b(0, 100, 101, 99, 100), b(1, 100, 110, 99, 108), b(2, 108, 109, 103, 104),
+        b(3, 104, 106, 101, 102), b(4, 102, 111, 102, 111), b(5, 111, 112, 109, 110.5),
+        b(6, 110.5, 114, 110, 113), b(7, 113, 113.5, 107, 108),
+    ]
+    ctx = analyze_technical_structure("TESTUSD", bars, decision_at=bars[-1].observed_at, swing_left=1, swing_right=1)
+    assert ctx.bullish_break_level == 110
+    assert ctx.retest_state == RETEST_FAILED
+
+
+def test_mixed_compression_is_not_labeled_change_of_character():
+    highs = (sp(1, 110, "HIGH"), sp(3, 108, "HIGH"))
+    lows = (sp(2, 100, "LOW"), sp(4, 102, "LOW"))
+    bias, choch = _structure_sequence_bias(highs, lows)
+    assert bias == BIAS_MIXED
+    assert choch is False
+
+
+def test_complete_bullish_to_bearish_sequence_is_change_of_character():
+    highs = (sp(1, 105, "HIGH"), sp(3, 110, "HIGH"), sp(5, 108, "HIGH"))
+    lows = (sp(2, 95, "LOW"), sp(4, 100, "LOW"), sp(6, 98, "LOW"))
+    bias, choch = _structure_sequence_bias(highs, lows)
+    assert bias == BIAS_BEARISH
+    assert choch is True
 
 
 def test_repeatability():
