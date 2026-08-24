@@ -64,12 +64,35 @@ Last-observation-carried-forward is justified here by *why* a row is missing.
 | Notional ratio | ≥ 1.50× |
 | Heartbeat | every 3600s regardless |
 
-So the absence of a row between two scans is itself evidence the market was
-quiet — price moved *less than 1%* — rather than evidence of missing data. The
-imputation error is therefore bounded by Phase 1's own thresholds, with the
-hourly heartbeat as the one exception. `CARRY_*_BOUND` constants mirror those
-thresholds and `test_carry_error_bounds_match_phase_1` fails if the runtime
-changes and the replay does not.
+Crucially, `_should_persist` compares against the last **persisted** row —
+which is exactly the value the replay carries — so silence implies the carried
+value was within those thresholds of the truth. `CARRY_*_BOUND` constants
+mirror the thresholds and `test_carry_error_bounds_match_phase_1` fails if the
+runtime changes and the replay does not.
+
+#### The bound is conditional, not absolute
+
+`_should_persist` returns `NO_MEANINGFUL_CHANGE` only when **all** of these held
+at that scan:
+
+1. the production scan actually ran;
+2. the symbol was actually observed in it — `collect_full_market_observations`
+   fail-softs on a ticker batch error, and an unobserved symbol has no persist
+   decision at all;
+3. the last persisted row was under 3600s old, since the heartbeat writes
+   regardless of movement;
+4. the prior row parsed as finite (`INVALID_PRIOR_STATE` forces a write).
+
+Where any precondition fails, **silence is not evidence of a quiet market** and
+the bound simply does not apply. The replay cannot tell "quiet" from "not
+observed" from the JSONL alone — the same ambiguity Phase 1's own retention
+design has to live with — so rather than assume the bound holds everywhere, the
+report counts the cells where it provably cannot:
+`bound_inapplicable_cells_beyond_heartbeat` are carries at or past the heartbeat
+interval, for which a heartbeat row *should* have existed. Past 5% of carries
+the report raises `CARRY_BOUND_INAPPLICABLE`. The block also publishes
+`bound_is_conditional: true` and the precondition list itself, so the caveat
+travels with the number.
 
 The theoretical bound is the defensible statement. The report also publishes a
 companion diagnostic, `reconstruction_drift_proxy`, but it is important to be
@@ -258,17 +281,33 @@ The persisted stream can miss intraperiod highs, so episode peaks drawn from
   deterministic**, so a report is reproducible instead of depending on whatever
   the exchange returns that minute. Build a cache once with
   `--write-ohlc-cache`, then validate repeatedly with `--ohlc-cache`. It
-  normalises symbol case, deduplicates by `(symbol, start_at)`, and counts
-  `rejected_rows` / `duplicate_rows` rather than dropping them silently.
+  normalises symbol case, deduplicates by `(symbol, start_at)`, skips the format
+  header, and counts `rejected_rows` / `duplicate_rows` rather than dropping
+  them silently.
 - Tests use a deterministic in-memory fixture provider. **No unit test touches
   the network**, so CI stays deterministic.
 
 `write_ohlc_cache` is the only function in the module that writes a file, and
-two guards keep that safe. It **refuses to truncate an existing file that is
-not already an OHLC cache**, so a mistyped path aimed at a production registry
-raises `OhlcCacheTargetError` instead of destroying it; and it deduplicates
-candles by `(symbol, start_at)`, since overlapping episodes on one symbol would
-otherwise write the same candle repeatedly.
+it deduplicates candles by `(symbol, start_at)`, since overlapping episodes on
+one symbol would otherwise write the same candle repeatedly.
+
+### Cache file identity guard
+
+The writer **refuses to truncate an existing file that is not already an OHLC
+cache**, raising `OhlcCacheTargetError` — a mistyped path aimed at a production
+registry fails loudly instead of destroying it. The check fails closed, and a
+file passes only by:
+
+1. carrying the `ohm-phase2-ohlc-cache-v1` header the writer emits on line one;
+2. being empty; or
+3. having **every** one of its first 200 non-blank lines candle-shaped, which
+   lets a hand-built cache be replaced without demanding a header.
+
+Requiring *every* sampled line, not just the first, is the load-bearing part: a
+production JSONL registry could plausibly open with a row that happens to carry
+`symbol` / `start_at` / `high`, and truncating it would be unrecoverable.
+Non-regular files (directories, devices, symlinks to them) and files that are
+not valid UTF-8 JSON are refused outright.
 
 Validation is **outcome-side only**. It never feeds feature generation, so it
 cannot leak future information into a decision.

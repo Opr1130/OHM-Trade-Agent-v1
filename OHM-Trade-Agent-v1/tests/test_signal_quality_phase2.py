@@ -1307,7 +1307,10 @@ def test_cache_writer_deduplicates_overlapping_candles(tmp_path):
     written = write_ohlc_cache(episodes, AlwaysSame(), path)
 
     assert written == 1
-    assert len(path.read_text(encoding="utf-8").strip().splitlines()) == 1
+    # One header line plus exactly one candle, not one candle per episode.
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    candles = [line for line in lines if "_ohlc_cache_format" not in line]
+    assert len(candles) == 1
 
 
 def test_cache_reader_counts_rejected_and_duplicate_rows(tmp_path):
@@ -1336,3 +1339,219 @@ def test_cache_reader_normalises_symbol_case(tmp_path):
 
     assert len(provider.fetch("TESTUSD", BASE, BASE + timedelta(hours=1))) == 1
     assert len(provider.fetch("testusd", BASE, BASE + timedelta(hours=1))) == 1
+
+
+# ---------------------------------------------------------------------------
+# The persist bound is conditional, and the report says so
+# ---------------------------------------------------------------------------
+
+
+def test_carry_bound_is_published_as_conditional():
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+
+    assert block["bound_is_conditional"] is True
+    preconditions = " ".join(block["bound_preconditions"]).lower()
+    assert "scan actually ran" in preconditions
+    assert "observed" in preconditions
+    assert "heartbeat" in preconditions
+    assert "not observed" in block["bound_conditionality_note"]
+
+
+def test_cells_within_the_heartbeat_keep_the_bound_applicable():
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+
+    # Every carry here is well inside the hourly heartbeat.
+    assert block["bound_inapplicable_cells_beyond_heartbeat"] == 0
+    assert block["bound_inapplicable_pct"] == 0.0
+
+
+def test_carries_beyond_the_heartbeat_are_counted_as_bound_inapplicable():
+    """A heartbeat row should have existed, so silence is not evidence of quiet."""
+    from app.services.signal_quality_phase2 import (
+        CARRY_HEARTBEAT_SECONDS,
+        measure_persistence_gap_drift,
+    )
+
+    # Carry window stretched past the heartbeat so such cells can exist at all.
+    observations = [_obs(0, 100.0), _obs(200, 100.5)]
+    frames = reconstruct_scan_frames(
+        observations, interval_seconds=600, max_carry_seconds=CARRY_HEARTBEAT_SECONDS * 3
+    )
+    block = measure_persistence_gap_drift(observations, frames)
+
+    assert block["bound_inapplicable_cells_beyond_heartbeat"] > 0
+    assert block["bound_inapplicable_pct"] > 0
+
+
+def test_bound_inapplicable_share_raises_a_warning():
+    from app.services.signal_quality_phase2 import (
+        CARRY_HEARTBEAT_SECONDS,
+        measure_persistence_gap_drift,
+    )
+
+    config = Phase2Config(max_carry_seconds=CARRY_HEARTBEAT_SECONDS * 3)
+    observations = [_obs(0, 100.0), _obs(200, 100.5)]
+    frames = reconstruct_scan_frames(
+        observations,
+        interval_seconds=config.scan_interval_seconds,
+        max_carry_seconds=config.max_carry_seconds,
+    )
+    report = build_phase2_report(
+        IngestionResult(observations, len(observations), 0),
+        frames, [], [], [], [],
+        config=config,
+        carry_fidelity=measure_persistence_gap_drift(observations, frames),
+    )
+    assert any("CARRY_BOUND_INAPPLICABLE" in w for w in report["warnings"])
+
+
+def test_report_carries_the_conditionality_through():
+    observations = [_obs(0, 100), _obs(40, 100.4), _obs(80, 140)]
+    report = _report_for(observations, [])
+    block = report["reconstruction_drift_proxy"]
+
+    assert block["bound_is_conditional"] is True
+    assert "bound_preconditions" in block
+    assert "bound_inapplicable_cells_beyond_heartbeat" in block
+
+
+# ---------------------------------------------------------------------------
+# Cache identity guard
+# ---------------------------------------------------------------------------
+
+
+def test_written_cache_carries_a_format_header(tmp_path):
+    from app.services.signal_quality_phase2 import OHLC_CACHE_FORMAT, write_ohlc_cache
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+    path = tmp_path / "ohlc.jsonl"
+    write_ohlc_cache(episodes, provider, path)
+
+    first = path.read_text(encoding="utf-8").splitlines()[0]
+    assert OHLC_CACHE_FORMAT in first
+
+
+def test_header_is_not_read_back_as_a_candle(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider, write_ohlc_cache
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+    path = tmp_path / "ohlc.jsonl"
+    write_ohlc_cache(episodes, provider, path)
+
+    reloaded = CachedOhlcProvider(path)
+    assert len(reloaded.fetch("TESTUSD", BASE, BASE + timedelta(hours=1))) == 1
+    assert reloaded.rejected_rows == 0
+    assert reloaded.duplicate_rows == 0
+
+
+def test_cache_round_trips_through_its_own_header(tmp_path):
+    """A cache we wrote must be replaceable by a later run."""
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+    path = tmp_path / "ohlc.jsonl"
+
+    write_ohlc_cache(episodes, provider, path)
+    write_ohlc_cache(episodes, provider, path)  # must not raise
+
+    assert path.read_text(encoding="utf-8").count("_ohlc_cache_format") == 1
+
+
+def test_guard_rejects_a_registry_whose_first_row_looks_candle_shaped(tmp_path):
+    """The decisive strengthening: every sampled line must qualify, not just one.
+
+    A production JSONL could plausibly open with a row carrying these keys.
+    Checking only the first line would truncate it unrecoverably.
+    """
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    registry = tmp_path / "registry.jsonl"
+    original = "\n".join([
+        '{"symbol":"BTCUSD","start_at":"2026-08-01T00:00:00+00:00","high":1}',
+        '{"record_type":"TRADE_OUTCOME","symbol":"BTCUSD","pnl":123.45}',
+    ])
+    registry.write_text(original, encoding="utf-8")
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), registry)
+    assert registry.read_text(encoding="utf-8") == original
+
+
+def test_guard_rejects_a_directory(tmp_path):
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    target = tmp_path / "somedir"
+    target.mkdir()
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), target)
+    assert target.is_dir()
+
+
+def test_guard_rejects_a_binary_file(tmp_path):
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    target = tmp_path / "blob.bin"
+    target.write_bytes(b"\x00\x01\x02\xff\xfe")
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), target)
+    assert target.read_bytes() == b"\x00\x01\x02\xff\xfe"
+
+
+def test_guard_allows_an_empty_file(tmp_path):
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    target = tmp_path / "empty.jsonl"
+    target.write_text("", encoding="utf-8")
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+
+    assert write_ohlc_cache(episodes, provider, target) == 1
+
+
+def test_guard_still_allows_a_headerless_hand_built_cache(tmp_path):
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    target = tmp_path / "handmade.jsonl"
+    target.write_text("\n".join([
+        '{"symbol":"AUSD","start_at":"2026-08-01T00:00:00+00:00","high":1,"low":1,"close":1}',
+        '{"symbol":"BUSD","start_at":"2026-08-01T00:10:00+00:00","high":2,"low":1,"close":1}',
+    ]), encoding="utf-8")
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+
+    assert write_ohlc_cache(episodes, provider, target) == 1

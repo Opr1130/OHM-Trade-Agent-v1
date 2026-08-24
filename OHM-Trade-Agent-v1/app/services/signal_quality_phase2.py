@@ -134,10 +134,27 @@ ELIGIBLE_STAGES = frozenset({
 #
 # These bound the imputation error, and that is the whole reason
 # last-observation-carried-forward is defensible here rather than merely
-# convenient: _should_persist writes a row *because* something moved. If no row
-# was written between two scans, price moved less than
-# CARRY_PRICE_DRIFT_BOUND_PCT - the absence of a row is itself evidence of
-# quiet. The one exception is the hourly heartbeat, which writes regardless.
+# convenient: _should_persist writes a row *because* something moved, and it
+# compares against the last PERSISTED row - which is exactly the value the
+# replay carries. So silence implies the carried value was within the
+# thresholds of the truth.
+#
+# But only CONDITIONALLY. _should_persist returns NO_MEANINGFUL_CHANGE only
+# when every one of these held at that scan:
+#
+#   1. the production scan actually ran;
+#   2. the symbol was actually observed in it (collect_full_market_observations
+#      fail-softs on a ticker batch error, and an unobserved symbol has no
+#      persist decision at all);
+#   3. the last persisted row was under CARRY_HEARTBEAT_SECONDS old, since the
+#      heartbeat writes regardless of movement;
+#   4. the prior row parsed as finite (INVALID_PRIOR_STATE forces a write).
+#
+# Where any of those fails, silence is NOT evidence of a quiet market and the
+# bound simply does not apply. The replay cannot distinguish "quiet" from "not
+# observed" from the JSONL alone - the same ambiguity Phase 1's own retention
+# design has to live with - so the bound is reported as conditional and the
+# cells where it provably cannot hold are counted rather than assumed away.
 #
 # test_carry_error_bounds_match_phase_1 asserts these stay in sync with
 # app/services/full_market_observation.py.
@@ -676,10 +693,14 @@ def measure_persistence_gap_drift(
 
     It is still worth reporting as an upper-bound-flavoured uncertainty proxy:
     a small distribution is genuine reassurance, while a large one is a reason
-    to distrust reconstructed features. The defensible statement remains the
-    theoretical one - a row is written because something moved, so silence
-    between rows means price moved less than ``CARRY_PRICE_DRIFT_BOUND_PCT``,
-    with the hourly heartbeat as the exception.
+    to distrust reconstructed features.
+
+    The defensible statement remains the theoretical one, but it is
+    *conditional*: silence implies quiet only where the scan ran, observed the
+    symbol, and sat inside the heartbeat interval. Carried cells at or beyond
+    ``CARRY_HEARTBEAT_SECONDS`` are counted separately - a heartbeat row should
+    have existed for them, so their absence means a scan or an observation was
+    missing and the bound provably does not apply.
     """
     by_symbol: dict[str, list[ReplayObservation]] = defaultdict(list)
     for row in observations:
@@ -695,11 +716,18 @@ def measure_persistence_gap_drift(
     ages: list[float] = []
     exceeded_bound = 0
     unresolved = 0
+    beyond_heartbeat = 0
     for frame in frames:
         for symbol, cell in frame.cells.items():
             if not cell.imputed:
                 continue
-            ages.append((frame.scan_at - cell.source_at).total_seconds())
+            age = (frame.scan_at - cell.source_at).total_seconds()
+            ages.append(age)
+            if age >= CARRY_HEARTBEAT_SECONDS:
+                # A heartbeat row should have been written by now. Its absence
+                # means a scan or an observation was missing, so the persist
+                # thresholds say nothing about this cell.
+                beyond_heartbeat += 1
             series = epochs.get(symbol)
             if not series:
                 unresolved += 1
@@ -733,6 +761,25 @@ def measure_persistence_gap_drift(
         "imputed_cells_measured": len(drifts),
         "imputed_cells_unresolved": unresolved,
         "theoretical_price_drift_bound_pct": CARRY_PRICE_DRIFT_BOUND_PCT,
+        "bound_is_conditional": True,
+        "bound_preconditions": [
+            "the production scan actually ran",
+            "the symbol was observed in it (a fail-soft ticker batch error "
+            "produces no persist decision at all)",
+            f"the last persisted row was under {CARRY_HEARTBEAT_SECONDS}s old, "
+            "since the heartbeat writes regardless of movement",
+            "the prior row parsed as finite (INVALID_PRIOR_STATE forces a write)",
+        ],
+        "bound_inapplicable_cells_beyond_heartbeat": beyond_heartbeat,
+        "bound_inapplicable_pct": (
+            round(beyond_heartbeat / len(ages) * 100.0, 2) if ages else None
+        ),
+        "bound_conditionality_note": (
+            "Where a precondition fails, silence in the stream is not evidence "
+            "of a quiet market and the persist bound does not apply. The replay "
+            "cannot distinguish 'quiet' from 'not observed' from the JSONL "
+            "alone, so these cells are counted rather than assumed away."
+        ),
         "bound_rationale": (
             "_should_persist writes a row when price moves at least "
             f"{CARRY_PRICE_DRIFT_BOUND_PCT}%, lift {CARRY_LIFT_DRIFT_BOUND_PCT}%, "
@@ -1149,6 +1196,8 @@ class CachedOhlcProvider:
                 if not isinstance(raw, dict):
                     self.rejected_rows += 1
                     continue
+                if _is_ohlc_cache_header(raw):
+                    continue  # format marker, not a candle
                 moment = _as_utc(raw.get("start_at"))
                 symbol = str(raw.get("symbol") or "").upper()
                 if moment is None or not symbol:
@@ -1187,18 +1236,62 @@ class OhlcCacheTargetError(RuntimeError):
     """Refused to write a cache over a file that is not an OHLC cache."""
 
 
+# First line of every cache this module writes. A file carrying it is
+# unambiguously ours and safe to replace; anything else has to earn that by
+# being candle-shaped throughout.
+OHLC_CACHE_FORMAT = "ohm-phase2-ohlc-cache-v1"
+OHLC_CACHE_HEADER: dict[str, Any] = {"_ohlc_cache_format": OHLC_CACHE_FORMAT}
+# How many lines to inspect before trusting a headerless file. Bounded so the
+# check stays cheap on a large cache.
+OHLC_CACHE_IDENTITY_SAMPLE_LINES = 200
+
+_OHLC_CANDLE_KEYS = frozenset({"symbol", "start_at", "high"})
+
+
+def _is_ohlc_cache_header(row: Any) -> bool:
+    return isinstance(row, dict) and row.get("_ohlc_cache_format") == OHLC_CACHE_FORMAT
+
+
 def _is_ohlc_cache_file(path: Path) -> bool:
-    """Does this existing file already look like an OHLC cache?"""
+    """Is this existing file safe to replace with a cache?
+
+    Fails closed. Three ways to pass, in decreasing confidence:
+
+    1. it carries our format header on the first line;
+    2. it is empty;
+    3. every one of the first ``OHLC_CACHE_IDENTITY_SAMPLE_LINES`` non-blank
+       lines is candle-shaped - which lets a hand-built cache be replaced
+       without demanding a header.
+
+    Checking *every* sampled line rather than only the first matters: a
+    production JSONL registry could plausibly begin with a row that happens to
+    carry these keys, and truncating it would be unrecoverable. Anything that
+    is not a regular file - a directory, a device, a symlink to one - is
+    refused outright.
+    """
+    try:
+        if not path.is_file():
+            return False
+    except OSError:
+        return False
+
     try:
         with path.open("r", encoding="utf-8") as handle:
+            inspected = 0
             for line in handle:
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                return isinstance(row, dict) and {"symbol", "start_at", "high"} <= set(row)
-    except (OSError, json.JSONDecodeError):
+                if inspected == 0 and _is_ohlc_cache_header(row):
+                    return True
+                if not (isinstance(row, dict) and _OHLC_CANDLE_KEYS <= set(row)):
+                    return False
+                inspected += 1
+                if inspected >= OHLC_CACHE_IDENTITY_SAMPLE_LINES:
+                    break
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
-    return True  # an empty file is safe to claim
+    return True  # header-led, or every sampled line was candle-shaped
 
 
 def write_ohlc_cache(
@@ -1241,6 +1334,7 @@ def write_ohlc_cache(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(OHLC_CACHE_HEADER, sort_keys=True) + "\n")
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     return len(rows)
@@ -1659,6 +1753,15 @@ def build_phase2_report(
         warnings.append(f"REJECTED_ROWS: {ingestion.rejected_lines} malformed or non-observation lines skipped.")
 
     if carry_fidelity:
+        inapplicable = carry_fidelity.get("bound_inapplicable_pct")
+        if inapplicable is not None and inapplicable > 5.0:
+            warnings.append(
+                f"CARRY_BOUND_INAPPLICABLE: {inapplicable}% of carried cells are at or "
+                f"beyond the {CARRY_HEARTBEAT_SECONDS}s heartbeat interval, where a "
+                "heartbeat row should have existed. For those cells a missing scan or "
+                "observation - not a quiet market - explains the silence, so the "
+                "persist-threshold bound does not apply to them."
+            )
         exceeded = carry_fidelity.get("exceeded_bound_pct")
         if exceeded is not None and exceeded > 20.0:
             warnings.append(
