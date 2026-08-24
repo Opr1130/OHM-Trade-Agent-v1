@@ -7,34 +7,28 @@ persist. This module exists to remove that approximation going forward: it
 records the *actual* live decision state, at the moment the live scan
 produced it, so future analysis has ground truth instead of only replay.
 
-Three properties make this safe to turn on:
+The same already-computed candidate stream also feeds Phase 3B shadow
+telemetry. Phase 3B is measurement-only: its output never feeds scoring,
+ranking, Telegram, PendingSetup, or execution. This composition deliberately
+uses the existing scan clock and same-scan reference-price mapping; it makes no
+second market-data fetch.
 
-* **Dark by default.** ``DECISION_TELEMETRY_V1_ENABLED`` defaults to False.
-  Composed with ``SIGNAL_QUALITY_V1_ENABLED`` already defaulting to False and
-  already making ``full_market.signal_quality_candidates`` empty when off,
-  both flags default off and either one being off writes nothing.
+Three properties make this safe:
+
 * **Fail-soft.** Every failure mode - a permissions error, a full disk, a
-  malformed candidate - is caught here. A telemetry failure can change what
-  gets logged; it can never change what gets scored or alerted, because this
-  module has no return value the caller could act on and no side effect
-  besides the append itself.
-* **One-directional.** Nothing in this module reads the telemetry file back.
-  There is no function here that could feed a written record into a future
-  decision, by construction - the only public function takes already-computed
-  candidates and returns a count.
+  malformed candidate - is caught here or in the Phase 3B writer. Telemetry
+  can fail to write; it cannot change scoring or alerting.
+* **One-directional.** Nothing in either telemetry module reads its JSONL back
+  into a live decision.
+* **No duplicate scanner.** Both telemetry streams consume candidates already
+  produced by the existing scan_movers cycle.
 
-The write path mirrors ``app/services/candidate_trace.py``: an append-only
-JSONL file behind a ``registry_lock``, one line per record, secret-free.
-
-``price`` is the exact same-scan observation price each candidate was scored
-from - not a value carried by ``SignalQualityCandidate`` itself (Phase 1's
-scorer has no price field, and never has), and not a second market-data
-lookup. ``app.services.full_market_observation.process_full_market_observations``
-already holds this price in memory for the same scan it derives features
-from, and exposes it read-only on ``FullMarketResult.signal_quality_reference_prices``
-(a ``{symbol: price}`` mapping, empty unless Signal Quality is enabled). This
-module only ever reads that mapping; it never fetches, derives, or requests a
-price of its own. See SIGNAL_QUALITY_PHASE3A.md §2.5 for the full data path.
+Phase 3A's own JSONL remains dark behind ``DECISION_TELEMETRY_V1_ENABLED``.
+Phase 3B shadow capture is active on the default live scan path whenever Signal
+Quality has produced scored candidates, reflecting the separately approved
+production measurement period. Callers that supply a custom Phase-3A path
+(such as isolated unit tests/offline tools) do not implicitly create the live
+Phase-3B shadow file.
 """
 
 from __future__ import annotations
@@ -45,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.services.phase3b_shadow_telemetry import record_phase3b_shadow_telemetry
 from app.services.registry_io import registry_lock
 
 
@@ -60,13 +55,8 @@ class DecisionTelemetryRecord:
 
     schema_version: int
     recorded_at: str
-    scan_source: str  # "LIVE" - reserved for future non-live sources
+    scan_source: str
     symbol: str
-    # The same-scan observation price this candidate was scored from, read
-    # from FullMarketResult.signal_quality_reference_prices (see module
-    # docstring). None only when that mapping has no entry for this symbol -
-    # e.g. a candidate built outside the live scan_movers.py path, such as in
-    # a unit test that does not supply one.
     price: float | None
     liquidity_24h_usd_approx: float
     stage: str
@@ -86,8 +76,6 @@ class DecisionTelemetryRecord:
     suppressed: bool
     signal_quality_enabled: bool
     early_alerts_enabled: bool
-    # Invariants asserted, not just documented: this record can never carry
-    # execution authority, no matter what future fields are added to it.
     advisory_only: bool = True
     weights_are_calibrated: bool = False
     trade_authority_changed: bool = False
@@ -106,22 +94,10 @@ def build_telemetry_record(
     reference_prices: Mapping[str, float] | None = None,
     now: datetime | None = None,
 ) -> DecisionTelemetryRecord:
-    """Convert one live ``SignalQualityCandidate`` into a telemetry record.
-
-    Reads only public attributes already present on the candidate (the same
-    object ``scan_movers.py`` already has after scoring); derives nothing new
-    and calls no external service. ``reference_prices`` is the same-scan
-    ``{symbol: price}`` mapping from
-    ``FullMarketResult.signal_quality_reference_prices`` - this function only
-    reads it by key, it never fetches or computes a price itself.
-    """
     now = now or datetime.now(timezone.utc)
     symbol = str(getattr(candidate, "symbol", "") or "").upper()
     price = (reference_prices or {}).get(symbol)
     if price is None:
-        # Opportunistic fallback only: no candidate carries this attribute
-        # today, but this keeps the record correct with no call-site change
-        # if one ever does.
         price = getattr(candidate, "reference_price", None)
     return DecisionTelemetryRecord(
         schema_version=SCHEMA_VERSION,
@@ -141,9 +117,7 @@ def build_telemetry_record(
         persistence_scans=int(getattr(candidate, "persistence_scans", 0) or 0),
         exhaustion_penalty=int(getattr(candidate, "exhaustion_penalty", 0) or 0),
         exhaustion_band=str(getattr(candidate, "exhaustion_band", "") or ""),
-        relative_strength_percentile=float(
-            getattr(candidate, "relative_strength_percentile", 0.0) or 0.0
-        ),
+        relative_strength_percentile=float(getattr(candidate, "relative_strength_percentile", 0.0) or 0.0),
         universe_size=int(getattr(candidate, "universe_size", 0) or 0),
         reasons=tuple(getattr(candidate, "reasons", ()) or ()),
         suppressed=bool(getattr(candidate, "suppressed", False)),
@@ -160,23 +134,34 @@ def record_decision_telemetry(
     path: Path | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Append one telemetry line per candidate. Returns the count written.
+    """Capture Phase 3B shadow evidence and, when enabled, Phase 3A telemetry.
 
-    ``reference_prices`` should be the same-scan
-    ``FullMarketResult.signal_quality_reference_prices`` mapping the caller
-    already has; passed straight through to ``build_telemetry_record`` with
-    no lookup, fetch, or derivation performed here.
-
-    Fail-soft and dark-by-default in the same call: if the flag is off, or
-    anything at all goes wrong, this returns 0 and raises nothing. Callers
-    never need their own try/except around this - it cannot escape here -
-    but ``scan_movers.py`` wraps it anyway as defence in depth, per the
-    approved design.
+    Phase 3B shadow capture is independent of the Phase 3A decision-telemetry
+    flag on the default live path, but only has rows when Signal Quality is
+    enabled and produced candidates. Both paths are fail-soft and append-only.
+    The return value remains the Phase 3A count for backward compatibility.
     """
+    try:
+        rows = list(candidates)
+    except Exception:
+        return 0
+
+    if (
+        rows
+        and path is None
+        and bool(getattr(settings, "signal_quality_v1_enabled", False))
+    ):
+        # Separately fail-soft inside the writer. No return value is consumed by
+        # live logic, so this cannot affect ranking, Telegram, or execution.
+        record_phase3b_shadow_telemetry(
+            rows,
+            reference_prices=reference_prices,
+            now=now,
+        )
+
     if not bool(getattr(settings, "decision_telemetry_v1_enabled", False)):
         return 0
     try:
-        rows = list(candidates)
         if not rows:
             return 0
         target = path or DEFAULT_TELEMETRY_FILE
@@ -200,6 +185,4 @@ def record_decision_telemetry(
                 handle.flush()
         return written
     except Exception:
-        # Fail-soft by design: telemetry must never affect scoring or
-        # alerting, so nothing here is allowed to propagate.
         return 0
