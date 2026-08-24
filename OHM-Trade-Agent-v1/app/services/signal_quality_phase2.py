@@ -84,6 +84,25 @@ ELIGIBLE_STAGES = frozenset({
     STAGE_ACTIONABLE_REVIEW,
 })
 
+# Phase 1's persistence thresholds, mirrored here so the replay can state how
+# far a carried value may drift without importing the runtime module (which
+# would pull the Kraken client into this offline import graph).
+#
+# These bound the imputation error, and that is the whole reason
+# last-observation-carried-forward is defensible here rather than merely
+# convenient: _should_persist writes a row *because* something moved. If no row
+# was written between two scans, price moved less than
+# CARRY_PRICE_DRIFT_BOUND_PCT - the absence of a row is itself evidence of
+# quiet. The one exception is the hourly heartbeat, which writes regardless.
+#
+# test_carry_error_bounds_match_phase_1 asserts these stay in sync with
+# app/services/full_market_observation.py.
+CARRY_PRICE_DRIFT_BOUND_PCT = 1.0
+CARRY_LIFT_DRIFT_BOUND_PCT = 0.75
+CARRY_HIGH_DISTANCE_DRIFT_BOUND_PCT = 0.75
+CARRY_NOTIONAL_RATIO_BOUND = 1.50
+CARRY_HEARTBEAT_SECONDS = 3600
+
 FORWARD_BUCKETS: tuple[tuple[str, float, float], ...] = (
     ("FAIL_LT_5", float("-inf"), 5.0),
     ("MOVE_5_10", 5.0, 10.0),
@@ -592,6 +611,117 @@ class SymbolTimeline:
         return lo, hi
 
 
+def measure_carry_fidelity(
+    observations: Sequence[ReplayObservation],
+    frames: Sequence[ScanFrame],
+) -> dict[str, Any]:
+    """Measure how wrong the carried-forward values actually were.
+
+    For every imputed cell, compare the carried price against the next real
+    observation for that symbol. That realised drift is the honest measure of
+    how much the reconstruction distorted each decision.
+
+    This turns imputation from an unquantified caveat into a number a reviewer
+    can weigh. The theoretical bound is Phase 1's own persist thresholds - a row
+    is written *because* something moved, so silence between rows means price
+    moved less than ``CARRY_PRICE_DRIFT_BOUND_PCT`` - but the realised
+    distribution is what actually matters, and heartbeat rows are an exception
+    to the bound.
+    """
+    by_symbol: dict[str, list[ReplayObservation]] = defaultdict(list)
+    for row in observations:
+        by_symbol[row.symbol].append(row)
+    epochs: dict[str, list[float]] = {}
+    prices: dict[str, list[float]] = {}
+    for symbol, rows in by_symbol.items():
+        rows.sort(key=lambda row: row.observed_at)
+        epochs[symbol] = [row.observed_at.timestamp() for row in rows]
+        prices[symbol] = [row.snapshot.last_price for row in rows]
+
+    drifts: list[float] = []
+    ages: list[float] = []
+    exceeded_bound = 0
+    unresolved = 0
+    for frame in frames:
+        for symbol, cell in frame.cells.items():
+            if not cell.imputed:
+                continue
+            ages.append((frame.scan_at - cell.source_at).total_seconds())
+            series = epochs.get(symbol)
+            if not series:
+                unresolved += 1
+                continue
+            nxt = bisect_right(series, frame.scan_at.timestamp())
+            if nxt >= len(series):
+                # No later observation: the drift is unknowable, not zero.
+                unresolved += 1
+                continue
+            carried = cell.snapshot.last_price
+            actual = prices[symbol][nxt]
+            if carried <= 0:
+                unresolved += 1
+                continue
+            drift = abs(actual / carried - 1.0) * 100.0
+            drifts.append(drift)
+            if drift > CARRY_PRICE_DRIFT_BOUND_PCT:
+                exceeded_bound += 1
+
+    return {
+        "imputed_cells_measured": len(drifts),
+        "imputed_cells_unresolved": unresolved,
+        "theoretical_price_drift_bound_pct": CARRY_PRICE_DRIFT_BOUND_PCT,
+        "bound_rationale": (
+            "_should_persist writes a row when price moves at least "
+            f"{CARRY_PRICE_DRIFT_BOUND_PCT}%, lift {CARRY_LIFT_DRIFT_BOUND_PCT}%, "
+            f"high-distance {CARRY_HIGH_DISTANCE_DRIFT_BOUND_PCT}%, or notional "
+            f"{CARRY_NOTIONAL_RATIO_BOUND}x; the absence of a row is therefore "
+            "evidence the market was quiet, not evidence of missing data. The "
+            f"{CARRY_HEARTBEAT_SECONDS}s heartbeat is the exception."
+        ),
+        "realised_drift_to_next_observation_pct": _quartiles(drifts),
+        "exceeded_bound": exceeded_bound,
+        "exceeded_bound_pct": (
+            round(exceeded_bound / len(drifts) * 100.0, 2) if drifts else None
+        ),
+        "carry_age_seconds": _quartiles(ages),
+    }
+
+
+def episode_sensitivity(
+    timelines: Mapping[str, SymbolTimeline],
+    *,
+    base: EpisodeConfig,
+    triggers: Sequence[float] = (15.0, 20.0, 30.0),
+    retraces: Sequence[float] = (20.0, 30.0, 50.0),
+) -> list[dict[str, Any]]:
+    """Report how episode counts move as the episode priors move.
+
+    The trigger and retrace values are priors, not calibrated figures, and they
+    directly determine how many "winners" exist to be captured. A capture rate
+    quoted without this sweep is not interpretable: if halving the trigger
+    doubles the episode count, the headline rate is an artefact of the
+    parameter rather than a property of the detector.
+    """
+    rows: list[dict[str, Any]] = []
+    for trigger in triggers:
+        for retrace in retraces:
+            variant = EpisodeConfig(
+                trigger_pct=trigger,
+                close_retrace_pct=retrace,
+                baseline_window_hours=base.baseline_window_hours,
+                peak_cooldown_hours=base.peak_cooldown_hours,
+            )
+            episodes = build_all_episodes(timelines, config=variant)
+            rows.append({
+                "trigger_pct": trigger,
+                "close_retrace_pct": retrace,
+                "episodes": len(episodes),
+                "episodes_by_class": dict(sorted(Counter(e.outcome_class for e in episodes).items())),
+                "is_default": trigger == base.trigger_pct and retrace == base.close_retrace_pct,
+            })
+    return rows
+
+
 def build_timelines(observations: Iterable[ReplayObservation]) -> dict[str, SymbolTimeline]:
     grouped: dict[str, list[ReplayObservation]] = defaultdict(list)
     for row in observations:
@@ -919,6 +1049,83 @@ class KrakenPublicOhlcProvider:
         return rows
 
 
+class CachedOhlcProvider:
+    """OHLC read from a local JSONL cache. Offline and deterministic.
+
+    Lets an operator fetch candles once (see ``write_ohlc_cache``) and then
+    re-run validation as often as they like without touching the network, so a
+    validated report is reproducible rather than depending on whatever the
+    exchange returns that minute.
+
+    Expected row shape, one JSON object per line:
+    ``{"symbol": "XBTUSD", "start_at": "...ISO8601...", "high": 1.0,
+       "low": 1.0, "close": 1.0}``
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._by_symbol: dict[str, list[OhlcCandle]] = defaultdict(list)
+        if not path.exists():
+            return
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                moment = _as_utc(raw.get("start_at"))
+                symbol = str(raw.get("symbol") or "").upper()
+                if moment is None or not symbol:
+                    continue
+                try:
+                    candle = OhlcCandle(
+                        start_at=moment,
+                        high=float(raw["high"]),
+                        low=float(raw["low"]),
+                        close=float(raw["close"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(candle.high) or candle.high <= 0:
+                    continue
+                self._by_symbol[symbol].append(candle)
+        for rows in self._by_symbol.values():
+            rows.sort(key=lambda row: row.start_at)
+
+    def fetch(self, symbol: str, start_at: datetime, end_at: datetime) -> list[OhlcCandle]:
+        return [
+            candle for candle in self._by_symbol.get(symbol.upper(), ())
+            if start_at <= candle.start_at <= end_at
+        ]
+
+
+def write_ohlc_cache(
+    episodes: Sequence[MoveEpisode],
+    provider: OhlcProvider,
+    path: Path,
+) -> int:
+    """Fetch candles for each episode once and persist them for reuse.
+
+    The only function in this module that writes a file, and it writes to an
+    operator-chosen cache path - never to a production registry.
+    """
+    written = 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for episode in episodes:
+            for candle in provider.fetch(episode.symbol, episode.baseline_at, episode.end_at):
+                handle.write(json.dumps({
+                    "symbol": episode.symbol,
+                    "start_at": candle.start_at.isoformat(),
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                }) + "\n")
+                written += 1
+    return written
+
+
 def validate_episodes_with_ohlc(
     episodes: Sequence[MoveEpisode],
     provider: OhlcProvider,
@@ -1153,6 +1360,8 @@ def build_phase2_report(
     *,
     config: Phase2Config,
     ohlc_validated: bool = False,
+    carry_fidelity: dict[str, Any] | None = None,
+    sensitivity: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     observations = ingestion.observations
     warnings: list[str] = []
@@ -1226,6 +1435,23 @@ def build_phase2_report(
         )
     if ingestion.rejected_lines:
         warnings.append(f"REJECTED_ROWS: {ingestion.rejected_lines} malformed or non-observation lines skipped.")
+
+    if carry_fidelity:
+        exceeded = carry_fidelity.get("exceeded_bound_pct")
+        if exceeded is not None and exceeded > 20.0:
+            warnings.append(
+                f"CARRY_DRIFT_HIGH: {exceeded}% of carried cells drifted past the "
+                f"{CARRY_PRICE_DRIFT_BOUND_PCT}% persist bound before the next "
+                "observation; reconstructed features are correspondingly less reliable."
+            )
+    if sensitivity:
+        counts = [row["episodes"] for row in sensitivity]
+        if counts and min(counts) > 0 and max(counts) / min(counts) >= 3.0:
+            warnings.append(
+                "EPISODE_COUNT_PARAMETER_SENSITIVE: episode totals vary more than 3x "
+                "across the trigger/retrace sweep, so capture rates depend heavily on "
+                "the episode priors and must not be quoted without them."
+            )
 
     imputed_cells = sum(frame.imputed_count for frame in frames)
     observed_cells = sum(frame.observed_count for frame in frames)
@@ -1316,6 +1542,22 @@ def build_phase2_report(
             "failed_breakout_detections": len(failures),
             "features": comparison,
         },
+        "reconstruction_fidelity": carry_fidelity or {
+            "note": "Carry fidelity not measured for this report.",
+        },
+        "episode_parameter_sensitivity": {
+            "note": (
+                "Episode priors are not calibrated. Capture rates are only "
+                "interpretable alongside this sweep."
+            ),
+            "default": {
+                "trigger_pct": config.episodes.trigger_pct,
+                "close_retrace_pct": config.episodes.close_retrace_pct,
+                "baseline_window_hours": config.episodes.baseline_window_hours,
+                "peak_cooldown_hours": config.episodes.peak_cooldown_hours,
+            },
+            "sweep": list(sensitivity or ()),
+        },
         "missed_winners": {
             "count": len(missed),
             "note": "Scores at the last scan before each threshold of an undetected episode.",
@@ -1382,4 +1624,6 @@ def run_phase2_replay(
         outcomes,
         config=config,
         ohlc_validated=ohlc_validated,
+        carry_fidelity=measure_carry_fidelity(ingestion.observations, frames),
+        sensitivity=episode_sensitivity(timelines, base=config.episodes),
     )

@@ -13,9 +13,14 @@ from pathlib import Path
 
 from app.services.signal_quality_phase2 import (
     DEFAULT_OBSERVATION_FILE,
+    CachedOhlcProvider,
     KrakenPublicOhlcProvider,
     Phase2Config,
+    build_all_episodes,
+    build_timelines,
+    read_observations,
     run_phase2_replay,
+    write_ohlc_cache,
 )
 
 
@@ -44,16 +49,54 @@ def main() -> None:
         action="store_true",
         help="Cross-validate episode peaks against public Kraken OHLC (network reads)",
     )
+    parser.add_argument(
+        "--ohlc-cache",
+        type=Path,
+        default=None,
+        help=(
+            "Validate against a local OHLC cache instead of the network. Offline "
+            "and reproducible. Build one with --write-ohlc-cache."
+        ),
+    )
+    parser.add_argument(
+        "--write-ohlc-cache",
+        type=Path,
+        default=None,
+        help=(
+            "Fetch public OHLC for each detected episode once and write it to this "
+            "path, then exit. The only mode that writes a file."
+        ),
+    )
     args = parser.parse_args()
 
     config = Phase2Config(
         horizon_hours=args.horizon_hours,
         calibration_fraction=args.calibration_fraction,
     )
+
+    if args.write_ohlc_cache is not None:
+        ingestion = read_observations(args.observations)
+        episodes = build_all_episodes(
+            build_timelines(ingestion.observations), config=config.episodes
+        )
+        written = write_ohlc_cache(episodes, KrakenPublicOhlcProvider(), args.write_ohlc_cache)
+        print(json.dumps({
+            "wrote_candles": written,
+            "episodes": len(episodes),
+            "cache_path": str(args.write_ohlc_cache),
+        }, indent=2))
+        return
+
+    provider = None
+    if args.ohlc_cache is not None:
+        provider = CachedOhlcProvider(args.ohlc_cache)
+    elif args.ohlc:
+        provider = KrakenPublicOhlcProvider()
+
     report = run_phase2_replay(
         observation_file=args.observations,
         config=config,
-        ohlc_provider=KrakenPublicOhlcProvider() if args.ohlc else None,
+        ohlc_provider=provider,
     )
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
 

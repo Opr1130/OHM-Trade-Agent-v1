@@ -551,8 +551,13 @@ def _report_for(observations, detections, *, config=None):
         interval_seconds=config.scan_interval_seconds,
         max_carry_seconds=config.max_carry_seconds,
     )
+    from app.services.signal_quality_phase2 import episode_sensitivity, measure_carry_fidelity
+
     return build_phase2_report(
-        ingestion, frames, detections, list(detections), episodes, outcomes, config=config
+        ingestion, frames, detections, list(detections), episodes, outcomes,
+        config=config,
+        carry_fidelity=measure_carry_fidelity(observations, frames),
+        sensitivity=episode_sensitivity(timelines, base=config.episodes),
     )
 
 
@@ -661,3 +666,270 @@ def test_replay_does_not_mutate_production_settings():
         settings.signal_quality_breakout_opportunity,
     )
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction fidelity: how wrong were the carried values?
+# ---------------------------------------------------------------------------
+
+
+def test_carry_error_bounds_match_phase_1():
+    """The stated bound must track the runtime that produces it.
+
+    These constants justify last-observation-carried-forward. If Phase 1's
+    persistence thresholds change and these do not, the report would advertise
+    a bound the data no longer satisfies.
+    """
+    from app.services import full_market_observation as runtime
+    from app.services import signal_quality_phase2 as phase2
+
+    assert phase2.CARRY_PRICE_DRIFT_BOUND_PCT == runtime.MIN_PERSIST_PRICE_CHANGE_PCT
+    assert phase2.CARRY_LIFT_DRIFT_BOUND_PCT == runtime.MIN_PERSIST_LIFT_CHANGE_PCT
+    assert phase2.CARRY_HIGH_DISTANCE_DRIFT_BOUND_PCT == runtime.MIN_PERSIST_HIGH_DISTANCE_CHANGE_PCT
+    assert phase2.CARRY_NOTIONAL_RATIO_BOUND == runtime.MIN_NOTIONAL_RATIO_CHANGE
+    assert phase2.CARRY_HEARTBEAT_SECONDS == runtime.HEARTBEAT_SECONDS
+
+
+def test_carry_fidelity_measures_realised_drift():
+    from app.services.signal_quality_phase2 import measure_carry_fidelity
+
+    # Quiet carry then a 0.5% move: within the 1% persist bound.
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    fidelity = measure_carry_fidelity(observations, frames)
+
+    assert fidelity["imputed_cells_measured"] > 0
+    assert fidelity["exceeded_bound"] == 0
+    assert fidelity["realised_drift_to_next_observation_pct"]["median"] == pytest.approx(0.5)
+    assert fidelity["theoretical_price_drift_bound_pct"] == 1.0
+
+
+def test_carry_fidelity_flags_drift_past_the_bound():
+    from app.services.signal_quality_phase2 import measure_carry_fidelity
+
+    observations = [_obs(0, 100.0), _obs(40, 130.0)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    fidelity = measure_carry_fidelity(observations, frames)
+
+    assert fidelity["exceeded_bound"] > 0
+    assert fidelity["exceeded_bound_pct"] > 0
+
+
+def test_unresolvable_carry_is_counted_not_assumed_zero():
+    """A carry with no later observation has unknowable drift."""
+    from app.services.signal_quality_phase2 import measure_carry_fidelity
+
+    observations = [_obs(0, 100.0)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    fidelity = measure_carry_fidelity(observations, frames)
+
+    assert fidelity["imputed_cells_unresolved"] > 0
+    assert fidelity["imputed_cells_measured"] == 0
+
+
+def test_report_includes_reconstruction_fidelity():
+    observations = [_obs(0, 100), _obs(40, 100.4), _obs(80, 140)]
+    report = _report_for(observations, [])
+    fidelity = report["reconstruction_fidelity"]
+
+    assert "theoretical_price_drift_bound_pct" in fidelity
+    assert "realised_drift_to_next_observation_pct" in fidelity
+
+
+def test_high_carry_drift_raises_a_warning():
+    observations = [_obs(0, 100), _obs(40, 200), _obs(80, 400)]
+    config = Phase2Config()
+    timelines = build_timelines(observations)
+    frames = reconstruct_scan_frames(
+        observations, interval_seconds=config.scan_interval_seconds,
+        max_carry_seconds=config.max_carry_seconds,
+    )
+    from app.services.signal_quality_phase2 import measure_carry_fidelity
+
+    report = build_phase2_report(
+        IngestionResult(observations, len(observations), 0),
+        frames, [], [], build_all_episodes(timelines, config=config.episodes), [],
+        config=config,
+        carry_fidelity=measure_carry_fidelity(observations, frames),
+    )
+    assert any("CARRY_DRIFT_HIGH" in w for w in report["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Episode parameter sensitivity
+# ---------------------------------------------------------------------------
+
+
+def test_episode_sensitivity_sweeps_trigger_and_retrace():
+    from app.services.signal_quality_phase2 import episode_sensitivity
+
+    observations = [_obs(i * 10, 100 * (1.03 ** i)) for i in range(40)]
+    timelines = build_timelines(observations)
+    sweep = episode_sensitivity(timelines, base=EpisodeConfig())
+
+    assert len(sweep) == 9
+    assert sum(row["is_default"] for row in sweep) == 1
+    default = next(row for row in sweep if row["is_default"])
+    assert default["trigger_pct"] == EpisodeConfig().trigger_pct
+    assert default["close_retrace_pct"] == EpisodeConfig().close_retrace_pct
+    for row in sweep:
+        assert row["episodes"] >= 0
+        assert isinstance(row["episodes_by_class"], dict)
+
+
+def test_lower_trigger_never_finds_fewer_episodes():
+    """Sanity property: loosening the trigger cannot hide runs."""
+    from app.services.signal_quality_phase2 import episode_sensitivity
+
+    observations = []
+    for sym in ("AUSD", "BUSD"):
+        price = 100.0
+        for i in range(60):
+            price *= 1.02 if i < 30 else 0.99
+            observations.append(_obs(i * 10, price, symbol=sym))
+    timelines = build_timelines(observations)
+    sweep = episode_sensitivity(timelines, base=EpisodeConfig(), retraces=(30.0,))
+
+    by_trigger = {row["trigger_pct"]: row["episodes"] for row in sweep}
+    assert by_trigger[15.0] >= by_trigger[30.0]
+
+
+def test_report_publishes_the_sensitivity_sweep():
+    observations = [_obs(i * 10, 100 * (1.03 ** i)) for i in range(30)]
+    report = _report_for(observations, [])
+    block = report["episode_parameter_sensitivity"]
+
+    assert block["default"]["trigger_pct"] == EpisodeConfig().trigger_pct
+    assert isinstance(block["sweep"], list)
+
+
+def test_parameter_sensitive_episode_counts_raise_a_warning():
+    """A capture rate that moves with the priors must be flagged as such.
+
+    Each tooth rises ~50% then retraces ~38%. A 20%/30% close threshold splits
+    every tooth into its own episode; a 50% threshold cannot close them and
+    merges the lot into one run - an 8x swing in how many "winners" exist.
+    """
+    from app.services.signal_quality_phase2 import episode_sensitivity
+
+    config = Phase2Config()
+    observations = []
+    price = 100.0
+    minute = 0
+    for _ in range(8):
+        for _ in range(5):
+            price *= 1.0845
+            observations.append(_obs(minute, price))
+            minute += 10
+        for _ in range(5):
+            price *= 0.9075
+            observations.append(_obs(minute, price))
+            minute += 10
+
+    timelines = build_timelines(observations)
+    sweep = episode_sensitivity(timelines, base=config.episodes)
+    counts = [row["episodes"] for row in sweep]
+    assert min(counts) > 0
+    assert max(counts) / min(counts) >= 3.0
+
+    report = build_phase2_report(
+        IngestionResult(observations, len(observations), 0),
+        [], [], [], build_all_episodes(timelines, config=config.episodes), [],
+        config=config, sensitivity=sweep,
+    )
+    assert any("EPISODE_COUNT_PARAMETER_SENSITIVE" in w for w in report["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Offline OHLC cache
+# ---------------------------------------------------------------------------
+
+
+def test_cached_ohlc_provider_reads_a_local_file(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    path = tmp_path / "ohlc.jsonl"
+    path.write_text("\n".join([
+        '{"symbol":"TESTUSD","start_at":"2026-08-01T00:10:00+00:00","high":180,"low":100,"close":125}',
+        '{"symbol":"TESTUSD","start_at":"2026-08-01T00:20:00+00:00","high":150,"low":110,"close":118}',
+        "malformed",
+        '{"symbol":"TESTUSD","start_at":"bad-time","high":1,"low":1,"close":1}',
+        '{"symbol":"OTHERUSD","start_at":"2026-08-01T00:10:00+00:00","high":9,"low":1,"close":5}',
+    ]), encoding="utf-8")
+
+    provider = CachedOhlcProvider(path)
+    rows = provider.fetch("TESTUSD", BASE, BASE + timedelta(hours=1))
+
+    assert [r.high for r in rows] == [180.0, 150.0]
+    assert provider.fetch("MISSINGUSD", BASE, BASE + timedelta(hours=1)) == []
+
+
+def test_cached_provider_validates_episodes_offline(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    path = tmp_path / "ohlc.jsonl"
+    path.write_text(
+        '{"symbol":"TESTUSD","start_at":"2026-08-01T00:10:00+00:00","high":180,"low":100,"close":125}',
+        encoding="utf-8",
+    )
+    timeline = _run_timeline([(0, 100), (10, 125), (20, 118)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    validated = validate_episodes_with_ohlc(episodes, CachedOhlcProvider(path))
+
+    assert validated[0].ohlc_validated is True
+    assert validated[0].ohlc_peak_return_pct == pytest.approx(80.0)
+
+
+def test_missing_cache_file_is_safe(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    provider = CachedOhlcProvider(tmp_path / "absent.jsonl")
+    assert provider.fetch("TESTUSD", BASE, BASE + timedelta(hours=1)) == []
+
+
+def test_write_ohlc_cache_round_trips(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider, write_ohlc_cache
+
+    timeline = _run_timeline([(0, 100), (10, 125), (20, 118)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    source = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=125.0),
+    ])
+    path = tmp_path / "cache.jsonl"
+
+    written = write_ohlc_cache(episodes, source, path)
+    assert written == 1
+
+    reloaded = CachedOhlcProvider(path).fetch("TESTUSD", BASE, BASE + timedelta(hours=1))
+    assert reloaded[0].high == 180.0
+
+
+def test_ohlc_validated_report_changes_status(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    path = tmp_path / "obs.jsonl"
+    lines = []
+    for index in range(12):
+        moment = BASE + timedelta(minutes=10 * index)
+        price = 100 * (1.06 ** index)
+        lines.append(
+            '{"record_type":"FULL_MARKET_OBSERVATION","observed_at":"%s","symbol":"AUSD",'
+            '"last_price":%s,"volume_24h":1000,"notional_24h_usd_approx":%s,'
+            '"high_24h":%s,"low_24h":100,"lift_from_24h_low_pct":%s,'
+            '"distance_from_24h_high_pct":0}'
+            % (moment.isoformat(), price, price * 1000, price, (price / 100 - 1) * 100)
+        )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    cache = tmp_path / "ohlc.jsonl"
+    cache.write_text(
+        '{"symbol":"AUSD","start_at":"2026-08-01T00:30:00+00:00","high":900,"low":100,"close":300}',
+        encoding="utf-8",
+    )
+
+    report = run_phase2_replay(observation_file=path, ohlc_provider=CachedOhlcProvider(cache))
+
+    assert report["status"] == "OHLC_CROSS_VALIDATED_REPLAY"
+    assert report["coverage"]["ohlc_validated_episodes"] >= 1
+    assert not any("OHLC_VALIDATION_ABSENT" in w for w in report["warnings"])

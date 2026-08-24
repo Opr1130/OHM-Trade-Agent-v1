@@ -51,6 +51,36 @@ retention).
 real production scan — Phase 1 genuinely scanned then — but its *values* are
 stale, and stale values are never presented as fresh observations.
 
+### Why carrying forward is defensible, and how far it can be wrong
+
+Last-observation-carried-forward is justified here by *why* a row is missing.
+`_should_persist` writes a row **because** something moved:
+
+| Trigger | Threshold |
+| --- | --- |
+| Price change | ≥ 1.0% |
+| Lift change | ≥ 0.75% |
+| High-distance change | ≥ 0.75% |
+| Notional ratio | ≥ 1.50× |
+| Heartbeat | every 3600s regardless |
+
+So the absence of a row between two scans is itself evidence the market was
+quiet — price moved *less than 1%* — rather than evidence of missing data. The
+imputation error is therefore bounded by Phase 1's own thresholds, with the
+hourly heartbeat as the one exception. `CARRY_*_BOUND` constants mirror those
+thresholds and `test_carry_error_bounds_match_phase_1` fails if the runtime
+changes and the replay does not.
+
+The bound is theory; the report also **measures** it.
+`measure_carry_fidelity` compares every carried price against the next real
+observation for that symbol and publishes the realised drift distribution
+(count/p25/median/p75), how many carries exceeded the 1% bound, and the carry
+age distribution, under `reconstruction_fidelity`. A carry with no later
+observation is counted as `imputed_cells_unresolved` rather than assumed to be
+zero drift. If more than 20% of carries exceed the bound, the report raises
+`CARRY_DRIFT_HIGH` — reconstructed features are correspondingly less reliable
+and capture rates should be discounted.
+
 ## 3. Replaying the exact Phase 1 pipeline
 
 No alternate scorer exists. The replay calls the production functions directly:
@@ -90,6 +120,21 @@ baseline → trigger → peak → reset cycle:
 One DENT-style run is therefore **one** episode with one baseline, one peak and
 one set of threshold-crossing timestamps — not hundreds of overlapping windows.
 `test_one_explosive_run_is_one_episode` pins this against a densely sampled run.
+
+### Episode parameters are priors, so their effect is measured
+
+The trigger, retrace, baseline-window and cooldown values are **not calibrated**
+and they directly determine how many "winners" exist to be captured. A capture
+rate quoted without them is not interpretable: if halving the trigger doubles
+the episode count, the headline rate is an artefact of the parameter rather
+than a property of the detector.
+
+Every report therefore includes `episode_parameter_sensitivity` — a sweep of
+episode counts and class distributions across trigger ∈ {15, 20, 30} ×
+retrace ∈ {20, 30, 50}, with the active default marked. If totals vary by 3× or
+more across that sweep, the report raises
+`EPISODE_COUNT_PARAMETER_SENSITIVE` and the capture rates must not be quoted
+without the sweep beside them.
 
 Each episode records the first time it closed at or above +3, +5, +10, +20, +50,
 +100, +200 and +300 percent from its baseline. Its class comes from its peak
@@ -165,8 +210,15 @@ The persisted stream can miss intraperiod highs, so episode peaks drawn from
 - `NullOhlcProvider` (default) validates nothing and the report says so.
 - `KrakenPublicOhlcProvider` uses only `KrakenClient.get_ohlc`, a **public**
   endpoint, and fails soft — outcome validation may never break a report.
+- `CachedOhlcProvider` reads candles from a local JSONL cache: **offline and
+  deterministic**, so a validated report is reproducible instead of depending
+  on whatever the exchange returns that minute. Build a cache once with
+  `--write-ohlc-cache`, then validate repeatedly with `--ohlc-cache`.
 - Tests use a deterministic in-memory fixture provider. **No unit test touches
   the network**, so CI stays deterministic.
+
+`write_ohlc_cache` is the only function in the module that writes a file, and
+it writes only to an operator-chosen cache path — never a production registry.
 
 Validation is **outcome-side only**. It never feeds feature generation, so it
 cannot leak future information into a decision. Both the event-sampled and the
@@ -191,17 +243,30 @@ for every row — is quadratic and unusable. Instead:
 `source_lines`, `rejected_lines`, `observation_rows`, `symbols`, date coverage,
 `reconstructed_scans`, observed/imputed cell counts and share, `detections`,
 `episodes`, `major_move_episodes`, per-class episode counts, detections with an
-incomplete forward window, OHLC coverage, and an explicit `warnings` list
-(missing OHLC validation, small validation sample, rejected rows, no episodes,
-nothing to replay).
+incomplete forward window, OHLC coverage, `reconstruction_fidelity` (measured
+carry drift), `episode_parameter_sensitivity` (the prior sweep), and an explicit
+`warnings` list: missing OHLC validation, high carry drift, parameter-sensitive
+episode counts, small validation sample, rejected rows, no episodes, nothing to
+replay.
 
 ## 11. Running
 
 ```bash
+# Offline, provisional (default)
 python -m app.jobs.report_signal_quality_phase2
+
+# Build a reusable OHLC cache once (the only file-writing mode)
+python -m app.jobs.report_signal_quality_phase2 --write-ohlc-cache /tmp/ohlc.jsonl
+
+# Reproducible OHLC-validated run, offline
+python -m app.jobs.report_signal_quality_phase2 --ohlc-cache /tmp/ohlc.jsonl
+
+# Or validate straight against the public endpoint
+python -m app.jobs.report_signal_quality_phase2 --ohlc
 ```
 
-Prints JSON to stdout. Reads one file; writes nothing.
+Prints JSON to stdout. Apart from `--write-ohlc-cache`, reads only; writes
+nothing.
 
 ## 12. Safety invariants
 
