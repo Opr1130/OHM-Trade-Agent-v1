@@ -5,8 +5,7 @@ on:
     types: [synchronize]
 
 permissions:
-  actions: write
-  contents: read
+  contents: write
 
 jobs:
   dispatch:
@@ -19,5 +18,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run pr69-external-reviews-manual.yml --repo "$GITHUB_REPOSITORY" --ref main
-          echo "Dispatched combined Gemini and DeepSeek review for PR #69"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" -f event_type=pr69-ai-review >/dev/null
+          echo "Dispatched repository event pr69-ai-review for PR #69"
