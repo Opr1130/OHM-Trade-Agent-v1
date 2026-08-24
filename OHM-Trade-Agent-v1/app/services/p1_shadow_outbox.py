@@ -134,6 +134,10 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
             handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
 
 
 def _default_ledger_processor(
@@ -165,34 +169,37 @@ def _default_ledger_processor(
     return True
 
 
-def drain_outbox_to_evidence_ledger(
-    *,
-    outbox_path: Path | None = None,
-    evidence_path: Path | None = None,
-    checkpoint_path: Path | None = None,
-    dead_letter_path: Path | None = None,
-    batch_limit: int = 100,
-    processor: Callable[[dict[str, Any]], None] | None = None,
-) -> DrainResult:
-    """Consume snapshots after the live path and advance a durable line cursor.
+def _read_complete_outbox_lines(source: Path) -> list[str]:
+    """Read a stable outbox snapshot and never consume a partial tail record.
 
-    A processor failure does not advance the failing line, so it can be retried.
-    Malformed JSON is moved to a dead-letter stream and the cursor advances.
-    The default processor copies snapshots idempotently into the immutable
-    evidence ledger.
+    The producer and reader share the same file lock, so a concurrent append
+    cannot be observed mid-write. If a prior process crashed with a truncated
+    final line, the incomplete tail is deliberately left pending instead of
+    being dead-lettered and checkpointed past.
     """
-    source = outbox_path or DEFAULT_OUTBOX_FILE
-    ledger = evidence_path or DEFAULT_EVIDENCE_LEDGER
-    checkpoint = checkpoint_path or DEFAULT_CHECKPOINT_FILE
-    dead_letter = dead_letter_path or DEFAULT_DEAD_LETTER_FILE
-    if batch_limit < 1:
-        raise ValueError("batch_limit must be >= 1")
-    if not source.exists():
-        return DrainResult(0, 0, 0, 0, False)
+    source_lock = source.parent / f".{source.name}.lock"
+    with registry_lock(source_lock):
+        text = source.read_text(encoding="utf-8")
+    if not text:
+        return []
+    lines = text.splitlines()
+    if not text.endswith("\n") and lines:
+        lines = lines[:-1]
+    return lines
 
+
+def _drain_outbox_locked(
+    *,
+    source: Path,
+    ledger: Path,
+    checkpoint: Path,
+    dead_letter: Path,
+    batch_limit: int,
+    processor: Callable[[dict[str, Any]], None] | None,
+) -> DrainResult:
     start_line = _load_checkpoint(checkpoint)
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        lines = _read_complete_outbox_lines(source)
     except OSError as exc:
         return DrainResult(0, 0, 0, start_line, True, type(exc).__name__)
 
@@ -252,6 +259,43 @@ def drain_outbox_to_evidence_ledger(
         stopped_on_error=stopped,
         error_type=error_type,
     )
+
+
+def drain_outbox_to_evidence_ledger(
+    *,
+    outbox_path: Path | None = None,
+    evidence_path: Path | None = None,
+    checkpoint_path: Path | None = None,
+    dead_letter_path: Path | None = None,
+    batch_limit: int = 100,
+    processor: Callable[[dict[str, Any]], None] | None = None,
+) -> DrainResult:
+    """Consume snapshots after the live path and advance a durable line cursor.
+
+    A processor failure does not advance the failing line, so it can be retried.
+    Malformed complete JSON is moved to a dead-letter stream and the cursor
+    advances. A partial trailing line is never treated as malformed. A dedicated
+    consumer lock prevents two workers from racing the same checkpoint/ledger.
+    """
+    source = outbox_path or DEFAULT_OUTBOX_FILE
+    ledger = evidence_path or DEFAULT_EVIDENCE_LEDGER
+    checkpoint = checkpoint_path or DEFAULT_CHECKPOINT_FILE
+    dead_letter = dead_letter_path or DEFAULT_DEAD_LETTER_FILE
+    if batch_limit < 1:
+        raise ValueError("batch_limit must be >= 1")
+    if not source.exists():
+        return DrainResult(0, 0, 0, 0, False)
+
+    consumer_lock = checkpoint.parent / f".{checkpoint.name}.consumer.lock"
+    with registry_lock(consumer_lock):
+        return _drain_outbox_locked(
+            source=source,
+            ledger=ledger,
+            checkpoint=checkpoint,
+            dead_letter=dead_letter,
+            batch_limit=batch_limit,
+            processor=processor,
+        )
 
 
 def outbox_health(
