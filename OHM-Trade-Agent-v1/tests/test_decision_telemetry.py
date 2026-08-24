@@ -66,14 +66,18 @@ def test_flag_on_writes_one_line_per_candidate(tmp_path):
     settings = _settings(decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True)
     target = tmp_path / "telemetry.jsonl"
     candidates = [_candidate(symbol="AAAUSD"), _candidate(symbol="BBBUSD")]
+    reference_prices = {"AAAUSD": 12.5, "BBBUSD": 0.003}
 
-    written = record_decision_telemetry(candidates, settings=settings, path=target)
+    written = record_decision_telemetry(
+        candidates, settings=settings, reference_prices=reference_prices, path=target
+    )
 
     assert written == 2
     lines = target.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
     row = json.loads(lines[0])
     assert row["symbol"] == "AAAUSD"
+    assert row["price"] == pytest.approx(12.5)
     assert row["schema_version"] == 1
     assert row["scan_source"] == "LIVE"
 
@@ -111,23 +115,64 @@ def test_record_carries_no_execution_authority():
     assert record.production_execution_gate_changed is False
 
 
-def test_price_is_none_when_candidate_has_no_reference_price():
+def test_price_is_none_when_no_reference_price_is_available():
     settings = _settings(decision_telemetry_v1_enabled=True)
     record = build_telemetry_record(_candidate(), settings=settings)
 
     assert record.price is None
 
 
-def test_price_is_read_opportunistically_if_present():
+def test_price_is_read_from_the_reference_prices_mapping():
+    """The primary price path: the same-scan price
+    FullMarketResult.signal_quality_reference_prices already holds for this
+    symbol - not a value read off the candidate, not a new lookup.
+    """
     settings = _settings(decision_telemetry_v1_enabled=True)
-    candidate = _candidate()
+    candidate = _candidate(symbol="TESTUSD")
+
+    record = build_telemetry_record(
+        candidate, settings=settings, reference_prices={"TESTUSD": 42.5}
+    )
+
+    assert record.price == pytest.approx(42.5)
+
+
+def test_reference_prices_mapping_is_keyed_by_upper_cased_symbol():
+    settings = _settings(decision_telemetry_v1_enabled=True)
+    candidate = _candidate(symbol="testusd")
+
+    record = build_telemetry_record(
+        candidate, settings=settings, reference_prices={"TESTUSD": 42.5}
+    )
+
+    assert record.symbol == "TESTUSD"
+    assert record.price == pytest.approx(42.5)
+
+
+def test_price_missing_from_mapping_falls_back_to_opportunistic_attribute():
+    settings = _settings(decision_telemetry_v1_enabled=True)
+    candidate = _candidate(symbol="OTHERUSD")
     # SignalQualityCandidate carries no reference_price field today; simulate
-    # a future candidate object that does, to pin the opportunistic read.
+    # a future candidate object that does, to pin the opportunistic fallback.
     object.__setattr__(candidate, "reference_price", 1.2345)
 
-    record = build_telemetry_record(candidate, settings=settings)
+    record = build_telemetry_record(
+        candidate, settings=settings, reference_prices={"TESTUSD": 42.5}
+    )
 
     assert record.price == pytest.approx(1.2345)
+
+
+def test_reference_prices_mapping_takes_priority_over_opportunistic_attribute():
+    settings = _settings(decision_telemetry_v1_enabled=True)
+    candidate = _candidate(symbol="TESTUSD")
+    object.__setattr__(candidate, "reference_price", 999.0)
+
+    record = build_telemetry_record(
+        candidate, settings=settings, reference_prices={"TESTUSD": 42.5}
+    )
+
+    assert record.price == pytest.approx(42.5)
 
 
 def test_record_round_trips_key_fields():

@@ -202,7 +202,57 @@ _maybe_record_decision_telemetry(full_market, settings)
 No other line in `scan_movers.py` changed. The wrapper is a no-op whenever
 `full_market is None`, and delegates entirely to
 `record_decision_telemetry()`'s own dark-by-default and fail-soft guarantees
-otherwise.
+otherwise. It also passes `full_market.signal_quality_reference_prices`
+through to `record_decision_telemetry` (§2.9) — the one other argument this
+call site carries.
+
+### 2.9 Same-scan reference price (`FullMarketResult.signal_quality_reference_prices`)
+
+`SignalQualityCandidate` (Phase 1) carries no price field, and adding one
+there was explicitly ruled out: it would be a scoring-semantics change for a
+measurement-only phase. Two other shortcuts were ruled out too — a second
+Kraken/ticker request after scoring (an extra market-data fetch this phase
+must not add), and reading a later ticker print (which would silently turn
+"the price OHM actually saw" into "the price some time after"). Instead, the
+exact same-scan price already sitting in memory is exposed read-only:
+
+- `process_full_market_observations()` builds `history: dict[str, list[ObservationSnapshot]]`
+  once per scan. For every observed symbol, `_append_history(...)` appends
+  that scan's `ObservationSnapshot` (`last_price=observation.last_price`) as
+  `history[symbol][-1]` **before** `evaluate_signal_quality(history, ...)` is
+  called with that same dict.
+- `evaluate_signal_quality` feeds that same `history` into
+  `derive_features_for_universe`, which is what actually derives the features
+  each returned `SignalQualityCandidate` is scored from. So
+  `history[candidate.symbol][-1].last_price` is not merely *a* price for that
+  symbol — it is the exact snapshot the candidate's own score came from.
+- Immediately after `candidates = evaluate_signal_quality(...)` succeeds, one
+  more read-only pass (its own independent fail-soft `try`/`except`, so a
+  defect here can never take the already-scored `candidates` down with it)
+  builds:
+  ```python
+  reference_prices = {
+      candidate.symbol: history[candidate.symbol][-1].last_price
+      for candidate in candidates
+      if history.get(candidate.symbol)
+  }
+  ```
+- `FullMarketResult` gains one new additive, defaulted field:
+  `signal_quality_reference_prices: Mapping[str, float] = field(default_factory=dict)`
+  — empty whenever `signal_quality_v1_enabled` is `False`, and containing an
+  entry only for symbols that actually produced a candidate this scan (not
+  "every observed symbol's price").
+- `decision_telemetry.build_telemetry_record()` reads this mapping by
+  `candidate.symbol` as `price`'s primary source, falling back to the
+  existing opportunistic `getattr(candidate, "reference_price", None)` read
+  only if the mapping has no entry — so a future `SignalQualityCandidate`
+  that does gain its own price field is still picked up with no call-site
+  change.
+
+No line of `evaluate_signal_quality`, `derive_features_for_universe`,
+`evaluate_universe`, or anything in `signal_scoring.py` changed. Stage
+determination, alert behaviour, and execution are all untouched — this is a
+read of data the scan already held, exposed one field further out.
 
 ---
 
@@ -218,7 +268,7 @@ used only by tests):
 | `recorded_at` | ISO-8601 UTC | telemetry write time |
 | `scan_source` | str | `"LIVE"` (reserved for future non-live sources) |
 | `symbol` | str | upper-cased |
-| `price` | float \| null | **known limitation — see §5.1** |
+| `price` | float \| null | same-scan price from `signal_quality_reference_prices` (§2.9); `null` only if that mapping has no entry for this symbol |
 | `liquidity_24h_usd_approx` | float | |
 | `stage` | str | |
 | `pattern` | str \| null | |
@@ -259,17 +309,21 @@ locked value without a code change to the dataclass itself.
 
 ## 5. Known limitations
 
-### 5.1 `price` is `None` in every telemetry record
+### 5.1 (Resolved) `price` is populated from the same-scan observation, not from `SignalQualityCandidate`
 
-`SignalQualityCandidate` (Phase 1, `signal_scoring.py`) carries no reference
-price field, and neither does any other part of the existing Signal Quality
-Telegram rendering path — this is a pre-existing gap, not one Phase 3A
-introduced. `build_telemetry_record()` reads a `reference_price` attribute
-opportunistically via `getattr`, so if that field is ever added to
-`SignalQualityCandidate` in a future, separately-approved change, telemetry
-picks it up automatically with no further call-site change. Fixing it now
-would mean touching `signal_scoring.py`, which is deliberately untouched this
-phase.
+An earlier draft of this phase shipped `price = None` in every telemetry
+record, reasoning that `SignalQualityCandidate` carries no price field and
+that adding one there was out of scope. That was corrected before this
+branch's implementation was finalized: `price` is not read off the
+candidate at all. It is read from `FullMarketResult.signal_quality_reference_prices`
+(§2.9) — the exact same-scan `ObservationSnapshot.last_price` that
+`derive_features_for_universe` used to derive that candidate's own score,
+already sitting in `process_full_market_observations()`'s in-memory
+`history` dict. No field was added to `SignalQualityCandidate`, no second
+Kraken/ticker request was made, and no later print is ever substituted.
+`price` is only `None` if `signal_quality_reference_prices` has no entry for
+that symbol — which does not happen for any candidate produced by a live
+scan, since the mapping is built directly from the same candidates list.
 
 ### 5.2 Two originally-proposed ablations are not reachable
 
@@ -314,26 +368,39 @@ added — out of scope for a measurement-only phase.
   stage-timing decomposition, opportunity decay, and both counterfactual
   sweeps (including a "loosening never reduces detections" monotonicity
   check and a "sweeps never mutate the base config" check).
-- `tests/test_decision_telemetry.py` (8 tests) — flag-off no-op, flag-on
-  write-through, empty-candidate-list no-op, fail-soft on a forced write
-  failure, the four safety-invariant fields, the `price` limitation and its
-  opportunistic-read fallback.
-- `tests/test_scan_movers_decision_telemetry_v1.py` (4 tests) — `full_market
+- `tests/test_decision_telemetry.py` (11 tests) — flag-off no-op, flag-on
+  write-through with the price read from `reference_prices`, empty-candidate-
+  list no-op, fail-soft on a forced write failure, the four safety-invariant
+  fields, price sourced from the `reference_prices` mapping (keyed by
+  upper-cased symbol), the opportunistic-attribute fallback when the mapping
+  has no entry, and the mapping taking priority over that fallback when both
+  are present.
+- `tests/test_scan_movers_decision_telemetry_v1.py` (5 tests) — `full_market
   is None` no-op, **both flags at their real defaults write nothing**
   (the explicit "all-flags-off behaviour unchanged" proof), a forced
   exception inside `record_decision_telemetry` never escapes the call site,
-  and an enabled write-through that also asserts `full_market` itself is
-  never mutated by the call site.
+  an enabled write-through that also asserts `full_market` itself is never
+  mutated by the call site, and the same-scan reference price flowing end to
+  end from `FullMarketResult` into the written JSONL record.
+- `tests/test_full_market_observation.py` (10 tests, 5 new for Phase 3A) —
+  `signal_quality_reference_prices` matches the exact same-scan price
+  `evaluate_signal_quality` was called with; empty when Signal Quality is
+  disabled; empty (and candidates still `()`) when scoring itself fails,
+  fail-soft; a failure while *building the price mapping* is independently
+  fail-soft and never discards the already-computed candidates; and the
+  mapping contains only symbols that actually produced a candidate, not
+  every observed symbol.
 - Full Phase 2 regression: `tests/test_signal_quality_phase2.py` — unchanged,
   passing (`CandidateRow`'s two new fields are additive/defaulted; no
   existing test needed modification).
 - Full Phase 1 regression:
   `tests/test_signal_quality_explosion_detection_v1.py`,
   `tests/test_signal_quality_history_state_v1.py`,
-  `tests/test_signal_quality_config_v1.py`, `tests/test_full_market_observation.py`,
-  `tests/test_signal_quality_audit_v1.py` — unchanged, passing.
-- Complete suite: `python -m pytest -q` — **1019 passed**, no failures, no
-  new warnings.
+  `tests/test_signal_quality_config_v1.py`, `tests/test_signal_quality_audit_v1.py`
+  — unchanged, passing.
+- Complete suite: `python -m pytest -q` — **1028 passed**, no failures, no
+  new warnings (6 pre-existing FastAPI/Starlette deprecation warnings,
+  unrelated to this phase).
 - `python -m compileall -q app tests` — clean.
 
 ---
@@ -365,10 +432,22 @@ added — out of scope for a measurement-only phase.
    field, method signature, or control flow changed. The full Phase 2 test
    suite (which constructs `CandidateRow` via keyword arguments throughout)
    passes unmodified.
-6. Nothing in this phase reads or writes `app/core/config.py`'s existing
-   fields, nor any file under `app/services/signal_scoring.py`,
-   `app/services/entry_exit_advisor.py`, `app/services/full_market_observation.py`,
-   or the PendingSetup / confirmation lifecycle.
+6. `full_market_observation.py` *is* touched this phase (§2.9), but only
+   additively: one new, defaulted `FullMarketResult` field
+   (`signal_quality_reference_prices: Mapping[str, float] = field(default_factory=dict)`)
+   and one new read-only block that runs only inside the existing
+   `if signal_quality_enabled:` branch, in its own fail-soft `try`/`except`
+   that cannot affect `candidates`. No existing field, function signature, or
+   control-flow branch changed; `evaluate_signal_quality`,
+   `derive_features_for_universe`, and `evaluate_universe` are called exactly
+   as before with exactly the same arguments.
+   `test_reference_prices_empty_when_signal_quality_disabled` asserts the new
+   field is `{}` whenever `signal_quality_v1_enabled` is `False` - i.e. the
+   same condition that already made `signal_quality_candidates` empty.
+7. Nothing in this phase reads or writes `app/core/config.py`'s existing
+   fields, nor any file under `app/services/signal_scoring.py` or
+   `app/services/entry_exit_advisor.py`, nor the PendingSetup / confirmation
+   lifecycle.
 
 ---
 
@@ -377,14 +456,24 @@ added — out of scope for a measurement-only phase.
 Suggested review order:
 
 1. `app/core/config.py` diff (one field, one comment block).
-2. `app/services/decision_telemetry.py` in full (new file, ~190 lines) —
+2. `app/services/decision_telemetry.py` in full (new file, ~205 lines) —
    confirm the three safety properties (§2.8) hold by inspection, then check
    `tests/test_decision_telemetry.py` proves each one.
 3. `app/jobs/scan_movers.py` diff (one import, one function, one call site) —
    confirm no existing line changed, then check
    `tests/test_scan_movers_decision_telemetry_v1.py`, especially
-   `test_both_flags_off_by_default_writes_nothing`.
-4. `app/services/signal_quality_phase2.py` diff — confirm both new
+   `test_both_flags_off_by_default_writes_nothing` and
+   `test_reference_prices_flow_from_full_market_to_the_written_record`.
+4. `app/services/full_market_observation.py` diff (§2.9) — confirm the new
+   `signal_quality_reference_prices` field is additive/defaulted, that its
+   population sits inside the existing `if signal_quality_enabled:` branch in
+   its own fail-soft `try`/`except`, and that `history[candidate.symbol][-1]`
+   really is the same snapshot `evaluate_signal_quality` was called with (not
+   a re-fetch or a value read after scoring). Check
+   `tests/test_full_market_observation.py`'s five new cases, especially
+   `test_reference_prices_match_the_same_scan_price_used_for_scoring` and
+   `test_reference_price_lookup_failure_is_fail_soft_and_never_touches_candidates`.
+5. `app/services/signal_quality_phase2.py` diff — confirm both new
    `CandidateRow` fields are optional/defaulted and both new
    `SymbolTimeline` methods (`forward_extreme`, `price_asof`) are additive
    siblings of the existing `forward_maxima`/`index_before`, not
@@ -392,17 +481,21 @@ Suggested review order:
    (in `signal_timing_v2`'s test file, but exercising this module's
    `determine_stage`) actually imports and calls the real production
    function, not a copy.
-5. `app/services/signal_timing_v2.py` in full (new file) — the gate-status
+6. `app/services/signal_timing_v2.py` in full (new file) — the gate-status
    diagnosis (§2.1) is the module's most safety-relevant piece, since it is
    what will be used to explain future DRV-style cases; review it alongside
    `determine_stage()` in `signal_scoring.py` line by line for threshold and
    comparison-operator parity.
-6. §5 (known limitations) — confirm each is an honest scope boundary, not a
-   masked defect.
+7. §5 (known limitations) — confirm each remaining one is an honest scope
+   boundary, not a masked defect, and that §5.1's resolution actually holds
+   (no `signal_scoring.py` change, no second market-data fetch, no later
+   price substituted).
 
 Independent review should specifically check for: any path by which a
 telemetry write could throw into the scoring/alerting path (traced through
 `record_decision_telemetry`'s try/except and `_maybe_record_decision_telemetry`'s
-own); any path by which a counterfactual sweep result could be mistaken for,
-or accidentally merged into, the current-production report; and any drift
-between `evaluate_stage_gates`'s thresholds and `determine_stage`'s.
+own); any path by which building `signal_quality_reference_prices` could
+throw into or delay the `candidates` result it's computed alongside; any path
+by which a counterfactual sweep result could be mistaken for, or accidentally
+merged into, the current-production report; and any drift between
+`evaluate_stage_gates`'s thresholds and `determine_stage`'s.

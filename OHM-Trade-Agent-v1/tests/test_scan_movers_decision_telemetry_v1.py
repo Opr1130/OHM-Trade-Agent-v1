@@ -58,6 +58,7 @@ def _full_market(**overrides) -> FullMarketResult:
         transition_alerts=(),
         signal_quality_enabled=True,
         signal_quality_candidates=(_candidate(),),
+        signal_quality_reference_prices={"TESTUSD": 55.5},
     )
     fields.update(overrides)
     return FullMarketResult(**fields)
@@ -116,13 +117,41 @@ def test_enabled_flags_write_through_to_disk(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "app.jobs.scan_movers.record_decision_telemetry",
-        lambda candidates, *, settings: real_record(candidates, settings=settings, path=target),
+        lambda candidates, *, settings, reference_prices=None: real_record(
+            candidates, settings=settings, reference_prices=reference_prices, path=target
+        ),
     )
 
     full_market = _full_market()
     _maybe_record_decision_telemetry(full_market, settings)
 
     assert target.exists()
-    assert len(target.read_text(encoding="utf-8").strip().splitlines()) == 1
+    lines = target.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
     # The call site must not mutate full_market itself.
     assert full_market == replace(full_market)
+
+
+def test_reference_prices_flow_from_full_market_to_the_written_record(tmp_path):
+    """The exact same-scan price on FullMarketResult must reach the telemetry
+    file, end to end through _maybe_record_decision_telemetry - no lookup,
+    no fetch, and no later price substituted along the way.
+    """
+    import json
+
+    settings = _settings(decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True)
+    target = tmp_path / "telemetry.jsonl"
+    full_market = _full_market(signal_quality_reference_prices={"TESTUSD": 55.5})
+
+    from app.services import decision_telemetry as telemetry_module
+
+    original_default = telemetry_module.DEFAULT_TELEMETRY_FILE
+    telemetry_module.DEFAULT_TELEMETRY_FILE = target
+    try:
+        _maybe_record_decision_telemetry(full_market, settings)
+    finally:
+        telemetry_module.DEFAULT_TELEMETRY_FILE = original_default
+
+    row = json.loads(target.read_text(encoding="utf-8").strip().splitlines()[0])
+    assert row["symbol"] == "TESTUSD"
+    assert row["price"] == pytest.approx(55.5)

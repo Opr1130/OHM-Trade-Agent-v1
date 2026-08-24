@@ -50,6 +50,7 @@ def _maybe_record_decision_telemetry(full_market, settings) -> None:
         record_decision_telemetry(
             full_market.signal_quality_candidates,
             settings=settings,
+            reference_prices=full_market.signal_quality_reference_prices,
         )
     except Exception as exc:
         print("Decision telemetry: fail-soft", type(exc).__name__)

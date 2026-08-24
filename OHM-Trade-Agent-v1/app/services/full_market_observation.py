@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.exchanges.kraken import KrakenClient
 from app.scanner.universe import TICKER_BATCH_SIZE, _is_excluded_market, _market_symbols
@@ -107,6 +107,14 @@ class FullMarketResult:
     # dark and the legacy Broad Watch path is untouched while it is off.
     signal_quality_candidates: tuple[SignalQualityCandidate, ...] = ()
     signal_quality_enabled: bool = False
+    # Phase 3A: the exact same-scan observation price each candidate in
+    # signal_quality_candidates was derived from, keyed by symbol. Read
+    # straight out of the in-memory history this scan already built for
+    # evaluate_signal_quality() - not a second lookup, not a later print, and
+    # not a new market-data fetch. Empty whenever signal_quality_enabled is
+    # False. Exists so telemetry (Phase 3A) can record a real decision price
+    # without SignalQualityCandidate itself needing one.
+    signal_quality_reference_prices: Mapping[str, float] = field(default_factory=dict)
 
 
 def _finite(*values: float) -> bool:
@@ -585,6 +593,7 @@ def process_full_market_observations(
         state["observed_markets_last_scan"] = len(observations)
         save_json_atomic(state_target, state)
 
+    reference_prices: dict[str, float] = {}
     if signal_quality_enabled:
         # Scoring is pure CPU over an in-memory copy, so it runs outside the
         # registry lock rather than holding it across the whole universe.
@@ -597,6 +606,21 @@ def process_full_market_observations(
             # learning stream it feeds.
             candidates = ()
             print("Signal Quality v1: fail-soft", type(exc).__name__)
+
+        try:
+            # Same-scan price each candidate was actually derived from - the
+            # last entry history[symbol] already holds after this scan's
+            # _append_history call, not a second lookup or a later print.
+            # Phase 3A telemetry (app/services/decision_telemetry.py) is the
+            # only consumer; nothing here changes scoring or stage output.
+            reference_prices = {
+                candidate.symbol: history[candidate.symbol][-1].last_price
+                for candidate in candidates
+                if history.get(candidate.symbol)
+            }
+        except Exception as exc:
+            reference_prices = {}
+            print("Signal Quality v1 reference prices: fail-soft", type(exc).__name__)
 
     transitions.sort(key=lambda row: (-row.score, -row.liquidity_24h_usd_approx, row.symbol))
 
@@ -623,4 +647,5 @@ def process_full_market_observations(
         transition_alerts=tuple(transitions),
         signal_quality_candidates=candidates,
         signal_quality_enabled=signal_quality_enabled,
+        signal_quality_reference_prices=reference_prices,
     )

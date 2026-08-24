@@ -26,12 +26,15 @@ Three properties make this safe to turn on:
 The write path mirrors ``app/services/candidate_trace.py``: an append-only
 JSONL file behind a ``registry_lock``, one line per record, secret-free.
 
-Known limitation, carried honestly rather than worked around: ``price`` is
-``None`` in every Phase 3A record. ``SignalQualityCandidate`` (Phase 1) does
-not carry a reference price - no part of the existing Signal Quality Telegram
-path does either, so this is a pre-existing gap, not one Phase 3A introduced.
-Fixing it means adding a field to ``signal_scoring.py``, which is deliberately
-untouched this phase; see SIGNAL_QUALITY_PHASE3A.md.
+``price`` is the exact same-scan observation price each candidate was scored
+from - not a value carried by ``SignalQualityCandidate`` itself (Phase 1's
+scorer has no price field, and never has), and not a second market-data
+lookup. ``app.services.full_market_observation.process_full_market_observations``
+already holds this price in memory for the same scan it derives features
+from, and exposes it read-only on ``FullMarketResult.signal_quality_reference_prices``
+(a ``{symbol: price}`` mapping, empty unless Signal Quality is enabled). This
+module only ever reads that mapping; it never fetches, derives, or requests a
+price of its own. See SIGNAL_QUALITY_PHASE3A.md §2.5 for the full data path.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from app.services.registry_io import registry_lock
 
@@ -59,13 +62,11 @@ class DecisionTelemetryRecord:
     recorded_at: str
     scan_source: str  # "LIVE" - reserved for future non-live sources
     symbol: str
-    # KNOWN LIMITATION (documented in SIGNAL_QUALITY_PHASE3A.md): Signal
-    # Quality v1's SignalQualityCandidate does not carry a reference price -
-    # neither does the rest of the Phase 1 signal-quality Telegram path, this
-    # is a pre-existing gap, not one Phase 3A introduced. Adding one is a
-    # minimal, additive change to signal_scoring.py, which is deliberately
-    # untouched this phase. price is therefore None until that follow-up is
-    # separately approved and shipped.
+    # The same-scan observation price this candidate was scored from, read
+    # from FullMarketResult.signal_quality_reference_prices (see module
+    # docstring). None only when that mapping has no entry for this symbol -
+    # e.g. a candidate built outside the live scan_movers.py path, such as in
+    # a unit test that does not supply one.
     price: float | None
     liquidity_24h_usd_approx: float
     stage: str
@@ -102,29 +103,32 @@ def build_telemetry_record(
     candidate: Any,
     *,
     settings: Any,
+    reference_prices: Mapping[str, float] | None = None,
     now: datetime | None = None,
 ) -> DecisionTelemetryRecord:
     """Convert one live ``SignalQualityCandidate`` into a telemetry record.
 
     Reads only public attributes already present on the candidate (the same
     object ``scan_movers.py`` already has after scoring); derives nothing new
-    and calls no external service.
+    and calls no external service. ``reference_prices`` is the same-scan
+    ``{symbol: price}`` mapping from
+    ``FullMarketResult.signal_quality_reference_prices`` - this function only
+    reads it by key, it never fetches or computes a price itself.
     """
     now = now or datetime.now(timezone.utc)
+    symbol = str(getattr(candidate, "symbol", "") or "").upper()
+    price = (reference_prices or {}).get(symbol)
+    if price is None:
+        # Opportunistic fallback only: no candidate carries this attribute
+        # today, but this keeps the record correct with no call-site change
+        # if one ever does.
+        price = getattr(candidate, "reference_price", None)
     return DecisionTelemetryRecord(
         schema_version=SCHEMA_VERSION,
         recorded_at=now.astimezone(timezone.utc).isoformat(),
         scan_source="LIVE",
-        symbol=str(getattr(candidate, "symbol", "") or "").upper(),
-        # See the field-level comment on DecisionTelemetryRecord.price: not
-        # available on SignalQualityCandidate in Phase 1 as shipped. Read
-        # opportunistically in case a future SignalQualityCandidate gains the
-        # field, so this call site does not need to change again to pick it up.
-        price=(
-            float(candidate.reference_price)
-            if getattr(candidate, "reference_price", None) is not None
-            else None
-        ),
+        symbol=symbol,
+        price=(float(price) if price is not None else None),
         liquidity_24h_usd_approx=float(getattr(candidate, "liquidity_24h_usd_approx", 0.0) or 0.0),
         stage=str(getattr(candidate, "stage", "") or ""),
         pattern=getattr(candidate, "pattern", None),
@@ -152,10 +156,16 @@ def record_decision_telemetry(
     candidates: Iterable[Any],
     *,
     settings: Any,
+    reference_prices: Mapping[str, float] | None = None,
     path: Path | None = None,
     now: datetime | None = None,
 ) -> int:
     """Append one telemetry line per candidate. Returns the count written.
+
+    ``reference_prices`` should be the same-scan
+    ``FullMarketResult.signal_quality_reference_prices`` mapping the caller
+    already has; passed straight through to ``build_telemetry_record`` with
+    no lookup, fetch, or derivation performed here.
 
     Fail-soft and dark-by-default in the same call: if the flag is off, or
     anything at all goes wrong, this returns 0 and raises nothing. Callers
@@ -176,7 +186,12 @@ def record_decision_telemetry(
         with registry_lock(lock):
             with target.open("a", encoding="utf-8") as handle:
                 for candidate in rows:
-                    record = build_telemetry_record(candidate, settings=settings, now=now)
+                    record = build_telemetry_record(
+                        candidate,
+                        settings=settings,
+                        reference_prices=reference_prices,
+                        now=now,
+                    )
                     handle.write(
                         json.dumps(record.as_dict(), sort_keys=True, default=str, allow_nan=False)
                         + "\n"
