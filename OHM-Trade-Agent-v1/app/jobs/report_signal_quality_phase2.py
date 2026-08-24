@@ -4,7 +4,8 @@ Read-only and offline by default. OHLC peak comparison is opt-in via --ohlc
 because it performs public network reads; even with OHLC, timing/class metrics
 remain event-sampled and the report stays PROVISIONAL_EVENT_SAMPLED_REPLAY.
 Normal replay never writes a file; only explicit --write-ohlc-cache does so.
-External review orchestration does not alter replay or trading behaviour.
+External review orchestration does not alter replay or trading behaviour, and
+external model feedback remains advisory until independently validated.
 """
 
 from __future__ import annotations
