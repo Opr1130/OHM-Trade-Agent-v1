@@ -5,7 +5,8 @@ because it performs public network reads; even with OHLC, timing/class metrics
 remain event-sampled and the report stays PROVISIONAL_EVENT_SAMPLED_REPLAY.
 Normal replay never writes a file; only explicit --write-ohlc-cache does so.
 External review orchestration does not alter replay or trading behaviour, and
-external model feedback remains advisory until independently validated.
+external model feedback remains advisory until independently validated; it
+cannot change production settings or execution authority.
 """
 
 from __future__ import annotations
