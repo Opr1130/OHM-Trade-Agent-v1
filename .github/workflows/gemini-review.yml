@@ -1,0 +1,138 @@
+name: Gemini PR Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GEMINI_MODEL: gemini-3.7-flash
+
+    steps:
+      - name: Checkout review configuration
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Validate inputs and secret
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "Invalid PR number"; exit 64; }
+          [ -n "$GEMINI_API_KEY" ] || { echo "GEMINI_API_KEY is missing"; exit 65; }
+
+      - name: Fetch pull request diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > /tmp/pr.diff
+          test -s /tmp/pr.diff || { echo "PR diff is empty"; exit 66; }
+          bytes=$(wc -c < /tmp/pr.diff)
+          echo "PR diff bytes: $bytes"
+          if [ "$bytes" -gt 500000 ]; then
+            echo "PR diff exceeds 500000-byte review limit; split the review or narrow the PR."
+            exit 67
+          fi
+
+      - name: Ask Gemini for independent review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
+
+          prompt = pathlib.Path('.github/gemini/review_prompt.md').read_text(encoding='utf-8')
+          diff = pathlib.Path('/tmp/pr.diff').read_text(encoding='utf-8', errors='replace')
+          pr_number = os.environ['PR_NUMBER']
+          model = os.environ['GEMINI_MODEL']
+          api_key = os.environ['GEMINI_API_KEY']
+
+          payload = {
+              'system_instruction': {
+                  'parts': [{'text': prompt}],
+              },
+              'contents': [{
+                  'role': 'user',
+                  'parts': [{
+                      'text': (
+                          f'Review OHM Trade Agent pull request #{pr_number}. '
+                          'Base every finding on this diff and the supplied OHM review rules. '
+                          'If a conclusion requires repository context not present here, say so explicitly.\n\n'
+                          '--- BEGIN PR DIFF ---\n'
+                          + diff
+                          + '\n--- END PR DIFF ---\n'
+                      )
+                  }],
+              }],
+              'generationConfig': {
+                  'temperature': 0.2,
+                  'maxOutputTokens': 8192,
+              },
+          }
+
+          request = urllib.request.Request(
+              f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
+              data=json.dumps(payload).encode('utf-8'),
+              headers={
+                  'Content-Type': 'application/json',
+                  'x-goog-api-key': api_key,
+              },
+              method='POST',
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=180) as response:
+                  body = json.loads(response.read().decode('utf-8'))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode('utf-8', errors='replace')
+              raise SystemExit(f'Gemini API HTTP {exc.code}: {detail[:2000]}') from exc
+
+          candidates = body.get('candidates') or []
+          if not candidates:
+              raise SystemExit('Gemini returned no review candidate')
+
+          parts = ((candidates[0].get('content') or {}).get('parts') or [])
+          text = '\n'.join(str(part.get('text') or '') for part in parts).strip()
+          if not text:
+              raise SystemExit('Gemini returned an empty review')
+
+          output = (
+              '## Gemini Independent Review\n\n'
+              f'> Model: `{model}` · PR: #{pr_number} · Trigger: manual GitHub Action\n\n'
+              + text
+              + '\n\n---\n'
+              '_AI review is advisory. Findings require human/independent validation before merge or production changes._\n'
+          )
+          pathlib.Path('/tmp/gemini-review.md').write_text(output, encoding='utf-8')
+          PY
+
+      - name: Post Gemini review to pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/gemini-review.md
