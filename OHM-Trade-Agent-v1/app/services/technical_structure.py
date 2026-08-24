@@ -123,17 +123,37 @@ def _last_breaks(
 def _structure_sequence_bias(
     highs: Sequence[SwingPoint], lows: Sequence[SwingPoint]
 ) -> tuple[str, bool]:
+    """Classify the latest HH/HL or LH/LL relationship and a strict transition.
+
+    ``change_of_character`` is intentionally conservative: it is True only
+    when a previously complete bullish relationship flips to a complete bearish
+    relationship, or vice versa. A mixed compression such as LH + HL remains
+    ``MIXED`` but is not labeled CHoCH merely because it is non-trending.
+    """
     if len(highs) < 2 or len(lows) < 2:
         return BIAS_INSUFFICIENT, False
-    h1, h2 = highs[-2], highs[-1]
-    l1, l2 = lows[-2], lows[-1]
-    bullish = h2.price > h1.price and l2.price > l1.price
-    bearish = h2.price < h1.price and l2.price < l1.price
-    if bullish:
-        return BIAS_BULLISH, False
-    if bearish:
-        return BIAS_BEARISH, False
-    return BIAS_MIXED, True
+
+    h_prev, h_now = highs[-2], highs[-1]
+    l_prev, l_now = lows[-2], lows[-1]
+    bullish_now = h_now.price > h_prev.price and l_now.price > l_prev.price
+    bearish_now = h_now.price < h_prev.price and l_now.price < l_prev.price
+
+    if bullish_now:
+        bias = BIAS_BULLISH
+    elif bearish_now:
+        bias = BIAS_BEARISH
+    else:
+        return BIAS_MIXED, False
+
+    if len(highs) < 3 or len(lows) < 3:
+        return bias, False
+
+    h_old = highs[-3]
+    l_old = lows[-3]
+    bullish_before = h_prev.price > h_old.price and l_prev.price > l_old.price
+    bearish_before = h_prev.price < h_old.price and l_prev.price < l_old.price
+    choch = (bullish_before and bearish_now) or (bearish_before and bullish_now)
+    return bias, choch
 
 
 def latest_fvg_zone(bars: Sequence[StructureBar]) -> tuple[float | None, float | None]:
@@ -174,12 +194,12 @@ def latest_liquidity_sweep(
 def breakout_retest_state(
     bars: Sequence[StructureBar], breakout_level: float | None, *, bullish: bool
 ) -> str | None:
-    """Classify the first retest after the first qualifying break of a level.
+    """Classify retest state after the first qualifying break of a level.
 
-    Later continuation closes beyond the same level must not move the breakout
-    timestamp forward; doing so can erase an already-observed retest. A failed
-    retest is terminal for this breakout event, while a touch that closes back
-    on the breakout side is reported as held.
+    The first break anchors the event. A held touch is provisional until the
+    decision-time endpoint: any later close through the breakout level upgrades
+    the same event to ``FAILED``. This prevents an old held retest from masking
+    subsequent structural invalidation.
     """
     if breakout_level is None or len(bars) < 2:
         return None
@@ -193,13 +213,20 @@ def breakout_retest_state(
             break
     if break_idx is None or break_idx == len(bars) - 1:
         return RETEST_NOT_SEEN
-    post = bars[break_idx + 1 :]
-    for bar in post:
-        if bullish and bar.low <= breakout_level:
-            return RETEST_FAILED if bar.close < breakout_level else RETEST_HELD
-        if not bullish and bar.high >= breakout_level:
-            return RETEST_FAILED if bar.close > breakout_level else RETEST_HELD
-    return RETEST_NOT_SEEN
+
+    held_seen = False
+    for bar in bars[break_idx + 1 :]:
+        if bullish:
+            if bar.close < breakout_level:
+                return RETEST_FAILED
+            if bar.low <= breakout_level and bar.close >= breakout_level:
+                held_seen = True
+        else:
+            if bar.close > breakout_level:
+                return RETEST_FAILED
+            if bar.high >= breakout_level and bar.close <= breakout_level:
+                held_seen = True
+    return RETEST_HELD if held_seen else RETEST_NOT_SEEN
 
 
 def analyze_technical_structure(
@@ -257,7 +284,7 @@ def analyze_technical_structure(
     if bear_break is not None:
         reasons.append(f"BOS bearish close below {bear_break:.8g}")
     if choch:
-        reasons.append("mixed HH/HL vs LH/LL sequence (CHoCH-style transition)")
+        reasons.append("confirmed HH/HL to LH/LL or LH/LL to HH/HL transition (CHoCH-style)")
     if zone_low is not None and zone_high is not None:
         reasons.append(f"measurable imbalance zone {zone_low:.8g}-{zone_high:.8g}")
     if sweep:
