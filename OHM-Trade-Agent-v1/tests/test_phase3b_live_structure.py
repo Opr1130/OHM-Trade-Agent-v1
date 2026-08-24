@@ -74,10 +74,6 @@ def test_canonical_pair_preserves_spot_quote_and_slash():
 def test_still_forming_15m_candle_is_excluded():
     # 17:45 candle closed at 18:00 and is eligible. 18:00 closes at 18:15 and
     # must not be visible to a decision made at 18:07.
-    candles = [
-        candle(1_777_? if False else 0, 1, 1, 1, 1),
-    ]
-    # Use literal epoch values generated from UTC datetimes for readability.
     closed_open = int(datetime(2026, 8, 24, 17, 45, tzinfo=timezone.utc).timestamp())
     forming_open = int(datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc).timestamp())
     bars = _completed_structure_bars(
@@ -97,7 +93,7 @@ def test_collector_uses_completed_bars_and_existing_ranked_candidate_order():
     rows = []
     price = 10.0
     for i in range(97):
-        opened = int((start.timestamp()) + i * 15 * 60)
+        opened = int(start.timestamp() + i * 15 * 60)
         # Deterministic oscillation creates confirmed swings without relying on
         # the still-forming endpoint candle.
         bump = (i % 6) * 0.08
