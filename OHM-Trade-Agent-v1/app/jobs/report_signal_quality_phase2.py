@@ -6,7 +6,8 @@ remain event-sampled and the report stays PROVISIONAL_EVENT_SAMPLED_REPLAY.
 Normal replay never writes a file; only explicit --write-ohlc-cache does so.
 External review orchestration does not alter replay or trading behaviour, and
 external model feedback remains advisory until independently validated; it
-cannot change production settings or execution authority.
+cannot change production settings or execution authority. Review workflows
+consume the PR diff only as untrusted analysis input and never execute it.
 """
 
 from __future__ import annotations
