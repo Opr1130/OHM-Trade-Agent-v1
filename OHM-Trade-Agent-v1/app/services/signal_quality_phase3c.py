@@ -105,8 +105,9 @@ def join_point_in_time_evidence(
     """Join evidence strictly on canonical symbol + original decision time.
 
     `outcomes` are offline labels and are never copied into any live feature
-    contract. A missing episode id is kept explicit as an isolated snapshot
-    episode so the caller cannot accidentally pseudo-replicate a named episode.
+    contract. A missing episode id is marked ``UNASSIGNED`` and is excluded
+    from episode-level statistics; Phase 3C never treats repeated snapshots as
+    independent episodes merely because episode mapping is unavailable.
     """
     structure_by_key = {
         _key(row.get("symbol", ""), row.get("recorded_at", row.get("decision_at_utc", ""))): row
@@ -138,7 +139,7 @@ def join_point_in_time_evidence(
         episode_id = (
             (episode_ids or {}).get(join_key)
             or str(outcome.get("episode_id", "") or "")
-            or f"SNAPSHOT:{snapshot_id}"
+            or f"UNASSIGNED:{snapshot_id}"
         )
 
         joined.append(
@@ -192,8 +193,15 @@ def join_point_in_time_evidence(
 
 
 def deduplicate_first_per_episode(rows: Sequence[Phase3CRow]) -> list[Phase3CRow]:
+    """Return the earliest decision per independently mapped episode.
+
+    Rows without a Phase-2/forward-outcome episode identity are deliberately
+    excluded rather than silently counted as independent observations.
+    """
     first: dict[str, Phase3CRow] = {}
     for row in sorted(rows, key=lambda item: (item.decision_at_utc, item.symbol)):
+        if not row.episode_id or row.episode_id.startswith("UNASSIGNED:"):
+            continue
         current = first.get(row.episode_id)
         if current is None or row.decision_at_utc < current.decision_at_utc:
             first[row.episode_id] = row
@@ -360,9 +368,16 @@ def build_phase3c_report(
     bootstrap_resamples: int = BOOTSTRAP_RESAMPLES,
     seed: int = 42,
 ) -> dict[str, Any]:
+    unassigned_snapshot_rows = sum(
+        1 for row in rows
+        if not row.episode_id or row.episode_id.startswith("UNASSIGNED:")
+    )
     episodes = deduplicate_first_per_episode(rows)
     split = chronological_split(episodes)
     test_count = len(split.test)
+    test_primary_outcomes = sum(
+        1 for row in split.test if row.return_4h_pct is not None
+    )
 
     required_baseline = [
         row
@@ -380,6 +395,7 @@ def build_phase3c_report(
         episodes
         and baseline_completeness >= 0.95
         and test_count >= min_holdout_episodes
+        and test_primary_outcomes >= min_holdout_episodes
     )
 
     return {
@@ -394,6 +410,8 @@ def build_phase3c_report(
         "split": split.as_dict(),
         "data_quality": {
             "baseline_completeness": baseline_completeness,
+            "unassigned_snapshot_rows": unassigned_snapshot_rows,
+            "test_primary_outcome_episodes": test_primary_outcomes,
             "complete_24h_outcomes": complete_outcomes,
             "top8_structure_cohort_episodes": top8_count,
             "top8_structure_cohort_fraction": top8_count / len(episodes) if episodes else 0.0,
