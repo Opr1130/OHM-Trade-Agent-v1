@@ -85,7 +85,9 @@ jobs:
               accept="application/vnd.github.v3.diff",
           ).decode("utf-8", errors="replace")
 
-          max_diff_chars = 180_000
+          # V4 Pro has a 1M-token context window. Keep an explicit, bounded diff
+          # cap while allowing the ~4k-line Phase 2 review target to fit.
+          max_diff_chars = 500_000
           if len(diff) > max_diff_chars:
               raise SystemExit(
                   f"PR diff is {len(diff):,} characters, above safe review limit "

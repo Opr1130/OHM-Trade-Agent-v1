@@ -1,0 +1,26 @@
+name: Dispatch PR69 Multimodel Reviews Once
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/run-pr69-reviews-once.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch Gemini and DeepSeek reviews for PR 69
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run gemini-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
+          gh workflow run deepseek-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
+          echo "Dispatched Gemini and DeepSeek reviews for PR #69."
