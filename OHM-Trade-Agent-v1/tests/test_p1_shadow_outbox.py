@@ -115,6 +115,27 @@ def test_malformed_row_goes_to_dead_letter_and_does_not_block(tmp_path):
     assert json.loads(dead.read_text().strip())["measurement_only"] is True
 
 
+def test_partial_trailing_row_is_left_pending_not_dead_lettered(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    dead = tmp_path / "dead.jsonl"
+    outbox.write_text('{"snapshot_id":"S1"', encoding="utf-8")
+
+    result = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        dead_letter_path=dead,
+    )
+
+    assert result.processed == 0
+    assert result.malformed == 0
+    assert not checkpoint.exists()
+    assert not dead.exists()
+    assert outbox_health(outbox_path=outbox, checkpoint_path=checkpoint)["backlog_rows"] == 1
+
+
 def test_processor_failure_does_not_advance_failing_line(tmp_path):
     outbox = tmp_path / "outbox.jsonl"
     checkpoint = tmp_path / "checkpoint.json"
