@@ -3,6 +3,7 @@
 Read-only and offline by default. OHLC peak comparison is opt-in via --ohlc
 because it performs public network reads; even with OHLC, timing/class metrics
 remain event-sampled and the report stays PROVISIONAL_EVENT_SAMPLED_REPLAY.
+Normal replay never writes a file; only explicit --write-ohlc-cache does so.
 """
 
 from __future__ import annotations
@@ -54,8 +55,8 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Compare against a local OHLC cache instead of the network. Offline "
-            "and reproducible. Build one with --write-ohlc-cache."
+            "Compare peak magnitude against a local OHLC cache instead of the network. "
+            "Timing/classes remain event-sampled. Build one with --write-ohlc-cache."
         ),
     )
     parser.add_argument(
