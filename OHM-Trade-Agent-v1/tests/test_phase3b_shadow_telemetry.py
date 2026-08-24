@@ -1,11 +1,13 @@
 import json
 from datetime import datetime, timezone
 
+from app.services.phase3b_live_structure import Phase3BStructureSample
 from app.services.phase3b_shadow_telemetry import (
     build_phase3b_shadow_record,
     record_phase3b_shadow_telemetry,
 )
 from app.services.signal_scoring import SignalQualityCandidate
+from app.services.technical_structure import TechnicalStructureContext
 
 NOW = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
 
@@ -37,6 +39,36 @@ def candidate(**overrides):
     )
     fields.update(overrides)
     return SignalQualityCandidate(**fields)
+
+
+def structure_sample(**overrides):
+    context = TechnicalStructureContext(
+        symbol="TESTUSD",
+        observed_at=NOW,
+        bias="BULLISH",
+        last_swing_high=10.4,
+        last_swing_low=9.6,
+        bullish_break_level=10.0,
+        bearish_break_level=None,
+        change_of_character=False,
+        imbalance_zone_low=9.9,
+        imbalance_zone_high=10.0,
+        liquidity_sweep="LOW_SWEEP_RECLAIM",
+        retest_state="HELD",
+        distance_from_breakout_pct=2.0,
+        reasons=("BOS bullish close above 10", "retest: HELD"),
+    )
+    fields = dict(
+        symbol="TESTUSD",
+        status="AVAILABLE_COMPLETED_KRAKEN_SPOT_OHLC",
+        kraken_pair="TEST/USD",
+        interval_minutes=15,
+        completed_bar_count=96,
+        latest_completed_at=NOW,
+        context=context,
+    )
+    fields.update(overrides)
+    return Phase3BStructureSample(**fields)
 
 
 def test_shadow_record_is_measurement_only_and_never_authoritative():
@@ -81,9 +113,32 @@ def test_structure_is_explicitly_unavailable_not_fabricated():
     )
     assert row.structure_status == "UNAVAILABLE_NO_COMPLETED_OHLC_HISTORY"
     assert row.structure_bias is None
-    assert row.breakout_level is None
+    assert row.bullish_break_level is None
+    assert row.bearish_break_level is None
     assert row.retest_state is None
     assert row.retest_available is False
+
+
+def test_completed_ohlc_structure_is_recorded_and_enriches_chase_context():
+    sample = structure_sample()
+    row = build_phase3b_shadow_record(
+        candidate(),
+        reference_prices={"TESTUSD": 10.2},
+        structure_samples={"TESTUSD": sample},
+        now=NOW,
+    )
+    assert row.schema_version == 2
+    assert row.structure_status == "AVAILABLE_COMPLETED_KRAKEN_SPOT_OHLC"
+    assert row.structure_pair == "TEST/USD"
+    assert row.structure_interval_minutes == 15
+    assert row.structure_completed_bars == 96
+    assert row.structure_bias == "BULLISH"
+    assert row.bullish_break_level == 10.0
+    assert row.breakout_level_used_for_chase == 10.0
+    assert row.retest_state == "HELD"
+    assert row.retest_available is True
+    assert row.liquidity_sweep == "LOW_SWEEP_RECLAIM"
+    assert row.structure_reasons
 
 
 def test_shadow_score_uses_only_point_in_time_available_inputs():
