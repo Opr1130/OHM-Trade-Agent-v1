@@ -290,6 +290,13 @@ class CandidateRow:
     liquidity_24h_usd_approx: float
     pattern: str | None
     reasons: tuple[str, ...]
+    # Phase 3A additions. Optional and defaulted so every existing keyword
+    # construction of this dataclass (tests included) stays valid unchanged.
+    # Populated from the same SymbolFeatures already computed for this scan;
+    # no new feature derivation, just retaining values that already existed
+    # and were previously discarded after scoring.
+    distance_from_24h_high_pct: float | None = None
+    lift_from_24h_low_pct: float | None = None
 
     @property
     def is_detection(self) -> bool:
@@ -571,6 +578,7 @@ def replay_signal_quality(
             cell = frame.cells.get(candidate.symbol)
             if cell is None or cell.snapshot.last_price <= 0:
                 continue
+            symbol_features = features.get(candidate.symbol)
             row = CandidateRow(
                 scan_at=frame.scan_at,
                 symbol=candidate.symbol,
@@ -588,6 +596,12 @@ def replay_signal_quality(
                 liquidity_24h_usd_approx=candidate.liquidity_24h_usd_approx,
                 pattern=candidate.pattern,
                 reasons=tuple(candidate.reasons),
+                distance_from_24h_high_pct=(
+                    symbol_features.distance_from_24h_high_pct if symbol_features else None
+                ),
+                lift_from_24h_low_pct=(
+                    symbol_features.lift_from_24h_low_pct if symbol_features else None
+                ),
             )
             if row.is_detection:
                 detections.append(row)
@@ -653,6 +667,88 @@ class SymbolTimeline:
                 window.popleft()
             result.append(self.prices[window[0]] if window else None)
         return result
+
+    def forward_extreme(
+        self,
+        query_times: Sequence[datetime],
+        horizon: timedelta,
+        *,
+        mode: str = "max",
+    ) -> list[tuple[float, datetime] | None]:
+        """Extremum price and its timestamp over ``(t, t + horizon]``, per query time.
+
+        A new primitive alongside ``forward_maxima`` (which returns only a
+        value): Phase 3A's MFE/MAE need "time to extremum" as well as the
+        extremum itself, and MAE needs the minimum, not the maximum.
+        ``forward_maxima`` is left untouched so its existing callers and tests
+        are unaffected; this method implements the same strictly-exclusive,
+        O(n + m) monotonic-deque sweep independently, so it carries no risk of
+        perturbing Phase 2's already-validated behaviour.
+
+        ``query_times`` must be ascending, matching ``forward_maxima``'s
+        contract - both sweep the timeline once, forward, in step with the
+        queries.
+        """
+        if not query_times:
+            return []
+        better = (lambda a, b: a >= b) if mode == "max" else (lambda a, b: a <= b)
+        horizon_seconds = horizon.total_seconds()
+        window: deque[int] = deque()
+        result: list[tuple[float, datetime] | None] = []
+        head = 0
+        for moment in query_times:
+            start = moment.timestamp()
+            limit = start + horizon_seconds
+            while head < len(self._epochs) and self._epochs[head] <= limit:
+                while window and better(self.prices[head], self.prices[window[-1]]):
+                    window.pop()
+                window.append(head)
+                head += 1
+            while window and self._epochs[window[0]] <= start:
+                window.popleft()
+            if window:
+                idx = window[0]
+                result.append((self.prices[idx], self.times[idx]))
+            else:
+                result.append(None)
+        return result
+
+    def price_asof(self, moment: datetime) -> float | None:
+        """The last observed price at or before ``moment``, or None.
+
+        Used for fixed-horizon forward returns (5m/15m/.../24h): "what had the
+        price done by t + H" rather than an extremum over the window. Distinct
+        from ``index_before``, which is strictly-before and index-only.
+
+        On its own this can silently return the *reference* observation
+        itself when nothing newer exists yet - e.g. querying 5 minutes ahead
+        on data sampled no finer than a 10-minute scan grid resolves to the
+        same row the query started from, reading as a genuine "0% in 5
+        minutes" rather than "unobserved at this horizon". Callers that need
+        to tell those apart should gate this with ``has_forward_observation``
+        first (see Phase 3A's ``compute_forward_outcome``, which does).
+        """
+        position = bisect_right(self._epochs, moment.timestamp())
+        return self.prices[position - 1] if position > 0 else None
+
+    def has_forward_observation(self, moment: datetime, horizon: timedelta) -> bool:
+        """Does at least one observation exist strictly after ``moment`` and
+        at or before ``moment + horizon``?
+
+        The same ``(t, t + horizon]`` boundary ``forward_maxima`` and
+        ``forward_extreme`` sweep - this only answers "is there any evidence
+        at all in that window", via one pair of binary searches (O(log n)),
+        without extracting a value. Exists so a caller combining this with
+        ``price_asof`` can distinguish a genuine forward observation from
+        ``price_asof`` silently carrying the pre-window price forward.
+        """
+        if not self._epochs:
+            return False
+        start = moment.timestamp()
+        limit = start + horizon.total_seconds()
+        lo = bisect_right(self._epochs, start)
+        hi = bisect_right(self._epochs, limit)
+        return hi > lo
 
     def has_complete_window(self, moment: datetime, horizon: timedelta) -> bool:
         """Is the full forward horizon actually covered by observed data?"""

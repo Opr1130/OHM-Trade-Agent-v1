@@ -119,6 +119,16 @@ class Settings(BaseSettings):
     # Off by default: EARLY_BUILDING is explicitly a pre-confirmation tier.
     signal_quality_early_alerts_enabled: bool = False
 
+    # Phase 3A: forward decision telemetry. Appends one row per scored
+    # candidate to a local append-only log, purely so future analysis has the
+    # actual live decision state instead of depending only on event-sampled
+    # JSONL reconstruction. Writing is fail-soft (a telemetry failure can never
+    # affect scoring or alerting) and one-directional (telemetry is never read
+    # back into a decision). Composes with signal_quality_v1_enabled: while
+    # that flag is off, process_full_market_observations() already returns no
+    # candidates, so this flag being on writes nothing regardless.
+    decision_telemetry_v1_enabled: bool = False
+
     # Hard tradeability bands (24h USD notional). Below the minimum a market is
     # suppressed outright no matter how strong its pattern is.
     signal_quality_min_liquidity_usd: float = Field(default=100_000.0, gt=0)

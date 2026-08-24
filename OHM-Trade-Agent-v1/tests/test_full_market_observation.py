@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from app.services.full_market_observation import (
+    DEFAULT_HISTORY_SCANS,
     MarketObservation,
     _should_persist,
     _transition,
@@ -153,3 +155,132 @@ def test_process_is_event_driven_and_second_scan_can_create_transition(tmp_path)
     low_transition = next(item for item in second.transition_alerts if item.symbol == "LOWUSD")
     assert low_transition.pattern == "COMPRESSION_RELEASE"
     assert low_transition.alert_tier == "WATCH_ONLY"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: signal_quality_reference_prices (the same-scan price a candidate
+# was actually scored from, exposed read-only for decision telemetry)
+# ---------------------------------------------------------------------------
+
+
+def _signal_quality_settings(**overrides):
+    fields = dict(
+        signal_quality_v1_enabled=True,
+        signal_quality_history_scans=DEFAULT_HISTORY_SCANS,
+        signal_quality_scan_interval_seconds=600,
+        signal_quality_continuity_multiplier=2.5,
+        signal_quality_stale_history_retention_seconds=3600,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class _FakeCandidate:
+    def __init__(self, symbol):
+        self.symbol = symbol
+
+
+def test_reference_prices_match_the_same_scan_price_used_for_scoring(tmp_path, monkeypatch):
+    """The mapping must hold exactly the price this scan's history carried for
+    the candidate's symbol - not a re-derived or later value.
+    """
+    import app.services.full_market_observation as fmo
+
+    monkeypatch.setattr(
+        fmo, "evaluate_signal_quality", lambda *a, **k: (_FakeCandidate("BIGUSD"),)
+    )
+
+    result = process_full_market_observations(
+        client=FakeKraken(),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=_signal_quality_settings(),
+    )
+
+    assert result.signal_quality_reference_prices == {"BIGUSD": 12.0}
+
+
+def test_reference_prices_empty_when_signal_quality_disabled(tmp_path):
+    result = process_full_market_observations(
+        client=FakeKraken(),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=_signal_quality_settings(signal_quality_v1_enabled=False),
+    )
+
+    assert result.signal_quality_reference_prices == {}
+    assert result.signal_quality_candidates == ()
+
+
+def test_reference_prices_empty_when_scoring_fails_fail_soft(tmp_path, monkeypatch, capsys):
+    import app.services.full_market_observation as fmo
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("scoring exploded")
+
+    monkeypatch.setattr(fmo, "evaluate_signal_quality", boom)
+
+    result = process_full_market_observations(
+        client=FakeKraken(),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=_signal_quality_settings(),
+    )
+
+    assert result.signal_quality_candidates == ()
+    assert result.signal_quality_reference_prices == {}
+    assert "Signal Quality v1: fail-soft" in capsys.readouterr().out
+
+
+def test_reference_price_lookup_failure_is_fail_soft_and_never_touches_candidates(
+    tmp_path, monkeypatch, capsys
+):
+    """A defect while building the price mapping must never take the already
+    -computed candidates down with it - scoring and telemetry-adjacency are
+    independent fail-soft boundaries.
+    """
+    import app.services.full_market_observation as fmo
+
+    class ExplodingSymbol:
+        symbol = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    monkeypatch.setattr(
+        fmo, "evaluate_signal_quality", lambda *a, **k: (ExplodingSymbol(),)
+    )
+
+    result = process_full_market_observations(
+        client=FakeKraken(),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=_signal_quality_settings(),
+    )
+
+    assert len(result.signal_quality_candidates) == 1
+    assert result.signal_quality_reference_prices == {}
+    assert "reference prices: fail-soft" in capsys.readouterr().out
+
+
+def test_reference_prices_only_include_scored_candidates(tmp_path, monkeypatch):
+    """The mapping is not "every observed symbol's price" - only symbols that
+    actually produced a candidate this scan.
+    """
+    import app.services.full_market_observation as fmo
+
+    monkeypatch.setattr(
+        fmo, "evaluate_signal_quality", lambda *a, **k: (_FakeCandidate("BIGUSD"),)
+    )
+
+    result = process_full_market_observations(
+        client=FakeKraken(),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        observation_file=tmp_path / "observations.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=_signal_quality_settings(),
+    )
+
+    assert set(result.signal_quality_reference_prices) == {"BIGUSD"}
+    assert "LOWUSD" not in result.signal_quality_reference_prices

@@ -6,6 +6,7 @@ from app.services.compact_alerts import (
     heuristic_risk_score,
     one_line_reason,
 )
+from app.services.decision_telemetry import record_decision_telemetry
 from app.services.full_market_observation import (
     ALERT_GOVERNOR_STATE_FILE as FULL_MARKET_ALERT_STATE_FILE,
     MarketTransition,
@@ -32,6 +33,27 @@ def _transition_key(signal) -> str:
             "EXTENDED" if signal.extended_move else "NOT_EXTENDED",
         )
     )
+
+
+def _maybe_record_decision_telemetry(full_market, settings) -> None:
+    """Phase 3A forward decision telemetry (best-effort, dark by default).
+
+    ``record_decision_telemetry`` is already fail-soft and a no-op when
+    ``DECISION_TELEMETRY_V1_ENABLED`` (or ``SIGNAL_QUALITY_V1_ENABLED``, via
+    an empty candidate list) is off. This wrapper adds nothing behaviourally;
+    it exists so a defect in the telemetry call site itself - not just inside
+    ``record_decision_telemetry`` - can never interrupt the scan.
+    """
+    if full_market is None:
+        return
+    try:
+        record_decision_telemetry(
+            full_market.signal_quality_candidates,
+            settings=settings,
+            reference_prices=full_market.signal_quality_reference_prices,
+        )
+    except Exception as exc:
+        print("Decision telemetry: fail-soft", type(exc).__name__)
 
 
 def _best_signal_reason(signal) -> str:
@@ -242,6 +264,8 @@ def main() -> None:
     except Exception as exc:
         full_market = None
         print("Full-market observation: fail-soft", type(exc).__name__)
+
+    _maybe_record_decision_telemetry(full_market, settings)
 
     coarse, signals = scan_early_movers()
 
