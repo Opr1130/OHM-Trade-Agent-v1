@@ -131,11 +131,9 @@ def _structure_fields(symbol: str, structure_samples: Mapping[str, Any] | None) 
     bias = getattr(context, "bias", None) if context is not None else None
     bullish_break = _finite_float(getattr(context, "bullish_break_level", None)) if context else None
     bearish_break = _finite_float(getattr(context, "bearish_break_level", None)) if context else None
-    breakout_for_chase = None
-    if bias == "BULLISH":
-        breakout_for_chase = bullish_break
-    elif bias == "BEARISH":
-        breakout_for_chase = bearish_break
+    # Spot-only advisory model: bearish structure is retained as risk/context,
+    # but a bearish break must never be interpreted as a short entry geometry.
+    breakout_for_chase = bullish_break if bias == "BULLISH" else None
 
     latest_completed = getattr(sample, "latest_completed_at", None)
     return {
@@ -176,6 +174,7 @@ def build_phase3b_shadow_record(
     run_up = _finite_float(components.get("window_run_up_pct"))
     inferred_distance = _inferred_distance_from_near_high_component(candidate)
     structure = _structure_fields(symbol, structure_samples)
+    bullish_structure = structure["structure_bias"] == "BULLISH"
 
     assessment = assess_chase_risk(
         ChaseRiskInput(
@@ -185,7 +184,7 @@ def build_phase3b_shadow_record(
             distance_from_24h_high_pct=inferred_distance,
             persistence_scans=int(getattr(candidate, "persistence_scans", 0) or 0),
             exhaustion_penalty=int(getattr(candidate, "exhaustion_penalty", 0) or 0),
-            retest_state=structure["retest_state"],
+            retest_state=structure["retest_state"] if bullish_structure else None,
             # Deliberately absent: no Phase-3A future-derived
             # move-completed value is allowed into this point-in-time score.
         )
