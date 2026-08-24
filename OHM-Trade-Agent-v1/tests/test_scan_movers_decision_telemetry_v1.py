@@ -1,14 +1,11 @@
-"""Phase 3A call-site wiring in scan_movers.py: all-flags-off is a no-op.
+"""Phase 3A call-site wiring in scan_movers.py.
 
-``_maybe_record_decision_telemetry`` is the only change this phase makes to
-the live scan path. These tests pin that with both feature flags at their
-default (off) the call writes nothing and cannot raise, that a full_market of
-None is a no-op, and that a failure inside ``record_decision_telemetry``
-itself never escapes the call site - defence in depth on top of
-``record_decision_telemetry``'s own fail-soft guarantee.
+These tests pin that the Phase 3A call site is fail-soft and carries the
+immutable decision timestamp without performing Phase 3B OHLC work.
 """
 
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -19,6 +16,7 @@ from app.services.signal_scoring import SignalQualityCandidate
 
 
 BASE_SETTINGS = {"webhook_secret": "test-webhook-secret"}
+DECISION_AT = datetime(2026, 8, 24, 18, 7, tzinfo=timezone.utc)
 
 
 def _settings(**overrides):
@@ -71,7 +69,7 @@ def test_none_full_market_is_a_noop(tmp_path, monkeypatch):
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not be called")),
     )
 
-    _maybe_record_decision_telemetry(None, settings)
+    _maybe_record_decision_telemetry(None, settings, decision_at=DECISION_AT)
 
 
 def test_both_flags_off_by_default_writes_nothing(monkeypatch, tmp_path):
@@ -88,9 +86,11 @@ def test_both_flags_off_by_default_writes_nothing(monkeypatch, tmp_path):
 
     monkeypatch.setattr("app.jobs.scan_movers.record_decision_telemetry", spy)
 
-    _maybe_record_decision_telemetry(_full_market(), settings)
+    _maybe_record_decision_telemetry(
+        _full_market(), settings, decision_at=DECISION_AT
+    )
 
-    assert calls  # the wrapper still calls through
+    assert calls
     assert not (tmp_path / "telemetry.jsonl").exists()
 
 
@@ -102,56 +102,68 @@ def test_internal_failure_never_escapes_the_call_site(monkeypatch, capsys):
 
     monkeypatch.setattr("app.jobs.scan_movers.record_decision_telemetry", boom)
 
-    # Must not raise.
-    _maybe_record_decision_telemetry(_full_market(), settings)
+    _maybe_record_decision_telemetry(
+        _full_market(), settings, decision_at=DECISION_AT
+    )
 
     out = capsys.readouterr().out
     assert "Decision telemetry: fail-soft" in out
 
 
 def test_enabled_flags_write_through_to_disk(tmp_path, monkeypatch):
-    settings = _settings(decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True)
+    settings = _settings(
+        decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True
+    )
     target = tmp_path / "telemetry.jsonl"
 
     from app.services.decision_telemetry import record_decision_telemetry as real_record
 
     monkeypatch.setattr(
         "app.jobs.scan_movers.record_decision_telemetry",
-        lambda candidates, *, settings, reference_prices=None: real_record(
-            candidates, settings=settings, reference_prices=reference_prices, path=target
+        lambda candidates, *, settings, reference_prices=None, now=None: real_record(
+            candidates,
+            settings=settings,
+            reference_prices=reference_prices,
+            path=target,
+            now=now,
         ),
     )
 
     full_market = _full_market()
-    _maybe_record_decision_telemetry(full_market, settings)
+    _maybe_record_decision_telemetry(
+        full_market, settings, decision_at=DECISION_AT
+    )
 
     assert target.exists()
     lines = target.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
-    # The call site must not mutate full_market itself.
     assert full_market == replace(full_market)
 
 
 def test_reference_prices_flow_from_full_market_to_the_written_record(tmp_path):
-    """The exact same-scan price on FullMarketResult must reach the telemetry
-    file, end to end through _maybe_record_decision_telemetry - no lookup,
-    no fetch, and no later price substituted along the way.
-    """
+    """The exact same-scan price and decision time must reach Phase 3A."""
     import json
 
-    settings = _settings(decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True)
+    settings = _settings(
+        decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True
+    )
     target = tmp_path / "telemetry.jsonl"
-    full_market = _full_market(signal_quality_reference_prices={"TESTUSD": 55.5})
+    full_market = _full_market(
+        signal_quality_reference_prices={"TESTUSD": 55.5}
+    )
 
     from app.services import decision_telemetry as telemetry_module
 
     original_default = telemetry_module.DEFAULT_TELEMETRY_FILE
     telemetry_module.DEFAULT_TELEMETRY_FILE = target
     try:
-        _maybe_record_decision_telemetry(full_market, settings)
+        _maybe_record_decision_telemetry(
+            full_market, settings, decision_at=DECISION_AT
+        )
     finally:
         telemetry_module.DEFAULT_TELEMETRY_FILE = original_default
 
     row = json.loads(target.read_text(encoding="utf-8").strip().splitlines()[0])
     assert row["symbol"] == "TESTUSD"
     assert row["price"] == pytest.approx(55.5)
+    assert row["recorded_at"] == DECISION_AT.isoformat()

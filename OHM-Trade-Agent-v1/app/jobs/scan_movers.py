@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from app.core.config import get_settings
 from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
 from app.services.compact_alerts import (
@@ -6,7 +8,10 @@ from app.services.compact_alerts import (
     heuristic_risk_score,
     one_line_reason,
 )
-from app.services.decision_telemetry import record_decision_telemetry
+from app.services.decision_telemetry import (
+    record_decision_telemetry,
+    record_phase3b_shadow_for_decision,
+)
 from app.services.full_market_observation import (
     ALERT_GOVERNOR_STATE_FILE as FULL_MARKET_ALERT_STATE_FILE,
     MarketTransition,
@@ -35,15 +40,8 @@ def _transition_key(signal) -> str:
     )
 
 
-def _maybe_record_decision_telemetry(full_market, settings) -> None:
-    """Phase 3A forward decision telemetry (best-effort, dark by default).
-
-    ``record_decision_telemetry`` is already fail-soft and a no-op when
-    ``DECISION_TELEMETRY_V1_ENABLED`` (or ``SIGNAL_QUALITY_V1_ENABLED``, via
-    an empty candidate list) is off. This wrapper adds nothing behaviourally;
-    it exists so a defect in the telemetry call site itself - not just inside
-    ``record_decision_telemetry`` - can never interrupt the scan.
-    """
+def _maybe_record_decision_telemetry(full_market, settings, *, decision_at) -> None:
+    """Phase 3A forward telemetry only; no external OHLC I/O occurs here."""
     if full_market is None:
         return
     try:
@@ -51,9 +49,25 @@ def _maybe_record_decision_telemetry(full_market, settings) -> None:
             full_market.signal_quality_candidates,
             settings=settings,
             reference_prices=full_market.signal_quality_reference_prices,
+            now=decision_at,
         )
     except Exception as exc:
         print("Decision telemetry: fail-soft", type(exc).__name__)
+
+
+def _maybe_record_phase3b_shadow(full_market, settings, *, decision_at) -> None:
+    """Post-alert Phase 3B shadow enrichment using original decision time."""
+    if full_market is None:
+        return
+    try:
+        record_phase3b_shadow_for_decision(
+            full_market.signal_quality_candidates,
+            settings=settings,
+            reference_prices=full_market.signal_quality_reference_prices,
+            decision_at=decision_at,
+        )
+    except Exception as exc:
+        print("Phase 3B shadow telemetry: fail-soft", type(exc).__name__)
 
 
 def _best_signal_reason(signal) -> str:
@@ -265,7 +279,12 @@ def main() -> None:
         full_market = None
         print("Full-market observation: fail-soft", type(exc).__name__)
 
-    _maybe_record_decision_telemetry(full_market, settings)
+    # This is the immutable time at which the full-market decision state exists.
+    # Phase 3B may fetch later, but it must filter candles against this time.
+    decision_at = datetime.now(timezone.utc)
+    _maybe_record_decision_telemetry(
+        full_market, settings, decision_at=decision_at
+    )
 
     coarse, signals = scan_early_movers()
 
@@ -431,6 +450,12 @@ def main() -> None:
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
                 broad_created += 1
+
+    # External OHLC work is deliberately deferred until every alert-critical
+    # operation above has completed. It still uses the immutable decision_at.
+    _maybe_record_phase3b_shadow(
+        full_market, settings, decision_at=decision_at
+    )
 
     print("Early-mover Telegram cards created:", created)
     print("Early-mover Telegram cards edited:", edited)
