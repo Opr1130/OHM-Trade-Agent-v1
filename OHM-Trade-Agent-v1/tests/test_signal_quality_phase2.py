@@ -1370,7 +1370,7 @@ def test_cells_within_the_heartbeat_keep_the_bound_applicable():
 
     # Every carry here is well inside the hourly heartbeat.
     assert block["bound_inapplicable_cells_beyond_heartbeat"] == 0
-    assert block["bound_inapplicable_pct"] == 0.0
+    assert block["provably_bound_inapplicable_pct"] == 0.0
 
 
 def test_carries_beyond_the_heartbeat_are_counted_as_bound_inapplicable():
@@ -1388,7 +1388,7 @@ def test_carries_beyond_the_heartbeat_are_counted_as_bound_inapplicable():
     block = measure_persistence_gap_drift(observations, frames)
 
     assert block["bound_inapplicable_cells_beyond_heartbeat"] > 0
-    assert block["bound_inapplicable_pct"] > 0
+    assert block["provably_bound_inapplicable_pct"] > 0
 
 
 def test_bound_inapplicable_share_raises_a_warning():
@@ -1555,3 +1555,194 @@ def test_guard_still_allows_a_headerless_hand_built_cache(tmp_path):
     ])
 
     assert write_ohlc_cache(episodes, provider, target) == 1
+
+
+# ---------------------------------------------------------------------------
+# bound_rationale must state the conditionality, not contradict it
+# ---------------------------------------------------------------------------
+
+
+def test_bound_rationale_does_not_assert_silence_unconditionally():
+    """The exact regression: bound_rationale previously read as unconditional
+    even after bound_is_conditional/bound_preconditions were added elsewhere in
+    the same block, which is self-contradictory and can mislead a reader who
+    only reads bound_rationale.
+    """
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+    rationale = block["bound_rationale"].lower()
+
+    # The old wording, verbatim, must be gone.
+    assert "is therefore\n" not in block["bound_rationale"]
+    assert "evidence the market was quiet, not evidence of missing data" not in block["bound_rationale"]
+    # It must now name the conditionality explicitly and point at the
+    # preconditions rather than asserting the conclusion outright.
+    assert "only when" in rationale or "conditional" in rationale
+    assert "observed" in rationale
+
+
+def test_bound_rationale_is_consistent_with_bound_is_conditional():
+    """The two fields in one block must not contradict each other."""
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+
+    assert block["bound_is_conditional"] is True
+    # If the rationale asserted the bound unconditionally while this flag says
+    # otherwise, that would be the exact defect being fixed.
+    unconditional_phrases = (
+        "is therefore evidence",
+        "is evidence the market was quiet, not evidence of missing data",
+    )
+    for phrase in unconditional_phrases:
+        assert phrase not in block["bound_rationale"]
+
+
+def test_inapplicable_field_named_as_a_detectable_lower_bound():
+    """Renamed from bound_inapplicable_pct: the JSONL can only prove
+    inapplicability past the heartbeat, not detect a collection failure that
+    happens to fall inside it. The name and the accompanying note must say so.
+    """
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+
+    assert "provably_bound_inapplicable_pct" in block
+    assert "bound_inapplicable_pct" not in block
+    assert "invisible" in block["bound_conditionality_note"]
+    assert "detectable" in block["bound_conditionality_note"] or "only" in block["bound_conditionality_note"]
+
+
+def test_report_warning_uses_renamed_field():
+    from app.services.signal_quality_phase2 import (
+        CARRY_HEARTBEAT_SECONDS,
+        measure_persistence_gap_drift,
+    )
+
+    config = Phase2Config(max_carry_seconds=CARRY_HEARTBEAT_SECONDS * 3)
+    observations = [_obs(0, 100.0), _obs(200, 100.5)]
+    frames = reconstruct_scan_frames(
+        observations,
+        interval_seconds=config.scan_interval_seconds,
+        max_carry_seconds=config.max_carry_seconds,
+    )
+    report = build_phase2_report(
+        IngestionResult(observations, len(observations), 0),
+        frames, [], [], [], [],
+        config=config,
+        carry_fidelity=measure_persistence_gap_drift(observations, frames),
+    )
+    assert any("CARRY_BOUND_INAPPLICABLE" in w for w in report["warnings"])
+    assert any("detectable lower bound" in w for w in report["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Cache guard: symlinks are refused even when the target is a valid cache
+# ---------------------------------------------------------------------------
+
+
+def test_guard_rejects_a_symlink_to_a_valid_cache(tmp_path):
+    """The decisive strengthening: a symlink is refused regardless of what it
+    points to, because the target at write time is not guaranteed to be what
+    was inspected.
+    """
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    real_cache = tmp_path / "real_cache.jsonl"
+    real_cache.write_text(
+        '{"_ohlc_cache_format": "ohm-phase2-ohlc-cache-v1"}\n'
+        '{"symbol":"AUSD","start_at":"2026-08-01T00:00:00+00:00","high":1,"low":1,"close":1}\n',
+        encoding="utf-8",
+    )
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real_cache)
+    assert link.is_symlink()
+
+    # Sanity: the symlink's target genuinely is a valid cache on its own.
+    from app.services.signal_quality_phase2 import _is_ohlc_cache_file
+    assert _is_ohlc_cache_file(real_cache) is True
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), link)
+
+    # Neither the link nor its target was modified.
+    assert link.is_symlink()
+    assert real_cache.read_text(encoding="utf-8").startswith('{"_ohlc_cache_format"')
+
+
+def test_guard_rejects_a_symlink_to_a_non_cache_file(tmp_path):
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    registry = tmp_path / "trade_outcomes.json"
+    original = '{"record_type":"TRADE_OUTCOME","symbol":"BTCUSD"}'
+    registry.write_text(original, encoding="utf-8")
+    link = tmp_path / "link_to_registry.jsonl"
+    link.symlink_to(registry)
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), link)
+
+    assert registry.read_text(encoding="utf-8") == original
+
+
+def test_guard_rejects_a_broken_symlink(tmp_path):
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    link = tmp_path / "broken_link.jsonl"
+    link.symlink_to(tmp_path / "does_not_exist.jsonl")
+    assert link.is_symlink()
+    assert not link.exists()  # broken: target missing
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), link)
+
+
+def test_is_ohlc_cache_file_helper_itself_rejects_symlinks(tmp_path):
+    """Defense in depth: the identity helper is correct standalone, not only
+    because its one caller happens to check first.
+    """
+    from app.services.signal_quality_phase2 import _is_ohlc_cache_file
+
+    real_cache = tmp_path / "real_cache.jsonl"
+    real_cache.write_text(
+        '{"_ohlc_cache_format": "ohm-phase2-ohlc-cache-v1"}\n', encoding="utf-8"
+    )
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real_cache)
+
+    assert _is_ohlc_cache_file(real_cache) is True
+    assert _is_ohlc_cache_file(link) is False
+
+
+def test_guard_still_permits_a_real_file_reuse_of_its_own_cache(tmp_path):
+    """Non-regression: rejecting symlinks must not break the ordinary,
+    non-symlink cache-reuse path.
+    """
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    path = tmp_path / "ohlc.jsonl"
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+
+    assert write_ohlc_cache(episodes, provider, path) == 1
+    assert not path.is_symlink()
+    assert write_ohlc_cache(episodes, provider, path) == 1  # replace, no raise

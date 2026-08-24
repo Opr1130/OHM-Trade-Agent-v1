@@ -771,22 +771,34 @@ def measure_persistence_gap_drift(
             "the prior row parsed as finite (INVALID_PRIOR_STATE forces a write)",
         ],
         "bound_inapplicable_cells_beyond_heartbeat": beyond_heartbeat,
-        "bound_inapplicable_pct": (
+        # Named "provably_" deliberately: this counts only the cells where the
+        # JSONL itself proves the bound cannot apply (the carry outlived the
+        # heartbeat). A scan or observation failure INSIDE the heartbeat
+        # interval is invisible to the stream, so this is a detectable lower
+        # bound on inapplicability, not the true share.
+        "provably_bound_inapplicable_pct": (
             round(beyond_heartbeat / len(ages) * 100.0, 2) if ages else None
         ),
         "bound_conditionality_note": (
             "Where a precondition fails, silence in the stream is not evidence "
             "of a quiet market and the persist bound does not apply. The replay "
             "cannot distinguish 'quiet' from 'not observed' from the JSONL "
-            "alone, so these cells are counted rather than assumed away."
+            "alone, so these cells are counted rather than assumed away. "
+            "provably_bound_inapplicable_pct is only the portion of that failure "
+            "the stream can prove (carries past the heartbeat) - a collection "
+            "failure inside the heartbeat interval is invisible here."
         ),
         "bound_rationale": (
             "_should_persist writes a row when price moves at least "
             f"{CARRY_PRICE_DRIFT_BOUND_PCT}%, lift {CARRY_LIFT_DRIFT_BOUND_PCT}%, "
             f"high-distance {CARRY_HIGH_DISTANCE_DRIFT_BOUND_PCT}%, or notional "
-            f"{CARRY_NOTIONAL_RATIO_BOUND}x; the absence of a row is therefore "
-            "evidence the market was quiet, not evidence of missing data. The "
-            f"{CARRY_HEARTBEAT_SECONDS}s heartbeat is the exception."
+            f"{CARRY_NOTIONAL_RATIO_BOUND}x, or when the {CARRY_HEARTBEAT_SECONDS}s "
+            "heartbeat is due regardless of movement. The absence of a row is "
+            "evidence the market was quiet ONLY WHEN every bound_precondition "
+            "above held at that scan - in particular, that the symbol was "
+            "actually observed. A collection or batch failure produces the same "
+            "silence as a quiet market and is indistinguishable from it in the "
+            "JSONL, so this bound is conditional, not unconditional evidence."
         ),
         "drift_to_next_persisted_observation_pct": _quartiles(drifts),
         "exceeded_bound": exceeded_bound,
@@ -1266,11 +1278,15 @@ def _is_ohlc_cache_file(path: Path) -> bool:
     Checking *every* sampled line rather than only the first matters: a
     production JSONL registry could plausibly begin with a row that happens to
     carry these keys, and truncating it would be unrecoverable. Anything that
-    is not a regular file - a directory, a device, a symlink to one - is
-    refused outright.
+    is not a regular file - a directory, a device - is refused outright.
+
+    A symlink is refused unconditionally, even one that resolves to content
+    that would otherwise pass every check above. ``write_ohlc_cache`` already
+    checks this before calling here; the check is repeated so this function is
+    correct on its own rather than only in the presence of that caller.
     """
     try:
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             return False
     except OSError:
         return False
@@ -1301,13 +1317,23 @@ def write_ohlc_cache(
 ) -> int:
     """Fetch candles for each episode once and persist them for reuse.
 
-    The only function in this module that writes a file. Two guards make that
-    safe: it refuses to truncate an existing file that is not already an OHLC
-    cache - a mistyped path aimed at a production registry raises rather than
-    destroying it - and it deduplicates candles by ``(symbol, start_at)``,
+    The only function in this module that writes a file. Three guards make
+    that safe: it refuses to write through a symlink at all - even one that
+    already points at a valid OHLC cache, since the target is whatever the
+    symlink resolves to at write time, not necessarily what was inspected; it
+    refuses to truncate an existing regular file that is not already an OHLC
+    cache, so a mistyped path aimed at a production registry raises rather
+    than destroying it; and it deduplicates candles by ``(symbol, start_at)``,
     because overlapping episodes on one symbol otherwise write the same candle
     repeatedly and inflate the cache.
     """
+    if path.is_symlink():
+        raise OhlcCacheTargetError(
+            f"Refusing to write through symlink {path}. Point the cache path at "
+            "a real file, not a link - even a link to a valid OHLC cache is "
+            "refused, since what it resolves to at write time is not "
+            "guaranteed to be what was inspected."
+        )
     if path.exists() and not _is_ohlc_cache_file(path):
         raise OhlcCacheTargetError(
             f"Refusing to overwrite {path}: it exists and does not look like an "
@@ -1753,14 +1779,15 @@ def build_phase2_report(
         warnings.append(f"REJECTED_ROWS: {ingestion.rejected_lines} malformed or non-observation lines skipped.")
 
     if carry_fidelity:
-        inapplicable = carry_fidelity.get("bound_inapplicable_pct")
+        inapplicable = carry_fidelity.get("provably_bound_inapplicable_pct")
         if inapplicable is not None and inapplicable > 5.0:
             warnings.append(
-                f"CARRY_BOUND_INAPPLICABLE: {inapplicable}% of carried cells are at or "
-                f"beyond the {CARRY_HEARTBEAT_SECONDS}s heartbeat interval, where a "
-                "heartbeat row should have existed. For those cells a missing scan or "
-                "observation - not a quiet market - explains the silence, so the "
-                "persist-threshold bound does not apply to them."
+                f"CARRY_BOUND_INAPPLICABLE: {inapplicable}% of carried cells are provably "
+                f"beyond the persist bound - at or beyond the {CARRY_HEARTBEAT_SECONDS}s "
+                "heartbeat interval, where a heartbeat row should have existed. For those "
+                "cells a missing scan or observation, not a quiet market, explains the "
+                "silence. This is a detectable lower bound: a collection failure inside "
+                "the heartbeat interval is invisible to the JSONL and not counted here."
             )
         exceeded = carry_fidelity.get("exceeded_bound_pct")
         if exceeded is not None and exceeded > 20.0:

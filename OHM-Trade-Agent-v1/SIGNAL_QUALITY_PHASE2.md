@@ -89,10 +89,17 @@ observed" from the JSONL alone — the same ambiguity Phase 1's own retention
 design has to live with — so rather than assume the bound holds everywhere, the
 report counts the cells where it provably cannot:
 `bound_inapplicable_cells_beyond_heartbeat` are carries at or past the heartbeat
-interval, for which a heartbeat row *should* have existed. Past 5% of carries
-the report raises `CARRY_BOUND_INAPPLICABLE`. The block also publishes
-`bound_is_conditional: true` and the precondition list itself, so the caveat
-travels with the number.
+interval, for which a heartbeat row *should* have existed. Its share is
+published as `provably_bound_inapplicable_pct` — named deliberately: it is only
+a **detectable lower bound**, because a collection or observation failure
+falling *inside* the heartbeat interval produces exactly the same silence as a
+genuinely quiet market and the JSONL cannot tell the two apart. Past 5% the
+report raises `CARRY_BOUND_INAPPLICABLE`. `bound_rationale` itself states the
+conclusion conditionally — "the absence of a row is evidence the market was
+quiet **only when** every precondition held" — rather than asserting it
+outright, so a reader who reads only that one field cannot come away with the
+unconditional claim. `bound_is_conditional: true` and the precondition list
+travel with it.
 
 The theoretical bound is the defensible statement. The report also publishes a
 companion diagnostic, `reconstruction_drift_proxy`, but it is important to be
@@ -306,8 +313,18 @@ file passes only by:
 Requiring *every* sampled line, not just the first, is the load-bearing part: a
 production JSONL registry could plausibly open with a row that happens to carry
 `symbol` / `start_at` / `high`, and truncating it would be unrecoverable.
-Non-regular files (directories, devices, symlinks to them) and files that are
-not valid UTF-8 JSON are refused outright.
+Non-regular files (directories, devices) and files that are not valid UTF-8
+JSON are refused outright.
+
+**A symlink is refused unconditionally — even one that resolves to an
+otherwise-valid OHLC cache.** The target a symlink resolves to at write time is
+not guaranteed to be the same file that was inspected, so passing every content
+check is not enough; `write_ohlc_cache` checks `path.is_symlink()` before doing
+anything else, and `_is_ohlc_cache_file` repeats the check so it is correct
+standalone rather than only in the presence of that caller. This covers a
+symlink to a valid cache, a symlink to an unrelated file, and a broken symlink
+alike — the last of which would otherwise slip past the `path.exists()` guard
+entirely, since a broken symlink reports `exists() == False`.
 
 Validation is **outcome-side only**. It never feeds feature generation, so it
 cannot leak future information into a decision.
