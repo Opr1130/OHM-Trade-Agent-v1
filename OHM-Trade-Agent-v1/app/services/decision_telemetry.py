@@ -24,8 +24,11 @@ Three properties make this safe:
   produced by the existing scan_movers cycle.
 
 Phase 3A's own JSONL remains dark behind ``DECISION_TELEMETRY_V1_ENABLED``.
-Phase 3B shadow capture is active whenever Signal Quality has produced scored
-candidates, reflecting the separately approved production measurement period.
+Phase 3B shadow capture is active on the default live scan path whenever Signal
+Quality has produced scored candidates, reflecting the separately approved
+production measurement period. Callers that supply a custom Phase-3A path
+(such as isolated unit tests/offline tools) do not implicitly create the live
+Phase-3B shadow file.
 """
 
 from __future__ import annotations
@@ -134,16 +137,20 @@ def record_decision_telemetry(
     """Capture Phase 3B shadow evidence and, when enabled, Phase 3A telemetry.
 
     Phase 3B shadow capture is independent of the Phase 3A decision-telemetry
-    flag, but only has rows when Signal Quality produced candidates. Both paths
-    are fail-soft and append-only. The return value remains the Phase 3A count
-    for backward compatibility with existing tests/callers.
+    flag on the default live path, but only has rows when Signal Quality is
+    enabled and produced candidates. Both paths are fail-soft and append-only.
+    The return value remains the Phase 3A count for backward compatibility.
     """
     try:
         rows = list(candidates)
     except Exception:
         return 0
 
-    if rows:
+    if (
+        rows
+        and path is None
+        and bool(getattr(settings, "signal_quality_v1_enabled", False))
+    ):
         # Separately fail-soft inside the writer. No return value is consumed by
         # live logic, so this cannot affect ranking, Telegram, or execution.
         record_phase3b_shadow_telemetry(
