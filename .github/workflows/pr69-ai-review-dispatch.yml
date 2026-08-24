@@ -14,11 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Dispatch Gemini and DeepSeek reviews
+      - name: Dispatch combined Gemini and DeepSeek review
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh workflow run gemini-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
-          gh workflow run deepseek-quant-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
-          echo "Dispatched Gemini and DeepSeek reviews for PR #69"
+          gh workflow run pr69-external-reviews-manual.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Dispatched combined Gemini and DeepSeek review for PR #69"
