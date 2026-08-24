@@ -9,26 +9,30 @@ produced it, so future analysis has ground truth instead of only replay.
 
 The same already-computed candidate stream also feeds Phase 3B shadow
 telemetry. Phase 3B is measurement-only: its output never feeds scoring,
-ranking, Telegram, PendingSetup, or execution. This composition deliberately
-uses the existing scan clock and same-scan reference-price mapping; it makes no
-second market-data fetch.
+ranking, Telegram, PendingSetup, or execution. On the default live path a
+bounded subset of already-ranked, non-suppressed candidates also receives
+completed Kraken spot 15m OHLC context through ``phase3b_live_structure``.
+That is an additional public-data read inside the existing scan cycle, not a
+second scanner, and the still-forming Kraken candle is explicitly excluded.
 
 Three properties make this safe:
 
 * **Fail-soft.** Every failure mode - a permissions error, a full disk, a
-  malformed candidate - is caught here or in the Phase 3B writer. Telemetry
-  can fail to write; it cannot change scoring or alerting.
+  malformed candidate, or a Kraken OHLC error - is caught here or in the
+  Phase 3B services. Telemetry can fail or be unavailable; it cannot change
+  scoring or alerting.
 * **One-directional.** Nothing in either telemetry module reads its JSONL back
   into a live decision.
 * **No duplicate scanner.** Both telemetry streams consume candidates already
-  produced by the existing scan_movers cycle.
+  produced by the existing scan_movers cycle. Phase 3B OHLC is a bounded
+  enrichment pass for those candidates only.
 
 Phase 3A's own JSONL remains dark behind ``DECISION_TELEMETRY_V1_ENABLED``.
 Phase 3B shadow capture is active on the default live scan path whenever Signal
 Quality has produced scored candidates, reflecting the separately approved
 production measurement period. Callers that supply a custom Phase-3A path
 (such as isolated unit tests/offline tools) do not implicitly create the live
-Phase-3B shadow file.
+Phase-3B shadow file or perform Kraken OHLC enrichment.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.services.phase3b_live_structure import collect_phase3b_live_structure
 from app.services.phase3b_shadow_telemetry import record_phase3b_shadow_telemetry
 from app.services.registry_io import registry_lock
 
@@ -138,8 +143,9 @@ def record_decision_telemetry(
 
     Phase 3B shadow capture is independent of the Phase 3A decision-telemetry
     flag on the default live path, but only has rows when Signal Quality is
-    enabled and produced candidates. Both paths are fail-soft and append-only.
-    The return value remains the Phase 3A count for backward compatibility.
+    enabled and produced candidates. Live completed-OHLC structure enrichment
+    is bounded, fail-soft, and measurement-only. The return value remains the
+    Phase 3A count for backward compatibility.
     """
     try:
         rows = list(candidates)
@@ -151,12 +157,25 @@ def record_decision_telemetry(
         and path is None
         and bool(getattr(settings, "signal_quality_v1_enabled", False))
     ):
+        decision_at = now or datetime.now(timezone.utc)
+        structure_samples = {}
+        try:
+            structure_samples = collect_phase3b_live_structure(
+                rows,
+                decision_at=decision_at,
+            )
+        except Exception:
+            # Defence in depth: the collector is already fail-soft per symbol,
+            # but its call site is not allowed to affect the scan either.
+            structure_samples = {}
+
         # Separately fail-soft inside the writer. No return value is consumed by
         # live logic, so this cannot affect ranking, Telegram, or execution.
         record_phase3b_shadow_telemetry(
             rows,
             reference_prices=reference_prices,
-            now=now,
+            structure_samples=structure_samples,
+            now=decision_at,
         )
 
     if not bool(getattr(settings, "decision_telemetry_v1_enabled", False)):
