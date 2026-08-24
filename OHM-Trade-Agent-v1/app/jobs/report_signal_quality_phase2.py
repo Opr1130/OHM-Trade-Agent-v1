@@ -1,8 +1,8 @@
 """Print the Signal Quality Phase 2 replay report as JSON.
 
-Read-only and offline. OHLC cross-validation is opt-in via --ohlc because it
-performs public network reads; without it the report is explicitly labelled
-PROVISIONAL_EVENT_SAMPLED_REPLAY.
+Read-only and offline by default. OHLC peak comparison is opt-in via --ohlc
+because it performs public network reads; even with OHLC, timing/class metrics
+remain event-sampled and the report stays PROVISIONAL_EVENT_SAMPLED_REPLAY.
 """
 
 from __future__ import annotations
@@ -47,14 +47,14 @@ def main() -> None:
     parser.add_argument(
         "--ohlc",
         action="store_true",
-        help="Cross-validate episode peaks against public Kraken OHLC (network reads)",
+        help="Compare episode peak magnitude against public Kraken OHLC (network reads)",
     )
     parser.add_argument(
         "--ohlc-cache",
         type=Path,
         default=None,
         help=(
-            "Validate against a local OHLC cache instead of the network. Offline "
+            "Compare against a local OHLC cache instead of the network. Offline "
             "and reproducible. Build one with --write-ohlc-cache."
         ),
     )
