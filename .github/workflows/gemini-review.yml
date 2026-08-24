@@ -7,6 +7,8 @@ on:
         description: "Pull request number to review"
         required: true
         type: string
+  pull_request:
+    types: [ready_for_review]
 
 permissions:
   contents: read
@@ -15,10 +17,12 @@ permissions:
 
 jobs:
   review:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 69 }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       GEMINI_MODEL: gemini-3.7-flash
+      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
 
     steps:
       - name: Checkout trusted review configuration
@@ -29,7 +33,6 @@ jobs:
       - name: Validate inputs and secret
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid PR number"; exit 64; }
@@ -38,7 +41,6 @@ jobs:
       - name: Fetch pull request diff
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null
@@ -54,7 +56,6 @@ jobs:
       - name: Ask Gemini for independent review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -128,7 +129,7 @@ jobs:
 
           output = (
               '## Gemini Independent Review\n\n'
-              f'> Model: `{model}` · PR: #{pr_number} · Trigger: manual GitHub Action\n\n'
+              f'> Model: `{model}` · PR: #{pr_number}\n\n'
               + text
               + '\n\n---\n'
               '_AI review is advisory. Findings require human/independent validation before merge or production changes._\n'
@@ -139,7 +140,13 @@ jobs:
       - name: Post Gemini review to pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/gemini-review.md
+
+      - name: Report Gemini workflow failure
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "## Gemini Independent Review\n\nREVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate."
