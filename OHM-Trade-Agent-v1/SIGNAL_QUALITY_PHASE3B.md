@@ -91,6 +91,19 @@ All technical structure and chase-risk features must be computed from observatio
 
 Do not make a second market-data fetch solely for Phase 3B if the required same-scan observation already exists in memory.
 
+### Live shadow OHLC enrichment rules
+
+The approved live-shadow design may perform a bounded public Kraken OHLC enrichment only when completed OHLC history is not already available in the existing scan state. The enrichment is measurement-only and follows these additional invariants:
+
+- the immutable decision timestamp is captured when the full-market Signal Quality decision state exists;
+- Phase 1 mover/ranking work and any Telegram dispatch complete before Phase 3B public OHLC enrichment runs;
+- a Kraken 15m bucket is eligible only when `bucket_open + 15m <= original_decision_at`; fetch time must never replace the original decision timestamp;
+- duplicate OHLC buckets are deduplicated and bars are sorted chronologically before structure analysis;
+- Kraken failures are fail-soft and cannot interrupt ranking, Telegram, PendingSetup, or any execution path;
+- only the first eight non-suppressed candidates in the existing ranked order receive live OHLC structure enrichment in this measurement phase; all scored candidates still retain the non-structure shadow fields.
+
+The eight-candidate cap creates **intentional selection bias**. Live structure results therefore describe a top-ranked, non-suppressed cohort and must not be presented as an unbiased estimate of the entire scored universe. Population analysis must report rank/cohort coverage explicitly and stratify results by rank where possible. A later experiment may sample lower-ranked candidates, but expanding the live cohort is not part of this PR and must not be done automatically.
+
 ## No duplicate production scanner
 
 Phase 3B should initially be pure service code plus offline/shadow tests. Do not introduce a permanent second live scanner or a competing scan clock. Production composition, if later approved, should occur through the existing scan cycle.
@@ -150,6 +163,17 @@ Tests must cover at minimum:
 - no imports from execution / PendingSetup / Telegram callback modules
 - Phase 1 / Phase 2 / Phase 3A regression remains clean
 
+Live-shadow regression tests must additionally cover:
+
+- exact 15m completion boundary (`12:15:00` accepts the 12:00 bucket; `12:14:59` rejects it);
+- delayed fetch cannot admit a bucket that closed after the original decision timestamp;
+- duplicate/out-of-order Kraken candles are deduplicated and sorted;
+- naive timestamps are coerced to UTC deterministically;
+- BTC/XBT and DOGE/XDG Kraken public aliases;
+- fewer than 96 completed 15m bars is explicitly marked insufficient;
+- Phase 3A recording performs no Kraken OHLC request;
+- the Phase 3B OHLC call site occurs only after the alert-critical Telegram path.
+
 ## Population validation plan
 
 Before Phase 3C/3D integration, evaluate Phase 3B against Phase 3A telemetry/replay using:
@@ -161,7 +185,8 @@ Before Phase 3C/3D integration, evaluate Phase 3B against Phase 3A telemetry/rep
 5. structure-bias and retest-state buckets;
 6. false-positive analysis for high chase scores followed by continued favorable returns;
 7. regime and liquidity stratification;
-8. bootstrap/confidence intervals or comparable uncertainty estimates when sample sizes support them.
+8. bootstrap/confidence intervals or comparable uncertainty estimates when sample sizes support them;
+9. explicit top-eight cohort coverage and rank-stratified reporting so live-shadow selection bias is visible rather than silently generalized.
 
 The key test is empirical monotonicity: higher chase-risk buckets should demonstrate measurably worse entry timing or risk-adjusted forward outcomes before the score is allowed to influence ranking or alerts. If that relationship does not hold out-of-sample, weights/components must be revised rather than rationalized after the fact.
 
