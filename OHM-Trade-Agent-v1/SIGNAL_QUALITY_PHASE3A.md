@@ -57,24 +57,31 @@ run, write, or change behaviour while it or its own flag is off.
 
 For one `CandidateRow` and one target stage (`BREAKOUT_CANDIDATE` or
 `ACTIONABLE_REVIEW`), builds a per-gate pass/fail table by comparing the row's
-actual scored values against the *real* `SignalQualityConfig` thresholds —
-the same fields `determine_stage()` reads. This is a comparison table, not a
-reimplementation of the stage cascade, so it cannot drift from what
-production actually decided without a test catching it:
-`test_gate_status_agrees_with_determine_stage` (property-style, 60 random
-seeds) asserts the table's `eligible` bit always agrees with a direct call to
-the real `determine_stage()`.
+actual scored values against the *real* `SignalQualityConfig` threshold
+*fields* — the same ones `determine_stage()` reads, so the threshold
+*values* cannot diverge. The per-gate comparison operators (`>=` for the
+score gates, strict `<` for exhaustion) are mirrored rather than shared code,
+so drift there is possible in principle if `determine_stage()`'s logic ever
+changed without a matching update here. Two layers of tests catch that:
+`test_gate_status_agrees_with_determine_stage` (60 randomized seeds) provides
+randomized regression coverage — evidence across sampled cases, not a proof
+of exact equivalence — and `test_actionable_gate_boundary_is_correct` /
+`test_breakout_gate_boundary_is_correct` / `test_exhaustion_strict_less_than_boundary_matches_determine_stage`
+/ `test_liquidity_observation_boundary_matches_determine_stage` add
+deterministic exactly-at / epsilon-below / epsilon-above coverage for every
+gate, specifically targeting the boundaries randomized sampling is least
+likely to hit.
 
 ### 2.2 Forward outcomes (`compute_forward_outcome`)
 
 For one reference point in time (a stage-first-reached timestamp) and its
 price, computes:
 
-- **Fixed-horizon returns** at 5m/15m/30m/60m/4h/8h/24h, via the new
+- **Fixed-horizon returns** at 5m/15m/30m/60m/4h/8h/24h, via the
   `SymbolTimeline.price_asof()` primitive (last observation at-or-before
-  `t + H`).
+  `t + H`), gated per horizon by `horizon_observed` (see below).
 - **MFE / MAE** (maximum favourable / adverse excursion) and **time-to-MFE /
-  time-to-MAE**, via the new `SymbolTimeline.forward_extreme()` primitive — an
+  time-to-MAE**, via the `SymbolTimeline.forward_extreme()` primitive — an
   independent, `mode="max"|"min"` sibling of Phase 2's existing
   `forward_maxima`, built with the identical strictly-exclusive `(t, t+H]`,
   O(n+m) monotonic-deque sweep. `forward_maxima` itself is untouched; nothing
@@ -83,9 +90,54 @@ price, computes:
   horizon return computed from data that doesn't actually reach that far
   forward is flagged, not silently presented as a true measurement.
 
+**Horizon observability (`horizon_observed`).** Independent review flagged
+that on the reconstructed replay grid, production scans every
+`DEFAULT_SCAN_INTERVAL_SECONDS` (600s / 10 minutes) — so a naive "5m" query
+commonly has *no observation at all* strictly between the reference and the
+horizon. `price_asof` alone would silently return the reference price itself
+in that case, which reads as "the market moved 0% in 5 minutes" when the true
+answer is "OHM has no data this soon." This is fixed via a new primitive,
+`SymbolTimeline.has_forward_observation(moment, horizon)` — an O(log n) pair
+of binary searches over the same `(t, t+horizon]` boundary
+`forward_maxima`/`forward_extreme` already use, answering only "does any
+observation exist in this window", not "what is it". `compute_forward_outcome`
+checks this **before** calling `price_asof` for every horizon: whenever it is
+`False`, `horizon_returns_pct[label]` is forced to `None` rather than the
+carried-forward value, and `ForwardOutcome.horizon_observed[label]` records
+which case applied. Concretely: 5m is frequently `None`/unobserved on the
+replay grid (expected, not a bug); 15m and coarser are ordinarily observed,
+since at least one real scan falls inside a 15-minute window even at exactly
+production cadence. `price_asof` itself is unchanged and is used nowhere in
+Phase 2 (`git grep price_asof` confirms the only caller is this module), so
+this fix cannot alter Phase 2 behaviour.
+
+**MAE sign convention (`mae_pct` vs. `max_adverse_excursion_pct`).**
+Independent review also flagged that `mae_pct` — `(min_future_price /
+reference_price - 1) * 100` — can be *positive* if every future observation
+stayed above the reference price, which a reader could misread against the
+name "Maximum Adverse Excursion" (conventionally ≤ 0). Rather than silently
+redefining the field, both readings are now reported: `mae_pct` keeps its
+existing, signed, "minimum forward return actually realised" meaning
+(documented explicitly in `ForwardOutcome`'s docstring), and a new field,
+`max_adverse_excursion_pct = min(0.0, mae_pct)` (`None` only when `mae_pct`
+is `None`), gives the conventional always-≤-0 reading. Neither one overwrites
+or redefines the other.
+
 ### 2.3 Stage timing decomposition (`build_stage_timing_records`)
 
-One `StageTimingRecord` per Phase 2 episode (`MoveEpisode`), containing:
+One `StageTimingRecord` per Phase 2 episode (`MoveEpisode`) — **not** one per
+candidate or per scan. This is episode-conditioned scope, stated explicitly
+because it changes what any aggregate over these records means: a candidate
+that never became part of a qualifying episode (no real move followed it, or
+one too small to open an episode) has no `StageTimingRecord` and is invisible
+to every statistic built from this function's output. Treat figures derived
+from it as "conditional on a real move having happened" — never as "all OHM
+signals," and never as a false-positive or false-negative rate. That analysis
+is still possible, but from a different, unfiltered source: Phase 2's audit
+rows and Phase 3A's own `decision_telemetry` (§2.9) both retain every scored
+candidate — suppressed included — regardless of what happened afterward.
+
+Each record contains:
 
 - `first_candidate_at` / `_stage` / `_price` — the episode's first detection
   in `[baseline_at, peak_at)`, reusing `evaluate_episode_detection`'s own
@@ -337,7 +389,7 @@ either touching `signal_scoring.py` (out of scope) or forking a duplicate
 scorer (rejected as a drift risk). Documented here rather than silently
 dropped or worked around.
 
-### 5.3 Stage timing is per-episode, not per-scan
+### 5.3 Stage timing is episode-conditioned, not signal-conditioned
 
 `build_stage_timing_records` associates a symbol's detections with one Phase
 2 `MoveEpisode` window (`[baseline_at, peak_at)`), consistent with Phase 2's
@@ -347,6 +399,17 @@ window (e.g. a move too small to open an episode, or truncated at the end of
 the observation file) has no `StageTimingRecord`, even if it produced
 detections. This mirrors Phase 2's own missed-winner-forensics scoping, not a
 new limitation.
+
+Independent review asked this be stated even more plainly, since it changes
+what a `StageTimingRecord` population statistic means: **do not describe any
+figure derived from `stage_timing_records` as representing "all OHM
+signals."** It represents signals conditioned on a real move having
+happened. False-positive analysis (candidates that never led anywhere,
+suppressed rows, near-misses) remains fully possible — from Phase 2's audit
+rows and from Phase 3A's own `decision_telemetry` (§2.9), both of which
+retain every scored candidate regardless of episode outcome — just not from
+this function's output. See §2.3 for the same note where the function is
+introduced.
 
 ### 5.4 Counterfactual sweeps re-run the full replay per configuration point
 
@@ -358,23 +421,101 @@ single replay cost). Acceptable for the sweep ranges Phase 3A ships with
 should expect proportionally longer runtime. No caching or parallelism was
 added — out of scope for a measurement-only phase.
 
+### 5.5 Telemetry retention: not implemented this phase, growth documented here
+
+`decision_telemetry.jsonl` (§2.8) is a plain append-only file with no
+rotation, no size cap, and no expiry logic. That is a deliberate Phase 3A
+choice — per the approved scope, this phase adds the write path and nothing
+more — but it means the file grows without bound for as long as
+`DECISION_TELEMETRY_V1_ENABLED` stays on, and that must be sized before any
+long-term production enablement.
+
+**Growth math.** `evaluate_universe` (§2.9's data source) scores and returns
+**every observed market** — suppressed rows included, by design (§7's
+suppressed-candidate preservation requirement) — so one telemetry line is
+written per universe symbol per scan, not per alert. At the production scan
+cadence (`DEFAULT_SCAN_INTERVAL_SECONDS` = 600s ⇒ 144 scans/day) and a
+measured ~850 bytes/record (a realistic row with several reason strings and
+a `LONGUSD`-length symbol; shorter symbols or fewer reasons run smaller):
+
+| Universe size | Rows/day | Approx. size/day | Approx. size/30 days |
+|---:|---:|---:|---:|
+| 100 | 14,400 | ~12 MB | ~360 MB |
+| 300 | 43,200 | ~37 MB | ~1.1 GB |
+| 500 | 72,000 | ~61 MB | ~1.8 GB |
+
+The exact Kraken USD-market count is not pinned down here — these rows are
+illustrative order-of-magnitude figures from the measured per-record size and
+production cadence, not a claim about the live universe size. The
+takeaway that does not depend on the exact count: this is multi-hundred-MB
+to multi-GB per month at any realistic universe size, entirely because full,
+unfiltered universe capture is the point of the design (§7) — narrowing it
+to alert-worthy rows would defeat the reason this file exists.
+
+**Proposed (not implemented) bounded design**, for a separate, explicitly-
+approved follow-up before any long-term production enablement:
+
+1. **Daily rotation** — write to `decision_telemetry-YYYY-MM-DD.jsonl`
+   instead of one ever-growing file, keyed off `recorded_at`'s date. Old
+   files become independently prunable/archivable without touching the
+   active file or its lock; no change to the per-record schema.
+2. **A retention window** (e.g. 30/60/90 days, operator-configured) enforced
+   by a separate, explicitly fail-soft prune step — a cron-style job or a
+   check at scan start — that deletes rotated files older than the window.
+   Never a truncate-in-place on the active file: JSONL has no efficient
+   in-place head-truncation, and truncating a file mid-append is a data-loss
+   risk this design should avoid entirely.
+3. **Optional compression** of rotated-out files (e.g. gzip) if the
+   retention window is long enough that raw size becomes a concern.
+4. Rotation and pruning stay outside the write path's fail-soft boundary in
+   the same way persistence and scoring already are: a pruning failure must
+   never block or slow down a live scan, and must never be allowed to touch
+   the file currently being appended to.
+
+None of this is implemented in Phase 3A. It is documented here so growth is
+visible before telemetry is ever left on in production for an extended
+period, and so a follow-up implementing it has a starting design already
+reviewed.
+
+### 5.6 Reviewer-proposed production validation numbers are not adopted policy
+
+Independent review proposed candidate production-readiness criteria for a
+possible future promotion decision — e.g. requiring N ≥ 100 independent
+episodes, an MAE worse than -8%, and a degradation ceiling around 1.1x. These
+are recorded here **only for traceability to that review**, and explicitly
+are **not** adopted OHM policy, not a Phase 3A output, and not implemented
+anywhere in this branch. Phase 3A remains measurement-only per the approved
+scope (§8 of the original architecture approval): it reports numbers, it does
+not gate, threshold, or promote anything against them. Any future decision to
+adopt specific validation criteria is a separate, explicit decision for a
+later phase, not something this phase or this document sets.
+
 ---
 
 ## 6. Testing
 
-- `tests/test_signal_timing_v2.py` (76 tests) — gate-status diagnosis
-  including the DRV case itself, the `determine_stage()` cross-validation
-  property test (60 seeds), forward-outcome horizons/MFE/MAE/no-lookahead,
-  stage-timing decomposition, opportunity decay, and both counterfactual
-  sweeps (including a "loosening never reduces detections" monotonicity
-  check and a "sweeps never mutate the base config" check).
-- `tests/test_decision_telemetry.py` (11 tests) — flag-off no-op, flag-on
-  write-through with the price read from `reference_prices`, empty-candidate-
-  list no-op, fail-soft on a forced write failure, the four safety-invariant
-  fields, price sourced from the `reference_prices` mapping (keyed by
-  upper-cased symbol), the opportunistic-attribute fallback when the mapping
-  has no entry, and the mapping taking priority over that fallback when both
-  are present.
+- `tests/test_signal_timing_v2.py` (94 tests) — gate-status diagnosis
+  including the DRV case itself; the `determine_stage()` randomized
+  regression test (60 seeds); deterministic exactly-at/epsilon-below/
+  epsilon-above boundary tests for every ACTIONABLE_REVIEW and
+  BREAKOUT_CANDIDATE gate (`test_actionable_gate_boundary_is_correct`,
+  `test_breakout_gate_boundary_is_correct`), plus two tests specifically
+  cross-checking the exhaustion strict-`<` boundary and the liquidity
+  observation-only boundary against the real `determine_stage`; forward-
+  outcome horizons/MFE/MAE/no-lookahead; the new horizon-observability tests
+  (`test_five_minute_horizon_is_unobserved_on_a_ten_minute_scan_grid`,
+  `test_coarser_horizon_is_observed_on_the_same_ten_minute_grid`); the new
+  `max_adverse_excursion_pct` capping tests; stage-timing decomposition;
+  opportunity decay; and both counterfactual sweeps (including a "loosening
+  never reduces detections" monotonicity check and a "sweeps never mutate
+  the base config" check).
+- `tests/test_decision_telemetry.py` (12 tests) — flag-off no-op, flag-on
+  write-through with the price read from `reference_prices`, suppressed
+  candidates still recorded (§7), empty-candidate-list no-op, fail-soft on a
+  forced write failure, the four safety-invariant fields, price sourced from
+  the `reference_prices` mapping (keyed by upper-cased symbol), the
+  opportunistic-attribute fallback when the mapping has no entry, and the
+  mapping taking priority over that fallback when both are present.
 - `tests/test_scan_movers_decision_telemetry_v1.py` (5 tests) — `full_market
   is None` no-op, **both flags at their real defaults write nothing**
   (the explicit "all-flags-off behaviour unchanged" proof), a forced
@@ -390,15 +531,19 @@ added — out of scope for a measurement-only phase.
   fail-soft and never discards the already-computed candidates; and the
   mapping contains only symbols that actually produced a candidate, not
   every observed symbol.
-- Full Phase 2 regression: `tests/test_signal_quality_phase2.py` — unchanged,
-  passing (`CandidateRow`'s two new fields are additive/defaulted; no
-  existing test needed modification).
+- Full Phase 2 regression: `tests/test_signal_quality_phase2.py` (98 tests)
+  — passing. `signal_quality_phase2.py` gained one more additive method this
+  round (`SymbolTimeline.has_forward_observation`, §2.2); `price_asof` and
+  `forward_extreme` are otherwise unchanged, and neither is called anywhere
+  in Phase 2 itself (only from `signal_timing_v2.py`), so this fix cannot
+  alter Phase 2 behaviour — confirmed by the full Phase 2 suite passing
+  unmodified.
 - Full Phase 1 regression:
   `tests/test_signal_quality_explosion_detection_v1.py`,
   `tests/test_signal_quality_history_state_v1.py`,
   `tests/test_signal_quality_config_v1.py`, `tests/test_signal_quality_audit_v1.py`
   — unchanged, passing.
-- Complete suite: `python -m pytest -q` — **1028 passed**, no failures, no
+- Complete suite: `python -m pytest -q` — **1047 passed**, no failures, no
   new warnings (6 pre-existing FastAPI/Starlette deprecation warnings,
   unrelated to this phase).
 - `python -m compileall -q app tests` — clean.
@@ -429,9 +574,13 @@ added — out of scope for a measurement-only phase.
 5. `signal_quality_phase2.py`'s two new `CandidateRow` fields are optional
    and default to `None`; `replay_signal_quality()`'s only change is passing
    two additional keyword arguments when constructing each row — no existing
-   field, method signature, or control flow changed. The full Phase 2 test
-   suite (which constructs `CandidateRow` via keyword arguments throughout)
-   passes unmodified.
+   field, method signature, or control flow changed. The one further change
+   to this file, `SymbolTimeline.has_forward_observation` (§2.2), is a new
+   method alongside the existing ones — it reads `_epochs` the same way
+   `price_asof`/`index_before` already do and calls nothing else. The full
+   Phase 2 test suite (which constructs `CandidateRow` via keyword arguments
+   throughout, and never calls `price_asof`, `forward_extreme`, or
+   `has_forward_observation` — confirmed by `git grep`) passes unmodified.
 6. `full_market_observation.py` *is* touched this phase (§2.9), but only
    additively: one new, defaulted `FullMarketResult` field
    (`signal_quality_reference_prices: Mapping[str, float] = field(default_factory=dict)`)
@@ -474,22 +623,35 @@ Suggested review order:
    `test_reference_prices_match_the_same_scan_price_used_for_scoring` and
    `test_reference_price_lookup_failure_is_fail_soft_and_never_touches_candidates`.
 5. `app/services/signal_quality_phase2.py` diff — confirm both new
-   `CandidateRow` fields are optional/defaulted and both new
-   `SymbolTimeline` methods (`forward_extreme`, `price_asof`) are additive
-   siblings of the existing `forward_maxima`/`index_before`, not
-   replacements. Confirm `test_gate_status_agrees_with_determine_stage`
-   (in `signal_timing_v2`'s test file, but exercising this module's
-   `determine_stage`) actually imports and calls the real production
-   function, not a copy.
+   `CandidateRow` fields are optional/defaulted and all three new
+   `SymbolTimeline` methods (`forward_extreme`, `price_asof`,
+   `has_forward_observation`) are additive siblings of the existing
+   `forward_maxima`/`index_before`, not replacements; confirm (e.g. via
+   `git grep`) that Phase 2 itself never calls any of the three. Confirm
+   `test_gate_status_agrees_with_determine_stage` and the deterministic
+   `test_*_gate_boundary_*` / `test_*_boundary_matches_determine_stage`
+   tests (in `signal_timing_v2`'s test file, but exercising this module's
+   `determine_stage`) actually import and call the real production function,
+   not a copy.
 6. `app/services/signal_timing_v2.py` in full (new file) — the gate-status
    diagnosis (§2.1) is the module's most safety-relevant piece, since it is
    what will be used to explain future DRV-style cases; review it alongside
    `determine_stage()` in `signal_scoring.py` line by line for threshold and
-   comparison-operator parity.
+   comparison-operator parity, paying particular attention to the exhaustion
+   strict-`<` and liquidity boundaries. Separately confirm `compute_forward_outcome`
+   gates every horizon through `has_forward_observation` before trusting
+   `price_asof` (§2.2), and that `max_adverse_excursion_pct` is genuinely
+   `min(0.0, mae_pct)` rather than a redefinition of `mae_pct` itself.
 7. §5 (known limitations) — confirm each remaining one is an honest scope
-   boundary, not a masked defect, and that §5.1's resolution actually holds
-   (no `signal_scoring.py` change, no second market-data fetch, no later
-   price substituted).
+   boundary, not a masked defect; that §5.1's resolution actually holds (no
+   `signal_scoring.py` change, no second market-data fetch, no later price
+   substituted); that §5.3's episode-conditioned-scope framing matches what
+   `build_stage_timing_records` actually does; that §5.5's growth figures are
+   presented as illustrative rather than as a claim about the live Kraken
+   universe size, and that no rotation/retention logic was actually added;
+   and that §5.6's reviewer-proposed numbers (N ≥ 100 episodes, MAE < -8%,
+   1.1x degradation ceiling) appear nowhere else in this branch as adopted
+   policy or as an implemented gate.
 
 Independent review should specifically check for: any path by which a
 telemetry write could throw into the scoring/alerting path (traced through
@@ -497,5 +659,10 @@ telemetry write could throw into the scoring/alerting path (traced through
 own); any path by which building `signal_quality_reference_prices` could
 throw into or delay the `candidates` result it's computed alongside; any path
 by which a counterfactual sweep result could be mistaken for, or accidentally
-merged into, the current-production report; and any drift between
-`evaluate_stage_gates`'s thresholds and `determine_stage`'s.
+merged into, the current-production report; any drift between
+`evaluate_stage_gates`'s thresholds and `determine_stage`'s; any horizon
+label whose `horizon_returns_pct` value is populated despite
+`horizon_observed` reading `False` for it (the two must never disagree); and
+any place in this document or the code that states or implies
+`StageTimingRecord`-derived figures represent the full universe of OHM
+signals rather than the episode-conditioned subset (§2.3/§5.3).

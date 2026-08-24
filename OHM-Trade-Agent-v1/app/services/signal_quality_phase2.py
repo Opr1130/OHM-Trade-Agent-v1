@@ -719,9 +719,36 @@ class SymbolTimeline:
         Used for fixed-horizon forward returns (5m/15m/.../24h): "what had the
         price done by t + H" rather than an extremum over the window. Distinct
         from ``index_before``, which is strictly-before and index-only.
+
+        On its own this can silently return the *reference* observation
+        itself when nothing newer exists yet - e.g. querying 5 minutes ahead
+        on data sampled no finer than a 10-minute scan grid resolves to the
+        same row the query started from, reading as a genuine "0% in 5
+        minutes" rather than "unobserved at this horizon". Callers that need
+        to tell those apart should gate this with ``has_forward_observation``
+        first (see Phase 3A's ``compute_forward_outcome``, which does).
         """
         position = bisect_right(self._epochs, moment.timestamp())
         return self.prices[position - 1] if position > 0 else None
+
+    def has_forward_observation(self, moment: datetime, horizon: timedelta) -> bool:
+        """Does at least one observation exist strictly after ``moment`` and
+        at or before ``moment + horizon``?
+
+        The same ``(t, t + horizon]`` boundary ``forward_maxima`` and
+        ``forward_extreme`` sweep - this only answers "is there any evidence
+        at all in that window", via one pair of binary searches (O(log n)),
+        without extracting a value. Exists so a caller combining this with
+        ``price_asof`` can distinguish a genuine forward observation from
+        ``price_asof`` silently carrying the pre-window price forward.
+        """
+        if not self._epochs:
+            return False
+        start = moment.timestamp()
+        limit = start + horizon.total_seconds()
+        lo = bisect_right(self._epochs, start)
+        hi = bisect_right(self._epochs, limit)
+        return hi > lo
 
     def has_complete_window(self, moment: datetime, horizon: timedelta) -> bool:
         """Is the full forward horizon actually covered by observed data?"""

@@ -28,6 +28,27 @@ tuning (a sweep reports numbers; it never selects a winner), and
 counterfactual results are always returned in a block separate from - never
 merged into - the current-production replay.
 
+Scope, stated plainly: ``StageTimingRecord`` (below) is one row per Phase 2
+episode (``MoveEpisode``), not one row per candidate or per scan. A candidate
+that never becomes part of a qualifying episode - most obviously, one that
+never crosses the episode-trigger threshold at all, or is a genuine false
+positive that fizzled - has no ``StageTimingRecord`` and is invisible to
+every statistic in this module. These are not "all OHM signals"; they are
+"signals conditioned on a real move having happened". False-positive rate and
+suppressed-candidate analysis belong to Phase 2's audit rows and to Phase
+3A's own ``decision_telemetry`` (§2.8/§2.9 in SIGNAL_QUALITY_PHASE3A.md),
+both of which retain every scored candidate regardless of outcome - not to
+anything in this module.
+
+``test_gate_status_agrees_with_determine_stage`` (60 randomized seeds, plus
+deterministic per-gate boundary cases) provides randomized regression
+coverage against the real ``determine_stage`` implementation. It is not, and
+cannot be, a proof of exact equivalence across the full continuous input
+space - it is evidence that the two structures agree on every case checked,
+strengthened at the boundaries that matter most (exhaustion's strict ``<``,
+the liquidity observation-only cutoff), and re-run on every future change to
+either function.
+
 Known limitation, carried honestly: two ablations from the original Phase 3A
 proposal - acceleration-trigger sensitivity and volume-corroboration-cap
 relaxation - are NOT reachable through ``run_threshold_ablation``, because
@@ -108,9 +129,15 @@ class StageGateStatus:
     """Per-gate pass/fail for one candidate row against one target stage.
 
     Diagnostic only. This is a comparison table built from the same
-    thresholds ``determine_stage`` reads off ``SignalQualityConfig`` - it does
-    not reimplement the stage cascade, so it carries no risk of drifting from
-    what production actually decided.
+    threshold *fields* ``determine_stage`` reads off ``SignalQualityConfig`` -
+    it does not reimplement the stage cascade, so it cannot diverge on the
+    threshold *values* production uses. The per-gate comparison operators
+    (``>=`` for score gates, strict ``<`` for exhaustion) are mirrored, not
+    shared, so they could in principle drift if `determine_stage` ever
+    changed one without a corresponding update here;
+    ``test_gate_status_agrees_with_determine_stage`` (randomized seeds plus
+    deterministic boundary cases - see module docstring) is what actually
+    catches that, not a structural guarantee.
     """
 
     target_stage: str
@@ -208,17 +235,43 @@ class ForwardOutcome:
     instead: the best/worst price actually touched anywhere in the window,
     which is a different question from the fixed-horizon return and is why
     both are reported rather than one being derived from the other.
+
+    ``horizon_observed`` names, per horizon label, whether at least one real
+    observation existed strictly after ``reference_at`` and at or before that
+    horizon. On the reconstructed replay grid this matters concretely:
+    production scans every ``DEFAULT_SCAN_INTERVAL_SECONDS`` (600s / 10
+    minutes), so a "5m" query commonly has no observation at all between the
+    reference and the horizon - ``price_asof`` would otherwise silently
+    return the reference price itself, and a naive reader would misread that
+    as "the market moved 0% in 5 minutes" rather than "OHM has no data this
+    soon". Whenever ``horizon_observed[label]`` is ``False``,
+    ``horizon_returns_pct[label]`` is forced to ``None`` rather than carrying
+    that stale value forward. Coarser horizons (15m and up) are ordinarily
+    observed even on the 10-minute grid, since at least one real scan falls
+    inside a 15-minute window.
+
+    ``mae_pct`` is the *signed* minimum forward return over the window -
+    ``(min_future_price / reference_price - 1) * 100`` - and can be
+    *positive* if every future observation stayed above the reference price
+    (nothing adverse happened at all). Read it as "the worst return actually
+    realised", not as a return that is necessarily a loss.
+    ``max_adverse_excursion_pct`` is the conventional MAE reading instead:
+    ``min(0.0, mae_pct)``, always zero or negative, ``None`` only when
+    ``mae_pct`` itself is ``None``. Both are reported side by side rather
+    than one silently redefining the other.
     """
 
     reference_at: datetime
     reference_price: float
     horizon_returns_pct: Mapping[str, float | None]
+    horizon_observed: Mapping[str, bool]
     mfe_pct: float | None
     mfe_at: datetime | None
     time_to_mfe_seconds: float | None
     mae_pct: float | None
     mae_at: datetime | None
     time_to_mae_seconds: float | None
+    max_adverse_excursion_pct: float | None
     window_complete: bool
 
     def as_dict(self) -> dict[str, Any]:
@@ -226,12 +279,14 @@ class ForwardOutcome:
             "reference_at": self.reference_at.isoformat(),
             "reference_price": self.reference_price,
             "horizon_returns_pct": dict(self.horizon_returns_pct),
+            "horizon_observed": dict(self.horizon_observed),
             "mfe_pct": self.mfe_pct,
             "mfe_at": self.mfe_at.isoformat() if self.mfe_at else None,
             "time_to_mfe_seconds": self.time_to_mfe_seconds,
             "mae_pct": self.mae_pct,
             "mae_at": self.mae_at.isoformat() if self.mae_at else None,
             "time_to_mae_seconds": self.time_to_mae_seconds,
+            "max_adverse_excursion_pct": self.max_adverse_excursion_pct,
             "window_complete": self.window_complete,
         }
 
@@ -249,7 +304,16 @@ def compute_forward_outcome(
         return None
 
     horizon_returns: dict[str, float | None] = {}
+    horizon_observed: dict[str, bool] = {}
     for label, delta in horizons.items():
+        observed = timeline.has_forward_observation(reference_at, delta)
+        horizon_observed[label] = observed
+        if not observed:
+            # No observation strictly after reference_at within this
+            # horizon: price_asof would only return the carried-forward
+            # reference price here, which is not a real forward measurement.
+            horizon_returns[label] = None
+            continue
         price_then = timeline.price_asof(reference_at + delta)
         horizon_returns[label] = (
             (price_then / reference_price - 1.0) * 100.0 if price_then is not None else None
@@ -276,12 +340,14 @@ def compute_forward_outcome(
         reference_at=reference_at,
         reference_price=reference_price,
         horizon_returns_pct=horizon_returns,
+        horizon_observed=horizon_observed,
         mfe_pct=mfe_pct,
         mfe_at=mfe_at,
         time_to_mfe_seconds=time_to_mfe,
         mae_pct=mae_pct,
         mae_at=mae_at,
         time_to_mae_seconds=time_to_mae,
+        max_adverse_excursion_pct=(min(0.0, mae_pct) if mae_pct is not None else None),
         window_complete=timeline.has_complete_window(reference_at, mfe_mae_horizon),
     )
 
@@ -295,6 +361,18 @@ def compute_forward_outcome(
 class StageTimingRecord:
     """One episode's timing story: when each stage tier was first reached,
     what blocked the next tier at that moment, and what happened after.
+
+    EPISODE-CONDITIONED, not signal-conditioned: there is exactly one record
+    per Phase 2 ``MoveEpisode`` (a real, qualifying price move), never one
+    per candidate or per scan. A candidate that never became part of a
+    qualifying episode - because no real move followed it, or one too small
+    to open an episode - has no record here and contributes nothing to any
+    aggregate built from ``build_stage_timing_records``'s output. Treat
+    statistics over these records as "conditional on a real move having
+    happened", never as "all OHM signals" or a false-positive rate. That
+    analysis instead belongs to Phase 2's audit rows and Phase 3A's
+    ``decision_telemetry``, both of which retain every scored candidate
+    (suppressed included) regardless of what happened afterward.
     """
 
     symbol: str

@@ -16,7 +16,7 @@ from app.services.decision_telemetry import (
     build_telemetry_record,
     record_decision_telemetry,
 )
-from app.services.signal_scoring import SignalQualityCandidate
+from app.services.signal_scoring import STAGE_SUPPRESSED, SignalQualityCandidate
 
 
 BASE_SETTINGS = {"webhook_secret": "test-webhook-secret"}
@@ -80,6 +80,28 @@ def test_flag_on_writes_one_line_per_candidate(tmp_path):
     assert row["price"] == pytest.approx(12.5)
     assert row["schema_version"] == 1
     assert row["scan_source"] == "LIVE"
+
+
+def test_suppressed_candidates_are_still_recorded(tmp_path):
+    """Telemetry must retain the full scored universe, suppressed rows
+    included - narrowing it to alert-worthy candidates would make future
+    false-positive/false-negative analysis impossible from this data source.
+    """
+    settings = _settings(decision_telemetry_v1_enabled=True, signal_quality_v1_enabled=True)
+    target = tmp_path / "telemetry.jsonl"
+    candidates = [
+        _candidate(symbol="AAAUSD", stage=STAGE_SUPPRESSED),
+        _candidate(symbol="BBBUSD", stage="BREAKOUT_CANDIDATE"),
+    ]
+    assert candidates[0].suppressed is True
+
+    written = record_decision_telemetry(candidates, settings=settings, path=target)
+
+    assert written == 2
+    rows = [json.loads(line) for line in target.read_text(encoding="utf-8").strip().splitlines()]
+    suppressed_row = next(row for row in rows if row["symbol"] == "AAAUSD")
+    assert suppressed_row["suppressed"] is True
+    assert suppressed_row["stage"] == STAGE_SUPPRESSED
 
 
 def test_empty_candidate_list_writes_nothing(tmp_path):

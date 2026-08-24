@@ -3,10 +3,12 @@
 These tests exist to pin the correction that started Phase 3A: an alert
 observed at Stage=BREAKOUT_CANDIDATE, Persistence=3 is NOT, by itself,
 evidence that persistence was what blocked ACTIONABLE_REVIEW.
-``test_gate_status_agrees_with_determine_stage`` is the load-bearing test in
-this file - it asserts the diagnostic gate table can never silently drift
-from what ``determine_stage`` (the real production stage machine) actually
-decides.
+``test_gate_status_agrees_with_determine_stage`` (randomized) plus the
+``test_*_gate_boundary_*`` and ``test_*_boundary_matches_determine_stage``
+tests (deterministic, exactly-at/epsilon-below/epsilon-above every gate)
+together provide randomized and boundary regression coverage against
+``determine_stage`` (the real production stage machine) - evidence, not a
+proof of exact equivalence across the full continuous input space.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -169,9 +171,14 @@ def test_evaluate_stage_gates_rejects_unsupported_target_stage():
 
 @pytest.mark.parametrize("seed", range(60))
 def test_gate_status_agrees_with_determine_stage(seed):
-    """Cross-validation: the diagnostic table's eligibility bit must always
-    match what the real production stage machine (``determine_stage``)
-    decides, so the two structures can never silently drift apart.
+    """Randomized regression coverage against the real ``determine_stage``
+    implementation: for 60 pseudo-random score/persistence/exhaustion/
+    liquidity combinations, the diagnostic table's eligibility bit agrees
+    with what the real production stage machine decides. This samples the
+    input space; it does not prove exact equivalence across it. The
+    deterministic ``test_*_gate_boundary_*`` and
+    ``test_*_boundary_matches_determine_stage`` tests below specifically
+    target the edges randomized sampling is least likely to hit.
     """
     import random
 
@@ -212,6 +219,140 @@ def test_gate_status_agrees_with_determine_stage(seed):
         assert actual_stage == STAGE_BREAKOUT_CANDIDATE
     else:
         assert actual_stage in (STAGE_EARLY_BUILDING, STAGE_SUPPRESSED)
+
+
+EPS = 1e-6
+
+_ACTIONABLE_GATE_BOUNDARIES = [
+    ("opportunity", "opportunity", CONFIG.actionable_opportunity, ">="),
+    ("explosion_potential", "explosion", CONFIG.actionable_explosion, ">="),
+    ("tradeability", "tradeability", CONFIG.actionable_tradeability, ">="),
+    ("persistence_scans", "persistence", CONFIG.actionable_min_persistence_scans, ">="),
+    ("exhaustion_penalty", "exhaustion", CONFIG.actionable_max_exhaustion, "<"),
+]
+
+_BREAKOUT_GATE_BOUNDARIES = [
+    ("opportunity", "opportunity", CONFIG.breakout_opportunity, ">="),
+    ("explosion_potential", "explosion", CONFIG.breakout_explosion, ">="),
+    ("tradeability", "tradeability", CONFIG.breakout_tradeability, ">="),
+    ("persistence_scans", "persistence", CONFIG.breakout_min_persistence_scans, ">="),
+    ("exhaustion_penalty", "exhaustion", CONFIG.breakout_max_exhaustion, "<"),
+]
+
+_COMFORTABLY_PASSING = dict(
+    opportunity=95, explosion=95, tradeability=95, persistence=10, exhaustion=0,
+)
+
+
+def _gate_at(status, name):
+    return next(gate for gate in status.gates if gate.name == name)
+
+
+@pytest.mark.parametrize("gate_name, kwarg, threshold, comparison", _ACTIONABLE_GATE_BOUNDARIES)
+def test_actionable_gate_boundary_is_correct(gate_name, kwarg, threshold, comparison):
+    """Deterministic exactly-at / epsilon-below / epsilon-above coverage for
+    every ACTIONABLE_REVIEW gate - randomized sampling can miss an exact
+    boundary; this targets it directly. Persistence is integer-stepped since
+    epsilon has no meaning for a scan count.
+    """
+    step = 1 if kwarg == "persistence" else EPS
+
+    def _status(value):
+        kwargs = dict(_COMFORTABLY_PASSING)
+        kwargs[kwarg] = value
+        row = _row(0, 100.0, liquidity=2_000_000.0, **kwargs)
+        return evaluate_stage_gates(row, config=CONFIG, target_stage=STAGE_ACTIONABLE_REVIEW)
+
+    at = _gate_at(_status(threshold), gate_name)
+    below = _gate_at(_status(threshold - step), gate_name)
+    above = _gate_at(_status(threshold + step), gate_name)
+
+    if comparison == ">=":
+        assert at.passed is True
+        assert below.passed is False
+        assert above.passed is True
+    else:  # strict "<" (exhaustion_penalty)
+        assert at.passed is False  # exactly at the cap does NOT satisfy strict <
+        assert below.passed is True
+        assert above.passed is False
+
+
+@pytest.mark.parametrize("gate_name, kwarg, threshold, comparison", _BREAKOUT_GATE_BOUNDARIES)
+def test_breakout_gate_boundary_is_correct(gate_name, kwarg, threshold, comparison):
+    step = 1 if kwarg == "persistence" else EPS
+
+    def _status(value):
+        kwargs = dict(_COMFORTABLY_PASSING)
+        kwargs[kwarg] = value
+        row = _row(0, 100.0, liquidity=2_000_000.0, **kwargs)
+        return evaluate_stage_gates(row, config=CONFIG, target_stage=STAGE_BREAKOUT_CANDIDATE)
+
+    at = _gate_at(_status(threshold), gate_name)
+    below = _gate_at(_status(threshold - step), gate_name)
+    above = _gate_at(_status(threshold + step), gate_name)
+
+    if comparison == ">=":
+        assert at.passed is True
+        assert below.passed is False
+        assert above.passed is True
+    else:
+        assert at.passed is False
+        assert below.passed is True
+        assert above.passed is False
+
+
+def test_exhaustion_strict_less_than_boundary_matches_determine_stage():
+    """The exhaustion gate is a strict ``<``, not ``<=`` - exactly at the cap
+    must FAIL against both the diagnostic table and the real production
+    function, not just one of them.
+    """
+    kwargs = dict(_COMFORTABLY_PASSING, liquidity=2_000_000.0)
+
+    for exhaustion, expect_actionable in (
+        (CONFIG.actionable_max_exhaustion - EPS, True),
+        (CONFIG.actionable_max_exhaustion, False),
+        (CONFIG.actionable_max_exhaustion + EPS, False),
+    ):
+        row = _row(0, 100.0, exhaustion=exhaustion, **{k: v for k, v in kwargs.items() if k != "exhaustion"})
+        status = evaluate_stage_gates(row, config=CONFIG, target_stage=STAGE_ACTIONABLE_REVIEW)
+        actual_stage = determine_stage(
+            opportunity=kwargs["opportunity"],
+            explosion=kwargs["explosion"],
+            tradeability=kwargs["tradeability"],
+            persistence_scans=kwargs["persistence"],
+            exhaustion_penalty=exhaustion,
+            liquidity_24h_usd=kwargs["liquidity"],
+            config=CONFIG,
+        )
+        assert status.eligible is expect_actionable
+        assert (actual_stage == STAGE_ACTIONABLE_REVIEW) is expect_actionable
+
+
+def test_liquidity_observation_boundary_matches_determine_stage():
+    """observation_only is ``liquidity < observation_liquidity_usd`` - exactly
+    at the threshold must NOT be observation-only, one cent below must be.
+    """
+    kwargs = dict(_COMFORTABLY_PASSING)
+    threshold = CONFIG.observation_liquidity_usd
+
+    for liquidity, expect_actionable in (
+        (threshold, True),
+        (threshold - EPS, False),
+        (threshold + EPS, True),
+    ):
+        row = _row(0, 100.0, liquidity=liquidity, **kwargs)
+        status = evaluate_stage_gates(row, config=CONFIG, target_stage=STAGE_ACTIONABLE_REVIEW)
+        actual_stage = determine_stage(
+            opportunity=kwargs["opportunity"],
+            explosion=kwargs["explosion"],
+            tradeability=kwargs["tradeability"],
+            persistence_scans=kwargs["persistence"],
+            exhaustion_penalty=kwargs["exhaustion"],
+            liquidity_24h_usd=liquidity,
+            config=CONFIG,
+        )
+        assert status.eligible is expect_actionable
+        assert (actual_stage == STAGE_ACTIONABLE_REVIEW) is expect_actionable
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +414,78 @@ def test_forward_outcome_never_sees_data_before_reference_at():
     timeline = _timeline([r for r in rows if r.observed_at >= BASE])
     outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
     assert outcome.mfe_pct is None or outcome.mfe_pct < 800.0
+
+
+def test_five_minute_horizon_is_unobserved_on_a_ten_minute_scan_grid():
+    """The reviewer's core concern: production scans every 10 minutes
+    (DEFAULT_SCAN_INTERVAL_SECONDS). On data sampled no finer than that grid,
+    a 5-minute-ahead query has no observation at all - it must read as
+    unobserved, never as a silently-carried-forward 0% return.
+    """
+    rows = [_obs(0, 100.0), _obs(10, 101.0), _obs(20, 102.0)]
+    timeline = _timeline(rows)
+
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert outcome.horizon_observed["5m"] is False
+    assert outcome.horizon_returns_pct["5m"] is None
+
+
+def test_coarser_horizon_is_observed_on_the_same_ten_minute_grid():
+    """15m and up ordinarily see at least one real scan inside the window,
+    even at exactly production cadence.
+    """
+    rows = [_obs(0, 100.0), _obs(10, 101.0), _obs(20, 102.0)]
+    timeline = _timeline(rows)
+
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert outcome.horizon_observed["15m"] is True
+    assert outcome.horizon_returns_pct["15m"] == pytest.approx(1.0)
+
+
+def test_horizon_observed_has_an_entry_for_every_horizon():
+    rows = [_obs(0, 100.0), _obs(10, 101.0)]
+    timeline = _timeline(rows)
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert set(outcome.horizon_observed) == set(outcome.horizon_returns_pct)
+    for label, observed in outcome.horizon_observed.items():
+        if not observed:
+            assert outcome.horizon_returns_pct[label] is None
+
+
+def test_max_adverse_excursion_is_capped_at_zero_when_every_price_rose():
+    """A run that only ever went up has a positive signed minimum-future
+    return (mae_pct) - the conventional MAE reading must still be 0, not
+    positive, so a reader cannot mistake "nothing adverse happened" for an
+    adverse move.
+    """
+    rows = [_obs(0, 100.0), _obs(10, 105.0), _obs(20, 110.0)]
+    timeline = _timeline(rows)
+
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert outcome.mae_pct == pytest.approx(5.0)  # signed: positive here
+    assert outcome.max_adverse_excursion_pct == pytest.approx(0.0)
+
+
+def test_max_adverse_excursion_equals_raw_mae_when_negative():
+    rows = [_obs(0, 100.0), _obs(10, 90.0), _obs(20, 95.0)]
+    timeline = _timeline(rows)
+
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert outcome.mae_pct == pytest.approx(-10.0)
+    assert outcome.max_adverse_excursion_pct == pytest.approx(-10.0)
+
+
+def test_max_adverse_excursion_is_none_when_mae_is_none():
+    timeline = _timeline([_obs(0, 100.0)])  # nothing forward at all
+    outcome = compute_forward_outcome(timeline, reference_at=BASE, reference_price=100.0)
+
+    assert outcome.mae_pct is None
+    assert outcome.max_adverse_excursion_pct is None
 
 
 # ---------------------------------------------------------------------------
