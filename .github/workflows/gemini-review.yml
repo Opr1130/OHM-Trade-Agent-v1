@@ -9,6 +9,8 @@ on:
         type: string
   pull_request:
     types: [ready_for_review]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
@@ -17,12 +19,15 @@ permissions:
 
 jobs:
   review:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 69 }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' && github.event.pull_request.number == 69) ||
+          (github.event_name == 'issue_comment' && github.event.issue.number == 69 && github.event.comment.body == '/run-ai-review') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       GEMINI_MODEL: gemini-3.7-flash
-      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || (github.event_name == 'pull_request' && github.event.pull_request.number || github.event.issue.number) }}
 
     steps:
       - name: Checkout trusted review configuration
