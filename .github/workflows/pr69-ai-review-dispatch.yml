@@ -1,0 +1,24 @@
+name: PR69 AI Review Dispatcher
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    if: ${{ github.event.pull_request.number == 69 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch Gemini and DeepSeek reviews
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run gemini-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
+          gh workflow run deepseek-quant-review.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr_number=69
+          echo "Dispatched Gemini and DeepSeek reviews for PR #69"
