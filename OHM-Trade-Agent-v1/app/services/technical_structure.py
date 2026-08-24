@@ -174,32 +174,32 @@ def latest_liquidity_sweep(
 def breakout_retest_state(
     bars: Sequence[StructureBar], breakout_level: float | None, *, bullish: bool
 ) -> str | None:
+    """Classify the first retest after the first qualifying break of a level.
+
+    Later continuation closes beyond the same level must not move the breakout
+    timestamp forward; doing so can erase an already-observed retest. A failed
+    retest is terminal for this breakout event, while a touch that closes back
+    on the breakout side is reported as held.
+    """
     if breakout_level is None or len(bars) < 2:
         return None
     break_idx: int | None = None
     for i, bar in enumerate(bars):
-        if (bullish and bar.close > breakout_level) or (not bullish and bar.close < breakout_level):
+        broke = (bullish and bar.close > breakout_level) or (
+            not bullish and bar.close < breakout_level
+        )
+        if broke:
             break_idx = i
+            break
     if break_idx is None or break_idx == len(bars) - 1:
         return RETEST_NOT_SEEN
     post = bars[break_idx + 1 :]
-    touched = False
     for bar in post:
-        if bullish:
-            if bar.low <= breakout_level:
-                touched = True
-                if bar.close < breakout_level:
-                    return RETEST_FAILED
-                if bar.close >= breakout_level:
-                    return RETEST_HELD
-        else:
-            if bar.high >= breakout_level:
-                touched = True
-                if bar.close > breakout_level:
-                    return RETEST_FAILED
-                if bar.close <= breakout_level:
-                    return RETEST_HELD
-    return RETEST_NOT_SEEN if not touched else None
+        if bullish and bar.low <= breakout_level:
+            return RETEST_FAILED if bar.close < breakout_level else RETEST_HELD
+        if not bullish and bar.high >= breakout_level:
+            return RETEST_FAILED if bar.close > breakout_level else RETEST_HELD
+    return RETEST_NOT_SEEN
 
 
 def analyze_technical_structure(
