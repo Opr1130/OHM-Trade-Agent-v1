@@ -7,8 +7,10 @@ on:
         description: "Pull request number to review"
         required: true
         type: string
-  pull_request:
-    types: [synchronize]
+  push:
+    branches: [main]
+    paths:
+      - .github/ai-review-pr69.trigger
 
 permissions:
   contents: read
@@ -17,12 +19,11 @@ permissions:
 
 jobs:
   review:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 69 }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       GEMINI_MODEL: gemini-3.7-flash
-      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || github.event.pull_request.number }}
+      PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || '69' }}
 
     steps:
       - name: Checkout trusted review configuration
