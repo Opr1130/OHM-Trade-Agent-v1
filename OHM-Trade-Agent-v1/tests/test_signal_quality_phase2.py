@@ -308,10 +308,10 @@ def test_episode_records_threshold_crossing_times_in_order():
 
 def test_move_class_boundaries():
     cases = {
-        25.0: "MOVE_20",
-        60.0: "MOVE_50",
-        140.0: "MOVE_100",
-        250.0: "MOVE_200",
+        25.0: "MOVE_20_50",
+        60.0: "MOVE_50_100",
+        140.0: "MOVE_100_200",
+        250.0: "MOVE_200_300",
         410.0: "MOVE_300_PLUS",
     }
     for gain, expected in cases.items():
@@ -551,12 +551,12 @@ def _report_for(observations, detections, *, config=None):
         interval_seconds=config.scan_interval_seconds,
         max_carry_seconds=config.max_carry_seconds,
     )
-    from app.services.signal_quality_phase2 import episode_sensitivity, measure_carry_fidelity
+    from app.services.signal_quality_phase2 import episode_sensitivity, measure_persistence_gap_drift
 
     return build_phase2_report(
         ingestion, frames, detections, list(detections), episodes, outcomes,
         config=config,
-        carry_fidelity=measure_carry_fidelity(observations, frames),
+        carry_fidelity=measure_persistence_gap_drift(observations, frames),
         sensitivity=episode_sensitivity(timelines, base=config.episodes),
     )
 
@@ -584,8 +584,8 @@ def test_report_counts_one_episode_for_one_run():
 
     assert report["coverage"]["episodes"] == 1
     assert report["coverage"]["major_move_episodes"] == 1
-    assert report["detection_metrics_by_class"]["MOVE_20"]["episodes"] == 1
-    assert report["detection_metrics_by_class"]["MOVE_20"]["missed_episodes"] == 1
+    assert report["detection_metrics_by_threshold_cohort"]["cohorts"]["GE_20"]["episodes"] == 1
+    assert report["detection_metrics_by_threshold_cohort"]["cohorts"]["GE_20"]["missed_episodes"] == 1
 
 
 def test_report_reports_imputed_cell_share():
@@ -691,25 +691,25 @@ def test_carry_error_bounds_match_phase_1():
 
 
 def test_carry_fidelity_measures_realised_drift():
-    from app.services.signal_quality_phase2 import measure_carry_fidelity
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
 
     # Quiet carry then a 0.5% move: within the 1% persist bound.
     observations = [_obs(0, 100.0), _obs(40, 100.5)]
     frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
-    fidelity = measure_carry_fidelity(observations, frames)
+    fidelity = measure_persistence_gap_drift(observations, frames)
 
     assert fidelity["imputed_cells_measured"] > 0
     assert fidelity["exceeded_bound"] == 0
-    assert fidelity["realised_drift_to_next_observation_pct"]["median"] == pytest.approx(0.5)
+    assert fidelity["drift_to_next_persisted_observation_pct"]["median"] == pytest.approx(0.5)
     assert fidelity["theoretical_price_drift_bound_pct"] == 1.0
 
 
 def test_carry_fidelity_flags_drift_past_the_bound():
-    from app.services.signal_quality_phase2 import measure_carry_fidelity
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
 
     observations = [_obs(0, 100.0), _obs(40, 130.0)]
     frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
-    fidelity = measure_carry_fidelity(observations, frames)
+    fidelity = measure_persistence_gap_drift(observations, frames)
 
     assert fidelity["exceeded_bound"] > 0
     assert fidelity["exceeded_bound_pct"] > 0
@@ -717,11 +717,11 @@ def test_carry_fidelity_flags_drift_past_the_bound():
 
 def test_unresolvable_carry_is_counted_not_assumed_zero():
     """A carry with no later observation has unknowable drift."""
-    from app.services.signal_quality_phase2 import measure_carry_fidelity
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
 
     observations = [_obs(0, 100.0)]
     frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
-    fidelity = measure_carry_fidelity(observations, frames)
+    fidelity = measure_persistence_gap_drift(observations, frames)
 
     assert fidelity["imputed_cells_unresolved"] > 0
     assert fidelity["imputed_cells_measured"] == 0
@@ -730,10 +730,10 @@ def test_unresolvable_carry_is_counted_not_assumed_zero():
 def test_report_includes_reconstruction_fidelity():
     observations = [_obs(0, 100), _obs(40, 100.4), _obs(80, 140)]
     report = _report_for(observations, [])
-    fidelity = report["reconstruction_fidelity"]
+    fidelity = report["reconstruction_drift_proxy"]
 
     assert "theoretical_price_drift_bound_pct" in fidelity
-    assert "realised_drift_to_next_observation_pct" in fidelity
+    assert "drift_to_next_persisted_observation_pct" in fidelity
 
 
 def test_high_carry_drift_raises_a_warning():
@@ -744,15 +744,15 @@ def test_high_carry_drift_raises_a_warning():
         observations, interval_seconds=config.scan_interval_seconds,
         max_carry_seconds=config.max_carry_seconds,
     )
-    from app.services.signal_quality_phase2 import measure_carry_fidelity
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
 
     report = build_phase2_report(
         IngestionResult(observations, len(observations), 0),
         frames, [], [], build_all_episodes(timelines, config=config.episodes), [],
         config=config,
-        carry_fidelity=measure_carry_fidelity(observations, frames),
+        carry_fidelity=measure_persistence_gap_drift(observations, frames),
     )
-    assert any("CARRY_DRIFT_HIGH" in w for w in report["warnings"])
+    assert any("PERSISTENCE_GAP_DRIFT_HIGH" in w for w in report["warnings"])
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +905,8 @@ def test_write_ohlc_cache_round_trips(tmp_path):
     assert reloaded[0].high == 180.0
 
 
-def test_ohlc_validated_report_changes_status(tmp_path):
+def test_full_ohlc_coverage_still_does_not_claim_cross_validation(tmp_path):
+    """Even complete peak coverage validates only peak magnitude."""
     from app.services.signal_quality_phase2 import CachedOhlcProvider
 
     path = tmp_path / "obs.jsonl"
@@ -929,7 +930,409 @@ def test_ohlc_validated_report_changes_status(tmp_path):
     )
 
     report = run_phase2_replay(observation_file=path, ohlc_provider=CachedOhlcProvider(cache))
+    block = report["ohlc_validation"]
 
-    assert report["status"] == "OHLC_CROSS_VALIDATED_REPLAY"
-    assert report["coverage"]["ohlc_validated_episodes"] >= 1
-    assert not any("OHLC_VALIDATION_ABSENT" in w for w in report["warnings"])
+    # Every episode covered...
+    assert block["coverage_pct"] == 100.0
+    assert block["status"] == "COMPLETE_OHLC_PEAK_COMPARISON"
+    # ...and the report is still provisional, because timing and class were
+    # never recomputed from OHLC.
+    assert report["status"] == "PROVISIONAL_EVENT_SAMPLED_REPLAY"
+    assert block["fully_validated_metrics"] == []
+    assert any("crossings" in m for m in block["not_validated_metrics"])
+    assert any("outcome_class" in m for m in block["not_validated_metrics"])
+    assert any("OHLC_PEAK_COMPARISON_ONLY" in w for w in report["warnings"])
+    assert "OHLC-validated episode peaks" not in report["methodology"]["outcome_source"]
+
+
+# ---------------------------------------------------------------------------
+# HIGH 1 — incomplete forward windows must not reach any precision denominator
+# ---------------------------------------------------------------------------
+
+
+def _late_and_early_outcomes():
+    """One complete-window detection and one truncated-window detection.
+
+    The late detection has a future print (so it is measurable) but the data
+    ends well before its 24h horizon closes, which is exactly the case that
+    previously leaked into precision.
+    """
+    observations = [
+        _obs(0, 100.0),
+        _obs(60, 102.0),
+        _obs(60 * 24 + 60, 101.0),   # closes the early detection's horizon
+        _obs(60 * 24 + 120, 400.0),  # strong partial move for the late one
+    ]
+    timelines = build_timelines(observations)
+    early = _detection(0, 100.0)
+    late = _detection(60 * 24 + 60, 101.0)
+    outcomes = evaluate_detections([early, late], timelines, horizon=HORIZON)
+    return observations, timelines, outcomes, early, late
+
+
+def test_incomplete_window_is_measurable_but_not_judged():
+    _, _, outcomes, _, late = _late_and_early_outcomes()
+    late_outcome = next(o for o in outcomes if o.detection.scan_at == late.scan_at)
+
+    # It has a forward return - the old rule would have admitted it.
+    assert late_outcome.forward_max_return_pct is not None
+    assert late_outcome.forward_max_return_pct > 100.0
+    assert late_outcome.window_complete is False
+
+
+def _report_from_outcomes(observations, detections):
+    config = Phase2Config()
+    timelines = build_timelines(observations)
+    episodes = build_all_episodes(timelines, config=config.episodes)
+    outcomes = evaluate_detections(detections, timelines, horizon=config.horizon)
+    frames = reconstruct_scan_frames(
+        observations,
+        interval_seconds=config.scan_interval_seconds,
+        max_carry_seconds=config.max_carry_seconds,
+    )
+    return build_phase2_report(
+        IngestionResult(observations, len(observations), 0),
+        frames, detections, list(detections), episodes, outcomes, config=config,
+    )
+
+
+def test_incomplete_detection_with_a_strong_partial_move_is_excluded_from_precision():
+    observations, _, _, early, late = _late_and_early_outcomes()
+    report = _report_from_outcomes(observations, [early, late])
+    fp = report["false_positives"]
+
+    # Only the complete-window detection is judged.
+    assert fp["judged_detections"] == 1
+    assert fp["excluded_incomplete_window"] == 1
+    # The +300% partial move did not inflate the +20% reach rate.
+    assert fp["reached_plus_20_pct"] == 0.0
+    assert "window_complete" in fp["judged_population_rule"]
+
+
+def test_incomplete_detection_with_no_move_is_excluded_from_the_failure_rate():
+    observations = [
+        _obs(0, 100.0),
+        _obs(60, 108.0),
+        _obs(60 * 24 + 60, 130.0),   # early detection reaches +30%
+        _obs(60 * 24 + 70, 130.0),   # late detection: flat, window truncated
+    ]
+    early = _detection(0, 100.0)
+    late = _detection(60 * 24 + 60, 130.0)
+    report = _report_from_outcomes(observations, [early, late])
+    fp = report["false_positives"]
+
+    assert fp["judged_detections"] == 1
+    assert fp["excluded_incomplete_window"] == 1
+    # The flat truncated detection did not drag the failure rate up.
+    assert fp["failed_to_reach_plus_5_pct"] == 0.0
+
+
+def test_calibration_and_validation_exclude_incomplete_windows():
+    observations, _, _, early, late = _late_and_early_outcomes()
+    report = _report_from_outcomes(observations, [early, late])
+    split = report["out_of_sample"]
+
+    assert split["calibration_detections"] + split["validation_detections"] == 1
+
+
+def test_winner_versus_failed_distributions_exclude_incomplete_windows():
+    observations, _, _, early, late = _late_and_early_outcomes()
+    report = _report_from_outcomes(observations, [early, late])
+    block = report["winner_vs_failed_breakout"]
+
+    # The truncated +300% row must not appear as a "winner".
+    assert block["eventual_major_mover_detections"] == 0
+    assert block["failed_breakout_detections"] == 1
+
+
+def test_precision_tables_exclude_incomplete_windows():
+    observations, _, _, early, late = _late_and_early_outcomes()
+    report = _report_from_outcomes(observations, [early, late])
+    fp = report["false_positives"]
+
+    for table in (
+        "precision_by_stage",
+        "precision_by_explosion_bucket",
+        "precision_by_opportunity_bucket",
+        "precision_by_liquidity_band",
+    ):
+        judged = sum(row["judged"] for row in fp[table].values())
+        assert judged == 1, table
+
+
+def test_incomplete_detections_remain_reported():
+    observations, _, _, early, late = _late_and_early_outcomes()
+    report = _report_from_outcomes(observations, [early, late])
+
+    assert report["coverage"]["detections_with_incomplete_forward_window"] == 1
+    assert report["false_positives"]["excluded_incomplete_window"] == 1
+    assert report["false_positives"]["excluded_incomplete_bucket_counts"]
+    assert any("INCOMPLETE_FORWARD_WINDOWS" in w for w in report["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 — OHLC coverage must not upgrade the report
+# ---------------------------------------------------------------------------
+
+
+def _ten_episodes_one_covered():
+    from app.services.signal_quality_phase2 import build_ohlc_validation_block
+
+    episodes = []
+    for index in range(10):
+        timeline = _run_timeline([(0, 100), (10, 130), (20, 118)])
+        episodes.extend(build_episodes(timeline, f"S{index}USD", config=EpisodeConfig()))
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=200.0, low=100.0, close=130.0),
+    ])
+    # Only the first symbol resolves in the fixture.
+    covered = validate_episodes_with_ohlc(episodes[:1], provider) + list(episodes[1:])
+    return covered, build_ohlc_validation_block
+
+
+def test_one_covered_episode_cannot_upgrade_the_whole_report():
+    episodes, build_block = _ten_episodes_one_covered()
+    block = build_block(episodes, provider_name="FixtureOhlcProvider")
+
+    assert block["episodes_requested"] == 10
+    assert block["episodes_with_candles"] == 1
+    assert block["coverage_pct"] == 10.0
+    assert block["status"] == "PARTIAL_OHLC_PEAK_COMPARISON"
+    assert block["status"] != "COMPLETE_OHLC_PEAK_COMPARISON"
+
+
+def test_partial_coverage_is_reported_explicitly_in_the_report():
+    from app.services.signal_quality_phase2 import build_ohlc_validation_block
+
+    episodes, _ = _ten_episodes_one_covered()
+    config = Phase2Config()
+    report = build_phase2_report(
+        IngestionResult([], 0, 0), [], [], [], episodes, [],
+        config=config,
+        ohlc_validation=build_ohlc_validation_block(episodes, provider_name="Fixture"),
+    )
+
+    assert report["status"] == "PROVISIONAL_EVENT_SAMPLED_REPLAY"
+    assert report["ohlc_validation"]["coverage_pct"] == 10.0
+    assert any("OHLC_COVERAGE_PARTIAL" in w for w in report["warnings"])
+
+
+def test_ohlc_peak_comparison_does_not_imply_threshold_validation():
+    """Peak magnitude is compared; crossings and class are untouched."""
+    timeline = _run_timeline([(0, 100), (10, 125), (20, 118)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    before = episodes[0]
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=400.0, low=100.0, close=125.0),
+    ])
+
+    after = validate_episodes_with_ohlc(episodes, provider)[0]
+
+    # OHLC says +300%; the episode's own class and timing are unchanged.
+    assert after.ohlc_peak_return_pct == pytest.approx(300.0)
+    assert after.peak_return_pct == before.peak_return_pct
+    assert after.outcome_class == before.outcome_class
+    assert after.peak_at == before.peak_at
+    assert after.crossings == before.crossings
+
+
+def test_no_ohlc_data_leaves_the_report_provisional():
+    from app.services.signal_quality_phase2 import build_ohlc_validation_block
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    block = build_ohlc_validation_block(episodes, provider_name="none")
+    report = build_phase2_report(
+        IngestionResult([], 0, 0), [], [], [], episodes, [],
+        config=Phase2Config(), ohlc_validation=block,
+    )
+
+    assert block["status"] == "NO_OHLC_VALIDATION"
+    assert report["status"] == "PROVISIONAL_EVENT_SAMPLED_REPLAY"
+    assert any("OHLC_VALIDATION_ABSENT" in w for w in report["warnings"])
+
+
+def test_no_cross_validated_status_constant_exists():
+    """The overclaiming status must be unreachable, not merely unused."""
+    import app.services.signal_quality_phase2 as module
+
+    assert not hasattr(module, "REPORT_STATUS_OHLC_VALIDATED")
+    source = open(module.__file__, encoding="utf-8").read()
+    assert "OHLC_CROSS_VALIDATED_REPLAY" not in source
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM 1 — drift terminology
+# ---------------------------------------------------------------------------
+
+
+def test_drift_metric_disclaims_being_reconstruction_error():
+    from app.services.signal_quality_phase2 import measure_persistence_gap_drift
+
+    observations = [_obs(0, 100.0), _obs(40, 100.5)]
+    frames = reconstruct_scan_frames(observations, interval_seconds=600, max_carry_seconds=3600)
+    block = measure_persistence_gap_drift(observations, frames)
+
+    assert block["metric"] == "drift_to_next_persisted_observation"
+    assert block["is_point_in_time_reconstruction_error"] is False
+    assert "not to the true contemporaneous price" in block["interpretation"]
+    assert "unknowable" in block["interpretation"]
+    assert "drift_to_next_persisted_observation_pct" in block
+    assert "realised_drift_to_next_observation_pct" not in block
+    assert "exceeded_bound_caveat" in block
+
+
+def test_report_drift_block_is_named_as_a_proxy():
+    observations = [_obs(0, 100), _obs(40, 100.4), _obs(80, 140)]
+    report = _report_for(observations, [])
+
+    assert "reconstruction_drift_proxy" in report
+    assert "reconstruction_fidelity" not in report
+    assert report["reconstruction_drift_proxy"]["is_point_in_time_reconstruction_error"] is False
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM 2 — cumulative cohorts vs exclusive classes
+# ---------------------------------------------------------------------------
+
+
+def _mixed_magnitude_observations():
+    """Four symbols peaking at roughly +30, +70, +150 and +400 percent."""
+    observations = []
+    for symbol, peak in (("AUSD", 1.3), ("BUSD", 1.7), ("CUSD", 2.5), ("DUSD", 5.0)):
+        steps = 12
+        for index in range(steps + 1):
+            price = 100.0 * (peak ** (index / steps))
+            observations.append(_obs(index * 10, price, symbol=symbol))
+        observations.append(_obs((steps + 1) * 10, 100.0 * peak * 0.5, symbol=symbol))
+    return observations
+
+
+def test_cumulative_cohorts_overlap_and_exclusive_classes_do_not():
+    observations = _mixed_magnitude_observations()
+    report = _report_for(observations, [])
+
+    cohorts = report["detection_metrics_by_threshold_cohort"]["cohorts"]
+    classes = report["detection_metrics_by_exclusive_class"]["classes"]
+    total_episodes = report["coverage"]["episodes"]
+
+    # Cumulative: every cohort key is GE_, and counts are non-increasing.
+    assert set(cohorts) == {"GE_20", "GE_50", "GE_100", "GE_200", "GE_300"}
+    counts = [cohorts[k]["episodes"] for k in ("GE_20", "GE_50", "GE_100", "GE_200", "GE_300")]
+    assert counts == sorted(counts, reverse=True)
+    assert counts[0] == 4  # all four qualify as >= +20%
+
+    # Exclusive: each episode counted once, and the bands sum to the total.
+    assert sum(row["episodes"] for row in classes.values()) == total_episodes
+    assert classes["MOVE_20_50"]["episodes"] == 1
+    assert classes["MOVE_50_100"]["episodes"] == 1
+    assert classes["MOVE_100_200"]["episodes"] == 1
+    assert classes["MOVE_300_PLUS"]["episodes"] == 1
+
+
+def test_counting_semantics_are_documented_in_the_report():
+    report = _report_for(_mixed_magnitude_observations(), [])
+
+    assert "CUMULATIVE" in report["detection_metrics_by_threshold_cohort"]["counting"]
+    assert "Do not sum" in report["detection_metrics_by_threshold_cohort"]["counting"]
+    assert "EXCLUSIVE" in report["detection_metrics_by_exclusive_class"]["counting"]
+
+
+def test_episode_outcome_class_uses_the_exclusive_vocabulary():
+    """One name, one meaning: episodes_by_class and the exclusive metrics agree."""
+    report = _report_for(_mixed_magnitude_observations(), [])
+    by_class = report["coverage"]["episodes_by_class"]
+    classes = report["detection_metrics_by_exclusive_class"]["classes"]
+
+    for name, count in by_class.items():
+        assert name in classes
+        assert classes[name]["episodes"] == count
+
+
+# ---------------------------------------------------------------------------
+# Cache hardening
+# ---------------------------------------------------------------------------
+
+
+def test_cache_writer_refuses_to_truncate_a_non_cache_file(tmp_path):
+    """A mistyped path must not destroy a production registry."""
+    from app.services.signal_quality_phase2 import OhlcCacheTargetError, write_ohlc_cache
+
+    registry = tmp_path / "trade_outcomes.json"
+    original = '{"record_type":"TRADE_OUTCOME","symbol":"BTCUSD"}'
+    registry.write_text(original, encoding="utf-8")
+
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+
+    with pytest.raises(OhlcCacheTargetError):
+        write_ohlc_cache(episodes, FixtureOhlcProvider([]), registry)
+
+    assert registry.read_text(encoding="utf-8") == original
+
+
+def test_cache_writer_may_replace_an_existing_cache(tmp_path):
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    path = tmp_path / "ohlc.jsonl"
+    path.write_text(
+        '{"symbol":"OLDUSD","start_at":"2026-08-01T00:00:00+00:00","high":1,"low":1,"close":1}',
+        encoding="utf-8",
+    )
+    timeline = _run_timeline([(0, 100), (10, 130)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    provider = FixtureOhlcProvider([
+        OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0),
+    ])
+
+    assert write_ohlc_cache(episodes, provider, path) == 1
+    assert "OLDUSD" not in path.read_text(encoding="utf-8")
+
+
+def test_cache_writer_deduplicates_overlapping_candles(tmp_path):
+    """Overlapping episodes on one symbol must not multiply the cache."""
+    from app.services.signal_quality_phase2 import write_ohlc_cache
+
+    timeline = _run_timeline([(0, 100), (10, 130), (20, 90), (600, 90), (610, 125), (620, 80)])
+    episodes = build_episodes(timeline, "TESTUSD", config=EpisodeConfig())
+    assert len(episodes) >= 2
+
+    candle = OhlcCandle(BASE + timedelta(minutes=10), high=180.0, low=100.0, close=130.0)
+
+    class AlwaysSame:
+        def fetch(self, symbol, start_at, end_at):
+            return [candle]
+
+    path = tmp_path / "ohlc.jsonl"
+    written = write_ohlc_cache(episodes, AlwaysSame(), path)
+
+    assert written == 1
+    assert len(path.read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+def test_cache_reader_counts_rejected_and_duplicate_rows(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    path = tmp_path / "ohlc.jsonl"
+    row = '{"symbol":"TESTUSD","start_at":"2026-08-01T00:10:00+00:00","high":180,"low":100,"close":125}'
+    path.write_text("\n".join([row, row, "nonsense", '["not","a","dict"]']), encoding="utf-8")
+
+    provider = CachedOhlcProvider(path)
+
+    assert len(provider.fetch("TESTUSD", BASE, BASE + timedelta(hours=1))) == 1
+    assert provider.duplicate_rows == 1
+    assert provider.rejected_rows == 2
+
+
+def test_cache_reader_normalises_symbol_case(tmp_path):
+    from app.services.signal_quality_phase2 import CachedOhlcProvider
+
+    path = tmp_path / "ohlc.jsonl"
+    path.write_text(
+        '{"symbol":"testusd","start_at":"2026-08-01T00:10:00+00:00","high":180,"low":100,"close":125}',
+        encoding="utf-8",
+    )
+    provider = CachedOhlcProvider(path)
+
+    assert len(provider.fetch("TESTUSD", BASE, BASE + timedelta(hours=1))) == 1
+    assert len(provider.fetch("testusd", BASE, BASE + timedelta(hours=1))) == 1

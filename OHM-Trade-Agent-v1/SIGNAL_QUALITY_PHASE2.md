@@ -8,10 +8,10 @@ Kraken endpoint, and has no deployment side effect.
 It answers one question: **does the Phase 1 detector surface genuine explosive
 movers early, and how often does it fire on moves that never arrive?**
 
-> **Status: `PROVISIONAL_EVENT_SAMPLED_REPLAY`.** Until OHLC cross-validation is
-> supplied and sample counts are adequate, every number this harness produces is
-> provisional. It must never be presented as validated production truth, and it
-> must never be used to tune production automatically.
+> **Status: `PROVISIONAL_EVENT_SAMPLED_REPLAY` — always, in this harness.**
+> Every number it produces is provisional. It must never be presented as
+> validated production truth, and never used to tune production automatically.
+> OHLC coverage does **not** upgrade this status: see §8.
 
 ---
 
@@ -51,7 +51,7 @@ retention).
 real production scan — Phase 1 genuinely scanned then — but its *values* are
 stale, and stale values are never presented as fresh observations.
 
-### Why carrying forward is defensible, and how far it can be wrong
+### Why carrying forward is defensible, and what the drift number is not
 
 Last-observation-carried-forward is justified here by *why* a row is missing.
 `_should_persist` writes a row **because** something moved:
@@ -71,15 +71,31 @@ hourly heartbeat as the one exception. `CARRY_*_BOUND` constants mirror those
 thresholds and `test_carry_error_bounds_match_phase_1` fails if the runtime
 changes and the replay does not.
 
-The bound is theory; the report also **measures** it.
-`measure_carry_fidelity` compares every carried price against the next real
-observation for that symbol and publishes the realised drift distribution
-(count/p25/median/p75), how many carries exceeded the 1% bound, and the carry
-age distribution, under `reconstruction_fidelity`. A carry with no later
-observation is counted as `imputed_cells_unresolved` rather than assumed to be
-zero drift. If more than 20% of carries exceed the bound, the report raises
-`CARRY_DRIFT_HIGH` — reconstructed features are correspondingly less reliable
-and capture rates should be discounted.
+The theoretical bound is the defensible statement. The report also publishes a
+companion diagnostic, `reconstruction_drift_proxy`, but it is important to be
+exact about what that is:
+
+> **It is not the reconstruction error, and it cannot be.** The true error of a
+> carried value is its distance from the contemporaneous market price at that
+> scan — a price that was never recorded, which is precisely why there was
+> something to carry. Point-in-time reconstruction error is **unknowable**
+> without a live scan log.
+
+`measure_persistence_gap_drift` measures the distance from each carried value to
+the **next persisted observation**. That row exists *because* the market moved
+past a persist threshold, so the gap bundles two different things: how stale the
+carried value was, and how much the market moved after the scan. It therefore
+tends to **overstate** carry error, and ordinary later movement can show up here
+as though it were reconstruction distortion.
+
+It is still worth reporting as an upper-bound-flavoured uncertainty proxy: a
+small distribution is genuine reassurance, a large one is a reason to distrust
+reconstructed features. The block carries
+`is_point_in_time_reconstruction_error: false` and an `interpretation` string so
+the distinction travels with the numbers. A carry with no later observation is
+counted `imputed_cells_unresolved` rather than assumed zero-drift. Past 20%
+exceedance the report raises `PERSISTENCE_GAP_DRIFT_HIGH`, itself carrying the
+caveat that exceeding the bound does not prove the carried value was wrong.
 
 ## 3. Replaying the exact Phase 1 pipeline
 
@@ -137,8 +153,21 @@ more across that sweep, the report raises
 without the sweep beside them.
 
 Each episode records the first time it closed at or above +3, +5, +10, +20, +50,
-+100, +200 and +300 percent from its baseline. Its class comes from its peak
-return: `MOVE_20` / `MOVE_50` / `MOVE_100` / `MOVE_200` / `MOVE_300_PLUS`.
++100, +200 and +300 percent from its baseline.
+
+### Exclusive classes vs cumulative cohorts
+
+Two different questions, so two separately named blocks — previously one set of
+`MOVE_*` keys served both and could be misread as mutually exclusive:
+
+| Block | Keys | Counting |
+| --- | --- | --- |
+| `detection_metrics_by_exclusive_class` | `MOVE_20_50`, `MOVE_50_100`, `MOVE_100_200`, `MOVE_200_300`, `MOVE_300_PLUS` | **Mutually exclusive** half-open bands `[low, high)`. Each episode appears once; the bands sum to the episode total. |
+| `detection_metrics_by_threshold_cohort` | `GE_20`, `GE_50`, `GE_100`, `GE_200`, `GE_300` | **Cumulative and overlapping.** A +320% episode is in all five. Do not sum. |
+
+An episode's own `outcome_class` uses the exclusive vocabulary, so
+`episodes_by_class` and the exclusive metrics agree key for key. Each block
+states its counting rule inline, and both are covered by tests.
 
 ## 5. Detections are evaluated only on movement *after* the detection
 
@@ -178,8 +207,23 @@ Per class (`MOVE_20` … `MOVE_300_PLUS`), counted in **episodes**, not windows:
 **False positives** are judged prospectively from each detection's own
 timestamp, bucketed `FAIL_LT_5` / `MOVE_5_10` / `MOVE_10_20` / `MOVE_20_50` /
 `MOVE_50_PLUS`, with +20% precision broken out by stage, explosion-potential
-bucket, opportunity bucket and liquidity band. Detections whose forward horizon
-is not fully covered by data are excluded from precision and counted separately.
+bucket, opportunity bucket and liquidity band.
+
+### The judged population requires a complete forward window
+
+```
+judged  <=>  forward_max_return_pct is not None  AND  window_complete is True
+```
+
+Both conditions, not just the first. A detection near the right edge of the
+dataset has a future print but not a full horizon; admitting it would let the
+data simply running out register as a failure — or let a truncated partial spike
+register as a win. Such rows enter **no** rate, precision table, cohort or
+split. They are reported separately under
+`false_positives.excluded_incomplete_window` with their own bucket counts, and
+`coverage.detections_with_incomplete_forward_window`, so they are excluded but
+never silently discarded. Five tests pin this, each failing if the
+`window_complete` condition is dropped.
 
 **Missed-winner forensics** reconstruct what OHM knew at the last scan before
 each of +3/+5/+10/+20/+50 for every undetected major episode — all scores,
@@ -211,20 +255,46 @@ The persisted stream can miss intraperiod highs, so episode peaks drawn from
 - `KrakenPublicOhlcProvider` uses only `KrakenClient.get_ohlc`, a **public**
   endpoint, and fails soft — outcome validation may never break a report.
 - `CachedOhlcProvider` reads candles from a local JSONL cache: **offline and
-  deterministic**, so a validated report is reproducible instead of depending
-  on whatever the exchange returns that minute. Build a cache once with
-  `--write-ohlc-cache`, then validate repeatedly with `--ohlc-cache`.
+  deterministic**, so a report is reproducible instead of depending on whatever
+  the exchange returns that minute. Build a cache once with
+  `--write-ohlc-cache`, then validate repeatedly with `--ohlc-cache`. It
+  normalises symbol case, deduplicates by `(symbol, start_at)`, and counts
+  `rejected_rows` / `duplicate_rows` rather than dropping them silently.
 - Tests use a deterministic in-memory fixture provider. **No unit test touches
   the network**, so CI stays deterministic.
 
 `write_ohlc_cache` is the only function in the module that writes a file, and
-it writes only to an operator-chosen cache path — never a production registry.
+two guards keep that safe. It **refuses to truncate an existing file that is
+not already an OHLC cache**, so a mistyped path aimed at a production registry
+raises `OhlcCacheTargetError` instead of destroying it; and it deduplicates
+candles by `(symbol, start_at)`, since overlapping episodes on one symbol would
+otherwise write the same candle repeatedly.
 
 Validation is **outcome-side only**. It never feeds feature generation, so it
-cannot leak future information into a decision. Both the event-sampled and the
-OHLC peak are retained on the episode so undercounting stays visible rather
-than being silently corrected. When any episode is OHLC-validated the report
-status becomes `OHLC_CROSS_VALIDATED_REPLAY`.
+cannot leak future information into a decision.
+
+### OHLC does not upgrade the report status
+
+`validate_episodes_with_ohlc` attaches `ohlc_peak_return_pct` and deliberately
+leaves `peak_return_pct`, `peak_at`, `outcome_class` and `crossings` exactly as
+the close-based episode construction produced them. Nothing downstream is
+recomputed. So every capture rate, lead time, threshold crossing and class
+assignment in the report remains **event-sampled even at 100% OHLC coverage**.
+
+Letting one covered episode flip the whole report to "cross-validated" would
+claim far more than the data supports, so there is deliberately no
+cross-validated status constant to reach for —
+`test_no_cross_validated_status_constant_exists` fails if one reappears.
+Instead an `ohlc_validation` block reports:
+
+- `status`: `NO_OHLC_VALIDATION` / `PARTIAL_OHLC_PEAK_COMPARISON` / `COMPLETE_OHLC_PEAK_COMPARISON`
+- `provider`, `episodes_requested`, `episodes_with_candles`, `coverage_pct`
+- `event_sampled_peak_vs_ohlc_peak_delta_pct`, and how often event sampling understated the peak
+- `fully_validated_metrics` (empty), `partially_validated_metrics` (peak magnitude, compared not replaced), and `not_validated_metrics` (class, peak timing, crossings, capture rates, forward returns)
+
+Both peaks are retained so undercounting stays visible rather than being
+silently corrected, and so no metric can quietly start mixing close-based
+episode construction with high-based labels.
 
 ## 9. Performance
 
@@ -243,10 +313,12 @@ for every row — is quadratic and unusable. Instead:
 `source_lines`, `rejected_lines`, `observation_rows`, `symbols`, date coverage,
 `reconstructed_scans`, observed/imputed cell counts and share, `detections`,
 `episodes`, `major_move_episodes`, per-class episode counts, detections with an
-incomplete forward window, OHLC coverage, `reconstruction_fidelity` (measured
-carry drift), `episode_parameter_sensitivity` (the prior sweep), and an explicit
-`warnings` list: missing OHLC validation, high carry drift, parameter-sensitive
-episode counts, small validation sample, rejected rows, no episodes, nothing to
+incomplete forward window, OHLC coverage, `ohlc_validation` (coverage and what
+it does and does not establish), `reconstruction_drift_proxy` (persistence-gap
+drift), `episode_parameter_sensitivity` (the prior sweep), and an explicit
+`warnings` list: absent or partial OHLC coverage, peak-comparison-only coverage,
+high persistence-gap drift, parameter-sensitive episode counts, incomplete
+forward windows, small validation sample, rejected rows, no episodes, nothing to
 replay.
 
 ## 11. Running

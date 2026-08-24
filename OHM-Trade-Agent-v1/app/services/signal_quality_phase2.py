@@ -59,8 +59,39 @@ from app.services.signal_scoring import (
 
 
 VERSION = "signal-quality-phase2-replay-v2"
+
+# The report status is ALWAYS provisional in this harness. OHLC attaches an
+# auxiliary peak comparison; it does not rebuild the episode peak, class,
+# timing or threshold crossings, so no metric derived from those becomes
+# validated. Upgrading the whole report because one episode had candles would
+# claim far more than the data supports, so there is deliberately no
+# "cross-validated" status constant to reach for.
 REPORT_STATUS_PROVISIONAL = "PROVISIONAL_EVENT_SAMPLED_REPLAY"
-REPORT_STATUS_OHLC_VALIDATED = "OHLC_CROSS_VALIDATED_REPLAY"
+
+# What OHLC coverage actually establishes, stated separately from the report
+# status so the two can never be conflated.
+OHLC_STATUS_NONE = "NO_OHLC_VALIDATION"
+OHLC_STATUS_PARTIAL_PEAK = "PARTIAL_OHLC_PEAK_COMPARISON"
+OHLC_STATUS_COMPLETE_PEAK = "COMPLETE_OHLC_PEAK_COMPARISON"
+
+# Which reported metrics OHLC coverage does and does not speak to. Every metric
+# in this harness is built from close-based episode construction, so OHLC highs
+# corroborate peak magnitude alone.
+OHLC_FULLY_VALIDATED_METRICS: tuple[str, ...] = ()
+OHLC_PARTIALLY_VALIDATED_METRICS: tuple[str, ...] = (
+    "episode.peak_return_pct (magnitude only, compared not replaced)",
+)
+OHLC_NOT_VALIDATED_METRICS: tuple[str, ...] = (
+    "episode.outcome_class",
+    "episode.peak_at",
+    "episode.crossings (threshold timing)",
+    "detection_metrics_by_threshold_cohort",
+    "detection_metrics_by_exclusive_class",
+    "early-capture timing and lead times",
+    "detected_before_plus_N",
+    "missed_winners thresholds",
+    "false_positives (forward returns use persisted last_price)",
+)
 
 DEFAULT_OBSERVATION_FILE = Path("/app/data/full_market_observations.jsonl")
 
@@ -73,8 +104,21 @@ DEFAULT_HISTORY_SCANS = 8
 DEFAULT_MAX_CARRY_SECONDS = 3600
 DEFAULT_OUTCOME_HORIZON_HOURS = 24
 
-# Episode thresholds, in percent above the episode baseline.
+# Episode thresholds, in percent above the episode baseline. These generate
+# CUMULATIVE cohorts: an episode peaking at +320% belongs to every one of them.
 OUTCOME_THRESHOLDS: tuple[float, ...] = (20.0, 50.0, 100.0, 200.0, 300.0)
+
+# Mutually EXCLUSIVE bands, half-open [low, high). An episode belongs to exactly
+# one. Reported alongside the cumulative cohorts because the two answer
+# different questions and were previously easy to confuse: "MOVE_50" reading as
+# an exclusive class while actually meaning "peaked at +50% or more".
+EXCLUSIVE_CLASS_BANDS: tuple[tuple[str, float, float], ...] = (
+    ("MOVE_20_50", 20.0, 50.0),
+    ("MOVE_50_100", 50.0, 100.0),
+    ("MOVE_100_200", 100.0, 200.0),
+    ("MOVE_200_300", 200.0, 300.0),
+    ("MOVE_300_PLUS", 300.0, float("inf")),
+)
 # Additional early marks used only for missed-winner forensics.
 FORENSIC_THRESHOLDS: tuple[float, ...] = (3.0, 5.0, 10.0, 20.0, 50.0)
 
@@ -611,22 +655,31 @@ class SymbolTimeline:
         return lo, hi
 
 
-def measure_carry_fidelity(
+def measure_persistence_gap_drift(
     observations: Sequence[ReplayObservation],
     frames: Sequence[ScanFrame],
 ) -> dict[str, Any]:
-    """Measure how wrong the carried-forward values actually were.
+    """Distance from each carried value to the NEXT PERSISTED observation.
 
-    For every imputed cell, compare the carried price against the next real
-    observation for that symbol. That realised drift is the honest measure of
-    how much the reconstruction distorted each decision.
+    **This is not the reconstruction error.** It cannot be. The true error of a
+    carried value is its distance from the contemporaneous market price at that
+    scan, and that price was never recorded - if it had been, there would be
+    nothing to carry. Point-in-time reconstruction error is unknowable without
+    a live scan log.
 
-    This turns imputation from an unquantified caveat into a number a reviewer
-    can weigh. The theoretical bound is Phase 1's own persist thresholds - a row
-    is written *because* something moved, so silence between rows means price
-    moved less than ``CARRY_PRICE_DRIFT_BOUND_PCT`` - but the realised
-    distribution is what actually matters, and heartbeat rows are an exception
-    to the bound.
+    What this measures instead is the gap to the next persisted row. That row
+    exists *because* the market moved past a persist threshold, so the measured
+    gap bundles together two different things: how stale the carried value was,
+    and how much the market moved after the scan in question. It therefore
+    tends to **overstate** carry error, and normal later movement can appear
+    here as though it were reconstruction distortion.
+
+    It is still worth reporting as an upper-bound-flavoured uncertainty proxy:
+    a small distribution is genuine reassurance, while a large one is a reason
+    to distrust reconstructed features. The defensible statement remains the
+    theoretical one - a row is written because something moved, so silence
+    between rows means price moved less than ``CARRY_PRICE_DRIFT_BOUND_PCT``,
+    with the hourly heartbeat as the exception.
     """
     by_symbol: dict[str, list[ReplayObservation]] = defaultdict(list)
     for row in observations:
@@ -667,6 +720,16 @@ def measure_carry_fidelity(
                 exceeded_bound += 1
 
     return {
+        "metric": "drift_to_next_persisted_observation",
+        "is_point_in_time_reconstruction_error": False,
+        "interpretation": (
+            "Distance from each carried value to the next PERSISTED observation, "
+            "not to the true contemporaneous price at that scan. The next row "
+            "exists because the market moved past a persist threshold, so this "
+            "bundles carry staleness with genuine post-scan movement and tends "
+            "to overstate reconstruction error. True point-in-time error is "
+            "unknowable without a live scan log."
+        ),
         "imputed_cells_measured": len(drifts),
         "imputed_cells_unresolved": unresolved,
         "theoretical_price_drift_bound_pct": CARRY_PRICE_DRIFT_BOUND_PCT,
@@ -678,10 +741,15 @@ def measure_carry_fidelity(
             "evidence the market was quiet, not evidence of missing data. The "
             f"{CARRY_HEARTBEAT_SECONDS}s heartbeat is the exception."
         ),
-        "realised_drift_to_next_observation_pct": _quartiles(drifts),
+        "drift_to_next_persisted_observation_pct": _quartiles(drifts),
         "exceeded_bound": exceeded_bound,
         "exceeded_bound_pct": (
             round(exceeded_bound / len(drifts) * 100.0, 2) if drifts else None
+        ),
+        "exceeded_bound_caveat": (
+            "Exceeding the bound does not prove the carried value was wrong at "
+            "the scan; the market may simply have moved afterwards, which is "
+            "what triggered the next persisted row."
         ),
         "carry_age_seconds": _quartiles(ages),
     }
@@ -735,16 +803,16 @@ def build_timelines(observations: Iterable[ReplayObservation]) -> dict[str, Symb
 
 
 def _outcome_class(move_pct: float) -> str:
-    if move_pct >= 300:
-        return "MOVE_300_PLUS"
-    if move_pct >= 200:
-        return "MOVE_200"
-    if move_pct >= 100:
-        return "MOVE_100"
-    if move_pct >= 50:
-        return "MOVE_50"
-    if move_pct >= 20:
-        return "MOVE_20"
+    """Exclusive class for an episode peak.
+
+    Uses EXCLUSIVE_CLASS_BANDS so an episode's own class label and the
+    exclusive-class metrics share one vocabulary. Previously this returned
+    "MOVE_50" for a +60% episode while the metrics block used "MOVE_50" to mean
+    "+50% or more" - two different meanings behind one name.
+    """
+    for name, low, high in EXCLUSIVE_CLASS_BANDS:
+        if low <= move_pct < high:
+            return name
     return "NO_MAJOR_MOVE"
 
 
@@ -1064,8 +1132,11 @@ class CachedOhlcProvider:
 
     def __init__(self, path: Path) -> None:
         self._by_symbol: dict[str, list[OhlcCandle]] = defaultdict(list)
+        self.rejected_rows = 0
+        self.duplicate_rows = 0
         if not path.exists():
             return
+        seen: set[tuple[str, datetime]] = set()
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
@@ -1073,10 +1144,15 @@ class CachedOhlcProvider:
                 try:
                     raw = json.loads(line)
                 except json.JSONDecodeError:
+                    self.rejected_rows += 1
+                    continue
+                if not isinstance(raw, dict):
+                    self.rejected_rows += 1
                     continue
                 moment = _as_utc(raw.get("start_at"))
                 symbol = str(raw.get("symbol") or "").upper()
                 if moment is None or not symbol:
+                    self.rejected_rows += 1
                     continue
                 try:
                     candle = OhlcCandle(
@@ -1086,9 +1162,16 @@ class CachedOhlcProvider:
                         close=float(raw["close"]),
                     )
                 except (KeyError, TypeError, ValueError):
+                    self.rejected_rows += 1
                     continue
                 if not math.isfinite(candle.high) or candle.high <= 0:
+                    self.rejected_rows += 1
                     continue
+                key = (symbol, moment)
+                if key in seen:
+                    self.duplicate_rows += 1
+                    continue
+                seen.add(key)
                 self._by_symbol[symbol].append(candle)
         for rows in self._by_symbol.values():
             rows.sort(key=lambda row: row.start_at)
@@ -1100,6 +1183,24 @@ class CachedOhlcProvider:
         ]
 
 
+class OhlcCacheTargetError(RuntimeError):
+    """Refused to write a cache over a file that is not an OHLC cache."""
+
+
+def _is_ohlc_cache_file(path: Path) -> bool:
+    """Does this existing file already look like an OHLC cache?"""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                return isinstance(row, dict) and {"symbol", "start_at", "high"} <= set(row)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True  # an empty file is safe to claim
+
+
 def write_ohlc_cache(
     episodes: Sequence[MoveEpisode],
     provider: OhlcProvider,
@@ -1107,33 +1208,106 @@ def write_ohlc_cache(
 ) -> int:
     """Fetch candles for each episode once and persist them for reuse.
 
-    The only function in this module that writes a file, and it writes to an
-    operator-chosen cache path - never to a production registry.
+    The only function in this module that writes a file. Two guards make that
+    safe: it refuses to truncate an existing file that is not already an OHLC
+    cache - a mistyped path aimed at a production registry raises rather than
+    destroying it - and it deduplicates candles by ``(symbol, start_at)``,
+    because overlapping episodes on one symbol otherwise write the same candle
+    repeatedly and inflate the cache.
     """
-    written = 0
+    if path.exists() and not _is_ohlc_cache_file(path):
+        raise OhlcCacheTargetError(
+            f"Refusing to overwrite {path}: it exists and does not look like an "
+            "OHLC cache. Choose a new path rather than truncating an existing file."
+        )
+
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for episode in episodes:
+        symbol = episode.symbol.upper()
+        for candle in provider.fetch(episode.symbol, episode.baseline_at, episode.end_at):
+            stamp = candle.start_at.astimezone(timezone.utc).isoformat()
+            key = (symbol, stamp)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "symbol": symbol,
+                "start_at": stamp,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+            })
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        for episode in episodes:
-            for candle in provider.fetch(episode.symbol, episode.baseline_at, episode.end_at):
-                handle.write(json.dumps({
-                    "symbol": episode.symbol,
-                    "start_at": candle.start_at.isoformat(),
-                    "high": candle.high,
-                    "low": candle.low,
-                    "close": candle.close,
-                }) + "\n")
-                written += 1
-    return written
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    return len(rows)
+
+
+def build_ohlc_validation_block(
+    episodes: Sequence[MoveEpisode],
+    *,
+    provider_name: str,
+) -> dict[str, Any]:
+    """State exactly what OHLC coverage does and does not establish.
+
+    Deliberately verbose. The temptation is to reduce this to one boolean and
+    let it flip the report status - which would announce that capture rates,
+    threshold timings and class assignments had been cross-validated when none
+    of them were touched. Coverage, peak deltas, and the per-metric validation
+    lists are published instead so a reader can see the limit for themselves.
+    """
+    covered = [row for row in episodes if row.ohlc_validated]
+    coverage_pct = round(len(covered) / len(episodes) * 100.0, 2) if episodes else None
+
+    if not covered:
+        status = OHLC_STATUS_NONE
+    elif len(covered) == len(episodes):
+        status = OHLC_STATUS_COMPLETE_PEAK
+    else:
+        status = OHLC_STATUS_PARTIAL_PEAK
+
+    deltas = [
+        row.ohlc_peak_return_pct - row.peak_return_pct
+        for row in covered
+        if row.ohlc_peak_return_pct is not None
+    ]
+    understated = sum(1 for delta in deltas if delta > 0.0)
+
+    return {
+        "status": status,
+        "provider": provider_name,
+        "episodes_requested": len(episodes),
+        "episodes_with_candles": len(covered),
+        "coverage_pct": coverage_pct,
+        "event_sampled_peak_vs_ohlc_peak_delta_pct": _quartiles(deltas),
+        "episodes_where_event_sampling_understated_the_peak": understated,
+        "fully_validated_metrics": list(OHLC_FULLY_VALIDATED_METRICS),
+        "partially_validated_metrics": list(OHLC_PARTIALLY_VALIDATED_METRICS),
+        "not_validated_metrics": list(OHLC_NOT_VALIDATED_METRICS),
+        "note": (
+            "OHLC highs are compared against event-sampled peaks; they do not "
+            "replace peak_at, outcome_class or threshold crossings, so no "
+            "capture rate or timing metric here is OHLC-validated. The report "
+            "status stays provisional regardless of coverage."
+        ),
+    }
 
 
 def validate_episodes_with_ohlc(
     episodes: Sequence[MoveEpisode],
     provider: OhlcProvider,
 ) -> list[MoveEpisode]:
-    """Re-measure each episode's peak against OHLC highs.
+    """Attach an OHLC peak comparison to each episode.
 
-    Outcome-side only. The returned episodes carry both the event-sampled and
-    the OHLC peak so under-counting is visible rather than silently corrected.
+    Outcome-side only, and deliberately non-destructive: ``peak_return_pct``,
+    ``peak_at``, ``outcome_class`` and ``crossings`` are left exactly as the
+    event-sampled construction produced them. Both peaks are carried so
+    under-counting becomes visible rather than being silently corrected, and so
+    no downstream metric can quietly start mixing close-based episode
+    construction with high-based labels.
     """
     validated: list[MoveEpisode] = []
     for episode in episodes:
@@ -1309,11 +1483,21 @@ FEATURE_COMPARISON_FIELDS = (
 )
 
 
-def _class_metrics(
+def _cohort_metrics(
     results: Sequence[EpisodeDetectionResult],
-    threshold: float,
+    *,
+    low: float,
+    high: float = float("inf"),
 ) -> dict[str, Any]:
-    eligible = [row for row in results if row.episode.peak_return_pct >= threshold]
+    """Detection metrics for episodes whose peak lies in [low, high).
+
+    One implementation serves both views: the cumulative cohorts pass
+    ``high=inf``, the exclusive bands pass a real upper edge.
+    """
+    eligible = [
+        row for row in results
+        if low <= row.episode.peak_return_pct < high
+    ]
     if not eligible:
         return {
             "episodes": 0,
@@ -1359,7 +1543,7 @@ def build_phase2_report(
     outcomes: Sequence[DetectionOutcome],
     *,
     config: Phase2Config,
-    ohlc_validated: bool = False,
+    ohlc_validation: dict[str, Any] | None = None,
     carry_fidelity: dict[str, Any] | None = None,
     sensitivity: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -1378,14 +1562,39 @@ def build_phase2_report(
     ]
 
     major = [row for row in results if row.episode.peak_return_pct >= OUTCOME_THRESHOLDS[0]]
-    class_metrics = {}
-    for threshold in OUTCOME_THRESHOLDS:
-        key = "MOVE_300_PLUS" if threshold >= 300 else f"MOVE_{int(threshold)}"
-        class_metrics[key] = _class_metrics(results, threshold)
 
-    judged = [row for row in outcomes if row.forward_max_return_pct is not None]
+    # Cumulative: "peaked at or above X". Overlapping by construction, so the
+    # keys say GE_ rather than MOVE_ - a +320% episode appears in all five.
+    threshold_cohorts = {
+        f"GE_{int(threshold)}": _cohort_metrics(results, low=threshold)
+        for threshold in OUTCOME_THRESHOLDS
+    }
+    # Exclusive: each episode appears exactly once.
+    exclusive_classes = {
+        name: _cohort_metrics(results, low=low, high=high)
+        for name, low, high in EXCLUSIVE_CLASS_BANDS
+    }
+
+    # The precision population requires BOTH a measurable forward return and a
+    # fully covered forward horizon. Requiring only the former let detections
+    # near the right edge of the dataset - which have a future print but not a
+    # complete window - enter every precision, failure and split denominator,
+    # biasing precision downward purely because the data ran out. Incomplete
+    # rows stay visible in their own cohort; they are reported, never silently
+    # discarded, and never counted.
+    judged = [
+        row for row in outcomes
+        if row.forward_max_return_pct is not None and row.window_complete
+    ]
     incomplete = [row for row in outcomes if not row.window_complete]
-    bucket_counts = Counter(row.bucket for row in outcomes)
+    unmeasurable = [
+        row for row in outcomes
+        if row.window_complete and row.forward_max_return_pct is None
+    ]
+    # Bucket the judged population only; incomplete rows get their own count so
+    # the two are never summed together by a reader.
+    bucket_counts = Counter(row.bucket for row in judged)
+    incomplete_bucket_counts = Counter(row.bucket for row in incomplete)
 
     # Winner vs failed-breakout: both groups judged from their own timestamps.
     winners = [
@@ -1416,10 +1625,23 @@ def build_phase2_report(
 
     if not observations:
         warnings.append("NO_OBSERVATION_ROWS: nothing was replayed; run against production history.")
-    if not ohlc_validated:
+    ohlc_block = ohlc_validation or build_ohlc_validation_block(episodes, provider_name="none")
+    if ohlc_block["status"] == OHLC_STATUS_NONE:
         warnings.append(
             "OHLC_VALIDATION_ABSENT: peaks come from event-sampled last_price only and "
             "may undercount intraperiod highs."
+        )
+    elif ohlc_block["status"] == OHLC_STATUS_PARTIAL_PEAK:
+        warnings.append(
+            f"OHLC_COVERAGE_PARTIAL: {ohlc_block['episodes_with_candles']}/"
+            f"{ohlc_block['episodes_requested']} episodes have candles; peak "
+            "comparison is incomplete and no timing or class metric is validated."
+        )
+    else:
+        warnings.append(
+            "OHLC_PEAK_COMPARISON_ONLY: every episode has candles, but only peak "
+            "magnitude is corroborated. Class assignment, peak timing and threshold "
+            "crossings remain event-sampled."
         )
     if incomplete:
         warnings.append(
@@ -1440,9 +1662,12 @@ def build_phase2_report(
         exceeded = carry_fidelity.get("exceeded_bound_pct")
         if exceeded is not None and exceeded > 20.0:
             warnings.append(
-                f"CARRY_DRIFT_HIGH: {exceeded}% of carried cells drifted past the "
-                f"{CARRY_PRICE_DRIFT_BOUND_PCT}% persist bound before the next "
-                "observation; reconstructed features are correspondingly less reliable."
+                f"PERSISTENCE_GAP_DRIFT_HIGH: {exceeded}% of carried cells sit further "
+                f"than {CARRY_PRICE_DRIFT_BOUND_PCT}% from the next persisted "
+                "observation. This is an uncertainty proxy, not measured "
+                "reconstruction error - the gap also contains genuine post-scan "
+                "movement - but a large share is a reason to discount reconstructed "
+                "features."
             )
     if sensitivity:
         counts = [row["episodes"] for row in sensitivity]
@@ -1458,7 +1683,9 @@ def build_phase2_report(
 
     return {
         "version": VERSION,
-        "status": REPORT_STATUS_OHLC_VALIDATED if ohlc_validated else REPORT_STATUS_PROVISIONAL,
+        # Always provisional: see the module constants. OHLC coverage is
+        # reported under "ohlc_validation" and never promotes this field.
+        "status": REPORT_STATUS_PROVISIONAL,
         "methodology": {
             "scan_reconstruction": (
                 "fixed 10-minute grid; latest event at or before each boundary carried "
@@ -1471,8 +1698,8 @@ def build_phase2_report(
                 "baseline-trigger-peak-reset cycle; one explosive run is one episode"
             ),
             "outcome_source": (
-                "OHLC-validated episode peaks" if ohlc_validated
-                else "future persisted last_price only (event-sampled proxy)"
+                "future persisted last_price only (event-sampled proxy); any OHLC "
+                "coverage is an auxiliary peak comparison, not a replacement"
             ),
             "automatic_tuning_applied": False,
             "production_thresholds_changed": False,
@@ -1502,14 +1729,36 @@ def build_phase2_report(
             "episodes_by_class": dict(sorted(Counter(row.outcome_class for row in episodes).items())),
             "detections_with_incomplete_forward_window": len(incomplete),
             "ohlc_validated_episodes": sum(1 for row in episodes if row.ohlc_validated),
-            "ohlc_validation_coverage_pct": (
-                round(sum(1 for row in episodes if row.ohlc_validated) / len(episodes) * 100.0, 2)
-                if episodes else None
-            ),
+            "ohlc_validation_coverage_pct": ohlc_block["coverage_pct"],
         },
-        "detection_metrics_by_class": class_metrics,
+        "ohlc_validation": ohlc_block,
+        "detection_metrics_by_threshold_cohort": {
+            "counting": (
+                "CUMULATIVE and overlapping: GE_20 includes every episode that "
+                "peaked at +20% or more, so a +320% episode is counted in all "
+                "five cohorts. Do not sum these."
+            ),
+            "cohorts": threshold_cohorts,
+        },
+        "detection_metrics_by_exclusive_class": {
+            "counting": (
+                "MUTUALLY EXCLUSIVE half-open bands [low, high): each episode "
+                "appears in exactly one. These sum to the episode total."
+            ),
+            "classes": exclusive_classes,
+        },
         "false_positives": {
             "judged_detections": len(judged),
+            "judged_population_rule": (
+                "forward_max_return_pct is not None AND window_complete is True"
+            ),
+            "excluded_incomplete_window": len(incomplete),
+            "excluded_unmeasurable": len(unmeasurable),
+            "excluded_incomplete_bucket_counts": dict(sorted(incomplete_bucket_counts.items())),
+            "excluded_note": (
+                "Detections without a fully covered forward horizon are reported here "
+                "but contribute to no rate, precision table, cohort or split below."
+            ),
             "bucket_counts": dict(sorted(bucket_counts.items())),
             "failed_to_reach_plus_5_pct": (
                 round(sum(1 for row in judged if row.forward_max_return_pct < 5.0) / len(judged) * 100.0, 2)
@@ -1542,8 +1791,8 @@ def build_phase2_report(
             "failed_breakout_detections": len(failures),
             "features": comparison,
         },
-        "reconstruction_fidelity": carry_fidelity or {
-            "note": "Carry fidelity not measured for this report.",
+        "reconstruction_drift_proxy": carry_fidelity or {
+            "note": "Persistence-gap drift not measured for this report.",
         },
         "episode_parameter_sensitivity": {
             "note": (
@@ -1599,10 +1848,10 @@ def run_phase2_replay(
     # Episodes are derived first so audit retention can be scoped to the
     # symbols that actually matter for missed-winner forensics.
     episodes = build_all_episodes(timelines, config=config.episodes)
-    ohlc_validated = False
+    provider_name = "none"
     if ohlc_provider is not None and not isinstance(ohlc_provider, NullOhlcProvider):
         episodes = validate_episodes_with_ohlc(episodes, ohlc_provider)
-        ohlc_validated = any(row.ohlc_validated for row in episodes)
+        provider_name = type(ohlc_provider).__name__
 
     episode_symbols = {row.symbol for row in episodes}
     frames = reconstruct_scan_frames(
@@ -1623,7 +1872,7 @@ def run_phase2_replay(
         episodes,
         outcomes,
         config=config,
-        ohlc_validated=ohlc_validated,
-        carry_fidelity=measure_carry_fidelity(ingestion.observations, frames),
+        ohlc_validation=build_ohlc_validation_block(episodes, provider_name=provider_name),
+        carry_fidelity=measure_persistence_gap_drift(ingestion.observations, frames),
         sensitivity=episode_sensitivity(timelines, base=config.episodes),
     )
