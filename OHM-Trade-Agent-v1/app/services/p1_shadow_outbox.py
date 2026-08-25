@@ -37,53 +37,126 @@ def p1_shadow_outbox_enabled(environ: Mapping[str, str] | None = None) -> bool:
     }
 
 
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.parent / f".{path.name}.lock"
+    with registry_lock(lock):
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+
+
+def _repair_truncated_tail_before_append(target: Path) -> bool:
+    """Isolate a crashed partial tail before a later producer appends.
+
+    JSONL requires record boundaries. If a prior process died after writing only
+    part of its final row, appending the next valid snapshot directly would
+    concatenate the two payloads into one malformed line and destroy the good
+    later snapshot with the bad tail. Under the producer/consumer file lock,
+    terminate that orphan tail with a newline first. The consumer can then
+    dead-letter only the damaged row while preserving every later valid row.
+
+    Returns True when a repair newline was written.
+    """
+    if not target.exists() or target.stat().st_size <= 0:
+        return False
+    with target.open("rb") as reader:
+        reader.seek(-1, os.SEEK_END)
+        if reader.read(1) == b"\n":
+            return False
+    with target.open("ab") as handle:
+        handle.write(b"\n")
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    return True
+
+
 def append_live_scan_snapshots(
     candidates: Iterable[Any],
     *,
     decision_at: datetime,
     reference_prices: Mapping[str, float] | None = None,
     path: Path | None = None,
+    dead_letter_path: Path | None = None,
     enabled: bool | None = None,
 ) -> int:
     """Append candidate snapshots in existing ranked order, fail-soft.
 
-    Suppressed candidates are intentionally retained. candidate_rank is the
-    one-based index in the incoming ranked stream.
+    Suppressed candidates are intentionally retained. ``candidate_rank`` is
+    the one-based index in the incoming ranked stream.
+
+    Candidate build/serialization failures are isolated per row and written to
+    the research dead-letter stream; one malformed candidate cannot truncate
+    the remainder of the ranked cohort. The return value is the number of
+    snapshots actually appended, not the number attempted.
     """
     active = p1_shadow_outbox_enabled() if enabled is None else bool(enabled)
     if not active:
         return 0
 
+    rows = list(candidates)
+    if not rows:
+        return 0
+
+    target = path or DEFAULT_OUTBOX_FILE
+    dead_letter = dead_letter_path or DEFAULT_DEAD_LETTER_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.parent / f".{target.name}.lock"
+    written = 0
+
     try:
-        rows = list(candidates)
-        if not rows:
-            return 0
-        snapshots = [
-            build_live_scan_snapshot(
-                candidate,
-                decision_at=decision_at,
-                candidate_rank=index,
-                reference_prices=reference_prices,
-            )
-            for index, candidate in enumerate(rows, start=1)
-        ]
-        target = path or DEFAULT_OUTBOX_FILE
-        target.parent.mkdir(parents=True, exist_ok=True)
-        lock = target.parent / f".{target.name}.lock"
         with registry_lock(lock):
+            _repair_truncated_tail_before_append(target)
             with target.open("a", encoding="utf-8") as handle:
-                for snapshot in snapshots:
-                    handle.write(
-                        json.dumps(snapshot.as_dict(), sort_keys=True, allow_nan=False)
-                        + "\n"
-                    )
+                for index, candidate in enumerate(rows, start=1):
+                    try:
+                        snapshot = build_live_scan_snapshot(
+                            candidate,
+                            decision_at=decision_at,
+                            candidate_rank=index,
+                            reference_prices=reference_prices,
+                        )
+                        encoded = json.dumps(
+                            snapshot.as_dict(), sort_keys=True, allow_nan=False
+                        )
+                    except Exception as exc:
+                        _append_jsonl(
+                            dead_letter,
+                            {
+                                "dead_letter_source": "P1_OUTBOX_PRODUCER",
+                                "candidate_rank": index,
+                                "symbol": str(
+                                    getattr(candidate, "symbol", "") or ""
+                                ).upper(),
+                                "decision_at_utc": (
+                                    decision_at.isoformat()
+                                    if isinstance(decision_at, datetime)
+                                    else str(decision_at)
+                                ),
+                                "error_type": type(exc).__name__,
+                                "measurement_only": True,
+                                "affects_live_decisions": False,
+                            },
+                        )
+                        continue
+                    handle.write(encoded + "\n")
+                    written += 1
                 handle.flush()
                 try:
                     os.fsync(handle.fileno())
                 except OSError:
                     pass
-        return len(snapshots)
+        return written
     except Exception:
+        # The live caller is intentionally fail-soft. A producer-level I/O or
+        # lock failure never suppresses alerts or Phase 3B measurement.
         return 0
 
 
@@ -127,19 +200,6 @@ def _ledger_snapshot_ids(path: Path) -> set[str]:
     return ids
 
 
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.parent / f".{path.name}.lock"
-    with registry_lock(lock):
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
-
-
 def _default_ledger_processor(
     row: dict[str, Any],
     *,
@@ -175,7 +235,9 @@ def _read_complete_outbox_lines(source: Path) -> list[str]:
     The producer and reader share the same file lock, so a concurrent append
     cannot be observed mid-write. If a prior process crashed with a truncated
     final line, the incomplete tail is deliberately left pending instead of
-    being dead-lettered and checkpointed past.
+    being dead-lettered and checkpointed past. A later producer first inserts a
+    newline boundary before appending, turning the orphan tail into its own
+    dead-letterable row without corrupting the new snapshot.
     """
     source_lock = source.parent / f".{source.name}.lock"
     with registry_lock(source_lock):
@@ -203,6 +265,19 @@ def _drain_outbox_locked(
     except OSError as exc:
         return DrainResult(0, 0, 0, start_line, True, type(exc).__name__)
 
+    # A line-index checkpoint cannot safely follow an outbox that has been
+    # externally truncated or rotated. Do not silently report "caught up" and
+    # skip the new generation; surface the invariant violation explicitly.
+    if start_line > len(lines):
+        return DrainResult(
+            0,
+            0,
+            0,
+            start_line,
+            True,
+            "CHECKPOINT_AHEAD_OF_OUTBOX",
+        )
+
     known_ids = _ledger_snapshot_ids(ledger)
     processed = duplicates = malformed = 0
     next_line = start_line
@@ -220,6 +295,7 @@ def _drain_outbox_locked(
             _append_jsonl(
                 dead_letter,
                 {
+                    "dead_letter_source": "P1_OUTBOX_CONSUMER",
                     "line_number": index,
                     "error_type": type(exc).__name__,
                     "raw": raw,
@@ -310,10 +386,15 @@ def outbox_health(
         total = len(source.read_text(encoding="utf-8").splitlines()) if source.exists() else 0
     except OSError:
         total = 0
+    checkpoint_ahead = next_line > total
     return {
         "total_rows": total,
         "processed_through_line": next_line,
         "backlog_rows": max(0, total - next_line),
+        "status": (
+            "CHECKPOINT_AHEAD_OF_OUTBOX" if checkpoint_ahead else "OK"
+        ),
+        "checkpoint_ahead_of_outbox": checkpoint_ahead,
         "measurement_only": True,
         "affects_live_decisions": False,
     }
