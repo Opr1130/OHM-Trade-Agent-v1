@@ -250,21 +250,30 @@ def observe_due_movement_discovery_outcomes(
         outcomes_path.parent.mkdir(parents=True, exist_ok=True)
         lock_target = outcomes_path.parent / f".{outcomes_path.name}.lock"
         with registry_lock(lock_target):
+            latest_state = load_json(state_target)
+            latest_completed = [str(item) for item in (latest_state.get("completed") or [])]
+            completed_order = _merge_completed_keys(latest_completed, completed_order)
+            latest_completed_set = set(latest_completed)
             if observations:
-                with outcomes_path.open("a", encoding="utf-8") as handle:
-                    for row in observations:
-                        handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
-                    handle.flush()
-                ledger_compacted = compact_jsonl_recent(
-                    outcomes_path,
-                    max_bytes=OUTCOME_LEDGER_MAX_BYTES,
-                    keep_lines=OUTCOME_LEDGER_KEEP_LINES,
-                )
-            state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
-            state["completion_index_version"] = COMPLETION_INDEX_VERSION
+                observations = [
+                    row for row in observations
+                    if f"{row['detection_id']}:{row['horizon']}" not in latest_completed_set
+                ]
+                if observations:
+                    with outcomes_path.open("a", encoding="utf-8") as handle:
+                        for row in observations:
+                            handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
+                        handle.flush()
+                    ledger_compacted = compact_jsonl_recent(
+                        outcomes_path,
+                        max_bytes=OUTCOME_LEDGER_MAX_BYTES,
+                        keep_lines=OUTCOME_LEDGER_KEEP_LINES,
+                    )
+            latest_state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
+            latest_state["completion_index_version"] = COMPLETION_INDEX_VERSION
             if observations:
-                state["last_observed_at"] = now.isoformat()
-            save_json_atomic(state_target, state)
+                latest_state["last_observed_at"] = now.isoformat()
+            save_json_atomic(state_target, latest_state)
 
     return {
         "status": "OK", "detections": len(rows), "observations_added": len(observations),
