@@ -1,8 +1,15 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from app.exchanges.kraken import Candle
 from app.services.daily_gainer_reconciliation import reconcile_daily_gainers
-from app.services.explosion_learning import append_explosion_state, observe_due_explosion_outcomes
+from app.services.explosion_learning import (
+    HORIZONS,
+    MAX_COMPLETED_KEYS,
+    MAX_SOURCE_SNAPSHOTS,
+    append_explosion_state,
+    observe_due_explosion_outcomes,
+)
 from app.services.explosion_state import ExplosionStateVector
 
 
@@ -60,6 +67,11 @@ class OutcomeClient:
         return candles
 
 
+class NeverCallOutcomeClient:
+    def get_ohlc(self, *args, **kwargs):
+        raise AssertionError("completed ledger outcomes should suppress a second market-data fetch")
+
+
 def test_wave5_outcomes_use_fixed_horizon_ohlc(tmp_path):
     observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
     snapshots = tmp_path / "snapshots.jsonl"
@@ -85,6 +97,49 @@ def test_wave5_outcomes_use_fixed_horizon_ohlc(tmp_path):
     assert '"relative_volume_change": 0.4' in text
     assert '"atr_percentile_change": 12.0' in text
     assert '"distance_to_high_velocity_pct": 2.0' in text
+
+
+def test_explosion_completion_index_capacity_covers_source_window():
+    assert MAX_COMPLETED_KEYS >= MAX_SOURCE_SNAPSHOTS * len(HORIZONS)
+
+
+def test_explosion_outcomes_rehydrate_completion_from_existing_ledger(tmp_path):
+    observed = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    snapshots = tmp_path / "snapshots.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "state.json"
+    observation_id = append_explosion_state(
+        _vector(),
+        path=snapshots,
+        observed_at=observed,
+        source_cohort="EARLY_ACCELERATION",
+    )
+    outcomes.write_text(
+        "".join(
+            json.dumps({
+                "record_type": "EXPLOSION_OUTCOME",
+                "observation_id": observation_id,
+                "horizon": horizon,
+            }) + "\n"
+            for horizon in ("1h", "4h")
+        ),
+        encoding="utf-8",
+    )
+
+    summary = observe_due_explosion_outcomes(
+        now=observed + timedelta(hours=4, minutes=5),
+        client=NeverCallOutcomeClient(),
+        snapshot_file=snapshots,
+        outcome_file=outcomes,
+        state_file=state,
+    )
+
+    assert summary["outcomes_added"] == 0
+    assert summary["completion_index_migrated"] is True
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["completion_index_version"] == 2
+    assert f"{observation_id}:1h" in saved["completed"]
+    assert f"{observation_id}:4h" in saved["completed"]
 
 
 class GainerClient:
