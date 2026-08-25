@@ -236,21 +236,30 @@ def observe_due_explosion_outcomes(*, now: datetime | None = None, client: Krake
         target.parent.mkdir(parents=True, exist_ok=True)
         lock = target.parent / f".{target.name}.lock"
         with registry_lock(lock):
+            latest_state = load_json(state_target)
+            latest_completed = [str(item) for item in (latest_state.get("completed") or [])]
+            completed_order = _merge_completed_keys(latest_completed, completed_order)
+            latest_completed_set = set(latest_completed)
             if outcomes:
-                with target.open("a", encoding="utf-8") as handle:
-                    for row in outcomes:
-                        handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
-                    handle.flush()
-                ledger_compacted = compact_jsonl_recent(
-                    target,
-                    max_bytes=OUTCOME_LEDGER_MAX_BYTES,
-                    keep_lines=OUTCOME_LEDGER_KEEP_LINES,
-                )
-            state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
-            state["completion_index_version"] = COMPLETION_INDEX_VERSION
+                outcomes = [
+                    row for row in outcomes
+                    if f"{row['observation_id']}:{row['horizon']}" not in latest_completed_set
+                ]
+                if outcomes:
+                    with target.open("a", encoding="utf-8") as handle:
+                        for row in outcomes:
+                            handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
+                        handle.flush()
+                    ledger_compacted = compact_jsonl_recent(
+                        target,
+                        max_bytes=OUTCOME_LEDGER_MAX_BYTES,
+                        keep_lines=OUTCOME_LEDGER_KEEP_LINES,
+                    )
+            latest_state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
+            latest_state["completion_index_version"] = COMPLETION_INDEX_VERSION
             if outcomes:
-                state["last_observed_at"] = now.isoformat()
-            save_json_atomic(state_target, state)
+                latest_state["last_observed_at"] = now.isoformat()
+            save_json_atomic(state_target, latest_state)
 
     return {
         "status": "OK", "snapshots": len(snapshots), "outcomes_added": len(outcomes),
