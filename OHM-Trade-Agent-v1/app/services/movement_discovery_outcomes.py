@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
-from collections import defaultdict
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from app.exchanges.kraken import Candle, KrakenClient
+from app.services.jsonl_retention import compact_jsonl_recent
 from app.services.movement_discovery_learning_capture import DETECTION_FILE
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
@@ -22,6 +23,11 @@ HORIZONS = {
     "12h": timedelta(hours=12),
     "24h": timedelta(hours=24),
 }
+MAX_SOURCE_DETECTIONS = 10_000
+MAX_COMPLETED_KEYS = 50_000
+COMPLETION_INDEX_VERSION = 2
+OUTCOME_LEDGER_MAX_BYTES = 512 * 1024 * 1024
+OUTCOME_LEDGER_KEEP_LINES = 100_000
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -36,10 +42,10 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _read_detections(path: Path) -> list[dict[str, Any]]:
+def _read_detections(path: Path, *, limit: int = MAX_SOURCE_DETECTIONS) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    rows: list[dict[str, Any]] = []
+    rows: deque[dict[str, Any]] = deque(maxlen=max(1, int(limit)))
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -51,7 +57,45 @@ def _read_detections(path: Path) -> list[dict[str, Any]]:
                     rows.append(row)
     except OSError:
         return []
-    return rows
+    return list(rows)
+
+
+def _read_completed_outcome_keys(path: Path) -> list[str]:
+    """Recover recent completion tombstones from the durable outcome ledger."""
+    if not path.exists():
+        return []
+    ordered: OrderedDict[str, None] = OrderedDict()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("record_type") != "OUTCOME":
+                    continue
+                detection_id = str(row.get("detection_id") or "")
+                horizon = str(row.get("horizon") or "")
+                if not detection_id or horizon not in HORIZONS:
+                    continue
+                key = f"{detection_id}:{horizon}"
+                ordered.pop(key, None)
+                ordered[key] = None
+    except OSError:
+        return []
+    return list(ordered.keys())[-MAX_COMPLETED_KEYS:]
+
+
+def _merge_completed_keys(*groups: list[str]) -> list[str]:
+    ordered: OrderedDict[str, None] = OrderedDict()
+    for group in groups:
+        for raw in group:
+            key = str(raw or "")
+            if not key:
+                continue
+            ordered.pop(key, None)
+            ordered[key] = None
+    return list(ordered.keys())[-MAX_COMPLETED_KEYS:]
 
 
 def _window_metrics(
@@ -115,7 +159,13 @@ def observe_due_movement_discovery_outcomes(
     outcome_file: Path | None = None,
     state_file: Path | None = None,
 ) -> dict[str, Any]:
-    """Label v2.1 detections only after fixed horizons are due."""
+    """Label recent v2.1 detections only after fixed horizons are due.
+
+    The source window and completion index are intentionally bounded together:
+    every horizon for every retained source detection fits inside the completion
+    index. This prevents old completed detections from falling out of state and
+    being appended repeatedly forever.
+    """
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -128,8 +178,14 @@ def observe_due_movement_discovery_outcomes(
         return {"status": "OK", "detections": 0, "observations_added": 0, "pending_horizons": 0, "legacy_unobservable": 0}
 
     state = load_json(state_target)
-    completed_order = [str(item) for item in (state.get("completed") or [])]
-    completed_order = list(dict.fromkeys(completed_order))
+    state_completed = [str(item) for item in (state.get("completed") or [])]
+    migrated_completion_index = int(state.get("completion_index_version") or 0) < COMPLETION_INDEX_VERSION
+    ledger_completed: list[str] = []
+    if migrated_completion_index:
+        lock_target = outcomes_path.parent / f".{outcomes_path.name}.lock"
+        with registry_lock(lock_target):
+            ledger_completed = _read_completed_outcome_keys(outcomes_path)
+    completed_order = _merge_completed_keys(state_completed, ledger_completed)
     completed = set(completed_order)
     legacy_unobservable = 0
     pending = 0
@@ -189,20 +245,30 @@ def observe_due_movement_discovery_outcomes(
             observations.append(observation)
             _append_completed_key(completed_order, completed, key)
 
-    if observations:
+    ledger_compacted = False
+    if observations or migrated_completion_index:
         outcomes_path.parent.mkdir(parents=True, exist_ok=True)
         lock_target = outcomes_path.parent / f".{outcomes_path.name}.lock"
         with registry_lock(lock_target):
-            with outcomes_path.open("a", encoding="utf-8") as handle:
-                for row in observations:
-                    handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
-                handle.flush()
-            state["completed"] = completed_order[-20000:]
-            state["last_observed_at"] = now.isoformat()
+            if observations:
+                with outcomes_path.open("a", encoding="utf-8") as handle:
+                    for row in observations:
+                        handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
+                    handle.flush()
+                ledger_compacted = compact_jsonl_recent(
+                    outcomes_path,
+                    max_bytes=OUTCOME_LEDGER_MAX_BYTES,
+                    keep_lines=OUTCOME_LEDGER_KEEP_LINES,
+                )
+            state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
+            state["completion_index_version"] = COMPLETION_INDEX_VERSION
+            if observations:
+                state["last_observed_at"] = now.isoformat()
             save_json_atomic(state_target, state)
 
     return {
         "status": "OK", "detections": len(rows), "observations_added": len(observations),
         "pending_horizons": pending, "legacy_unobservable": legacy_unobservable,
-        "unavailable_horizons": unavailable,
+        "unavailable_horizons": unavailable, "completion_index_migrated": migrated_completion_index,
+        "outcome_ledger_compacted": ledger_compacted,
     }
