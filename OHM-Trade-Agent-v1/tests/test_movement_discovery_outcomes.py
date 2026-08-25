@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 from app.exchanges.kraken import Candle
 from app.scanner.models import MarketSnapshot
 from app.services.movement_discovery_learning_capture import capture_movement_detections
-from app.services.movement_discovery_outcomes import observe_due_movement_discovery_outcomes
+from app.services.movement_discovery_outcomes import (
+    HORIZONS,
+    MAX_COMPLETED_KEYS,
+    MAX_SOURCE_DETECTIONS,
+    _read_detections,
+    observe_due_movement_discovery_outcomes,
+)
 from app.services.movement_discovery_v2 import CoarseMover, evaluate_early_mover
 
 
@@ -82,6 +88,11 @@ class _FakeKraken:
     def get_ohlc(self, symbol, interval=60, since=None):
         self.calls.append((symbol, interval, since))
         return self.candles
+
+
+class _NeverCallKraken:
+    def get_ohlc(self, *args, **kwargs):
+        raise AssertionError("completed ledger outcome should suppress a second market-data fetch")
 
 
 def test_outcome_observer_uses_only_candles_fully_inside_horizon(tmp_path):
@@ -168,3 +179,56 @@ def test_legacy_detection_without_timestamp_is_not_backfilled(tmp_path):
     )
     assert result["legacy_unobservable"] == 1
     assert result["observations_added"] == 0
+
+
+def test_recent_detection_window_is_bounded(tmp_path):
+    detections = tmp_path / "detections.jsonl"
+    detections.write_text(
+        "".join(
+            json.dumps({"record_type": "DETECTION", "detection_id": f"D{index}"}) + "\n"
+            for index in range(5)
+        ),
+        encoding="utf-8",
+    )
+
+    rows = _read_detections(detections, limit=2)
+
+    assert [row["detection_id"] for row in rows] == ["D3", "D4"]
+
+
+def test_completion_index_capacity_covers_entire_source_window():
+    assert MAX_COMPLETED_KEYS >= MAX_SOURCE_DETECTIONS * len(HORIZONS)
+
+
+def test_outcome_observer_rehydrates_completion_from_existing_ledger(tmp_path):
+    detected = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
+    detections = tmp_path / "detections.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "state.json"
+    detections.write_text(json.dumps({
+        "record_type": "DETECTION",
+        "detection_id": "already-done",
+        "symbol": "FASTUSD",
+        "direction": "LONG",
+        "observed_at": detected.isoformat(),
+        "reference_price": 100.0,
+    }) + "\n", encoding="utf-8")
+    outcomes.write_text(json.dumps({
+        "record_type": "OUTCOME",
+        "detection_id": "already-done",
+        "horizon": "1h",
+    }) + "\n", encoding="utf-8")
+
+    result = observe_due_movement_discovery_outcomes(
+        now=detected + timedelta(hours=1, minutes=1),
+        client=_NeverCallKraken(),
+        detection_file=detections,
+        outcome_file=outcomes,
+        state_file=state,
+    )
+
+    assert result["observations_added"] == 0
+    assert result["completion_index_migrated"] is True
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["completion_index_version"] == 2
+    assert "already-done:1h" in saved["completed"]
