@@ -13,7 +13,11 @@ Kraken OHLC request. A separate post-alert function performs bounded Phase 3B
 completed-OHLC enrichment later, while retaining the immutable original
 ``decision_at`` so delayed HTTP responses cannot introduce future candles.
 
-Both telemetry paths are fail-soft and one-directional. Nothing here can rank,
+The P1 durable outbox is also emitted only from that post-alert function. Its
+producer is local append-only I/O, dark by default, and performs no network
+request or P1 evaluation. A separate worker consumes it asynchronously.
+
+All telemetry paths are fail-soft and one-directional. Nothing here can rank,
 suppress, promote, alert, place, confirm, cancel, or modify a trade.
 """
 
@@ -25,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.services.p1_shadow_outbox import append_live_scan_snapshots
 from app.services.phase3b_live_structure import collect_phase3b_live_structure
 from app.services.phase3b_shadow_telemetry import record_phase3b_shadow_telemetry
 from app.services.registry_io import registry_lock
@@ -147,7 +152,9 @@ def record_phase3b_shadow_for_decision(
     This function is intended to run only after the alert-critical work for the
     scan has completed. It may perform bounded public Kraken OHLC reads, but all
     returned bars are filtered by ``decision_at`` in ``phase3b_live_structure``.
-    The function is fully fail-soft and returns only a measurement count.
+    Before external OHLC I/O, a dark-by-default P1 producer may append the same
+    immutable decision snapshots to its local durable outbox. Both operations
+    are fully fail-soft.
     """
     try:
         rows = list(candidates)
@@ -157,6 +164,18 @@ def record_phase3b_shadow_for_decision(
         getattr(settings, "signal_quality_v1_enabled", False)
     ):
         return 0
+
+    # P1 producer: local append-only I/O only. The helper is dark by default
+    # (P1_SHADOW_OUTBOX_ENABLED=false) and never performs network calls.
+    # Its return value is deliberately ignored by live logic.
+    try:
+        append_live_scan_snapshots(
+            rows,
+            reference_prices=reference_prices,
+            decision_at=decision_at,
+        )
+    except Exception as exc:
+        print("P1 shadow outbox: fail-soft", type(exc).__name__)
 
     try:
         structure_samples = collect_phase3b_live_structure(
@@ -202,9 +221,10 @@ def record_decision_telemetry(
 ) -> int:
     """Capture Phase 3A live decision telemetry only.
 
-    The Phase 3B OHLC path is intentionally not invoked here, so recording a
-    decision cannot block mover detection or Telegram on external OHLC I/O.
-    The return value remains the Phase 3A count for backward compatibility.
+    The Phase 3B OHLC path and P1 outbox are intentionally not invoked here, so
+    recording a decision cannot block mover detection or Telegram on external
+    OHLC I/O. The return value remains the Phase 3A count for backward
+    compatibility.
     """
     try:
         rows = list(candidates)
