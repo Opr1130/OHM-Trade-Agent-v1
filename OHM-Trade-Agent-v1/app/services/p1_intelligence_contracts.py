@@ -1,7 +1,7 @@
 """Canonical point-in-time contracts for the OHM P1 intelligence program.
 
 These contracts deliberately contain no network clients, Telegram integration,
-PendingSetup state, or execution authority.  They are immutable research
+PendingSetup state, or execution authority. They are immutable research
 snapshots emitted from an already-computed live decision.
 """
 
@@ -77,8 +77,8 @@ class LiveScanSnapshot:
     persistence_scans: int
     exhaustion_penalty: int
     exhaustion_band: str
-    relative_strength_percentile: float
-    liquidity_24h_usd_approx: float
+    relative_strength_percentile: float | None
+    liquidity_24h_usd_approx: float | None
     suppressed: bool
     reasons: tuple[str, ...]
     components: dict[str, Any]
@@ -121,7 +121,12 @@ def build_live_scan_snapshot(
     reference_prices: Mapping[str, float] | None = None,
     source_exchange: str = "KRAKEN_SPOT",
 ) -> LiveScanSnapshot:
-    """Build a snapshot without consulting wall-clock time or external data."""
+    """Build a snapshot without consulting wall-clock time or external data.
+
+    Non-finite numeric measurements are represented as ``None`` rather than
+    emitting invalid JSON or aborting a ranked batch. Missingness remains
+    explicit evidence; it is never promoted to a positive score.
+    """
     decision = require_utc(decision_at, field_name="decision_at")
     if candidate_rank < 1:
         raise ValueError("candidate_rank must be >= 1")
@@ -152,11 +157,11 @@ def build_live_scan_snapshot(
         persistence_scans=int(getattr(candidate, "persistence_scans", 0) or 0),
         exhaustion_penalty=int(getattr(candidate, "exhaustion_penalty", 0) or 0),
         exhaustion_band=str(getattr(candidate, "exhaustion_band", "") or ""),
-        relative_strength_percentile=float(
-            getattr(candidate, "relative_strength_percentile", 0.0) or 0.0
+        relative_strength_percentile=_finite_float(
+            getattr(candidate, "relative_strength_percentile", None)
         ),
-        liquidity_24h_usd_approx=float(
-            getattr(candidate, "liquidity_24h_usd_approx", 0.0) or 0.0
+        liquidity_24h_usd_approx=_finite_float(
+            getattr(candidate, "liquidity_24h_usd_approx", None)
         ),
         suppressed=bool(getattr(candidate, "suppressed", False)),
         reasons=tuple(str(item) for item in (getattr(candidate, "reasons", ()) or ())),
