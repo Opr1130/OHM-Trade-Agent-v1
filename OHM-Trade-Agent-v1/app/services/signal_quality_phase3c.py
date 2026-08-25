@@ -305,29 +305,36 @@ def _summarize_rows(
     unique = deduplicate_first_per_episode(rows)
     count = len(unique)
     status = "SUFFICIENT_SAMPLE" if count >= min_episodes else "INSUFFICIENT_SAMPLE"
-    observed_4h = [row for row in unique if row.return_4h_pct is not None]
+
+    # ForwardOutcome.window_complete means the full 24h label window exists.
+    # Until Phase 3C stores per-horizon completeness explicitly, use that
+    # conservative guard for every return summary. This prevents an observed
+    # t+20m price from masquerading as a complete 4h outcome via price_asof.
+    complete = [row for row in unique if row.window_complete]
+    observed_4h = [row for row in complete if row.return_4h_pct is not None]
     return {
         "status": status,
         "episodes": count,
+        "complete_label_episodes": len(complete),
         "returns": {
             "15m": bootstrap_mean_ci(
-                (row.return_15m_pct for row in unique), resamples=resamples, seed=seed + 15
+                (row.return_15m_pct for row in complete), resamples=resamples, seed=seed + 15
             ),
             "30m": bootstrap_mean_ci(
-                (row.return_30m_pct for row in unique), resamples=resamples, seed=seed + 30
+                (row.return_30m_pct for row in complete), resamples=resamples, seed=seed + 30
             ),
             "60m": bootstrap_mean_ci(
-                (row.return_60m_pct for row in unique), resamples=resamples, seed=seed + 60
+                (row.return_60m_pct for row in complete), resamples=resamples, seed=seed + 60
             ),
             "4h": bootstrap_mean_ci(
-                (row.return_4h_pct for row in unique), resamples=resamples, seed=seed + 240
+                (row.return_4h_pct for row in complete), resamples=resamples, seed=seed + 240
             ),
         },
         "mfe_24h": bootstrap_mean_ci(
-            (row.mfe_24h_pct for row in unique), resamples=resamples, seed=seed + 241
+            (row.mfe_24h_pct for row in complete), resamples=resamples, seed=seed + 241
         ),
         "mae_24h": bootstrap_mean_ci(
-            (row.mae_24h_pct for row in unique), resamples=resamples, seed=seed + 242
+            (row.mae_24h_pct for row in complete), resamples=resamples, seed=seed + 242
         ),
         "win_rate_4h": (
             sum(1 for row in observed_4h if row.return_4h_pct > 0) / len(observed_4h)
@@ -375,8 +382,13 @@ def build_phase3c_report(
     episodes = deduplicate_first_per_episode(rows)
     split = chronological_split(episodes)
     test_count = len(split.test)
-    test_primary_outcomes = sum(
+    test_observed_4h_outcomes = sum(
         1 for row in split.test if row.return_4h_pct is not None
+    )
+    test_primary_outcomes = sum(
+        1
+        for row in split.test
+        if row.return_4h_pct is not None and row.window_complete
     )
 
     required_baseline = [
@@ -411,13 +423,22 @@ def build_phase3c_report(
         "data_quality": {
             "baseline_completeness": baseline_completeness,
             "unassigned_snapshot_rows": unassigned_snapshot_rows,
+            "test_observed_4h_outcome_episodes": test_observed_4h_outcomes,
             "test_primary_outcome_episodes": test_primary_outcomes,
+            "test_truncated_4h_outcome_episodes": max(
+                0, test_observed_4h_outcomes - test_primary_outcomes
+            ),
             "complete_24h_outcomes": complete_outcomes,
             "top8_structure_cohort_episodes": top8_count,
             "top8_structure_cohort_fraction": top8_count / len(episodes) if episodes else 0.0,
             "selection_bias_note": (
                 "Phase 3B live structure is top-8 non-suppressed cohort data; "
                 "population conclusions must be rank-stratified."
+            ),
+            "primary_outcome_completeness_note": (
+                "Gate 0 counts a 4h primary outcome only when the full 24h "
+                "forward label window is complete. This is deliberately "
+                "conservative until per-horizon completeness is stored."
             ),
             "minimum_bucket_episodes": min_bucket_episodes,
             "minimum_holdout_episodes": min_holdout_episodes,
