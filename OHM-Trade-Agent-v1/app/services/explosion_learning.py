@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from app.exchanges.kraken import Candle, KrakenClient
 from app.services.explosion_state import ExplosionStateVector
+from app.services.jsonl_retention import compact_jsonl_recent
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -21,6 +22,11 @@ HORIZONS = {
     "1h": timedelta(hours=1), "4h": timedelta(hours=4),
     "12h": timedelta(hours=12), "24h": timedelta(hours=24),
 }
+MAX_SOURCE_SNAPSHOTS = 20_000
+MAX_COMPLETED_KEYS = 100_000
+COMPLETION_INDEX_VERSION = 2
+OUTCOME_LEDGER_MAX_BYTES = 512 * 1024 * 1024
+OUTCOME_LEDGER_KEEP_LINES = 100_000
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -70,6 +76,44 @@ def read_recent_explosion_states(*, path: Path | None = None, limit: int = 5000)
     return rows[-max(1, limit):]
 
 
+def _read_completed_outcome_keys(path: Path) -> list[str]:
+    """Recover recent completion tombstones from the durable outcome ledger."""
+    if not path.exists():
+        return []
+    ordered: OrderedDict[str, None] = OrderedDict()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("record_type") != "EXPLOSION_OUTCOME":
+                    continue
+                observation_id = str(row.get("observation_id") or "")
+                horizon = str(row.get("horizon") or "")
+                if not observation_id or horizon not in HORIZONS:
+                    continue
+                key = f"{observation_id}:{horizon}"
+                ordered.pop(key, None)
+                ordered[key] = None
+    except OSError:
+        return []
+    return list(ordered.keys())[-MAX_COMPLETED_KEYS:]
+
+
+def _merge_completed_keys(*groups: list[str]) -> list[str]:
+    ordered: OrderedDict[str, None] = OrderedDict()
+    for group in groups:
+        for raw in group:
+            key = str(raw or "")
+            if not key:
+                continue
+            ordered.pop(key, None)
+            ordered[key] = None
+    return list(ordered.keys())[-MAX_COMPLETED_KEYS:]
+
+
 def latest_state_by_symbol(*, path: Path | None = None) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for row in read_recent_explosion_states(path=path):
@@ -115,11 +159,18 @@ def observe_due_explosion_outcomes(*, now: datetime | None = None, client: Krake
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
-    snapshots = read_recent_explosion_states(path=snapshot_file, limit=20000)
+    snapshots = read_recent_explosion_states(path=snapshot_file, limit=MAX_SOURCE_SNAPSHOTS)
     target = outcome_file or OUTCOME_FILE
     state_target = state_file or STATE_FILE
     state = load_json(state_target)
-    completed_order = list(dict.fromkeys(str(item) for item in (state.get("completed") or [])))
+    state_completed = [str(item) for item in (state.get("completed") or [])]
+    migrated_completion_index = int(state.get("completion_index_version") or 0) < COMPLETION_INDEX_VERSION
+    ledger_completed: list[str] = []
+    if migrated_completion_index:
+        lock_target = target.parent / f".{target.name}.lock"
+        with registry_lock(lock_target):
+            ledger_completed = _read_completed_outcome_keys(target)
+    completed_order = _merge_completed_keys(state_completed, ledger_completed)
     completed = set(completed_order)
 
     due_by_symbol: dict[str, list[tuple[dict[str, Any], str, datetime, datetime]]] = defaultdict(list)
@@ -180,16 +231,29 @@ def observe_due_explosion_outcomes(*, now: datetime | None = None, client: Krake
                 completed.add(key)
                 completed_order.append(key)
 
-    if outcomes:
+    ledger_compacted = False
+    if outcomes or migrated_completion_index:
         target.parent.mkdir(parents=True, exist_ok=True)
         lock = target.parent / f".{target.name}.lock"
         with registry_lock(lock):
-            with target.open("a", encoding="utf-8") as handle:
-                for row in outcomes:
-                    handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
-                handle.flush()
-            state["completed"] = completed_order[-50000:]
-            state["last_observed_at"] = now.isoformat()
+            if outcomes:
+                with target.open("a", encoding="utf-8") as handle:
+                    for row in outcomes:
+                        handle.write(json.dumps(row, sort_keys=True, default=str, allow_nan=False) + "\n")
+                    handle.flush()
+                ledger_compacted = compact_jsonl_recent(
+                    target,
+                    max_bytes=OUTCOME_LEDGER_MAX_BYTES,
+                    keep_lines=OUTCOME_LEDGER_KEEP_LINES,
+                )
+            state["completed"] = completed_order[-MAX_COMPLETED_KEYS:]
+            state["completion_index_version"] = COMPLETION_INDEX_VERSION
+            if outcomes:
+                state["last_observed_at"] = now.isoformat()
             save_json_atomic(state_target, state)
 
-    return {"status": "OK", "snapshots": len(snapshots), "outcomes_added": len(outcomes), "pending_horizons": pending, "invalid_snapshots": invalid, "unavailable_horizons": unavailable}
+    return {
+        "status": "OK", "snapshots": len(snapshots), "outcomes_added": len(outcomes),
+        "pending_horizons": pending, "invalid_snapshots": invalid, "unavailable_horizons": unavailable,
+        "completion_index_migrated": migrated_completion_index, "outcome_ledger_compacted": ledger_compacted,
+    }
