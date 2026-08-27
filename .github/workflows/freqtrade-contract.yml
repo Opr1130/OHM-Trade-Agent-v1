@@ -1,0 +1,83 @@
+name: freqtrade-contract
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/freqtrade/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/app/services/freqtrade_**'
+      - 'OHM-Trade-Agent-v1/app/services/intelligence_**'
+      - 'OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py'
+      - '.github/workflows/freqtrade-contract.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/freqtrade/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/app/services/freqtrade_**'
+      - 'OHM-Trade-Agent-v1/app/services/intelligence_**'
+      - 'OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py'
+      - '.github/workflows/freqtrade-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose model
+        run: docker compose config -q
+
+      - name: Prepare isolated bridge fixtures
+        run: |
+          mkdir -p "$RUNNER_TEMP/ohm-ft-bridge"
+          printf '%s\n' '{"pairs":["BTC/USD"],"refresh_period":10}' > "$RUNNER_TEMP/ohm-ft-bridge/pairlist.json"
+          printf '%s\n' '{"schema_version":1,"signals":[]}' > "$RUNNER_TEMP/ohm-ft-bridge/signals.json"
+          printf '%s\n' '{"schema_version":1,"enabled":false,"authoritative_engine":"FREQTRADE_DRY_RUN"}' > "$RUNNER_TEMP/ohm-ft-bridge/control.json"
+
+      - name: Pull pinned Freqtrade engine
+        run: docker pull freqtradeorg/freqtrade:2026.7
+
+      - name: Load OHM strategy in real Freqtrade
+        run: |
+          docker run --rm \
+            -v "$PWD/freqtrade/user_data:/freqtrade/user_data:ro" \
+            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/bridge:ro" \
+            freqtradeorg/freqtrade:2026.7 \
+            list-strategies \
+            --config /freqtrade/user_data/config.json \
+            --strategy-path /freqtrade/user_data/strategies \
+            | tee "$RUNNER_TEMP/ohm-ft-strategies.txt"
+          grep -q 'OHMExternalSignalStrategy' "$RUNNER_TEMP/ohm-ft-strategies.txt"
+
+      - name: Prove dry-run and credential isolation
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("freqtrade/user_data/config.json").read_text())
+          assert config["dry_run"] is True
+          assert config["trading_mode"] == "spot"
+          assert config["exchange"]["name"] == "kraken"
+          assert not config["exchange"].get("key")
+          assert not config["exchange"].get("secret")
+          assert config["api_server"]["enabled"] is False
+          assert config["telegram"]["enabled"] is False
+
+          compose = Path("docker-compose.yml").read_text()
+          sidecar = compose.split("  ohm-freqtrade-paper:", 1)[1].split(
+              "  ohm-trade-agent:", 1
+          )[0]
+          assert "freqtradeorg/freqtrade:2026.7" in sidecar
+          assert "env_file:" not in sidecar
+          assert "ports:" not in sidecar
+          print("Freqtrade paper authority boundary: PASS")
+          PY
