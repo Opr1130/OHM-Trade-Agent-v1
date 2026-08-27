@@ -245,3 +245,27 @@ def test_no_new_closed_bar_is_a_freeze_not_an_unresolved_outcome(tmp_path):
     assert summary.unresolved == 0
     assert trade.status == "OPEN"
     assert trade.last_processed_candle_ts is None
+
+
+
+def test_missing_control_file_freezes_existing_pending_instead_of_assuming_operator_off(tmp_path):
+    assert enroll(tmp_path, pending=True).status == "PENDING"
+    control = tmp_path / "control.json"
+    client = RecordingClient([bar(5, 15, low=98.0)])
+
+    summary = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 5, 45, tzinfo=timezone.utc),
+        state_file=tmp_path / "state.json",
+        event_file=tmp_path / "events.jsonl",
+        control_file=control,
+    )
+
+    trade = get_lifecycles(state_file=tmp_path / "state.json")[0]
+    assert trade.status == "PENDING_ENTRY"
+    assert trade.entry_price is None
+    assert client.calls == 0
+    assert summary.control_enabled is False
+    assert len(summary.failures) == 1
+    assert "CONTROL_UNAVAILABLE_PENDING_FROZEN" in summary.failures[0]
