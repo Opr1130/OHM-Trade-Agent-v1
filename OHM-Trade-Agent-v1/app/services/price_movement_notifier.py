@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import (
     downside_scenario_pct,
     explosion_band,
@@ -48,7 +49,7 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
     symbol = str(signal.get("symbol") or "UNKNOWN").upper()
     if stage == EXPIRED:
         return (
-            f"⚪ OHM WATCH EXPIRED — {symbol}\n"
+            f"⚪ OHM WATCH EXPIRED — {display_market_label(symbol)}\n"
             "Reason: Setup expired without directional confirmation\n"
             "Action: NO TRADE"
         )

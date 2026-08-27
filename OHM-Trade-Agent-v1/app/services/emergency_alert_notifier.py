@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
+from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import one_line_reason
 from app.services.emergency_move_detector import EmergencyMoveResult
 from app.services.telegram_notifier import send_telegram_message
@@ -43,7 +44,7 @@ def format_emergency_message(
     )
     reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM RISK — {trade.symbol}\n"
+        f"{icon} OHM RISK — {display_market_label(trade.symbol)}\n"
         f"Risk: {result.severity.upper()}\n"
         f"Distance to stop: {float(result.stop_distance_pct):.1f}%\n"
         f"5m / 15m: {float(result.change_5m_pct):+.1f}% / {float(result.change_15m_pct):+.1f}%\n"

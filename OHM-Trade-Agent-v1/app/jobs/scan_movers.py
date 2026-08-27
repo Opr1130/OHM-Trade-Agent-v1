@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
+from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import (
     downside_scenario_pct,
     explosion_band,
@@ -101,7 +102,7 @@ def _compact_card(signal) -> str:
         else "WATCH FOR PULLBACK"
     )
     return (
-        f"🚀 OHM OPPORTUNITY — {signal.symbol} — {signal.stage}\n"
+        f"🚀 OHM OPPORTUNITY — {display_market_label(signal.symbol)} — {signal.stage}\n"
         f"Potential: +{low}% to +{high}%\n"
         f"Confidence*: {signal.continuation_confidence}% | Risk*: {risk}%\n"
         f"Downside if wrong*: up to -{downside}%\n"
@@ -122,7 +123,7 @@ def _observation_card(transition: MarketTransition) -> str:
     pattern = str(transition.pattern).replace("_", " ").title()
     action = "DEEP REVIEW" if transition.alert_tier == "DEEP_REVIEW" else "WATCH ONLY"
     return (
-        f"🌐 OHM BROAD WATCH — {transition.symbol}\n"
+        f"🌐 OHM BROAD WATCH — {display_market_label(transition.symbol)}\n"
         f"Pattern: {pattern}\n"
         f"Transition score*: {transition.score}/100\n"
         f"Liquidity: ${transition.liquidity_24h_usd_approx:,.0f} / 24h\n"
@@ -172,7 +173,7 @@ def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
     pattern = str(candidate.pattern or "UNCLASSIFIED").replace("_", " ").title()
     stage = str(candidate.stage).replace("_", " ")
     return (
-        f"🚀 OHM EARLY WATCH — {candidate.symbol}\n"
+        f"🚀 OHM EARLY WATCH — {display_market_label(candidate.symbol)}\n"
         f"Stage: {stage}\n"
         f"Pattern: {pattern}\n"
         f"Pattern strength*: {candidate.pattern_strength_score}/100\n"
