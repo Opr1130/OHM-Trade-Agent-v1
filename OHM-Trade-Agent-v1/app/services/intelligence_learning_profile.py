@@ -80,6 +80,19 @@ def build_intelligence_learning_profile(
     early_journeys = [value for value in journeys.values() if value["early"]]
     signal_journeys = [value for value in journeys.values() if value["signals"]]
     paper_journeys = [value for value in journeys.values() if value["outcomes"]]
+    qualified_signal_ids = {
+        str(row.get("signal_id"))
+        for value in journeys.values()
+        for row in value["signals"]
+        if row.get("signal_id")
+    }
+    paper_outcome_signal_ids = {
+        str(row.get("signal_id"))
+        for value in journeys.values()
+        for row in value["outcomes"]
+        if row.get("signal_id")
+    }
+    converted_signal_ids = qualified_signal_ids & paper_outcome_signal_ids
     early_to_signal = [
         value for value in journeys.values()
         if value["early"] and value["signals"]
@@ -182,14 +195,16 @@ def build_intelligence_learning_profile(
         "journeys": len(journeys),
         "early_watch_journeys": len(early_journeys),
         "qualified_signal_journeys": len(signal_journeys),
+        "qualified_signals": len(qualified_signal_ids),
         "paper_outcome_journeys": len(paper_journeys),
+        "paper_outcome_signals": len(paper_outcome_signal_ids),
         "early_watch_to_signal_conversion_pct": _pct(
             len(early_to_signal),
             len(early_journeys),
         ),
         "signal_to_paper_outcome_conversion_pct": _pct(
-            len(paper_journeys),
-            len(signal_journeys),
+            len(converted_signal_ids),
+            len(qualified_signal_ids),
         ),
         "early_watch_to_signal_latency_minutes": {
             "samples": len(latencies),
