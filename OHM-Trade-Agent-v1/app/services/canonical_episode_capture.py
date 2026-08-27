@@ -57,6 +57,22 @@ def _first_finite(*values: Any) -> float | None:
     return None
 
 
+def _decision_reference_price(observation: Any, scan_source: str) -> float | None:
+    """Return the price that was actually observable at decision time.
+
+    Native opportunity scans retain the completed-candle close in last_price
+    and the contemporaneous Kraken ticker in ticker_last. Outcome attribution
+    must anchor to the latter. Other producers preserve their existing
+    last_price semantics.
+    """
+    if str(scan_source or "").upper() == "LIVE_OPPORTUNITY_SCAN":
+        return _first_finite(
+            getattr(observation, "ticker_last", None),
+            getattr(observation, "last_price", None),
+        )
+    return _finite(getattr(observation, "last_price", None))
+
+
 def _hash(prefix: str, value: str, *, length: int = 32) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
     return f"{prefix}:{digest}"
@@ -126,6 +142,7 @@ def _build_snapshot(
         length=32,
     )
     ranked = candidate_index.get(symbol)
+    decision_reference_price = _decision_reference_price(observation, scan_source)
 
     if ranked is None:
         candidate_rank = None
@@ -153,7 +170,7 @@ def _build_snapshot(
             decision_at=decision,
             candidate_rank=candidate_rank,
             reference_prices={
-                symbol: getattr(observation, "last_price", None),
+                symbol: decision_reference_price,
             },
         )
         candidate_payload = candidate_snapshot.as_dict()
@@ -197,8 +214,8 @@ def _build_snapshot(
         "kraken_public_symbol": str(
             getattr(observation, "kraken_public_symbol", "") or ""
         ),
-        "reference_price": _finite(getattr(observation, "last_price", None)),
-        "last_price": _finite(getattr(observation, "last_price", None)),
+        "reference_price": decision_reference_price,
+        "last_price": decision_reference_price,
         "volume_24h": _finite(getattr(observation, "volume_24h", None)),
         "liquidity_24h_usd_approx": _first_finite(
             getattr(observation, "notional_24h_usd_approx", None),
