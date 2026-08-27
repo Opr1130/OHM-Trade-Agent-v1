@@ -92,7 +92,8 @@ class OHMExternalSignalStrategy(IStrategy):
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         self._reload_bridge()
         try:
-            Path("/tmp/ohm_freqtrade_heartbeat").write_text(
+            stake = str(self.config.get("stake_currency") or "UNKNOWN").upper()
+            Path(f"/tmp/ohm_freqtrade_heartbeat_{stake}").write_text(
                 current_time.astimezone(timezone.utc).isoformat(),
                 encoding="utf-8",
             )
