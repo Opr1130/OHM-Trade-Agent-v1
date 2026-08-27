@@ -124,9 +124,10 @@ of an already-open or pending paper trade.
 Before advancing a lifecycle, the monitor verifies continuity from the next
 required candle. A provable skipped historical interval terminates that
 lifecycle as UNRESOLVED rather than allowing the simulator to skip unknown
-price action. UNRESOLVED outcomes are excluded from realized P/L statistics.
-A temporary absence of a newly closed candle simply freezes progress and is
-not counted as a loss or win.
+price action. UNRESOLVED outcomes are excluded from realized P/L statistics. Their paper
+capital remains quarantined rather than being released for reuse, because the
+true terminal cash value is unknown. A temporary absence of a newly closed
+candle simply freezes progress and is not counted as a loss or win.
 
 ## Conservative intrabar rules
 
