@@ -69,6 +69,9 @@ class Phase3CRow:
     mae_24h_pct: float | None = None
     window_complete: bool = False
     top8_structure_cohort: bool = False
+    cohort_id: str | None = None
+    cohort_size: int | None = None
+    decision_status: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -189,6 +192,17 @@ def join_point_in_time_evidence(
                 top8_structure_cohort=bool(
                     structure
                     and int(snapshot.get("candidate_rank", 0) or 0) in range(1, 9)
+                ),
+                cohort_id=(
+                    str(snapshot.get("cohort_id", "") or "") or None
+                ),
+                cohort_size=(
+                    int(snapshot.get("cohort_size"))
+                    if snapshot.get("cohort_size") is not None
+                    else None
+                ),
+                decision_status=(
+                    str(snapshot.get("decision_status", "") or "") or None
                 ),
             )
         )
@@ -373,6 +387,51 @@ def _bucket_report(
     }
 
 
+def canonical_capture_coverage(rows: Sequence[Phase3CRow]) -> dict[str, Any]:
+    """Measure whether canonical cohorts contain every pair the scan said existed."""
+    cohorts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not row.cohort_id:
+            continue
+        state = cohorts.setdefault(
+            row.cohort_id,
+            {"expected": 0, "episode_ids": set(), "rows": 0},
+        )
+        state["rows"] += 1
+        if row.cohort_size is not None:
+            state["expected"] = max(state["expected"], int(row.cohort_size))
+        if row.episode_id:
+            state["episode_ids"].add(row.episode_id)
+
+    expected = sum(int(state["expected"]) for state in cohorts.values())
+    captured = sum(len(state["episode_ids"]) for state in cohorts.values())
+    duplicate_rows = sum(
+        max(0, int(state["rows"]) - len(state["episode_ids"]))
+        for state in cohorts.values()
+    )
+    incomplete = sum(
+        1
+        for state in cohorts.values()
+        if int(state["expected"]) > 0
+        and len(state["episode_ids"]) != int(state["expected"])
+    )
+    coverage = captured / expected if expected else None
+    return {
+        "canonical_cohorts": len(cohorts),
+        "expected_episode_rows": expected,
+        "captured_unique_episode_rows": captured,
+        "duplicate_episode_rows": duplicate_rows,
+        "incomplete_cohorts": incomplete,
+        "coverage": coverage,
+        "target": 0.999,
+        "meets_target": (
+            coverage is not None
+            and coverage >= 0.999
+            and incomplete == 0
+        ),
+    }
+
+
 def build_phase3c_report(
     rows: Sequence[Phase3CRow],
     *,
@@ -401,17 +460,26 @@ def build_phase3c_report(
         row
         for row in episodes
         if row.symbol
-        and row.candidate_rank >= 1
         and row.reference_price is not None
         and row.stage
+        and (
+            row.candidate_rank >= 1
+            or str(row.decision_status or "").upper() == "NOT_SCORED"
+        )
     ]
     baseline_completeness = len(required_baseline) / len(episodes) if episodes else 0.0
     complete_outcomes = sum(1 for row in episodes if row.window_complete)
     top8_count = sum(1 for row in episodes if row.top8_structure_cohort)
+    capture_quality = canonical_capture_coverage(rows)
+    canonical_capture_ok = (
+        capture_quality["canonical_cohorts"] == 0
+        or capture_quality["meets_target"]
+    )
 
     gate0_ready = bool(
         episodes
         and baseline_completeness >= 0.95
+        and canonical_capture_ok
         and test_count >= min_holdout_episodes
         and test_primary_outcomes >= min_holdout_episodes
     )
@@ -428,6 +496,7 @@ def build_phase3c_report(
         "split": split.as_dict(),
         "data_quality": {
             "baseline_completeness": baseline_completeness,
+            "canonical_capture": capture_quality,
             "unassigned_snapshot_rows": unassigned_snapshot_rows,
             "test_observed_4h_outcome_episodes": test_observed_4h_outcomes,
             "test_primary_outcome_episodes": test_primary_outcomes,
