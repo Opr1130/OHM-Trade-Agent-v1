@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 NONTERMINAL_STATUSES = {"PENDING_ENTRY", "OPEN"}
-TERMINAL_STATUSES = {"CLOSED", "CANCELLED"}
+TERMINAL_STATUSES = {"CLOSED", "CANCELLED", "UNRESOLVED"}
 
 
 @dataclass
@@ -84,3 +84,4 @@ class PaperAccountSummary:
     open_positions: int
     closed_trades: int
     cancelled_setups: int
+    unresolved_trades: int
