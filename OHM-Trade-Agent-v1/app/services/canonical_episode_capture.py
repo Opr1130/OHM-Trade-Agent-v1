@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -91,6 +92,147 @@ def _candidate_by_symbol(
     return indexed
 
 
+def _build_snapshot(
+    observation: Any,
+    *,
+    decision: datetime,
+    cohort_id: str,
+    cohort_position: int,
+    cohort_size: int,
+    candidate_index: Mapping[str, tuple[int, Any]],
+    signal_quality_enabled: bool,
+) -> dict[str, Any]:
+    symbol = str(getattr(observation, "symbol", "") or "").upper()
+    if not symbol:
+        raise ValueError("market observation symbol is required")
+
+    episode_id = _hash(
+        "EP",
+        f"{SCHEMA_VERSION}|{cohort_id}|{symbol}",
+        length=24,
+    )
+    snapshot_id = _hash(
+        "SNAP",
+        f"{SCHEMA_VERSION}|{episode_id}",
+        length=32,
+    )
+    ranked = candidate_index.get(symbol)
+
+    if ranked is None:
+        candidate_rank = None
+        stage = "NOT_SCORED"
+        pattern = None
+        opportunity_score = None
+        explosion_potential_score = None
+        tradeability_score = None
+        pattern_strength_score = None
+        volume_acceleration_score = None
+        relative_strength_score = None
+        persistence_scans = None
+        exhaustion_penalty = None
+        exhaustion_band = None
+        relative_strength_percentile = None
+        signal_quality_universe_size = None
+        suppressed = None
+        reasons = ["NO_SIGNAL_QUALITY_CANDIDATE"]
+        components: Mapping[str, Any] = {}
+        decision_status = "NOT_SCORED"
+    else:
+        candidate_rank, candidate = ranked
+        candidate_snapshot = build_live_scan_snapshot(
+            candidate,
+            decision_at=decision,
+            candidate_rank=candidate_rank,
+            reference_prices={
+                symbol: getattr(observation, "last_price", None),
+            },
+        )
+        candidate_payload = candidate_snapshot.as_dict()
+        stage = candidate_payload["stage"]
+        pattern = candidate_payload["pattern"]
+        opportunity_score = candidate_payload["opportunity_score"]
+        explosion_potential_score = candidate_payload["explosion_potential_score"]
+        tradeability_score = candidate_payload["tradeability_score"]
+        pattern_strength_score = candidate_payload["pattern_strength_score"]
+        volume_acceleration_score = candidate_payload["volume_acceleration_score"]
+        relative_strength_score = candidate_payload["relative_strength_score"]
+        persistence_scans = candidate_payload["persistence_scans"]
+        exhaustion_penalty = candidate_payload["exhaustion_penalty"]
+        exhaustion_band = candidate_payload["exhaustion_band"]
+        relative_strength_percentile = candidate_payload[
+            "relative_strength_percentile"
+        ]
+        signal_quality_universe_size = candidate_payload["universe_size"]
+        suppressed = bool(candidate_payload["suppressed"])
+        reasons = list(candidate_payload["reasons"])
+        components = candidate_payload["components"]
+        decision_status = (
+            "SCORED_SUPPRESSED" if suppressed else "SCORED_ELIGIBLE"
+        )
+
+    payload = {
+        "record_type": RECORD_TYPE,
+        "schema_version": SCHEMA_VERSION,
+        "snapshot_id": snapshot_id,
+        "episode_id": episode_id,
+        "cohort_id": cohort_id,
+        "cohort_position": cohort_position,
+        "cohort_size": cohort_size,
+        "decision_at_utc": decision.isoformat(),
+        "symbol": symbol,
+        "base_asset": str(
+            getattr(observation, "base_asset", "") or ""
+        ).upper(),
+        "kraken_public_symbol": str(
+            getattr(observation, "kraken_public_symbol", "") or ""
+        ),
+        "reference_price": _finite(getattr(observation, "last_price", None)),
+        "last_price": _finite(getattr(observation, "last_price", None)),
+        "volume_24h": _finite(getattr(observation, "volume_24h", None)),
+        "liquidity_24h_usd_approx": _finite(
+            getattr(observation, "notional_24h_usd_approx", None)
+        ),
+        "high_24h": _finite(getattr(observation, "high_24h", None)),
+        "low_24h": _finite(getattr(observation, "low_24h", None)),
+        "lift_from_24h_low_pct": _finite(
+            getattr(observation, "lift_from_24h_low_pct", None)
+        ),
+        "distance_from_24h_high_pct": _finite(
+            getattr(observation, "distance_from_24h_high_pct", None)
+        ),
+        "signal_quality_enabled": bool(signal_quality_enabled),
+        "decision_status": decision_status,
+        "candidate_rank": candidate_rank,
+        "signal_quality_universe_size": signal_quality_universe_size,
+        "stage": stage,
+        "pattern": pattern,
+        "opportunity_score": opportunity_score,
+        "explosion_potential_score": explosion_potential_score,
+        "tradeability_score": tradeability_score,
+        "pattern_strength_score": pattern_strength_score,
+        "volume_acceleration_score": volume_acceleration_score,
+        "relative_strength_score": relative_strength_score,
+        "persistence_scans": persistence_scans,
+        "exhaustion_penalty": exhaustion_penalty,
+        "exhaustion_band": exhaustion_band,
+        "relative_strength_percentile": relative_strength_percentile,
+        "suppressed": suppressed,
+        "reasons": reasons,
+        "components": components,
+        "source_exchange": "KRAKEN_SPOT",
+        "scan_source": "LIVE_FULL_MARKET",
+        "measurement_only": True,
+        "advisory_only": True,
+        "affects_ranking": False,
+        "affects_telegram": False,
+        "affects_pending_setup": False,
+        "trade_authority_changed": False,
+        "production_execution_gate_changed": False,
+    }
+    json.dumps(payload, sort_keys=True, allow_nan=False)
+    return payload
+
+
 def build_canonical_episode_snapshots(
     observations: Iterable[Any],
     *,
@@ -98,13 +240,7 @@ def build_canonical_episode_snapshots(
     decision_at: datetime,
     signal_quality_enabled: bool,
 ) -> list[dict[str, Any]]:
-    """Build one immutable record for every observed pair.
-
-    Ranked Signal Quality state is attached when it exists. Markets that did
-    not become SignalQualityCandidate rows remain first-class evidence with an
-    explicit NOT_SCORED status rather than disappearing from the learning
-    population.
-    """
+    """Build one immutable record for every valid observed pair."""
     decision = _require_utc(decision_at)
     observation_rows = list(observations)
     candidate_rows = list(candidates)
@@ -112,153 +248,26 @@ def build_canonical_episode_snapshots(
     cohort_size = len(observation_rows)
     candidate_index = _candidate_by_symbol(candidate_rows)
 
-    snapshots: list[dict[str, Any]] = []
-    for cohort_position, observation in enumerate(
-        sorted(
-            observation_rows,
-            key=lambda row: str(getattr(row, "symbol", "") or "").upper(),
-        ),
-        start=1,
-    ):
-        symbol = str(getattr(observation, "symbol", "") or "").upper()
-        if not symbol:
-            raise ValueError("market observation symbol is required")
-
-        episode_id = _hash(
-            "EP",
-            f"{SCHEMA_VERSION}|{cohort_id}|{symbol}",
-            length=24,
+    return [
+        _build_snapshot(
+            observation,
+            decision=decision,
+            cohort_id=cohort_id,
+            cohort_position=cohort_position,
+            cohort_size=cohort_size,
+            candidate_index=candidate_index,
+            signal_quality_enabled=signal_quality_enabled,
         )
-        snapshot_id = _hash(
-            "SNAP",
-            f"{SCHEMA_VERSION}|{episode_id}",
-            length=32,
+        for cohort_position, observation in enumerate(
+            sorted(
+                observation_rows,
+                key=lambda row: str(
+                    getattr(row, "symbol", "") or ""
+                ).upper(),
+            ),
+            start=1,
         )
-        ranked = candidate_index.get(symbol)
-
-        if ranked is None:
-            candidate_rank = None
-            stage = "NOT_SCORED"
-            pattern = None
-            opportunity_score = None
-            explosion_potential_score = None
-            tradeability_score = None
-            pattern_strength_score = None
-            volume_acceleration_score = None
-            relative_strength_score = None
-            persistence_scans = None
-            exhaustion_penalty = None
-            exhaustion_band = None
-            relative_strength_percentile = None
-            signal_quality_universe_size = None
-            suppressed = None
-            reasons = ["NO_SIGNAL_QUALITY_CANDIDATE"]
-            components: Mapping[str, Any] = {}
-            decision_status = "NOT_SCORED"
-        else:
-            candidate_rank, candidate = ranked
-            candidate_snapshot = build_live_scan_snapshot(
-                candidate,
-                decision_at=decision,
-                candidate_rank=candidate_rank,
-                reference_prices={
-                    symbol: getattr(observation, "last_price", None),
-                },
-            )
-            candidate_payload = candidate_snapshot.as_dict()
-            stage = candidate_payload["stage"]
-            pattern = candidate_payload["pattern"]
-            opportunity_score = candidate_payload["opportunity_score"]
-            explosion_potential_score = candidate_payload[
-                "explosion_potential_score"
-            ]
-            tradeability_score = candidate_payload["tradeability_score"]
-            pattern_strength_score = candidate_payload["pattern_strength_score"]
-            volume_acceleration_score = candidate_payload[
-                "volume_acceleration_score"
-            ]
-            relative_strength_score = candidate_payload[
-                "relative_strength_score"
-            ]
-            persistence_scans = candidate_payload["persistence_scans"]
-            exhaustion_penalty = candidate_payload["exhaustion_penalty"]
-            exhaustion_band = candidate_payload["exhaustion_band"]
-            relative_strength_percentile = candidate_payload[
-                "relative_strength_percentile"
-            ]
-            signal_quality_universe_size = candidate_payload["universe_size"]
-            suppressed = bool(candidate_payload["suppressed"])
-            reasons = list(candidate_payload["reasons"])
-            components = candidate_payload["components"]
-            decision_status = (
-                "SCORED_SUPPRESSED" if suppressed else "SCORED_ELIGIBLE"
-            )
-
-        payload = {
-            "record_type": RECORD_TYPE,
-            "schema_version": SCHEMA_VERSION,
-            "snapshot_id": snapshot_id,
-            "episode_id": episode_id,
-            "cohort_id": cohort_id,
-            "cohort_position": cohort_position,
-            "cohort_size": cohort_size,
-            "decision_at_utc": decision.isoformat(),
-            "symbol": symbol,
-            "base_asset": str(
-                getattr(observation, "base_asset", "") or ""
-            ).upper(),
-            "kraken_public_symbol": str(
-                getattr(observation, "kraken_public_symbol", "") or ""
-            ),
-            "reference_price": _finite(getattr(observation, "last_price", None)),
-            "last_price": _finite(getattr(observation, "last_price", None)),
-            "volume_24h": _finite(getattr(observation, "volume_24h", None)),
-            "liquidity_24h_usd_approx": _finite(
-                getattr(observation, "notional_24h_usd_approx", None)
-            ),
-            "high_24h": _finite(getattr(observation, "high_24h", None)),
-            "low_24h": _finite(getattr(observation, "low_24h", None)),
-            "lift_from_24h_low_pct": _finite(
-                getattr(observation, "lift_from_24h_low_pct", None)
-            ),
-            "distance_from_24h_high_pct": _finite(
-                getattr(observation, "distance_from_24h_high_pct", None)
-            ),
-            "signal_quality_enabled": bool(signal_quality_enabled),
-            "decision_status": decision_status,
-            "candidate_rank": candidate_rank,
-            "signal_quality_universe_size": signal_quality_universe_size,
-            "stage": stage,
-            "pattern": pattern,
-            "opportunity_score": opportunity_score,
-            "explosion_potential_score": explosion_potential_score,
-            "tradeability_score": tradeability_score,
-            "pattern_strength_score": pattern_strength_score,
-            "volume_acceleration_score": volume_acceleration_score,
-            "relative_strength_score": relative_strength_score,
-            "persistence_scans": persistence_scans,
-            "exhaustion_penalty": exhaustion_penalty,
-            "exhaustion_band": exhaustion_band,
-            "relative_strength_percentile": relative_strength_percentile,
-            "suppressed": suppressed,
-            "reasons": reasons,
-            "components": components,
-            "source_exchange": "KRAKEN_SPOT",
-            "scan_source": "LIVE_FULL_MARKET",
-            "measurement_only": True,
-            "advisory_only": True,
-            "affects_ranking": False,
-            "affects_telegram": False,
-            "affects_pending_setup": False,
-            "trade_authority_changed": False,
-            "production_execution_gate_changed": False,
-        }
-        # Verify strict JSON serializability at construction time so failures
-        # are isolated to one row by the append layer.
-        json.dumps(payload, sort_keys=True, allow_nan=False)
-        snapshots.append(payload)
-
-    return snapshots
+    ]
 
 
 def append_canonical_episode_snapshots(
@@ -271,23 +280,23 @@ def append_canonical_episode_snapshots(
     dead_letter_path: Path | None = None,
     enabled: bool | None = None,
 ) -> int:
-    """Append canonical every-pair snapshots to the existing P1 outbox.
+    """Append every valid pair while isolating row-level failures.
 
-    The operation is local, locked, append-only and fail-soft. It intentionally
-    uses the same outbox/checkpoint/evidence-ledger consumer as ranked P1
-    snapshots, so Build 2 introduces no parallel evidence transport.
+    A malformed observation is dead-lettered and does not suppress other rows in
+    the same cohort. The cohort_size remains the number of pairs presented by
+    the live scanner, so downstream coverage checks detect any missing row.
     """
     active = p1_shadow_outbox_enabled() if enabled is None else bool(enabled)
     if not active:
         return 0
 
     try:
-        rows = build_canonical_episode_snapshots(
-            observations,
-            candidates=candidates,
-            decision_at=decision_at,
-            signal_quality_enabled=signal_quality_enabled,
-        )
+        decision = _require_utc(decision_at)
+        observation_rows = list(observations)
+        candidate_rows = list(candidates)
+        cohort_id = canonical_cohort_id(observation_rows, decision_at=decision)
+        cohort_size = len(observation_rows)
+        candidate_index = _candidate_by_symbol(candidate_rows)
     except Exception as exc:
         dead_letter = dead_letter_path or DEFAULT_DEAD_LETTER_FILE
         try:
@@ -309,7 +318,7 @@ def append_canonical_episode_snapshots(
             pass
         return 0
 
-    if not rows:
+    if not observation_rows:
         return 0
 
     target = path or DEFAULT_OUTBOX_FILE
@@ -318,18 +327,28 @@ def append_canonical_episode_snapshots(
     lock = target.parent / f".{target.name}.lock"
     written = 0
 
+    ordered = sorted(
+        observation_rows,
+        key=lambda row: str(getattr(row, "symbol", "") or "").upper(),
+    )
+
     try:
         with registry_lock(lock):
             _repair_truncated_tail_before_append(target)
             with target.open("a", encoding="utf-8") as handle:
-                for row in rows:
+                for cohort_position, observation in enumerate(ordered, start=1):
                     try:
+                        row = _build_snapshot(
+                            observation,
+                            decision=decision,
+                            cohort_id=cohort_id,
+                            cohort_position=cohort_position,
+                            cohort_size=cohort_size,
+                            candidate_index=candidate_index,
+                            signal_quality_enabled=signal_quality_enabled,
+                        )
                         handle.write(
-                            json.dumps(
-                                row,
-                                sort_keys=True,
-                                allow_nan=False,
-                            )
+                            json.dumps(row, sort_keys=True, allow_nan=False)
                             + "\n"
                         )
                         written += 1
@@ -338,16 +357,23 @@ def append_canonical_episode_snapshots(
                             dead_letter,
                             {
                                 "dead_letter_source": "CANONICAL_EPISODE_PRODUCER",
-                                "episode_id": row.get("episode_id"),
-                                "snapshot_id": row.get("snapshot_id"),
-                                "symbol": row.get("symbol"),
-                                "decision_at_utc": row.get("decision_at_utc"),
+                                "cohort_id": cohort_id,
+                                "cohort_position": cohort_position,
+                                "cohort_size": cohort_size,
+                                "symbol": str(
+                                    getattr(observation, "symbol", "") or ""
+                                ).upper(),
+                                "decision_at_utc": decision.isoformat(),
                                 "error_type": type(exc).__name__,
                                 "measurement_only": True,
                                 "affects_live_decisions": False,
                             },
                         )
                 handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
         return written
     except Exception:
         return 0
