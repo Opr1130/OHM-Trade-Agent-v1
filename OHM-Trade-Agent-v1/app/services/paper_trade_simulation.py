@@ -89,6 +89,24 @@ def cancel_pending(
     trade.outcome = "NO_TRADE"
 
 
+def mark_unresolved(
+    trade: PaperTradeLifecycle,
+    *,
+    reason: str,
+    at: datetime,
+    observed_price: float | None = None,
+) -> None:
+    trade.status = "UNRESOLVED"
+    trade.closed_at = at.astimezone(timezone.utc).isoformat()
+    trade.exit_price = None
+    trade.exit_reason = str(reason)
+    trade.last_observed_price = observed_price
+    trade.gross_pnl = None
+    trade.net_pnl = None
+    trade.net_pnl_pct = None
+    trade.outcome = "UNRESOLVED"
+
+
 def take_profit_1(
     trade: PaperTradeLifecycle,
     *,
