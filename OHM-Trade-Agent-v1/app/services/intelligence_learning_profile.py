@@ -158,20 +158,46 @@ def build_intelligence_learning_profile(
 
     def paper_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         pnl: list[float] = []
+        pnl_by_currency: dict[str, list[float]] = defaultdict(list)
+        returns: list[float] = []
         for row in rows:
             try:
-                pnl.append(float(row.get("net_pnl")))
+                value = float(row.get("net_pnl"))
             except (TypeError, ValueError):
                 continue
+            currency = str(row.get("pnl_currency") or "USD").upper()
+            pnl.append(value)
+            pnl_by_currency[currency].append(value)
+            try:
+                returns.append(float(row.get("close_profit_ratio")))
+            except (TypeError, ValueError):
+                pass
         wins = sum(value > 0 for value in pnl)
         losses = sum(value < 0 for value in pnl)
+        by_currency = {
+            currency: {
+                "count": len(values),
+                "net_pnl": round(sum(values), 8),
+                "avg_net_pnl": round(mean(values), 8),
+            }
+            for currency, values in sorted(pnl_by_currency.items())
+        }
+        # Absolute USD and USDT P/L are intentionally not combined into one
+        # exact money figure. Cross-quote comparison uses return ratios.
+        single_currency_net = (
+            round(sum(pnl), 8)
+            if len(by_currency) <= 1 and pnl
+            else None
+        )
         return {
             "count": len(pnl),
             "wins": wins,
             "losses": losses,
             "win_rate_pct": _pct(wins, len(pnl)),
-            "net_pnl": round(sum(pnl), 8) if pnl else 0.0,
-            "avg_net_pnl": round(mean(pnl), 8) if pnl else None,
+            "net_pnl": single_currency_net,
+            "net_pnl_by_currency": by_currency,
+            "avg_net_pnl": round(mean(pnl), 8) if len(by_currency) <= 1 and pnl else None,
+            "avg_return_pct": round(mean(returns) * 100.0, 6) if returns else None,
         }
 
     bucket_rows: dict[str, Any] = {}
