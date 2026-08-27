@@ -75,6 +75,36 @@ def _decision_prices(snapshot: Any) -> tuple[float | None, float | None]:
     return reference, ask
 
 
+def _valid_long_geometry(
+    plan: EntryExitPlan,
+    *,
+    actual_entry: float | None = None,
+) -> bool:
+    values = (
+        plan.entry_low,
+        plan.entry_high,
+        plan.chase_limit,
+        plan.stop_price,
+        plan.target_1,
+        plan.target_2,
+    )
+    if any(_positive(value) is None for value in values):
+        return False
+    if not (
+        float(plan.entry_low)
+        <= float(plan.entry_high)
+        <= float(plan.chase_limit)
+    ):
+        return False
+    entry = float(actual_entry) if actual_entry is not None else float(plan.entry_low)
+    return (
+        float(plan.stop_price)
+        < entry
+        < float(plan.target_1)
+        < float(plan.target_2)
+    )
+
+
 def enroll_paper_opportunity(
     *,
     candidate: dict[str, Any],
@@ -140,6 +170,12 @@ def enroll_paper_opportunity(
     if reference is None:
         return PaperEnrollmentResult("REJECTED", "decision-time market price unavailable")
 
+    if not _valid_long_geometry(plan):
+        return PaperEnrollmentResult(
+            "REJECTED",
+            "paper entry/stop/target geometry is invalid",
+        )
+
     market_now = bool(plan.valid_now)
     limit_setup = str(plan.entry_style or "").lower() == "wait_for_pullback"
     if not market_now and not limit_setup:
@@ -165,6 +201,11 @@ def enroll_paper_opportunity(
             return PaperEnrollmentResult(
                 "DO_NOT_CHASE",
                 "decision-time simulated fill exceeded the approved chase boundary",
+            )
+        if not _valid_long_geometry(plan, actual_entry=entry_price):
+            return PaperEnrollmentResult(
+                "REJECTED",
+                "simulated market fill invalidated stop/target geometry",
             )
         quantity = config.capital_per_trade / entry_price
         entry_fee = config.capital_per_trade * config.fee_rate
