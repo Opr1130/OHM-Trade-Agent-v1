@@ -58,6 +58,7 @@ def test_paper_status_reports_simulation_only_and_does_not_mutate(monkeypatch):
             "open_trades": 1,
             "closed_trades": 3,
             "realized_net_pnl": 88.25,
+            "realized_pnl_by_currency": {"USD": 88.25, "USDT": 12.5},
             "open_pairs": ["SOL/USD"],
         },
     )
@@ -78,7 +79,7 @@ def test_paper_status_reports_simulation_only_and_does_not_mutate(monkeypatch):
     assert "Mode: ON" in sent[0]
     assert "Authoritative engine: FREQTRADE DRY-RUN" in sent[0]
     assert "Freqtrade open/closed: 1/3" in sent[0]
-    assert "Freqtrade realized net P/L: $88.25" in sent[0]
+    assert "Freqtrade realized P/L: $88.25 USD | 12.50 USDT" in sent[0]
     assert "Kraken exchange writes: NONE" in sent[0]
     assert "Shadow open/closed: 0/4" in sent[0]
 
