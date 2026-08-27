@@ -21,6 +21,7 @@ from app.services.paper_trade_control import set_paper_trade_enabled
 from app.services.paper_trade_engine import PaperTradeConfig, enroll_paper_opportunity
 from app.services.paper_trade_monitor import run_paper_trade_monitor
 from app.services.paper_trade_registry import get_lifecycles
+from app.services.registry_io import registry_lock
 
 
 SIGNAL_AT = datetime(2026, 8, 27, 5, 7, tzinfo=timezone.utc)
@@ -380,3 +381,26 @@ def test_repeated_monitor_pass_after_tp1_does_not_double_realize_partial_profit(
         if line.strip()
     ]
     assert sum(row["event_type"] == "TARGET_1" for row in rows) == 1
+
+
+
+def test_second_paper_monitor_instance_fails_fast_without_processing(tmp_path):
+    state = tmp_path / "state.json"
+    events = tmp_path / "events.jsonl"
+    control = tmp_path / "control.json"
+    lock_file = state.parent / ".paper_monitor.lock"
+
+    with registry_lock(lock_file):
+        summary = run_paper_trade_monitor(
+            config(),
+            client=FakeClient(),
+            now=datetime(2026, 8, 27, 5, 30, tzinfo=timezone.utc),
+            state_file=state,
+            event_file=events,
+            control_file=control,
+            lock_timeout_seconds=0.0,
+        )
+
+    assert summary.tracked == 0
+    assert summary.checked == 0
+    assert summary.failures == ("PAPER_MONITOR_ALREADY_RUNNING",)
