@@ -68,6 +68,30 @@ def _latest_closed_bar_start(now: datetime, interval_minutes: int) -> int:
     return ((now_ts - interval_seconds) // interval_seconds) * interval_seconds
 
 
+def _history_expected_but_absent(
+    trade: PaperTradeLifecycle,
+    candles: list[Any],
+    *,
+    now: datetime,
+    interval_minutes: int,
+) -> bool:
+    interval_seconds = int(interval_minutes) * 60
+    first = first_full_bar_start(trade.signal_at, interval_minutes)
+    required = (
+        int(trade.last_processed_candle_ts) + interval_seconds
+        if trade.last_processed_candle_ts is not None
+        else first
+    )
+    latest_closed = _latest_closed_bar_start(now, interval_minutes)
+    if required > latest_closed:
+        return False
+    return not any(
+        int(candle.timestamp) >= required
+        and int(candle.timestamp) + interval_seconds <= int(now.timestamp())
+        for candle in candles
+    )
+
+
 def _continuity_issue(
     trade: PaperTradeLifecycle,
     candles: list[Any],
@@ -236,6 +260,12 @@ def run_paper_trade_monitor(
                 now=now,
                 interval_minutes=interval_minutes,
             )
+            history_wait = _history_expected_but_absent(
+                trade,
+                candles,
+                now=now,
+                interval_minutes=interval_minutes,
+            )
 
             dirty = False
             for candle in eligible:
@@ -289,6 +319,17 @@ def run_paper_trade_monitor(
                     )
                     dirty = False
                     break
+
+            if (
+                history_wait
+                and trade.status in {"PENDING_ENTRY", "OPEN"}
+            ):
+                failures.append(
+                    f"{trade.paper_trade_id}:{trade.symbol}:"
+                    "OHLC_HISTORY_PENDING"
+                )
+                checked += 1
+                continue
 
             if trade.status == "PENDING_ENTRY" and _pending_expired(trade, now):
                 cancel_pending(
