@@ -19,6 +19,7 @@ from app.services.paper_trade_simulation import (
     cancel_pending,
     close_remaining,
     first_full_bar_start,
+    mark_unresolved,
     parse_utc,
     process_closed_candle,
 )
@@ -33,6 +34,7 @@ class PaperMonitorSummary:
     tp1_hits: int
     closed: int
     cancelled: int
+    unresolved: int
     failures: tuple[str, ...]
 
 
@@ -54,6 +56,51 @@ def _eligible_closed_candles(
         and int(candle.timestamp) > last
         and int(candle.timestamp) + interval_seconds <= now_ts
     ]
+
+
+def _latest_closed_bar_start(now: datetime, interval_minutes: int) -> int:
+    interval_seconds = int(interval_minutes) * 60
+    now_ts = int(now.timestamp())
+    if interval_seconds <= 0:
+        raise ValueError("paper lifecycle candle interval must be positive")
+    if now_ts < interval_seconds:
+        return -1
+    return ((now_ts - interval_seconds) // interval_seconds) * interval_seconds
+
+
+def _continuity_issue(
+    trade: PaperTradeLifecycle,
+    candles: list[Any],
+    *,
+    now: datetime,
+    interval_minutes: int,
+) -> str | None:
+    interval_seconds = int(interval_minutes) * 60
+    first = first_full_bar_start(trade.signal_at, interval_minutes)
+    required = (
+        int(trade.last_processed_candle_ts) + interval_seconds
+        if trade.last_processed_candle_ts is not None
+        else first
+    )
+    latest_closed = _latest_closed_bar_start(now, interval_minutes)
+    if required > latest_closed:
+        return None
+
+    closed = sorted(
+        {
+            int(candle.timestamp)
+            for candle in candles
+            if int(candle.timestamp) >= first
+            and int(candle.timestamp) + interval_seconds <= int(now.timestamp())
+        }
+    )
+    relevant = [timestamp for timestamp in closed if timestamp >= required]
+    if relevant and relevant[0] > required:
+        return f"OHLC_GAP:{required}->{relevant[0]}"
+    for previous, current in zip(relevant, relevant[1:]):
+        if current - previous != interval_seconds:
+            return f"OHLC_GAP:{previous}->{current}"
+    return None
 
 
 def _pending_expired(trade: PaperTradeLifecycle, now: datetime) -> bool:
@@ -104,14 +151,26 @@ def run_paper_trade_monitor(
     trades = get_nonterminal_lifecycles(state_file=state_file)
     client = client or KrakenClient(timeout_seconds=5.0)
 
-    checked = opened = tp1_hits = closed = cancelled = 0
+    checked = opened = tp1_hits = closed = cancelled = unresolved = 0
     failures: list[str] = []
 
     for trade in trades:
         try:
-            # OFF means no new simulated exposure. Pending entries are cancelled
-            # immediately, while already-open paper positions continue to a
-            # terminal outcome so the dataset is not censored.
+            # An unreadable control file is not equivalent to an explicit OFF.
+            # Freeze pending entries so no new simulated exposure is opened or
+            # cancelled on ambiguous operator state. Existing open positions
+            # continue to be monitored to avoid censoring their outcomes.
+            if trade.status == "PENDING_ENTRY" and control.status != "OK":
+                failures.append(
+                    f"{trade.paper_trade_id}:{trade.symbol}:"
+                    "CONTROL_UNAVAILABLE_PENDING_FROZEN"
+                )
+                checked += 1
+                continue
+
+            # Explicit OFF means no new simulated exposure. Pending entries are
+            # cancelled immediately, while already-open paper positions
+            # continue to a terminal outcome so the dataset is not censored.
             if trade.status == "PENDING_ENTRY" and not control.enabled:
                 cancel_pending(
                     trade,
@@ -147,6 +206,30 @@ def run_paper_trade_monitor(
                 interval=interval_minutes,
                 since=since,
             )
+            continuity = _continuity_issue(
+                trade,
+                candles,
+                now=now,
+                interval_minutes=interval_minutes,
+            )
+            if continuity is not None:
+                mark_unresolved(
+                    trade,
+                    reason=continuity,
+                    at=now,
+                    observed_price=trade.last_observed_price,
+                )
+                _save(
+                    trade,
+                    "UNRESOLVED_OHLC_GAP",
+                    state_file=state_file,
+                    event_file=event_file,
+                    now=now,
+                )
+                unresolved += 1
+                checked += 1
+                continue
+
             eligible = _eligible_closed_candles(
                 trade,
                 candles,
@@ -268,5 +351,6 @@ def run_paper_trade_monitor(
         tp1_hits=tp1_hits,
         closed=closed,
         cancelled=cancelled,
+        unresolved=unresolved,
         failures=tuple(failures),
     )
