@@ -1,4 +1,6 @@
 import json
+
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from app.jobs.build_phase3c_forward_outcomes import build_outcomes
@@ -95,7 +97,7 @@ def test_outcome_maturation_is_append_only_and_idempotent(tmp_path):
     )
     assert third[0]["maturation_status"] == "MATURE_24H"
     assert third[0]["outcome_revision"] == 2
-    assert third[0]["horizon_returns_pct"]["24h"] == 10.0
+    assert third[0]["horizon_returns_pct"]["24h"] == pytest.approx(10.0)
     assert len(outcomes.read_text().splitlines()) == 2
 
 
