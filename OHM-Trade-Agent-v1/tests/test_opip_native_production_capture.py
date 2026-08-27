@@ -13,7 +13,8 @@ def test_native_market_snapshot_maps_to_canonical_episode_fields():
         symbol="BTCUSD",
         underlying_asset="BTC",
         kraken_public_symbol="BTC/USD",
-        last_price=65000.0,
+        last_price=64000.0,
+        ticker_last=65000.0,
         combined_24h_liquidity_usd=25000000.0,
         primary_24h_liquidity_usd=20000000.0,
         recent_24h_high=67000.0,
@@ -35,6 +36,7 @@ def test_native_market_snapshot_maps_to_canonical_episode_fields():
     assert row["base_asset"] == "BTC"
     assert row["kraken_public_symbol"] == "BTC/USD"
     assert row["reference_price"] == 65000.0
+    assert row["last_price"] == 65000.0
     assert row["liquidity_24h_usd_approx"] == 25000000.0
     assert row["high_24h"] == 67000.0
     assert row["low_24h"] == 62000.0
