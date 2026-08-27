@@ -146,7 +146,6 @@ def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     decision_at = datetime.now(timezone.utc)
-    _capture_native_scan_cohort(scan, decision_at=decision_at)
     market_regime = evaluate_market_regime(scan.snapshots)
     local_movement_signals = [
         signal
@@ -226,6 +225,7 @@ def main():
 
     if not candidates:
         print("No technical candidates.")
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
     margin_summary = validate_short_margin_eligibility(
@@ -258,6 +258,7 @@ def main():
     candidates = keep_margin_tradeable_candidates(candidates)
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
     secondary_summary = confirm_secondary_markets(
@@ -332,6 +333,7 @@ def main():
     print("Execution structural/short-quality rejects:", execution_requested - len(candidates))
     if not candidates:
         print("No candidates survived execution quality validation.")
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
     reference_summary = validate_finalist_references(
@@ -623,6 +625,7 @@ def main():
     print("Pending setups saved:", pending_saved)
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
+    _capture_native_scan_cohort(scan, decision_at=decision_at)
 
 
 if __name__ == "__main__":
