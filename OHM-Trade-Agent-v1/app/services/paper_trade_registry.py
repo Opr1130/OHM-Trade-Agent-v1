@@ -231,6 +231,7 @@ def account_summary(
     )
     reserved = sum(
         float(trade.capital)
+        + (float(trade.fees_paid) if trade.status == "OPEN" else 0.0)
         for trade in rows
         if trade.status in NONTERMINAL_STATUSES
     )
