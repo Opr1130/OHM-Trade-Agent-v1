@@ -91,6 +91,13 @@ class OHMExternalSignalStrategy(IStrategy):
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         self._reload_bridge()
+        try:
+            Path("/tmp/ohm_freqtrade_heartbeat").write_text(
+                current_time.astimezone(timezone.utc).isoformat(),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _enabled(self) -> bool:
         return bool(self._control.get("enabled")) and (
