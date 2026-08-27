@@ -105,6 +105,15 @@ def _append_event(
         "revision": trade.revision,
         "updated_at": trade.updated_at,
         "paper_only": True,
+        "population": "PAPER_TRADE_V1",
+        "entry_price": trade.entry_price,
+        "exit_price": trade.exit_price,
+        "exit_reason": trade.exit_reason,
+        "tp1_hit": trade.tp1_hit,
+        "gross_pnl": trade.gross_pnl,
+        "net_pnl": trade.net_pnl,
+        "net_pnl_pct": trade.net_pnl_pct,
+        "outcome": trade.outcome,
         "details": details or {},
     }
     event_file.parent.mkdir(parents=True, exist_ok=True)
