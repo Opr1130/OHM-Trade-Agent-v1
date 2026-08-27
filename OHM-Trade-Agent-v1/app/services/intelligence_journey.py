@@ -226,8 +226,12 @@ def record_paper_outcome(
         if not journey_id:
             return None
         symbols = state.setdefault("symbols", {})
-        journey = symbols.get(normalized)
-        if isinstance(journey, dict) and journey.get("journey_id") == journey_id:
+        journey = None
+        for candidate in symbols.values():
+            if isinstance(candidate, dict) and candidate.get("journey_id") == journey_id:
+                journey = candidate
+                break
+        if isinstance(journey, dict):
             journey["paper_outcome_count"] = int(journey.get("paper_outcome_count") or 0) + 1
             journey["latest_paper_outcome"] = dict(payload)
             journey["last_seen_at"] = timestamp.isoformat()
