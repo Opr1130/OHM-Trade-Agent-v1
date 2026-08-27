@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.asset_display_identity import display_market_label
+
 
 def clamp_pct(value: float) -> int:
     return int(round(max(0.0, min(100.0, float(value)))))
@@ -71,8 +73,9 @@ def format_watch_alert(
     action: str,
     title: str = "OHM MARKET WATCH",
 ) -> str:
+    label = display_market_label(symbol)
     return (
-        f"🚀 {title} — {symbol}\n"
+        f"🚀 {title} — {label}\n"
         f"Potential: +{potential_low_pct:.0f}% to +{potential_high_pct:.0f}%\n"
         f"Confidence*: {confidence_pct:.0f}%\n"
         f"Risk*: {risk_pct:.0f}%\n"
