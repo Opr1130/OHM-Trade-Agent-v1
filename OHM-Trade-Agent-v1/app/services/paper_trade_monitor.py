@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,6 @@ from app.services.paper_trade_registry import (
 )
 from app.services.paper_trade_simulation import (
     cancel_pending,
-    close_remaining,
     first_full_bar_start,
     mark_unresolved,
     parse_utc,
@@ -125,22 +124,6 @@ def _continuity_issue(
         if current - previous != interval_seconds:
             return f"OHLC_GAP:{previous}->{current}"
     return None
-
-
-def _pending_expired(trade: PaperTradeLifecycle, now: datetime) -> bool:
-    signal = parse_utc(trade.signal_at)
-    return bool(
-        signal is not None
-        and now >= signal + timedelta(hours=trade.pending_ttl_hours)
-    )
-
-
-def _holding_expired(trade: PaperTradeLifecycle, now: datetime) -> bool:
-    opened = parse_utc(trade.opened_at)
-    return bool(
-        opened is not None
-        and now >= opened + timedelta(hours=trade.max_hold_hours)
-    )
 
 
 def _save(
@@ -330,43 +313,6 @@ def run_paper_trade_monitor(
                 )
                 checked += 1
                 continue
-
-            if trade.status == "PENDING_ENTRY" and _pending_expired(trade, now):
-                cancel_pending(
-                    trade,
-                    reason="PENDING_TTL_EXPIRED",
-                    at=now,
-                    observed_price=trade.last_observed_price,
-                )
-                _save(
-                    trade,
-                    "CANCELLED_TTL",
-                    state_file=state_file,
-                    event_file=event_file,
-                    now=now,
-                )
-                cancelled += 1
-                dirty = False
-
-            if trade.status == "OPEN" and _holding_expired(trade, now):
-                ticker = client.get_ticker(trade.symbol)
-                reference = float(ticker.get("bid") or ticker.get("last") or 0.0)
-                close_remaining(
-                    trade,
-                    reference_price=reference,
-                    reason="TIME_EXIT",
-                    at=now,
-                    market_exit=True,
-                )
-                _save(
-                    trade,
-                    "CLOSED_TIME_EXIT",
-                    state_file=state_file,
-                    event_file=event_file,
-                    now=now,
-                )
-                closed += 1
-                dirty = False
 
             if dirty and trade.status in {"PENDING_ENTRY", "OPEN"}:
                 _save(
