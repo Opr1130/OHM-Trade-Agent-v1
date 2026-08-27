@@ -14,6 +14,7 @@ def main() -> None:
     print("TP1 hits:", summary.tp1_hits)
     print("Closed:", summary.closed)
     print("Cancelled:", summary.cancelled)
+    print("Unresolved:", summary.unresolved)
     print("Failures:", len(summary.failures))
     for failure in summary.failures[:5]:
         print("PAPER FAILURE:", failure)
