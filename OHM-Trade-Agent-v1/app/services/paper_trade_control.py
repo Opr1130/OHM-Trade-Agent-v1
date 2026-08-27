@@ -72,7 +72,10 @@ def set_paper_trade_enabled(
     path: Path = CONTROL_FILE,
 ) -> PaperTradeControl:
     """Persist one explicit on/off operator decision atomically."""
-    timestamp = (now or _now()).astimezone(timezone.utc)
+    timestamp = now or _now()
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("paper control timestamp must be timezone-aware")
+    timestamp = timestamp.astimezone(timezone.utc)
     payload = {
         "schema_version": 1,
         "enabled": bool(enabled),
