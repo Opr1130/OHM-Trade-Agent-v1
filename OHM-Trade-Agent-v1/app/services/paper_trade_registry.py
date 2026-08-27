@@ -33,6 +33,7 @@ def _normalize_item(item: dict[str, Any]) -> PaperTradeLifecycle:
     allowed = {field.name for field in fields(PaperTradeLifecycle)}
     normalized = {key: value for key, value in item.items() if key in allowed}
     defaults = {
+        "candle_interval_minutes": 15,
         "reference_ask": None,
         "entry_price": None,
         "entry_fee": 0.0,
@@ -242,7 +243,11 @@ def account_summary(
     )
     reserved = sum(
         float(trade.capital)
-        + (float(trade.fees_paid) if trade.status == "OPEN" else 0.0)
+        + (
+            float(trade.fees_paid)
+            if trade.status == "OPEN"
+            else float(trade.capital) * float(trade.fee_rate)
+        )
         for trade in rows
         if trade.status in NONTERMINAL_STATUSES
     )
