@@ -52,6 +52,17 @@ def test_paper_status_reports_simulation_only_and_does_not_mutate(monkeypatch):
     monkeypatch.setattr(commands, "account_summary", lambda equity: summary())
     monkeypatch.setattr(
         commands,
+        "freqtrade_dry_run_status",
+        lambda: {
+            "status": "OK",
+            "open_trades": 1,
+            "closed_trades": 3,
+            "realized_net_pnl": 88.25,
+            "open_pairs": ["SOL/USD"],
+        },
+    )
+    monkeypatch.setattr(
+        commands,
         "set_paper_trade_enabled",
         lambda *a, **k: mutations.append((a, k)),
     )
@@ -63,10 +74,13 @@ def test_paper_status_reports_simulation_only_and_does_not_mutate(monkeypatch):
     )
 
     assert mutations == []
-    assert "PAPER TRADE V1" in sent[0]
+    assert "OHM PAPER TRADE" in sent[0]
     assert "Mode: ON" in sent[0]
-    assert "Exchange writes: DISABLED BY ARCHITECTURE" in sent[0]
-    assert "Closed/Unresolved: 4/1" in sent[0]
+    assert "Authoritative engine: FREQTRADE DRY-RUN" in sent[0]
+    assert "Freqtrade open/closed: 1/3" in sent[0]
+    assert "Freqtrade realized net P/L: $88.25" in sent[0]
+    assert "Kraken exchange writes: NONE" in sent[0]
+    assert "Shadow open/closed: 0/4" in sent[0]
 
 
 def test_paper_on_changes_only_paper_control(monkeypatch):
@@ -98,7 +112,8 @@ def test_paper_on_changes_only_paper_control(monkeypatch):
             {"updated_by": "TELEGRAM_AUTHORIZED_OPERATOR"},
         )
     ]
-    assert "PAPER TRADE V1 — ON" in sent[0]
+    assert "PAPER TRADE — ON" in sent[0]
+    assert "Authoritative engine: FREQTRADE DRY-RUN" in sent[0]
     assert "Kraken execution authority: NONE" in sent[0]
 
 
@@ -126,7 +141,7 @@ def test_paper_off_changes_only_paper_control(monkeypatch):
     )
 
     assert calls[0][0] is False
-    assert "PAPER TRADE V1 — OFF" in sent[0]
+    assert "PAPER TRADE — OFF" in sent[0]
     assert "already-open paper positions continue" in sent[0]
     assert "Kraken execution authority: NONE" in sent[0]
 
