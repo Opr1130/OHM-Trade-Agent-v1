@@ -18,7 +18,7 @@ import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 
-HORIZONS = ("15m", "30m", "60m", "4h")
+HORIZONS = ("15m", "30m", "60m", "4h", "24h")
 MIN_BUCKET_EPISODES = 30
 MIN_HOLDOUT_EPISODES = 100
 BOOTSTRAP_RESAMPLES = 1000
@@ -64,6 +64,7 @@ class Phase3CRow:
     return_30m_pct: float | None = None
     return_60m_pct: float | None = None
     return_4h_pct: float | None = None
+    return_24h_pct: float | None = None
     mfe_24h_pct: float | None = None
     mae_24h_pct: float | None = None
     window_complete: bool = False
@@ -137,7 +138,8 @@ def join_point_in_time_evidence(
             horizon = {}
 
         episode_id = (
-            (episode_ids or {}).get(join_key)
+            str(snapshot.get("episode_id", "") or "")
+            or (episode_ids or {}).get(join_key)
             or str(outcome.get("episode_id", "") or "")
             or f"UNASSIGNED:{snapshot_id}"
         )
@@ -175,6 +177,7 @@ def join_point_in_time_evidence(
                 return_30m_pct=_finite(horizon.get("30m", outcome.get("return_30m_pct"))),
                 return_60m_pct=_finite(horizon.get("60m", outcome.get("return_60m_pct"))),
                 return_4h_pct=_finite(horizon.get("4h", outcome.get("return_4h_pct"))),
+                return_24h_pct=_finite(horizon.get("24h", outcome.get("return_24h_pct"))),
                 mfe_24h_pct=_finite(outcome.get("mfe_pct", outcome.get("mfe_24h_pct"))),
                 mae_24h_pct=_finite(
                     outcome.get(
@@ -328,6 +331,9 @@ def _summarize_rows(
             ),
             "4h": bootstrap_mean_ci(
                 (row.return_4h_pct for row in complete), resamples=resamples, seed=seed + 240
+            ),
+            "24h": bootstrap_mean_ci(
+                (row.return_24h_pct for row in complete), resamples=resamples, seed=seed + 1440
             ),
         },
         "mfe_24h": bootstrap_mean_ci(
