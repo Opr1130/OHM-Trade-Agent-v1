@@ -267,4 +267,14 @@ def process_closed_candle(
         )
         return "CLOSED"
 
+    if end >= deadline:
+        close_remaining(
+            trade,
+            reference_price=close,
+            reason="TIME_EXIT",
+            at=deadline,
+            market_exit=True,
+        )
+        return "CLOSED"
+
     return "TP1" if trade.tp1_hit else "NO_CHANGE"
