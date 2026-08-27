@@ -228,5 +228,5 @@ def test_time_exit_uses_market_slippage_and_fees():
     )
     assert result == "CLOSED"
     assert trade.exit_reason == "TIME_EXIT"
-    assert trade.exit_price == pytest.approx(103.0 * 0.999)
+    assert trade.exit_price == pytest.approx(102.0 * 0.999)
     assert trade.fees_paid > 4.0
