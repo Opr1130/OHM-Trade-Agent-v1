@@ -130,25 +130,28 @@ def run_paper_trade_monitor(
                 checked += 1
                 continue
 
+            interval_minutes = int(trade.candle_interval_minutes)
+            if interval_minutes <= 0:
+                raise ValueError("paper lifecycle candle interval must be positive")
             first = first_full_bar_start(
                 trade.signal_at,
-                config.candle_interval_minutes,
+                interval_minutes,
             )
             since = max(
                 0,
                 int(trade.last_processed_candle_ts or first)
-                - config.candle_interval_minutes * 60,
+                - interval_minutes * 60,
             )
             candles = client.get_ohlc(
                 trade.symbol,
-                interval=config.candle_interval_minutes,
+                interval=interval_minutes,
                 since=since,
             )
             eligible = _eligible_closed_candles(
                 trade,
                 candles,
                 now=now,
-                interval_minutes=config.candle_interval_minutes,
+                interval_minutes=interval_minutes,
             )
 
             dirty = False
@@ -157,7 +160,7 @@ def run_paper_trade_monitor(
                 result = process_closed_candle(
                     trade,
                     candle,
-                    interval_minutes=config.candle_interval_minutes,
+                    interval_minutes=interval_minutes,
                 )
                 dirty = True
                 if result == "OPENED":
