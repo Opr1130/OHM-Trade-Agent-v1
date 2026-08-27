@@ -1,11 +1,49 @@
 services:
+  ohm-freqtrade-paper:
+    image: freqtradeorg/freqtrade:stable
+    container_name: ohm-freqtrade-paper
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: "0.65"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /freqtrade/bridge /freqtrade/user_data/logs
+        if [ ! -s /freqtrade/bridge/pairlist.json ]; then
+          printf '%s\n' '{"pairs":["BTC/USD"],"refresh_period":10}' > /freqtrade/bridge/pairlist.json
+        fi
+        if [ ! -s /freqtrade/bridge/signals.json ]; then
+          printf '%s\n' '{"schema_version":1,"signals":[]}' > /freqtrade/bridge/signals.json
+        fi
+        if [ ! -s /freqtrade/bridge/control.json ]; then
+          printf '%s\n' '{"schema_version":1,"enabled":false,"authoritative_engine":"FREQTRADE_DRY_RUN"}' > /freqtrade/bridge/control.json
+        fi
+        exec freqtrade trade \
+          --logfile /freqtrade/user_data/logs/ohm-freqtrade-paper.log \
+          --db-url sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run.sqlite \
+          --config /freqtrade/user_data/config.json \
+          --strategy OHMExternalSignalStrategy
+    volumes:
+      - ./freqtrade/user_data:/freqtrade/user_data
+      - ./data/freqtrade_bridge:/freqtrade/bridge
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/ohm_freqtrade_heartbeat && find /tmp/ohm_freqtrade_heartbeat -mmin -1 -print -quit | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
   ohm-trade-agent:
     build: .
     container_name: ohm-trade-agent
     restart: unless-stopped
+    depends_on:
+      ohm-freqtrade-paper:
+        condition: service_healthy
     env_file:
       - .env
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
+      - ./freqtrade/user_data:/app/freqtrade_paper:ro
