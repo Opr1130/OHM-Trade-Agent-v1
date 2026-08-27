@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -344,6 +345,26 @@ def _run_paper_trade_monitor_unlocked(
     )
 
 
+class PaperMonitorBusyError(RuntimeError):
+    pass
+
+
+@contextmanager
+def _paper_monitor_lock(lock_file: Path, timeout_seconds: float):
+    lock = registry_lock(
+        lock_file,
+        timeout=max(0.0, float(timeout_seconds)),
+    )
+    try:
+        lock.__enter__()
+    except TimeoutError as exc:
+        raise PaperMonitorBusyError(str(exc)) from exc
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
 def run_paper_trade_monitor(
     config: PaperTradeConfig,
     *,
@@ -357,7 +378,7 @@ def run_paper_trade_monitor(
     """Run exactly one paper monitor instance for a state directory."""
     lock_file = state_file.parent / ".paper_monitor.lock"
     try:
-        with registry_lock(lock_file, timeout=max(0.0, float(lock_timeout_seconds))):
+        with _paper_monitor_lock(lock_file, lock_timeout_seconds):
             return _run_paper_trade_monitor_unlocked(
                 config,
                 client=client,
@@ -366,7 +387,7 @@ def run_paper_trade_monitor(
                 event_file=event_file,
                 control_file=control_file,
             )
-    except TimeoutError:
+    except PaperMonitorBusyError:
         control = get_paper_trade_control(control_file)
         return PaperMonitorSummary(
             control_enabled=control.enabled,
