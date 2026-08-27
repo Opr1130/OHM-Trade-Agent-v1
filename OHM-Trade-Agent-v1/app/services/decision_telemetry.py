@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from app.services.canonical_episode_capture import append_canonical_episode_snapshots
 from app.services.p1_shadow_outbox import append_live_scan_snapshots
 from app.services.phase3b_live_structure import collect_phase3b_live_structure
 from app.services.phase3b_shadow_telemetry import record_phase3b_shadow_telemetry
@@ -146,6 +147,7 @@ def record_phase3b_shadow_for_decision(
     settings: Any,
     reference_prices: Mapping[str, float] | None = None,
     decision_at: datetime,
+    market_observations: Iterable[Any] | None = None,
 ) -> int:
     """Post-alert Phase 3B capture using the immutable original decision time.
 
@@ -160,22 +162,43 @@ def record_phase3b_shadow_for_decision(
         rows = list(candidates)
     except Exception:
         return 0
-    if not rows or not bool(
+    try:
+        observation_rows = list(market_observations or ())
+    except Exception:
+        observation_rows = []
+
+    signal_quality_enabled = bool(
         getattr(settings, "signal_quality_v1_enabled", False)
-    ):
+    )
+    if not signal_quality_enabled:
         return 0
 
-    # P1 producer: local append-only I/O only. The helper is dark by default
-    # (P1_SHADOW_OUTBOX_ENABLED=false) and never performs network calls.
-    # Its return value is deliberately ignored by live logic.
+    # Build 2 canonical producer: when the full in-memory scan cohort is
+    # supplied, record every observed pair to the existing P1 outbox. This is
+    # local append-only I/O and occurs after alert-critical work. The legacy
+    # ranked-candidate producer remains as a compatibility fallback for callers
+    # that do not yet provide full-market observations.
     try:
-        append_live_scan_snapshots(
-            rows,
-            reference_prices=reference_prices,
-            decision_at=decision_at,
-        )
+        if observation_rows:
+            append_canonical_episode_snapshots(
+                observation_rows,
+                candidates=rows,
+                decision_at=decision_at,
+                signal_quality_enabled=signal_quality_enabled,
+            )
+        elif rows:
+            append_live_scan_snapshots(
+                rows,
+                reference_prices=reference_prices,
+                decision_at=decision_at,
+            )
     except Exception as exc:
         print("P1 shadow outbox: fail-soft", type(exc).__name__)
+
+    # Phase 3B structure enrichment remains candidate-scoped. Canonical capture
+    # above must still succeed on scans where the ranker emits zero candidates.
+    if not rows:
+        return 0
 
     try:
         structure_samples = collect_phase3b_live_structure(
