@@ -506,6 +506,9 @@ def _paper_status_text(settings: Any) -> str:
     authoritative = freqtrade_dry_run_status()
     shadow = account_summary(float(settings.paper_trade_starting_equity))
     open_pairs = ", ".join(authoritative.get("open_pairs") or []) or "None"
+    pnl_by_currency = authoritative.get("realized_pnl_by_currency") or {}
+    usd_pnl = float(pnl_by_currency.get("USD") or 0.0)
+    usdt_pnl = float(pnl_by_currency.get("USDT") or 0.0)
     return (
         "🧪 OHM PAPER TRADE\n"
         f"Mode: {'ON' if control.enabled else 'OFF'}\n"
@@ -513,7 +516,7 @@ def _paper_status_text(settings: Any) -> str:
         f"Freqtrade status: {authoritative.get('status', 'UNKNOWN')}\n"
         f"Freqtrade open/closed: {authoritative.get('open_trades', 0)}/"
         f"{authoritative.get('closed_trades', 0)}\n"
-        f"Freqtrade realized net P/L: ${float(authoritative.get('realized_net_pnl') or 0.0):,.2f}\n"
+        f"Freqtrade realized P/L: ${usd_pnl:,.2f} USD | {usdt_pnl:,.2f} USDT\n"
         f"Freqtrade open pairs: {open_pairs}\n"
         "Shadow/control engine: OHM INTERNAL SIMULATOR\n"
         f"Shadow open/closed: {shadow.open_positions}/{shadow.closed_trades}\n"
