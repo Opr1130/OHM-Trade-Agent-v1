@@ -316,7 +316,12 @@ class OHMExternalSignalStrategy(IStrategy):
             return None
         try:
             target_1 = float(self._trade_value(trade, "target_1"))
+            target_2 = float(self._trade_value(trade, "target_2"))
         except (TypeError, ValueError):
+            return None
+        # A direct move through TP2 is a full-exit event. Do not create a
+        # redundant partial-exit order in the same loop.
+        if target_2 > 0 and current_rate >= target_2:
             return None
         if current_rate >= target_1 and trade.stake_amount > 0:
             return -(float(trade.stake_amount) * 0.5), "ohm_tp1"
@@ -331,6 +336,15 @@ class OHMExternalSignalStrategy(IStrategy):
         current_profit: float,
         **kwargs,
     ):
+        try:
+            stop_price = float(self._trade_value(trade, "stop_price"))
+        except (TypeError, ValueError):
+            stop_price = 0.0
+        if stop_price > 0 and current_rate <= stop_price:
+            # Handles gaps through the intended absolute stop. The normal
+            # custom_stoploss path handles non-gapped approaches.
+            return "ohm_stop_gap"
+
         try:
             target_2 = float(self._trade_value(trade, "target_2"))
         except (TypeError, ValueError):
