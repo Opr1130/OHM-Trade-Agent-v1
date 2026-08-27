@@ -1,6 +1,6 @@
 {
   "dry_run": true,
-  "dry_run_wallet": 10000,
+  "dry_run_wallet": 5000,
   "trading_mode": "spot",
   "margin_mode": "",
   "max_open_trades": 3,
@@ -33,7 +33,7 @@
       "method": "RemotePairList",
       "mode": "whitelist",
       "processing_mode": "filter",
-      "pairlist_url": "file:///freqtrade/bridge/pairlist.json",
+      "pairlist_url": "file:///freqtrade/bridge/pairlist_usd.json",
       "refresh_period": 10,
       "keep_pairlist_on_failure": true,
       "read_timeout": 5
@@ -43,7 +43,7 @@
     "price_side": "same",
     "use_order_book": true,
     "order_book_top": 1,
-    "price_last_balance": 0.0,
+    "price_last_balance": 0,
     "check_depth_of_market": {
       "enabled": false,
       "bids_to_ask_delta": 1
@@ -64,6 +64,6 @@
     "process_throttle_secs": 5,
     "heartbeat_interval": 60
   },
-  "bot_name": "OHM-Freqtrade-Paper",
-  "db_url": "sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run.sqlite"
+  "bot_name": "OHM-Freqtrade-Paper-USD",
+  "db_url": "sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run_usd.sqlite"
 }
