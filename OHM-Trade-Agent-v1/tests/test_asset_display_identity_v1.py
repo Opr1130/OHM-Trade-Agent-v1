@@ -34,7 +34,7 @@ def test_verified_pair_identity_renders_name_ticker_and_pair(tmp_path):
 
 def test_unknown_asset_never_guesses_name(tmp_path):
     path = tmp_path / "asset_identity.json"
-    assert display_market_label("FOOUSD", path=path) == "FOO — FOOUSD"
+    assert display_market_label("FOOUSD", path=path) == "FOOUSD"
     assert display_asset_text("FOO", path=path) == "FOO"
 
 
@@ -89,7 +89,7 @@ def test_corrupt_registry_fails_safe_to_ticker_pair(tmp_path):
     path.write_text("{not-json", encoding="utf-8")
 
     # load_json quarantines malformed state; alert rendering must still succeed.
-    assert display_market_label("BTCUSD", path=path) == "BTC — BTCUSD"
+    assert display_market_label("BTCUSD", path=path) == "BTCUSD"
     quarantined = list(tmp_path.glob("asset_identity.json.corrupt-*"))
     assert quarantined
 
@@ -120,4 +120,4 @@ def test_candidate_identity_learns_only_identity_safe_reference(tmp_path):
         ),
     )
     assert not learn_candidate_identity(unsafe, path=path)
-    assert display_market_label("DUPUSD", path=path) == "DUP — DUPUSD"
+    assert display_market_label("DUPUSD", path=path) == "DUPUSD"
