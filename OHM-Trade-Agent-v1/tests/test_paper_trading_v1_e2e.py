@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import inspect
 from types import SimpleNamespace
 
@@ -235,3 +236,43 @@ def test_paper_enrollment_is_post_telegram_and_monitor_is_below_live_protection(
     paper_index = cycle_source.index("_run_paper_monitor_fail_open()")
     assert cycle_source.rfind("monitor_active_main()", 0, paper_index) >= 0
     assert cycle_source.rfind("monitor_pending_main()", 0, paper_index) >= 0
+
+
+
+def test_same_candle_tp1_tp2_writes_one_terminal_outcome_event(tmp_path):
+    state = tmp_path / "state.json"
+    events = tmp_path / "events.jsonl"
+    control = tmp_path / "control.json"
+    enroll("SOLUSD", "EP:terminal", pending=False, state=state, events=events)
+    set_paper_trade_enabled(True, path=control, now=SIGNAL_AT)
+
+    terminal_candle = SimpleNamespace(
+        timestamp=int(datetime(2026, 8, 27, 5, 15, tzinfo=timezone.utc).timestamp()),
+        open=100.0,
+        high=111.0,
+        low=99.0,
+        close=110.0,
+    )
+    summary = run_paper_trade_monitor(
+        config(),
+        client=FakeClient(candles={"SOLUSD": [terminal_candle]}),
+        now=datetime(2026, 8, 27, 5, 45, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=events,
+        control_file=control,
+    )
+
+    assert summary.closed == 1
+    rows = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event_types = [row["event_type"] for row in rows]
+    assert event_types.count("TARGET_1") == 0
+    assert event_types.count("CLOSED_TARGET_2") == 1
+    terminal = next(row for row in rows if row["event_type"] == "CLOSED_TARGET_2")
+    assert terminal["population"] == "PAPER_TRADE_V1"
+    assert terminal["episode_id"] == "EP:terminal"
+    assert terminal["outcome"] == "WIN"
+    assert terminal["net_pnl"] > 0
