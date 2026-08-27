@@ -262,4 +262,5 @@ def account_summary(
         open_positions=sum(trade.status == "OPEN" for trade in rows),
         closed_trades=sum(trade.status == "CLOSED" for trade in rows),
         cancelled_setups=sum(trade.status == "CANCELLED" for trade in rows),
+        unresolved_trades=sum(trade.status == "UNRESOLVED" for trade in rows),
     )
