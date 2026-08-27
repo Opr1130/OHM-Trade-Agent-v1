@@ -12,7 +12,7 @@ from app.services.paper_trade_engine import (
     PaperTradeConfig,
     enroll_paper_opportunity,
 )
-from app.services.paper_trade_registry import get_lifecycles
+from app.services.paper_trade_registry import account_summary, get_lifecycles
 
 
 NOW = datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc)
@@ -253,3 +253,43 @@ def test_enter_now_refuses_to_chase_stale_decision_price(tmp_path):
         enabled=True,
     )
     assert result.status == "DO_NOT_CHASE"
+
+
+
+def test_invalid_long_geometry_is_rejected_before_paper_state_is_created(tmp_path):
+    bad = plan()
+    bad.stop_price = 101.0
+    result = enroll_paper_opportunity(
+        candidate=candidate(),
+        snapshot=snapshot(),
+        plan=bad,
+        episode_id="EP:bad-geometry",
+        cohort_id="COHORT:one",
+        decision_at=NOW,
+        config=config(),
+        state_file=tmp_path / "state.json",
+        event_file=tmp_path / "events.jsonl",
+        enabled=True,
+    )
+    assert result.status == "REJECTED"
+    assert "geometry" in result.reason
+    assert get_lifecycles(state_file=tmp_path / "state.json") == []
+
+
+def test_open_paper_position_reserves_paid_entry_fee_as_well_as_notional(tmp_path):
+    state = tmp_path / "state.json"
+    enroll_paper_opportunity(
+        candidate=candidate(),
+        snapshot=snapshot(),
+        plan=plan(),
+        episode_id="EP:reserve",
+        cohort_id="COHORT:one",
+        decision_at=NOW,
+        config=config(),
+        state_file=state,
+        event_file=tmp_path / "events.jsonl",
+        enabled=True,
+    )
+    summary = account_summary(10_000.0, state_file=state)
+    assert summary.reserved_capital == pytest.approx(1004.0)
+    assert summary.available_capital == pytest.approx(8996.0)
