@@ -87,6 +87,8 @@ def build_intelligence_learning_profile(
 
     paper_outcomes: list[dict[str, Any]] = []
     early_paper: list[dict[str, Any]] = []
+    delivered_early_paper: list[dict[str, Any]] = []
+    nondelivered_early_paper: list[dict[str, Any]] = []
     direct_paper: list[dict[str, Any]] = []
     latencies: list[float] = []
     buckets: dict[str, dict[str, list[float] | int]] = {}
@@ -117,6 +119,10 @@ def build_intelligence_learning_profile(
             paper_outcomes.append(payload)
             if value["early"]:
                 early_paper.append(payload)
+                if any(bool(row.get("delivered")) for row in value["early"]):
+                    delivered_early_paper.append(payload)
+                else:
+                    nondelivered_early_paper.append(payload)
             else:
                 direct_paper.append(payload)
 
@@ -193,6 +199,8 @@ def build_intelligence_learning_profile(
         },
         "paper_performance": paper_stats(paper_outcomes),
         "paper_performance_with_early_watch": paper_stats(early_paper),
+        "paper_performance_after_delivered_early_alert": paper_stats(delivered_early_paper),
+        "paper_performance_after_nondelivered_early_detection": paper_stats(nondelivered_early_paper),
         "paper_performance_without_early_watch": paper_stats(direct_paper),
         "early_stage_pattern_performance": bucket_rows,
         "learning_only": True,
