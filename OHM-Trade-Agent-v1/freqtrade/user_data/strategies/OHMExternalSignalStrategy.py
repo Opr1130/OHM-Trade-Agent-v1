@@ -233,6 +233,10 @@ class OHMExternalSignalStrategy(IStrategy):
         current_time: datetime,
         **kwargs,
     ) -> bool:
+        # Explicit operator OFF cancels unfilled dry-run entries immediately.
+        # Existing filled paper positions remain managed to terminal outcomes.
+        if not self._enabled():
+            return True
         signal = self._signal_by_id(getattr(trade, "enter_tag", None))
         if signal is None:
             return True
