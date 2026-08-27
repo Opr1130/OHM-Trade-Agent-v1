@@ -305,3 +305,29 @@ def test_phase3c_uses_canonical_episode_without_outcome_and_reads_24h_when_matur
     )
     assert report["overall"]["returns"]["24h"]["mean"] == 7.5
     assert report["auto_promotion_allowed"] is False
+
+
+def test_bad_market_row_does_not_drop_rest_of_cohort(tmp_path):
+    outbox = tmp_path / "p1.jsonl"
+    dead = tmp_path / "dead.jsonl"
+    bad = SimpleNamespace(symbol="")
+    good = observation("AUSD", 1.0, base="A")
+
+    written = append_canonical_episode_snapshots(
+        [bad, good],
+        candidates=[candidate("AUSD")],
+        decision_at=NOW,
+        signal_quality_enabled=True,
+        path=outbox,
+        dead_letter_path=dead,
+        enabled=True,
+    )
+
+    assert written == 1
+    row = json.loads(outbox.read_text().strip())
+    assert row["symbol"] == "AUSD"
+    assert row["cohort_size"] == 2
+    failed = json.loads(dead.read_text().strip())
+    assert failed["dead_letter_source"] == "CANONICAL_EPISODE_PRODUCER"
+    assert failed["cohort_size"] == 2
+    assert failed["affects_live_decisions"] is False
