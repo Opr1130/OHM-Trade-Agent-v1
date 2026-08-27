@@ -186,6 +186,10 @@ def test_missing_first_required_historical_bar_marks_lifecycle_unresolved(tmp_pa
     assert account.closed_trades == 0
     assert account.realized_net_pnl == 0.0
     assert account.closed_equity == 10_000.0
+    # Unknown market history must not release fictitious cash back into the
+    # simulation account. The unresolved lifecycle quarantines its capital.
+    assert account.reserved_capital >= 1_000.0
+    assert account.available_capital < 9_000.0
 
 
 def test_internal_historical_gap_marks_lifecycle_unresolved(tmp_path):
