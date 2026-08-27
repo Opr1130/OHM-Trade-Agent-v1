@@ -3,14 +3,18 @@ services:
     image: freqtradeorg/freqtrade:2026.7
     container_name: ohm-freqtrade-paper
     restart: unless-stopped
-    mem_limit: 384m
-    cpus: "0.65"
-    entrypoint: ["/bin/sh", "-c"]
+    mem_limit: 512m
+    cpus: "0.75"
+    entrypoint: ["/bin/bash", "-lc"]
     command:
       - |
+        set -Eeuo pipefail
         mkdir -p /freqtrade/bridge /freqtrade/user_data/logs
-        if [ ! -s /freqtrade/bridge/pairlist.json ]; then
-          printf '%s\n' '{"pairs":["BTC/USD"],"refresh_period":10}' > /freqtrade/bridge/pairlist.json
+        if [ ! -s /freqtrade/bridge/pairlist_usd.json ]; then
+          printf '%s\n' '{"pairs":["BTC/USD"],"refresh_period":10,"stake_currency":"USD"}' > /freqtrade/bridge/pairlist_usd.json
+        fi
+        if [ ! -s /freqtrade/bridge/pairlist_usdt.json ]; then
+          printf '%s\n' '{"pairs":["BTC/USDT"],"refresh_period":10,"stake_currency":"USDT"}' > /freqtrade/bridge/pairlist_usdt.json
         fi
         if [ ! -s /freqtrade/bridge/signals.json ]; then
           printf '%s\n' '{"schema_version":1,"signals":[]}' > /freqtrade/bridge/signals.json
@@ -18,20 +22,45 @@ services:
         if [ ! -s /freqtrade/bridge/control.json ]; then
           printf '%s\n' '{"schema_version":1,"enabled":false,"authoritative_engine":"FREQTRADE_DRY_RUN"}' > /freqtrade/bridge/control.json
         fi
-        exec freqtrade trade \
-          --logfile /freqtrade/user_data/logs/ohm-freqtrade-paper.log \
-          --db-url sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run.sqlite \
+
+        freqtrade trade \
+          --logfile /freqtrade/user_data/logs/ohm-freqtrade-paper-usd.log \
+          --db-url sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run_usd.sqlite \
           --config /freqtrade/user_data/config.json \
-          --strategy OHMExternalSignalStrategy
+          --strategy OHMExternalSignalStrategy &
+        USD_PID=$!
+
+        freqtrade trade \
+          --logfile /freqtrade/user_data/logs/ohm-freqtrade-paper-usdt.log \
+          --db-url sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run_usdt.sqlite \
+          --config /freqtrade/user_data/config_usdt.json \
+          --strategy OHMExternalSignalStrategy &
+        USDT_PID=$!
+
+        cleanup() {
+          kill "$USD_PID" "$USDT_PID" 2>/dev/null || true
+          wait "$USD_PID" "$USDT_PID" 2>/dev/null || true
+        }
+        trap cleanup EXIT INT TERM
+
+        while kill -0 "$USD_PID" 2>/dev/null && kill -0 "$USDT_PID" 2>/dev/null; do
+          sleep 5
+        done
+        echo "A Freqtrade paper worker exited; restarting sidecar." >&2
+        exit 1
     volumes:
       - ./freqtrade/user_data:/freqtrade/user_data
       - ./data/freqtrade_bridge:/freqtrade/bridge
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/ohm_freqtrade_heartbeat && find /tmp/ohm_freqtrade_heartbeat -mmin -1 -print -quit | grep -q ."]
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /tmp/ohm_freqtrade_heartbeat_USD && test -f /tmp/ohm_freqtrade_heartbeat_USDT && find /tmp/ohm_freqtrade_heartbeat_USD -mmin -1 -print -quit | grep -q . && find /tmp/ohm_freqtrade_heartbeat_USDT -mmin -1 -print -quit | grep -q ."
+        ]
       interval: 10s
       timeout: 3s
       retries: 12
-      start_period: 30s
+      start_period: 45s
 
   ohm-trade-agent:
     build: .
