@@ -3,6 +3,8 @@ import json
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from app.jobs import run_cycle, scan_opportunities
 from app.services import (
     paper_trade_control,
@@ -404,3 +406,29 @@ def test_second_paper_monitor_instance_fails_fast_without_processing(tmp_path):
     assert summary.tracked == 0
     assert summary.checked == 0
     assert summary.failures == ("PAPER_MONITOR_ALREADY_RUNNING",)
+
+
+
+def test_internal_timeout_is_not_misclassified_as_monitor_lock_contention(
+    tmp_path,
+    monkeypatch,
+):
+    def raise_internal_timeout(*args, **kwargs):
+        raise TimeoutError("paper state lock timeout")
+
+    monkeypatch.setattr(
+        paper_trade_monitor,
+        "_run_paper_trade_monitor_unlocked",
+        raise_internal_timeout,
+    )
+
+    with pytest.raises(TimeoutError, match="paper state lock timeout"):
+        paper_trade_monitor.run_paper_trade_monitor(
+            config(),
+            client=FakeClient(),
+            now=datetime(2026, 8, 27, 5, 30, tzinfo=timezone.utc),
+            state_file=tmp_path / "state.json",
+            event_file=tmp_path / "events.jsonl",
+            control_file=tmp_path / "control.json",
+            lock_timeout_seconds=0.0,
+        )
