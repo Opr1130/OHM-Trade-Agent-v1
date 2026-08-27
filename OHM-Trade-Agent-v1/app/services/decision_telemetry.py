@@ -170,14 +170,16 @@ def record_phase3b_shadow_for_decision(
     signal_quality_enabled = bool(
         getattr(settings, "signal_quality_v1_enabled", False)
     )
-    if not signal_quality_enabled:
-        return 0
 
     # Build 2 canonical producer: when the full in-memory scan cohort is
-    # supplied, record every observed pair to the existing P1 outbox. This is
-    # local append-only I/O and occurs after alert-critical work. The legacy
-    # ranked-candidate producer remains as a compatibility fallback for callers
-    # that do not yet provide full-market observations.
+    # supplied, record every observed pair to the existing P1 outbox. Capture
+    # is intentionally independent of the Signal Quality feature flag: a scan
+    # with that feature disabled is still a real cohort and its rows are
+    # explicitly marked NOT_SCORED. The outbox itself remains dark unless
+    # P1_SHADOW_OUTBOX_ENABLED is explicitly enabled.
+    #
+    # The legacy ranked-candidate producer remains as a compatibility fallback
+    # for callers that do not yet provide full-market observations.
     try:
         if observation_rows:
             append_canonical_episode_snapshots(
@@ -186,7 +188,7 @@ def record_phase3b_shadow_for_decision(
                 decision_at=decision_at,
                 signal_quality_enabled=signal_quality_enabled,
             )
-        elif rows:
+        elif rows and signal_quality_enabled:
             append_live_scan_snapshots(
                 rows,
                 reference_prices=reference_prices,
@@ -195,9 +197,10 @@ def record_phase3b_shadow_for_decision(
     except Exception as exc:
         print("P1 shadow outbox: fail-soft", type(exc).__name__)
 
-    # Phase 3B structure enrichment remains candidate-scoped. Canonical capture
-    # above must still succeed on scans where the ranker emits zero candidates.
-    if not rows:
+    # Phase 3B structure enrichment remains candidate-scoped and retains its
+    # existing Signal Quality gate. Canonical capture above must still succeed
+    # on zero-candidate or Signal-Quality-disabled scans.
+    if not signal_quality_enabled or not rows:
         return 0
 
     try:
