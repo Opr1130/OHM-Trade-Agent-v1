@@ -232,6 +232,8 @@ def account_summary(
     *,
     state_file: Path = STATE_FILE,
 ) -> PaperAccountSummary:
+    if float(starting_equity) <= 0:
+        raise ValueError("starting_equity must be positive")
     rows = get_lifecycles(state_file=state_file)
     realized = sum(
         float(trade.net_pnl or 0.0)
