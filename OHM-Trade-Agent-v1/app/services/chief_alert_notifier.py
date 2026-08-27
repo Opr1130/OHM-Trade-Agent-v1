@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
+from app.services.asset_display_identity import display_asset_text, display_market_label
 from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
@@ -152,10 +153,22 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
+    base_asset = str(candidate.get("underlying_asset") or plan.symbol)
+    primary_pair = str(candidate.get("primary_pair") or plan.symbol)
+    asset_text = display_asset_text(
+        plan.symbol,
+        base_asset=base_asset,
+        pair=primary_pair,
+    )
+    market_label = display_market_label(
+        plan.symbol,
+        base_asset=base_asset,
+        pair=primary_pair,
+    )
     return (
         f"{headline}\n\n{action_text}\n\n"
-        f"Asset: {candidate.get('underlying_asset', plan.symbol)}\n"
-        f"Market: {candidate.get('primary_pair', plan.symbol)}\n"
+        f"Asset: {asset_text}\n"
+        f"Market: {market_label}\n"
         f"Direction: {direction}\n"
         f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{movement_note}{fill_tracking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
