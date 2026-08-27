@@ -12,6 +12,7 @@ from app.exchanges.kraken import KrakenClient
 from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import get_active_trades
+from app.services.asset_display_identity import display_asset_text, display_market_label
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
