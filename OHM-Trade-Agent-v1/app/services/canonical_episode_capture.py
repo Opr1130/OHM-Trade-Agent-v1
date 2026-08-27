@@ -49,6 +49,14 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _first_finite(*values: Any) -> float | None:
+    for value in values:
+        number = _finite(value)
+        if number is not None:
+            return number
+    return None
+
+
 def _hash(prefix: str, value: str, *, length: int = 32) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
     return f"{prefix}:{digest}"
@@ -101,6 +109,7 @@ def _build_snapshot(
     cohort_size: int,
     candidate_index: Mapping[str, tuple[int, Any]],
     signal_quality_enabled: bool,
+    scan_source: str,
 ) -> dict[str, Any]:
     symbol = str(getattr(observation, "symbol", "") or "").upper()
     if not symbol:
@@ -181,7 +190,9 @@ def _build_snapshot(
         "decision_at_utc": decision.isoformat(),
         "symbol": symbol,
         "base_asset": str(
-            getattr(observation, "base_asset", "") or ""
+            getattr(observation, "base_asset", "")
+            or getattr(observation, "underlying_asset", "")
+            or ""
         ).upper(),
         "kraken_public_symbol": str(
             getattr(observation, "kraken_public_symbol", "") or ""
@@ -189,16 +200,25 @@ def _build_snapshot(
         "reference_price": _finite(getattr(observation, "last_price", None)),
         "last_price": _finite(getattr(observation, "last_price", None)),
         "volume_24h": _finite(getattr(observation, "volume_24h", None)),
-        "liquidity_24h_usd_approx": _finite(
-            getattr(observation, "notional_24h_usd_approx", None)
+        "liquidity_24h_usd_approx": _first_finite(
+            getattr(observation, "notional_24h_usd_approx", None),
+            getattr(observation, "combined_24h_liquidity_usd", None),
+            getattr(observation, "primary_24h_liquidity_usd", None),
         ),
-        "high_24h": _finite(getattr(observation, "high_24h", None)),
-        "low_24h": _finite(getattr(observation, "low_24h", None)),
+        "high_24h": _first_finite(
+            getattr(observation, "high_24h", None),
+            getattr(observation, "recent_24h_high", None),
+        ),
+        "low_24h": _first_finite(
+            getattr(observation, "low_24h", None),
+            getattr(observation, "recent_24h_low", None),
+        ),
         "lift_from_24h_low_pct": _finite(
             getattr(observation, "lift_from_24h_low_pct", None)
         ),
-        "distance_from_24h_high_pct": _finite(
-            getattr(observation, "distance_from_24h_high_pct", None)
+        "distance_from_24h_high_pct": _first_finite(
+            getattr(observation, "distance_from_24h_high_pct", None),
+            getattr(observation, "distance_to_24h_high_pct", None),
         ),
         "signal_quality_enabled": bool(signal_quality_enabled),
         "decision_status": decision_status,
@@ -220,7 +240,7 @@ def _build_snapshot(
         "reasons": reasons,
         "components": components,
         "source_exchange": "KRAKEN_SPOT",
-        "scan_source": "LIVE_FULL_MARKET",
+        "scan_source": str(scan_source or "LIVE_FULL_MARKET"),
         "measurement_only": True,
         "advisory_only": True,
         "affects_ranking": False,
@@ -239,6 +259,7 @@ def build_canonical_episode_snapshots(
     candidates: Iterable[Any] = (),
     decision_at: datetime,
     signal_quality_enabled: bool,
+    scan_source: str = "LIVE_FULL_MARKET",
 ) -> list[dict[str, Any]]:
     """Build one immutable record for every valid observed pair."""
     decision = _require_utc(decision_at)
@@ -257,6 +278,7 @@ def build_canonical_episode_snapshots(
             cohort_size=cohort_size,
             candidate_index=candidate_index,
             signal_quality_enabled=signal_quality_enabled,
+            scan_source=scan_source,
         )
         for cohort_position, observation in enumerate(
             sorted(
@@ -276,6 +298,7 @@ def append_canonical_episode_snapshots(
     candidates: Iterable[Any] = (),
     decision_at: datetime,
     signal_quality_enabled: bool,
+    scan_source: str = "LIVE_FULL_MARKET",
     path: Path | None = None,
     dead_letter_path: Path | None = None,
     enabled: bool | None = None,
@@ -346,6 +369,7 @@ def append_canonical_episode_snapshots(
                             cohort_size=cohort_size,
                             candidate_index=candidate_index,
                             signal_quality_enabled=signal_quality_enabled,
+                            scan_source=scan_source,
                         )
                         handle.write(
                             json.dumps(row, sort_keys=True, allow_nan=False)
