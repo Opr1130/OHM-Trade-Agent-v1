@@ -5,7 +5,11 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from app.services.intelligence_journey import record_paper_outcome
+from app.services.intelligence_journey import (
+    EVENT_FILE as JOURNEY_EVENT_FILE,
+    STATE_FILE as JOURNEY_STATE_FILE,
+    record_paper_outcome,
+)
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -42,6 +46,8 @@ def ingest_freqtrade_dry_run(
     *,
     db_file: Path = DB_FILE,
     state_file: Path = STATE_FILE,
+    journey_state_file: Path = JOURNEY_STATE_FILE,
+    journey_event_file: Path = JOURNEY_EVENT_FILE,
 ) -> dict[str, Any]:
     if not db_file.exists():
         return {
@@ -128,6 +134,8 @@ def ingest_freqtrade_dry_run(
             symbol=symbol,
             observed_at=close_time,
             payload=payload,
+            state_file=journey_state_file,
+            event_file=journey_event_file,
         )
         if journey_id is not None:
             added += 1
