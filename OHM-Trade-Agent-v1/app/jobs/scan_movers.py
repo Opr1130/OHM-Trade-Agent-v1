@@ -342,6 +342,8 @@ def main() -> None:
     broad_created = 0
     broad_edited = 0
     broad_suppressed = 0
+    early_mover_delivery: dict[str, tuple[str, bool]] = {}
+    broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     if (
         str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
@@ -365,6 +367,7 @@ def main() -> None:
             )
             if decision.action == "SUPPRESS":
                 suppressed += 1
+                early_mover_delivery[signal.symbol.upper()] = ("SUPPRESSED", False)
                 print(f"Alert governor suppressed {signal.symbol}: {decision.reason}")
                 continue
 
@@ -383,7 +386,9 @@ def main() -> None:
                         created_new=False,
                     )
                     edited += 1
+                    early_mover_delivery[signal.symbol.upper()] = ("EDITED", True)
                 else:
+                    early_mover_delivery[signal.symbol.upper()] = ("EDIT_FAILED", False)
                     print(f"Telegram edit failed for {signal.symbol}; existing card retained for retry.")
                 continue
 
@@ -400,6 +405,9 @@ def main() -> None:
                     created_new=True,
                 )
                 created += 1
+                early_mover_delivery[signal.symbol.upper()] = ("CREATED", True)
+            else:
+                early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
 
         broad_feed = _broad_watch_feed(
             full_market,
@@ -417,6 +425,7 @@ def main() -> None:
             )
             if decision.action == "SUPPRESS":
                 broad_suppressed += 1
+                broad_watch_delivery[symbol.upper()] = ("SUPPRESSED", False)
                 print(f"Broad-watch governor suppressed {symbol}: {decision.reason}")
                 continue
 
@@ -435,7 +444,9 @@ def main() -> None:
                         state_file=FULL_MARKET_ALERT_STATE_FILE,
                     )
                     broad_edited += 1
+                    broad_watch_delivery[symbol.upper()] = ("EDITED", True)
                 else:
+                    broad_watch_delivery[symbol.upper()] = ("EDIT_FAILED", False)
                     print(f"Telegram broad-watch edit failed for {symbol}; card retained.")
                 continue
 
@@ -453,6 +464,9 @@ def main() -> None:
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
                 broad_created += 1
+                broad_watch_delivery[symbol.upper()] = ("CREATED", True)
+            else:
+                broad_watch_delivery[symbol.upper()] = ("CREATE_FAILED", False)
 
     # Intelligence-journey persistence is deliberately post-alert and
     # measurement-only. It links early evidence to later qualified signals and
@@ -465,6 +479,10 @@ def main() -> None:
                 config=learning_config,
             )
             for candidate in learning_candidates:
+                delivery_action, delivered = broad_watch_delivery.get(
+                    candidate.symbol.upper(),
+                    ("NOT_DELIVERED_OR_EXCLUDED", False),
+                )
                 record_watch_observation(
                     symbol=candidate.symbol,
                     observed_at=decision_at,
@@ -487,12 +505,16 @@ def main() -> None:
                         "reasons": list(candidate.reasons),
                         "telegram_alert_eligible": True,
                     },
-                    delivery_action="POST_ALERT_OBSERVATION",
-                    delivered=False,
+                    delivery_action=delivery_action,
+                    delivered=delivered,
                 )
         for signal in signals:
             if not signal.alert_eligible:
                 continue
+            delivery_action, delivered = early_mover_delivery.get(
+                signal.symbol.upper(),
+                ("NOT_DELIVERED", False),
+            )
             record_watch_observation(
                 symbol=signal.symbol,
                 observed_at=decision_at,
@@ -513,8 +535,8 @@ def main() -> None:
                     "extended_move": signal.extended_move,
                     "telegram_alert_eligible": True,
                 },
-                delivery_action="POST_ALERT_OBSERVATION",
-                delivered=False,
+                delivery_action=delivery_action,
+                delivered=delivered,
             )
     except Exception as exc:
         print("Intelligence journey watch capture: fail-soft", type(exc).__name__)
