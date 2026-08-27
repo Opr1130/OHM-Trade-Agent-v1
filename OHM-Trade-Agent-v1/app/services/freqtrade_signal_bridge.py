@@ -35,7 +35,7 @@ def _parse(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _pair(base_asset: str, quote_asset: str = "USD") -> str:
+def to_freqtrade_pair(base_asset: str, quote_asset: str = "USD") -> str:
     base = canonicalize_asset(str(base_asset or "").strip().upper())
     quote = canonicalize_asset(str(quote_asset or "USD").strip().upper())
     if not base or quote not in {"USD", "USDT"}:
@@ -122,7 +122,7 @@ def publish_qualified_long(
     pairlist_file: Path = PAIRLIST_FILE,
 ) -> dict[str, Any]:
     decision = _utc(decision_at)
-    pair = _pair(base_asset, quote_asset)
+    pair = to_freqtrade_pair(base_asset, quote_asset)
     signal_id = build_signal_id(
         episode_id=episode_id,
         pair=pair,
