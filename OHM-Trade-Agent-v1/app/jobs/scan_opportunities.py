@@ -20,7 +20,11 @@ from app.scanner.reference_market_validation import validate_finalist_references
 from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
-from app.services.canonical_episode_capture import append_canonical_episode_snapshots
+from app.services.canonical_episode_capture import (
+    append_canonical_episode_snapshots,
+    canonical_cohort_id,
+    canonical_episode_id,
+)
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import (
     SHORT_MARGIN_COST_RESERVE_PCT,
@@ -85,6 +89,73 @@ def _capture_native_scan_cohort(scan, *, decision_at):
         return 0
     print("O'Pip canonical native episodes captured:", written)
     return written
+
+
+def _maybe_enroll_paper_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Post-alert paper enrollment; never participates in live decisions."""
+    try:
+        from app.services.paper_trade_control import paper_trade_enabled
+        from app.services.paper_trade_engine import (
+            PaperTradeConfig,
+            enroll_paper_opportunity,
+        )
+
+        if not paper_trade_enabled():
+            return 0, 0
+        config = PaperTradeConfig.from_settings(settings)
+        cohort_id = canonical_cohort_id(
+            scan.snapshots,
+            decision_at=decision_at,
+        )
+    except Exception as exc:
+        print(
+            "Paper Trade enrollment unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, 1
+
+    enrolled = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        try:
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            result = enroll_paper_opportunity(
+                candidate=alert,
+                snapshot=snapshot,
+                plan=plan,
+                episode_id=episode_id,
+                cohort_id=cohort_id,
+                decision_at=decision_at,
+                config=config,
+            )
+            print(
+                f"PAPER {snapshot.symbol}: Status={result.status} "
+                f"Reason={result.reason} "
+                f"Id={result.paper_trade_id or 'N/A'}"
+            )
+            if result.status in {"OPENED", "PENDING"}:
+                enrolled += 1
+        except Exception as exc:
+            failures += 1
+            print(
+                f"PAPER {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return enrolled, failures
 
 
 def _target_quality(plan, snapshot):
@@ -625,6 +696,14 @@ def main():
     print("Pending setups saved:", pending_saved)
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
+    paper_enrolled, paper_failures = _maybe_enroll_paper_opportunities(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    print("Paper lifecycles enrolled:", paper_enrolled)
+    print("Paper enrollment failures:", paper_failures)
     _capture_native_scan_cohort(scan, decision_at=decision_at)
 
 
