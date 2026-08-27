@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from app.scanner.models import MarketSnapshot
+from app.services.asset_display_identity import learn_candidate_identity
 from app.services.coingecko import CoinGeckoAPIError, CoinGeckoClient
 
 
@@ -233,7 +234,16 @@ def validate_finalist_references(
             candidate.independent_market_reference = _unavailable(api_mode, "CoinGecko batch request unavailable")
     else:
         for candidate in requested:
-            candidate.independent_market_reference = evaluate_reference_market(candidate, rows, usdt_usd_rate, api_mode, now)
+            candidate.independent_market_reference = evaluate_reference_market(
+                candidate,
+                rows,
+                usdt_usd_rate,
+                api_mode,
+                now,
+            )
+            # Presentation identity is learned only after identity-safe external
+            # resolution. Failure is intentionally non-blocking.
+            learn_candidate_identity(candidate)
     references = [item.independent_market_reference for item in requested]
     return ReferenceValidationSummary(
         requested=len(requested),
