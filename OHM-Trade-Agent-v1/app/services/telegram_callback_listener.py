@@ -36,6 +36,7 @@ _RESERVED_COMMANDS = {
     "orders",
     "positions",
     "market",
+    "paper",
 }
 
 
