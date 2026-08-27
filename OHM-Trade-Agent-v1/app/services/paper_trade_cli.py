@@ -32,6 +32,7 @@ def _print_status() -> None:
     print("Open positions:", summary.open_positions)
     print("Closed trades:", summary.closed_trades)
     print("Cancelled setups:", summary.cancelled_setups)
+    print("Unresolved evidence:", summary.unresolved_trades)
 
 
 def main() -> None:
