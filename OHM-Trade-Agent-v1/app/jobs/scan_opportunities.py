@@ -1,5 +1,6 @@
 import logging
 from collections import Counter
+from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.scanner.directional_candidates import select_directional_candidates
@@ -19,6 +20,7 @@ from app.scanner.reference_market_validation import validate_finalist_references
 from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
+from app.services.canonical_episode_capture import append_canonical_episode_snapshots
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import (
     SHORT_MARGIN_COST_RESERVE_PCT,
@@ -58,6 +60,31 @@ def _direction_counts(candidates):
         sum(c.trade_direction == "LONG" for c in candidates),
         sum(c.trade_direction == "SHORT" for c in candidates),
     )
+
+
+def _capture_native_scan_cohort(scan, *, decision_at):
+    """Capture the exact native production scan cohort for O'Pip evidence.
+
+    Measurement-only and fail-soft: this writes to the existing P1 shadow
+    outbox when enabled, but cannot change ranking, Telegram, PendingSetup,
+    Chief review, or trading authority.
+    """
+    try:
+        written = append_canonical_episode_snapshots(
+            scan.snapshots,
+            candidates=(),
+            decision_at=decision_at,
+            signal_quality_enabled=False,
+            scan_source="LIVE_OPPORTUNITY_SCAN",
+        )
+    except Exception as exc:
+        logger.warning(
+            "O'Pip canonical native capture failed open: %s",
+            type(exc).__name__,
+        )
+        return 0
+    print("O'Pip canonical native episodes captured:", written)
+    return written
 
 
 def _target_quality(plan, snapshot):
@@ -118,6 +145,8 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
 def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
+    decision_at = datetime.now(timezone.utc)
+    _capture_native_scan_cohort(scan, decision_at=decision_at)
     market_regime = evaluate_market_regime(scan.snapshots)
     local_movement_signals = [
         signal
