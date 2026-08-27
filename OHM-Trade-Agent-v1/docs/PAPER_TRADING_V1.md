@@ -110,6 +110,10 @@ No fill is invented at signal time.
 Paper monitoring runs only after real active-position and pending-setup
 protection have completed in the unified cycle.
 
+A dedicated paper-monitor lock serializes monitor runs for the paper state
+directory. A duplicate/manual monitor invocation fails fast rather than
+processing the same lifecycle concurrently.
+
 It uses Kraken public OHLC data only.
 
 The candle containing the original signal is excluded from high/low outcome
