@@ -11,7 +11,10 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 BRIDGE_DIR = Path("/app/data/freqtrade_bridge")
 SIGNALS_FILE = BRIDGE_DIR / "signals.json"
-PAIRLIST_FILE = BRIDGE_DIR / "pairlist.json"
+PAIRLIST_USD_FILE = BRIDGE_DIR / "pairlist_usd.json"
+PAIRLIST_USDT_FILE = BRIDGE_DIR / "pairlist_usdt.json"
+# Backward-compatible alias for tests/importers that assume the primary USD path.
+PAIRLIST_FILE = PAIRLIST_USD_FILE
 CONTROL_FILE = BRIDGE_DIR / "control.json"
 SIGNAL_RETENTION = timedelta(days=7)
 
@@ -51,14 +54,23 @@ def build_signal_id(*, episode_id: str, pair: str, decision_at: datetime) -> str
 def ensure_bridge_files(
     *,
     signals_file: Path = SIGNALS_FILE,
-    pairlist_file: Path = PAIRLIST_FILE,
+    pairlist_usd_file: Path = PAIRLIST_USD_FILE,
+    pairlist_usdt_file: Path = PAIRLIST_USDT_FILE,
     control_file: Path = CONTROL_FILE,
 ) -> None:
     signals_file.parent.mkdir(parents=True, exist_ok=True)
     if not signals_file.exists():
         save_json_atomic(signals_file, {"schema_version": 1, "signals": []})
-    if not pairlist_file.exists():
-        save_json_atomic(pairlist_file, {"pairs": ["BTC/USD"], "refresh_period": 10})
+    if not pairlist_usd_file.exists():
+        save_json_atomic(
+            pairlist_usd_file,
+            {"pairs": ["BTC/USD"], "refresh_period": 10},
+        )
+    if not pairlist_usdt_file.exists():
+        save_json_atomic(
+            pairlist_usdt_file,
+            {"pairs": ["BTC/USDT"], "refresh_period": 10},
+        )
     if not control_file.exists():
         save_json_atomic(
             control_file,
@@ -66,6 +78,8 @@ def ensure_bridge_files(
                 "schema_version": 1,
                 "enabled": False,
                 "source": "SYSTEM_DEFAULT",
+                "authoritative_engine": "FREQTRADE_DRY_RUN",
+                "exchange_write_authority": False,
             },
         )
 
@@ -119,7 +133,7 @@ def publish_qualified_long(
     profit_rank_score: float | None,
     early_watch_context: dict[str, Any] | None = None,
     signals_file: Path = SIGNALS_FILE,
-    pairlist_file: Path = PAIRLIST_FILE,
+    pairlist_file: Path | None = None,
 ) -> dict[str, Any]:
     decision = _utc(decision_at)
     pair = to_freqtrade_pair(base_asset, quote_asset)
@@ -195,24 +209,30 @@ def publish_qualified_long(
             },
         )
 
-    pair_lock = pairlist_file.parent / f".{pairlist_file.name}.lock"
+    quote = str(quote_asset).upper()
+    target_pairlist = pairlist_file or (
+        PAIRLIST_USDT_FILE if quote == "USDT" else PAIRLIST_USD_FILE
+    )
+    pair_lock = target_pairlist.parent / f".{target_pairlist.name}.lock"
     with registry_lock(pair_lock):
         pairs = {pair}
         payload = load_json(signals_file)
+        suffix = f"/{quote}"
         for row in payload.get("signals", []):
             if not isinstance(row, dict):
                 continue
             expiry = _parse(row.get("expires_at"))
             if expiry is not None and expiry >= decision:
                 value = str(row.get("pair") or "")
-                if value:
+                if value.endswith(suffix):
                     pairs.add(value)
         save_json_atomic(
-            pairlist_file,
+            target_pairlist,
             {
                 "pairs": sorted(pairs),
                 "refresh_period": 10,
                 "updated_at": decision.isoformat(),
+                "stake_currency": quote,
             },
         )
     return signal
