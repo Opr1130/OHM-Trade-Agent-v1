@@ -254,6 +254,7 @@ def test_freqtrade_outcome_ingest_is_idempotent(tmp_path):
 def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     root = Path(__file__).resolve().parents[1]
     config_path = root / "freqtrade" / "user_data" / "config.json"
+    config_usdt_path = root / "freqtrade" / "user_data" / "config_usdt.json"
     strategy_path = (
         root
         / "freqtrade"
@@ -263,15 +264,20 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     )
     compose_path = root / "docker-compose.yml"
 
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    assert config["dry_run"] is True
-    assert config["trading_mode"] == "spot"
-    assert config["force_entry_enable"] is False
-    assert config["exchange"]["name"] == "kraken"
-    assert config["exchange"]["key"] == ""
-    assert config["exchange"]["secret"] == ""
-    assert config["api_server"]["enabled"] is False
-    assert config["telegram"]["enabled"] is False
+    configs = [
+        json.loads(config_path.read_text(encoding="utf-8")),
+        json.loads(config_usdt_path.read_text(encoding="utf-8")),
+    ]
+    assert {config["stake_currency"] for config in configs} == {"USD", "USDT"}
+    for config in configs:
+        assert config["dry_run"] is True
+        assert config["trading_mode"] == "spot"
+        assert config["force_entry_enable"] is False
+        assert config["exchange"]["name"] == "kraken"
+        assert config["exchange"]["key"] == ""
+        assert config["exchange"]["secret"] == ""
+        assert config["api_server"]["enabled"] is False
+        assert config["telegram"]["enabled"] is False
 
     strategy_source = strategy_path.read_text(encoding="utf-8")
     ast.parse(strategy_source)
@@ -279,6 +285,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "Trade.get_trades_proxy" in strategy_source
     assert "ohm_stop_gap" in strategy_source
     assert "current_rate >= target_2" in strategy_source
+    assert "if not self._enabled():" in strategy_source
     assert "exchange_write_authority" not in strategy_source
 
     compose = compose_path.read_text(encoding="utf-8")
@@ -288,6 +295,98 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "freqtradeorg/freqtrade:2026.7" in sidecar
     assert "env_file:" not in sidecar
     assert "ports:" not in sidecar
-    assert "tradesv3.ohm_dry_run.sqlite" in sidecar
+    assert "tradesv3.ohm_dry_run_usd.sqlite" in sidecar
+    assert "tradesv3.ohm_dry_run_usdt.sqlite" in sidecar
+    assert "ohm_freqtrade_heartbeat_USD" in sidecar
+    assert "ohm_freqtrade_heartbeat_USDT" in sidecar
     assert "service_healthy" in compose
     assert "./freqtrade/user_data:/app/freqtrade_paper:ro" in compose
+
+
+
+def test_signal_to_paper_conversion_counts_distinct_signal_ids(tmp_path):
+    journey_state = tmp_path / "journeys.json"
+    events = tmp_path / "events.jsonl"
+
+    record_watch_observation(
+        symbol="SOLUSD",
+        observed_at=NOW,
+        watch_type="EARLY_WATCH",
+        payload={"stage": "EARLY_BUILDING", "pattern": "TEST"},
+        delivery_action="CREATED",
+        delivered=True,
+        state_file=journey_state,
+        event_file=events,
+    )
+    for index in (1, 2):
+        link_qualified_signal(
+            symbol="SOLUSD",
+            signal_id=f"OHM:signal-{index}",
+            observed_at=NOW + timedelta(minutes=index),
+            payload={},
+            state_file=journey_state,
+            event_file=events,
+        )
+
+    from app.services.intelligence_journey import record_paper_outcome
+
+    record_paper_outcome(
+        signal_id="OHM:signal-1",
+        symbol="SOLUSD",
+        observed_at=NOW + timedelta(hours=1),
+        payload={
+            "net_pnl": 10.0,
+            "pnl_currency": "USD",
+            "close_profit_ratio": 0.01,
+        },
+        state_file=journey_state,
+        event_file=events,
+    )
+
+    profile = build_intelligence_learning_profile(
+        event_file=events,
+        persist=False,
+    )
+    assert profile["qualified_signals"] == 2
+    assert profile["paper_outcome_signals"] == 1
+    assert profile["signal_to_paper_outcome_conversion_pct"] == 50.0
+
+
+def test_usd_and_usdt_trade_ids_do_not_collide_during_ingest(tmp_path):
+    journey_state = tmp_path / "journeys.json"
+    events = tmp_path / "events.jsonl"
+    ingest_state = tmp_path / "ingest.json"
+    usd_db = tmp_path / "tradesv3.ohm_dry_run_usd.sqlite"
+    usdt_db = tmp_path / "tradesv3.ohm_dry_run_usdt.sqlite"
+
+    for signal_id in ("OHM:usd", "OHM:usdt"):
+        link_qualified_signal(
+            symbol="SOLUSD",
+            signal_id=signal_id,
+            observed_at=NOW,
+            payload={},
+            state_file=journey_state,
+            event_file=events,
+        )
+
+    _create_dry_run_db(usd_db, "OHM:usd")
+    _create_dry_run_db(usdt_db, "OHM:usdt")
+
+    # Inject each database separately to prove identical numeric trade ids
+    # are namespaced by quote currency in the persisted ingest state.
+    first = ingest_freqtrade_dry_run(
+        db_file=usd_db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    second = ingest_freqtrade_dry_run(
+        db_file=usdt_db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    assert first["outcomes_added"] == 1
+    assert second["outcomes_added"] == 1
+    state = json.loads(ingest_state.read_text(encoding="utf-8"))
+    assert set(state["processed_trade_keys"]) == {"USD:1", "USDT:1"}
