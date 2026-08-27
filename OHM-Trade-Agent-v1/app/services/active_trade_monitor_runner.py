@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.services.active_trade_registry import get_active_trades
+from app.services.asset_display_identity import display_market_label
 from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
 from app.services.kraken_position_verification import KrakenPositionVerifier
