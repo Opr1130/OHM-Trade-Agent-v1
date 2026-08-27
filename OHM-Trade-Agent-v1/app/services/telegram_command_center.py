@@ -15,6 +15,11 @@ from app.services.active_trade_registry import get_active_trades
 from app.services.asset_display_identity import display_asset_text, display_market_label
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
+from app.services.paper_trade_control import (
+    get_paper_trade_control,
+    set_paper_trade_enabled,
+)
+from app.services.paper_trade_registry import account_summary
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_market_insights import (
     MarketInsight,
@@ -54,9 +59,11 @@ _HELP = (
     "/orders — review current Kraken open orders\n"
     "/positions — review Kraken spot balances/margin positions\n"
     "/market — BTC-led market regime read\n"
+    "/paper status|on|off — isolated Paper Trade v1 control\n"
     "/help — show commands\n\n"
     "Examples: /CAP, /BTC, /ETH, /scan VVV\n\n"
-    "Read-only/advisory: Telegram commands never place, cancel, modify, or confirm Kraken orders."
+    "Read-only/advisory: Telegram commands never place, cancel, modify, or confirm Kraken orders. "
+    "Paper control changes simulation state only."
 )
 
 
@@ -493,6 +500,58 @@ def _handle_unwatch(settings: Any, symbol_query: str) -> None:
     _send(settings, f"👁 {symbol} removed from watchlist." if removed else f"👁 {symbol} was not on the watchlist.")
 
 
+def _paper_status_text(settings: Any) -> str:
+    control = get_paper_trade_control()
+    summary = account_summary(float(settings.paper_trade_starting_equity))
+    return (
+        "🧪 OHM PAPER TRADE V1\n"
+        f"Mode: {'ON' if control.enabled else 'OFF'}\n"
+        f"Control: {control.status}\n"
+        "Policy: SPOT LONG ONLY\n"
+        "Exchange writes: DISABLED BY ARCHITECTURE\n"
+        f"Paper equity: ${summary.closed_equity:,.2f}\n"
+        f"Realized net P/L: ${summary.realized_net_pnl:,.2f}\n"
+        f"Reserved: ${summary.reserved_capital:,.2f}\n"
+        f"Available: ${summary.available_capital:,.2f}\n"
+        f"Pending/Open: {summary.pending_entries}/{summary.open_positions}\n"
+        f"Closed/Unresolved: {summary.closed_trades}/{summary.unresolved_trades}"
+    )
+
+
+def _handle_paper(settings: Any, args: tuple[str, ...]) -> None:
+    if len(args) > 1:
+        raise TelegramCommandError("Usage: /paper status|on|off")
+    action = str(args[0] if args else "status").strip().casefold()
+    if action == "status":
+        _send(settings, _paper_status_text(settings))
+        return
+    if action not in {"on", "off"}:
+        raise TelegramCommandError("Usage: /paper status|on|off")
+
+    state = set_paper_trade_enabled(
+        action == "on",
+        updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
+    )
+    if action == "on":
+        prefix = (
+            "✅ PAPER TRADE V1 — ON\n"
+            "New qualified LONG opportunities may enter the isolated paper ledger.\n"
+        )
+    else:
+        prefix = (
+            "⛔ PAPER TRADE V1 — OFF\n"
+            "No new paper exposure will be admitted. Pending entries cancel on "
+            "the next monitor pass; already-open paper positions continue to a "
+            "terminal outcome.\n"
+        )
+    _send(
+        settings,
+        prefix
+        + f"Updated: {state.updated_at}\n"
+        + "Kraken execution authority: NONE",
+    )
+
+
 def process_command_message(update: dict[str, Any], settings: Any | None = None) -> bool:
     """Process one already-authorized Telegram message update.
 
@@ -550,6 +609,8 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             if args:
                 raise TelegramCommandError("Usage: /market")
             _send(settings, market_report())
+        elif command == "paper":
+            _handle_paper(settings, args)
         else:
             _send(settings, f"Unknown command /{command}. Use /help.")
     except TelegramCommandError as exc:
