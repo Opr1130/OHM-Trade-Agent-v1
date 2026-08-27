@@ -63,45 +63,49 @@ def build_outcomes(
     ingestion = read_observations(observation_path)
     labels = build_forward_outcome_labels(snapshots, ingestion.observations)
 
-    existing = read_jsonl(output_path)
-    latest = _latest_by_snapshot(existing)
-    revisions: dict[str, int] = {}
-    for row in existing:
-        snapshot_id = str(row.get("snapshot_id", "") or "")
-        if not snapshot_id:
-            continue
-        revisions[snapshot_id] = max(
-            revisions.get(snapshot_id, 0),
-            int(row.get("outcome_revision", 0) or 0),
-        )
-
-    pending: list[dict[str, Any]] = []
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = output_path.parent / f".{output_path.name}.lock"
     current: list[dict[str, Any]] = []
-    for label in labels:
-        snapshot_id = str(label.get("snapshot_id", "") or "")
-        if not snapshot_id:
-            continue
-        record_id = _outcome_record_id(label)
-        prior = latest.get(snapshot_id)
-        if prior and str(prior.get("outcome_record_id", "") or "") == record_id:
-            current.append(prior)
-            continue
 
-        revision = revisions.get(snapshot_id, 0) + 1
-        row = {
-            **label,
-            "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
-            "outcome_record_id": record_id,
-            "outcome_revision": revision,
-            "append_only": True,
-        }
-        pending.append(row)
-        current.append(row)
+    # Dedup/revision selection and append share one lock. Two overlapping
+    # scheduler invocations therefore cannot both decide that the same
+    # maturation state is new and append duplicate revisions.
+    with registry_lock(lock):
+        existing = read_jsonl(output_path)
+        latest = _latest_by_snapshot(existing)
+        revisions: dict[str, int] = {}
+        for row in existing:
+            snapshot_id = str(row.get("snapshot_id", "") or "")
+            if not snapshot_id:
+                continue
+            revisions[snapshot_id] = max(
+                revisions.get(snapshot_id, 0),
+                int(row.get("outcome_revision", 0) or 0),
+            )
 
-    if pending:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        lock = output_path.parent / f".{output_path.name}.lock"
-        with registry_lock(lock):
+        pending: list[dict[str, Any]] = []
+        for label in labels:
+            snapshot_id = str(label.get("snapshot_id", "") or "")
+            if not snapshot_id:
+                continue
+            record_id = _outcome_record_id(label)
+            prior = latest.get(snapshot_id)
+            if prior and str(prior.get("outcome_record_id", "") or "") == record_id:
+                current.append(prior)
+                continue
+
+            revision = revisions.get(snapshot_id, 0) + 1
+            row = {
+                **label,
+                "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
+                "outcome_record_id": record_id,
+                "outcome_revision": revision,
+                "append_only": True,
+            }
+            pending.append(row)
+            current.append(row)
+
+        if pending:
             with output_path.open("a", encoding="utf-8") as handle:
                 for row in pending:
                     handle.write(
