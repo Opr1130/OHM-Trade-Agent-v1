@@ -50,6 +50,11 @@ On the next monitor pass:
 - unfilled paper entries are cancelled;
 - already-open paper positions continue to a terminal outcome.
 
+A missing or unreadable control file is not treated as an explicit operator
+OFF. Existing pending entries freeze in place until control state is readable
+again, while already-open paper positions continue to be monitored. This
+prevents ambiguous control state from creating or deleting simulated exposure.
+
 This prevents new simulated risk while avoiding survivorship/censoring bias in
 positions that were already opened.
 
@@ -112,6 +117,17 @@ attribution because part of that candle occurred before the decision.
 
 Only fully closed post-signal candles are evaluated.
 
+The candle interval is frozen into each paper lifecycle at enrollment. Later
+runtime configuration changes cannot change the historical sampling interval
+of an already-open or pending paper trade.
+
+Before advancing a lifecycle, the monitor verifies continuity from the next
+required candle. A provable skipped historical interval terminates that
+lifecycle as UNRESOLVED rather than allowing the simulator to skip unknown
+price action. UNRESOLVED outcomes are excluded from realized P/L statistics.
+A temporary absence of a newly closed candle simply freezes progress and is
+not counted as a loss or win.
+
 ## Conservative intrabar rules
 
 OHLC cannot prove event ordering inside a candle. Therefore:
@@ -156,11 +172,12 @@ Unrealized paper P/L does not increase available capital.
 
 Paper trading is lower priority than production.
 
-- control corruption fails safe to OFF;
+- control corruption prevents new paper exposure and freezes pending entries;
 - one paper market-data failure does not stop other paper lifecycles;
 - paper monitor failure cannot stop real active-position monitoring;
 - paper enrollment occurs only after Telegram processing;
-- paper persistence failure cannot change live ranking or trade authority.
+- paper persistence failure cannot change live ranking or trade authority;
+- missing historical OHLC cannot be silently skipped into a paper win/loss.
 
 ## Known v1 limitations
 
