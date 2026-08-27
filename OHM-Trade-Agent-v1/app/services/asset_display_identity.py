@@ -29,8 +29,10 @@ class AssetDisplayIdentity:
 
     @property
     def label(self) -> str:
-        if self.pair and self.pair != self.base_asset:
+        if self.display_name and self.pair and self.pair != self.base_asset:
             return f"{self.asset_text} — {self.pair}"
+        if self.pair:
+            return self.pair
         return self.asset_text
 
 
