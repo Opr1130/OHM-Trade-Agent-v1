@@ -269,3 +269,71 @@ def test_missing_control_file_freezes_existing_pending_instead_of_assuming_opera
     assert summary.control_enabled is False
     assert len(summary.failures) == 1
     assert "CONTROL_UNAVAILABLE_PENDING_FROZEN" in summary.failures[0]
+
+
+
+def test_pending_past_ttl_with_no_history_freezes_instead_of_false_no_trade(tmp_path):
+    assert enroll(tmp_path, pending=True).status == "PENDING"
+    state = tmp_path / "state.json"
+    import json
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    trade_id = next(iter(payload["lifecycles"]))
+    payload["lifecycles"][trade_id]["pending_ttl_hours"] = 1
+    state.write_text(json.dumps(payload), encoding="utf-8")
+
+    control = tmp_path / "control.json"
+    control.write_text(
+        '{"enabled":true,"updated_by":"test","updated_at":"2026-08-27T05:07:00+00:00"}',
+        encoding="utf-8",
+    )
+    client = RecordingClient([])
+
+    summary = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 6, 30, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=tmp_path / "events.jsonl",
+        control_file=control,
+    )
+
+    trade = get_lifecycles(state_file=state)[0]
+    assert trade.status == "PENDING_ENTRY"
+    assert trade.outcome is None
+    assert summary.cancelled == 0
+    assert summary.unresolved == 0
+    assert any("OHLC_HISTORY_PENDING" in item for item in summary.failures)
+
+
+def test_open_past_max_hold_with_no_history_freezes_instead_of_ticker_exit(tmp_path):
+    assert enroll(tmp_path, pending=False).status == "OPENED"
+    state = tmp_path / "state.json"
+    import json
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    trade_id = next(iter(payload["lifecycles"]))
+    payload["lifecycles"][trade_id]["max_hold_hours"] = 1
+    state.write_text(json.dumps(payload), encoding="utf-8")
+
+    control = tmp_path / "control.json"
+    control.write_text(
+        '{"enabled":true,"updated_by":"test","updated_at":"2026-08-27T05:07:00+00:00"}',
+        encoding="utf-8",
+    )
+    client = RecordingClient([])
+
+    summary = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 6, 30, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=tmp_path / "events.jsonl",
+        control_file=control,
+    )
+
+    trade = get_lifecycles(state_file=state)[0]
+    assert trade.status == "OPEN"
+    assert trade.exit_price is None
+    assert trade.outcome is None
+    assert summary.closed == 0
+    assert summary.unresolved == 0
+    assert any("OHLC_HISTORY_PENDING" in item for item in summary.failures)
