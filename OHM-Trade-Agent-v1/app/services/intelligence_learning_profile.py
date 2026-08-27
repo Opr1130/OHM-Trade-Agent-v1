@@ -93,14 +93,18 @@ def build_intelligence_learning_profile(
 
     for value in journeys.values():
         if value["early"] and value["signals"]:
-            first_early = min(
-                (_parse(row.get("observed_at")) for row in value["early"]),
-                default=None,
-            )
-            first_signal = min(
-                (_parse(row.get("observed_at")) for row in value["signals"]),
-                default=None,
-            )
+            early_times = [
+                parsed
+                for parsed in (_parse(row.get("observed_at")) for row in value["early"])
+                if parsed is not None
+            ]
+            signal_times = [
+                parsed
+                for parsed in (_parse(row.get("observed_at")) for row in value["signals"])
+                if parsed is not None
+            ]
+            first_early = min(early_times) if early_times else None
+            first_signal = min(signal_times) if signal_times else None
             if first_early and first_signal and first_signal >= first_early:
                 latencies.append((first_signal - first_early).total_seconds() / 60.0)
 
