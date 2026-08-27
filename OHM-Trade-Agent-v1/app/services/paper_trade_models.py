@@ -40,6 +40,7 @@ class PaperTradeLifecycle:
     pending_ttl_hours: int
     max_hold_hours: int
     reference_price: float
+    candle_interval_minutes: int = 15
     reference_ask: float | None = None
 
     entry_price: float | None = None
