@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Iterable
 
 from app.services.intelligence_journey import (
     EVENT_FILE as JOURNEY_EVENT_FILE,
@@ -13,7 +13,11 @@ from app.services.intelligence_journey import (
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
-DB_FILE = Path("/app/freqtrade_paper/tradesv3.ohm_dry_run.sqlite")
+DB_USD_FILE = Path("/app/freqtrade_paper/tradesv3.ohm_dry_run_usd.sqlite")
+DB_USDT_FILE = Path("/app/freqtrade_paper/tradesv3.ohm_dry_run_usdt.sqlite")
+DB_FILES = (DB_USD_FILE, DB_USDT_FILE)
+# Backward-compatible primary path for tests/importers.
+DB_FILE = DB_USD_FILE
 STATE_FILE = Path("/app/data/intelligence_learning/freqtrade_ingest_state.json")
 
 
@@ -38,26 +42,36 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
-def _value(row: sqlite3.Row, columns: set[str], name: str, default: Any = None) -> Any:
+def _value(
+    row: sqlite3.Row,
+    columns: set[str],
+    name: str,
+    default: Any = None,
+) -> Any:
     return row[name] if name in columns else default
 
 
+def _quote_for_db(path: Path) -> str:
+    return "USDT" if "usdt" in path.name.casefold() else "USD"
 
-def freqtrade_dry_run_status(
+
+def _selected_db_files(db_file: Path | None) -> tuple[Path, ...]:
+    return (db_file,) if db_file is not None else DB_FILES
+
+
+def _read_trade_rows(
+    db_file: Path,
     *,
-    db_file: Path = DB_FILE,
-) -> dict[str, Any]:
+    closed_only: bool,
+) -> tuple[str, set[str], list[sqlite3.Row], str | None]:
     if not db_file.exists():
-        return {
-            "status": "NOT_READY",
-            "engine": "FREQTRADE",
-            "mode": "DRY_RUN",
-            "open_trades": 0,
-            "closed_trades": 0,
-            "realized_net_pnl": 0.0,
-        }
+        return "NOT_READY", set(), [], "database not created yet"
 
-    connection = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2.0)
+    connection = sqlite3.connect(
+        f"file:{db_file}?mode=ro",
+        uri=True,
+        timeout=2.0,
+    )
     connection.row_factory = sqlite3.Row
     try:
         tables = {
@@ -67,170 +81,232 @@ def freqtrade_dry_run_status(
             ).fetchall()
         }
         if "trades" not in tables:
-            return {
-                "status": "NOT_READY",
-                "engine": "FREQTRADE",
-                "mode": "DRY_RUN",
-                "open_trades": 0,
-                "closed_trades": 0,
-                "realized_net_pnl": 0.0,
-            }
+            return "NOT_READY", set(), [], "trades table not created yet"
+
         columns = _columns(connection, "trades")
-        if not {"is_open", "enter_tag"}.issubset(columns):
-            return {
-                "status": "SCHEMA_UNAVAILABLE",
-                "engine": "FREQTRADE",
-                "mode": "DRY_RUN",
-                "open_trades": 0,
-                "closed_trades": 0,
-                "realized_net_pnl": 0.0,
-            }
+        required = {"id", "pair", "is_open", "enter_tag"}
+        if not required.issubset(columns):
+            return (
+                "SCHEMA_UNAVAILABLE",
+                columns,
+                [],
+                f"missing columns: {sorted(required - columns)}",
+            )
+
+        where = (
+            "is_open = 0 AND enter_tag LIKE 'OHM:%'"
+            if closed_only
+            else "enter_tag LIKE 'OHM:%'"
+        )
         rows = connection.execute(
-            "SELECT * FROM trades WHERE enter_tag LIKE 'OHM:%'"
+            f"SELECT * FROM trades WHERE {where} ORDER BY id"
         ).fetchall()
+        return "OK", columns, rows, None
     finally:
         connection.close()
 
-    open_rows = [row for row in rows if int(row["is_open"] or 0) == 1]
-    closed_rows = [row for row in rows if int(row["is_open"] or 0) == 0]
-    pnl = 0.0
-    if "close_profit_abs" in columns:
-        for row in closed_rows:
-            try:
-                pnl += float(row["close_profit_abs"] or 0.0)
-            except (TypeError, ValueError):
-                continue
-    pairs = sorted(
-        {
+
+def freqtrade_dry_run_status(
+    *,
+    db_file: Path | None = None,
+) -> dict[str, Any]:
+    open_count = 0
+    closed_count = 0
+    open_pairs: set[str] = set()
+    pnl_by_currency: dict[str, float] = {}
+    per_worker: dict[str, dict[str, Any]] = {}
+
+    for path in _selected_db_files(db_file):
+        quote = _quote_for_db(path)
+        status, columns, rows, reason = _read_trade_rows(
+            path,
+            closed_only=False,
+        )
+        if status != "OK":
+            per_worker[quote] = {
+                "status": status,
+                "reason": reason,
+                "open_trades": 0,
+                "closed_trades": 0,
+                "realized_net_pnl": 0.0,
+            }
+            continue
+
+        open_rows = [row for row in rows if int(row["is_open"] or 0) == 1]
+        closed_rows = [row for row in rows if int(row["is_open"] or 0) == 0]
+        pnl = 0.0
+        if "close_profit_abs" in columns:
+            for row in closed_rows:
+                try:
+                    pnl += float(row["close_profit_abs"] or 0.0)
+                except (TypeError, ValueError):
+                    continue
+
+        worker_pairs = {
             str(row["pair"])
             for row in open_rows
             if "pair" in columns and row["pair"]
         }
+        open_pairs.update(worker_pairs)
+        open_count += len(open_rows)
+        closed_count += len(closed_rows)
+        pnl_by_currency[quote] = round(pnl, 8)
+        per_worker[quote] = {
+            "status": "OK",
+            "open_trades": len(open_rows),
+            "closed_trades": len(closed_rows),
+            "realized_net_pnl": round(pnl, 8),
+            "open_pairs": sorted(worker_pairs),
+        }
+
+    statuses = {row["status"] for row in per_worker.values()}
+    overall = (
+        "OK"
+        if statuses and statuses == {"OK"}
+        else "PARTIAL"
+        if "OK" in statuses
+        else "NOT_READY"
     )
+    total_numeric = round(sum(pnl_by_currency.values()), 8)
     return {
-        "status": "OK",
+        "status": overall,
         "engine": "FREQTRADE",
         "mode": "DRY_RUN",
-        "open_trades": len(open_rows),
-        "closed_trades": len(closed_rows),
-        "realized_net_pnl": round(pnl, 8),
-        "open_pairs": pairs,
+        "open_trades": open_count,
+        "closed_trades": closed_count,
+        # Retained for single-worker tests/backward compatibility. Cross-quote
+        # reporting should use realized_pnl_by_currency instead of assuming
+        # exact USD/USDT parity.
+        "realized_net_pnl": total_numeric,
+        "realized_pnl_by_currency": pnl_by_currency,
+        "open_pairs": sorted(open_pairs),
+        "workers": per_worker,
         "exchange_write_authority": False,
     }
 
 
 def ingest_freqtrade_dry_run(
     *,
-    db_file: Path = DB_FILE,
+    db_file: Path | None = None,
     state_file: Path = STATE_FILE,
     journey_state_file: Path = JOURNEY_STATE_FILE,
     journey_event_file: Path = JOURNEY_EVENT_FILE,
 ) -> dict[str, Any]:
-    if not db_file.exists():
-        return {
-            "status": "NOT_READY",
-            "closed_rows_seen": 0,
-            "outcomes_added": 0,
-            "reason": "Freqtrade dry-run database not created yet",
-        }
-
     state_lock = state_file.parent / f".{state_file.name}.lock"
     with registry_lock(state_lock):
         state = load_json(state_file)
-        processed = {int(value) for value in (state.get("processed_trade_ids") or [])}
-
-    connection = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2.0)
-    connection.row_factory = sqlite3.Row
-    try:
-        tables = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+        processed = {
+            str(value)
+            for value in (state.get("processed_trade_keys") or [])
         }
-        if "trades" not in tables:
-            return {
-                "status": "NOT_READY",
-                "closed_rows_seen": 0,
-                "outcomes_added": 0,
-                "reason": "Freqtrade trades table not created yet",
-            }
-        columns = _columns(connection, "trades")
-        required = {"id", "pair", "is_open", "enter_tag"}
-        if not required.issubset(columns):
-            return {
-                "status": "SCHEMA_UNAVAILABLE",
-                "closed_rows_seen": 0,
-                "outcomes_added": 0,
-                "reason": f"missing columns: {sorted(required - columns)}",
-            }
-        rows = connection.execute(
-            "SELECT * FROM trades WHERE is_open = 0 AND enter_tag LIKE 'OHM:%' ORDER BY id"
-        ).fetchall()
-    finally:
-        connection.close()
 
     added = 0
-    new_ids: list[int] = []
-    for row in rows:
-        trade_id = int(row["id"])
-        if trade_id in processed:
-            continue
-        signal_id = str(row["enter_tag"] or "")
-        pair = str(row["pair"] or "")
-        symbol = pair.replace("/", "").replace(":", "").upper()
-        close_time = _parse_time(
-            _value(row, columns, "close_date")
-            or _value(row, columns, "close_date_utc")
-        )
-        payload = {
-            "engine": "FREQTRADE",
-            "mode": "DRY_RUN",
-            "trade_id": trade_id,
-            "pair": pair,
-            "open_date": _value(row, columns, "open_date"),
-            "close_date": _value(row, columns, "close_date"),
-            "open_rate": _value(row, columns, "open_rate"),
-            "open_rate_requested": _value(row, columns, "open_rate_requested"),
-            "close_rate": _value(row, columns, "close_rate"),
-            "close_rate_requested": _value(row, columns, "close_rate_requested"),
-            "stake_amount": _value(row, columns, "stake_amount"),
-            "amount": _value(row, columns, "amount"),
-            "fee_open": _value(row, columns, "fee_open"),
-            "fee_close": _value(row, columns, "fee_close"),
-            "close_profit_ratio": _value(row, columns, "close_profit"),
-            "net_pnl": _value(row, columns, "close_profit_abs"),
-            "exit_reason": _value(row, columns, "exit_reason"),
-            "strategy": _value(row, columns, "strategy"),
-            "timeframe": _value(row, columns, "timeframe"),
-            "dry_run": True,
-            "exchange_write_authority": False,
-        }
-        journey_id = record_paper_outcome(
-            signal_id=signal_id,
-            symbol=symbol,
-            observed_at=close_time,
-            payload=payload,
-            state_file=journey_state_file,
-            event_file=journey_event_file,
-        )
-        if journey_id is not None:
-            added += 1
-        new_ids.append(trade_id)
+    rows_seen = 0
+    new_keys: list[str] = []
+    worker_status: dict[str, str] = {}
+    ready_workers = 0
 
-    if new_ids:
+    for path in _selected_db_files(db_file):
+        quote = _quote_for_db(path)
+        status, columns, rows, _reason = _read_trade_rows(
+            path,
+            closed_only=True,
+        )
+        worker_status[quote] = status
+        if status != "OK":
+            continue
+        ready_workers += 1
+        rows_seen += len(rows)
+
+        for row in rows:
+            trade_id = int(row["id"])
+            trade_key = f"{quote}:{trade_id}"
+            if trade_key in processed:
+                continue
+
+            signal_id = str(row["enter_tag"] or "")
+            pair = str(row["pair"] or "")
+            symbol = pair.replace("/", "").replace(":", "").upper()
+            close_time = _parse_time(
+                _value(row, columns, "close_date")
+                or _value(row, columns, "close_date_utc")
+            )
+            payload = {
+                "engine": "FREQTRADE",
+                "mode": "DRY_RUN",
+                "worker_quote": quote,
+                "trade_id": trade_id,
+                "trade_key": trade_key,
+                "pair": pair,
+                "pnl_currency": quote,
+                "open_date": _value(row, columns, "open_date"),
+                "close_date": _value(row, columns, "close_date"),
+                "open_rate": _value(row, columns, "open_rate"),
+                "open_rate_requested": _value(
+                    row,
+                    columns,
+                    "open_rate_requested",
+                ),
+                "close_rate": _value(row, columns, "close_rate"),
+                "close_rate_requested": _value(
+                    row,
+                    columns,
+                    "close_rate_requested",
+                ),
+                "stake_amount": _value(row, columns, "stake_amount"),
+                "amount": _value(row, columns, "amount"),
+                "fee_open": _value(row, columns, "fee_open"),
+                "fee_close": _value(row, columns, "fee_close"),
+                "close_profit_ratio": _value(
+                    row,
+                    columns,
+                    "close_profit",
+                ),
+                "net_pnl": _value(row, columns, "close_profit_abs"),
+                "exit_reason": _value(row, columns, "exit_reason"),
+                "strategy": _value(row, columns, "strategy"),
+                "timeframe": _value(row, columns, "timeframe"),
+                "dry_run": True,
+                "exchange_write_authority": False,
+            }
+            journey_id = record_paper_outcome(
+                signal_id=signal_id,
+                symbol=symbol,
+                observed_at=close_time,
+                payload=payload,
+                state_file=journey_state_file,
+                event_file=journey_event_file,
+            )
+            if journey_id is not None:
+                added += 1
+            new_keys.append(trade_key)
+
+    if new_keys:
         with registry_lock(state_lock):
             latest = load_json(state_file)
-            existing = [int(value) for value in (latest.get("processed_trade_ids") or [])]
-            merged = list(dict.fromkeys(existing + new_ids))[-5000:]
-            latest["processed_trade_ids"] = merged
+            existing = [
+                str(value)
+                for value in (latest.get("processed_trade_keys") or [])
+            ]
+            merged = list(dict.fromkeys(existing + new_keys))[-5000:]
+            latest["processed_trade_keys"] = merged
             latest["last_ingested_at"] = datetime.now(timezone.utc).isoformat()
             latest["population"] = "FREQTRADE_DRY_RUN_V1"
             save_json_atomic(state_file, latest)
 
+    total_workers = len(_selected_db_files(db_file))
+    status = (
+        "OK"
+        if ready_workers == total_workers
+        else "PARTIAL"
+        if ready_workers
+        else "NOT_READY"
+    )
     return {
-        "status": "OK",
-        "closed_rows_seen": len(rows),
+        "status": status,
+        "closed_rows_seen": rows_seen,
         "outcomes_added": added,
-        "new_trade_ids": len(new_ids),
+        "new_trade_ids": len(new_keys),
+        "new_trade_keys": len(new_keys),
+        "workers": worker_status,
     }
