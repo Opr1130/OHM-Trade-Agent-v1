@@ -18,6 +18,34 @@ from app.services.registry_io import registry_lock
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
 
 
+def _run_paper_monitor_fail_open() -> None:
+    """Run paper simulation only after live protection has completed."""
+    try:
+        from app.services.paper_trade_engine import PaperTradeConfig
+        from app.services.paper_trade_monitor import run_paper_trade_monitor
+
+        settings = get_settings()
+        summary = run_paper_trade_monitor(PaperTradeConfig.from_settings(settings))
+    except Exception as exc:
+        print(
+            "OHM Paper Trade v1 unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+
+    print("OHM Paper Trade v1")
+    print("Control enabled:", summary.control_enabled)
+    print("Tracked:", summary.tracked)
+    print("Checked:", summary.checked)
+    print("Opened:", summary.opened)
+    print("TP1 hits:", summary.tp1_hits)
+    print("Closed:", summary.closed)
+    print("Cancelled:", summary.cancelled)
+    print("Failures:", len(summary.failures))
+    for failure in summary.failures[:3]:
+        print("PAPER FAILURE:", failure)
+
+
 def _run_cycle_once() -> None:
     # Reconcile the exchange first so stale OHM lifecycle state cannot drive
     # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
@@ -133,6 +161,10 @@ def _run_cycle_once() -> None:
         print("Pending setup monitor skipped during quiet hours.")
     else:
         monitor_pending_main()
+
+    # Paper simulation is lower priority than every real lifecycle workflow.
+    # It is isolated, public-market-only, and fail-open.
+    _run_paper_monitor_fail_open()
 
     # Broad discovery is state/capacity/time gated. This is the only branch
     # that can reach the paid Chief analysis path.
