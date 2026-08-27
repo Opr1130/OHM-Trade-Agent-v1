@@ -19,6 +19,7 @@ from app.services.full_market_observation import (
     process_full_market_observations,
 )
 from app.services.full_market_transition_learning import build_full_market_transition_summary
+from app.services.intelligence_journey import record_watch_observation
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
 from app.services.signal_scoring import (
@@ -452,6 +453,71 @@ def main() -> None:
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
                 broad_created += 1
+
+    # Intelligence-journey persistence is deliberately post-alert and
+    # measurement-only. It links early evidence to later qualified signals and
+    # Freqtrade dry-run outcomes without participating in the live decision.
+    try:
+        if full_market is not None and getattr(full_market, "signal_quality_enabled", False):
+            learning_config = SignalQualityConfig.from_settings(settings)
+            learning_candidates = main_feed_candidates(
+                full_market.signal_quality_candidates,
+                config=learning_config,
+            )
+            for candidate in learning_candidates:
+                record_watch_observation(
+                    symbol=candidate.symbol,
+                    observed_at=decision_at,
+                    watch_type="EARLY_WATCH",
+                    payload={
+                        "stage": candidate.stage,
+                        "pattern": candidate.pattern,
+                        "tradeability_score": candidate.tradeability_score,
+                        "pattern_strength_score": candidate.pattern_strength_score,
+                        "volume_acceleration_score": candidate.volume_acceleration_score,
+                        "persistence_score": candidate.persistence_score,
+                        "relative_strength_score": candidate.relative_strength_score,
+                        "explosion_potential_score": candidate.explosion_potential_score,
+                        "opportunity_score": candidate.opportunity_score,
+                        "exhaustion_penalty": candidate.exhaustion_penalty,
+                        "exhaustion_band": candidate.exhaustion_band,
+                        "liquidity_24h_usd_approx": candidate.liquidity_24h_usd_approx,
+                        "persistence_scans": candidate.persistence_scans,
+                        "relative_strength_percentile": candidate.relative_strength_percentile,
+                        "reasons": list(candidate.reasons),
+                        "telegram_alert_eligible": True,
+                    },
+                    delivery_action="POST_ALERT_OBSERVATION",
+                    delivered=False,
+                )
+        for signal in signals:
+            if not signal.alert_eligible:
+                continue
+            record_watch_observation(
+                symbol=signal.symbol,
+                observed_at=decision_at,
+                watch_type="EARLY_MOVER",
+                payload={
+                    "stage": signal.stage,
+                    "pattern": "MOVEMENT_DISCOVERY",
+                    "discovery_score": signal.discovery_score,
+                    "continuation_confidence": signal.continuation_confidence,
+                    "entry_quality": signal.entry_quality,
+                    "entry_recommendation": signal.entry_recommendation,
+                    "momentum_state": signal.momentum_state,
+                    "momentum_1h_pct": signal.momentum_1h_pct,
+                    "momentum_6h_pct": signal.momentum_6h_pct,
+                    "momentum_24h_pct": signal.momentum_24h_pct,
+                    "relative_volume": signal.relative_volume,
+                    "liquidity_24h_usd_approx": signal.liquidity_24h_usd_approx,
+                    "extended_move": signal.extended_move,
+                    "telegram_alert_eligible": True,
+                },
+                delivery_action="POST_ALERT_OBSERVATION",
+                delivered=False,
+            )
+    except Exception as exc:
+        print("Intelligence journey watch capture: fail-soft", type(exc).__name__)
 
     # External OHLC work is deliberately deferred until every alert-critical
     # operation above has completed. It still uses the immutable decision_at.
