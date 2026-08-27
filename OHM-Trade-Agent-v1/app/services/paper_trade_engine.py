@@ -163,8 +163,12 @@ def enroll_paper_opportunity(
     summary = account_summary(config.starting_equity, state_file=state_file)
     if summary.pending_entries + summary.open_positions >= config.max_positions:
         return PaperEnrollmentResult("CAPACITY", "paper position capacity reached")
-    if summary.available_capital + 1e-9 < config.capital_per_trade:
-        return PaperEnrollmentResult("CAPITAL", "paper cash reserve is insufficient")
+    required_cash = config.capital_per_trade * (1.0 + config.fee_rate)
+    if summary.available_capital + 1e-9 < required_cash:
+        return PaperEnrollmentResult(
+            "CAPITAL",
+            "paper cash reserve is insufficient for capital plus entry fee",
+        )
 
     reference, ask = _decision_prices(snapshot)
     if reference is None:
@@ -250,6 +254,7 @@ def enroll_paper_opportunity(
         pending_ttl_hours=int(config.pending_ttl_hours),
         max_hold_hours=int(config.max_hold_hours),
         reference_price=float(reference),
+        candle_interval_minutes=int(config.candle_interval_minutes),
         reference_ask=float(ask) if ask is not None else None,
         entry_price=entry_price,
         entry_fee=entry_fee,
