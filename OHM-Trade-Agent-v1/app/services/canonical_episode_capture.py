@@ -49,6 +49,30 @@ def _finite(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _first_finite(*values: Any) -> float | None:
+    for value in values:
+        number = _finite(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _decision_reference_price(observation: Any, scan_source: str) -> float | None:
+    """Return the price that was actually observable at decision time.
+
+    Native opportunity scans retain the completed-candle close in last_price
+    and the contemporaneous Kraken ticker in ticker_last. Outcome attribution
+    must anchor to the latter. Other producers preserve their existing
+    last_price semantics.
+    """
+    if str(scan_source or "").upper() == "LIVE_OPPORTUNITY_SCAN":
+        return _first_finite(
+            getattr(observation, "ticker_last", None),
+            getattr(observation, "last_price", None),
+        )
+    return _finite(getattr(observation, "last_price", None))
+
+
 def _hash(prefix: str, value: str, *, length: int = 32) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
     return f"{prefix}:{digest}"
@@ -101,6 +125,7 @@ def _build_snapshot(
     cohort_size: int,
     candidate_index: Mapping[str, tuple[int, Any]],
     signal_quality_enabled: bool,
+    scan_source: str,
 ) -> dict[str, Any]:
     symbol = str(getattr(observation, "symbol", "") or "").upper()
     if not symbol:
@@ -117,6 +142,7 @@ def _build_snapshot(
         length=32,
     )
     ranked = candidate_index.get(symbol)
+    decision_reference_price = _decision_reference_price(observation, scan_source)
 
     if ranked is None:
         candidate_rank = None
@@ -144,7 +170,7 @@ def _build_snapshot(
             decision_at=decision,
             candidate_rank=candidate_rank,
             reference_prices={
-                symbol: getattr(observation, "last_price", None),
+                symbol: decision_reference_price,
             },
         )
         candidate_payload = candidate_snapshot.as_dict()
@@ -181,24 +207,35 @@ def _build_snapshot(
         "decision_at_utc": decision.isoformat(),
         "symbol": symbol,
         "base_asset": str(
-            getattr(observation, "base_asset", "") or ""
+            getattr(observation, "base_asset", "")
+            or getattr(observation, "underlying_asset", "")
+            or ""
         ).upper(),
         "kraken_public_symbol": str(
             getattr(observation, "kraken_public_symbol", "") or ""
         ),
-        "reference_price": _finite(getattr(observation, "last_price", None)),
-        "last_price": _finite(getattr(observation, "last_price", None)),
+        "reference_price": decision_reference_price,
+        "last_price": decision_reference_price,
         "volume_24h": _finite(getattr(observation, "volume_24h", None)),
-        "liquidity_24h_usd_approx": _finite(
-            getattr(observation, "notional_24h_usd_approx", None)
+        "liquidity_24h_usd_approx": _first_finite(
+            getattr(observation, "notional_24h_usd_approx", None),
+            getattr(observation, "combined_24h_liquidity_usd", None),
+            getattr(observation, "primary_24h_liquidity_usd", None),
         ),
-        "high_24h": _finite(getattr(observation, "high_24h", None)),
-        "low_24h": _finite(getattr(observation, "low_24h", None)),
+        "high_24h": _first_finite(
+            getattr(observation, "high_24h", None),
+            getattr(observation, "recent_24h_high", None),
+        ),
+        "low_24h": _first_finite(
+            getattr(observation, "low_24h", None),
+            getattr(observation, "recent_24h_low", None),
+        ),
         "lift_from_24h_low_pct": _finite(
             getattr(observation, "lift_from_24h_low_pct", None)
         ),
-        "distance_from_24h_high_pct": _finite(
-            getattr(observation, "distance_from_24h_high_pct", None)
+        "distance_from_24h_high_pct": _first_finite(
+            getattr(observation, "distance_from_24h_high_pct", None),
+            getattr(observation, "distance_to_24h_high_pct", None),
         ),
         "signal_quality_enabled": bool(signal_quality_enabled),
         "decision_status": decision_status,
@@ -220,7 +257,7 @@ def _build_snapshot(
         "reasons": reasons,
         "components": components,
         "source_exchange": "KRAKEN_SPOT",
-        "scan_source": "LIVE_FULL_MARKET",
+        "scan_source": str(scan_source or "LIVE_FULL_MARKET"),
         "measurement_only": True,
         "advisory_only": True,
         "affects_ranking": False,
@@ -239,6 +276,7 @@ def build_canonical_episode_snapshots(
     candidates: Iterable[Any] = (),
     decision_at: datetime,
     signal_quality_enabled: bool,
+    scan_source: str = "LIVE_FULL_MARKET",
 ) -> list[dict[str, Any]]:
     """Build one immutable record for every valid observed pair."""
     decision = _require_utc(decision_at)
@@ -257,6 +295,7 @@ def build_canonical_episode_snapshots(
             cohort_size=cohort_size,
             candidate_index=candidate_index,
             signal_quality_enabled=signal_quality_enabled,
+            scan_source=scan_source,
         )
         for cohort_position, observation in enumerate(
             sorted(
@@ -276,6 +315,7 @@ def append_canonical_episode_snapshots(
     candidates: Iterable[Any] = (),
     decision_at: datetime,
     signal_quality_enabled: bool,
+    scan_source: str = "LIVE_FULL_MARKET",
     path: Path | None = None,
     dead_letter_path: Path | None = None,
     enabled: bool | None = None,
@@ -346,6 +386,7 @@ def append_canonical_episode_snapshots(
                             cohort_size=cohort_size,
                             candidate_index=candidate_index,
                             signal_quality_enabled=signal_quality_enabled,
+                            scan_source=scan_source,
                         )
                         handle.write(
                             json.dumps(row, sort_keys=True, allow_nan=False)
