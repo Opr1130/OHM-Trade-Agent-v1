@@ -170,11 +170,14 @@ def process_closed_candle(
         if signal is None:
             raise ValueError("paper signal time is invalid")
         expiry = signal + timedelta(hours=trade.pending_ttl_hours)
-        if start >= expiry:
+        if start >= expiry or end > expiry:
+            # Never attribute an entry from a candle that is wholly or partly
+            # after the pending-order lifetime. Intrabar timing cannot prove
+            # that a touch occurred before expiry.
             cancel_pending(
                 trade,
                 reason="PENDING_TTL_EXPIRED",
-                at=start,
+                at=min(max(expiry, start), end),
                 observed_price=open_price,
             )
             return "CANCELLED"
@@ -208,6 +211,13 @@ def process_closed_candle(
     if trade.status != "OPEN":
         return "NO_CHANGE"
 
+    opened = parse_utc(trade.opened_at)
+    if opened is None:
+        raise ValueError("open paper trade has invalid opened_at")
+    deadline = opened + timedelta(hours=trade.max_hold_hours)
+    straddles_deadline = start < deadline < end
+    expired_before_bar = start >= deadline
+
     stop_hit = low <= trade.stop_price
     if stop_hit:
         stop_reference = min(trade.stop_price, open_price)
@@ -216,6 +226,19 @@ def process_closed_candle(
             reference_price=stop_reference,
             reason="STOP",
             at=end,
+            market_exit=True,
+        )
+        return "CLOSED"
+
+    if expired_before_bar or straddles_deadline:
+        # If the deadline shares a candle with a stop, the adverse stop above
+        # already wins. Otherwise close at the bar open and never credit a
+        # target that may have occurred after the allowed holding window.
+        close_remaining(
+            trade,
+            reference_price=open_price,
+            reason="TIME_EXIT",
+            at=start if expired_before_bar else deadline,
             market_exit=True,
         )
         return "CLOSED"
@@ -241,19 +264,6 @@ def process_closed_candle(
             reason="TARGET_2",
             at=end,
             market_exit=False,
-        )
-        return "CLOSED"
-
-    opened = parse_utc(trade.opened_at)
-    if opened is None:
-        raise ValueError("open paper trade has invalid opened_at")
-    if end >= opened + timedelta(hours=trade.max_hold_hours):
-        close_remaining(
-            trade,
-            reference_price=close,
-            reason="TIME_EXIT",
-            at=end,
-            market_exit=True,
         )
         return "CLOSED"
 
