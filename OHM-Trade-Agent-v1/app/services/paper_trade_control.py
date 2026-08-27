@@ -36,7 +36,14 @@ def _lock_file(path: Path) -> Path:
 
 
 def get_paper_trade_control(path: Path = CONTROL_FILE) -> PaperTradeControl:
-    """Read operator state; any unreadable/corrupt state fails safe to OFF."""
+    """Read operator state; missing/unreadable state never creates exposure."""
+    if not path.exists():
+        return PaperTradeControl(
+            enabled=False,
+            updated_at=None,
+            updated_by="SYSTEM_DEFAULT",
+            status="DEFAULT_OFF",
+        )
     try:
         with registry_lock(_lock_file(path)):
             payload = load_json(path)
