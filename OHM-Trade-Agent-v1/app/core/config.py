@@ -193,9 +193,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_paper_trade_config(self) -> "Settings":
-        if self.paper_trade_capital_per_trade > self.paper_trade_starting_equity:
+        required_cash = self.paper_trade_capital_per_trade * (
+            1.0 + self.paper_trade_fee_rate
+        )
+        if required_cash > self.paper_trade_starting_equity:
             raise ValueError(
-                "PAPER_TRADE_CAPITAL_PER_TRADE cannot exceed PAPER_TRADE_STARTING_EQUITY"
+                "PAPER_TRADE capital plus entry fee cannot exceed "
+                "PAPER_TRADE_STARTING_EQUITY"
             )
         if self.paper_trade_candle_interval_minutes not in {
             1, 5, 15, 30, 60, 240, 1440, 10080, 21600
