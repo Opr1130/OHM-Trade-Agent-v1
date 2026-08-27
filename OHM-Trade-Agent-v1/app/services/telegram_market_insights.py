@@ -10,6 +10,7 @@ from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
 from app.scanner.market_scanner import analyze_symbol
 from app.scanner.models import MarketSnapshot
 from app.scanner.universe import _is_excluded_market
+from app.services.asset_display_identity import display_market_label
 from app.services.explosion_state import build_explosion_state_vector
 from app.services.native_flow_evidence import NativeFlowShadowResult, evaluate_native_flow_shadow
 
@@ -356,7 +357,7 @@ def format_market_insight(insight: MarketInsight, *, verbose: bool = False, watc
     if insight.flow_bias != "UNAVAILABLE":
         flow_text += f" {insight.flow_strength}/10"
     lines = [
-        f"{prefix} — {insight.pair}",
+        f"{prefix} — {display_market_label(insight.pair, base_asset=insight.symbol, pair=insight.pair)}",
         f"State: {insight.state}",
         f"Price: {_fmt_price(insight.current_price)}",
         (
