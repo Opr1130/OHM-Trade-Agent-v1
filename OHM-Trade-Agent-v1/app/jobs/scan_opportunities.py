@@ -158,6 +158,130 @@ def _maybe_enroll_paper_opportunities(
     return enrolled, failures
 
 
+def _publish_freqtrade_paper_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Publish post-alert qualified LONG intents to authoritative Freqtrade dry-run."""
+    try:
+        from app.services.freqtrade_signal_bridge import (
+            build_signal_id,
+            publish_qualified_long,
+            to_freqtrade_pair,
+        )
+        from app.services.intelligence_journey import link_qualified_signal
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        if not paper_trade_enabled():
+            return 0, 0
+        cohort_id = canonical_cohort_id(scan.snapshots, decision_at=decision_at)
+    except Exception as exc:
+        print(
+            "Freqtrade paper bridge unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, 1
+
+    published = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(snapshot.trade_direction or "LONG").upper()
+        if direction != "LONG":
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: skipped "
+                "(v1 authoritative paper engine is spot LONG only)"
+            )
+            continue
+        try:
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            base_asset = str(
+                snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or ("USDT" if str(snapshot.symbol).upper().endswith("USDT") else "USD")
+            ).upper()
+            pair = to_freqtrade_pair(base_asset, quote_asset)
+            signal_id = build_signal_id(
+                episode_id=episode_id,
+                pair=pair,
+                decision_at=decision_at,
+            )
+            journey_id = link_qualified_signal(
+                symbol=snapshot.symbol,
+                signal_id=signal_id,
+                observed_at=decision_at,
+                payload={
+                    "direction": direction,
+                    "profit_rank": ranked.rank,
+                    "profit_rank_score": ranked.profit_ranking.total_score,
+                    "confidence": int(alert.get("confidence") or 0),
+                    "entry_style": plan.entry_style,
+                    "valid_now": bool(plan.valid_now),
+                    "entry_low": plan.entry_low,
+                    "entry_high": plan.entry_high,
+                    "chase_limit": plan.chase_limit,
+                    "stop_price": plan.stop_price,
+                    "target_1": plan.target_1,
+                    "target_2": plan.target_2,
+                    "technical_score": alert.get("technical_score"),
+                    "market_regime": alert.get("market_regime"),
+                    "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
+                    "target_attainability_score": alert.get("target_attainability_score"),
+                },
+            )
+            signal = publish_qualified_long(
+                episode_id=episode_id,
+                cohort_id=cohort_id,
+                journey_id=journey_id,
+                ohm_symbol=snapshot.symbol,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                decision_at=decision_at,
+                valid_now=bool(plan.valid_now),
+                entry_style=plan.entry_style,
+                entry_low=plan.entry_low,
+                entry_high=plan.entry_high,
+                chase_limit=plan.chase_limit,
+                stop_price=plan.stop_price,
+                target_1=plan.target_1,
+                target_2=plan.target_2,
+                stake_amount=float(settings.paper_trade_capital_per_trade),
+                max_hold_hours=int(settings.paper_trade_max_hold_hours),
+                pending_ttl_hours=int(settings.paper_trade_pending_ttl_hours),
+                confidence=int(alert.get("confidence") or 0),
+                profit_rank=ranked.rank,
+                profit_rank_score=float(ranked.profit_ranking.total_score),
+            )
+            published += 1
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: PUBLISHED "
+                f"Signal={signal['signal_id']} Pair={signal['pair']} "
+                f"Journey={journey_id} Entry={signal['entry_price']}"
+            )
+        except Exception as exc:
+            failures += 1
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return published, failures
+
+
 def _target_quality(plan, snapshot):
     if snapshot.trade_direction == "SHORT":
         return evaluate_short_target_attainability(plan, snapshot)
@@ -696,14 +820,22 @@ def main():
     print("Pending setups saved:", pending_saved)
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
-    paper_enrolled, paper_failures = _maybe_enroll_paper_opportunities(
+    freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
         ranked_opportunities,
         scan=scan,
         decision_at=decision_at,
         settings=settings,
     )
-    print("Paper lifecycles enrolled:", paper_enrolled)
-    print("Paper enrollment failures:", paper_failures)
+    shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    print("Authoritative Freqtrade paper signals published:", freqtrade_published)
+    print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
+    print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
+    print("Shadow simulator failures:", shadow_failures)
     _capture_native_scan_cohort(scan, decision_at=decision_at)
 
 
