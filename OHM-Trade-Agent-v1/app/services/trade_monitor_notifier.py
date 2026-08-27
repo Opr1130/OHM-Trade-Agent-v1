@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
+from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import one_line_reason
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_notifier import send_telegram_message
@@ -45,7 +46,7 @@ def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> st
     downside = _stop_downside_pct(trade, float(result.current_price))
     reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM TRADE — {trade.symbol}\n"
+        f"{icon} OHM TRADE — {display_market_label(trade.symbol)}\n"
         f"P/L: {float(pnl_pct):+.2f}%\n"
         f"Risk: {trade.risk_level.upper()}\n"
         f"Downside to stop: {downside:.1f}%\n"
