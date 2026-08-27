@@ -276,3 +276,107 @@ def test_same_candle_tp1_tp2_writes_one_terminal_outcome_event(tmp_path):
     assert terminal["episode_id"] == "EP:terminal"
     assert terminal["outcome"] == "WIN"
     assert terminal["net_pnl"] > 0
+
+
+
+def test_repeated_monitor_pass_does_not_double_book_terminal_outcome(tmp_path):
+    state = tmp_path / "state.json"
+    events = tmp_path / "events.jsonl"
+    control = tmp_path / "control.json"
+    enroll("SOLUSD", "EP:idempotent", pending=False, state=state, events=events)
+    set_paper_trade_enabled(True, path=control, now=SIGNAL_AT)
+
+    terminal_candle = SimpleNamespace(
+        timestamp=int(datetime(2026, 8, 27, 5, 15, tzinfo=timezone.utc).timestamp()),
+        open=100.0,
+        high=111.0,
+        low=99.0,
+        close=110.0,
+    )
+    client = FakeClient(candles={"SOLUSD": [terminal_candle]})
+    first = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 5, 45, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=events,
+        control_file=control,
+    )
+    first_trade = get_lifecycles(state_file=state)[0]
+    first_net = first_trade.net_pnl
+
+    second = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=events,
+        control_file=control,
+    )
+    second_trade = get_lifecycles(state_file=state)[0]
+
+    assert first.closed == 1
+    assert second.tracked == 0
+    assert second.closed == 0
+    assert second_trade.net_pnl == first_net
+
+    rows = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    terminal_events = [
+        row for row in rows
+        if row["event_type"] == "CLOSED_TARGET_2"
+    ]
+    assert len(terminal_events) == 1
+
+
+def test_repeated_monitor_pass_after_tp1_does_not_double_realize_partial_profit(tmp_path):
+    state = tmp_path / "state.json"
+    events = tmp_path / "events.jsonl"
+    control = tmp_path / "control.json"
+    enroll("SOLUSD", "EP:tp1-idempotent", pending=False, state=state, events=events)
+    set_paper_trade_enabled(True, path=control, now=SIGNAL_AT)
+
+    tp1_candle = SimpleNamespace(
+        timestamp=int(datetime(2026, 8, 27, 5, 15, tzinfo=timezone.utc).timestamp()),
+        open=100.0,
+        high=106.0,
+        low=99.0,
+        close=104.0,
+    )
+    client = FakeClient(candles={"SOLUSD": [tp1_candle]})
+    first = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 5, 45, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=events,
+        control_file=control,
+    )
+    after_first = get_lifecycles(state_file=state)[0]
+    gross_after_first = after_first.realized_gross_pnl
+    remaining_after_first = after_first.quantity_remaining
+
+    second = run_paper_trade_monitor(
+        config(),
+        client=client,
+        now=datetime(2026, 8, 27, 6, 0, tzinfo=timezone.utc),
+        state_file=state,
+        event_file=events,
+        control_file=control,
+    )
+    after_second = get_lifecycles(state_file=state)[0]
+
+    assert first.tp1_hits == 1
+    assert second.tp1_hits == 0
+    assert after_second.realized_gross_pnl == gross_after_first
+    assert after_second.quantity_remaining == remaining_after_first
+
+    rows = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert sum(row["event_type"] == "TARGET_1" for row in rows) == 1
