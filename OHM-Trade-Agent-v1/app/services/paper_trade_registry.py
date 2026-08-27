@@ -245,11 +245,11 @@ def account_summary(
         float(trade.capital)
         + (
             float(trade.fees_paid)
-            if trade.status == "OPEN"
+            if trade.status in {"OPEN", "UNRESOLVED"}
             else float(trade.capital) * float(trade.fee_rate)
         )
         for trade in rows
-        if trade.status in NONTERMINAL_STATUSES
+        if trade.status in NONTERMINAL_STATUSES or trade.status == "UNRESOLVED"
     )
     closed_equity = float(starting_equity) + realized
     return PaperAccountSummary(
