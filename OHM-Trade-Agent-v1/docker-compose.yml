@@ -1,6 +1,6 @@
 services:
   ohm-freqtrade-paper:
-    image: freqtradeorg/freqtrade:stable
+    image: freqtradeorg/freqtrade:2026.7
     container_name: ohm-freqtrade-paper
     restart: unless-stopped
     mem_limit: 384m
