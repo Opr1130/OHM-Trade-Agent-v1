@@ -93,10 +93,13 @@ def assign_signal_episode_ids(
         active_id: str | None = None
         prior_at: datetime | None = None
         for at, snapshot in rows:
-            suppressed = bool(snapshot.get("suppressed", False)) or str(
-                snapshot.get("stage", "") or ""
-            ).upper() == "SUPPRESSED"
-            if suppressed:
+            stage = str(snapshot.get("stage", "") or "").upper()
+            decision_status = str(
+                snapshot.get("decision_status", "") or ""
+            ).upper()
+            suppressed = bool(snapshot.get("suppressed", False)) or stage == "SUPPRESSED"
+            not_scored = stage == "NOT_SCORED" or decision_status == "NOT_SCORED"
+            if suppressed or not_scored:
                 active_id = None
                 prior_at = at
                 continue
