@@ -177,8 +177,8 @@ def test_early_watch_signal_and_freqtrade_outcome_form_one_learning_journey(tmp_
             "opportunity_score": 72,
             "explosion_potential_score": 76,
         },
-        delivery_action="POST_ALERT_OBSERVATION",
-        delivered=False,
+        delivery_action="CREATED",
+        delivered=True,
         state_file=journey_state,
         event_file=events,
     )
@@ -214,6 +214,8 @@ def test_early_watch_signal_and_freqtrade_outcome_form_one_learning_journey(tmp_
     assert profile["paper_performance"]["win_rate_pct"] == 100.0
     assert profile["paper_performance"]["net_pnl"] == 25.0
     assert profile["paper_performance_with_early_watch"]["count"] == 1
+    assert profile["paper_performance_after_delivered_early_alert"]["count"] == 1
+    assert profile["paper_performance_after_nondelivered_early_detection"]["count"] == 0
 
 
 def test_freqtrade_outcome_ingest_is_idempotent(tmp_path):
@@ -275,13 +277,15 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     ast.parse(strategy_source)
     assert "can_short = False" in strategy_source
     assert "Trade.get_trades_proxy" in strategy_source
+    assert "ohm_stop_gap" in strategy_source
+    assert "current_rate >= target_2" in strategy_source
     assert "exchange_write_authority" not in strategy_source
 
     compose = compose_path.read_text(encoding="utf-8")
     sidecar = compose.split("  ohm-freqtrade-paper:", 1)[1].split(
         "  ohm-trade-agent:", 1
     )[0]
-    assert "freqtradeorg/freqtrade:stable" in sidecar
+    assert "freqtradeorg/freqtrade:2026.7" in sidecar
     assert "env_file:" not in sidecar
     assert "ports:" not in sidecar
     assert "tradesv3.ohm_dry_run.sqlite" in sidecar
