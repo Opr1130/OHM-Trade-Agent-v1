@@ -172,14 +172,15 @@ def run_paper_trade_monitor(
                     dirty = False
                 if trade.tp1_hit and not before_tp1:
                     tp1_hits += 1
-                    _save(
-                        trade,
-                        "TARGET_1",
-                        state_file=state_file,
-                        event_file=event_file,
-                        now=now,
-                    )
-                    dirty = False
+                    if result != "CLOSED":
+                        _save(
+                            trade,
+                            "TARGET_1",
+                            state_file=state_file,
+                            event_file=event_file,
+                            now=now,
+                        )
+                        dirty = False
                 if result == "CLOSED":
                     closed += 1
                     _save(
