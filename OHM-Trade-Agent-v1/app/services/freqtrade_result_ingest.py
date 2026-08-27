@@ -42,6 +42,83 @@ def _value(row: sqlite3.Row, columns: set[str], name: str, default: Any = None) 
     return row[name] if name in columns else default
 
 
+
+def freqtrade_dry_run_status(
+    *,
+    db_file: Path = DB_FILE,
+) -> dict[str, Any]:
+    if not db_file.exists():
+        return {
+            "status": "NOT_READY",
+            "engine": "FREQTRADE",
+            "mode": "DRY_RUN",
+            "open_trades": 0,
+            "closed_trades": 0,
+            "realized_net_pnl": 0.0,
+        }
+
+    connection = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=2.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "trades" not in tables:
+            return {
+                "status": "NOT_READY",
+                "engine": "FREQTRADE",
+                "mode": "DRY_RUN",
+                "open_trades": 0,
+                "closed_trades": 0,
+                "realized_net_pnl": 0.0,
+            }
+        columns = _columns(connection, "trades")
+        if not {"is_open", "enter_tag"}.issubset(columns):
+            return {
+                "status": "SCHEMA_UNAVAILABLE",
+                "engine": "FREQTRADE",
+                "mode": "DRY_RUN",
+                "open_trades": 0,
+                "closed_trades": 0,
+                "realized_net_pnl": 0.0,
+            }
+        rows = connection.execute(
+            "SELECT * FROM trades WHERE enter_tag LIKE 'OHM:%'"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    open_rows = [row for row in rows if int(row["is_open"] or 0) == 1]
+    closed_rows = [row for row in rows if int(row["is_open"] or 0) == 0]
+    pnl = 0.0
+    if "close_profit_abs" in columns:
+        for row in closed_rows:
+            try:
+                pnl += float(row["close_profit_abs"] or 0.0)
+            except (TypeError, ValueError):
+                continue
+    pairs = sorted(
+        {
+            str(row["pair"])
+            for row in open_rows
+            if "pair" in columns and row["pair"]
+        }
+    )
+    return {
+        "status": "OK",
+        "engine": "FREQTRADE",
+        "mode": "DRY_RUN",
+        "open_trades": len(open_rows),
+        "closed_trades": len(closed_rows),
+        "realized_net_pnl": round(pnl, 8),
+        "open_pairs": pairs,
+        "exchange_write_authority": False,
+    }
+
+
 def ingest_freqtrade_dry_run(
     *,
     db_file: Path = DB_FILE,
