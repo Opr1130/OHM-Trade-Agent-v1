@@ -65,6 +65,7 @@ def _maybe_record_phase3b_shadow(full_market, settings, *, decision_at) -> None:
             settings=settings,
             reference_prices=full_market.signal_quality_reference_prices,
             decision_at=decision_at,
+            market_observations=full_market.market_observations,
         )
     except Exception as exc:
         print("Phase 3B shadow telemetry: fail-soft", type(exc).__name__)

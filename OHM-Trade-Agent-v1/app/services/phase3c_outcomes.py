@@ -70,9 +70,11 @@ def assign_signal_episode_ids(
 ) -> dict[str, str]:
     """Map non-suppressed snapshot_id -> deterministic contiguous signal episode.
 
-    An explicit suppressed row ends an active episode. A gap longer than the
-    continuity budget also starts a new one, so a missing scan cannot bridge
-    two setups indefinitely.
+    An explicit suppressed row ends an active signal episode. Canonical Build 2
+    pair-per-scan episode IDs are stored on snapshots separately and do not
+    depend on this signal-run grouping. A gap longer than the continuity budget
+    also starts a new signal episode, so a missing scan cannot bridge two
+    setups indefinitely.
     """
     if continuity_seconds <= 0:
         raise ValueError("continuity_seconds must be > 0")
@@ -91,10 +93,13 @@ def assign_signal_episode_ids(
         active_id: str | None = None
         prior_at: datetime | None = None
         for at, snapshot in rows:
-            suppressed = bool(snapshot.get("suppressed", False)) or str(
-                snapshot.get("stage", "") or ""
-            ).upper() == "SUPPRESSED"
-            if suppressed:
+            stage = str(snapshot.get("stage", "") or "").upper()
+            decision_status = str(
+                snapshot.get("decision_status", "") or ""
+            ).upper()
+            suppressed = bool(snapshot.get("suppressed", False)) or stage == "SUPPRESSED"
+            not_scored = stage == "NOT_SCORED" or decision_status == "NOT_SCORED"
+            if suppressed or not_scored:
                 active_id = None
                 prior_at = at
                 continue
@@ -178,14 +183,20 @@ def build_forward_outcome_labels(
             if timeline is not None and len(timeline) > 0
             else None
         )
+        canonical_episode_id = str(snapshot.get("episode_id", "") or "") or None
+        signal_episode_id = signal_ids.get(snapshot_id)
         payload: dict[str, Any] = {
             "label_schema_version": 1,
             "snapshot_id": snapshot_id,
             "symbol": symbol,
             "reference_at": at.isoformat(),
             "reference_price": reference_price,
-            "episode_id": signal_ids.get(snapshot_id),
-            "signal_episode_id": signal_ids.get(snapshot_id),
+            # Build 2 canonical pair-per-scan identity is authoritative when
+            # present. Legacy candidate snapshots retain their contiguous
+            # signal episode identity for backward-compatible analysis.
+            "episode_id": canonical_episode_id or signal_episode_id,
+            "canonical_episode_id": canonical_episode_id,
+            "signal_episode_id": signal_episode_id,
             "move_episode_id": move_ids.get(snapshot_id),
             "within_major_move_episode": snapshot_id in move_ids,
             "outcome_source": "PROVISIONAL_EVENT_SAMPLED_FULL_MARKET_OBSERVATIONS",
@@ -209,10 +220,16 @@ def build_forward_outcome_labels(
                     "time_to_mae_seconds": None,
                     "max_adverse_excursion_pct": None,
                     "window_complete": False,
+                    "maturation_status": "NO_FORWARD_DATA",
                 }
             )
         else:
             payload.update(outcome.as_dict())
+            payload["maturation_status"] = (
+                "MATURE_24H"
+                if bool(payload.get("window_complete"))
+                else "PARTIAL_FORWARD_WINDOW"
+            )
             # Keep immutable identity from the snapshot as the authoritative
             # reference even though ForwardOutcome repeats these fields.
             payload["reference_at"] = at.isoformat()

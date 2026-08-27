@@ -102,6 +102,11 @@ class FullMarketResult:
     observed_markets: int
     persisted_events: int
     transition_alerts: tuple[MarketTransition, ...]
+    # Build 2 canonical capture source: the exact eligible Kraken spot cohort
+    # already fetched by this scan. Exposing this immutable tuple prevents a
+    # second scanner/network fetch and lets post-alert learning record every
+    # pair considered, including markets that never became ranked candidates.
+    market_observations: tuple[MarketObservation, ...] = ()
     # Signal Quality v1 leaderboard, including suppressed rows with their
     # reasons. Empty unless signal_quality_v1_enabled is set; Phase 1 ships
     # dark and the legacy Broad Watch path is untouched while it is off.
@@ -645,6 +650,7 @@ def process_full_market_observations(
         observed_markets=len(observations),
         persisted_events=persisted,
         transition_alerts=tuple(transitions),
+        market_observations=tuple(observations),
         signal_quality_candidates=candidates,
         signal_quality_enabled=signal_quality_enabled,
         signal_quality_reference_prices=reference_prices,
