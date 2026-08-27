@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import one_line_reason
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.pending_setup_monitor import PendingSetupMonitorResult
@@ -61,7 +62,7 @@ def format_pending_setup_message(
 
     downside = _stop_downside_pct(setup, float(result.current_price))
     return (
-        f"{icon} {title} — {setup.symbol}\n"
+        f"{icon} {title} — {display_market_label(setup.symbol)}\n"
         f"Confidence*: {int(setup.confidence)}%\n"
         f"Risk: {setup.risk_level.upper()}\n"
         f"Downside to stop: {downside:.1f}%\n"
