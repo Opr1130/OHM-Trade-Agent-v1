@@ -15,6 +15,7 @@ from app.services.paper_trade_registry import (
     get_nonterminal_lifecycles,
     save_lifecycle,
 )
+from app.services.registry_io import registry_lock
 from app.services.paper_trade_simulation import (
     cancel_pending,
     first_full_bar_start,
@@ -143,7 +144,7 @@ def _save(
     )
 
 
-def run_paper_trade_monitor(
+def _run_paper_trade_monitor_unlocked(
     config: PaperTradeConfig,
     *,
     client: KrakenClient | None = None,
@@ -341,3 +342,40 @@ def run_paper_trade_monitor(
         unresolved=unresolved,
         failures=tuple(failures),
     )
+
+
+def run_paper_trade_monitor(
+    config: PaperTradeConfig,
+    *,
+    client: KrakenClient | None = None,
+    now: datetime | None = None,
+    state_file: Path = STATE_FILE,
+    event_file: Path = EVENT_FILE,
+    control_file: Path = CONTROL_FILE,
+    lock_timeout_seconds: float = 0.1,
+) -> PaperMonitorSummary:
+    """Run exactly one paper monitor instance for a state directory."""
+    lock_file = state_file.parent / ".paper_monitor.lock"
+    try:
+        with registry_lock(lock_file, timeout=max(0.0, float(lock_timeout_seconds))):
+            return _run_paper_trade_monitor_unlocked(
+                config,
+                client=client,
+                now=now,
+                state_file=state_file,
+                event_file=event_file,
+                control_file=control_file,
+            )
+    except TimeoutError:
+        control = get_paper_trade_control(control_file)
+        return PaperMonitorSummary(
+            control_enabled=control.enabled,
+            tracked=0,
+            checked=0,
+            opened=0,
+            tp1_hits=0,
+            closed=0,
+            cancelled=0,
+            unresolved=0,
+            failures=("PAPER_MONITOR_ALREADY_RUNNING",),
+        )
