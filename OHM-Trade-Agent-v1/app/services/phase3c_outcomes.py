@@ -220,10 +220,16 @@ def build_forward_outcome_labels(
                     "time_to_mae_seconds": None,
                     "max_adverse_excursion_pct": None,
                     "window_complete": False,
+                    "maturation_status": "NO_FORWARD_DATA",
                 }
             )
         else:
             payload.update(outcome.as_dict())
+            payload["maturation_status"] = (
+                "MATURE_24H"
+                if bool(payload.get("window_complete"))
+                else "PARTIAL_FORWARD_WINDOW"
+            )
             # Keep immutable identity from the snapshot as the authoritative
             # reference even though ForwardOutcome repeats these fields.
             payload["reference_at"] = at.isoformat()
