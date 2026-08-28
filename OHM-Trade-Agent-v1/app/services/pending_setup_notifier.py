@@ -13,6 +13,7 @@ from app.services.pending_setup_registry import (
 )
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_delivery import (
+    accepted_delivery_message_id,
     record_telegram_not_eligible,
     record_telegram_suppression,
     send_tracked_telegram,
@@ -197,6 +198,25 @@ def _deliver_terminal_retry(
             trade_id=setup.trade_id,
         )
         return False
+
+    accepted_message_id = accepted_delivery_message_id(
+        identity=identity,
+        event_type=result.status,
+        fingerprint=fingerprint,
+    )
+    if accepted_message_id is not None:
+        _persist_delivered_state(
+            setup=setup,
+            result=result,
+            message_id=accepted_message_id,
+        )
+        record_emitted(
+            identity=identity,
+            event_type=result.status,
+            fingerprint=fingerprint,
+        )
+        _remove_terminal_retry(setup.trade_id)
+        return True
 
     delivery = send_tracked_telegram(
         bot_token=bot_token,
