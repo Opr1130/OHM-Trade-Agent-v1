@@ -202,6 +202,106 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
     assert emitted
 
 
+def test_outbox_retry_reapplies_terminal_truth_after_crash_window(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+
+    # Simulate a crash after the durable outbox write but before terminalization.
+    pending_notifier._queue_terminal_notification(setup, result)
+    lifecycle = {"status": "waiting"}
+    terminalized = []
+
+    def terminalize(trade_id, status):
+        terminalized.append((trade_id, status))
+        lifecycle["status"] = status
+        return True
+
+    monkeypatch.setattr(pending_notifier, "terminalize_pending_setup", terminalize)
+    monkeypatch.setattr(
+        pending_notifier,
+        "get_pending_setup_record",
+        lambda trade_id: {"trade_id": trade_id, "status": lifecycle["status"]},
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "accepted_delivery_message_id",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=501),
+    )
+    monkeypatch.setattr(pending_notifier, "record_emitted", lambda **kwargs: None)
+
+    sent, failed = pending_notifier.retry_terminal_pending_notifications(
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert (sent, failed) == (1, 0)
+    assert terminalized == [("T-1", "invalidated")]
+    assert lifecycle["status"] == "invalidated"
+    assert json.loads(retry_file.read_text()) == {}
+
+
+def test_terminal_outbox_claim_prevents_concurrent_duplicate_workers(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+    pending_notifier._queue_terminal_notification(setup, result)
+
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 8, 28, 14, 0, tzinfo=timezone.utc)
+    first = pending_notifier._claim_terminal_retry("T-1", now=now)
+    second = pending_notifier._claim_terminal_retry("T-1", now=now + timedelta(seconds=1))
+
+    assert first is not None
+    assert second is None
+
+    # Lease expiry makes the claim recoverable after worker death.
+    recovered = pending_notifier._claim_terminal_retry(
+        "T-1",
+        now=now + timedelta(seconds=pending_notifier.TERMINAL_RETRY_LEASE_SECONDS + 1),
+    )
+    assert recovered is not None
+    assert recovered[0] != first[0]
+
+
+def test_requeue_preserves_active_terminal_outbox_lease(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+    pending_notifier._queue_terminal_notification(setup, result)
+    claim = pending_notifier._claim_terminal_retry("T-1")
+    assert claim is not None
+    token, _ = claim
+
+    pending_notifier._queue_terminal_notification(setup, result)
+    row = json.loads(retry_file.read_text())["T-1"]
+    assert row["lease_token"] == token
+
+
 def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch, tmp_path):
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
