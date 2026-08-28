@@ -29,6 +29,9 @@ def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypat
         event_type="READY",
         fingerprint="READY:BREAKOUT",
         symbol="METUSD",
+        journey_id="J-123",
+        signal_id="S-123",
+        trade_id="T-123",
         state_file=state_file,
         event_file=event_file,
     )
@@ -53,6 +56,9 @@ def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypat
         "DELIVERED",
     ]
     assert rows[-1]["message_id"] == 4321
+    assert rows[-1]["journey_id"] == "J-123"
+    assert rows[-1]["signal_id"] == "S-123"
+    assert rows[-1]["trade_id"] == "T-123"
     assert rows[-1]["latency_ms"] >= 0
     assert "super-secret-token" not in event_file.read_text()
 
@@ -126,7 +132,7 @@ def _pending_setup() -> PendingSetup:
     )
 
 
-def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
+def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(monkeypatch, tmp_path):
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
         symbol=setup.symbol,
@@ -135,13 +141,23 @@ def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
         reason="stop breached",
     )
     state_file = tmp_path / "pending_alert_state.json"
+    retry_file = tmp_path / "pending_terminal_outbox.json"
     monkeypatch.setattr(pending_notifier, "STATE_FILE", state_file)
-    monkeypatch.setattr(pending_notifier, "should_emit", lambda **kwargs: True)
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+
+    lifecycle = {"status": "waiting"}
     terminalized = []
+
+    def terminalize(trade_id, status):
+        terminalized.append((trade_id, status))
+        lifecycle["status"] = status
+        return True
+
+    monkeypatch.setattr(pending_notifier, "terminalize_pending_setup", terminalize)
     monkeypatch.setattr(
         pending_notifier,
-        "terminalize_pending_setup",
-        lambda trade_id, status: terminalized.append((trade_id, status)) or True,
+        "get_pending_setup_record",
+        lambda trade_id: {"trade_id": trade_id, "status": lifecycle["status"]},
     )
     monkeypatch.setattr(
         pending_notifier,
@@ -155,8 +171,12 @@ def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
         "token",
         "chat",
     ) is False
-    assert terminalized == []
-    assert not state_file.exists()
+
+    # Market truth advances even though Telegram failed.
+    assert terminalized == [("T-1", "invalidated")]
+    assert lifecycle["status"] == "invalidated"
+    queued = json.loads(retry_file.read_text())
+    assert queued["T-1"]["result"]["status"] == "INVALIDATED"
 
     monkeypatch.setattr(
         pending_notifier,
@@ -170,16 +190,15 @@ def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
         lambda **kwargs: emitted.append(kwargs),
     )
 
-    assert pending_notifier.send_pending_setup_update(
-        setup,
-        result,
-        "token",
-        "chat",
-    ) is True
-    assert terminalized == [("T-1", "invalidated")]
+    sent, failed = pending_notifier.retry_terminal_pending_notifications(
+        bot_token="token",
+        chat_id="chat",
+    )
+    assert (sent, failed) == (1, 0)
+    assert json.loads(retry_file.read_text()) == {}
     saved = json.loads(state_file.read_text())
-    assert saved["VVVUSD"]["status"] == "INVALIDATED"
-    assert saved["VVVUSD"]["message_id"] == 99
+    assert saved["T-1"]["status"] == "INVALIDATED"
+    assert saved["T-1"]["message_id"] == 99
     assert emitted
 
 
