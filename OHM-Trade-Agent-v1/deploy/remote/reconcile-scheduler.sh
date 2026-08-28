@@ -27,14 +27,15 @@ install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 rm -f "$LEGACY_MOVEMENT"
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+current="${tmp}.current"
+trap 'rm -f "$tmp" "$current"' EXIT
 
 # Remove only legacy O'Pip direct/unified scheduler lines from root's personal
 # crontab. Preserve every unrelated root cron entry exactly as-is.
-if crontab -l >"$tmp.current" 2>/dev/null; then
-  grep -v -E 'app\.jobs\.(run_cycle|scan_movers|scan_opportunities)'     "$tmp.current" > "$tmp" || true
+if crontab -l >"$current" 2>/dev/null; then
+  grep -v -E 'app\.jobs\.(run_cycle|scan_movers|scan_opportunities)'     "$current" > "$tmp" || true
   crontab "$tmp"
-  rm -f "$tmp.current"
+  rm -f "$current"
 fi
 
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
