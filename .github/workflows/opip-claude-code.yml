@@ -1,0 +1,138 @@
+name: opip-claude-code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: opip-claude-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    if: >-
+      github.actor == github.repository_owner &&
+      ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python test runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: OHM-Trade-Agent-v1/requirements.txt
+
+      - name: Install application test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r OHM-Trade-Agent-v1/requirements.txt
+
+      - name: Validate Anthropic API credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$ANTHROPIC_API_KEY" || {
+            echo "ANTHROPIC_API_KEY is not configured in GitHub Actions secrets." >&2
+            exit 78
+          }
+
+      - name: Resolve bounded cost profile
+        id: profile
+        env:
+          TRIGGER_BODY: ${{ github.event.comment.body || github.event.review.body || '' }}
+        run: |
+          set -euo pipefail
+          python OHM-Trade-Agent-v1/tools/ai_gateway/profiles.py \
+            --trigger "$TRIGGER_BODY"
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          trigger_phrase: '@claude'
+          claude_args: |
+            --model ${{ steps.profile.outputs.model }}
+            --max-turns ${{ steps.profile.outputs.max_turns }}
+            --max-budget-usd ${{ steps.profile.outputs.max_budget_usd }}
+            --exclude-dynamic-system-prompt-sections
+            --no-session-persistence
+            --allowedTools "Bash(cd OHM-Trade-Agent-v1 && python -m pytest:*),Bash(cd OHM-Trade-Agent-v1 && python -m compileall:*)"
+
+      - name: Capture non-sensitive AI usage telemetry
+        if: always() && steps.profile.outputs.profile != ''
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          PROFILE: ${{ steps.profile.outputs.profile }}
+          PROVIDER: ${{ steps.profile.outputs.provider }}
+          MODEL: ${{ steps.profile.outputs.model }}
+          MAX_TURNS: ${{ steps.profile.outputs.max_turns }}
+          MAX_BUDGET_USD: ${{ steps.profile.outputs.max_budget_usd }}
+          ACTION_CONCLUSION: ${{ steps.claude.outputs.conclusion }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          TELEMETRY_OUTPUT: ${{ runner.temp }}/opip-ai-usage.json
+        run: |
+          set -euo pipefail
+          python OHM-Trade-Agent-v1/tools/ai_gateway/capture_usage.py \
+            --execution-file "$EXECUTION_FILE" \
+            --profile "$PROFILE" \
+            --provider "$PROVIDER" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --max-budget-usd "$MAX_BUDGET_USD" \
+            --repository "$REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --event-name "$EVENT_NAME" \
+            --actor "$ACTOR" \
+            --action-conclusion "$ACTION_CONCLUSION" \
+            --output "$TELEMETRY_OUTPUT"
+
+          python - "$TELEMETRY_OUTPUT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          row = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          obs = row["observed"]
+          print("## O'Pip AI execution")
+          print(f"- Profile: \`{row['profile']}\`")
+          print(f"- Model: \`{row['model']}\`")
+          print(f"- Hard budget cap: \`${row['limits']['max_budget_usd']:.2f}\`")
+          print(f"- Max turns: \`{row['limits']['max_turns']}\`")
+          print(f"- Observed cost: \`{obs['actual_cost_usd']}\`")
+          print(f"- Observed turns: \`{obs['num_turns']}\`")
+          print(f"- Telemetry status: \`{obs['status']}\`")
+          PY
+
+      - name: Retain AI usage receipt
+        if: always() && steps.profile.outputs.profile != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: opip-ai-usage-${{ github.run_id }}
+          path: ${{ runner.temp }}/opip-ai-usage.json
+          if-no-files-found: warn
+          retention-days: 30
