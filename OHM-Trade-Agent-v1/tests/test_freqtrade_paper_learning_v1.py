@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 
+import pytest
+
 from app.services.freqtrade_result_ingest import ingest_freqtrade_dry_run
 from app.services.freqtrade_signal_bridge import (
     build_signal_id,
@@ -17,6 +19,7 @@ from app.services.intelligence_journey import (
     record_watch_observation,
 )
 from app.services.intelligence_learning_profile import build_intelligence_learning_profile
+from app.services import paper_trade_control as paper_control
 
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
@@ -446,3 +449,72 @@ def test_strategy_reads_the_single_canonical_operator_control():
         root / "app" / "services" / "freqtrade_signal_bridge.py"
     ).read_text(encoding="utf-8")
     assert "mirror_control" not in bridge_source
+
+
+
+def test_canonical_paper_on_refuses_when_authoritative_workers_are_not_healthy(
+    tmp_path,
+    monkeypatch,
+):
+    control = tmp_path / "control.json"
+    monkeypatch.setattr(paper_control, "CONTROL_FILE", control)
+    monkeypatch.setattr(paper_control, "LOCK_FILE", tmp_path / ".control.lock")
+
+    from app.services import freqtrade_result_ingest
+
+    monkeypatch.setattr(
+        freqtrade_result_ingest,
+        "freqtrade_dry_run_status",
+        lambda: {
+            "status": "PARTIAL",
+            "workers": {
+                "USD": {"status": "OK"},
+                "USDT": {"status": "STALE"},
+            },
+        },
+    )
+
+    with pytest.raises(
+        paper_control.PaperTradeActivationError,
+        match="USDT=STALE",
+    ):
+        paper_control.set_paper_trade_enabled(
+            True,
+            path=control,
+            now=NOW,
+        )
+
+    assert not control.exists()
+
+
+def test_canonical_paper_on_succeeds_only_after_both_workers_are_healthy(
+    tmp_path,
+    monkeypatch,
+):
+    control = tmp_path / "control.json"
+    monkeypatch.setattr(paper_control, "CONTROL_FILE", control)
+    monkeypatch.setattr(paper_control, "LOCK_FILE", tmp_path / ".control.lock")
+
+    from app.services import freqtrade_result_ingest
+
+    monkeypatch.setattr(
+        freqtrade_result_ingest,
+        "freqtrade_dry_run_status",
+        lambda: {
+            "status": "OK",
+            "workers": {
+                "USD": {"status": "OK"},
+                "USDT": {"status": "OK"},
+            },
+        },
+    )
+
+    state = paper_control.set_paper_trade_enabled(
+        True,
+        path=control,
+        now=NOW,
+    )
+    assert state.enabled is True
+    saved = json.loads(control.read_text(encoding="utf-8"))
+    assert saved["enabled"] is True
+    assert saved["kraken_execution_authority"] is False
