@@ -294,12 +294,7 @@ def cancel_admitted_signals(
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            expiry = _parse(row.get("expires_at"))
-            if (
-                str(row.get("admission_status") or "").upper() == "ADMITTED"
-                and expiry is not None
-                and expiry >= timestamp
-            ):
+            if str(row.get("admission_status") or "").upper() == "ADMITTED":
                 row["admission_status"] = "CANCELLED"
                 row["terminal_at"] = timestamp.isoformat()
                 row["terminal_outcome"] = str(reason)
