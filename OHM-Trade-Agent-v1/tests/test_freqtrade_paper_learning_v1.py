@@ -269,7 +269,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         assert config["exchange"]["key"] == ""
         assert config["exchange"]["secret"] == ""
         assert config["api_server"]["enabled"] is False
-        assert config["telegram"]["enabled"] is False
+        assert "telegram" not in config
         assert config["pairlists"][0]["processing_mode"] == "append"
 
     strategy_source = strategy_path.read_text(encoding="utf-8")
