@@ -331,6 +331,8 @@ def test_terminal_market_status_cannot_resurrect(
     monkeypatch,
 ):
     setup = pending_setup_registry.add_pending_setup(_setup())
+    monkeypatch.setattr(pending_setup_notifier, "should_emit", lambda **kwargs: True)
+    monkeypatch.setattr(pending_setup_notifier, "record_emitted", lambda **kwargs: None)
     monkeypatch.setattr(
         pending_setup_notifier,
         "send_tracked_telegram",
@@ -631,8 +633,8 @@ def test_generic_tradingview_webhook_has_no_confirmation_buttons(monkeypatch):
     sent = {}
     monkeypatch.setattr(
         routes,
-        "send_telegram_message",
-        lambda *args, **kwargs: sent.update(kwargs) or True,
+        "send_tracked_telegram",
+        lambda *args, **kwargs: sent.update(kwargs) or SimpleNamespace(delivered=True, message_id=106),
     )
     signal = TradingSignal(
         symbol="BTC/USD",
