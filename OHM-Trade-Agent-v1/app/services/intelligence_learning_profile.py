@@ -111,7 +111,7 @@ def build_intelligence_learning_profile(
     nondelivered_early_paper: list[dict[str, Any]] = []
     direct_paper: list[dict[str, Any]] = []
     latencies: list[float] = []
-    buckets: dict[str, dict[str, list[float] | int]] = {}
+    buckets: dict[str, dict[str, Any]] = {}
 
     for value in journeys.values():
         if value["early"] and value["signals"]:
@@ -156,12 +156,23 @@ def build_intelligence_learning_profile(
             key = f"{stage}|{pattern}"
             bucket = buckets.setdefault(
                 key,
-                {"count": 0, "wins": 0, "pnl": []},
+                {
+                    "count": 0,
+                    "wins": 0,
+                    "returns": [],
+                    "pnl_by_currency": {},
+                },
             )
             bucket["count"] = int(bucket["count"]) + 1
             if pnl > 0:
                 bucket["wins"] = int(bucket["wins"]) + 1
-            bucket["pnl"].append(pnl)
+            try:
+                bucket["returns"].append(float(payload.get("close_profit_ratio")))
+            except (TypeError, ValueError):
+                pass
+            currency = str(payload.get("pnl_currency") or "USD").upper()
+            by_currency = bucket["pnl_by_currency"]
+            by_currency.setdefault(currency, []).append(pnl)
 
     def paper_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         pnl: list[float] = []
@@ -209,15 +220,29 @@ def build_intelligence_learning_profile(
 
     bucket_rows: dict[str, Any] = {}
     for key, bucket in buckets.items():
-        pnl = list(bucket["pnl"])
         count = int(bucket["count"])
         wins = int(bucket["wins"])
+        returns = list(bucket["returns"])
+        pnl_by_currency = {
+            currency: {
+                "count": len(values),
+                "net_pnl": round(sum(values), 8),
+                "avg_net_pnl": round(mean(values), 8),
+            }
+            for currency, values in sorted(
+                (bucket["pnl_by_currency"] or {}).items()
+            )
+        }
         bucket_rows[key] = {
             "count": count,
             "wins": wins,
             "win_rate_pct": _pct(wins, count),
-            "net_pnl": round(sum(pnl), 8) if pnl else 0.0,
-            "avg_net_pnl": round(mean(pnl), 8) if pnl else None,
+            "avg_return_pct": (
+                round(mean(returns) * 100.0, 6)
+                if returns
+                else None
+            ),
+            "net_pnl_by_currency": pnl_by_currency,
         }
 
     profile = {
