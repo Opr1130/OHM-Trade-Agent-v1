@@ -471,6 +471,29 @@ def link_delivery_to_journey(
         return False
 
 
+def accepted_delivery_message_id(
+    *,
+    identity: str,
+    event_type: str,
+    fingerprint: str,
+    state_file: Path = STATE_FILE,
+) -> int | None:
+    """Return a previously accepted message only for the exact delivery state."""
+    try:
+        lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
+        with registry_lock(lock_file):
+            state = load_json(state_file)
+        identities = state.get("identities") or {}
+        row = identities.get(str(identity or "").strip()) or {}
+        if str(row.get("event_type") or "").upper() != str(event_type or "").upper():
+            return None
+        if str(row.get("fingerprint") or "") != str(fingerprint or ""):
+            return None
+        return _safe_message_id(row.get("message_id"))
+    except (OSError, TimeoutError, RegistryIOError, TypeError):
+        return None
+
+
 def canonical_message_id(identity: str, *, state_file: Path = STATE_FILE) -> int | None:
     try:
         lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
