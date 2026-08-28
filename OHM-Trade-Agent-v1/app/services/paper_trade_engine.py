@@ -61,8 +61,15 @@ def _positive(value: Any) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
-def _paper_id(episode_id: str, symbol: str) -> str:
-    raw = f"{episode_id}|{symbol.upper()}|LONG"
+def _paper_id(episode_id: str, symbol: str, direction: str = "LONG") -> str:
+    """Return the direction-scoped paper lifecycle identity.
+
+    ``direction`` defaults to ``LONG`` and replaces a hard-coded literal, so
+    ids already issued by the spot-long-only v1 engine are unchanged while a
+    future short engine cannot collide with them.
+    """
+    normalized = str(direction or "LONG").strip().upper() or "LONG"
+    raw = f"{episode_id}|{symbol.upper()}|{normalized}"
     return "PAPER:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
@@ -188,7 +195,7 @@ def enroll_paper_opportunity(
             "entry plan is neither enter-now nor approved long pullback",
         )
 
-    paper_trade_id = _paper_id(episode_id, symbol)
+    paper_trade_id = _paper_id(episode_id, symbol, direction)
     status = "OPEN" if market_now else "PENDING_ENTRY"
     entry_action = "MARKET_DECISION_TIME" if market_now else "LIMIT_PULLBACK"
     entry_limit = float(plan.entry_low)

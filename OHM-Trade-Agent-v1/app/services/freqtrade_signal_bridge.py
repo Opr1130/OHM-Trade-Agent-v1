@@ -52,8 +52,25 @@ def to_freqtrade_pair(base_asset: str, quote_asset: str = "USD") -> str:
     return f"{base}/{quote}"
 
 
-def build_signal_id(*, episode_id: str, pair: str, decision_at: datetime) -> str:
-    raw = f"{episode_id}|{pair}|{_utc(decision_at).isoformat()}|LONG"
+def build_signal_id(
+    *,
+    episode_id: str,
+    pair: str,
+    decision_at: datetime,
+    direction: str = "LONG",
+) -> str:
+    """Return the direction-scoped signal identity for one episode and pair.
+
+    Direction used to be hard-coded, which meant ``BTC/USD LONG`` and
+    ``BTC/USD SHORT`` in the same episode produced the same signal id and
+    silently collided in every downstream join.
+
+    ``direction`` defaults to ``LONG`` and is interpolated where the literal
+    used to be, so every id previously issued for a LONG signal is reproduced
+    byte-for-byte and existing historical records stay resolvable.
+    """
+    normalized = str(direction or "LONG").strip().upper() or "LONG"
+    raw = f"{episode_id}|{pair}|{_utc(decision_at).isoformat()}|{normalized}"
     return "OHM:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:28]
 
 

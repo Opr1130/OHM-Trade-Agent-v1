@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 
 from app.core.config import get_settings
+from app.opip.decision.explanations import build_zero_trade_explanation
 from app.services.dashboard_read_model import build_dashboard_read_model
 from app.services.operations_analytics import build_operations_summary
 from app.services.secret_auth import secret_matches
@@ -42,6 +43,21 @@ def intelligence_summary(
         return build_dashboard_read_model(scope=scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/opip/zero-trade-explanation")
+def opip_zero_trade_explanation(
+    include_candidates: bool = False,
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict:
+    """Return the O'Pip read model explaining the most recent scan's outcome.
+
+    Read-only by construction: it opens the append-only qualification streams
+    and returns their contents. There is no write path from this endpoint into
+    ranking, alerting, paper admission, or any trading state.
+    """
+    _require_secret(x_webhook_secret)
+    return build_zero_trade_explanation(include_candidates=include_candidates)
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
