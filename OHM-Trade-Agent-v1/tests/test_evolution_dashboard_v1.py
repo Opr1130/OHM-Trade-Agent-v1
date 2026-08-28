@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -412,3 +413,102 @@ def test_unversioned_samples_remain_baseline_building_even_with_large_sample():
         row["status"] == "BASELINE_BUILDING"
         for row in result["metrics"]
     )
+
+
+
+def test_paper_trade_table_keeps_old_open_trade_beyond_closed_history_limit(
+    monkeypatch,
+    tmp_path,
+):
+    db = tmp_path / "tradesv3.ohm_dry_run_usd.sqlite"
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY,
+                pair TEXT,
+                enter_tag TEXT,
+                is_open INTEGER,
+                open_date TEXT,
+                close_date TEXT,
+                open_rate REAL,
+                open_rate_requested REAL,
+                close_rate REAL,
+                stake_amount REAL,
+                close_profit_abs REAL,
+                close_profit REAL,
+                exit_reason TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trades (
+                id, pair, enter_tag, is_open, open_date, open_rate,
+                open_rate_requested, stake_amount
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                "SOL/USD",
+                "OHM:old-open",
+                1,
+                (NOW - timedelta(days=10)).isoformat(),
+                100.0,
+                99.5,
+                1000.0,
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO trades (
+                id, pair, enter_tag, is_open, open_date, close_date,
+                open_rate, open_rate_requested, close_rate, stake_amount,
+                close_profit_abs, close_profit, exit_reason
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    index,
+                    "BTC/USD",
+                    f"OHM:closed-{index}",
+                    (NOW - timedelta(hours=2)).isoformat(),
+                    (NOW - timedelta(hours=1)).isoformat(),
+                    100.0,
+                    100.0,
+                    101.0,
+                    1000.0,
+                    10.0,
+                    0.01,
+                    "ohm_tp2",
+                )
+                for index in range(2, 252)
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(dashboard, "DB_FILES", (db,))
+    rows = dashboard._paper_trade_rows()
+
+    assert [row["signal_id"] for row in rows["open"]] == ["OHM:old-open"]
+    assert len(rows["closed"]) == 50
+
+
+def test_chief_ai_health_does_not_turn_analytics_outage_into_ok():
+    sources = dashboard._source_health(
+        operations={
+            "_analytics_status": "UNAVAILABLE",
+            "market": {},
+            "ai": {},
+        },
+        paper={"status": "OK"},
+        tv={"coverage_status": "OK", "queue_depth": 0},
+        events=[],
+    )
+    chief = next(row for row in sources if row["source"] == "Chief AI")
+
+    assert chief["status"] == "UNAVAILABLE"
+    assert "cannot be inferred" in chief["detail"]
