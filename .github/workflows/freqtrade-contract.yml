@@ -21,6 +21,8 @@ on:
       - 'OHM-Trade-Agent-v1/docker-compose.yml'
       - 'OHM-Trade-Agent-v1/docker-compose.paper.yml'
       - 'OHM-Trade-Agent-v1/app/services/freqtrade_**'
+      - 'OHM-Trade-Agent-v1/app/services/paper_trade_control.py'
+      - 'OHM-Trade-Agent-v1/app/services/registry_io.py'
       - 'OHM-Trade-Agent-v1/app/services/intelligence_**'
       - 'OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py'
       - 'OHM-Trade-Agent-v1/app/jobs/run_cycle.py'
