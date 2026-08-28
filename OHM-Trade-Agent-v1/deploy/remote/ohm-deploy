@@ -7,6 +7,7 @@ APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 LOCK_FILE="/var/lock/ohm-deploy.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
+SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "invalid target sha" >&2
@@ -86,6 +87,12 @@ if [[ "$healthy" != "1" ]]; then
   echo "production health check failed" >&2
   false
 fi
+
+if [[ ! -x "$SCHEDULER_RECONCILE" ]]; then
+  echo "scheduler reconciliation script missing or not executable" >&2
+  false
+fi
+"$SCHEDULER_RECONCILE"
 
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
 trap - ERR
