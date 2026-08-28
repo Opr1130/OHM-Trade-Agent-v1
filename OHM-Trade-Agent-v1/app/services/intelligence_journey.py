@@ -13,6 +13,13 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 STATE_FILE = Path("/app/data/intelligence_learning/journeys.json")
 EVENT_FILE = Path("/app/data/intelligence_learning/events.jsonl")
 ACTIVE_WINDOW = timedelta(hours=48)
+MEASUREMENT_VERSIONS = {
+    "intelligence_stack": "OHM_EVOLUTION_BASELINE_2026_08_28",
+    "signal_quality": "SIGNAL_QUALITY_BASELINE_2026_08_28",
+    "profit_ranking": "PROFIT_RANKING_BASELINE_2026_08_28",
+    "entry_exit_strategy": "ENTRY_EXIT_BASELINE_2026_08_28",
+    "failure_taxonomy": "FAILURE_TAXONOMY_V1",
+}
 
 
 def _utc(value: datetime | None = None) -> datetime:
@@ -133,6 +140,7 @@ def record_watch_observation(
             "delivery_action": str(delivery_action or "UNKNOWN"),
             "delivered": bool(delivered),
             "payload": dict(payload),
+            "measurement_versions": dict(MEASUREMENT_VERSIONS),
             "measurement_only": True,
             "affects_ranking": False,
             "affects_trade_authority": False,
@@ -183,6 +191,7 @@ def link_qualified_signal(
             "symbol": normalized,
             "observed_at": timestamp.isoformat(),
             "payload": dict(payload),
+            "measurement_versions": dict(MEASUREMENT_VERSIONS),
             "measurement_only": True,
             "affects_ranking": False,
             "affects_trade_authority": False,
@@ -240,6 +249,7 @@ def record_paper_admission(
             "admitted": bool(admitted),
             "reason": str(reason),
             "payload": dict(payload or {}),
+            "measurement_versions": dict(MEASUREMENT_VERSIONS),
             "measurement_only": True,
             "affects_ranking": False,
             "affects_trade_authority": False,
@@ -304,6 +314,7 @@ def record_paper_outcome(
             "symbol": normalized,
             "observed_at": timestamp.isoformat(),
             "payload": dict(payload),
+            "measurement_versions": dict(MEASUREMENT_VERSIONS),
             "measurement_only": True,
             "affects_ranking": False,
             "affects_trade_authority": False,
