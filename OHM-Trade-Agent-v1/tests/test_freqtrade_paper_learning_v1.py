@@ -294,8 +294,10 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert 'cpus: "0.40"' in paper_compose
     assert "tradesv3.ohm_dry_run_usd.sqlite" in paper_compose
     assert "tradesv3.ohm_dry_run_usdt.sqlite" in paper_compose
-    assert "ohm_freqtrade_heartbeat_USD" in paper_compose
-    assert "ohm_freqtrade_heartbeat_USDT" in paper_compose
+    assert "heartbeat_USD" in paper_compose
+    assert "heartbeat_USDT" in paper_compose
+    assert "oom_score_adj: 500" in paper_compose
+    assert "no-new-privileges:true" in paper_compose
     assert "./data/freqtrade/state:/freqtrade/state" in paper_compose
     assert "./data/paper_trading:/freqtrade/control:ro" in paper_compose
     assert "./data/freqtrade_bridge:/freqtrade/bridge:ro" in paper_compose
