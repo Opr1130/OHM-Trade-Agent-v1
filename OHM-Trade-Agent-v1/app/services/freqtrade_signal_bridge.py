@@ -16,6 +16,7 @@ PAIRLIST_USDT_FILE = BRIDGE_DIR / "pairlist_usdt.json"
 # Backward-compatible alias for tests/importers that assume the primary USD path.
 PAIRLIST_FILE = PAIRLIST_USD_FILE
 SIGNAL_RETENTION = timedelta(days=7)
+FREQTRADE_WORKER_STARTING_BALANCE = 5_000.0
 
 
 class PaperAdmissionRejected(RuntimeError):
@@ -105,6 +106,7 @@ def publish_qualified_long(
     early_watch_context: dict[str, Any] | None = None,
     signals_file: Path = SIGNALS_FILE,
     pairlist_file: Path | None = None,
+    authoritative_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     decision = _utc(decision_at)
     quote = canonicalize_asset(str(quote_asset or "USD").strip().upper())
@@ -116,6 +118,31 @@ def publish_qualified_long(
     )
     ttl_hours = max_hold_hours if valid_now else pending_ttl_hours
     expires = decision + timedelta(hours=max(1, int(ttl_hours)))
+    if authoritative_status is None:
+        try:
+            from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
+
+            authoritative_status = freqtrade_dry_run_status()
+        except Exception as exc:
+            raise PaperAdmissionRejected(
+                f"AUTHORITATIVE_CAPACITY_UNAVAILABLE:{type(exc).__name__}"
+            ) from exc
+    if authoritative_status.get("status") != "OK":
+        raise PaperAdmissionRejected("AUTHORITATIVE_CAPACITY_UNAVAILABLE")
+
+    active_signal_ids = {
+        str(value)
+        for value in (authoritative_status.get("active_signal_ids") or [])
+    }
+    actual_open_positions = int(authoritative_status.get("open_trades") or 0)
+    workers = authoritative_status.get("workers") or {}
+    worker = workers.get(quote) or {}
+    try:
+        actual_worker_stake = max(0.0, float(worker.get("active_stake") or 0.0))
+        realized_worker_pnl = float(worker.get("realized_net_pnl") or 0.0)
+    except (TypeError, ValueError):
+        raise PaperAdmissionRejected("AUTHORITATIVE_CAPITAL_STATE_INVALID")
+
     signal = {
         "schema_version": 1,
         "signal_id": signal_id,
@@ -176,6 +203,7 @@ def publish_qualified_long(
             expiry = _parse(row.get("expires_at"))
             if (
                 str(row.get("admission_status") or "").upper() == "ADMITTED"
+                and str(row.get("signal_id") or "") not in active_signal_ids
                 and expiry is not None
                 and expiry >= decision
             ):
@@ -186,13 +214,14 @@ def publish_qualified_long(
 
         if int(max_positions) < 1:
             raise PaperAdmissionRejected("GLOBAL_POSITION_CAPACITY_INVALID")
-        if len(active_admissions) >= int(max_positions):
+        if actual_open_positions + len(active_admissions) >= int(max_positions):
             raise PaperAdmissionRejected("GLOBAL_POSITION_CAPACITY")
 
         try:
-            reserved = sum(
+            pending_worker_stake = sum(
                 max(0.0, float(row.get("stake_amount") or 0.0))
                 for row in active_admissions
+                if str(row.get("quote_asset") or "").upper() == quote
             )
         except (TypeError, ValueError):
             raise PaperAdmissionRejected("GLOBAL_CAPITAL_STATE_INVALID")
@@ -200,7 +229,16 @@ def publish_qualified_long(
         equity = float(starting_equity)
         if requested_stake <= 0 or equity <= 0:
             raise PaperAdmissionRejected("GLOBAL_CAPITAL_POLICY_INVALID")
-        if reserved + requested_stake > equity + 1e-9:
+
+        # The authoritative sidecar has two independent 5,000-unit dry-run
+        # wallets. Never let a configurable OHM paper-equity value claim more
+        # capital than the actual worker owns.
+        worker_budget = min(
+            max(0.0, equity / 2.0),
+            FREQTRADE_WORKER_STARTING_BALANCE,
+        ) + realized_worker_pnl
+        reserved_worker = actual_worker_stake + pending_worker_stake
+        if reserved_worker + requested_stake > worker_budget + 1e-9:
             raise PaperAdmissionRejected("GLOBAL_CAPITAL_CAPACITY")
 
         retained.append(signal)
