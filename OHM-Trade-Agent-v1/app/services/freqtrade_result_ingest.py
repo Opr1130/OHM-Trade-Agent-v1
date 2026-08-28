@@ -118,6 +118,8 @@ def freqtrade_dry_run_status(
     closed_count = 0
     open_pairs: set[str] = set()
     pnl_by_currency: dict[str, float] = {}
+    active_stake_by_currency: dict[str, float] = {}
+    active_signal_ids: set[str] = set()
     per_worker: dict[str, dict[str, Any]] = {}
 
     now = datetime.now(timezone.utc)
@@ -175,7 +177,24 @@ def freqtrade_dry_run_status(
             for row in open_rows
             if "pair" in columns and row["pair"]
         }
+        worker_signal_ids = {
+            str(row["enter_tag"])
+            for row in open_rows
+            if "enter_tag" in columns and row["enter_tag"]
+        }
+        worker_active_stake = 0.0
+        if "stake_amount" in columns:
+            for row in open_rows:
+                try:
+                    worker_active_stake += max(
+                        0.0,
+                        float(row["stake_amount"] or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    continue
         open_pairs.update(worker_pairs)
+        active_signal_ids.update(worker_signal_ids)
+        active_stake_by_currency[quote] = round(worker_active_stake, 8)
         open_count += len(open_rows)
         closed_count += len(closed_rows)
         pnl_by_currency[quote] = round(pnl, 8)
@@ -186,6 +205,8 @@ def freqtrade_dry_run_status(
             "open_trades": len(open_rows),
             "closed_trades": len(closed_rows),
             "realized_net_pnl": round(pnl, 8),
+            "active_stake": round(worker_active_stake, 8),
+            "active_signal_ids": sorted(worker_signal_ids),
             "open_pairs": sorted(worker_pairs),
         }
 
@@ -209,6 +230,8 @@ def freqtrade_dry_run_status(
         # exact USD/USDT parity.
         "realized_net_pnl": total_numeric,
         "realized_pnl_by_currency": pnl_by_currency,
+        "active_stake_by_currency": active_stake_by_currency,
+        "active_signal_ids": sorted(active_signal_ids),
         "open_pairs": sorted(open_pairs),
         "workers": per_worker,
         "exchange_write_authority": False,
