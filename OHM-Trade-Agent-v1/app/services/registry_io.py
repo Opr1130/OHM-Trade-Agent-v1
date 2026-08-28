@@ -145,7 +145,7 @@ def load_json(path: Path) -> dict:
     return payload
 
 
-def save_json_atomic(path: Path, data: dict) -> None:
+def save_json_atomic(path: Path, data: dict, *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
         dir=path.parent,
@@ -157,6 +157,8 @@ def save_json_atomic(path: Path, data: dict) -> None:
             json.dump(data, handle, indent=2, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temp_name, mode)
         os.replace(temp_name, path)
     except Exception:
         try:
