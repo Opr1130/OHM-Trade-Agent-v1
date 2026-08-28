@@ -109,7 +109,7 @@ jobs:
               assert not config["exchange"].get("key")
               assert not config["exchange"].get("secret")
               assert config["api_server"]["enabled"] is False
-              assert config["telegram"]["enabled"] is False
+              assert "telegram" not in config
               assert config["pairlists"][0]["processing_mode"] == "append"
 
           production = Path("docker-compose.yml").read_text()
