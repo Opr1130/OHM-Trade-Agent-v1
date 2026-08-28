@@ -30,6 +30,7 @@ from app.services.signal_scoring import (
 )
 from app.services.telegram_delivery import (
     edit_tracked_telegram,
+    link_delivery_to_journey,
     record_telegram_suppression,
     send_tracked_telegram,
 )
@@ -592,7 +593,7 @@ def main() -> None:
                     candidate.symbol.upper(),
                     ("NOT_DELIVERED_OR_EXCLUDED", False),
                 )
-                record_watch_observation(
+                journey_id = record_watch_observation(
                     symbol=candidate.symbol,
                     observed_at=decision_at,
                     watch_type="EARLY_WATCH",
@@ -617,6 +618,13 @@ def main() -> None:
                     delivery_action=delivery_action,
                     delivered=delivered,
                 )
+                link_delivery_to_journey(
+                    identity=f"FULL_MARKET_WATCH:{candidate.symbol}",
+                    alert_family="BROAD_WATCH",
+                    event_type=candidate.stage,
+                    fingerprint=_signal_quality_transition_key(candidate),
+                    journey_id=journey_id,
+                )
         for signal in signals:
             if not signal.alert_eligible:
                 continue
@@ -624,7 +632,7 @@ def main() -> None:
                 signal.symbol.upper(),
                 ("NOT_DELIVERED", False),
             )
-            record_watch_observation(
+            journey_id = record_watch_observation(
                 symbol=signal.symbol,
                 observed_at=decision_at,
                 watch_type="EARLY_MOVER",
@@ -646,6 +654,13 @@ def main() -> None:
                 },
                 delivery_action=delivery_action,
                 delivered=delivered,
+            )
+            link_delivery_to_journey(
+                identity=f"EARLY_MOVER:{signal.symbol}",
+                alert_family="EARLY_MOVER",
+                event_type=signal.stage,
+                fingerprint=_transition_key(signal),
+                journey_id=journey_id,
             )
     except Exception as exc:
         print("Intelligence journey watch capture: fail-soft", type(exc).__name__)
