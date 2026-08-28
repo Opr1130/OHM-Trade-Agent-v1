@@ -13,7 +13,9 @@ from app.services.freqtrade_result_ingest import (
     ingest_freqtrade_dry_run,
 )
 from app.services.freqtrade_signal_bridge import (
+    PaperAdmissionRejected,
     build_signal_id,
+    cancel_admitted_signals,
     publish_qualified_long,
     to_freqtrade_pair,
 )
@@ -26,6 +28,32 @@ from app.services import paper_trade_control as paper_control
 
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+
+
+def _authoritative_status(
+    *,
+    open_trades=0,
+    usd_stake=0.0,
+    usdt_stake=0.0,
+    active_signal_ids=None,
+):
+    return {
+        "status": "OK",
+        "open_trades": int(open_trades),
+        "active_signal_ids": list(active_signal_ids or []),
+        "workers": {
+            "USD": {
+                "status": "OK",
+                "active_stake": float(usd_stake),
+                "realized_net_pnl": 0.0,
+            },
+            "USDT": {
+                "status": "OK",
+                "active_stake": float(usdt_stake),
+                "realized_net_pnl": 0.0,
+            },
+        },
+    }
 
 
 def test_freqtrade_pair_normalizes_kraken_aliases():
@@ -58,8 +86,11 @@ def test_publish_qualified_long_writes_signal_and_dynamic_pairlist(tmp_path):
         confidence=90,
         profit_rank=1,
         profit_rank_score=88.0,
+        starting_equity=10_000.0,
+        max_positions=3,
         signals_file=signals,
         pairlist_file=pairlist,
+        authoritative_status=_authoritative_status(),
     )
     assert row["pair"] == "SOL/USD"
     assert row["direction"] == "LONG"
@@ -271,6 +302,10 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         assert "api_server" not in config
         assert "telegram" not in config
         assert config["pairlists"][0]["processing_mode"] == "append"
+        assert config["custom_price_max_distance_ratio"] == 1.0
+        assert config["pairlists"][0]["pairlist_url"].startswith(
+            "file:///user_data/bridge/"
+        )
 
     strategy_source = strategy_path.read_text(encoding="utf-8")
     ast.parse(strategy_source)
@@ -300,7 +335,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "no-new-privileges:true" in paper_compose
     assert "./data/freqtrade/state:/freqtrade/state" in paper_compose
     assert "./data/paper_trading:/freqtrade/control:ro" in paper_compose
-    assert "./data/freqtrade_bridge:/freqtrade/bridge:ro" in paper_compose
+    assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper_compose
 
 
 
@@ -388,8 +423,19 @@ def test_usd_and_usdt_trade_ids_do_not_collide_during_ingest(tmp_path):
     )
     assert first["outcomes_added"] == 1
     assert second["outcomes_added"] == 1
-    state = json.loads(ingest_state.read_text(encoding="utf-8"))
-    assert set(state["processed_trade_keys"]) == {"USD:1", "USDT:1"}
+    dedup = ingest_state.with_name("ingest_dedup.sqlite")
+    connection = sqlite3.connect(dedup)
+    try:
+        keys = {
+            row[0]
+            for row in connection.execute(
+                "SELECT trade_key FROM processed_trade_outcomes "
+                "WHERE status = 'APPLIED'"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+    assert keys == {"USD:1", "USDT:1"}
 
 
 
@@ -436,8 +482,16 @@ def test_unmatched_freqtrade_outcome_is_left_retryable(tmp_path):
     assert first["outcomes_added"] == 0
     assert first["unmatched_outcomes"] == 1
     assert second["unmatched_outcomes"] == 1
-    state = json.loads(ingest_state.read_text(encoding="utf-8")) if ingest_state.exists() else {}
-    assert "USD:1" not in set(state.get("processed_trade_keys") or [])
+    dedup = ingest_state.with_name("ingest_dedup.sqlite")
+    connection = sqlite3.connect(dedup)
+    try:
+        row = connection.execute(
+            "SELECT status FROM processed_trade_outcomes WHERE trade_key = ?",
+            ("USD:1",),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is None
 
 
 def test_strategy_reads_the_single_canonical_operator_control():
@@ -539,3 +593,213 @@ def test_freqtrade_status_requires_fresh_authoritative_heartbeat(tmp_path):
     fresh = freqtrade_dry_run_status(db_file=db)
     assert fresh["status"] == "OK"
     assert fresh["workers"]["USD"]["status"] == "OK"
+
+
+
+def test_authoritative_open_positions_continue_to_reserve_global_capacity(tmp_path):
+    with pytest.raises(PaperAdmissionRejected, match="GLOBAL_POSITION_CAPACITY"):
+        publish_qualified_long(
+            episode_id="EP:capacity",
+            cohort_id="COHORT:capacity",
+            journey_id="JOURNEY:capacity",
+            ohm_symbol="SOLUSD",
+            base_asset="SOL",
+            quote_asset="USD",
+            decision_at=NOW,
+            valid_now=True,
+            entry_style="pullback_or_retest",
+            entry_low=99.0,
+            entry_high=100.0,
+            chase_limit=102.0,
+            stop_price=95.0,
+            target_1=105.0,
+            target_2=110.0,
+            stake_amount=1000.0,
+            max_hold_hours=24,
+            pending_ttl_hours=24,
+            confidence=90,
+            profit_rank=1,
+            profit_rank_score=88.0,
+            starting_equity=10_000.0,
+            max_positions=3,
+            signals_file=tmp_path / "signals.json",
+            pairlist_file=tmp_path / "pairs.json",
+            authoritative_status=_authoritative_status(open_trades=3),
+        )
+
+
+def test_authoritative_open_stake_reserves_actual_worker_capital(tmp_path):
+    with pytest.raises(PaperAdmissionRejected, match="GLOBAL_CAPITAL_CAPACITY"):
+        publish_qualified_long(
+            episode_id="EP:capital",
+            cohort_id="COHORT:capital",
+            journey_id="JOURNEY:capital",
+            ohm_symbol="SOLUSD",
+            base_asset="SOL",
+            quote_asset="USD",
+            decision_at=NOW,
+            valid_now=True,
+            entry_style="pullback_or_retest",
+            entry_low=99.0,
+            entry_high=100.0,
+            chase_limit=102.0,
+            stop_price=95.0,
+            target_1=105.0,
+            target_2=110.0,
+            stake_amount=1000.0,
+            max_hold_hours=24,
+            pending_ttl_hours=24,
+            confidence=90,
+            profit_rank=1,
+            profit_rank_score=88.0,
+            starting_equity=10_000.0,
+            max_positions=10,
+            signals_file=tmp_path / "signals.json",
+            pairlist_file=tmp_path / "pairs.json",
+            authoritative_status=_authoritative_status(
+                open_trades=1,
+                usd_stake=4500.0,
+            ),
+        )
+
+
+def test_operator_cancellation_is_permanent_and_cannot_be_reactivated(tmp_path):
+    signals = tmp_path / "signals.json"
+    pairlist = tmp_path / "pairs.json"
+    first = publish_qualified_long(
+        episode_id="EP:cancel",
+        cohort_id="COHORT:cancel",
+        journey_id="JOURNEY:cancel",
+        ohm_symbol="SOLUSD",
+        base_asset="SOL",
+        quote_asset="USD",
+        decision_at=NOW,
+        valid_now=False,
+        entry_style="wait_for_pullback",
+        entry_low=95.0,
+        entry_high=97.0,
+        chase_limit=101.0,
+        stop_price=92.0,
+        target_1=104.0,
+        target_2=108.0,
+        stake_amount=1000.0,
+        max_hold_hours=24,
+        pending_ttl_hours=24,
+        confidence=88,
+        profit_rank=1,
+        profit_rank_score=82.0,
+        starting_equity=10_000.0,
+        max_positions=3,
+        signals_file=signals,
+        pairlist_file=pairlist,
+        authoritative_status=_authoritative_status(),
+    )
+    assert first["admission_status"] == "ADMITTED"
+    assert cancel_admitted_signals(
+        cancelled_at=NOW + timedelta(minutes=5),
+        signals_file=signals,
+    ) == 1
+
+    replay = publish_qualified_long(
+        episode_id="EP:cancel",
+        cohort_id="COHORT:cancel",
+        journey_id="JOURNEY:cancel",
+        ohm_symbol="SOLUSD",
+        base_asset="SOL",
+        quote_asset="USD",
+        decision_at=NOW,
+        valid_now=False,
+        entry_style="wait_for_pullback",
+        entry_low=95.0,
+        entry_high=97.0,
+        chase_limit=101.0,
+        stop_price=92.0,
+        target_1=104.0,
+        target_2=108.0,
+        stake_amount=1000.0,
+        max_hold_hours=24,
+        pending_ttl_hours=24,
+        confidence=88,
+        profit_rank=1,
+        profit_rank_score=82.0,
+        starting_equity=10_000.0,
+        max_positions=3,
+        signals_file=signals,
+        pairlist_file=pairlist,
+        authoritative_status=_authoritative_status(),
+    )
+    assert replay["signal_id"] == first["signal_id"]
+    assert replay["admission_status"] == "CANCELLED"
+
+
+def test_durable_dedup_does_not_forget_old_trade_after_more_than_5000_rows(tmp_path):
+    events = tmp_path / "events.jsonl"
+    journey_state = tmp_path / "journeys.json"
+    ingest_state = tmp_path / "ingest.json"
+    db = tmp_path / "tradesv3.ohm_dry_run_usd.sqlite"
+
+    signal_id = "OHM:durable"
+    link_qualified_signal(
+        symbol="SOLUSD",
+        signal_id=signal_id,
+        observed_at=NOW,
+        payload={"paper_requested": True},
+        state_file=journey_state,
+        event_file=events,
+    )
+    _create_dry_run_db(db, signal_id)
+
+    first = ingest_freqtrade_dry_run(
+        db_file=db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    assert first["outcomes_added"] == 1
+
+    dedup = ingest_state.with_name("ingest_dedup.sqlite")
+    connection = sqlite3.connect(dedup)
+    try:
+        now_iso = NOW.isoformat()
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO processed_trade_outcomes
+                (trade_key, signal_id, status, updated_at)
+            VALUES (?, ?, 'APPLIED', ?)
+            """,
+            [
+                (f"USD:{index}", f"OHM:history-{index}", now_iso)
+                for index in range(2, 6003)
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    second = ingest_freqtrade_dry_run(
+        db_file=db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    assert second["outcomes_added"] == 0
+
+    profile = build_intelligence_learning_profile(
+        event_file=events,
+        persist=False,
+    )
+    assert profile["paper_performance"]["count"] == 1
+
+
+def test_strategy_rejects_cancelled_terminal_signals_and_material_entry_clamping():
+    root = Path(__file__).resolve().parents[1]
+    source = (
+        root
+        / "freqtrade"
+        / "user_data"
+        / "strategies"
+        / "OHMExternalSignalStrategy.py"
+    ).read_text(encoding="utf-8")
+    assert '"admission_status"' in source
+    assert '"ADMITTED"' in source
+    assert "abs(requested - expected_entry) / expected_entry > 0.0025" in source
