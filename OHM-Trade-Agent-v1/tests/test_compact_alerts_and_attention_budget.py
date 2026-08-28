@@ -25,7 +25,8 @@ def test_compact_watch_alert_is_short_and_explicit():
     assert "Risk score: 32/100" in message
     assert "Downside if wrong: up to -9%" in message
     assert "Action: REVIEW ENTRY" in message
-    assert "*Heuristic scenario scores, not probabilities." not in message\n    assert len(message.splitlines()) <= 7
+    assert "*Heuristic scenario scores, not probabilities." not in message
+    assert len(message.splitlines()) <= 7
 
 
 def test_scenario_helpers_do_not_claim_probability():
