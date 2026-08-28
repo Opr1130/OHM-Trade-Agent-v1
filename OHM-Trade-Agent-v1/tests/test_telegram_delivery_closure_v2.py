@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+from app.services import pending_setup_notifier as pending_notifier
+from app.services import telegram_delivery
+from app.services.pending_setup_monitor import PendingSetupMonitorResult
+from app.services.pending_setup_registry import PendingSetup
+
+
+def test_canonical_delivery_ledger_tracks_message_id_retry_and_latency(monkeypatch, tmp_path):
+    event_file = tmp_path / "telegram_delivery_events.jsonl"
+    state_file = tmp_path / "telegram_delivery_state.json"
+    results = iter([None, None, 4321])
+    monkeypatch.setattr(
+        telegram_delivery,
+        "send_telegram_message_with_id",
+        lambda *args, **kwargs: next(results),
+    )
+
+    kwargs = dict(
+        bot_token="super-secret-token",
+        chat_id="123",
+        message="hello",
+        identity="EARLY_MOVER:METUSD",
+        alert_family="EARLY_MOVER",
+        event_type="READY",
+        fingerprint="READY:BREAKOUT",
+        symbol="METUSD",
+        state_file=state_file,
+        event_file=event_file,
+    )
+    first = telegram_delivery.send_tracked_telegram(**kwargs)
+    second = telegram_delivery.send_tracked_telegram(**kwargs)
+    third = telegram_delivery.send_tracked_telegram(**kwargs)
+
+    assert first.status == "SEND_FAILED"
+    assert first.attempt == 1
+    assert first.retry_count == 0
+    assert second.attempt == 2
+    assert second.retry_count == 1
+    assert third.delivered is True
+    assert third.message_id == 4321
+    assert third.attempt == 3
+    assert third.retry_count == 2
+
+    rows = [json.loads(line) for line in event_file.read_text().splitlines()]
+    assert [row["status"] for row in rows] == [
+        "SEND_FAILED",
+        "SEND_FAILED",
+        "DELIVERED",
+    ]
+    assert rows[-1]["message_id"] == 4321
+    assert rows[-1]["latency_ms"] >= 0
+    assert "super-secret-token" not in event_file.read_text()
+
+    state = json.loads(state_file.read_text())
+    assert state["identities"]["EARLY_MOVER:METUSD"]["message_id"] == 4321
+
+
+def test_delivery_summary_distinguishes_suppressed_not_eligible_and_failed(monkeypatch, tmp_path):
+    event_file = tmp_path / "events.jsonl"
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(
+        telegram_delivery,
+        "send_telegram_message_with_id",
+        lambda *args, **kwargs: None,
+    )
+
+    telegram_delivery.record_telegram_suppression(
+        identity="A",
+        alert_family="EARLY_MOVER",
+        event_type="READY",
+        fingerprint="A1",
+        reason="SAME_STATE_COOLDOWN",
+        symbol="AAAUSD",
+        state_file=state_file,
+        event_file=event_file,
+    )
+    telegram_delivery.record_telegram_not_eligible(
+        identity="B",
+        alert_family="PENDING_SETUP",
+        event_type="WAITING",
+        fingerprint="B1",
+        reason="NON_MATERIAL_PENDING_STATE",
+        symbol="BBBUSD",
+        state_file=state_file,
+        event_file=event_file,
+    )
+    telegram_delivery.send_tracked_telegram(
+        bot_token="x",
+        chat_id="y",
+        message="z",
+        identity="C",
+        alert_family="ACTIVE_TRADE",
+        event_type="WARNING",
+        fingerprint="C1",
+        symbol="CCCUSD",
+        state_file=state_file,
+        event_file=event_file,
+    )
+
+    summary = telegram_delivery.build_delivery_summary(path=event_file)
+    assert summary["events"] == 3
+    assert summary["suppressed"] == 1
+    assert summary["failed"] == 1
+    assert summary["by_status"]["NOT_ELIGIBLE"] == 1
+    assert summary["by_status"]["SUPPRESSED"] == 1
+    assert summary["by_status"]["SEND_FAILED"] == 1
+
+
+def _pending_setup() -> PendingSetup:
+    return PendingSetup(
+        symbol="VVVUSD",
+        entry_low=10.0,
+        entry_high=10.5,
+        chase_limit=10.8,
+        stop_price=9.0,
+        target_1=11.5,
+        target_2=12.5,
+        risk_level="medium",
+        confidence=75,
+        trade_id="T-1",
+    )
+
+
+def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    state_file = tmp_path / "pending_alert_state.json"
+    monkeypatch.setattr(pending_notifier, "STATE_FILE", state_file)
+    monkeypatch.setattr(
+        pending_notifier,
+        "LOCK_FILE",
+        state_file.parent / ".pending_alert_state.lock",
+    )
+    monkeypatch.setattr(pending_notifier, "should_emit", lambda **kwargs: True)
+    terminalized = []
+    monkeypatch.setattr(
+        pending_notifier,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalized.append((trade_id, status)) or True,
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=False, message_id=None),
+    )
+
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        result,
+        "token",
+        "chat",
+    ) is False
+    assert terminalized == []
+    assert not state_file.exists()
+
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=99),
+    )
+    emitted = []
+    monkeypatch.setattr(
+        pending_notifier,
+        "record_emitted",
+        lambda **kwargs: emitted.append(kwargs),
+    )
+
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        result,
+        "token",
+        "chat",
+    ) is True
+    assert terminalized == [("T-1", "invalidated")]
+    saved = json.loads(state_file.read_text())
+    assert saved["VVVUSD"]["status"] == "INVALIDATED"
+    assert saved["VVVUSD"]["message_id"] == 99
+    assert emitted
+
+
+def test_telegram_alert_state_writers_use_atomic_registry_io():
+    sources = [
+        Path(pending_notifier.__file__).read_text(),
+    ]
+    from app.services import trade_monitor_notifier, emergency_alert_notifier
+
+    sources.extend(
+        [
+            Path(trade_monitor_notifier.__file__).read_text(),
+            Path(emergency_alert_notifier.__file__).read_text(),
+        ]
+    )
+    for source in sources:
+        assert "save_json_atomic(" in source
+        assert "STATE_FILE.write_text" not in source
