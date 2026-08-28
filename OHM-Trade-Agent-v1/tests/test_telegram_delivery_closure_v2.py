@@ -202,6 +202,47 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
     assert emitted
 
 
+def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    state_file = tmp_path / "pending_alert_state.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+    monkeypatch.setattr(pending_notifier, "STATE_FILE", state_file)
+    pending_notifier._queue_terminal_notification(setup, result)
+    monkeypatch.setattr(
+        pending_notifier,
+        "get_pending_setup_record",
+        lambda trade_id: {"trade_id": trade_id, "status": "invalidated"},
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "accepted_delivery_message_id",
+        lambda **kwargs: 777,
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not duplicate accepted push")),
+    )
+    monkeypatch.setattr(pending_notifier, "record_emitted", lambda **kwargs: None)
+
+    sent, failed = pending_notifier.retry_terminal_pending_notifications(
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert (sent, failed) == (1, 0)
+    assert json.loads(retry_file.read_text()) == {}
+    saved = json.loads(state_file.read_text())
+    assert saved["T-1"]["message_id"] == 777
+
+
 def test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_alert(monkeypatch, tmp_path):
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
