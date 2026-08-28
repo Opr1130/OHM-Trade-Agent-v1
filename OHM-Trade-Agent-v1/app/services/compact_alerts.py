@@ -81,8 +81,7 @@ def format_watch_alert(
         f"Risk score: {risk_pct:.0f}/100\n"
         f"Downside if wrong: up to -{downside_pct:.0f}%\n"
         f"Reason: {one_line_reason(reason)}\n"
-        f"Action: {action}\n"
-        "*Heuristic scenario scores, not probabilities."
+        f"Action: {action}"
     )
 
 
