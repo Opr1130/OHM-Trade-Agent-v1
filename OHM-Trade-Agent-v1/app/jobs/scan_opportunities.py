@@ -175,8 +175,7 @@ def _publish_freqtrade_paper_opportunities(
         from app.services.intelligence_journey import link_qualified_signal
         from app.services.paper_trade_control import paper_trade_enabled
 
-        if not paper_trade_enabled():
-            return 0, 0
+        paper_enabled = paper_trade_enabled()
         cohort_id = canonical_cohort_id(scan.snapshots, decision_at=decision_at)
     except Exception as exc:
         print(
@@ -242,8 +241,17 @@ def _publish_freqtrade_paper_opportunities(
                     "market_regime": alert.get("market_regime"),
                     "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
                     "target_attainability_score": alert.get("target_attainability_score"),
+                    "paper_requested": bool(paper_enabled),
+                    "paper_engine": "FREQTRADE_DRY_RUN",
                 },
             )
+            if not paper_enabled:
+                print(
+                    f"FREQTRADE PAPER {snapshot.symbol}: PAPER_OFF "
+                    f"Signal={signal_id} Journey={journey_id}"
+                )
+                continue
+
             signal = publish_qualified_long(
                 episode_id=episode_id,
                 cohort_id=cohort_id,
