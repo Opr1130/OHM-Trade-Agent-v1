@@ -316,6 +316,7 @@ def send_trade_plan(
             reason="NO_ACTIONABLE_ENTRY_PLAN",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
             trade_id=candidate.get("trade_id"),
         )
         return False
@@ -328,6 +329,7 @@ def send_trade_plan(
             reason="DEDUP_OR_NOTIFICATION_POLICY",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
             trade_id=candidate.get("trade_id"),
         )
         return False
@@ -340,6 +342,7 @@ def send_trade_plan(
             reason="PORTFOLIO_OR_ALLOCATION_GUARDRAIL",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
             trade_id=candidate.get("trade_id"),
         )
         return False
@@ -410,6 +413,7 @@ def send_trade_plan(
         fingerprint=key,
         symbol=plan.symbol,
         journey_id=candidate.get("journey_id"),
+        signal_id=candidate.get("signal_id"),
         trade_id=trade_id,
     )
     if delivery.delivered:
