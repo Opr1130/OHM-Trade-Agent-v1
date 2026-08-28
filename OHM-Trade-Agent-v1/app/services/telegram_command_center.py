@@ -13,9 +13,11 @@ from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import get_active_trades
 from app.services.asset_display_identity import display_asset_text, display_market_label
+from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.paper_trade_control import (
+    PaperTradeActivationError,
     get_paper_trade_control,
     set_paper_trade_enabled,
 )
@@ -502,19 +504,26 @@ def _handle_unwatch(settings: Any, symbol_query: str) -> None:
 
 def _paper_status_text(settings: Any) -> str:
     control = get_paper_trade_control()
-    summary = account_summary(float(settings.paper_trade_starting_equity))
+    authoritative = freqtrade_dry_run_status()
+    shadow = account_summary(float(settings.paper_trade_starting_equity))
+    open_pairs = ", ".join(authoritative.get("open_pairs") or []) or "None"
+    pnl_by_currency = authoritative.get("realized_pnl_by_currency") or {}
+    usd_pnl = float(pnl_by_currency.get("USD") or 0.0)
+    usdt_pnl = float(pnl_by_currency.get("USDT") or 0.0)
     return (
-        "🧪 OHM PAPER TRADE V1\n"
+        "🧪 OHM PAPER TRADE\n"
         f"Mode: {'ON' if control.enabled else 'OFF'}\n"
-        f"Control: {control.status}\n"
+        "Authoritative engine: FREQTRADE DRY-RUN\n"
+        f"Freqtrade status: {authoritative.get('status', 'UNKNOWN')}\n"
+        f"Freqtrade open/closed: {authoritative.get('open_trades', 0)}/"
+        f"{authoritative.get('closed_trades', 0)}\n"
+        f"Freqtrade realized P/L: ${usd_pnl:,.2f} USD | {usdt_pnl:,.2f} USDT\n"
+        f"Freqtrade open pairs: {open_pairs}\n"
+        "Shadow/control engine: OHM INTERNAL SIMULATOR\n"
+        f"Shadow open/closed: {shadow.open_positions}/{shadow.closed_trades}\n"
+        f"Shadow realized net P/L: ${shadow.realized_net_pnl:,.2f}\n"
         "Policy: SPOT LONG ONLY\n"
-        "Exchange writes: DISABLED BY ARCHITECTURE\n"
-        f"Paper equity: ${summary.closed_equity:,.2f}\n"
-        f"Realized net P/L: ${summary.realized_net_pnl:,.2f}\n"
-        f"Reserved: ${summary.reserved_capital:,.2f}\n"
-        f"Available: ${summary.available_capital:,.2f}\n"
-        f"Pending/Open: {summary.pending_entries}/{summary.open_positions}\n"
-        f"Closed/Unresolved: {summary.closed_trades}/{summary.unresolved_trades}"
+        "Kraken exchange writes: NONE"
     )
 
 
@@ -528,18 +537,25 @@ def _handle_paper(settings: Any, args: tuple[str, ...]) -> None:
     if action not in {"on", "off"}:
         raise TelegramCommandError("Usage: /paper status|on|off")
 
-    state = set_paper_trade_enabled(
-        action == "on",
-        updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
-    )
+    try:
+        state = set_paper_trade_enabled(
+            action == "on",
+            updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
+        )
+    except PaperTradeActivationError as exc:
+        raise TelegramCommandError(
+            f"Paper activation refused: {exc}"
+        ) from exc
     if action == "on":
         prefix = (
-            "✅ PAPER TRADE V1 — ON\n"
-            "New qualified LONG opportunities may enter the isolated paper ledger.\n"
+            "✅ PAPER TRADE — ON\n"
+            "Authoritative engine: FREQTRADE DRY-RUN\n"
+            "New qualified LONG opportunities may enter Freqtrade forward testing.\n"
+            "OHM internal simulator remains shadow/control only.\n"
         )
     else:
         prefix = (
-            "⛔ PAPER TRADE V1 — OFF\n"
+            "⛔ PAPER TRADE — OFF\n"
             "No new paper exposure will be admitted. Pending entries cancel on "
             "the next monitor pass; already-open paper positions continue to a "
             "terminal outcome.\n"

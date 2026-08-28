@@ -16,6 +16,10 @@ CONTROL_FILE = Path("/app/data/paper_trading/control.json")
 LOCK_FILE = CONTROL_FILE.parent / ".paper_control.lock"
 
 
+class PaperTradeActivationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class PaperTradeControl:
     enabled: bool
@@ -83,6 +87,61 @@ def set_paper_trade_enabled(
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise ValueError("paper control timestamp must be timezone-aware")
     timestamp = timestamp.astimezone(timezone.utc)
+
+    current = get_paper_trade_control(path)
+    if bool(enabled) and current.enabled and current.status == "OK":
+        return current
+
+    if path == CONTROL_FILE:
+        try:
+            from app.services.freqtrade_signal_bridge import cancel_admitted_signals
+        except Exception as exc:
+            if bool(enabled):
+                raise PaperTradeActivationError(
+                    f"paper signal cancellation unavailable: {type(exc).__name__}"
+                ) from exc
+            cancel_admitted_signals = None
+
+        # OFF permanently retires every currently admitted signal. A later ON
+        # transition also cleans any stale admissions left by a prior crash.
+        if cancel_admitted_signals is not None:
+            try:
+                cancel_admitted_signals(
+                    cancelled_at=timestamp,
+                    reason=(
+                        "PRE_ENABLE_STALE_ADMISSION"
+                        if bool(enabled)
+                        else "OPERATOR_OFF"
+                    ),
+                )
+            except Exception as exc:
+                if bool(enabled):
+                    raise PaperTradeActivationError(
+                        f"stale paper admission cleanup failed: {type(exc).__name__}"
+                    ) from exc
+                # OFF itself must remain fail-safe even if bridge cleanup fails;
+                # the control file below disables Freqtrade entry callbacks.
+
+    if bool(enabled) and path == CONTROL_FILE:
+        try:
+            from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
+
+            authoritative = freqtrade_dry_run_status()
+        except Exception as exc:
+            raise PaperTradeActivationError(
+                f"authoritative Freqtrade health unavailable: {type(exc).__name__}"
+            ) from exc
+        if authoritative.get("status") != "OK":
+            workers = authoritative.get("workers") or {}
+            worker_states = ", ".join(
+                f"{name}={row.get('status', 'UNKNOWN')}"
+                for name, row in sorted(workers.items())
+            ) or "no workers ready"
+            raise PaperTradeActivationError(
+                "authoritative Freqtrade is not healthy; "
+                f"{worker_states}"
+            )
+
     payload = {
         "schema_version": 1,
         "enabled": bool(enabled),

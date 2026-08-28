@@ -1,0 +1,67 @@
+services:
+  ohm-freqtrade-paper:
+    image: freqtradeorg/freqtrade:2026.7
+    container_name: ohm-freqtrade-paper
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: "0.40"
+    pids_limit: 256
+    oom_score_adj: 500
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - paper-egress
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        set -Eeuo pipefail
+        mkdir -p /freqtrade/user_data/strategies /freqtrade/state/logs
+        for REQUIRED in           /freqtrade/user_data/bridge/pairlist_usd.json           /freqtrade/user_data/bridge/pairlist_usdt.json           /freqtrade/user_data/bridge/signals.json; do
+          test -s "$$REQUIRED" || {
+            echo "Missing required OHM paper bridge file: $$REQUIRED" >&2
+            exit 1
+          }
+        done
+
+        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usd.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usd.sqlite           --config /freqtrade/config/config.json            --strategy OHMExternalSignalStrategy &
+        USD_PID=$$!
+
+        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usdt.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usdt.sqlite           --config /freqtrade/config/config_usdt.json            --strategy OHMExternalSignalStrategy &
+        USDT_PID=$$!
+
+        cleanup() {
+          kill "$$USD_PID" "$$USDT_PID" 2>/dev/null || true
+          wait "$$USD_PID" "$$USDT_PID" 2>/dev/null || true
+        }
+        trap cleanup EXIT INT TERM
+
+        while kill -0 "$$USD_PID" 2>/dev/null && kill -0 "$$USDT_PID" 2>/dev/null; do
+          sleep 5
+        done
+        echo "A Freqtrade paper worker exited; restarting paper sidecar only." >&2
+        exit 1
+    volumes:
+      - ./data/freqtrade/user_data:/freqtrade/user_data
+      - ./data/freqtrade/state:/freqtrade/state
+      - ./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro
+      - ./data/paper_trading:/freqtrade/control:ro
+      - ./freqtrade/user_data/config.json:/freqtrade/config/config.json:ro
+      - ./freqtrade/user_data/config_usdt.json:/freqtrade/config/config_usdt.json:ro
+      - ./freqtrade/user_data/strategies/OHMExternalSignalStrategy.py:/freqtrade/user_data/strategies/OHMExternalSignalStrategy.py:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /freqtrade/state/heartbeat_USD && test -f /freqtrade/state/heartbeat_USDT && find /freqtrade/state/heartbeat_USD -mmin -1 -print -quit | grep -q . && find /freqtrade/state/heartbeat_USDT -mmin -1 -print -quit | grep -q ."
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 45s
+
+
+networks:
+  paper-egress:
+    driver: bridge
