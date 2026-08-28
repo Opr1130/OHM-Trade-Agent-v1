@@ -17,6 +17,7 @@ from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.paper_trade_control import (
+    PaperTradeActivationError,
     get_paper_trade_control,
     set_paper_trade_enabled,
 )
@@ -536,10 +537,15 @@ def _handle_paper(settings: Any, args: tuple[str, ...]) -> None:
     if action not in {"on", "off"}:
         raise TelegramCommandError("Usage: /paper status|on|off")
 
-    state = set_paper_trade_enabled(
-        action == "on",
-        updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
-    )
+    try:
+        state = set_paper_trade_enabled(
+            action == "on",
+            updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
+        )
+    except PaperTradeActivationError as exc:
+        raise TelegramCommandError(
+            f"Paper activation refused: {exc}"
+        ) from exc
     if action == "on":
         prefix = (
             "✅ PAPER TRADE — ON\n"
