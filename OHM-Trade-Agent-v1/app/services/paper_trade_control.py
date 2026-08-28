@@ -151,7 +151,7 @@ def set_paper_trade_enabled(
         "kraken_execution_authority": False,
     }
     with registry_lock(_lock_file(path)):
-        save_json_atomic(path, payload)
+        save_json_atomic(path, payload, mode=0o644)
     return PaperTradeControl(
         enabled=bool(enabled),
         updated_at=timestamp.isoformat(),
