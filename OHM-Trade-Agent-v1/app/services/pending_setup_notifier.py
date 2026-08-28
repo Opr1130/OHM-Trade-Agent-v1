@@ -48,6 +48,21 @@ def _load_retries() -> dict:
     return _locked_load(RETRY_FILE)
 
 
+def terminal_notification_pending(trade_id: str) -> bool:
+    """Treat a queued terminal event as a quarantine until lifecycle truth settles."""
+    key = str(trade_id or "").strip()
+    if not key:
+        return False
+    try:
+        with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
+            retries = load_json(RETRY_FILE)
+        return isinstance(retries.get(key), dict)
+    except (OSError, TimeoutError, RegistryIOError):
+        # Fail closed: inability to inspect terminal outbox must not authorize
+        # a fresh entry-ready notification.
+        return True
+
+
 def _previous_status(value) -> str | None:
     if isinstance(value, dict):
         raw = value.get("status")
@@ -397,6 +412,18 @@ def send_pending_setup_update(
 ) -> bool:
     identity = f"PENDING_SETUP:{setup.trade_id or setup.symbol}"
     fingerprint = f"{setup.direction}:{result.status}"
+
+    if _terminal_status(result.status) is None and terminal_notification_pending(setup.trade_id):
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="PENDING_SETUP",
+            event_type=result.status,
+            fingerprint=fingerprint,
+            reason="TERMINAL_TRANSITION_PENDING",
+            symbol=setup.symbol,
+            trade_id=setup.trade_id,
+        )
+        return False
 
     if result.status in {"WAITING", "NEAR_ENTRY"}:
         record_telegram_not_eligible(
