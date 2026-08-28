@@ -684,6 +684,30 @@ def _source_health(
     ]
 
 
+def _version_attribution(events: list[dict[str, Any]]) -> dict[str, Any]:
+    tagged = [
+        row
+        for row in events
+        if isinstance(row.get("measurement_versions"), dict)
+    ]
+    latest_versions: dict[str, Any] = {}
+    if tagged:
+        latest = max(
+            tagged,
+            key=lambda row: str(row.get("observed_at") or ""),
+        )
+        latest_versions = dict(latest.get("measurement_versions") or {})
+    return {
+        "current": latest_versions or {
+            "intelligence_stack": MEASUREMENT_BASELINE_VERSION,
+        },
+        "tagged_events": len(tagged),
+        "unversioned_events": max(0, len(events) - len(tagged)),
+        "coverage_pct": _pct(len(tagged), len(events)),
+        "status": "MEASURED" if tagged else "BASELINE_BUILDING",
+    }
+
+
 def _evolution_scorecard(
     all_events: list[dict[str, Any]],
     *,
@@ -777,13 +801,7 @@ def _evolution_scorecard(
             if recent["samples"] < 5 or prior["samples"] < 5
             else "MEASURED"
         ),
-        "version_attribution": {
-            "intelligence_version": MEASUREMENT_BASELINE_VERSION,
-            "signal_quality_version": "PRE_BASELINE_UNVERSIONED",
-            "ranking_version": "PRE_BASELINE_UNVERSIONED",
-            "entry_strategy_version": "PRE_BASELINE_UNVERSIONED",
-            "exit_strategy_version": "PRE_BASELINE_UNVERSIONED",
-        },
+        "version_attribution": _version_attribution(all_events),
     }
 
 
@@ -795,10 +813,43 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
     now = _now()
     all_events = _read_jsonl(EVENT_FILE)
     scoped_events = _filter_events(all_events, cutoff=_cutoff(scope, now))
-    operations = build_operations_summary("today")
-    paper = freqtrade_dry_run_status()
-    paper_control = get_paper_trade_control()
-    tv = load_tradingview_evidence_diagnostics()
+    try:
+        operations = build_operations_summary("today")
+    except Exception:
+        operations = {
+            "market": {},
+            "ai": {},
+            "current": {},
+        }
+    try:
+        paper = freqtrade_dry_run_status()
+    except Exception as exc:
+        paper = {
+            "status": "UNAVAILABLE",
+            "open_trades": 0,
+            "closed_trades": 0,
+            "realized_pnl_by_currency": {},
+            "active_stake_by_currency": {},
+            "workers": {},
+            "reason": f"{type(exc).__name__}",
+        }
+    try:
+        paper_control = get_paper_trade_control()
+    except Exception:
+        class _Control:
+            enabled = False
+            status = "UNAVAILABLE"
+            updated_at = None
+            updated_by = "UNKNOWN"
+        paper_control = _Control()
+    try:
+        tv = load_tradingview_evidence_diagnostics()
+    except Exception as exc:
+        tv = {
+            "coverage_status": "UNAVAILABLE",
+            "queue_depth": 0,
+            "reason": f"{type(exc).__name__}",
+        }
     outcomes = _paper_outcomes(scoped_events)
     failure = _failure_summary(scoped_events, all_events, now=now)
     evidence = outbox_health()
@@ -875,7 +926,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
             "freqtrade_dedup": "SQLITE_PRIMARY_KEY",
             "freqtrade_outcome_rows": len(outcomes),
             "measurement_baseline": MEASUREMENT_BASELINE_VERSION,
-            "version_attribution_status": "BASELINE_BUILDING",
+            "version_attribution": _version_attribution(all_events),
             "notes": [
                 "Historical strategy-version tags were not persisted before this dashboard baseline.",
                 "Failure recurrence uses explicit rejection/exit codes and does not claim causal attribution.",
