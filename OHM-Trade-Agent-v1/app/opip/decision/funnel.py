@@ -391,11 +391,15 @@ class QualificationFunnel:
 def counts_by_outcome(
     decisions: Iterable[AdmissionDecision],
 ) -> dict[str, int]:
-    """Return the funnel counters used by the terminal-attribution invariant."""
+    """Return terminal counters without conflating policy, budget, and model stops."""
     tally = {
         "entered": 0,
         "qualified": 0,
+        "rejected_total": 0,
         "rejected_by_policy": 0,
+        "rejected_by_budget": 0,
+        "rejected_by_model": 0,
+        "rejected_other": 0,
         "operational_failures": 0,
         "incomplete": 0,
     }
@@ -404,7 +408,16 @@ def counts_by_outcome(
         if decision.decision is DecisionOutcome.QUALIFIED:
             tally["qualified"] += 1
         elif decision.decision is DecisionOutcome.REJECTED:
-            tally["rejected_by_policy"] += 1
+            tally["rejected_total"] += 1
+            reason_class = decision.terminal_reason_class
+            if reason_class is ReasonClass.POLICY:
+                tally["rejected_by_policy"] += 1
+            elif reason_class is ReasonClass.BUDGET:
+                tally["rejected_by_budget"] += 1
+            elif reason_class is ReasonClass.MODEL:
+                tally["rejected_by_model"] += 1
+            else:
+                tally["rejected_other"] += 1
         elif decision.decision is DecisionOutcome.OPERATIONAL_FAILURE:
             tally["operational_failures"] += 1
         else:
@@ -419,7 +432,7 @@ def invariant_holds(counts: Mapping[str, int]) -> bool:
     """Return whether every candidate that entered the funnel was attributed."""
     return int(counts.get("entered", 0)) == (
         int(counts.get("qualified", 0))
-        + int(counts.get("rejected_by_policy", 0))
+        + int(counts.get("rejected_total", counts.get("rejected_by_policy", 0)))
         + int(counts.get("operationally_unresolved", 0))
     )
 
