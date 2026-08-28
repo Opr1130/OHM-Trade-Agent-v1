@@ -21,7 +21,7 @@ DB_FILE = DB_USD_FILE
 STATE_FILE = Path("/app/data/intelligence_learning/freqtrade_ingest_state.json")
 
 
-def _parse_time(value: Any) -> datetime:
+def _parse_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         parsed = value
     else:
@@ -29,7 +29,7 @@ def _parse_time(value: Any) -> datetime:
         try:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
-            parsed = datetime.now(timezone.utc)
+            return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -85,6 +85,8 @@ def _read_trade_rows(
 
         columns = _columns(connection, "trades")
         required = {"id", "pair", "is_open", "enter_tag"}
+        if closed_only:
+            required |= {"close_date", "close_profit", "close_profit_abs"}
         if not required.issubset(columns):
             return (
                 "SCHEMA_UNAVAILABLE",
@@ -203,6 +205,7 @@ def ingest_freqtrade_dry_run(
     added = 0
     rows_seen = 0
     unmatched_outcomes = 0
+    invalid_outcomes = 0
     new_keys: list[str] = []
     worker_status: dict[str, str] = {}
     ready_workers = 0
@@ -232,6 +235,16 @@ def ingest_freqtrade_dry_run(
                 _value(row, columns, "close_date")
                 or _value(row, columns, "close_date_utc")
             )
+            if close_time is None:
+                invalid_outcomes += 1
+                continue
+            try:
+                net_pnl = float(_value(row, columns, "close_profit_abs"))
+                close_profit_ratio = float(_value(row, columns, "close_profit"))
+            except (TypeError, ValueError):
+                invalid_outcomes += 1
+                continue
+
             payload = {
                 "engine": "FREQTRADE",
                 "mode": "DRY_RUN",
@@ -258,12 +271,8 @@ def ingest_freqtrade_dry_run(
                 "amount": _value(row, columns, "amount"),
                 "fee_open": _value(row, columns, "fee_open"),
                 "fee_close": _value(row, columns, "fee_close"),
-                "close_profit_ratio": _value(
-                    row,
-                    columns,
-                    "close_profit",
-                ),
-                "net_pnl": _value(row, columns, "close_profit_abs"),
+                "close_profit_ratio": close_profit_ratio,
+                "net_pnl": net_pnl,
                 "exit_reason": _value(row, columns, "exit_reason"),
                 "strategy": _value(row, columns, "strategy"),
                 "timeframe": _value(row, columns, "timeframe"),
@@ -313,6 +322,7 @@ def ingest_freqtrade_dry_run(
         "closed_rows_seen": rows_seen,
         "outcomes_added": added,
         "unmatched_outcomes": unmatched_outcomes,
+        "invalid_outcomes": invalid_outcomes,
         "new_trade_ids": len(new_keys),
         "new_trade_keys": len(new_keys),
         "workers": worker_status,
