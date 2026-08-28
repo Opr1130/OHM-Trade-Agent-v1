@@ -18,17 +18,17 @@ services:
       - |
         set -Eeuo pipefail
         mkdir -p /freqtrade/user_data/strategies /freqtrade/state/logs
-        for REQUIRED in           /freqtrade/bridge/pairlist_usd.json           /freqtrade/bridge/pairlist_usdt.json           /freqtrade/bridge/signals.json; do
+        for REQUIRED in           /freqtrade/user_data/bridge/pairlist_usd.json           /freqtrade/user_data/bridge/pairlist_usdt.json           /freqtrade/user_data/bridge/signals.json; do
           test -s "$$REQUIRED" || {
             echo "Missing required OHM paper bridge file: $$REQUIRED" >&2
             exit 1
           }
         done
 
-        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usd.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usd.sqlite           --config /freqtrade/config/config.json           --strategy-path /freqtrade/user_data/strategies           --strategy OHMExternalSignalStrategy &
+        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usd.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usd.sqlite           --config /freqtrade/config/config.json            --strategy OHMExternalSignalStrategy &
         USD_PID=$$!
 
-        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usdt.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usdt.sqlite           --config /freqtrade/config/config_usdt.json           --strategy-path /freqtrade/user_data/strategies           --strategy OHMExternalSignalStrategy &
+        freqtrade trade           --logfile /freqtrade/state/logs/ohm-freqtrade-paper-usdt.log           --db-url sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usdt.sqlite           --config /freqtrade/config/config_usdt.json            --strategy OHMExternalSignalStrategy &
         USDT_PID=$$!
 
         cleanup() {
@@ -45,7 +45,7 @@ services:
     volumes:
       - ./data/freqtrade/user_data:/freqtrade/user_data
       - ./data/freqtrade/state:/freqtrade/state
-      - ./data/freqtrade_bridge:/freqtrade/bridge:ro
+      - ./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro
       - ./data/paper_trading:/freqtrade/control:ro
       - ./freqtrade/user_data/config.json:/freqtrade/config/config.json:ro
       - ./freqtrade/user_data/config_usdt.json:/freqtrade/config/config_usdt.json:ro
