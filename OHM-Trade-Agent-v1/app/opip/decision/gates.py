@@ -292,6 +292,7 @@ def evaluate_deterministic_quality_gate(
             reason="deterministic target and economic gates viable at low or medium risk",
             measured_value=binding["binding_measured"],
             threshold=binding["binding_threshold"],
+            higher_is_better=bool(binding.get("binding_higher_is_better", True)),
             evaluated_at=evaluated_at,
             metadata=metadata,
         )
@@ -303,6 +304,7 @@ def evaluate_deterministic_quality_gate(
         or "no risk level clears both the target and economic gates",
         measured_value=binding["binding_measured"],
         threshold=binding["binding_threshold"],
+        higher_is_better=bool(binding.get("binding_higher_is_better", True)),
         evaluated_at=evaluated_at,
         metadata=metadata,
     )

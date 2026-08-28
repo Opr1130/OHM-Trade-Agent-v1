@@ -76,16 +76,30 @@ def _explanation_sentence(summary: dict[str, Any]) -> str:
         return f"{qualified} of {entered} directional candidates qualified."
     if entered == 0:
         return "No directional candidate entered the qualification funnel."
+    eligible = int(ai_stage.get("eligible_candidates_before_ai", 0) or 0)
+    earlier = max(0, entered - eligible)
     if ai_stage.get("budget_exhausted"):
+        if eligible == entered:
+            return (
+                f"All {entered} directional candidates reached Chief review and "
+                "were stopped because the daily AI budget guard suppressed the call."
+            )
         return (
-            f"All {entered} directional candidates stopped at the Chief review "
-            "stage because the daily AI budget guard suppressed the call."
+            f"{eligible} of {entered} directional candidates reached Chief review "
+            "and were stopped because the daily AI budget guard suppressed the call; "
+            f"{earlier} stopped earlier in the qualification funnel."
         )
     if ai_stage.get("unavailable"):
         failure = ai_stage.get("failure_type") or "unavailable"
+        if eligible == entered:
+            return (
+                f"All {entered} directional candidates reached Chief review and "
+                f"were stopped because the AI service was {failure}."
+            )
         return (
-            f"All {entered} directional candidates stopped at the Chief review "
-            f"stage because the AI service was {failure}."
+            f"{eligible} of {entered} directional candidates reached Chief review "
+            f"and were stopped because the AI service was {failure}; "
+            f"{earlier} stopped earlier in the qualification funnel."
         )
     gate = terminal.get("dominant_terminal_gate") or "an unattributed gate"
     reasons = terminal.get("top_reasons") or {}
@@ -122,12 +136,15 @@ def build_zero_trade_explanation(
         if telemetry_enabled is None
         else bool(telemetry_enabled)
     )
+    # Current control state is authoritative. Historical summaries may remain
+    # on disk after telemetry is disabled (including rollback), but they must
+    # never be presented as the current explanation.
+    if not enabled:
+        return _empty(STATE_TELEMETRY_DISABLED, telemetry_enabled=False)
+
     summary = read_latest_scan_summary(path=summaries_path)
     if summary is None:
-        return _empty(
-            STATE_TELEMETRY_DISABLED if not enabled else STATE_NO_DATA,
-            telemetry_enabled=enabled,
-        )
+        return _empty(STATE_NO_DATA, telemetry_enabled=True)
 
     moment = now or datetime.now(timezone.utc)
     recorded_at = _parse_utc(summary.get("decision_at_utc"))
@@ -158,7 +175,11 @@ def build_zero_trade_explanation(
         "directional_candidates": funnel.get("entered", 0),
         "deepest_stage_reached": terminal.get("deepest_stage_reached"),
         "qualified": funnel.get("qualified", 0),
+        "rejected_total": funnel.get("rejected_total", 0),
         "rejected_by_policy": funnel.get("rejected_by_policy", 0),
+        "rejected_by_budget": funnel.get("rejected_by_budget", 0),
+        "rejected_by_model": funnel.get("rejected_by_model", 0),
+        "rejected_other": funnel.get("rejected_other", 0),
         "paper_admission_eligible": summary.get("paper_admission_eligible", 0),
         "dominant_terminal_gate": terminal.get("dominant_terminal_gate"),
         "dominant_rejection_reasons": terminal.get("top_reasons") or {},

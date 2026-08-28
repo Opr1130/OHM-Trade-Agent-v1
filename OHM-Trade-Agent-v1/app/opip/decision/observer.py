@@ -301,8 +301,12 @@ class OPipScanObserver:
                 reason=str(row.get("reason") or "deterministic prefilter rejected"),
                 measured_value=row.get("binding_measured"),
                 threshold=row.get("binding_threshold"),
+                higher_is_better=bool(row.get("binding_higher_is_better", True)),
                 metadata={
                     "binding_metric": row.get("binding_metric"),
+                    "binding_higher_is_better": bool(
+                        row.get("binding_higher_is_better", True)
+                    ),
                     "best_target_quality_score": row.get("best_target_quality_score"),
                     "best_economic_net_profit": row.get("best_economic_net_profit"),
                     "target_qualified_any": bool(row.get("target_qualified_any")),

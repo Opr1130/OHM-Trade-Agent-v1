@@ -172,7 +172,12 @@ def render_scan_summary_text(summary: Mapping[str, Any]) -> str:
     lines: list[str] = ["O'Pip Qualification Summary", ""]
     lines.append(f"Directional candidates: {funnel.get('entered', 0)}")
     lines.append(f"Qualified: {funnel.get('qualified', 0)}")
+    lines.append(f"Rejected total: {funnel.get('rejected_total', 0)}")
     lines.append(f"Rejected by policy: {funnel.get('rejected_by_policy', 0)}")
+    lines.append(f"Budget suppressions: {funnel.get('rejected_by_budget', 0)}")
+    lines.append(f"Model stops: {funnel.get('rejected_by_model', 0)}")
+    if funnel.get("rejected_other"):
+        lines.append(f"Other rejected: {funnel.get('rejected_other', 0)}")
     lines.append(f"Operational failures: {funnel.get('operational_failures', 0)}")
     if funnel.get("incomplete"):
         lines.append(f"Incomplete (unattributed): {funnel.get('incomplete', 0)}")
