@@ -352,7 +352,7 @@ def _fmt_price(value: float) -> str:
 
 
 def format_market_insight(insight: MarketInsight, *, verbose: bool = False, watch: bool = False) -> str:
-    prefix = "👁 OHM WATCH" if watch else "🔎 OHM SCAN"
+    prefix = "👁 WATCH" if watch else "🔎 SCAN"
     flow_text = insight.flow_bias
     if insight.flow_bias != "UNAVAILABLE":
         flow_text += f" {insight.flow_strength}/10"
