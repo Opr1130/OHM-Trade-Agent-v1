@@ -93,18 +93,6 @@ def set_paper_trade_enabled(
     }
     with registry_lock(_lock_file(path)):
         save_json_atomic(path, payload)
-    if path == CONTROL_FILE:
-        try:
-            from app.services.freqtrade_signal_bridge import mirror_control
-            mirror_control(
-                enabled=bool(enabled),
-                updated_at=timestamp,
-                updated_by=payload["updated_by"],
-            )
-        except Exception:
-            # Paper-control durability is authoritative. Bridge mirroring is
-            # fail-soft and can never alter production trading authority.
-            pass
     return PaperTradeControl(
         enabled=bool(enabled),
         updated_at=timestamp.isoformat(),
