@@ -192,6 +192,63 @@ def link_qualified_signal(
     return journey_id
 
 
+def record_paper_admission(
+    *,
+    signal_id: str,
+    symbol: str,
+    observed_at: datetime,
+    admitted: bool,
+    reason: str,
+    payload: dict[str, Any] | None = None,
+    state_file: Path = STATE_FILE,
+    event_file: Path = EVENT_FILE,
+) -> str | None:
+    timestamp = _utc(observed_at)
+    signal = str(signal_id or "").strip()
+    normalized = str(symbol or "").strip().upper()
+    if not signal or not normalized:
+        return None
+
+    lock = state_file.parent / f".{state_file.name}.lock"
+    with registry_lock(lock):
+        state = load_json(state_file)
+        journey_id = (state.get("signals") or {}).get(signal)
+        if not journey_id:
+            return None
+        symbols = state.setdefault("symbols", {})
+        for candidate in symbols.values():
+            if isinstance(candidate, dict) and candidate.get("journey_id") == journey_id:
+                candidate["latest_paper_admission"] = {
+                    "signal_id": signal,
+                    "admitted": bool(admitted),
+                    "reason": str(reason),
+                    "observed_at": timestamp.isoformat(),
+                }
+                candidate["last_seen_at"] = timestamp.isoformat()
+                save_json_atomic(state_file, state)
+                break
+
+    _append_event(
+        {
+            "record_type": "INTELLIGENCE_JOURNEY_EVENT",
+            "population": "FREQTRADE_DRY_RUN_V1",
+            "event_type": "PAPER_ADMISSION",
+            "journey_id": str(journey_id),
+            "signal_id": signal,
+            "symbol": normalized,
+            "observed_at": timestamp.isoformat(),
+            "admitted": bool(admitted),
+            "reason": str(reason),
+            "payload": dict(payload or {}),
+            "measurement_only": True,
+            "affects_ranking": False,
+            "affects_trade_authority": False,
+        },
+        event_file,
+    )
+    return str(journey_id)
+
+
 def journey_for_signal(
     signal_id: str,
     *,
