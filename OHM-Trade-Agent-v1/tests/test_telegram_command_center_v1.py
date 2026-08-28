@@ -359,7 +359,7 @@ def test_scan_failure_returns_safe_message(monkeypatch):
     monkeypatch.setattr(commands, "send_telegram_message", lambda *args: sent.append(args[-1]) or True)
     monkeypatch.setattr(commands, "analyze_market", lambda *a, **k: (_ for _ in ()).throw(insights.MarketInsightUnavailable("timeout")))
     commands.process_command_message({"message": {"text": "/scan VVV"}}, settings=_settings())
-    assert any("OHM SCAN" in item and "timeout" in item for item in sent)
+    assert any("SCAN" in item and "timeout" in item and "OHM SCAN" not in item for item in sent)
 
 
 def test_too_long_command_returns_error_instead_of_crashing_listener(monkeypatch):
