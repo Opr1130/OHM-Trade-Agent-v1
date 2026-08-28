@@ -65,16 +65,18 @@ def ensure_bridge_files(
 ) -> None:
     signals_file.parent.mkdir(parents=True, exist_ok=True)
     if not signals_file.exists():
-        save_json_atomic(signals_file, {"schema_version": 1, "signals": []})
+        save_json_atomic(signals_file, {"schema_version": 1, "signals": []}, mode=0o644)
     if not pairlist_usd_file.exists():
         save_json_atomic(
             pairlist_usd_file,
             {"pairs": ["BTC/USD"], "refresh_period": 10, "stake_currency": "USD"},
+            mode=0o644,
         )
     if not pairlist_usdt_file.exists():
         save_json_atomic(
             pairlist_usdt_file,
             {"pairs": ["BTC/USDT"], "refresh_period": 10, "stake_currency": "USDT"},
+            mode=0o644,
         )
 
 
@@ -249,6 +251,7 @@ def publish_qualified_long(
                 "updated_at": decision.isoformat(),
                 "signals": retained[-500:],
             },
+            mode=0o644,
         )
 
     target_pairlist = pairlist_file or (
@@ -275,6 +278,7 @@ def publish_qualified_long(
                 "updated_at": decision.isoformat(),
                 "stake_currency": quote,
             },
+            mode=0o644,
         )
     return signal
 
@@ -309,7 +313,7 @@ def mark_signal_terminal(
         if changed:
             payload["updated_at"] = timestamp.isoformat()
             payload["signals"] = rows
-            save_json_atomic(signals_file, payload)
+            save_json_atomic(signals_file, payload, mode=0o644)
         return changed
 
 
@@ -340,5 +344,5 @@ def cancel_admitted_signals(
         if changed:
             payload["updated_at"] = timestamp.isoformat()
             payload["signals"] = rows
-            save_json_atomic(signals_file, payload)
+            save_json_atomic(signals_file, payload, mode=0o644)
         return changed
