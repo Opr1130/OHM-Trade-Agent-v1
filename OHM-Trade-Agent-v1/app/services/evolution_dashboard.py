@@ -275,15 +275,20 @@ def _short_date(value: Any) -> str:
     return at.strftime("%b %d")
 
 
-def _daily_trend(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped = _journeys(events)
+def _daily_trend(
+    events: list[dict[str, Any]],
+    *,
+    context_events: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    context = context_events if context_events is not None else events
+    context_journeys = _journeys(context)
     daily: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "early_journeys": set(),
             "qualified_signals": set(),
             "paper_outcomes": [],
+            "early_outcomes": [],
             "wins": 0,
-            "losses": 0,
         }
     )
     for row in events:
@@ -301,35 +306,33 @@ def _daily_trend(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             payload = row.get("payload") or {}
             net = _safe_float(payload.get("net_pnl"))
             ratio = _safe_float(payload.get("close_profit_ratio"))
-            if net is not None:
-                daily[key]["paper_outcomes"].append(ratio)
-                if net > 0:
-                    daily[key]["wins"] += 1
-                elif net < 0:
-                    daily[key]["losses"] += 1
-
-    early_outcomes: dict[str, list[float]] = defaultdict(list)
-    for jid, rows in grouped.items():
-        has_early = any(
-            _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
-            for row in rows
-        )
-        if not has_early:
-            continue
-        for row in rows:
-            if _event_type(row) != "PAPER_OUTCOME":
+            if net is None:
                 continue
-            at = _parse_time(row.get("observed_at"))
-            net = _safe_float((row.get("payload") or {}).get("net_pnl"))
-            if at is not None and net is not None:
-                early_outcomes[at.date().isoformat()].append(net)
+            daily[key]["paper_outcomes"].append(ratio)
+            if net > 0:
+                daily[key]["wins"] += 1
+            journey_id = str(row.get("journey_id") or "")
+            history = context_journeys.get(journey_id, [])
+            if any(
+                _event_type(item) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
+                and (
+                    (_parse_time(item.get("observed_at")) or at) <= at
+                )
+                for item in history
+            ):
+                daily[key]["early_outcomes"].append(net)
 
     result: list[dict[str, Any]] = []
     for key in sorted(daily):
         row = daily[key]
         outcome_count = len(row["paper_outcomes"])
         wins = int(row["wins"])
-        early_values = early_outcomes.get(key, [])
+        early_values = row["early_outcomes"]
+        valid_returns = [
+            value * 100.0
+            for value in row["paper_outcomes"]
+            if value is not None
+        ]
         result.append(
             {
                 "date": key,
@@ -343,21 +346,13 @@ def _daily_trend(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     len(early_values),
                 ),
                 "avg_return_pct": (
-                    round(
-                        mean(
-                            value * 100.0
-                            for value in row["paper_outcomes"]
-                            if value is not None
-                        ),
-                        6,
-                    )
-                    if any(value is not None for value in row["paper_outcomes"])
+                    round(mean(valid_returns), 6)
+                    if valid_returns
                     else None
                 ),
             }
         )
     return result
-
 
 def _failure_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
@@ -476,28 +471,40 @@ def _failure_summary(
     }
 
 
-def _pattern_performance(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped = _journeys(events)
+def _pattern_performance(
+    events: list[dict[str, Any]],
+    *,
+    context_events: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    context = context_events if context_events is not None else events
+    context_journeys = _journeys(context)
     buckets: dict[str, list[float]] = defaultdict(list)
-    for rows in grouped.values():
-        early = [
-            row for row in rows
-            if _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
-        ]
-        outcomes = [row for row in rows if _event_type(row) == "PAPER_OUTCOME"]
-        if not outcomes:
+
+    for outcome in events:
+        if _event_type(outcome) != "PAPER_OUTCOME":
             continue
+        ratio = _safe_float((outcome.get("payload") or {}).get("close_profit_ratio"))
+        if ratio is None:
+            continue
+        outcome_at = _parse_time(outcome.get("observed_at"))
+        journey_id = str(outcome.get("journey_id") or "")
+        history = context_journeys.get(journey_id, [])
+        early = [
+            row
+            for row in history
+            if _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
+            and (
+                outcome_at is None
+                or (_parse_time(row.get("observed_at")) or outcome_at) <= outcome_at
+            )
+        ]
         pattern = "NO EARLY WATCH"
         stage = "—"
         if early:
             payload = early[-1].get("payload") or {}
             pattern = str(payload.get("pattern") or "UNCLASSIFIED")
             stage = str(payload.get("stage") or "UNKNOWN")
-        key = f"{stage} · {pattern}"
-        for outcome in outcomes:
-            ratio = _safe_float((outcome.get("payload") or {}).get("close_profit_ratio"))
-            if ratio is not None:
-                buckets[key].append(ratio * 100.0)
+        buckets[f"{stage} · {pattern}"].append(ratio * 100.0)
 
     result: list[dict[str, Any]] = []
     for name, values in buckets.items():
@@ -511,7 +518,6 @@ def _pattern_performance(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     result.sort(key=lambda row: (-row["samples"], -(row["avg_return_pct"] or -9999)))
     return result[:10]
-
 
 def _recent_journeys(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
@@ -562,6 +568,66 @@ def _recent_journeys(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     result.sort(key=lambda row: str(row.get("last_seen_at") or ""), reverse=True)
     return result[:30]
+
+
+def _live_candidates(
+    events: list[dict[str, Any]],
+    *,
+    now: datetime,
+    lookback_hours: int = 6,
+) -> list[dict[str, Any]]:
+    cutoff = now - timedelta(hours=max(1, lookback_hours))
+    latest_by_journey: dict[str, dict[str, Any]] = {}
+    for row in events:
+        if _event_type(row) not in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}:
+            continue
+        at = _parse_time(row.get("observed_at"))
+        journey_id = str(row.get("journey_id") or "")
+        if at is None or at < cutoff or not journey_id:
+            continue
+        existing = latest_by_journey.get(journey_id)
+        existing_at = _parse_time(existing.get("observed_at")) if existing else None
+        if existing is None or existing_at is None or at >= existing_at:
+            latest_by_journey[journey_id] = row
+
+    rows: list[dict[str, Any]] = []
+    for journey_id, row in latest_by_journey.items():
+        payload = row.get("payload") or {}
+        at = _parse_time(row.get("observed_at"))
+        rows.append(
+            {
+                "journey_id": journey_id,
+                "symbol": row.get("symbol"),
+                "observed_at": row.get("observed_at"),
+                "age_minutes": (
+                    round((now - at).total_seconds() / 60.0, 1)
+                    if at is not None
+                    else None
+                ),
+                "event_type": _event_type(row),
+                "stage": payload.get("stage"),
+                "pattern": payload.get("pattern"),
+                "opportunity_score": _safe_float(payload.get("opportunity_score")),
+                "explosion_potential_score": _safe_float(
+                    payload.get("explosion_potential_score")
+                ),
+                "tradeability_score": _safe_float(payload.get("tradeability_score")),
+                "relative_strength_score": _safe_float(
+                    payload.get("relative_strength_score")
+                ),
+                "persistence_score": _safe_float(payload.get("persistence_score")),
+                "exhaustion_penalty": _safe_float(payload.get("exhaustion_penalty")),
+                "delivery_action": row.get("delivery_action"),
+                "delivered": bool(row.get("delivered")),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            -(row["opportunity_score"] if row["opportunity_score"] is not None else -1),
+            row["age_minutes"] if row["age_minutes"] is not None else 10**9,
+        )
+    )
+    return rows[:30]
 
 
 def _paper_trade_rows(
@@ -725,50 +791,85 @@ def _evolution_scorecard(
     *,
     now: datetime,
 ) -> dict[str, Any]:
+    context_journeys = _journeys(all_events)
+    outcomes_by_signal = {
+        str(row.get("signal_id")): row
+        for row in all_events
+        if _event_type(row) == "PAPER_OUTCOME" and row.get("signal_id")
+    }
+
     def window(start: datetime, end: datetime) -> dict[str, Any]:
-        rows = [
+        outcomes = [
             row
             for row in all_events
-            if (at := _parse_time(row.get("observed_at"))) is not None
+            if _event_type(row) == "PAPER_OUTCOME"
+            and (at := _parse_time(row.get("observed_at"))) is not None
             and start <= at < end
         ]
-        funnel = _funnel(rows)
-        outcomes = _paper_outcomes(rows)
-        failures = _failure_events(rows)
-        grouped = _journeys(rows)
+        failures = [
+            row
+            for row in _failure_events(all_events)
+            if start <= row["at"] < end
+        ]
         early_outcomes: list[float] = []
-        for journey_rows in grouped.values():
-            if not any(
-                _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
-                for row in journey_rows
-            ):
+        paper_returns: list[float] = []
+        paper_wins = 0
+        for outcome in outcomes:
+            payload = outcome.get("payload") or {}
+            net = _safe_float(payload.get("net_pnl"))
+            ratio = _safe_float(payload.get("close_profit_ratio"))
+            if net is None:
                 continue
-            for row in journey_rows:
-                if _event_type(row) != "PAPER_OUTCOME":
-                    continue
-                net = _safe_float((row.get("payload") or {}).get("net_pnl"))
-                if net is not None:
-                    early_outcomes.append(net)
+            if net > 0:
+                paper_wins += 1
+            if ratio is not None:
+                paper_returns.append(ratio * 100.0)
+            journey_id = str(outcome.get("journey_id") or "")
+            history = context_journeys.get(journey_id, [])
+            outcome_at = _parse_time(outcome.get("observed_at"))
+            if any(
+                _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
+                and (
+                    outcome_at is None
+                    or (_parse_time(row.get("observed_at")) or outcome_at) <= outcome_at
+                )
+                for row in history
+            ):
+                early_outcomes.append(net)
+
+        maturity_cutoff = now - timedelta(hours=48)
+        mature_requested: set[str] = set()
+        for row in all_events:
+            if _event_type(row) != "QUALIFIED_SIGNAL" or not row.get("signal_id"):
+                continue
+            at = _parse_time(row.get("observed_at"))
+            if (
+                at is not None
+                and start <= at < end
+                and at <= maturity_cutoff
+                and bool((row.get("payload") or {}).get("paper_requested"))
+            ):
+                mature_requested.add(str(row["signal_id"]))
+        mature_closed = mature_requested & set(outcomes_by_signal)
+
         return {
             "early_precision_pct": _pct(
                 sum(value > 0 for value in early_outcomes),
                 len(early_outcomes),
             ),
-            "signal_to_outcome_pct": funnel["requested_to_closed_pct"],
-            "paper_win_rate_pct": _pct(
-                sum(row["net_pnl"] > 0 for row in outcomes),
-                len(outcomes),
+            "signal_to_outcome_pct": _pct(
+                len(mature_closed),
+                len(mature_requested),
             ),
+            "paper_win_rate_pct": _pct(paper_wins, len(outcomes)),
             "avg_return_pct": (
-                round(
-                    mean(row["return_pct"] for row in outcomes if row["return_pct"] is not None),
-                    6,
-                )
-                if any(row["return_pct"] is not None for row in outcomes)
+                round(mean(paper_returns), 6)
+                if paper_returns
                 else None
             ),
             "failure_events": len(failures),
             "samples": len(outcomes),
+            "mature_signal_samples": len(mature_requested),
         }
 
     recent = window(now - timedelta(days=7), now)
@@ -776,7 +877,7 @@ def _evolution_scorecard(
     metrics = []
     specs = [
         ("Early-watch / closed win rate", "early_precision_pct", "higher"),
-        ("Signal → closed conversion", "signal_to_outcome_pct", "higher"),
+        ("Mature signal → closed conversion", "signal_to_outcome_pct", "higher"),
         ("Paper win rate", "paper_win_rate_pct", "higher"),
         ("Average paper return", "avg_return_pct", "higher"),
         ("Failure events", "failure_events", "lower"),
@@ -807,6 +908,8 @@ def _evolution_scorecard(
         "prior_window": "Previous 7 days",
         "recent_samples": recent["samples"],
         "prior_samples": prior["samples"],
+        "recent_mature_signal_samples": recent["mature_signal_samples"],
+        "prior_mature_signal_samples": prior["mature_signal_samples"],
         "metrics": metrics,
         "attribution_status": (
             "BASELINE_BUILDING"
@@ -815,7 +918,6 @@ def _evolution_scorecard(
         ),
         "version_attribution": _version_attribution(all_events),
     }
-
 
 def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
     scope = str(scope or "30d").lower()
@@ -911,9 +1013,16 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
             "market": operations.get("market") or {},
             "ai": operations.get("ai") or {},
             "tradingview": tv,
+            "live_candidates": _live_candidates(
+                all_events,
+                now=now,
+            ),
         },
         "funnel": _funnel(scoped_events),
-        "trend": _daily_trend(scoped_events),
+        "trend": _daily_trend(
+            scoped_events,
+            context_events=all_events,
+        ),
         "paper": {
             "status": paper,
             "control": {
@@ -926,7 +1035,10 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
             "trades": _paper_trade_rows(cutoff=_cutoff(scope, now)),
         },
         "signal_intelligence": {
-            "pattern_performance": _pattern_performance(scoped_events),
+            "pattern_performance": _pattern_performance(
+                scoped_events,
+                context_events=all_events,
+            ),
         },
         "failures": failure,
         "journeys": _recent_journeys(scoped_events),
