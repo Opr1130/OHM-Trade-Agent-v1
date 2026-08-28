@@ -18,6 +18,12 @@ PAIRLIST_FILE = PAIRLIST_USD_FILE
 SIGNAL_RETENTION = timedelta(days=7)
 
 
+class PaperAdmissionRejected(RuntimeError):
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(self.reason)
+
+
 def _utc(value: datetime | None = None) -> datetime:
     result = value or datetime.now(timezone.utc)
     if result.tzinfo is None or result.utcoffset() is None:
@@ -94,6 +100,8 @@ def publish_qualified_long(
     confidence: int,
     profit_rank: int | None,
     profit_rank_score: float | None,
+    starting_equity: float,
+    max_positions: int,
     early_watch_context: dict[str, Any] | None = None,
     signals_file: Path = SIGNALS_FILE,
     pairlist_file: Path | None = None,
@@ -138,6 +146,8 @@ def publish_qualified_long(
         "profit_rank_score": profit_rank_score,
         "early_watch_context": dict(early_watch_context or {}),
         "population": "FREQTRADE_DRY_RUN_V1",
+        "admission_status": "ADMITTED",
+        "admitted_at": decision.isoformat(),
         "exchange_write_authority": False,
     }
 
@@ -148,22 +158,52 @@ def publish_qualified_long(
         rows = payload.get("signals") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             rows = []
+
         cutoff = decision - SIGNAL_RETENTION
         retained: list[dict[str, Any]] = []
-        replaced = False
+        existing_signal: dict[str, Any] | None = None
+        active_admissions: list[dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
             row_time = _parse(row.get("decision_at"))
             if row_time is not None and row_time < cutoff:
                 continue
+            retained.append(row)
             if row.get("signal_id") == signal_id:
-                retained.append(signal)
-                replaced = True
-            else:
-                retained.append(row)
-        if not replaced:
-            retained.append(signal)
+                existing_signal = row
+                continue
+            expiry = _parse(row.get("expires_at"))
+            if (
+                str(row.get("admission_status") or "").upper() == "ADMITTED"
+                and expiry is not None
+                and expiry >= decision
+            ):
+                active_admissions.append(row)
+
+        if existing_signal is not None:
+            return existing_signal
+
+        if int(max_positions) < 1:
+            raise PaperAdmissionRejected("GLOBAL_POSITION_CAPACITY_INVALID")
+        if len(active_admissions) >= int(max_positions):
+            raise PaperAdmissionRejected("GLOBAL_POSITION_CAPACITY")
+
+        try:
+            reserved = sum(
+                max(0.0, float(row.get("stake_amount") or 0.0))
+                for row in active_admissions
+            )
+        except (TypeError, ValueError):
+            raise PaperAdmissionRejected("GLOBAL_CAPITAL_STATE_INVALID")
+        requested_stake = float(stake_amount)
+        equity = float(starting_equity)
+        if requested_stake <= 0 or equity <= 0:
+            raise PaperAdmissionRejected("GLOBAL_CAPITAL_POLICY_INVALID")
+        if reserved + requested_stake > equity + 1e-9:
+            raise PaperAdmissionRejected("GLOBAL_CAPITAL_CAPACITY")
+
+        retained.append(signal)
         save_json_atomic(
             signals_file,
             {
@@ -199,3 +239,73 @@ def publish_qualified_long(
             },
         )
     return signal
+
+
+
+def mark_signal_terminal(
+    signal_id: str,
+    *,
+    terminal_at: datetime,
+    outcome: str,
+    signals_file: Path = SIGNALS_FILE,
+) -> bool:
+    signal_key = str(signal_id or "").strip()
+    if not signal_key or not signals_file.exists():
+        return False
+    timestamp = _utc(terminal_at)
+    lock = signals_file.parent / f".{signals_file.name}.lock"
+    with registry_lock(lock):
+        payload = load_json(signals_file)
+        rows = payload.get("signals") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return False
+        changed = False
+        for row in rows:
+            if not isinstance(row, dict) or row.get("signal_id") != signal_key:
+                continue
+            row["admission_status"] = "TERMINAL"
+            row["terminal_at"] = timestamp.isoformat()
+            row["terminal_outcome"] = str(outcome or "UNKNOWN")
+            changed = True
+            break
+        if changed:
+            payload["updated_at"] = timestamp.isoformat()
+            payload["signals"] = rows
+            save_json_atomic(signals_file, payload)
+        return changed
+
+
+def cancel_admitted_signals(
+    *,
+    cancelled_at: datetime,
+    reason: str = "OPERATOR_OFF",
+    signals_file: Path = SIGNALS_FILE,
+) -> int:
+    if not signals_file.exists():
+        return 0
+    timestamp = _utc(cancelled_at)
+    lock = signals_file.parent / f".{signals_file.name}.lock"
+    with registry_lock(lock):
+        payload = load_json(signals_file)
+        rows = payload.get("signals") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return 0
+        changed = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            expiry = _parse(row.get("expires_at"))
+            if (
+                str(row.get("admission_status") or "").upper() == "ADMITTED"
+                and expiry is not None
+                and expiry >= timestamp
+            ):
+                row["admission_status"] = "CANCELLED"
+                row["terminal_at"] = timestamp.isoformat()
+                row["terminal_outcome"] = str(reason)
+                changed += 1
+        if changed:
+            payload["updated_at"] = timestamp.isoformat()
+            payload["signals"] = rows
+            save_json_atomic(signals_file, payload)
+        return changed
