@@ -108,7 +108,7 @@ jobs:
               assert config["exchange"]["name"] == "kraken"
               assert not config["exchange"].get("key")
               assert not config["exchange"].get("secret")
-              assert config["api_server"]["enabled"] is False
+              assert "api_server" not in config
               assert "telegram" not in config
               assert config["pairlists"][0]["processing_mode"] == "append"
 
