@@ -989,7 +989,7 @@ def test_card_renders_every_required_line_and_refuses_to_authorise_entry():
     ranked = evaluate_universe(features, derive_universe_percentiles(features), config=CONFIG)
     card = _signal_quality_card(ranked[0])
 
-    assert "OHM EARLY WATCH — BIGUSD" in card
+    assert "EARLY WATCH — BIGUSD" in card\n    assert "OHM EARLY WATCH" not in card
     for label in (
         "Stage:",
         "Pattern:",
