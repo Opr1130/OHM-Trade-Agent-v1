@@ -353,9 +353,9 @@ def _economic_quality(plan, snapshot, account_equity):
 
 def _telegram_delivery_ready(settings) -> bool:
     return bool(
-        settings.telegram_enabled
-        and settings.telegram_bot_token
-        and settings.telegram_chat_id
+        getattr(settings, "telegram_enabled", False)
+        and getattr(settings, "telegram_bot_token", None)
+        and getattr(settings, "telegram_chat_id", None)
     )
 
 
