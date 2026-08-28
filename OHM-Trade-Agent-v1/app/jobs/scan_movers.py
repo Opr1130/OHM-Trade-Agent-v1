@@ -42,6 +42,39 @@ def _transition_key(signal) -> str:
     )
 
 
+def _deliver_existing_card_update(
+    *,
+    settings,
+    decision,
+    message: str,
+) -> tuple[str, int | None]:
+    """Deliver an existing opportunity update without hiding meaningful changes.
+
+    Periodic same-state refreshes edit the canonical Telegram card silently.
+    A meaningful transition sends a fresh card so Telegram generates a new
+    mobile notification. The new message becomes canonical only after Telegram
+    accepts it, so a failed transition send remains retryable next scan.
+    """
+    if decision.reason == "MEANINGFUL_TRANSITION":
+        message_id = send_telegram_message_with_id(
+            settings.telegram_bot_token,
+            settings.telegram_chat_id,
+            message,
+        )
+        if message_id is None:
+            return "TRANSITION_PUSH_FAILED", None
+        return "TRANSITION_PUSHED", message_id
+
+    if edit_telegram_message(
+        settings.telegram_bot_token,
+        settings.telegram_chat_id,
+        decision.message_id,
+        message,
+    ):
+        return "EDITED", decision.message_id
+    return "EDIT_FAILED", None
+
+
 def _maybe_record_decision_telemetry(full_market, settings, *, decision_at) -> None:
     """Phase 3A forward telemetry only; no external OHLC I/O occurs here."""
     if full_market is None:
@@ -342,6 +375,8 @@ def main() -> None:
     broad_created = 0
     broad_edited = 0
     broad_suppressed = 0
+    transition_pushes = 0
+    transition_push_failures = 0
     early_mover_delivery: dict[str, tuple[str, bool]] = {}
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     if (
@@ -373,23 +408,30 @@ def main() -> None:
 
             message = _compact_card(signal)
             if decision.action == "EDIT" and decision.message_id is not None:
-                if edit_telegram_message(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    decision.message_id,
-                    message,
-                ):
+                delivery_action, delivered_message_id = _deliver_existing_card_update(
+                    settings=settings,
+                    decision=decision,
+                    message=message,
+                )
+                if delivered_message_id is not None:
                     record_opportunity_alert(
                         identity=identity,
                         transition_key=transition_key,
-                        message_id=decision.message_id,
+                        message_id=delivered_message_id,
                         created_new=False,
                     )
                     edited += 1
-                    early_mover_delivery[signal.symbol.upper()] = ("EDITED", True)
+                    if delivery_action == "TRANSITION_PUSHED":
+                        transition_pushes += 1
+                    early_mover_delivery[signal.symbol.upper()] = (delivery_action, True)
                 else:
-                    early_mover_delivery[signal.symbol.upper()] = ("EDIT_FAILED", False)
-                    print(f"Telegram edit failed for {signal.symbol}; existing card retained for retry.")
+                    if delivery_action == "TRANSITION_PUSH_FAILED":
+                        transition_push_failures += 1
+                    early_mover_delivery[signal.symbol.upper()] = (delivery_action, False)
+                    print(
+                        f"Telegram update failed for {signal.symbol}: "
+                        f"{delivery_action}; prior canonical card retained for retry."
+                    )
                 continue
 
             message_id = send_telegram_message_with_id(
@@ -430,24 +472,31 @@ def main() -> None:
                 continue
 
             if decision.action == "EDIT" and decision.message_id is not None:
-                if edit_telegram_message(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    decision.message_id,
-                    message,
-                ):
+                delivery_action, delivered_message_id = _deliver_existing_card_update(
+                    settings=settings,
+                    decision=decision,
+                    message=message,
+                )
+                if delivered_message_id is not None:
                     record_opportunity_alert(
                         identity=identity,
                         transition_key=transition_key,
-                        message_id=decision.message_id,
+                        message_id=delivered_message_id,
                         created_new=False,
                         state_file=FULL_MARKET_ALERT_STATE_FILE,
                     )
                     broad_edited += 1
-                    broad_watch_delivery[symbol.upper()] = ("EDITED", True)
+                    if delivery_action == "TRANSITION_PUSHED":
+                        transition_pushes += 1
+                    broad_watch_delivery[symbol.upper()] = (delivery_action, True)
                 else:
-                    broad_watch_delivery[symbol.upper()] = ("EDIT_FAILED", False)
-                    print(f"Telegram broad-watch edit failed for {symbol}; card retained.")
+                    if delivery_action == "TRANSITION_PUSH_FAILED":
+                        transition_push_failures += 1
+                    broad_watch_delivery[symbol.upper()] = (delivery_action, False)
+                    print(
+                        f"Telegram broad-watch update failed for {symbol}: "
+                        f"{delivery_action}; prior canonical card retained for retry."
+                    )
                 continue
 
             message_id = send_telegram_message_with_id(
@@ -548,7 +597,9 @@ def main() -> None:
     )
 
     print("Early-mover Telegram cards created:", created)
-    print("Early-mover Telegram cards edited:", edited)
+    print("Early-mover Telegram cards edited/transitioned:", edited)
+    print("Meaningful-transition push notifications sent:", transition_pushes)
+    print("Meaningful-transition push notification failures:", transition_push_failures)
     print("Alert-governor opportunity updates suppressed:", suppressed)
     print("Broad-market watch cards created:", broad_created)
     print("Broad-market watch cards edited:", broad_edited)
