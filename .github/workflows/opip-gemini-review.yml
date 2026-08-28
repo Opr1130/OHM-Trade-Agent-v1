@@ -1,0 +1,148 @@
+name: opip-gemini-review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: opip-gemini-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.actor == github.repository_owner &&
+      ((github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '@gemini')) ||
+       (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@gemini')) ||
+       (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@gemini')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout trusted review code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate Gemini API credential
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$GEMINI_API_KEY" || {
+            echo "GEMINI_API_KEY is not configured in GitHub Actions secrets." >&2
+            exit 78
+          }
+
+      - name: Resolve review profile
+        id: profile
+        env:
+          TRIGGER_BODY: ${{ github.event.comment.body || github.event.review.body || '' }}
+        run: |
+          set -euo pipefail
+          python OHM-Trade-Agent-v1/tools/ai_gateway/gemini_profiles.py \
+            --trigger "$TRIGGER_BODY"
+
+      - name: Resolve pull request
+        id: pr
+        env:
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "Could not resolve a valid pull request number." >&2
+            exit 64
+          }
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch untrusted pull request diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          MAX_DIFF_BYTES: ${{ steps.profile.outputs.max_diff_bytes }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/opip-gemini-pr.diff"
+          test -s "$RUNNER_TEMP/opip-gemini-pr.diff" || {
+            echo "Pull request diff is empty." >&2
+            exit 66
+          }
+          bytes="$(wc -c < "$RUNNER_TEMP/opip-gemini-pr.diff")"
+          echo "PR diff bytes: $bytes"
+          if [ "$bytes" -gt "$MAX_DIFF_BYTES" ]; then
+            echo "PR diff exceeds profile limit: $bytes > $MAX_DIFF_BYTES bytes." >&2
+            exit 67
+          fi
+
+      - name: Run independent Gemini review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PROFILE: ${{ steps.profile.outputs.profile }}
+          MODEL: ${{ steps.profile.outputs.model }}
+          THINKING_LEVEL: ${{ steps.profile.outputs.thinking_level }}
+          MAX_OUTPUT_TOKENS: ${{ steps.profile.outputs.max_output_tokens }}
+        run: |
+          set -euo pipefail
+          python OHM-Trade-Agent-v1/tools/ai_gateway/run_gemini_review.py \
+            --prompt .github/gemini/opip_review_prompt.md \
+            --diff "$RUNNER_TEMP/opip-gemini-pr.diff" \
+            --pr-number "$PR_NUMBER" \
+            --profile "$PROFILE" \
+            --model "$MODEL" \
+            --thinking-level "$THINKING_LEVEL" \
+            --max-output-tokens "$MAX_OUTPUT_TOKENS" \
+            --review-output "$RUNNER_TEMP/opip-gemini-review.md" \
+            --telemetry-output "$RUNNER_TEMP/opip-gemini-usage.json"
+
+      - name: Post Gemini review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          body="$(cat "$RUNNER_TEMP/opip-gemini-review.md")"
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="$body" >/dev/null
+
+      - name: Retain Gemini usage receipt
+        if: always() && steps.profile.outputs.profile != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: opip-gemini-usage-${{ github.run_id }}
+          path: ${{ runner.temp }}/opip-gemini-usage.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Report Gemini review failure
+        if: failure() && steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="## O'Pip Gemini Independent Review
+
+REVIEW_WORKFLOW_FAILED. Inspect the O'Pip Gemini Review Actions run before relying on this review gate." >/dev/null || true
