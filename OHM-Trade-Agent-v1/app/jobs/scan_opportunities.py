@@ -3,6 +3,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from app.core.config import get_settings
+from app.opip.decision.observer import build_scan_observer
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
@@ -57,6 +58,33 @@ logger = logging.getLogger(__name__)
 # Backwards-compatible test/extension seam. Production default is the new mixed
 # directional selector; existing callers that patch select_candidates still work.
 select_candidates = select_directional_candidates
+
+
+def _opip_scan_context(scan, technical_candidates: int) -> dict:
+    """Return the scan-level counters the O'Pip funnel summary reports.
+
+    ``technical_candidates`` is the size of the directional shortlist as
+    selected, not the number of survivors at the point the summary is written -
+    the funnel's own counters already describe attrition, and reporting the
+    survivor count here would understate how many candidates were considered.
+    """
+    return {
+        "requested": getattr(scan, "requested", None),
+        "analyzed": getattr(scan, "analyzed", None),
+        "skipped": getattr(scan, "skipped", None),
+        "failed": getattr(scan, "failed", None),
+        "technical_candidates": int(technical_candidates),
+    }
+
+
+def _paper_trade_enabled_safe() -> bool:
+    """Report paper-engine state for telemetry without ever raising."""
+    try:
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        return bool(paper_trade_enabled())
+    except Exception:
+        return False
 
 
 def _direction_counts(candidates):
@@ -208,6 +236,7 @@ def _prepare_qualified_lineage(
                 episode_id=episode_id,
                 pair=pair,
                 decision_at=decision_at,
+                direction=direction,
             )
             journey_id = link_qualified_signal(
                 symbol=snapshot.symbol,
@@ -326,6 +355,7 @@ def _publish_freqtrade_paper_opportunities(
                     episode_id=episode_id,
                     pair=pair,
                     decision_at=decision_at,
+                    direction=direction,
                 )
             )
             journey_id = str(alert.get("journey_id") or "")
@@ -557,6 +587,17 @@ def main():
                 "TradingView v2 evidence merge failed open; continuing with native candidates only"
             )
 
+    # O'Pip qualification funnel: observation only. Every hook below is
+    # fail-soft and one-directional - it records what the production path just
+    # decided and can never change that decision.
+    opip = build_scan_observer(
+        snapshots=scan.snapshots,
+        decision_at=decision_at,
+        account_equity=getattr(settings, "account_equity", None),
+    )
+    opip.register_candidates(candidates)
+    technical_candidate_count = len(candidates)
+
     print("OHM AI Opportunity Scan")
     if scan.universe is not None:
         print("===== OHM UNIVERSE =====")
@@ -605,6 +646,7 @@ def main():
 
     if not candidates:
         print("No technical candidates.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -635,9 +677,11 @@ def main():
                     reason=f"margin status {candidate.margin_validation_status}",
                     source="margin_eligibility_gate",
                 )
+    opip.record_margin(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -662,6 +706,8 @@ def main():
             f"SecondaryVol={candidate.secondary_volume_ratio if candidate.secondary_volume_ratio is not None else 'N/A'} "
             f"Status={candidate.cross_pair_confirmation_status}"
         )
+
+    opip.record_cross_market(candidates)
 
     execution_requested = len(candidates)
     pre_execution_candidates = list(candidates)
@@ -709,10 +755,12 @@ def main():
             f"RecentTradeAge={execution.latest_trade_age_seconds if execution.latest_trade_age_seconds is not None else 'N/A'}s"
         )
     candidates = strict_execution_candidates
+    opip.record_execution(pre_execution_candidates)
     print("Execution validation requested:", execution_requested)
     print("Execution structural/short-quality rejects:", execution_requested - len(candidates))
     if not candidates:
         print("No candidates survived execution quality validation.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -735,6 +783,8 @@ def main():
             f"CoinGecko={reference.coingecko_id or 'N/A'} "
             f"Divergence={reference.price_divergence_pct if reference.price_divergence_pct is not None else 'N/A'}%"
         )
+
+    opip.record_reference(candidates)
 
     coingecko_global = load_coingecko_global_context(
         api_key=getattr(settings, "coingecko_api_key", None)
@@ -816,6 +866,8 @@ def main():
             f"Sentiment={assessment.sentiment_bias}"
         )
 
+    opip.record_market_intelligence(candidates, intelligence.assessments)
+
     review = review_candidates(
         candidates,
         settings.openai_model,
@@ -824,6 +876,7 @@ def main():
         market_regime_context=intelligence.chief_market_regime_context,
         coingecko_global_context=coingecko_global,
     )
+    opip.record_ai_stage(review)
     alerts = qualified_alerts(review)
     print("AI top candidates:", len(review.get("top_candidates", [])))
     print("Qualified alerts before deterministic quality gates:", len(alerts))
@@ -846,6 +899,7 @@ def main():
         snapshot = snapshot_by_key.get((alert["symbol"], direction))
         if snapshot is None:
             print("Snapshot missing for:", alert["symbol"], direction)
+            opip.record_snapshot_missing(alert["symbol"], direction)
             continue
 
         plan = (
@@ -871,6 +925,7 @@ def main():
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
 
         target_quality = _target_quality(plan, snapshot)
+        opip.record_target_quality(snapshot, target_quality)
         if not target_quality.qualified:
             target_rejected += 1
             rejection_reason = "; ".join(target_quality.rejection_reasons)
@@ -899,6 +954,7 @@ def main():
         )
 
         economic = _economic_quality(plan, snapshot, settings.account_equity)
+        opip.record_economic_quality(snapshot, economic)
         if not economic.qualified:
             economic_rejected += 1
             print(f"ECONOMIC REJECT {direction} {plan.symbol}: {economic.rejection_reason}")
@@ -961,6 +1017,7 @@ def main():
     )
     print("Qualified signal lineages prepared before Telegram:", lineage_prepared)
     print("Qualified signal lineage failures:", lineage_failures)
+    opip.record_qualified(ranked_opportunities)
 
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
@@ -1018,6 +1075,14 @@ def main():
     print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
     print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
     print("Shadow simulator failures:", shadow_failures)
+    paper_admission_eligible = opip.record_paper_admission_eligibility(
+        ranked_opportunities,
+        paper_enabled=_paper_trade_enabled_safe(),
+    )
+    opip.finalize(
+        scan_context=_opip_scan_context(scan, technical_candidate_count),
+        paper_admission_eligible=paper_admission_eligible,
+    )
     _capture_native_scan_cohort(scan, decision_at=decision_at)
 
 
