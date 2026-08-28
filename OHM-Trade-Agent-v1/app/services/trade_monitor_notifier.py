@@ -1,29 +1,35 @@
-import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.services.active_trade_registry import ActiveTrade
 from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import one_line_reason
 from app.services.notification_policy import record_emitted, should_emit
-from app.services.telegram_notifier import send_telegram_message
+from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
+from app.services.telegram_delivery import record_telegram_suppression, send_tracked_telegram
 from app.services.trade_monitor import TradeMonitorResult
 
 
 STATE_FILE = Path("/app/data/trade_monitor_state.json")
+LOCK_FILE = STATE_FILE.parent / ".trade_monitor_state.lock"
 
 
-def _load_state() -> dict[str, str]:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
+def _load_state() -> dict:
+    with registry_lock(LOCK_FILE):
+        return load_json(STATE_FILE)
 
 
-def _save_state(state: dict[str, str]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def _save_state(state: dict) -> None:
+    with registry_lock(LOCK_FILE):
+        save_json_atomic(STATE_FILE, state)
+
+
+def _previous_action(value) -> str | None:
+    if isinstance(value, dict):
+        raw = value.get("action")
+    else:
+        raw = value
+    return str(raw) if raw not in (None, "") else None
 
 
 def _stop_downside_pct(trade: ActiveTrade, current_price: float) -> float:
@@ -46,10 +52,11 @@ def format_monitor_message(trade: ActiveTrade, result: TradeMonitorResult) -> st
     downside = _stop_downside_pct(trade, float(result.current_price))
     reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM TRADE — {display_market_label(trade.symbol)}\n"
-        f"P/L: {float(pnl_pct):+.2f}%\n"
-        f"Risk: {trade.risk_level.upper()}\n"
-        f"Downside to stop: {downside:.1f}%\n"
+        f"{icon} OHM ACTIVE TRADE — {display_market_label(trade.symbol)}\n"
+        f"Price: {float(result.current_price):.8g} | Entry: {float(trade.entry_price):.8g}\n"
+        f"P/L: {float(pnl_pct):+.2f}% | Risk: {trade.risk_level.upper()}\n"
+        f"Stop: {float(trade.stop_price):.8g} | Downside: {downside:.1f}%\n"
+        f"T1 / T2: {float(trade.target_1):.8g} / {float(trade.target_2):.8g}\n"
         f"Reason: {reason}\n"
         f"Action: {result.action.replace('_', ' ')}"
     )
@@ -64,19 +71,67 @@ def send_monitor_update(
     if trade.status != "active":
         return False
 
-    state = _load_state()
-    previous_action = state.get(trade.symbol)
-    if previous_action == result.action:
-        return False
-
-    identity = trade.trade_id or trade.symbol
+    identity = f"ACTIVE_TRADE:{trade.trade_id or trade.symbol}"
     fingerprint = f"{trade.direction}:{result.action}"
-    if not should_emit(identity=identity, event_type=result.action, fingerprint=fingerprint):
+    try:
+        state = _load_state()
+    except (OSError, TimeoutError, RegistryIOError):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="ACTIVE_TRADE",
+            event_type=result.action,
+            fingerprint=fingerprint,
+            reason="STATE_UNAVAILABLE_FAIL_CLOSED",
+            symbol=trade.symbol,
+            trade_id=trade.trade_id,
+        )
         return False
 
-    sent = send_telegram_message(bot_token, chat_id, format_monitor_message(trade, result))
-    if sent:
-        state[trade.symbol] = result.action
-        _save_state(state)
+    previous_action = _previous_action(state.get(trade.symbol))
+    if previous_action == result.action:
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="ACTIVE_TRADE",
+            event_type=result.action,
+            fingerprint=fingerprint,
+            reason="SAME_ACTION",
+            symbol=trade.symbol,
+            trade_id=trade.trade_id,
+        )
+        return False
+
+    if not should_emit(identity=identity, event_type=result.action, fingerprint=fingerprint):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="ACTIVE_TRADE",
+            event_type=result.action,
+            fingerprint=fingerprint,
+            reason="NOTIFICATION_POLICY",
+            symbol=trade.symbol,
+            trade_id=trade.trade_id,
+        )
+        return False
+
+    delivery = send_tracked_telegram(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        message=format_monitor_message(trade, result),
+        identity=identity,
+        alert_family="ACTIVE_TRADE",
+        event_type=result.action,
+        fingerprint=fingerprint,
+        symbol=trade.symbol,
+        trade_id=trade.trade_id,
+    )
+    if delivery.delivered:
+        state[trade.symbol] = {
+            "action": result.action,
+            "message_id": delivery.message_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _save_state(state)
+        except (OSError, TimeoutError, RegistryIOError):
+            pass
         record_emitted(identity=identity, event_type=result.action, fingerprint=fingerprint)
-    return sent
+    return delivery.delivered
