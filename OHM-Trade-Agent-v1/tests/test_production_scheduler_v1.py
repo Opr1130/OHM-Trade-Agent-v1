@@ -1,4 +1,8 @@
 from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,3 +35,18 @@ def test_remote_bootstrap_and_future_deploy_reconcile_scheduler():
     assert 'bash "$SCHEDULER_RECONCILE_SRC"' in bootstrap
     assert 'SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"' in deploy
     assert 'bash "$SCHEDULER_RECONCILE"' in deploy
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash unavailable")
+def test_scheduler_shell_scripts_have_valid_bash_syntax():
+    for relative in (
+        "deploy/remote/reconcile-scheduler.sh",
+        "deploy/remote/bootstrap-remote-ops.sh",
+        "deploy/remote/ohm-deploy",
+    ):
+        subprocess.run(
+            ["bash", "-n", str(ROOT / relative)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
