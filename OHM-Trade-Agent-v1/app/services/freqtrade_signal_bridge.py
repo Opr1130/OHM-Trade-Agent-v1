@@ -78,6 +78,8 @@ def ensure_bridge_files(
             {"pairs": ["BTC/USDT"], "refresh_period": 10, "stake_currency": "USDT"},
             mode=0o644,
         )
+    for shared_file in (signals_file, pairlist_usd_file, pairlist_usdt_file):
+        shared_file.chmod(0o644)
 
 
 def publish_qualified_long(
