@@ -304,6 +304,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         assert "telegram" not in config
         assert config["pairlists"][0]["processing_mode"] == "append"
         assert config["custom_price_max_distance_ratio"] == 1.0
+        assert config["exit_pricing"]["price_side"] == "other"
         assert config["pairlists"][0]["pairlist_url"].startswith(
             "file:///user_data/bridge/"
         )
@@ -335,7 +336,12 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     )
     assert "./data/freqtrade/state:/app/freqtrade_paper:ro" in compose
 
+    assert paper_compose.startswith("name: ohm-paper\n")
     assert "freqtradeorg/freqtrade:2026.7" in paper_compose
+    assert "ohm-freqtrade-paper-init" in paper_compose
+    assert "network_mode: none" in paper_compose
+    assert "condition: service_completed_successfully" in paper_compose
+    assert "USD_READY" in paper_compose
     assert "env_file:" not in paper_compose
     assert "ports:" not in paper_compose
     assert 'mem_limit: 384m' in paper_compose
