@@ -93,7 +93,7 @@ class OHMExternalSignalStrategy(IStrategy):
         self._reload_bridge()
         try:
             stake = str(self.config.get("stake_currency") or "UNKNOWN").upper()
-            Path(f"/tmp/ohm_freqtrade_heartbeat_{stake}").write_text(
+            Path(f"/freqtrade/state/heartbeat_{stake}").write_text(
                 current_time.astimezone(timezone.utc).isoformat(),
                 encoding="utf-8",
             )
