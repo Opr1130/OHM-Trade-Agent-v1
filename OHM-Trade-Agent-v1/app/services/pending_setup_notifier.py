@@ -172,6 +172,21 @@ def _deliver_terminal_retry(
     fingerprint = f"{setup.direction}:{result.status}"
 
     if persisted_status != terminal_status:
+        if persisted_status and persisted_status != "waiting":
+            # Exchange/lifecycle truth superseded the queued market-terminal
+            # notification (for example a fill won the race). Retire the stale
+            # outbox row rather than retrying an invalid alert forever.
+            _remove_terminal_retry(setup.trade_id)
+            record_telegram_not_eligible(
+                identity=identity,
+                alert_family="PENDING_SETUP",
+                event_type=result.status,
+                fingerprint=fingerprint,
+                reason=f"TERMINAL_ALERT_SUPERSEDED_BY_{persisted_status.upper()}",
+                symbol=setup.symbol,
+                trade_id=setup.trade_id,
+            )
+            return False
         record_telegram_suppression(
             identity=identity,
             alert_family="PENDING_SETUP",
@@ -293,7 +308,20 @@ def send_pending_setup_update(
 
         terminalized = terminalize_pending_setup(setup.trade_id, terminal_status)
         lifecycle = get_pending_setup_record(setup.trade_id)
-        if not terminalized and str((lifecycle or {}).get("status") or "") != terminal_status:
+        persisted_status = str((lifecycle or {}).get("status") or "")
+        if not terminalized and persisted_status != terminal_status:
+            if persisted_status and persisted_status != "waiting":
+                _remove_terminal_retry(setup.trade_id)
+                record_telegram_not_eligible(
+                    identity=identity,
+                    alert_family="PENDING_SETUP",
+                    event_type=result.status,
+                    fingerprint=fingerprint,
+                    reason=f"TERMINAL_ALERT_SUPERSEDED_BY_{persisted_status.upper()}",
+                    symbol=setup.symbol,
+                    trade_id=setup.trade_id,
+                )
+                return False
             record_telegram_suppression(
                 identity=identity,
                 alert_family="PENDING_SETUP",
