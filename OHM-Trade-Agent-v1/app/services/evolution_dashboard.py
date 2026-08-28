@@ -404,9 +404,19 @@ def _failure_summary(
 
     seen: set[str] = set()
     repeated = 0
-    for row in all_failures:
+    scoped_start = min(
+        (row["at"] for row in scoped),
+        default=None,
+    )
+    if scoped_start is not None:
+        seen.update(
+            row["family"]
+            for row in all_failures
+            if row["at"] < scoped_start
+        )
+    for row in scoped:
         family = row["family"]
-        if row in scoped and family in seen:
+        if family in seen:
             repeated += 1
         seen.add(family)
 
@@ -689,8 +699,25 @@ def _evolution_scorecard(
         funnel = _funnel(rows)
         outcomes = _paper_outcomes(rows)
         failures = _failure_events(rows)
+        grouped = _journeys(rows)
+        early_outcomes: list[float] = []
+        for journey_rows in grouped.values():
+            if not any(
+                _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
+                for row in journey_rows
+            ):
+                continue
+            for row in journey_rows:
+                if _event_type(row) != "PAPER_OUTCOME":
+                    continue
+                net = _safe_float((row.get("payload") or {}).get("net_pnl"))
+                if net is not None:
+                    early_outcomes.append(net)
         return {
-            "early_precision_pct": funnel["closed_win_rate_pct"],
+            "early_precision_pct": _pct(
+                sum(value > 0 for value in early_outcomes),
+                len(early_outcomes),
+            ),
             "signal_to_outcome_pct": funnel["requested_to_closed_pct"],
             "paper_win_rate_pct": _pct(
                 sum(row["net_pnl"] > 0 for row in outcomes),
