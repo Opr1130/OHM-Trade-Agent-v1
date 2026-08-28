@@ -202,6 +202,7 @@ def ingest_freqtrade_dry_run(
 
     added = 0
     rows_seen = 0
+    unmatched_outcomes = 0
     new_keys: list[str] = []
     worker_status: dict[str, str] = {}
     ready_workers = 0
@@ -279,7 +280,12 @@ def ingest_freqtrade_dry_run(
             )
             if journey_id is not None:
                 added += 1
-            new_keys.append(trade_key)
+                new_keys.append(trade_key)
+            else:
+                # Do not acknowledge an outcome that could not be joined to
+                # its signal lineage. Leave it unprocessed so a later learning
+                # pass can recover after temporary state/ordering issues.
+                unmatched_outcomes += 1
 
     if new_keys:
         with registry_lock(state_lock):
@@ -306,6 +312,7 @@ def ingest_freqtrade_dry_run(
         "status": status,
         "closed_rows_seen": rows_seen,
         "outcomes_added": added,
+        "unmatched_outcomes": unmatched_outcomes,
         "new_trade_ids": len(new_keys),
         "new_trade_keys": len(new_keys),
         "workers": worker_status,
