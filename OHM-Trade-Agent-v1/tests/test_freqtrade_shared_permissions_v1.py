@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from datetime import datetime, timezone
 
 import pytest
 
@@ -63,7 +64,7 @@ def test_bridge_rewrite_and_control_rewrite_restore_shared_mode(tmp_path):
     signals.chmod(0o600)
 
     changed = cancel_admitted_signals(
-        cancelled_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        cancelled_at=datetime.now(timezone.utc),
         signals_file=signals,
     )
     assert changed == 1
