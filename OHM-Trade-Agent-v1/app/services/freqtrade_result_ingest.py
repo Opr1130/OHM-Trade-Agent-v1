@@ -19,6 +19,7 @@ DB_FILES = (DB_USD_FILE, DB_USDT_FILE)
 # Backward-compatible primary path for tests/importers.
 DB_FILE = DB_USD_FILE
 STATE_FILE = Path("/app/data/intelligence_learning/freqtrade_ingest_state.json")
+WORKER_HEARTBEAT_MAX_AGE_SECONDS = 60
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -111,6 +112,7 @@ def _read_trade_rows(
 def freqtrade_dry_run_status(
     *,
     db_file: Path | None = None,
+    require_heartbeat: bool = True,
 ) -> dict[str, Any]:
     open_count = 0
     closed_count = 0
@@ -118,8 +120,28 @@ def freqtrade_dry_run_status(
     pnl_by_currency: dict[str, float] = {}
     per_worker: dict[str, dict[str, Any]] = {}
 
+    now = datetime.now(timezone.utc)
     for path in _selected_db_files(db_file):
         quote = _quote_for_db(path)
+        heartbeat = path.parent / f"heartbeat_{quote}"
+        heartbeat_age_seconds: float | None = None
+        heartbeat_fresh = not require_heartbeat
+        if require_heartbeat and heartbeat.exists():
+            try:
+                modified = datetime.fromtimestamp(
+                    heartbeat.stat().st_mtime,
+                    tz=timezone.utc,
+                )
+                heartbeat_age_seconds = max(
+                    0.0,
+                    (now - modified).total_seconds(),
+                )
+                heartbeat_fresh = (
+                    heartbeat_age_seconds <= WORKER_HEARTBEAT_MAX_AGE_SECONDS
+                )
+            except OSError:
+                heartbeat_fresh = False
+
         status, columns, rows, reason = _read_trade_rows(
             path,
             closed_only=False,
@@ -128,11 +150,15 @@ def freqtrade_dry_run_status(
             per_worker[quote] = {
                 "status": status,
                 "reason": reason,
+                "heartbeat_age_seconds": heartbeat_age_seconds,
                 "open_trades": 0,
                 "closed_trades": 0,
                 "realized_net_pnl": 0.0,
             }
             continue
+        if not heartbeat_fresh:
+            status = "STALE"
+            reason = "worker heartbeat missing or stale"
 
         open_rows = [row for row in rows if int(row["is_open"] or 0) == 1]
         closed_rows = [row for row in rows if int(row["is_open"] or 0) == 0]
@@ -154,7 +180,9 @@ def freqtrade_dry_run_status(
         closed_count += len(closed_rows)
         pnl_by_currency[quote] = round(pnl, 8)
         per_worker[quote] = {
-            "status": "OK",
+            "status": status,
+            "reason": reason,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
             "open_trades": len(open_rows),
             "closed_trades": len(closed_rows),
             "realized_net_pnl": round(pnl, 8),
