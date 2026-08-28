@@ -351,6 +351,48 @@ def _economic_quality(plan, snapshot, account_equity):
     )
 
 
+def _telegram_delivery_ready(settings) -> bool:
+    return bool(
+        getattr(settings, "telegram_enabled", False)
+        and getattr(settings, "telegram_bot_token", None)
+        and getattr(settings, "telegram_chat_id", None)
+    )
+
+
+def _send_movement_notification(movement, settings) -> tuple[bool, bool]:
+    """Return (sent, failed).
+
+    Policy suppression / non-alert mode is not a delivery failure. Exceptions
+    from the actual notification path are surfaced and counted.
+    """
+    if (
+        str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
+        or not _telegram_delivery_ready(settings)
+    ):
+        return False, False
+    try:
+        sent = send_price_movement_update(
+            movement,
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            cooldown_seconds=int(
+                getattr(
+                    settings,
+                    "price_movement_alert_cooldown_seconds",
+                    21_600,
+                )
+            ),
+        )
+        return bool(sent), False
+    except Exception:
+        logger.exception(
+            "Price movement Telegram delivery failed symbol=%s stage=%s",
+            movement.get("symbol", "UNKNOWN"),
+            movement.get("stage", "UNKNOWN"),
+        )
+        return False, True
+
+
 def _assess_price_movement(snapshot, settings, market_intelligence=None):
     """Evaluate and persist radar context without affecting candidate gates."""
     if str(getattr(settings, "price_movement_mode", "shadow")).lower() == "off":
@@ -631,6 +673,7 @@ def main():
     intelligence = enrich_finalist_market_intelligence(candidates, market_regime)
     candidates = list(intelligence.candidates)
     movement_notifications_sent = 0
+    movement_notification_failures = 0
     enriched_movement_counts: Counter[str] = Counter()
     for candidate in candidates:
         movement = _assess_price_movement(
@@ -641,28 +684,12 @@ def main():
         if movement is None:
             continue
         enriched_movement_counts[str(movement.get("stage") or "UNKNOWN")] += 1
-        if (
-            str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
-            and settings.telegram_enabled
-            and settings.telegram_bot_token
-            and settings.telegram_chat_id
-        ):
-            try:
-                if send_price_movement_update(
-                    movement,
-                    bot_token=settings.telegram_bot_token,
-                    chat_id=settings.telegram_chat_id,
-                    cooldown_seconds=int(
-                        getattr(
-                            settings,
-                            "price_movement_alert_cooldown_seconds",
-                            21_600,
-                        )
-                    ),
-                ):
-                    movement_notifications_sent += 1
-            except Exception:
-                pass
+        movement_sent, movement_failed = _send_movement_notification(
+            movement,
+            settings,
+        )
+        movement_notifications_sent += int(movement_sent)
+        movement_notification_failures += int(movement_failed)
     print("===== OHM EXTERNAL MARKET INTELLIGENCE =====")
     print("Evidence records:", len(intelligence.evidence))
     print("Available assessments:", sum(
@@ -863,8 +890,11 @@ def main():
     print("Target quality passes:", target_passed)
     print("Target quality rejects:", target_rejected)
     print("Pending setups saved:", pending_saved)
+    print("Telegram delivery configured:", _telegram_delivery_ready(settings))
+    print("Price movement mode:", getattr(settings, "price_movement_mode", "shadow"))
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
+    print("Price movement notification failures:", movement_notification_failures)
     freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
         ranked_opportunities,
         scan=scan,

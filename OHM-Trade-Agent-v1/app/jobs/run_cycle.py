@@ -37,13 +37,12 @@ def _parse_scheduler_time(value: str | None) -> datetime | None:
 def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
     """Run Early Watch on its configured cadence after real risk protection.
 
-    Quiet hours intentionally skip the alerting scanner rather than creating a
-    new overnight notification path. Canonical/O'Pip learning continues through
-    the existing non-alert learning jobs.
+    Crypto markets are continuous. Quiet hours suppress lower-priority pending
+    and broad/paid discovery, but must not create an overnight blind spot in
+    the selective Early Watch Telegram channel.
     """
     if quiet_hours:
-        print("OHM Early Watch skipped during quiet hours.")
-        return
+        print("OHM Early Watch remains active during quiet hours.")
 
     now = datetime.now(timezone.utc)
     interval_seconds = max(
@@ -221,8 +220,9 @@ def _run_cycle_once() -> None:
     else:
         monitor_pending_main()
 
-    # Early Watch runs only after real active/pending protection and on its own
-    # cadence. Its failure cannot suppress the production opportunity scanner.
+    # Early Watch runs 24/7 after real active/pending protection and on its own
+    # cadence. Alert governance/dedup controls noise during quiet hours. Its
+    # failure cannot suppress the production opportunity scanner.
     _run_early_watch_if_due(
         settings=get_settings(),
         quiet_hours=decision.quiet_hours,
