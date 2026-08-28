@@ -25,9 +25,9 @@ def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
     downside = _price_pct(float(signal.stop_price), float(signal.price), "SHORT" if side == "LONG" else "LONG")
     confidence = float(decision.final_score)
     risk_pct = max(10.0, min(90.0, 100.0 - confidence + downside * 2.0))
-    reason = " ".join(str(decision.summary or "Qualified OHM trade setup").split())[:140]
+    reason = " ".join(str(decision.summary or "Qualified trade setup").split())[:140]
     return (
-        f"🚨 OHM TRADE — {display_market_label(decision.symbol)}\n"
+        f"🚨 TRADE — {display_market_label(decision.symbol)}\n"
         f"Potential: +{potential:.1f}%\n"
         f"Confidence*: {confidence:.0f}%\n"
         f"Risk*: {risk_pct:.0f}%\n"
@@ -64,7 +64,7 @@ def _number(value: str | None) -> float | None:
 
 
 def _compact_legacy_chief(message: str) -> str:
-    if "OHM CHIEF" not in message:
+    if "OHM CHIEF" not in message and "📍 ENTRY PLAN" not in message:
         return message
 
     market = _line_value(message, "Market") or _line_value(message, "Asset") or "UNKNOWN"
@@ -104,7 +104,7 @@ def _compact_legacy_chief(message: str) -> str:
             )
 
     lines = message.splitlines()
-    reason = "Qualified OHM trade setup"
+    reason = "Qualified trade setup"
     for index, line in enumerate(lines):
         if line.strip() == "Reason:":
             for candidate in lines[index + 1:index + 4]:
@@ -131,7 +131,7 @@ def _compact_legacy_chief(message: str) -> str:
         economic = f"Capital: {cap_text} | Projected net edge: {edge_text}\n"
 
     return (
-        f"🔥 OHM QUALIFIED OPPORTUNITY — {market}\n"
+        f"🔥 QUALIFIED OPPORTUNITY — {market}\n"
         f"Action: {action}\n"
         f"Entry: {entry_text}\n"
         f"Do not chase: {chase_text}\n"

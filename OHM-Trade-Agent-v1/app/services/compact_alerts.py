@@ -71,7 +71,7 @@ def format_watch_alert(
     downside_pct: float,
     reason: str,
     action: str,
-    title: str = "OHM MARKET WATCH",
+    title: str = "MARKET WATCH",
 ) -> str:
     label = display_market_label(symbol)
     return (

@@ -83,10 +83,10 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     if action == "ENTER_NOW":
-        headline = f"🔥 OHM CHIEF — {direction} — ENTER NOW"
+        headline = f"🔥 OPPORTUNITY — {direction} — ENTER NOW"
         action_text = "Action: ENTRY CONDITIONS VALID\nUse the approved entry zone and respect the chase boundary."
     elif action == "PLACE_LIMIT":
-        headline = f"🎯 OHM CHIEF — {direction} — PLACE LIMIT"
+        headline = f"🎯 OPPORTUNITY — {direction} — PLACE LIMIT"
         action_text = (
             "Action: SET LIMIT ENTRY\n"
             + (
@@ -96,7 +96,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
             )
         )
     else:
-        raise ValueError("Cannot format non-actionable OHM trade plan")
+        raise ValueError("Cannot format non-actionable trade plan")
 
     quote_note = ""
     if candidate.get("primary_quote_currency") == "USDT" and not candidate.get("secondary_pair"):
@@ -104,7 +104,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
 
     ranking_note = ""
     if candidate.get("profit_rank") is not None:
-        ranking_note += f"OHM Opportunity Rank: #{candidate['profit_rank']}\n"
+        ranking_note += f"Opportunity Rank: #{candidate['profit_rank']}\n"
     if candidate.get("profit_rank_score") is not None:
         ranking_note += f"Profit Rank Score: {float(candidate['profit_rank_score']):.2f}/100\n"
 
@@ -153,7 +153,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     fill_tracking_note = ""
     if candidate.get("economic_qualified") is True:
         fill_tracking_note = (
-            "Fill Tracking: read-only Kraken reconciliation; OHM sends a monitoring-degraded alert if position verification is unavailable\n"
+            "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
         )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"

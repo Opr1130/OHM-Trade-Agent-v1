@@ -581,7 +581,8 @@ def test_telegram_includes_optional_rank_and_score():
         _plan(),
         "summary",
     )
-    assert "OHM Opportunity Rank: #2" in message
+    assert "Opportunity Rank: #2" in message
+    assert "OHM Opportunity Rank" not in message
     assert "Profit Rank Score: 78.42/100" in message
     assert "% probability" not in message
 

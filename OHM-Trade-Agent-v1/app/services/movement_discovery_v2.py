@@ -375,7 +375,7 @@ def format_early_mover_message(signal: EarlyMoverSignal) -> str:
     reason = "; ".join(str(item) for item in signal.reasons[:3]) or "Early movement conditions detected"
     caution = f" | Caution: {warning}" if warning else ""
     return (
-        f"🚀 OHM EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
         f"Price: {signal.reference_price:.8g} | TF: {signal.detection_timeframe}\n"
         f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | 24h {signal.momentum_24h_pct:+.2f}%\n"
         f"Continuation*: {signal.continuation_confidence}/100 | Entry quality*: {signal.entry_quality}/100\n"

@@ -53,7 +53,7 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
     symbol = str(signal.get("symbol") or "UNKNOWN").upper()
     if stage == EXPIRED:
         return (
-            f"⚪ OHM WATCH EXPIRED — {display_market_label(symbol)}\n"
+            f"⚪ WATCH EXPIRED — {display_market_label(symbol)}\n"
             "Reason: Setup expired without directional confirmation\n"
             "Action: NO TRADE"
         )
@@ -72,7 +72,7 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
         downside_pct=downside_scenario_pct(risk),
         reason=reason,
         action=action,
-        title="OHM MOVEMENT WATCH",
+        title="MOVEMENT WATCH",
     )
     if fallback:
         plain = f"Potential: +{low:.0f}% to +{high:.0f}%"

@@ -243,8 +243,8 @@ def _is_material_watch_change(row: dict[str, Any], insight: MarketInsight) -> bo
 
 def _format_watchlist(watches: dict[str, dict[str, Any]]) -> str:
     if not watches:
-        return "👁 OHM WATCHLIST\nNo coins are being watched. Use /watch COIN."
-    lines = [f"👁 OHM WATCHLIST — {len(watches)}/{MAX_WATCHES}"]
+        return "👁 WATCHLIST\nNo coins are being watched. Use /watch COIN."
+    lines = [f"👁 WATCHLIST — {len(watches)}/{MAX_WATCHES}"]
     for symbol, row in sorted(watches.items()):
         lines.append(
             f"{symbol}: {row.get('state', 'UNKNOWN')} | {row.get('action', 'UNKNOWN')} | {_fmt_price(_finite(row.get('last_price')))}"
@@ -341,9 +341,9 @@ def orders_report() -> str:
         intents = get_live_order_intents()
         return format_orders_report(open_orders, intents, KrakenClient(timeout_seconds=5.0))
     except KrakenPrivateAPIError:
-        return "⚠️ OHM ORDERS — Kraken private account data is temporarily unavailable. No order was changed."
+        return "⚠️ ORDERS — Kraken private account data is temporarily unavailable. No order was changed."
     except RegistryIOError:
-        return "⚠️ OHM ORDERS — local lifecycle state is unavailable, so order attribution is unsafe. No order was changed."
+        return "⚠️ ORDERS — local lifecycle state is unavailable, so order attribution is unsafe. No order was changed."
 
 
 def _aggregate_balances(raw: dict[str, float]) -> tuple[dict[str, float], bool]:
@@ -367,7 +367,7 @@ def positions_report() -> str:
         balances, invalid = _aggregate_balances(private.get_balance())
         margin_positions = private.get_open_positions()
     except KrakenPrivateAPIError:
-        return "⚠️ OHM POSITIONS — Kraken private account data is temporarily unavailable."
+        return "⚠️ POSITIONS — Kraken private account data is temporarily unavailable."
 
     public = KrakenClient(timeout_seconds=5.0)
     try:
@@ -422,7 +422,7 @@ def market_report() -> str:
     try:
         insight = analyze_market("BTC")
     except (MarketResolutionError, MarketInsightUnavailable) as exc:
-        return f"⚠️ OHM MARKET — BTC regime data unavailable: {str(exc)[:160]}"
+        return f"⚠️ MARKET — BTC regime data unavailable: {str(exc)[:160]}"
     if insight.momentum_24h_pct <= -3.0 or insight.momentum_1h_pct <= -2.0 or insight.state == "REVERSAL_RISK":
         regime = "RISK_OFF / DEFENSIVE"
     elif insight.momentum_24h_pct >= 3.0 and insight.momentum_1h_pct > -0.5 and insight.trend == "BULLISH":
@@ -450,16 +450,16 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
     try:
         insight = analyze_market(symbol_query)
     except (MarketResolutionError, MarketInsightUnavailable) as exc:
-        _send(settings, f"⚠️ OHM WATCH — {str(exc)[:220]}")
+        _send(settings, f"⚠️ WATCH — {str(exc)[:220]}")
         return
     try:
         watches = get_watches()
     except RegistryIOError:
-        _send(settings, "⚠️ OHM WATCH — watch registry is unavailable; no watch was added.")
+        _send(settings, "⚠️ WATCH — watch registry is unavailable; no watch was added.")
         return
     existing = watches.get(insight.symbol)
     if existing is None and len(watches) >= MAX_WATCHES:
-        _send(settings, f"⚠️ OHM WATCH — limit reached ({MAX_WATCHES}). Use /unwatch COIN first.")
+        _send(settings, f"⚠️ WATCH — limit reached ({MAX_WATCHES}). Use /unwatch COIN first.")
         return
 
     text = format_market_insight(insight, watch=True)
@@ -484,7 +484,7 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
     try:
         _put_watch(insight.symbol, _watch_row(insight, message_id))
     except (RegistryIOError, OSError, TimeoutError):
-        _send(settings, "⚠️ OHM WATCH — card sent, but watch persistence failed; automatic refresh is not active.")
+        _send(settings, "⚠️ WATCH — card sent, but watch persistence failed; automatic refresh is not active.")
         return
     if existing is not None:
         _send(settings, f"👁 {insight.symbol} watch refreshed. The existing watch card will update on material changes.")
@@ -495,10 +495,10 @@ def _handle_unwatch(settings: Any, symbol_query: str) -> None:
         symbol = _canonical_watch_symbol(symbol_query)
         removed = _delete_watch(symbol)
     except TelegramCommandError as exc:
-        _send(settings, f"⚠️ OHM UNWATCH — {exc}")
+        _send(settings, f"⚠️ UNWATCH — {exc}")
         return
     except (RegistryIOError, OSError, TimeoutError):
-        _send(settings, "⚠️ OHM UNWATCH — watch registry is unavailable; no change was made.")
+        _send(settings, "⚠️ UNWATCH — watch registry is unavailable; no change was made.")
         return
     _send(settings, f"👁 {symbol} removed from watchlist." if removed else f"👁 {symbol} was not on the watchlist.")
 
@@ -596,13 +596,13 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             try:
                 _send(settings, format_market_insight(analyze_market(symbol)))
             except (MarketResolutionError, MarketInsightUnavailable) as exc:
-                _send(settings, f"⚠️ OHM SCAN — {str(exc)[:220]}")
+                _send(settings, f"⚠️ SCAN — {str(exc)[:220]}")
         elif command == "why":
             symbol = _require_symbol(args, "why")
             try:
                 _send(settings, format_market_insight(analyze_market(symbol), verbose=True))
             except (MarketResolutionError, MarketInsightUnavailable) as exc:
-                _send(settings, f"⚠️ OHM WHY — {str(exc)[:220]}")
+                _send(settings, f"⚠️ WHY — {str(exc)[:220]}")
         elif command == "watch":
             _handle_watch(settings, _require_symbol(args, "watch"))
         elif command == "unwatch":
@@ -613,7 +613,7 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             try:
                 _send(settings, _format_watchlist(get_watches()))
             except RegistryIOError:
-                _send(settings, "⚠️ OHM WATCHLIST — watch registry is unavailable.")
+                _send(settings, "⚠️ WATCHLIST — watch registry is unavailable.")
         elif command == "orders":
             if args:
                 raise TelegramCommandError("Usage: /orders")
@@ -633,7 +633,7 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
     except TelegramCommandError as exc:
         _send(settings, f"⚠️ {exc}")
     except Exception as exc:
-        _send(settings, f"⚠️ OHM command failed safely ({type(exc).__name__}). No Kraken order was changed.")
+        _send(settings, f"⚠️ command failed safely ({type(exc).__name__}). No Kraken order was changed.")
     return True
 
 
@@ -645,7 +645,7 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
     except RegistryIOError:
         _send(
             settings,
-            "⚠️ OHM WATCH DEGRADED — watch registry is unavailable or corrupt. Existing Telegram cards may be stale.",
+            "⚠️ WATCH DEGRADED — watch registry is unavailable or corrupt. Existing Telegram cards may be stale.",
         )
         return 0
     changed = 0
@@ -673,7 +673,7 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
             except Exception:
                 pass
             if failures == 3:
-                _send(settings, f"⚠️ OHM WATCH DEGRADED — {symbol}: three consecutive market-data refresh failures. Existing card retained.")
+                _send(settings, f"⚠️ WATCH DEGRADED — {symbol}: three consecutive market-data refresh failures. Existing card retained.")
             continue
 
         material = _is_material_watch_change(row, insight)
