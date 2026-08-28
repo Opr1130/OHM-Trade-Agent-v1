@@ -60,6 +60,11 @@ def registry_files(tmp_path, monkeypatch):
         "STATE_FILE",
         tmp_path / "pending_alert_state.json",
     )
+    monkeypatch.setattr(
+        pending_setup_notifier,
+        "RETRY_FILE",
+        tmp_path / "pending_terminal_alert_outbox.json",
+    )
 
 
 def _snapshot(price: float, ema20: float) -> MarketSnapshot:
@@ -242,6 +247,8 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
+        "signal_id": "SIG-BTC-1",
+        "journey_id": "JOURNEY-BTC-1",
     }
 
     assert chief_alert_notifier.send_trade_plan(
@@ -261,6 +268,8 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
     assert intent.entry_action == "ENTER_NOW"
     assert intent.source == "ohm_actionable_signal"
     assert "reply_markup" not in sent
+    assert sent["signal_id"] == "SIG-BTC-1"
+    assert sent["journey_id"] == "JOURNEY-BTC-1"
 
 
 def test_place_limit_reuses_pending_trade_id_for_reconciliation(
