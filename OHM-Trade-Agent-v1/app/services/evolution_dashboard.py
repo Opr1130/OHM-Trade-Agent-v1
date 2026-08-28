@@ -564,7 +564,10 @@ def _recent_journeys(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result[:30]
 
 
-def _paper_trade_rows() -> dict[str, list[dict[str, Any]]]:
+def _paper_trade_rows(
+    *,
+    cutoff: datetime | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     opened: list[dict[str, Any]] = []
     closed: list[dict[str, Any]] = []
     for db in DB_FILES:
@@ -614,7 +617,14 @@ def _paper_trade_rows() -> dict[str, list[dict[str, Any]]]:
                     ),
                     "exit_reason": get("exit_reason"),
                 }
-                (opened if payload["is_open"] else closed).append(payload)
+                if payload["is_open"]:
+                    opened.append(payload)
+                else:
+                    closed_at = _parse_time(payload.get("close_date"))
+                    if cutoff is None or (
+                        closed_at is not None and closed_at >= cutoff
+                    ):
+                        closed.append(payload)
         except sqlite3.Error:
             continue
         finally:
@@ -636,10 +646,12 @@ def _source_health(
     events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     last_scan = _parse_time((operations.get("market") or {}).get("last_scan_utc"))
-    last_event = max(
-        (_parse_time(row.get("observed_at")) for row in events),
-        default=None,
-    )
+    event_times = [
+        parsed
+        for parsed in (_parse_time(row.get("observed_at")) for row in events)
+        if parsed is not None
+    ]
+    last_event = max(event_times) if event_times else None
     now = _now()
     scan_age = (now - last_scan).total_seconds() if last_scan else None
     event_age = (now - last_event).total_seconds() if last_event else None
@@ -894,7 +906,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
                 operations=operations,
                 paper=paper,
                 tv=tv,
-                events=scoped_events,
+                events=all_events,
             ),
             "market": operations.get("market") or {},
             "ai": operations.get("ai") or {},
@@ -911,7 +923,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
                 "updated_by": paper_control.updated_by,
             },
             "equity_curve": _equity_curve(outcomes),
-            "trades": _paper_trade_rows(),
+            "trades": _paper_trade_rows(cutoff=_cutoff(scope, now)),
         },
         "signal_intelligence": {
             "pattern_performance": _pattern_performance(scoped_events),
