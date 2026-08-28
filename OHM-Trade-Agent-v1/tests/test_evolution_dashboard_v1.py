@@ -324,3 +324,91 @@ def test_dashboard_html_has_graph_first_information_architecture():
     ]
     for value in required:
         assert value in DASHBOARD_HTML
+
+
+
+def test_scoped_journey_history_keeps_pre_cutoff_early_stages():
+    early_at = NOW - timedelta(days=2)
+    outcome_at = NOW - timedelta(hours=2)
+    events = _journey(
+        journey="JOURNEY:cross-cutoff",
+        signal="OHM:cross-cutoff",
+        at=early_at,
+        pnl=None,
+    )
+    events.append(
+        _event(
+            kind="PAPER_OUTCOME",
+            journey="JOURNEY:cross-cutoff",
+            signal="OHM:cross-cutoff",
+            at=outcome_at,
+            payload={
+                "net_pnl": 20.0,
+                "pnl_currency": "USD",
+                "close_profit_ratio": 0.02,
+                "exit_reason": "ohm_tp2",
+            },
+        )
+    )
+
+    scoped = dashboard._scoped_journey_history(
+        events,
+        cutoff=NOW - timedelta(days=1),
+    )
+    funnel = dashboard._funnel(scoped)
+
+    assert len(scoped) == len(events)
+    assert funnel["early_detected"] == 1
+    assert funnel["qualified_journeys_from_early"] == 1
+    assert funnel["paper_requested"] == 1
+    assert funnel["paper_admitted"] == 1
+    assert funnel["paper_closed"] == 1
+
+
+def test_inactive_failure_family_is_not_labeled_improving():
+    old = _event(
+        kind="PAPER_ADMISSION",
+        journey="J:inactive",
+        signal="S:inactive",
+        at=NOW - timedelta(days=30),
+        admitted=False,
+        reason="OLD_ONLY_FAILURE",
+    )
+    result = dashboard._failure_summary([old], [old], now=NOW)
+
+    assert result["events"] == 1
+    assert result["families_detail"] == []
+
+
+def test_unversioned_samples_remain_baseline_building_even_with_large_sample():
+    events = []
+    for days_ago in range(1, 7):
+        events.extend(
+            _journey(
+                journey=f"J:recent-{days_ago}",
+                signal=f"S:recent-{days_ago}",
+                at=NOW - timedelta(days=days_ago, hours=12),
+                pnl=10.0,
+            )
+        )
+    for days_ago in range(8, 14):
+        events.extend(
+            _journey(
+                journey=f"J:prior-{days_ago}",
+                signal=f"S:prior-{days_ago}",
+                at=NOW - timedelta(days=days_ago, hours=12),
+                pnl=10.0,
+            )
+        )
+
+    result = dashboard._evolution_scorecard(events, now=NOW)
+
+    assert result["recent_samples"] >= 5
+    assert result["prior_samples"] >= 5
+    assert result["recent_version_coverage_pct"] == 0.0
+    assert result["prior_version_coverage_pct"] == 0.0
+    assert result["attribution_status"] == "BASELINE_BUILDING"
+    assert all(
+        row["status"] == "BASELINE_BUILDING"
+        for row in result["metrics"]
+    )
