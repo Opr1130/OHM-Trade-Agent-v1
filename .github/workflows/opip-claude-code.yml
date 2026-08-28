@@ -119,13 +119,13 @@ jobs:
           row = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           obs = row["observed"]
           print("## O'Pip AI execution")
-          print(f"- Profile: \`{row['profile']}\`")
-          print(f"- Model: \`{row['model']}\`")
-          print(f"- Hard budget cap: \`${row['limits']['max_budget_usd']:.2f}\`")
-          print(f"- Max turns: \`{row['limits']['max_turns']}\`")
-          print(f"- Observed cost: \`{obs['actual_cost_usd']}\`")
-          print(f"- Observed turns: \`{obs['num_turns']}\`")
-          print(f"- Telemetry status: \`{obs['status']}\`")
+          print(f"- Profile: `{row['profile']}`")
+          print(f"- Model: `{row['model']}`")
+          print(f"- Hard budget cap: `${row['limits']['max_budget_usd']:.2f}`")
+          print(f"- Max turns: `{row['limits']['max_turns']}`")
+          print(f"- Observed cost: `{obs['actual_cost_usd']}`")
+          print(f"- Observed turns: `{obs['num_turns']}`")
+          print(f"- Telemetry status: `{obs['status']}`")
           PY
 
       - name: Retain AI usage receipt
