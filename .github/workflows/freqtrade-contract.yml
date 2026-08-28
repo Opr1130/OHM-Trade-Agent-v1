@@ -60,15 +60,18 @@ jobs:
             docker run --rm \
               -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
               -v "$PWD/freqtrade/user_data/$CONFIG:/freqtrade/config/$CONFIG:ro" \
-              -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/bridge:ro" \
+              -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
               -v "$RUNNER_TEMP/ohm-ft-control:/freqtrade/control:ro" \
               -v "$RUNNER_TEMP/ohm-ft-state:/freqtrade/state" \
               freqtradeorg/freqtrade:2026.7 \
               list-strategies \
               --config "/freqtrade/config/$CONFIG" \
-              --strategy-path /freqtrade/user_data/strategies \
               | tee "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"
             grep -q 'OHMExternalSignalStrategy' "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"
+            if grep -q 'DUPLICATE NAME' "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"; then
+              echo "Duplicate OHM strategy registration detected" >&2
+              exit 1
+            fi
           done
 
       - name: Validate dynamic Kraken pairlists in real Freqtrade
@@ -76,7 +79,7 @@ jobs:
           docker run --rm \
             -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
             -v "$PWD/freqtrade/user_data/config.json:/freqtrade/config/config.json:ro" \
-            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/bridge:ro" \
+            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
             freqtradeorg/freqtrade:2026.7 \
             test-pairlist --config /freqtrade/config/config.json --print-json \
             | tee "$RUNNER_TEMP/ohm-ft-pairs-usd.txt"
@@ -85,7 +88,7 @@ jobs:
           docker run --rm \
             -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
             -v "$PWD/freqtrade/user_data/config_usdt.json:/freqtrade/config/config_usdt.json:ro" \
-            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/bridge:ro" \
+            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
             freqtradeorg/freqtrade:2026.7 \
             test-pairlist --config /freqtrade/config/config_usdt.json --print-json \
             | tee "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
@@ -111,6 +114,8 @@ jobs:
               assert "api_server" not in config
               assert "telegram" not in config
               assert config["pairlists"][0]["processing_mode"] == "append"
+              assert config["custom_price_max_distance_ratio"] == 1.0
+              assert config["pairlists"][0]["pairlist_url"].startswith("file:///user_data/bridge/")
 
           production = Path("docker-compose.yml").read_text()
           paper = Path("docker-compose.paper.yml").read_text()
@@ -120,7 +125,7 @@ jobs:
           assert "env_file:" not in paper
           assert "ports:" not in paper
           assert "./data/paper_trading:/freqtrade/control:ro" in paper
-          assert "./data/freqtrade_bridge:/freqtrade/bridge:ro" in paper
+          assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper
           assert "mem_limit: 384m" in paper
           assert 'cpus: "0.40"' in paper
           print("Freqtrade paper authority/isolation boundary: PASS")
