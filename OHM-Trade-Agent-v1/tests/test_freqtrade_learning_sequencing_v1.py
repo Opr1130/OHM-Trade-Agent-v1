@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import inspect
 
-from app.jobs import scan_movers, scan_opportunities
+from types import SimpleNamespace
+
+from app.jobs import run_cycle, scan_movers, scan_opportunities
 
 
 def test_freqtrade_signal_publication_remains_post_telegram():
@@ -37,3 +39,48 @@ def test_journey_capture_is_fail_soft_and_measurement_only():
     assert "Intelligence journey watch capture: fail-soft" in source
     helper_source = inspect.getsource(scan_opportunities._publish_freqtrade_paper_opportunities)
     assert "production unaffected" in helper_source
+
+
+
+def test_unified_cycle_orders_real_risk_before_early_watch_and_paper():
+    source = inspect.getsource(run_cycle._run_cycle_once)
+    active = source.index("monitor_active_main()")
+    pending = source.index("monitor_pending_main()")
+    early = source.index("_run_early_watch_if_due(")
+    paper = source.index("_run_paper_monitor_fail_open()")
+    broad = source.index("run_scan_with_telemetry(scan_main)")
+    assert active < pending < early < paper < broad
+
+
+def test_early_watch_cadence_runs_once_then_waits(tmp_path, monkeypatch):
+    state = tmp_path / "early.json"
+    lock = tmp_path / ".early.lock"
+    calls = []
+    monkeypatch.setattr(run_cycle, "EARLY_WATCH_STATE_FILE", state)
+    monkeypatch.setattr(run_cycle, "EARLY_WATCH_LOCK_FILE", lock)
+    monkeypatch.setattr(run_cycle, "scan_movers_main", lambda: calls.append(True))
+    monkeypatch.setattr(
+        run_cycle,
+        "datetime",
+        SimpleNamespace(
+            now=lambda tz: __import__("datetime").datetime(
+                2026, 8, 27, 12, 0, tzinfo=__import__("datetime").timezone.utc
+            ),
+            fromisoformat=__import__("datetime").datetime.fromisoformat,
+        ),
+    )
+    settings = SimpleNamespace(signal_quality_scan_interval_seconds=600)
+
+    run_cycle._run_early_watch_if_due(settings=settings, quiet_hours=False)
+    run_cycle._run_early_watch_if_due(settings=settings, quiet_hours=False)
+    assert calls == [True]
+
+
+def test_early_watch_does_not_create_new_quiet_hour_alert_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(run_cycle, "scan_movers_main", lambda: calls.append(True))
+    run_cycle._run_early_watch_if_due(
+        settings=SimpleNamespace(signal_quality_scan_interval_seconds=600),
+        quiet_hours=True,
+    )
+    assert calls == []
