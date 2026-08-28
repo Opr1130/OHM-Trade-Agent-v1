@@ -168,11 +168,15 @@ def _publish_freqtrade_paper_opportunities(
     """Publish post-alert qualified LONG intents to authoritative Freqtrade dry-run."""
     try:
         from app.services.freqtrade_signal_bridge import (
+            PaperAdmissionRejected,
             build_signal_id,
             publish_qualified_long,
             to_freqtrade_pair,
         )
-        from app.services.intelligence_journey import link_qualified_signal
+        from app.services.intelligence_journey import (
+            link_qualified_signal,
+            record_paper_admission,
+        )
         from app.services.paper_trade_control import paper_trade_enabled
 
         paper_enabled = paper_trade_enabled()
@@ -274,12 +278,45 @@ def _publish_freqtrade_paper_opportunities(
                 confidence=int(alert.get("confidence") or 0),
                 profit_rank=ranked.rank,
                 profit_rank_score=float(ranked.profit_ranking.total_score),
+                starting_equity=float(settings.paper_trade_starting_equity),
+                max_positions=int(settings.paper_trade_max_positions),
+            )
+            record_paper_admission(
+                signal_id=signal_id,
+                symbol=snapshot.symbol,
+                observed_at=decision_at,
+                admitted=True,
+                reason="ADMITTED",
+                payload={
+                    "pair": signal["pair"],
+                    "stake_amount": signal["stake_amount"],
+                    "profit_rank": ranked.rank,
+                },
             )
             published += 1
             print(
                 f"FREQTRADE PAPER {snapshot.symbol}: PUBLISHED "
                 f"Signal={signal['signal_id']} Pair={signal['pair']} "
                 f"Journey={journey_id} Entry={signal['entry_price']}"
+            )
+        except PaperAdmissionRejected as exc:
+            try:
+                record_paper_admission(
+                    signal_id=signal_id,
+                    symbol=snapshot.symbol,
+                    observed_at=decision_at,
+                    admitted=False,
+                    reason=exc.reason,
+                    payload={
+                        "profit_rank": ranked.rank,
+                        "stake_amount": float(settings.paper_trade_capital_per_trade),
+                    },
+                )
+            except Exception:
+                pass
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: NOT_ADMITTED "
+                f"Reason={exc.reason} Signal={signal_id}"
             )
         except Exception as exc:
             failures += 1
