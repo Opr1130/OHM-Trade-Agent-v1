@@ -302,6 +302,40 @@ def test_requeue_preserves_active_terminal_outbox_lease(monkeypatch, tmp_path):
     assert row["lease_token"] == token
 
 
+def test_pending_entry_alert_is_quarantined_while_terminal_outbox_exists(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    terminal_result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+    pending_notifier._queue_terminal_notification(setup, terminal_result)
+
+    entry_result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="ENTRY_ZONE_REACHED",
+        current_price=10.2,
+        reason="price returned",
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("entry-ready alert must be quarantined")
+        ),
+    )
+
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        entry_result,
+        "token",
+        "chat",
+    ) is False
+
+
 def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch, tmp_path):
     setup = _pending_setup()
     result = PendingSetupMonitorResult(
