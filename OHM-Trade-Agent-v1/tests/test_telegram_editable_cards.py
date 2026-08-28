@@ -71,6 +71,8 @@ def test_compact_mover_card_is_short_and_decision_focused():
         distance_to_24h_high_pct=1.0,
         extended_move=False,
         liquidity_24h_usd_approx=500000.0,
+        reference_price=1.2345,
+        detection_timeframe="1H",
     )
 
     card = _compact_card(signal)
@@ -79,7 +81,8 @@ def test_compact_mover_card_is_short_and_decision_focused():
     assert "Entry: WAIT_FOR_PULLBACK" in card
     assert "Momentum accelerating" in card
     assert "Volume expanding" in card
-    assert len(card.splitlines()) <= 7
+    assert "Price: 1.2345 | TF: 1H" in card
+    assert len(card.splitlines()) <= 8
     assert "Evidence:" not in card
 
 
@@ -91,29 +94,43 @@ def _telegram_settings():
     )
 
 
+def _delivery(*, delivered: bool, message_id: int | None, status: str):
+    return SimpleNamespace(
+        delivered=delivered,
+        message_id=message_id,
+        status=status,
+    )
+
+
+def _update_args(decision, message="updated card"):
+    return dict(
+        settings=_telegram_settings(),
+        decision=decision,
+        message=message,
+        identity="EARLY_MOVER:METUSD",
+        alert_family="EARLY_MOVER",
+        event_type="READY",
+        fingerprint="READY:WAIT_FOR_PULLBACK:ACCELERATING:NOT_EXTENDED",
+        symbol="METUSD",
+    )
+
+
 def test_meaningful_transition_sends_fresh_push_instead_of_silent_edit(monkeypatch):
     calls = {"send": 0, "edit": 0}
 
     def send(*args, **kwargs):
         calls["send"] += 1
-        return 9001
+        return _delivery(delivered=True, message_id=9001, status="TRANSITION_PUSHED")
 
     def edit(*args, **kwargs):
         calls["edit"] += 1
-        return True
+        return _delivery(delivered=True, message_id=4321, status="EDITED")
 
-    monkeypatch.setattr("app.jobs.scan_movers.send_telegram_message_with_id", send)
-    monkeypatch.setattr("app.jobs.scan_movers.edit_telegram_message", edit)
+    monkeypatch.setattr("app.jobs.scan_movers.send_tracked_telegram", send)
+    monkeypatch.setattr("app.jobs.scan_movers.edit_tracked_telegram", edit)
 
-    decision = SimpleNamespace(
-        reason="MEANINGFUL_TRANSITION",
-        message_id=4321,
-    )
-    action, message_id = _deliver_existing_card_update(
-        settings=_telegram_settings(),
-        decision=decision,
-        message="updated card",
-    )
+    decision = SimpleNamespace(reason="MEANINGFUL_TRANSITION", message_id=4321)
+    action, message_id = _deliver_existing_card_update(**_update_args(decision))
 
     assert action == "TRANSITION_PUSHED"
     assert message_id == 9001
@@ -125,23 +142,18 @@ def test_periodic_refresh_keeps_editing_existing_card_without_new_push(monkeypat
 
     def send(*args, **kwargs):
         calls["send"] += 1
-        return 9002
+        return _delivery(delivered=True, message_id=9002, status="DELIVERED")
 
     def edit(*args, **kwargs):
         calls["edit"] += 1
-        return True
+        return _delivery(delivered=True, message_id=4321, status="EDITED")
 
-    monkeypatch.setattr("app.jobs.scan_movers.send_telegram_message_with_id", send)
-    monkeypatch.setattr("app.jobs.scan_movers.edit_telegram_message", edit)
+    monkeypatch.setattr("app.jobs.scan_movers.send_tracked_telegram", send)
+    monkeypatch.setattr("app.jobs.scan_movers.edit_tracked_telegram", edit)
 
-    decision = SimpleNamespace(
-        reason="PERIODIC_REFRESH",
-        message_id=4321,
-    )
+    decision = SimpleNamespace(reason="PERIODIC_REFRESH", message_id=4321)
     action, message_id = _deliver_existing_card_update(
-        settings=_telegram_settings(),
-        decision=decision,
-        message="refreshed card",
+        **_update_args(decision, "refreshed card")
     )
 
     assert action == "EDITED"
@@ -151,23 +163,22 @@ def test_periodic_refresh_keeps_editing_existing_card_without_new_push(monkeypat
 
 def test_failed_meaningful_transition_push_keeps_old_canonical_state_retryable(monkeypatch):
     monkeypatch.setattr(
-        "app.jobs.scan_movers.send_telegram_message_with_id",
-        lambda *args, **kwargs: None,
+        "app.jobs.scan_movers.send_tracked_telegram",
+        lambda *args, **kwargs: _delivery(
+            delivered=False,
+            message_id=None,
+            status="SEND_FAILED",
+        ),
     )
     monkeypatch.setattr(
-        "app.jobs.scan_movers.edit_telegram_message",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit must not run")),
+        "app.jobs.scan_movers.edit_tracked_telegram",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("edit must not run")
+        ),
     )
 
-    decision = SimpleNamespace(
-        reason="MEANINGFUL_TRANSITION",
-        message_id=4321,
-    )
-    action, message_id = _deliver_existing_card_update(
-        settings=_telegram_settings(),
-        decision=decision,
-        message="updated card",
-    )
+    decision = SimpleNamespace(reason="MEANINGFUL_TRANSITION", message_id=4321)
+    action, message_id = _deliver_existing_card_update(**_update_args(decision))
 
     assert action == "TRANSITION_PUSH_FAILED"
     assert message_id is None
