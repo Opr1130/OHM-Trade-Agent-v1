@@ -28,7 +28,11 @@ from app.services.signal_scoring import (
     main_feed_candidates,
     volume_growth_proxy_label,
 )
-from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
+from app.services.telegram_delivery import (
+    edit_tracked_telegram,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 
 
 def _transition_key(signal) -> str:
@@ -47,31 +51,42 @@ def _deliver_existing_card_update(
     settings,
     decision,
     message: str,
+    identity: str,
+    alert_family: str,
+    event_type: str,
+    fingerprint: str,
+    symbol: str,
 ) -> tuple[str, int | None]:
-    """Deliver an existing opportunity update without hiding meaningful changes.
-
-    Periodic same-state refreshes edit the canonical Telegram card silently.
-    A meaningful transition sends a fresh card so Telegram generates a new
-    mobile notification. The new message becomes canonical only after Telegram
-    accepts it, so a failed transition send remains retryable next scan.
-    """
+    """Deliver an existing opportunity update without hiding meaningful changes."""
     if decision.reason == "MEANINGFUL_TRANSITION":
-        message_id = send_telegram_message_with_id(
-            settings.telegram_bot_token,
-            settings.telegram_chat_id,
-            message,
+        delivery = send_tracked_telegram(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            message=message,
+            identity=identity,
+            alert_family=alert_family,
+            event_type=event_type,
+            fingerprint=fingerprint,
+            symbol=symbol,
+            success_status="TRANSITION_PUSHED",
         )
-        if message_id is None:
+        if not delivery.delivered:
             return "TRANSITION_PUSH_FAILED", None
-        return "TRANSITION_PUSHED", message_id
+        return "TRANSITION_PUSHED", delivery.message_id
 
-    if edit_telegram_message(
-        settings.telegram_bot_token,
-        settings.telegram_chat_id,
-        decision.message_id,
-        message,
-    ):
-        return "EDITED", decision.message_id
+    delivery = edit_tracked_telegram(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        message_id=decision.message_id,
+        message=message,
+        identity=identity,
+        alert_family=alert_family,
+        event_type=event_type,
+        fingerprint=fingerprint,
+        symbol=symbol,
+    )
+    if delivery.delivered:
+        return "EDITED", delivery.message_id
     return "EDIT_FAILED", None
 
 
@@ -136,11 +151,12 @@ def _compact_card(signal) -> str:
         else "WATCH FOR PULLBACK"
     )
     return (
-        f"🚀 OHM OPPORTUNITY — {display_market_label(signal.symbol)} — {signal.stage}\n"
-        f"Potential: +{low}% to +{high}%\n"
-        f"Confidence*: {signal.continuation_confidence}% | Risk*: {risk}%\n"
-        f"Downside if wrong*: up to -{downside}%\n"
-        f"Reason: {_best_signal_reason(signal)}\n"
+        f"🚀 OHM EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
+        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | {signal.momentum_state}\n"
+        f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
+        f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
+        f"Why now: {_best_signal_reason(signal)}\n"
         f"Entry: {signal.entry_recommendation} | Action: {action}\n"
         "*Heuristic scenario scores, not probabilities."
     )
@@ -197,7 +213,7 @@ def _signal_quality_transition_key(candidate: SignalQualityCandidate) -> str:
     )
 
 
-def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
+def _signal_quality_card(candidate: SignalQualityCandidate, *, reference_price: float | None = None) -> str:
     """Render a Signal Quality v1 card.
 
     Every score carries a heuristic marker and the action line states plainly
@@ -208,7 +224,8 @@ def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
     stage = str(candidate.stage).replace("_", " ")
     return (
         f"🚀 OHM EARLY WATCH — {display_market_label(candidate.symbol)}\n"
-        f"Stage: {stage}\n"
+        + (f"Price: {float(reference_price):.8g}\n" if isinstance(reference_price, (int, float)) and float(reference_price) > 0 else "")
+        + f"Stage: {stage}\n"
         f"Pattern: {pattern}\n"
         f"Pattern strength*: {candidate.pattern_strength_score}/100\n"
         f"Tradeability*: {candidate.tradeability_score}/100\n"
@@ -291,7 +308,10 @@ def _broad_watch_feed(
             (
                 candidate.symbol,
                 _signal_quality_transition_key(candidate),
-                _signal_quality_card(candidate),
+                _signal_quality_card(
+                    candidate,
+                    reference_price=(getattr(full_market, "signal_quality_reference_prices", {}) or {}).get(candidate.symbol),
+                ),
             )
             for candidate in eligible
         ]
@@ -403,6 +423,15 @@ def main() -> None:
             if decision.action == "SUPPRESS":
                 suppressed += 1
                 early_mover_delivery[signal.symbol.upper()] = ("SUPPRESSED", False)
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="EARLY_MOVER",
+                    event_type=signal.stage,
+                    fingerprint=transition_key,
+                    reason=decision.reason,
+                    symbol=signal.symbol,
+                    generated_at=decision_at,
+                )
                 print(f"Alert governor suppressed {signal.symbol}: {decision.reason}")
                 continue
 
@@ -412,6 +441,11 @@ def main() -> None:
                     settings=settings,
                     decision=decision,
                     message=message,
+                    identity=identity,
+                    alert_family="EARLY_MOVER",
+                    event_type=signal.stage,
+                    fingerprint=transition_key,
+                    symbol=signal.symbol,
                 )
                 if delivered_message_id is not None:
                     record_opportunity_alert(
@@ -434,16 +468,22 @@ def main() -> None:
                     )
                 continue
 
-            message_id = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message,
+            delivery = send_tracked_telegram(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id,
+                message=message,
+                identity=identity,
+                alert_family="EARLY_MOVER",
+                event_type=signal.stage,
+                fingerprint=transition_key,
+                symbol=signal.symbol,
+                generated_at=decision_at,
             )
-            if message_id is not None:
+            if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
-                    message_id=message_id,
+                    message_id=delivery.message_id,
                     created_new=True,
                 )
                 created += 1
@@ -468,6 +508,15 @@ def main() -> None:
             if decision.action == "SUPPRESS":
                 broad_suppressed += 1
                 broad_watch_delivery[symbol.upper()] = ("SUPPRESSED", False)
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="BROAD_WATCH",
+                    event_type=transition_key.split(":", 1)[0],
+                    fingerprint=transition_key,
+                    reason=decision.reason,
+                    symbol=symbol,
+                    generated_at=decision_at,
+                )
                 print(f"Broad-watch governor suppressed {symbol}: {decision.reason}")
                 continue
 
@@ -476,6 +525,11 @@ def main() -> None:
                     settings=settings,
                     decision=decision,
                     message=message,
+                    identity=identity,
+                    alert_family="BROAD_WATCH",
+                    event_type=transition_key.split(":", 1)[0],
+                    fingerprint=transition_key,
+                    symbol=symbol,
                 )
                 if delivered_message_id is not None:
                     record_opportunity_alert(
@@ -499,16 +553,22 @@ def main() -> None:
                     )
                 continue
 
-            message_id = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message,
+            delivery = send_tracked_telegram(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id,
+                message=message,
+                identity=identity,
+                alert_family="BROAD_WATCH",
+                event_type=transition_key.split(":", 1)[0],
+                fingerprint=transition_key,
+                symbol=symbol,
+                generated_at=decision_at,
             )
-            if message_id is not None:
+            if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
-                    message_id=message_id,
+                    message_id=delivery.message_id,
                     created_new=True,
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
