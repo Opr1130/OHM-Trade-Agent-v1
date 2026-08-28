@@ -7,6 +7,15 @@ from types import SimpleNamespace
 from app.jobs import run_cycle, scan_movers, scan_opportunities
 
 
+
+def test_qualified_signal_lineage_is_created_before_telegram_delivery():
+    source = inspect.getsource(scan_opportunities.main)
+    lineage = source.index("_prepare_qualified_lineage(")
+    send = source.index("send_trade_plan(", lineage)
+    publication = source.rfind("_publish_freqtrade_paper_opportunities(")
+    assert lineage < send < publication
+
+
 def test_freqtrade_signal_publication_remains_post_telegram():
     source = inspect.getsource(scan_opportunities.main)
     publication = source.rfind("_publish_freqtrade_paper_opportunities(")
