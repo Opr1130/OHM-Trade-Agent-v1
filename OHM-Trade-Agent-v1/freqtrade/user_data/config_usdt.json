@@ -54,9 +54,6 @@
     "use_order_book": true,
     "order_book_top": 1
   },
-  "api_server": {
-    "enabled": false
-  },
   "internals": {
     "process_throttle_secs": 5,
     "heartbeat_interval": 60
