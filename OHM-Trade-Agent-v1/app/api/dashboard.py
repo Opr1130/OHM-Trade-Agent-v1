@@ -100,7 +100,7 @@ button,input{font:inherit}.app{min-height:100vh;display:grid;grid-template-colum
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand"><b>OHM · O’Pip</b><div>Evolution console</div></div>
+    <div class="brand"><b>OHM · O’Pip</b><div>Evolution console</div><div style="font-size:9px;margin-top:6px;opacity:.62">OHM AI — Operations & Learning</div></div>
     <nav class="nav">
       <button class="active" data-page="overview"><span class="glyph">◫</span><span class="label">Overview</span></button>
       <button data-page="evolution"><span class="glyph">↗</span><span class="label">Evolution</span></button>
