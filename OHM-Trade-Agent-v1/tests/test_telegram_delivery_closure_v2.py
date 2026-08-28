@@ -202,6 +202,37 @@ def test_failed_terminal_pending_alert_persists_truth_and_retries_out_of_band(mo
     assert emitted
 
 
+def test_terminal_alert_outbox_retires_when_exchange_fill_supersedes_market_alert(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="INVALIDATED",
+        current_price=8.9,
+        reason="stop breached",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+    monkeypatch.setattr(pending_notifier, "terminalize_pending_setup", lambda *args: False)
+    monkeypatch.setattr(
+        pending_notifier,
+        "get_pending_setup_record",
+        lambda trade_id: {"trade_id": trade_id, "status": "entered"},
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("stale alert must not send")),
+    )
+
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        result,
+        "token",
+        "chat",
+    ) is False
+    assert json.loads(retry_file.read_text()) == {}
+
+
 def test_telegram_alert_state_writers_use_atomic_registry_io():
     sources = [
         Path(pending_notifier.__file__).read_text(),
