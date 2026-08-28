@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -123,7 +124,8 @@ def _record(
     attempt = 0
     retry_count = 0
     try:
-        with registry_lock(LOCK_FILE):
+        lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
+        with registry_lock(lock_file):
             state = load_json(state_file)
             alerts = state.get("alerts")
             identities = state.get("identities")
@@ -392,7 +394,8 @@ def record_telegram_not_eligible(
 
 def canonical_message_id(identity: str, *, state_file: Path = STATE_FILE) -> int | None:
     try:
-        with registry_lock(LOCK_FILE):
+        lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
+        with registry_lock(lock_file):
             state = load_json(state_file)
         identities = state.get("identities") or {}
         row = identities.get(str(identity or "").strip()) or {}
@@ -404,7 +407,7 @@ def canonical_message_id(identity: str, *, state_file: Path = STATE_FILE) -> int
 def read_delivery_events(*, path: Path = EVENT_FILE, limit: int = MAX_SUMMARY_EVENTS) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    rows: list[dict[str, Any]] = []
+    rows: deque[dict[str, Any]] = deque(maxlen=max(1, int(limit)))
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -416,7 +419,7 @@ def read_delivery_events(*, path: Path = EVENT_FILE, limit: int = MAX_SUMMARY_EV
                     rows.append(row)
     except OSError:
         return []
-    return rows[-max(1, int(limit)):]
+    return list(rows)
 
 
 def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> dict[str, Any]:
