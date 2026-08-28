@@ -392,6 +392,72 @@ def record_telegram_not_eligible(
     )
 
 
+
+def link_delivery_to_journey(
+    *,
+    identity: str,
+    alert_family: str,
+    event_type: str,
+    fingerprint: str,
+    journey_id: str,
+    signal_id: str | None = None,
+    trade_id: str | None = None,
+    state_file: Path = STATE_FILE,
+    event_file: Path = EVENT_FILE,
+) -> bool:
+    """Attach post-alert intelligence lineage without rewriting delivery history."""
+    alert_id = _alert_id(
+        identity=identity,
+        alert_family=alert_family,
+        event_type=event_type,
+        fingerprint=fingerprint,
+    )
+    now = _utc()
+    lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
+    try:
+        with registry_lock(lock_file):
+            state = load_json(state_file)
+            alerts = state.get("alerts")
+            if not isinstance(alerts, dict):
+                alerts = {}
+            row = alerts.get(alert_id)
+            if not isinstance(row, dict):
+                row = {
+                    "identity": identity,
+                    "alert_family": str(alert_family).upper(),
+                    "event_type": str(event_type).upper(),
+                    "fingerprint": fingerprint,
+                }
+            row["journey_id"] = str(journey_id)
+            if signal_id:
+                row["signal_id"] = str(signal_id)
+            if trade_id:
+                row["trade_id"] = str(trade_id)
+            row["lineage_updated_at"] = now.isoformat()
+            alerts[alert_id] = row
+            state["alerts"] = alerts
+            save_json_atomic(state_file, state)
+            _append_event_locked(
+                {
+                    "schema_version": 1,
+                    "record_type": "TELEGRAM_DELIVERY_LINEAGE",
+                    "alert_id": alert_id,
+                    "identity": identity,
+                    "alert_family": str(alert_family).upper(),
+                    "event_type": str(event_type).upper(),
+                    "fingerprint": fingerprint,
+                    "journey_id": str(journey_id),
+                    "signal_id": str(signal_id or "") or None,
+                    "trade_id": str(trade_id or "") or None,
+                    "linked_at": now.isoformat(),
+                },
+                event_file=event_file,
+            )
+        return True
+    except (OSError, TimeoutError, RegistryIOError, TypeError, ValueError):
+        return False
+
+
 def canonical_message_id(identity: str, *, state_file: Path = STATE_FILE) -> int | None:
     try:
         lock_file = state_file.parent / f".{state_file.name}.delivery.lock"
@@ -433,13 +499,15 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
             for row in rows
             if str(row.get("attempted_at") or "")[:10] == today.isoformat()
         ]
+    lineage_links = sum(1 for row in rows if row.get("record_type") == "TELEGRAM_DELIVERY_LINEAGE")
+    delivery_rows = [row for row in rows if row.get("record_type") == "TELEGRAM_DELIVERY_EVENT"]
     statuses: dict[str, int] = {}
     families: dict[str, int] = {}
     delivered = 0
     failed = 0
     suppressed = 0
     latencies: list[int] = []
-    for row in rows:
+    for row in delivery_rows:
         status = str(row.get("status") or "UNKNOWN").upper()
         family = str(row.get("alert_family") or "UNKNOWN").upper()
         statuses[status] = statuses.get(status, 0) + 1
@@ -454,7 +522,8 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
         elif status.endswith("FAILED"):
             failed += 1
     return {
-        "events": len(rows),
+        "events": len(delivery_rows),
+        "lineage_links": lineage_links,
         "delivered": delivered,
         "failed": failed,
         "suppressed": suppressed,
@@ -468,5 +537,5 @@ def build_delivery_summary(*, scope: str = "all", path: Path = EVENT_FILE) -> di
         ),
         "by_status": dict(sorted(statuses.items())),
         "by_family": dict(sorted(families.items())),
-        "recent": list(reversed(rows[-40:])),
+        "recent": list(reversed(delivery_rows[-40:])),
     }
