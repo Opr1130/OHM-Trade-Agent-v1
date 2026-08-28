@@ -19,6 +19,7 @@ DB_FILES = (DB_USD_FILE, DB_USDT_FILE)
 # Backward-compatible primary path for tests/importers.
 DB_FILE = DB_USD_FILE
 STATE_FILE = Path("/app/data/intelligence_learning/freqtrade_ingest_state.json")
+DEDUP_DB_FILE = Path("/app/data/intelligence_learning/freqtrade_ingest_dedup.sqlite")
 WORKER_HEARTBEAT_MAX_AGE_SECONDS = 60
 
 
@@ -238,20 +239,68 @@ def freqtrade_dry_run_status(
     }
 
 
-def ingest_freqtrade_dry_run(
+def _dedup_path(
+    state_file: Path,
+    dedup_db_file: Path | None,
+) -> Path:
+    if dedup_db_file is not None:
+        return dedup_db_file
+    if state_file == STATE_FILE:
+        return DEDUP_DB_FILE
+    return state_file.with_name(f"{state_file.stem}_dedup.sqlite")
+
+
+def _open_dedup(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=2.0)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_trade_outcomes (
+            trade_key TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def _event_contains_trade_key(event_file: Path, trade_key: str) -> bool:
+    if not event_file.exists():
+        return False
+    try:
+        with event_file.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if trade_key not in line:
+                    continue
+                try:
+                    import json
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if (
+                    str(row.get("event_type") or "").upper() == "PAPER_OUTCOME"
+                    and str((row.get("payload") or {}).get("trade_key") or "")
+                    == trade_key
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _ingest_freqtrade_dry_run_unlocked(
     *,
     db_file: Path | None = None,
     state_file: Path = STATE_FILE,
     journey_state_file: Path = JOURNEY_STATE_FILE,
     journey_event_file: Path = JOURNEY_EVENT_FILE,
+    dedup_db_file: Path | None = None,
 ) -> dict[str, Any]:
-    state_lock = state_file.parent / f".{state_file.name}.lock"
-    with registry_lock(state_lock):
-        state = load_json(state_file)
-        processed = {
-            str(value)
-            for value in (state.get("processed_trade_keys") or [])
-        }
+    dedup_path = _dedup_path(state_file, dedup_db_file)
+    dedup = _open_dedup(dedup_path)
 
     added = 0
     rows_seen = 0
@@ -261,104 +310,152 @@ def ingest_freqtrade_dry_run(
     worker_status: dict[str, str] = {}
     ready_workers = 0
 
-    for path in _selected_db_files(db_file):
-        quote = _quote_for_db(path)
-        status, columns, rows, _reason = _read_trade_rows(
-            path,
-            closed_only=True,
-        )
-        worker_status[quote] = status
-        if status != "OK":
-            continue
-        ready_workers += 1
-        rows_seen += len(rows)
-
-        for row in rows:
-            trade_id = int(row["id"])
-            trade_key = f"{quote}:{trade_id}"
-            if trade_key in processed:
-                continue
-
-            signal_id = str(row["enter_tag"] or "")
-            pair = str(row["pair"] or "")
-            symbol = pair.replace("/", "").replace(":", "").upper()
-            close_time = _parse_time(
-                _value(row, columns, "close_date")
-                or _value(row, columns, "close_date_utc")
+    try:
+        for path in _selected_db_files(db_file):
+            quote = _quote_for_db(path)
+            status, columns, rows, _reason = _read_trade_rows(
+                path,
+                closed_only=True,
             )
-            if close_time is None:
-                invalid_outcomes += 1
+            worker_status[quote] = status
+            if status != "OK":
                 continue
-            try:
-                net_pnl = float(_value(row, columns, "close_profit_abs"))
-                close_profit_ratio = float(_value(row, columns, "close_profit"))
-            except (TypeError, ValueError):
-                invalid_outcomes += 1
-                continue
+            ready_workers += 1
+            rows_seen += len(rows)
 
-            payload = {
-                "engine": "FREQTRADE",
-                "mode": "DRY_RUN",
-                "worker_quote": quote,
-                "trade_id": trade_id,
-                "trade_key": trade_key,
-                "pair": pair,
-                "pnl_currency": quote,
-                "open_date": _value(row, columns, "open_date"),
-                "close_date": _value(row, columns, "close_date"),
-                "open_rate": _value(row, columns, "open_rate"),
-                "open_rate_requested": _value(
-                    row,
-                    columns,
-                    "open_rate_requested",
-                ),
-                "close_rate": _value(row, columns, "close_rate"),
-                "close_rate_requested": _value(
-                    row,
-                    columns,
-                    "close_rate_requested",
-                ),
-                "stake_amount": _value(row, columns, "stake_amount"),
-                "amount": _value(row, columns, "amount"),
-                "fee_open": _value(row, columns, "fee_open"),
-                "fee_close": _value(row, columns, "fee_close"),
-                "close_profit_ratio": close_profit_ratio,
-                "net_pnl": net_pnl,
-                "exit_reason": _value(row, columns, "exit_reason"),
-                "strategy": _value(row, columns, "strategy"),
-                "timeframe": _value(row, columns, "timeframe"),
-                "dry_run": True,
-                "exchange_write_authority": False,
-            }
-            journey_id = record_paper_outcome(
-                signal_id=signal_id,
-                symbol=symbol,
-                observed_at=close_time,
-                payload=payload,
-                state_file=journey_state_file,
-                event_file=journey_event_file,
-            )
-            if journey_id is not None:
-                added += 1
-                new_keys.append(trade_key)
-            else:
-                # Do not acknowledge an outcome that could not be joined to
-                # its signal lineage. Leave it unprocessed so a later learning
-                # pass can recover after temporary state/ordering issues.
-                unmatched_outcomes += 1
+            for row in rows:
+                trade_id = int(row["id"])
+                trade_key = f"{quote}:{trade_id}"
+                existing = dedup.execute(
+                    "SELECT status FROM processed_trade_outcomes WHERE trade_key = ?",
+                    (trade_key,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing[0]).upper() == "APPLIED":
+                        continue
+                    # Recover a crash after the append but before the ledger
+                    # status update without creating a duplicate learning row.
+                    if _event_contains_trade_key(journey_event_file, trade_key):
+                        dedup.execute(
+                            """
+                            UPDATE processed_trade_outcomes
+                            SET status = 'APPLIED', updated_at = ?
+                            WHERE trade_key = ?
+                            """,
+                            (datetime.now(timezone.utc).isoformat(), trade_key),
+                        )
+                        dedup.commit()
+                        continue
+                    dedup.execute(
+                        "DELETE FROM processed_trade_outcomes WHERE trade_key = ?",
+                        (trade_key,),
+                    )
+                    dedup.commit()
 
-    if new_keys:
-        with registry_lock(state_lock):
-            latest = load_json(state_file)
-            existing = [
-                str(value)
-                for value in (latest.get("processed_trade_keys") or [])
-            ]
-            merged = list(dict.fromkeys(existing + new_keys))[-5000:]
-            latest["processed_trade_keys"] = merged
-            latest["last_ingested_at"] = datetime.now(timezone.utc).isoformat()
-            latest["population"] = "FREQTRADE_DRY_RUN_V1"
-            save_json_atomic(state_file, latest)
+                signal_id = str(row["enter_tag"] or "")
+                pair = str(row["pair"] or "")
+                symbol = pair.replace("/", "").replace(":", "").upper()
+                close_time = _parse_time(
+                    _value(row, columns, "close_date")
+                    or _value(row, columns, "close_date_utc")
+                )
+                if close_time is None:
+                    invalid_outcomes += 1
+                    continue
+                try:
+                    net_pnl = float(_value(row, columns, "close_profit_abs"))
+                    close_profit_ratio = float(
+                        _value(row, columns, "close_profit")
+                    )
+                except (TypeError, ValueError):
+                    invalid_outcomes += 1
+                    continue
+
+                payload = {
+                    "engine": "FREQTRADE",
+                    "mode": "DRY_RUN",
+                    "worker_quote": quote,
+                    "trade_id": trade_id,
+                    "trade_key": trade_key,
+                    "pair": pair,
+                    "pnl_currency": quote,
+                    "open_date": _value(row, columns, "open_date"),
+                    "close_date": _value(row, columns, "close_date"),
+                    "open_rate": _value(row, columns, "open_rate"),
+                    "open_rate_requested": _value(
+                        row,
+                        columns,
+                        "open_rate_requested",
+                    ),
+                    "close_rate": _value(row, columns, "close_rate"),
+                    "close_rate_requested": _value(
+                        row,
+                        columns,
+                        "close_rate_requested",
+                    ),
+                    "stake_amount": _value(row, columns, "stake_amount"),
+                    "amount": _value(row, columns, "amount"),
+                    "fee_open": _value(row, columns, "fee_open"),
+                    "fee_close": _value(row, columns, "fee_close"),
+                    "close_profit_ratio": close_profit_ratio,
+                    "net_pnl": net_pnl,
+                    "exit_reason": _value(row, columns, "exit_reason"),
+                    "strategy": _value(row, columns, "strategy"),
+                    "timeframe": _value(row, columns, "timeframe"),
+                    "dry_run": True,
+                    "exchange_write_authority": False,
+                }
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                dedup.execute(
+                    """
+                    INSERT INTO processed_trade_outcomes
+                        (trade_key, signal_id, status, updated_at)
+                    VALUES (?, ?, 'PENDING', ?)
+                    """,
+                    (trade_key, signal_id, now_iso),
+                )
+                dedup.commit()
+
+                journey_id = record_paper_outcome(
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    observed_at=close_time,
+                    payload=payload,
+                    state_file=journey_state_file,
+                    event_file=journey_event_file,
+                )
+                if journey_id is not None:
+                    dedup.execute(
+                        """
+                        UPDATE processed_trade_outcomes
+                        SET status = 'APPLIED', updated_at = ?
+                        WHERE trade_key = ?
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), trade_key),
+                    )
+                    dedup.commit()
+                    added += 1
+                    new_keys.append(trade_key)
+                else:
+                    # Keep unmatched outcomes retryable and do not poison the
+                    # durable primary-key ledger.
+                    dedup.execute(
+                        "DELETE FROM processed_trade_outcomes WHERE trade_key = ?",
+                        (trade_key,),
+                    )
+                    dedup.commit()
+                    unmatched_outcomes += 1
+    finally:
+        dedup.close()
+
+    state_lock = state_file.parent / f".{state_file.name}.lock"
+    with registry_lock(state_lock):
+        latest = load_json(state_file)
+        latest["last_ingested_at"] = datetime.now(timezone.utc).isoformat()
+        latest["population"] = "FREQTRADE_DRY_RUN_V1"
+        latest["dedup_store"] = str(dedup_path)
+        save_json_atomic(state_file, latest)
 
     total_workers = len(_selected_db_files(db_file))
     status = (
@@ -377,4 +474,25 @@ def ingest_freqtrade_dry_run(
         "new_trade_ids": len(new_keys),
         "new_trade_keys": len(new_keys),
         "workers": worker_status,
+        "dedup_store": str(dedup_path),
     }
+
+
+def ingest_freqtrade_dry_run(
+    *,
+    db_file: Path | None = None,
+    state_file: Path = STATE_FILE,
+    journey_state_file: Path = JOURNEY_STATE_FILE,
+    journey_event_file: Path = JOURNEY_EVENT_FILE,
+    dedup_db_file: Path | None = None,
+) -> dict[str, Any]:
+    ingest_lock = state_file.parent / ".freqtrade_ingest.lock"
+    with registry_lock(ingest_lock):
+        return _ingest_freqtrade_dry_run_unlocked(
+            db_file=db_file,
+            state_file=state_file,
+            journey_state_file=journey_state_file,
+            journey_event_file=journey_event_file,
+            dedup_db_file=dedup_db_file,
+        )
+
