@@ -11,7 +11,7 @@ from freqtrade.persistence import Order, Trade
 from freqtrade.strategy import IStrategy, stoploss_from_absolute
 
 
-BRIDGE_DIR = Path("/freqtrade/bridge")
+BRIDGE_DIR = Path("/freqtrade/user_data/bridge")
 SIGNALS_FILE = BRIDGE_DIR / "signals.json"
 CONTROL_FILE = Path("/freqtrade/control/control.json")
 
@@ -80,7 +80,12 @@ class OHMExternalSignalStrategy(IStrategy):
                 continue
             signal_id = str(row.get("signal_id") or "")
             pair = str(row.get("pair") or "")
-            if not signal_id or not pair or str(row.get("direction") or "").upper() != "LONG":
+            if (
+                not signal_id
+                or not pair
+                or str(row.get("direction") or "").upper() != "LONG"
+                or str(row.get("admission_status") or "").upper() != "ADMITTED"
+            ):
                 continue
             by_id[signal_id] = row
             by_pair.setdefault(pair, []).append(row)
@@ -167,10 +172,16 @@ class OHMExternalSignalStrategy(IStrategy):
         try:
             stop = float(signal["stop_price"])
             chase = float(signal["chase_limit"])
+            expected_entry = float(signal["entry_price"])
             requested = float(rate)
         except (KeyError, TypeError, ValueError):
             return False
-        if not (stop < requested <= chase):
+        if not (stop < requested <= chase) or expected_entry <= 0:
+            return False
+        # Freqtrade may apply exchange precision, but it must never silently
+        # turn an OHM pullback into a materially different entry. 25 bps allows
+        # precision rounding while rejecting default/custom-price clamping.
+        if abs(requested - expected_entry) / expected_entry > 0.0025:
             return False
 
         # A signal is one-shot even across bot restarts.
