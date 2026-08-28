@@ -5,6 +5,7 @@ import re
 import httpx
 
 from app.models.signal import SignalDecision, TradingSignal
+from app.services.asset_display_identity import display_market_label
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def format_trade_alert(signal: TradingSignal, decision: SignalDecision) -> str:
     risk_pct = max(10.0, min(90.0, 100.0 - confidence + downside * 2.0))
     reason = " ".join(str(decision.summary or "Qualified OHM trade setup").split())[:140]
     return (
-        f"🚨 OHM TRADE — {decision.symbol}\n"
+        f"🚨 OHM TRADE — {display_market_label(decision.symbol)}\n"
         f"Potential: +{potential:.1f}%\n"
         f"Confidence*: {confidence:.0f}%\n"
         f"Risk*: {risk_pct:.0f}%\n"
@@ -71,9 +72,12 @@ def _compact_legacy_chief(message: str) -> str:
     confidence = _number(_line_value(message, "AI Confidence")) or 0.0
     risk_label = (_line_value(message, "Risk") or "UNKNOWN").upper()
     entry_zone = _line_value(message, "Entry Zone")
+    chase = _line_value(message, "Do Not Chase Above") or _line_value(message, "Do Not Chase Below")
     stop = _number(_line_value(message, "Stop"))
     target1 = _number(_line_value(message, "Target 1"))
     target2 = _number(_line_value(message, "Target 2"))
+    capital = _number(_line_value(message, "Recommended Capital"))
+    net_edge = _number(_line_value(message, "Projected Net Edge"))
 
     entry_ref = None
     if entry_zone:
@@ -106,21 +110,37 @@ def _compact_legacy_chief(message: str) -> str:
             for candidate in lines[index + 1:index + 4]:
                 candidate = " ".join(candidate.split()).strip()
                 if candidate:
-                    reason = candidate[:140]
+                    reason = candidate[:160]
                     break
             break
 
     headline = lines[0].upper() if lines else ""
     action = "ENTER NOW" if "ENTER NOW" in headline else "SET LIMIT / WAIT"
+    entry_text = entry_zone or "N/A"
+    chase_text = chase or "N/A"
+    stop_text = f"{stop:.8g}" if stop is not None else "N/A"
+    target_text = (
+        f"{target1:.8g} / {target2:.8g}"
+        if target1 is not None and target2 is not None
+        else "N/A"
+    )
+    economic = ""
+    if capital is not None or net_edge is not None:
+        cap_text = f"${capital:,.0f}" if capital is not None else "N/A"
+        edge_text = f"{net_edge:.2f}%" if net_edge is not None else "N/A"
+        economic = f"Capital: {cap_text} | Projected net edge: {edge_text}\n"
+
     return (
-        f"🔥 OHM TRADE — {market}\n"
-        f"Potential: +{low:.1f}% to +{high:.1f}%\n"
-        f"Confidence*: {confidence:.0f}%\n"
-        f"Risk: {risk_label}\n"
-        f"Downside to stop: {downside:.1f}%\n"
-        f"Reason: {reason}\n"
+        f"🔥 OHM QUALIFIED OPPORTUNITY — {market}\n"
         f"Action: {action}\n"
-        "*Heuristic confidence, not probability."
+        f"Entry: {entry_text}\n"
+        f"Do not chase: {chase_text}\n"
+        f"Stop: {stop_text} | Downside: {downside:.1f}%\n"
+        f"T1 / T2: {target_text} | Potential: +{low:.1f}% to +{high:.1f}%\n"
+        f"{economic}"
+        f"Confidence*: {confidence:.0f}% | Risk: {risk_label}\n"
+        f"Why now: {reason}\n"
+        "*Heuristic confidence, not probability; human approval remains required."
     )
 
 

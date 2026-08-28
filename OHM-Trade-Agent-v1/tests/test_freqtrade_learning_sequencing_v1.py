@@ -7,6 +7,15 @@ from types import SimpleNamespace
 from app.jobs import run_cycle, scan_movers, scan_opportunities
 
 
+
+def test_qualified_signal_lineage_is_created_before_telegram_delivery():
+    source = inspect.getsource(scan_opportunities.main)
+    lineage = source.index("_prepare_qualified_lineage(")
+    send = source.index("send_trade_plan(", lineage)
+    publication = source.rfind("_publish_freqtrade_paper_opportunities(")
+    assert lineage < send < publication
+
+
 def test_freqtrade_signal_publication_remains_post_telegram():
     source = inspect.getsource(scan_opportunities.main)
     publication = source.rfind("_publish_freqtrade_paper_opportunities(")
@@ -26,7 +35,7 @@ def test_shadow_simulator_is_secondary_to_authoritative_freqtrade_bridge():
 def test_early_watch_journey_capture_occurs_after_telegram_delivery_loop():
     source = inspect.getsource(scan_movers.main)
     journey = source.index("record_watch_observation(")
-    last_send = source.rfind("send_telegram_message_with_id(", 0, journey)
+    last_send = source.rfind("send_tracked_telegram(", 0, journey)
     last_update = source.rfind("_deliver_existing_card_update(", 0, journey)
     assert last_send >= 0
     assert last_update >= 0
@@ -34,8 +43,8 @@ def test_early_watch_journey_capture_occurs_after_telegram_delivery_loop():
     assert last_update < journey
 
     helper_source = inspect.getsource(scan_movers._deliver_existing_card_update)
-    assert "send_telegram_message_with_id(" in helper_source
-    assert "edit_telegram_message(" in helper_source
+    assert "send_tracked_telegram(" in helper_source
+    assert "edit_tracked_telegram(" in helper_source
 
 
 def test_journey_capture_is_fail_soft_and_measurement_only():

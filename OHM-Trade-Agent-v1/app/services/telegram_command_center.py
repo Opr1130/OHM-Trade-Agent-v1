@@ -36,6 +36,7 @@ from app.services.telegram_notifier import (
     send_telegram_message,
     send_telegram_message_with_id,
 )
+from app.services.telegram_delivery import send_tracked_telegram
 
 
 WATCH_FILE = Path("/app/data/telegram_market_watches.json")
@@ -685,24 +686,23 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
                 pass
             continue
 
-        message_id = _safe_message_id(row.get("message_id"))
-        delivered = False
-        if message_id > 0:
-            delivered = edit_telegram_message(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message_id,
-                format_market_insight(insight, watch=True),
-            )
-        if not delivered:
-            replacement = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                format_market_insight(insight, watch=True),
-            )
-            if replacement is not None:
-                message_id = replacement
-                delivered = True
+        # A material watch transition must create a fresh Telegram message so
+        # the mobile client generates a new push. The old card remains historical.
+        fingerprint = f"{row.get('state')}:{row.get('action')}:{row.get('risk')}->{insight.state}:{insight.action}:{insight.risk}:{insight.current_price:.8g}"
+        delivery = send_tracked_telegram(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            message=format_market_insight(insight, watch=True),
+            identity=f"COMMAND_WATCH:{symbol}",
+            alert_family="COMMAND_WATCH",
+            event_type="MATERIAL_TRANSITION",
+            fingerprint=fingerprint,
+            symbol=insight.symbol,
+            pair=insight.pair,
+            success_status="TRANSITION_PUSHED",
+        )
+        message_id = delivery.message_id or 0
+        delivered = delivery.delivered
 
         if delivered and message_id > 0:
             changed += 1

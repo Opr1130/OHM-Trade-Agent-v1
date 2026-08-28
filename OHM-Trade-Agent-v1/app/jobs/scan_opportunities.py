@@ -158,6 +158,102 @@ def _maybe_enroll_paper_opportunities(
     return enrolled, failures
 
 
+def _prepare_qualified_lineage(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Create immutable signal/journey identity before any qualified Telegram send."""
+    try:
+        from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
+        from app.services.intelligence_journey import link_qualified_signal
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        paper_enabled = paper_trade_enabled()
+    except Exception as exc:
+        print(
+            "Qualified signal lineage unavailable; alert delivery remains fail-soft:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, len(ranked_opportunities)
+
+    prepared = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(snapshot.trade_direction or "LONG").upper()
+        try:
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            base_asset = str(
+                snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or ("USDT" if str(snapshot.symbol).upper().endswith("USDT") else "USD")
+            ).upper()
+            pair = to_freqtrade_pair(base_asset, quote_asset)
+            signal_id = build_signal_id(
+                episode_id=episode_id,
+                pair=pair,
+                decision_at=decision_at,
+            )
+            journey_id = link_qualified_signal(
+                symbol=snapshot.symbol,
+                signal_id=signal_id,
+                observed_at=decision_at,
+                payload={
+                    "direction": direction,
+                    "profit_rank": ranked.rank,
+                    "profit_rank_score": ranked.profit_ranking.total_score,
+                    "confidence": int(alert.get("confidence") or 0),
+                    "entry_style": plan.entry_style,
+                    "valid_now": bool(plan.valid_now),
+                    "entry_low": plan.entry_low,
+                    "entry_high": plan.entry_high,
+                    "chase_limit": plan.chase_limit,
+                    "stop_price": plan.stop_price,
+                    "target_1": plan.target_1,
+                    "target_2": plan.target_2,
+                    "technical_score": alert.get("technical_score"),
+                    "market_regime": alert.get("market_regime"),
+                    "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
+                    "target_attainability_score": alert.get("target_attainability_score"),
+                    "paper_requested": bool(paper_enabled and direction == "LONG"),
+                    "paper_engine": (
+                        "FREQTRADE_DRY_RUN"
+                        if direction == "LONG"
+                        else "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
+                    ),
+                },
+            )
+            alert["signal_id"] = signal_id
+            alert["journey_id"] = journey_id
+            alert["_lineage_episode_id"] = episode_id
+            alert["_lineage_pair"] = pair
+            alert["_lineage_base_asset"] = base_asset
+            alert["_lineage_quote_asset"] = quote_asset
+            prepared += 1
+        except Exception as exc:
+            failures += 1
+            print(
+                f"QUALIFIED LINEAGE {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return prepared, failures
+
+
 def _publish_freqtrade_paper_opportunities(
     ranked_opportunities,
     *,
@@ -203,52 +299,54 @@ def _publish_freqtrade_paper_opportunities(
             )
             continue
         try:
-            episode_id = canonical_episode_id(
-                scan.snapshots,
-                decision_at=decision_at,
-                symbol=snapshot.symbol,
+            episode_id = str(
+                alert.get("_lineage_episode_id")
+                or canonical_episode_id(
+                    scan.snapshots,
+                    decision_at=decision_at,
+                    symbol=snapshot.symbol,
+                )
             )
             base_asset = str(
-                snapshot.underlying_asset
+                alert.get("_lineage_base_asset")
+                or snapshot.underlying_asset
                 or alert.get("underlying_asset")
                 or snapshot.symbol
             )
             quote_asset = str(
-                snapshot.primary_quote_currency
+                alert.get("_lineage_quote_asset")
+                or snapshot.primary_quote_currency
                 or alert.get("primary_quote_currency")
                 or ("USDT" if str(snapshot.symbol).upper().endswith("USDT") else "USD")
             ).upper()
-            pair = to_freqtrade_pair(base_asset, quote_asset)
-            signal_id = build_signal_id(
-                episode_id=episode_id,
-                pair=pair,
-                decision_at=decision_at,
+            pair = str(alert.get("_lineage_pair") or to_freqtrade_pair(base_asset, quote_asset))
+            signal_id = str(
+                alert.get("signal_id")
+                or build_signal_id(
+                    episode_id=episode_id,
+                    pair=pair,
+                    decision_at=decision_at,
+                )
             )
-            journey_id = link_qualified_signal(
-                symbol=snapshot.symbol,
-                signal_id=signal_id,
-                observed_at=decision_at,
-                payload={
-                    "direction": direction,
-                    "profit_rank": ranked.rank,
-                    "profit_rank_score": ranked.profit_ranking.total_score,
-                    "confidence": int(alert.get("confidence") or 0),
-                    "entry_style": plan.entry_style,
-                    "valid_now": bool(plan.valid_now),
-                    "entry_low": plan.entry_low,
-                    "entry_high": plan.entry_high,
-                    "chase_limit": plan.chase_limit,
-                    "stop_price": plan.stop_price,
-                    "target_1": plan.target_1,
-                    "target_2": plan.target_2,
-                    "technical_score": alert.get("technical_score"),
-                    "market_regime": alert.get("market_regime"),
-                    "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
-                    "target_attainability_score": alert.get("target_attainability_score"),
-                    "paper_requested": bool(paper_enabled),
-                    "paper_engine": "FREQTRADE_DRY_RUN",
-                },
-            )
+            journey_id = str(alert.get("journey_id") or "")
+            if not journey_id:
+                journey_id = link_qualified_signal(
+                    symbol=snapshot.symbol,
+                    signal_id=signal_id,
+                    observed_at=decision_at,
+                    payload={
+                        "direction": direction,
+                        "profit_rank": ranked.rank,
+                        "profit_rank_score": ranked.profit_ranking.total_score,
+                        "confidence": int(alert.get("confidence") or 0),
+                        "entry_style": plan.entry_style,
+                        "valid_now": bool(plan.valid_now),
+                        "paper_requested": bool(paper_enabled),
+                        "paper_engine": "FREQTRADE_DRY_RUN",
+                    },
+                )
+                alert["signal_id"] = signal_id
+                alert["journey_id"] = journey_id
             if not paper_enabled:
                 print(
                     f"FREQTRADE PAPER {snapshot.symbol}: PAPER_OFF "
@@ -854,6 +952,15 @@ def main():
             f"ValidationNetT2=${economic.target_2_net_profit:.2f} "
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
+
+    lineage_prepared, lineage_failures = _prepare_qualified_lineage(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    print("Qualified signal lineages prepared before Telegram:", lineage_prepared)
+    print("Qualified signal lineage failures:", lineage_failures)
 
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
