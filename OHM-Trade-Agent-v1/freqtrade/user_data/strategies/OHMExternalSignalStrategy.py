@@ -13,7 +13,7 @@ from freqtrade.strategy import IStrategy, stoploss_from_absolute
 
 BRIDGE_DIR = Path("/freqtrade/bridge")
 SIGNALS_FILE = BRIDGE_DIR / "signals.json"
-CONTROL_FILE = BRIDGE_DIR / "control.json"
+CONTROL_FILE = Path("/freqtrade/control/control.json")
 
 
 class OHMExternalSignalStrategy(IStrategy):
