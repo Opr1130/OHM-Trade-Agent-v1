@@ -88,6 +88,28 @@ def _filter_events(
     return filtered
 
 
+def _scoped_journey_history(
+    all_events: list[dict[str, Any]],
+    *,
+    cutoff: datetime | None,
+) -> list[dict[str, Any]]:
+    """Select journeys active in the window while retaining full linked history."""
+    if cutoff is None:
+        return list(all_events)
+    selected_journeys = {
+        str(row.get("journey_id"))
+        for row in all_events
+        if row.get("journey_id")
+        and (at := _parse_time(row.get("observed_at"))) is not None
+        and at >= cutoff
+    }
+    return [
+        row
+        for row in all_events
+        if str(row.get("journey_id") or "") in selected_journeys
+    ]
+
+
 def _pct(numerator: int | float, denominator: int | float) -> float | None:
     if not denominator:
         return None
@@ -124,99 +146,133 @@ def _funnel(events: list[dict[str, Any]]) -> dict[str, Any]:
     early = {
         jid
         for jid, rows in journeys.items()
-        if any(_event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"} for row in rows)
+        if any(
+            _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
+            for row in rows
+        )
     }
-    delivered = {
+    early_delivered = {
         jid
         for jid, rows in journeys.items()
-        if any(
+        if jid in early
+        and any(
             _event_type(row) in {"EARLY_WATCH", "EARLY_MOVER", "BROAD_WATCH"}
             and bool(row.get("delivered"))
             for row in rows
         )
     }
-    signals = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "QUALIFIED_SIGNAL" and row.get("signal_id")
+    qualified = {
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(_event_type(row) == "QUALIFIED_SIGNAL" for row in rows)
     }
     requested = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "QUALIFIED_SIGNAL"
-        and row.get("signal_id")
-        and bool((row.get("payload") or {}).get("paper_requested"))
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(
+            _event_type(row) == "QUALIFIED_SIGNAL"
+            and bool((row.get("payload") or {}).get("paper_requested"))
+            for row in rows
+        )
     }
     admitted = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "PAPER_ADMISSION"
-        and bool(row.get("admitted"))
-        and row.get("signal_id")
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(
+            _event_type(row) == "PAPER_ADMISSION"
+            and bool(row.get("admitted"))
+            for row in rows
+        )
     }
     rejected = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "PAPER_ADMISSION"
-        and not bool(row.get("admitted"))
-        and row.get("signal_id")
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(
+            _event_type(row) == "PAPER_ADMISSION"
+            and not bool(row.get("admitted"))
+            for row in rows
+        )
     }
     closed = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "PAPER_OUTCOME" and row.get("signal_id")
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(_event_type(row) == "PAPER_OUTCOME" for row in rows)
     }
     profitable = {
-        str(row.get("signal_id"))
-        for row in events
-        if _event_type(row) == "PAPER_OUTCOME"
-        and row.get("signal_id")
-        and (_safe_float((row.get("payload") or {}).get("net_pnl")) or 0.0) > 0
+        jid
+        for jid, rows in journeys.items()
+        if jid in early
+        and any(
+            _event_type(row) == "PAPER_OUTCOME"
+            and (_safe_float((row.get("payload") or {}).get("net_pnl")) or 0.0) > 0
+            for row in rows
+        )
     }
-    stages = [
+    direct_qualified = {
+        jid
+        for jid, rows in journeys.items()
+        if jid not in early
+        and any(_event_type(row) == "QUALIFIED_SIGNAL" for row in rows)
+    }
+    qualified_signal_ids = {
+        str(row.get("signal_id"))
+        for rows in journeys.values()
+        for row in rows
+        if _event_type(row) == "QUALIFIED_SIGNAL" and row.get("signal_id")
+    }
+
+    stage_values = [
         ("Early detected", len(early)),
-        ("Early delivered", len(delivered)),
-        ("Qualified", len(signals)),
+        ("Qualified", len(qualified)),
         ("Paper requested", len(requested)),
         ("Admitted", len(admitted)),
         ("Closed", len(closed)),
         ("Profitable", len(profitable)),
     ]
-    rows: list[dict[str, Any]] = []
+    stages: list[dict[str, Any]] = []
     prior: int | None = None
-    for name, count in stages:
-        rows.append(
+    for name, count in stage_values:
+        stages.append(
             {
                 "stage": name,
                 "count": count,
-                "conversion_from_prior_pct": _pct(count, prior) if prior is not None else None,
+                "conversion_from_prior_pct": (
+                    _pct(count, prior)
+                    if prior is not None
+                    else None
+                ),
             }
         )
         prior = count
+
     return {
-        "stages": rows,
+        "stages": stages,
         "early_detected": len(early),
-        "early_delivered": len(delivered),
-        "qualified_signals": len(signals),
+        "early_delivered": len(early_delivered),
+        "early_delivered_pct": _pct(len(early_delivered), len(early)),
+        "qualified_journeys_from_early": len(qualified),
+        "qualified_signals": len(qualified_signal_ids),
+        "direct_qualified_journeys": len(direct_qualified),
         "paper_requested": len(requested),
         "paper_admitted": len(admitted),
         "paper_rejected": len(rejected),
         "paper_closed": len(closed),
         "paper_profitable": len(profitable),
-        "early_to_signal_pct": _pct(
-            len(
-                {
-                    jid
-                    for jid, rows in journeys.items()
-                    if jid in early and any(_event_type(row) == "QUALIFIED_SIGNAL" for row in rows)
-                }
-            ),
-            len(early),
-        ),
-        "requested_to_closed_pct": _pct(len(closed & requested), len(requested)),
+        "early_to_signal_pct": _pct(len(qualified), len(early)),
+        "requested_to_closed_pct": _pct(len(closed), len(requested)),
         "closed_win_rate_pct": _pct(len(profitable), len(closed)),
+        "scope_semantics": (
+            "Journeys with activity in the selected window are selected, then "
+            "their complete linked lifecycle is retained. Sequential funnel "
+            "stages use the Early Watch cohort; delivered-alert coverage is "
+            "reported separately because delivery is not required for qualification."
+        ),
     }
-
 
 def _paper_outcomes(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -425,7 +481,7 @@ def _failure_summary(
         for row in all_failures
         if prior_cutoff <= row["at"] < recent_cutoff
     )
-    families = sorted(set(recent) | set(prior) | {row["family"] for row in scoped})
+    families = sorted(set(recent) | set(prior))
     rows: list[dict[str, Any]] = []
     for family in families:
         r = recent.get(family, 0)
@@ -852,6 +908,27 @@ def _evolution_scorecard(
                 mature_requested.add(str(row["signal_id"]))
         mature_closed = mature_requested & set(outcomes_by_signal)
 
+        tagged_outcomes = sum(
+            isinstance(row.get("measurement_versions"), dict)
+            for row in outcomes
+        )
+        mature_signal_rows = [
+            row
+            for row in all_events
+            if _event_type(row) == "QUALIFIED_SIGNAL"
+            and str(row.get("signal_id") or "") in mature_requested
+        ]
+        tagged_mature_signals = sum(
+            isinstance(row.get("measurement_versions"), dict)
+            for row in mature_signal_rows
+        )
+        version_evidence_total = len(outcomes) + len(mature_signal_rows)
+        version_evidence_tagged = tagged_outcomes + tagged_mature_signals
+        version_coverage_pct = _pct(
+            version_evidence_tagged,
+            version_evidence_total,
+        )
+
         return {
             "early_precision_pct": _pct(
                 sum(value > 0 for value in early_outcomes),
@@ -870,10 +947,21 @@ def _evolution_scorecard(
             "failure_events": len(failures),
             "samples": len(outcomes),
             "mature_signal_samples": len(mature_requested),
+            "version_coverage_pct": version_coverage_pct,
         }
 
     recent = window(now - timedelta(days=7), now)
     prior = window(now - timedelta(days=14), now - timedelta(days=7))
+    version_ready = (
+        recent["version_coverage_pct"] == 100.0
+        and prior["version_coverage_pct"] == 100.0
+    )
+    sample_ready = (
+        recent["samples"] >= 5
+        and prior["samples"] >= 5
+    )
+    comparison_ready = sample_ready and version_ready
+
     metrics = []
     specs = [
         ("Early-watch / closed win rate", "early_precision_pct", "higher"),
@@ -897,7 +985,7 @@ def _evolution_scorecard(
                 "direction": better,
                 "status": (
                     "BASELINE_BUILDING"
-                    if recent["samples"] < 5 or prior["samples"] < 5
+                    if not comparison_ready
                     else "MEASURED"
                 ),
             }
@@ -910,10 +998,12 @@ def _evolution_scorecard(
         "prior_samples": prior["samples"],
         "recent_mature_signal_samples": recent["mature_signal_samples"],
         "prior_mature_signal_samples": prior["mature_signal_samples"],
+        "recent_version_coverage_pct": recent["version_coverage_pct"],
+        "prior_version_coverage_pct": prior["version_coverage_pct"],
         "metrics": metrics,
         "attribution_status": (
             "BASELINE_BUILDING"
-            if recent["samples"] < 5 or prior["samples"] < 5
+            if not comparison_ready
             else "MEASURED"
         ),
         "version_attribution": _version_attribution(all_events),
@@ -926,7 +1016,12 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
 
     now = _now()
     all_events = _read_jsonl(EVENT_FILE)
-    scoped_events = _filter_events(all_events, cutoff=_cutoff(scope, now))
+    cutoff = _cutoff(scope, now)
+    scoped_events = _filter_events(all_events, cutoff=cutoff)
+    scoped_journey_history = _scoped_journey_history(
+        all_events,
+        cutoff=cutoff,
+    )
     try:
         operations = build_operations_summary("today")
     except Exception:
@@ -967,6 +1062,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
     outcomes = _paper_outcomes(scoped_events)
     failure = _failure_summary(scoped_events, all_events, now=now)
     evidence = outbox_health()
+    funnel = _funnel(scoped_journey_history)
 
     return {
         "schema_version": EVOLUTION_SCHEMA_VERSION,
@@ -981,7 +1077,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
             "closed_paper_trades": paper.get("closed_trades", 0),
             "realized_pnl_by_currency": paper.get("realized_pnl_by_currency") or {},
             "active_stake_by_currency": paper.get("active_stake_by_currency") or {},
-            "early_watch_to_signal_pct": _funnel(scoped_events)["early_to_signal_pct"],
+            "early_watch_to_signal_pct": funnel["early_to_signal_pct"],
             "paper_win_rate_pct": _pct(
                 sum(row["net_pnl"] > 0 for row in outcomes),
                 len(outcomes),
@@ -1018,7 +1114,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
                 now=now,
             ),
         },
-        "funnel": _funnel(scoped_events),
+        "funnel": funnel,
         "trend": _daily_trend(
             scoped_events,
             context_events=all_events,
@@ -1041,7 +1137,7 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
             ),
         },
         "failures": failure,
-        "journeys": _recent_journeys(scoped_events),
+        "journeys": _recent_journeys(scoped_journey_history),
         "learning_health": {
             "journey_events": len(scoped_events),
             "all_journey_events": len(all_events),
