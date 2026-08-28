@@ -1,6 +1,7 @@
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import one_line_reason
@@ -22,6 +23,7 @@ from app.services.telegram_delivery import (
 
 STATE_FILE = Path("/app/data/pending_setup_alert_state.json")
 RETRY_FILE = Path("/app/data/pending_setup_terminal_alert_outbox.json")
+TERMINAL_RETRY_LEASE_SECONDS = 120
 
 
 def _locked_load(path: Path) -> dict:
@@ -46,8 +48,19 @@ def _load_retries() -> dict:
     return _locked_load(RETRY_FILE)
 
 
-def _save_retries(retries: dict) -> None:
-    _locked_save(RETRY_FILE, retries)
+def terminal_notification_pending(trade_id: str) -> bool:
+    """Treat a queued terminal event as a quarantine until lifecycle truth settles."""
+    key = str(trade_id or "").strip()
+    if not key:
+        return False
+    try:
+        with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
+            retries = load_json(RETRY_FILE)
+        return isinstance(retries.get(key), dict)
+    except (OSError, TimeoutError, RegistryIOError):
+        # Fail closed: inability to inspect terminal outbox must not authorize
+        # a fresh entry-ready notification.
+        return True
 
 
 def _previous_status(value) -> str | None:
@@ -56,6 +69,18 @@ def _previous_status(value) -> str | None:
     else:
         raw = value
     return str(raw) if raw not in (None, "") else None
+
+
+def _parse_utc(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def _stop_downside_pct(setup: PendingSetup, current_price: float) -> float:
@@ -118,22 +143,77 @@ def _queue_terminal_notification(
         raise ValueError("terminal pending alert requires trade_id")
     with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
         retries = load_json(RETRY_FILE)
-        retries[trade_id] = {
-            "schema_version": 1,
-            "trade_id": trade_id,
-            "queued_at": datetime.now(timezone.utc).isoformat(),
-            "setup": asdict(setup),
-            "result": asdict(result),
-        }
+        existing = retries.get(trade_id)
+        row = dict(existing) if isinstance(existing, dict) else {}
+        row["schema_version"] = 2
+        row["trade_id"] = trade_id
+        row.setdefault("queued_at", datetime.now(timezone.utc).isoformat())
+        row["setup"] = asdict(setup)
+        row["result"] = asdict(result)
+        # Preserve any active lease if the same terminal condition is observed
+        # while another worker is draining the outbox.
+        retries[trade_id] = row
         save_json_atomic(RETRY_FILE, retries)
 
 
-def _remove_terminal_retry(trade_id: str) -> None:
+def _claim_terminal_retry(
+    trade_id: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, dict] | None:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
         retries = load_json(RETRY_FILE)
-        if trade_id in retries:
-            del retries[trade_id]
-            save_json_atomic(RETRY_FILE, retries)
+        row = retries.get(trade_id)
+        if not isinstance(row, dict):
+            return None
+
+        lease_until = _parse_utc(row.get("lease_until"))
+        if lease_until is not None and lease_until > current:
+            return None
+
+        token = uuid4().hex
+        claimed = dict(row)
+        claimed["lease_token"] = token
+        claimed["claimed_at"] = current.isoformat()
+        claimed["lease_until"] = (
+            current + timedelta(seconds=TERMINAL_RETRY_LEASE_SECONDS)
+        ).isoformat()
+        retries[trade_id] = claimed
+        save_json_atomic(RETRY_FILE, retries)
+        return token, dict(claimed)
+
+
+def _release_terminal_retry(trade_id: str, lease_token: str) -> bool:
+    with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
+        retries = load_json(RETRY_FILE)
+        row = retries.get(trade_id)
+        if not isinstance(row, dict) or row.get("lease_token") != lease_token:
+            return False
+        updated = dict(row)
+        updated.pop("lease_token", None)
+        updated.pop("claimed_at", None)
+        updated.pop("lease_until", None)
+        retries[trade_id] = updated
+        save_json_atomic(RETRY_FILE, retries)
+        return True
+
+
+def _remove_terminal_retry(
+    trade_id: str,
+    *,
+    lease_token: str | None = None,
+) -> bool:
+    with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
+        retries = load_json(RETRY_FILE)
+        row = retries.get(trade_id)
+        if not isinstance(row, dict):
+            return False
+        if lease_token is not None and row.get("lease_token") != lease_token:
+            return False
+        del retries[trade_id]
+        save_json_atomic(RETRY_FILE, retries)
+        return True
 
 
 def _persist_delivered_state(
@@ -156,28 +236,28 @@ def _persist_delivered_state(
         pass
 
 
-def _deliver_terminal_retry(
+def _deliver_claimed_terminal_retry(
     *,
     setup: PendingSetup,
     result: PendingSetupMonitorResult,
+    lease_token: str,
     bot_token: str,
     chat_id: str,
-) -> bool:
+) -> str:
     terminal_status = _terminal_status(result.status)
-    if terminal_status is None:
-        return False
-
-    lifecycle = get_pending_setup_record(setup.trade_id)
-    persisted_status = str((lifecycle or {}).get("status") or "")
     identity = f"PENDING_SETUP:{setup.trade_id or setup.symbol}"
     fingerprint = f"{setup.direction}:{result.status}"
 
+    if terminal_status is None:
+        _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
+        return "NOT_ELIGIBLE"
+
+    lifecycle = get_pending_setup_record(setup.trade_id)
+    persisted_status = str((lifecycle or {}).get("status") or "")
+
     if persisted_status != terminal_status:
         if persisted_status and persisted_status != "waiting":
-            # Exchange/lifecycle truth superseded the queued market-terminal
-            # notification (for example a fill won the race). Retire the stale
-            # outbox row rather than retrying an invalid alert forever.
-            _remove_terminal_retry(setup.trade_id)
+            _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
             record_telegram_not_eligible(
                 identity=identity,
                 alert_family="PENDING_SETUP",
@@ -187,17 +267,40 @@ def _deliver_terminal_retry(
                 symbol=setup.symbol,
                 trade_id=setup.trade_id,
             )
-            return False
-        record_telegram_suppression(
-            identity=identity,
-            alert_family="PENDING_SETUP",
-            event_type=result.status,
-            fingerprint=fingerprint,
-            reason="TERMINAL_MARKET_STATE_NOT_PERSISTED",
-            symbol=setup.symbol,
-            trade_id=setup.trade_id,
-        )
-        return False
+            return "SUPERSEDED"
+
+        # Crash recovery / transient failure path: the durable outbox is the
+        # evidence that a terminal market transition had already been observed.
+        # Re-apply that market truth before any Telegram delivery.
+        terminalize_pending_setup(setup.trade_id, terminal_status)
+        lifecycle = get_pending_setup_record(setup.trade_id)
+        persisted_status = str((lifecycle or {}).get("status") or "")
+
+        if persisted_status != terminal_status:
+            if persisted_status and persisted_status != "waiting":
+                _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
+                record_telegram_not_eligible(
+                    identity=identity,
+                    alert_family="PENDING_SETUP",
+                    event_type=result.status,
+                    fingerprint=fingerprint,
+                    reason=f"TERMINAL_ALERT_SUPERSEDED_BY_{persisted_status.upper()}",
+                    symbol=setup.symbol,
+                    trade_id=setup.trade_id,
+                )
+                return "SUPERSEDED"
+
+            _release_terminal_retry(setup.trade_id, lease_token)
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="PENDING_SETUP",
+                event_type=result.status,
+                fingerprint=fingerprint,
+                reason="TERMINALIZATION_PENDING",
+                symbol=setup.symbol,
+                trade_id=setup.trade_id,
+            )
+            return "TERMINALIZATION_PENDING"
 
     accepted_message_id = accepted_delivery_message_id(
         identity=identity,
@@ -215,8 +318,8 @@ def _deliver_terminal_retry(
             event_type=result.status,
             fingerprint=fingerprint,
         )
-        _remove_terminal_retry(setup.trade_id)
-        return True
+        _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
+        return "DELIVERED"
 
     delivery = send_tracked_telegram(
         bot_token=bot_token,
@@ -230,7 +333,8 @@ def _deliver_terminal_retry(
         trade_id=setup.trade_id,
     )
     if not delivery.delivered:
-        return False
+        _release_terminal_retry(setup.trade_id, lease_token)
+        return "SEND_FAILED"
 
     _persist_delivered_state(
         setup=setup,
@@ -242,8 +346,36 @@ def _deliver_terminal_retry(
         event_type=result.status,
         fingerprint=fingerprint,
     )
-    _remove_terminal_retry(setup.trade_id)
-    return True
+    _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
+    return "DELIVERED"
+
+
+def _process_terminal_retry(
+    trade_id: str,
+    *,
+    bot_token: str,
+    chat_id: str,
+) -> str:
+    claim = _claim_terminal_retry(trade_id)
+    if claim is None:
+        return "BUSY_OR_MISSING"
+
+    lease_token, row = claim
+    try:
+        setup = PendingSetup(**dict(row.get("setup") or {}))
+        result = PendingSetupMonitorResult(**dict(row.get("result") or {}))
+        if str(setup.trade_id or "") != str(trade_id):
+            raise ValueError("terminal alert outbox trade_id mismatch")
+        return _deliver_claimed_terminal_retry(
+            setup=setup,
+            result=result,
+            lease_token=lease_token,
+            bot_token=bot_token,
+            chat_id=chat_id,
+        )
+    except Exception:
+        _release_terminal_retry(trade_id, lease_token)
+        return "FAILED"
 
 
 def retry_terminal_pending_notifications(
@@ -251,7 +383,7 @@ def retry_terminal_pending_notifications(
     bot_token: str,
     chat_id: str,
 ) -> tuple[int, int]:
-    """Retry terminal alerts from an outbox independent of live setup state."""
+    """Drain terminal alerts with recoverable leases and market-truth recovery."""
     try:
         retries = _load_retries()
     except (OSError, TimeoutError, RegistryIOError):
@@ -259,25 +391,15 @@ def retry_terminal_pending_notifications(
 
     sent = 0
     failed = 0
-    for trade_id, row in list(retries.items()):
-        if not isinstance(row, dict):
-            failed += 1
-            continue
-        try:
-            setup = PendingSetup(**dict(row.get("setup") or {}))
-            result = PendingSetupMonitorResult(**dict(row.get("result") or {}))
-            if str(setup.trade_id or "") != str(trade_id):
-                raise ValueError("terminal alert outbox trade_id mismatch")
-            if _deliver_terminal_retry(
-                setup=setup,
-                result=result,
-                bot_token=bot_token,
-                chat_id=chat_id,
-            ):
-                sent += 1
-            else:
-                failed += 1
-        except Exception:
+    for trade_id in list(retries):
+        status = _process_terminal_retry(
+            str(trade_id),
+            bot_token=bot_token,
+            chat_id=chat_id,
+        )
+        if status == "DELIVERED":
+            sent += 1
+        elif status in {"FAILED", "SEND_FAILED", "TERMINALIZATION_PENDING"}:
             failed += 1
     return sent, failed
 
@@ -290,6 +412,18 @@ def send_pending_setup_update(
 ) -> bool:
     identity = f"PENDING_SETUP:{setup.trade_id or setup.symbol}"
     fingerprint = f"{setup.direction}:{result.status}"
+
+    if _terminal_status(result.status) is None and terminal_notification_pending(setup.trade_id):
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="PENDING_SETUP",
+            event_type=result.status,
+            fingerprint=fingerprint,
+            reason="TERMINAL_TRANSITION_PENDING",
+            symbol=setup.symbol,
+            trade_id=setup.trade_id,
+        )
+        return False
 
     if result.status in {"WAITING", "NEAR_ENTRY"}:
         record_telegram_not_eligible(
@@ -305,13 +439,9 @@ def send_pending_setup_update(
 
     terminal_status = _terminal_status(result.status)
     if terminal_status is not None:
-        # Transactional-outbox ordering:
-        # 1) queue notification first;
-        # 2) persist terminal market truth;
-        # 3) deliver only after terminal truth is confirmed.
-        # If the process dies between 1 and 2, the retry worker refuses to send
-        # until terminal state exists. If it dies after 2, the outbox preserves
-        # the notification retry without resurrecting the setup.
+        # Durable outbox first. Any crash or transient terminalization failure
+        # is recovered by the outbox drainer, which re-applies terminal market
+        # truth before sending. Lease claiming prevents concurrent duplicate sends.
         try:
             _queue_terminal_notification(setup, result)
         except (OSError, TimeoutError, RegistryIOError, ValueError):
@@ -326,39 +456,12 @@ def send_pending_setup_update(
             )
             return False
 
-        terminalized = terminalize_pending_setup(setup.trade_id, terminal_status)
-        lifecycle = get_pending_setup_record(setup.trade_id)
-        persisted_status = str((lifecycle or {}).get("status") or "")
-        if not terminalized and persisted_status != terminal_status:
-            if persisted_status and persisted_status != "waiting":
-                _remove_terminal_retry(setup.trade_id)
-                record_telegram_not_eligible(
-                    identity=identity,
-                    alert_family="PENDING_SETUP",
-                    event_type=result.status,
-                    fingerprint=fingerprint,
-                    reason=f"TERMINAL_ALERT_SUPERSEDED_BY_{persisted_status.upper()}",
-                    symbol=setup.symbol,
-                    trade_id=setup.trade_id,
-                )
-                return False
-            record_telegram_suppression(
-                identity=identity,
-                alert_family="PENDING_SETUP",
-                event_type=result.status,
-                fingerprint=fingerprint,
-                reason="TERMINALIZATION_PENDING",
-                symbol=setup.symbol,
-                trade_id=setup.trade_id,
-            )
-            return False
-
-        return _deliver_terminal_retry(
-            setup=setup,
-            result=result,
+        status = _process_terminal_retry(
+            setup.trade_id,
             bot_token=bot_token,
             chat_id=chat_id,
         )
+        return status == "DELIVERED"
 
     try:
         state = _load_state()
