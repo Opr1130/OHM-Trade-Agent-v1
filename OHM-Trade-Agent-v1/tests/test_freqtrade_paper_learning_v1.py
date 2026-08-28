@@ -9,7 +9,6 @@ import sqlite3
 from app.services.freqtrade_result_ingest import ingest_freqtrade_dry_run
 from app.services.freqtrade_signal_bridge import (
     build_signal_id,
-    mirror_control,
     publish_qualified_long,
     to_freqtrade_pair,
 )
@@ -81,20 +80,6 @@ def test_freqtrade_signal_id_is_deterministic():
     )
     assert first == second
     assert first.startswith("OHM:")
-
-
-def test_freqtrade_bridge_control_contains_no_exchange_authority(tmp_path):
-    path = tmp_path / "control.json"
-    mirror_control(
-        enabled=True,
-        updated_at=NOW,
-        updated_by="TEST",
-        control_file=path,
-    )
-    row = json.loads(path.read_text(encoding="utf-8"))
-    assert row["enabled"] is True
-    assert row["authoritative_engine"] == "FREQTRADE_DRY_RUN"
-    assert row["exchange_write_authority"] is False
 
 
 def _create_dry_run_db(path: Path, signal_id: str) -> None:
@@ -187,7 +172,7 @@ def test_early_watch_signal_and_freqtrade_outcome_form_one_learning_journey(tmp_
         symbol="SOLUSD",
         signal_id=signal_id,
         observed_at=NOW + timedelta(minutes=30),
-        payload={"profit_rank": 1, "valid_now": True},
+        payload={"profit_rank": 1, "valid_now": True, "paper_requested": True},
         state_file=journey_state,
         event_file=events,
     )
@@ -229,7 +214,7 @@ def test_freqtrade_outcome_ingest_is_idempotent(tmp_path):
         symbol="SOLUSD",
         signal_id=signal_id,
         observed_at=NOW,
-        payload={},
+        payload={"paper_requested": True},
         state_file=journey_state,
         event_file=events,
     )
@@ -263,6 +248,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         / "OHMExternalSignalStrategy.py"
     )
     compose_path = root / "docker-compose.yml"
+    paper_compose_path = root / "docker-compose.paper.yml"
 
     configs = [
         json.loads(config_path.read_text(encoding="utf-8")),
@@ -278,6 +264,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         assert config["exchange"]["secret"] == ""
         assert config["api_server"]["enabled"] is False
         assert config["telegram"]["enabled"] is False
+        assert config["pairlists"][0]["processing_mode"] == "append"
 
     strategy_source = strategy_path.read_text(encoding="utf-8")
     ast.parse(strategy_source)
@@ -289,18 +276,23 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "exchange_write_authority" not in strategy_source
 
     compose = compose_path.read_text(encoding="utf-8")
-    sidecar = compose.split("  ohm-freqtrade-paper:", 1)[1].split(
-        "  ohm-trade-agent:", 1
-    )[0]
-    assert "freqtradeorg/freqtrade:2026.7" in sidecar
-    assert "env_file:" not in sidecar
-    assert "ports:" not in sidecar
-    assert "tradesv3.ohm_dry_run_usd.sqlite" in sidecar
-    assert "tradesv3.ohm_dry_run_usdt.sqlite" in sidecar
-    assert "ohm_freqtrade_heartbeat_USD" in sidecar
-    assert "ohm_freqtrade_heartbeat_USDT" in sidecar
-    assert "service_healthy" in compose
-    assert "./freqtrade/user_data:/app/freqtrade_paper:ro" in compose
+    paper_compose = paper_compose_path.read_text(encoding="utf-8")
+    assert "ohm-freqtrade-paper" not in compose
+    assert "depends_on:" not in compose
+    assert "./data/freqtrade/state:/app/freqtrade_paper:ro" in compose
+
+    assert "freqtradeorg/freqtrade:2026.7" in paper_compose
+    assert "env_file:" not in paper_compose
+    assert "ports:" not in paper_compose
+    assert 'mem_limit: 384m' in paper_compose
+    assert 'cpus: "0.40"' in paper_compose
+    assert "tradesv3.ohm_dry_run_usd.sqlite" in paper_compose
+    assert "tradesv3.ohm_dry_run_usdt.sqlite" in paper_compose
+    assert "ohm_freqtrade_heartbeat_USD" in paper_compose
+    assert "ohm_freqtrade_heartbeat_USDT" in paper_compose
+    assert "./data/freqtrade/state:/freqtrade/state" in paper_compose
+    assert "./data/paper_trading:/freqtrade/control:ro" in paper_compose
+    assert "./data/freqtrade_bridge:/freqtrade/bridge:ro" in paper_compose
 
 
 
@@ -323,7 +315,7 @@ def test_signal_to_paper_conversion_counts_distinct_signal_ids(tmp_path):
             symbol="SOLUSD",
             signal_id=f"OHM:signal-{index}",
             observed_at=NOW + timedelta(minutes=index),
-            payload={},
+            payload={"paper_requested": True},
             state_file=journey_state,
             event_file=events,
         )
@@ -364,7 +356,7 @@ def test_usd_and_usdt_trade_ids_do_not_collide_during_ingest(tmp_path):
             symbol="SOLUSD",
             signal_id=signal_id,
             observed_at=NOW,
-            payload={},
+            payload={"paper_requested": True},
             state_file=journey_state,
             event_file=events,
         )
@@ -390,3 +382,67 @@ def test_usd_and_usdt_trade_ids_do_not_collide_during_ingest(tmp_path):
     assert second["outcomes_added"] == 1
     state = json.loads(ingest_state.read_text(encoding="utf-8"))
     assert set(state["processed_trade_keys"]) == {"USD:1", "USDT:1"}
+
+
+
+def test_paper_off_signals_do_not_reduce_paper_conversion(tmp_path):
+    journey_state = tmp_path / "journeys.json"
+    events = tmp_path / "events.jsonl"
+
+    link_qualified_signal(
+        symbol="SOLUSD",
+        signal_id="OHM:paper-off",
+        observed_at=NOW,
+        payload={"paper_requested": False},
+        state_file=journey_state,
+        event_file=events,
+    )
+    profile = build_intelligence_learning_profile(
+        event_file=events,
+        persist=False,
+    )
+    assert profile["qualified_signals"] == 1
+    assert profile["paper_requested_signals"] == 0
+    assert profile["signal_to_paper_outcome_conversion_pct"] is None
+
+
+def test_unmatched_freqtrade_outcome_is_left_retryable(tmp_path):
+    events = tmp_path / "events.jsonl"
+    journey_state = tmp_path / "journeys.json"
+    ingest_state = tmp_path / "ingest.json"
+    db = tmp_path / "tradesv3.ohm_dry_run_usd.sqlite"
+    _create_dry_run_db(db, "OHM:not-linked")
+
+    first = ingest_freqtrade_dry_run(
+        db_file=db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    second = ingest_freqtrade_dry_run(
+        db_file=db,
+        state_file=ingest_state,
+        journey_state_file=journey_state,
+        journey_event_file=events,
+    )
+    assert first["outcomes_added"] == 0
+    assert first["unmatched_outcomes"] == 1
+    assert second["unmatched_outcomes"] == 1
+    state = json.loads(ingest_state.read_text(encoding="utf-8")) if ingest_state.exists() else {}
+    assert "USD:1" not in set(state.get("processed_trade_keys") or [])
+
+
+def test_strategy_reads_the_single_canonical_operator_control():
+    root = Path(__file__).resolve().parents[1]
+    strategy_source = (
+        root
+        / "freqtrade"
+        / "user_data"
+        / "strategies"
+        / "OHMExternalSignalStrategy.py"
+    ).read_text(encoding="utf-8")
+    assert 'Path("/freqtrade/control/control.json")' in strategy_source
+    bridge_source = (
+        root / "app" / "services" / "freqtrade_signal_bridge.py"
+    ).read_text(encoding="utf-8")
+    assert "mirror_control" not in bridge_source
