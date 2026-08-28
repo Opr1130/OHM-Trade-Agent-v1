@@ -16,6 +16,10 @@ CONTROL_FILE = Path("/app/data/paper_trading/control.json")
 LOCK_FILE = CONTROL_FILE.parent / ".paper_control.lock"
 
 
+class PaperTradeActivationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class PaperTradeControl:
     enabled: bool
@@ -83,6 +87,26 @@ def set_paper_trade_enabled(
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         raise ValueError("paper control timestamp must be timezone-aware")
     timestamp = timestamp.astimezone(timezone.utc)
+    if bool(enabled) and path == CONTROL_FILE:
+        try:
+            from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
+
+            authoritative = freqtrade_dry_run_status()
+        except Exception as exc:
+            raise PaperTradeActivationError(
+                f"authoritative Freqtrade health unavailable: {type(exc).__name__}"
+            ) from exc
+        if authoritative.get("status") != "OK":
+            workers = authoritative.get("workers") or {}
+            worker_states = ", ".join(
+                f"{name}={row.get('status', 'UNKNOWN')}"
+                for name, row in sorted(workers.items())
+            ) or "no workers ready"
+            raise PaperTradeActivationError(
+                "authoritative Freqtrade is not healthy; "
+                f"{worker_states}"
+            )
+
     payload = {
         "schema_version": 1,
         "enabled": bool(enabled),
