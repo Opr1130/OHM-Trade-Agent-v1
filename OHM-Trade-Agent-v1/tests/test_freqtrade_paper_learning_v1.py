@@ -8,7 +8,10 @@ import sqlite3
 
 import pytest
 
-from app.services.freqtrade_result_ingest import ingest_freqtrade_dry_run
+from app.services.freqtrade_result_ingest import (
+    freqtrade_dry_run_status,
+    ingest_freqtrade_dry_run,
+)
 from app.services.freqtrade_signal_bridge import (
     build_signal_id,
     publish_qualified_long,
@@ -518,3 +521,19 @@ def test_canonical_paper_on_succeeds_only_after_both_workers_are_healthy(
     saved = json.loads(control.read_text(encoding="utf-8"))
     assert saved["enabled"] is True
     assert saved["kraken_execution_authority"] is False
+
+
+
+def test_freqtrade_status_requires_fresh_authoritative_heartbeat(tmp_path):
+    db = tmp_path / "tradesv3.ohm_dry_run_usd.sqlite"
+    _create_dry_run_db(db, "OHM:status")
+
+    stale = freqtrade_dry_run_status(db_file=db)
+    assert stale["status"] == "NOT_READY"
+    assert stale["workers"]["USD"]["status"] == "STALE"
+
+    heartbeat = tmp_path / "heartbeat_USD"
+    heartbeat.write_text(NOW.isoformat(), encoding="utf-8")
+    fresh = freqtrade_dry_run_status(db_file=db)
+    assert fresh["status"] == "OK"
+    assert fresh["workers"]["USD"]["status"] == "OK"
