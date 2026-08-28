@@ -401,18 +401,24 @@ def test_refresh_watch_does_not_edit_on_small_nonmaterial_change(monkeypatch):
     old["last_checked_at"] = "2000-01-01T00:00:00+00:00"
     monkeypatch.setattr(commands, "get_watches", lambda: {"VVV": old})
     monkeypatch.setattr(commands, "analyze_market", lambda symbol: _insight(current_price=101.0))
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: (_ for _ in ()).throw(AssertionError("edit")))
+    monkeypatch.setattr(commands, "send_tracked_telegram", lambda *a, **k: (_ for _ in ()).throw(AssertionError("send")))
     monkeypatch.setattr(commands, "_put_watch", lambda *a, **k: None)
     assert commands.refresh_market_watches(_settings(), force=True) == 0
 
 
-def test_refresh_watch_edits_on_state_change(monkeypatch):
+def test_refresh_watch_pushes_fresh_card_on_state_change(monkeypatch):
     old = commands._watch_row(_insight(current_price=100.0), 9)
+    calls = []
     monkeypatch.setattr(commands, "get_watches", lambda: {"VVV": old})
     monkeypatch.setattr(commands, "analyze_market", lambda symbol: _insight(current_price=100.1, state="REVERSAL_RISK", action="WAIT", risk="HIGH"))
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: True)
+    monkeypatch.setattr(
+        commands,
+        "send_tracked_telegram",
+        lambda *a, **k: calls.append(k) or SimpleNamespace(delivered=True, message_id=88),
+    )
     monkeypatch.setattr(commands, "_put_watch", lambda *a, **k: None)
     assert commands.refresh_market_watches(_settings(), force=True) == 1
+    assert calls[0]["success_status"] == "TRANSITION_PUSHED"
 
 
 def test_third_consecutive_watch_failure_sends_single_degraded_alert(monkeypatch):
