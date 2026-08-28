@@ -94,6 +94,40 @@ jobs:
             | tee "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
           grep -q 'SOL/USDT' "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
 
+      - name: Boot production paper sidecar and require both worker heartbeats
+        run: |
+          rm -rf data/freqtrade data/freqtrade_bridge data/paper_trading
+          mkdir -p data/freqtrade/user_data data/freqtrade/state data/freqtrade_bridge data/paper_trading
+          cp "$RUNNER_TEMP/ohm-ft-bridge/"*.json data/freqtrade_bridge/
+          cp "$RUNNER_TEMP/ohm-ft-control/control.json" data/paper_trading/control.json
+
+          # Reproduce the restrictive root-created modes seen in production.
+          chmod 0600 data/freqtrade_bridge/*.json data/paper_trading/control.json
+
+          docker compose -f docker-compose.paper.yml up -d ohm-freqtrade-paper
+
+          STATUS=""
+          for _ in $(seq 1 45); do
+            STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ohm-freqtrade-paper 2>/dev/null || true)"
+            if [ "$STATUS" = "healthy" ]; then
+              break
+            fi
+            if [ "$(docker inspect --format='{{.State.Restarting}}' ohm-freqtrade-paper 2>/dev/null || true)" = "true" ]; then
+              docker compose -f docker-compose.paper.yml logs --tail=200
+              exit 1
+            fi
+            sleep 2
+          done
+
+          test "$STATUS" = "healthy"
+          test -s data/freqtrade/state/heartbeat_USD
+          test -s data/freqtrade/state/heartbeat_USDT
+          test "$(stat -c '%a' data/freqtrade_bridge/signals.json)" = "644"
+          test "$(stat -c '%a' data/paper_trading/control.json)" = "644"
+
+          docker top ohm-freqtrade-paper -eo args             | grep -q -- '--config /freqtrade/config/config.json'
+          docker top ohm-freqtrade-paper -eo args             | grep -q -- '--config /freqtrade/config/config_usdt.json'
+
       - name: Prove dry-run and credential isolation
         run: |
           python - <<'PY'
@@ -115,6 +149,7 @@ jobs:
               assert "telegram" not in config
               assert config["pairlists"][0]["processing_mode"] == "append"
               assert config["custom_price_max_distance_ratio"] == 1.0
+              assert config["exit_pricing"]["price_side"] == "other"
               assert config["pairlists"][0]["pairlist_url"].startswith("file:///user_data/bridge/")
 
           production = Path("docker-compose.yml").read_text()
@@ -122,6 +157,9 @@ jobs:
           assert "ohm-freqtrade-paper" not in production
           assert "freqtradeorg/freqtrade" not in production
           assert "docker-compose.paper.yml" not in production
+          assert paper.startswith("name: ohm-paper\n")
+          assert "ohm-freqtrade-paper-init" in paper
+          assert "network_mode: none" in paper
           assert "freqtradeorg/freqtrade:2026.7" in paper
           assert "env_file:" not in paper
           assert "ports:" not in paper
@@ -131,3 +169,7 @@ jobs:
           assert 'cpus: "0.40"' in paper
           print("Freqtrade paper authority/isolation boundary: PASS")
           PY
+
+      - name: Cleanup paper sidecar
+        if: always()
+        run: docker compose -f docker-compose.paper.yml down --remove-orphans || true
