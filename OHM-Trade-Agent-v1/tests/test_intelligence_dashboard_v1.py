@@ -143,7 +143,8 @@ def test_intelligence_dashboard_route_requires_secret_and_serves_graphs(monkeypa
     get_settings.cache_clear()
 
 
-def test_dashboard_includes_opip_bird_mascot():
+def test_dashboard_includes_approved_opip_mascot_artwork():
     html = __import__("pathlib").Path("app/api/dashboard.html").read_text(encoding="utf-8")
-    assert 'aria-label="O’Pip bird mascot"' in html
-    assert "🐦" in html
+    assert 'alt="O’Pip approved bird mascot"' in html
+    assert "data:image/webp;base64," in html
+    assert "🐦" not in html
