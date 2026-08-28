@@ -336,6 +336,42 @@ def test_pending_entry_alert_is_quarantined_while_terminal_outbox_exists(monkeyp
     ) is False
 
 
+def test_malformed_terminal_outbox_row_remains_quarantined_and_observable(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    retry_file.write_text(json.dumps({"T-1": None}))
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+
+    assert pending_notifier.terminal_notification_pending("T-1") is True
+
+    sent, failed = pending_notifier.retry_terminal_pending_notifications(
+        bot_token="token",
+        chat_id="chat",
+    )
+    assert (sent, failed) == (0, 1)
+    assert json.loads(retry_file.read_text()) == {"T-1": None}
+
+    entry_result = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="ENTRY_ZONE_REACHED",
+        current_price=10.2,
+        reason="price returned",
+    )
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("malformed unresolved terminal row must quarantine entry alert")
+        ),
+    )
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        entry_result,
+        "token",
+        "chat",
+    ) is False
+
+
 def test_terminal_retry_does_not_duplicate_already_recorded_delivery(monkeypatch, tmp_path):
     setup = _pending_setup()
     result = PendingSetupMonitorResult(

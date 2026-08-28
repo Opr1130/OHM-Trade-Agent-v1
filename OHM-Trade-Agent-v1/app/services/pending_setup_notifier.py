@@ -56,7 +56,9 @@ def terminal_notification_pending(trade_id: str) -> bool:
     try:
         with registry_lock(RETRY_FILE.parent / f".{RETRY_FILE.name}.lock"):
             retries = load_json(RETRY_FILE)
-        return isinstance(retries.get(key), dict)
+        # Key presence itself is a quarantine signal. A malformed row is not
+        # permission to resume entry monitoring; it is unresolved durable state.
+        return key in retries
     except (OSError, TimeoutError, RegistryIOError):
         # Fail closed: inability to inspect terminal outbox must not authorize
         # a fresh entry-ready notification.
@@ -391,7 +393,12 @@ def retry_terminal_pending_notifications(
 
     sent = 0
     failed = 0
-    for trade_id in list(retries):
+    for trade_id, row in list(retries.items()):
+        if not isinstance(row, dict):
+            # Preserve malformed evidence for operator inspection, keep the
+            # setup quarantined, and make the condition operationally visible.
+            failed += 1
+            continue
         status = _process_terminal_retry(
             str(trade_id),
             bot_token=bot_token,
