@@ -8,7 +8,7 @@ from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
 from app.services.kraken_position_verification import KrakenPositionVerifier
 from app.services.notification_policy import record_emitted, should_emit
-from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_delivery import record_telegram_suppression, send_tracked_telegram
 from app.services.trade_monitor import monitor_trade
 from app.services.trade_monitor_notifier import send_monitor_update
 from app.services.trade_outcome_registry import update_active_observation
@@ -43,6 +43,14 @@ def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_T
         cooldown_seconds=3600,
         now=now,
     ):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="MONITOR_DEGRADED",
+            event_type="MONITOR_DEGRADED",
+            fingerprint=fingerprint,
+            reason="NOTIFICATION_POLICY",
+            generated_at=now,
+        )
         return False
     message = (
         "🚨 OHM MONITORING DEGRADED\n"
@@ -51,19 +59,24 @@ def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_T
         "Action: VERIFY KRAKEN READ-ONLY CONNECTIVITY / POSITION STATE\n"
         "No order was placed or changed."
     )
-    sent = send_telegram_message(
-        settings.telegram_bot_token,
-        settings.telegram_chat_id,
-        message,
+    delivery = send_tracked_telegram(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        message=message,
+        identity=identity,
+        alert_family="MONITOR_DEGRADED",
+        event_type="MONITOR_DEGRADED",
+        fingerprint=fingerprint,
+        generated_at=now,
     )
-    if sent:
+    if delivery.delivered:
         record_emitted(
             identity=identity,
             event_type="MONITOR_DEGRADED",
             fingerprint=fingerprint,
             now=now,
         )
-    return sent
+    return delivery.delivered
 
 
 def run_active_trade_monitor() -> MonitorRunSummary:
