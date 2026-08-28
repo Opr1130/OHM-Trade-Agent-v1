@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -367,6 +368,50 @@ def test_malformed_terminal_outbox_row_remains_quarantined_and_observable(monkey
     assert pending_notifier.send_pending_setup_update(
         setup,
         entry_result,
+        "token",
+        "chat",
+    ) is False
+
+
+def test_malformed_mapping_terminal_row_is_preserved_quarantined_and_counted(monkeypatch, tmp_path):
+    setup = _pending_setup()
+    nonterminal = PendingSetupMonitorResult(
+        symbol=setup.symbol,
+        status="ENTRY_ZONE_REACHED",
+        current_price=10.2,
+        reason="invalid terminal-outbox payload",
+    )
+    retry_file = tmp_path / "pending_terminal_outbox.json"
+    row = {
+        "schema_version": 2,
+        "trade_id": setup.trade_id,
+        "setup": asdict(setup),
+        "result": asdict(nonterminal),
+    }
+    retry_file.write_text(json.dumps({"T-1": row}))
+    monkeypatch.setattr(pending_notifier, "RETRY_FILE", retry_file)
+
+    assert pending_notifier.terminal_notification_pending("T-1") is True
+    sent, failed = pending_notifier.retry_terminal_pending_notifications(
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert (sent, failed) == (0, 1)
+    persisted = json.loads(retry_file.read_text())
+    assert persisted["T-1"]["result"]["status"] == "ENTRY_ZONE_REACHED"
+    assert pending_notifier.terminal_notification_pending("T-1") is True
+
+    monkeypatch.setattr(
+        pending_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid terminal mapping must not authorize a new entry alert")
+        ),
+    )
+    assert pending_notifier.send_pending_setup_update(
+        setup,
+        nonterminal,
         "token",
         "chat",
     ) is False
