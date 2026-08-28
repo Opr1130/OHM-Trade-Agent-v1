@@ -6,6 +6,7 @@ services:
     mem_limit: 384m
     cpus: "0.40"
     pids_limit: 256
+    oom_score_adj: 500
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - |
