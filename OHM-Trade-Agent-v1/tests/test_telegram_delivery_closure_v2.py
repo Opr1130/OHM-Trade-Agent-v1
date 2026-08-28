@@ -136,11 +136,6 @@ def test_failed_terminal_pending_alert_remains_retryable(monkeypatch, tmp_path):
     )
     state_file = tmp_path / "pending_alert_state.json"
     monkeypatch.setattr(pending_notifier, "STATE_FILE", state_file)
-    monkeypatch.setattr(
-        pending_notifier,
-        "LOCK_FILE",
-        state_file.parent / ".pending_alert_state.lock",
-    )
     monkeypatch.setattr(pending_notifier, "should_emit", lambda **kwargs: True)
     terminalized = []
     monkeypatch.setattr(
