@@ -1,0 +1,26 @@
+name: dashboard-edge-public-smoke
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify public dashboard TLS route
+        run: |
+          set -euo pipefail
+          BASE="https://161-35-106-207.sslip.io:8443"
+
+          BODY="$(curl --fail --silent --show-error             --retry 3             --retry-delay 2             --connect-timeout 5             --max-time 20             "$BASE/dashboard")"
+          printf '%s' "$BODY" | grep -Fq "O’Pip Intelligence Cockpit"
+
+          STATUS="$(curl --silent --show-error             --connect-timeout 5             --max-time 20             -o /tmp/opip-api-body.txt             -w '%{http_code}'             "$BASE/api/analytics/intelligence?scope=all")"
+          test "$STATUS" = "401"
+          grep -Fq "Invalid dashboard secret" /tmp/opip-api-body.txt
+
+          echo "Public O'Pip dashboard edge: PASS"
