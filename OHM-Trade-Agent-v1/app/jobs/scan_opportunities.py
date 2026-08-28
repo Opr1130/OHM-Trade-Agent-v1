@@ -249,6 +249,8 @@ def _publish_freqtrade_paper_opportunities(
                     "paper_engine": "FREQTRADE_DRY_RUN",
                 },
             )
+            alert["signal_id"] = signal_id
+            alert["journey_id"] = journey_id
             if not paper_enabled:
                 print(
                     f"FREQTRADE PAPER {snapshot.symbol}: PAPER_OFF "
