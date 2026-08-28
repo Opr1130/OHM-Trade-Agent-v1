@@ -10,17 +10,16 @@ from app.services.telegram_delivery import record_telegram_suppression, send_tra
 
 
 STATE_FILE = Path("/app/data/emergency_alert_state.json")
-LOCK_FILE = STATE_FILE.parent / ".emergency_alert_state.lock"
 CRITICAL_REPEAT_SECONDS = 300
 
 
 def _load_state() -> dict:
-    with registry_lock(LOCK_FILE):
+    with registry_lock(STATE_FILE.parent / f".{STATE_FILE.name}.lock"):
         return load_json(STATE_FILE)
 
 
 def _save_state(state: dict) -> None:
-    with registry_lock(LOCK_FILE):
+    with registry_lock(STATE_FILE.parent / f".{STATE_FILE.name}.lock"):
         save_json_atomic(STATE_FILE, state)
 
 
