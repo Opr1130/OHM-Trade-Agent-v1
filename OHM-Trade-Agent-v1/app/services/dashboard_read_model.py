@@ -17,6 +17,7 @@ from app.services.paper_trade_control import paper_trade_enabled
 from app.services.profitability_learning import build_profitability_profile
 from app.services.shadow_learning import get_shadow_records
 from app.services.trade_outcome_registry import get_outcomes
+from app.services.telegram_delivery import build_delivery_summary
 
 
 MAX_EVENTS = 20000
@@ -408,7 +409,7 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     evidence_state = "INSUFFICIENT_DATA" if sample_count < 30 else "MEASURED"
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "scope": scope,
         "read_only": True,
@@ -440,6 +441,7 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
         },
         "failure_eradication": _failure_snapshot(outcomes, profitability),
         "paper_engine": _paper_status(),
+        "telegram_delivery": build_delivery_summary(scope=scope),
         "recent_events": _recent_events(events),
         "guardrails": {
             "dashboard_can_change_rankings": False,
