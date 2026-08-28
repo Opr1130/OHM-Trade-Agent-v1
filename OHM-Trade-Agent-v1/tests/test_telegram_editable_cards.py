@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.jobs.scan_movers import _compact_card
+from app.jobs.scan_movers import _compact_card, _deliver_existing_card_update
 from app.services import telegram_notifier
 
 
@@ -81,3 +81,93 @@ def test_compact_mover_card_is_short_and_decision_focused():
     assert "Volume expanding" in card
     assert len(card.splitlines()) <= 7
     assert "Evidence:" not in card
+
+
+
+def _telegram_settings():
+    return SimpleNamespace(
+        telegram_bot_token="secret",
+        telegram_chat_id="chat",
+    )
+
+
+def test_meaningful_transition_sends_fresh_push_instead_of_silent_edit(monkeypatch):
+    calls = {"send": 0, "edit": 0}
+
+    def send(*args, **kwargs):
+        calls["send"] += 1
+        return 9001
+
+    def edit(*args, **kwargs):
+        calls["edit"] += 1
+        return True
+
+    monkeypatch.setattr("app.jobs.scan_movers.send_telegram_message_with_id", send)
+    monkeypatch.setattr("app.jobs.scan_movers.edit_telegram_message", edit)
+
+    decision = SimpleNamespace(
+        reason="MEANINGFUL_TRANSITION",
+        message_id=4321,
+    )
+    action, message_id = _deliver_existing_card_update(
+        settings=_telegram_settings(),
+        decision=decision,
+        message="updated card",
+    )
+
+    assert action == "TRANSITION_PUSHED"
+    assert message_id == 9001
+    assert calls == {"send": 1, "edit": 0}
+
+
+def test_periodic_refresh_keeps_editing_existing_card_without_new_push(monkeypatch):
+    calls = {"send": 0, "edit": 0}
+
+    def send(*args, **kwargs):
+        calls["send"] += 1
+        return 9002
+
+    def edit(*args, **kwargs):
+        calls["edit"] += 1
+        return True
+
+    monkeypatch.setattr("app.jobs.scan_movers.send_telegram_message_with_id", send)
+    monkeypatch.setattr("app.jobs.scan_movers.edit_telegram_message", edit)
+
+    decision = SimpleNamespace(
+        reason="PERIODIC_REFRESH",
+        message_id=4321,
+    )
+    action, message_id = _deliver_existing_card_update(
+        settings=_telegram_settings(),
+        decision=decision,
+        message="refreshed card",
+    )
+
+    assert action == "EDITED"
+    assert message_id == 4321
+    assert calls == {"send": 0, "edit": 1}
+
+
+def test_failed_meaningful_transition_push_keeps_old_canonical_state_retryable(monkeypatch):
+    monkeypatch.setattr(
+        "app.jobs.scan_movers.send_telegram_message_with_id",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.jobs.scan_movers.edit_telegram_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("edit must not run")),
+    )
+
+    decision = SimpleNamespace(
+        reason="MEANINGFUL_TRANSITION",
+        message_id=4321,
+    )
+    action, message_id = _deliver_existing_card_update(
+        settings=_telegram_settings(),
+        decision=decision,
+        message="updated card",
+    )
+
+    assert action == "TRANSITION_PUSH_FAILED"
+    assert message_id is None
