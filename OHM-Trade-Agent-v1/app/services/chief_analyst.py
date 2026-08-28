@@ -155,7 +155,7 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
             "economic_assumed_capital": economic.recommended_capital,
             "economic_validation_leverage": getattr(economic, "leverage", 1.0),
             "economic_reward_to_risk_2": float(getattr(plan, "reward_to_risk_2", 0.0)),
-            "economic_target_2_move_pct": economic.target_2_move_pct,
+            "economic_target_2_move_pct": getattr(economic, "target_2_move_pct", None),
             "economic_account_risk_at_stop_pct": getattr(economic, "account_risk_at_stop_pct", 0.0),
             "economic_max_account_risk_at_stop_pct": (
                 SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT
@@ -229,13 +229,31 @@ def _economic_binding_constraint(level: dict) -> dict:
         threshold = level.get("economic_max_account_risk_at_stop_pct")
         higher_is_better = False
     else:
-        return {
-            "metric": "ECONOMIC_REJECTION",
-            "measured": None,
-            "threshold": None,
-            "higher_is_better": True,
-            "distance": None,
-        }
+        # Backward-compatible evidence (older captures and unit-test stubs)
+        # may predate the structured rejection string. Only infer net profit
+        # when the stored value itself proves that this named gate failed;
+        # otherwise leave the binding metric unattributed rather than inventing
+        # a threshold.
+        net_profit = level.get(
+            "hypothetical_target_2_net_profit_at_assumed_capital"
+        )
+        try:
+            net_profit_value = float(net_profit)
+        except (TypeError, ValueError):
+            net_profit_value = None
+        if net_profit_value is not None and net_profit_value < float(MIN_NET_PROFIT):
+            metric = "ECONOMIC_NET_PROFIT_AT_TARGET_2"
+            measured = net_profit_value
+            threshold = float(MIN_NET_PROFIT)
+            higher_is_better = True
+        else:
+            return {
+                "metric": "ECONOMIC_REJECTION",
+                "measured": None,
+                "threshold": None,
+                "higher_is_better": True,
+                "distance": None,
+            }
 
     try:
         measured_value = float(measured)
