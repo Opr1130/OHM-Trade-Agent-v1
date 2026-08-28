@@ -159,9 +159,9 @@ def test_actionable_setup_is_persisted_without_confirmation_buttons(
         setup = pending_setup_registry.get_pending_setups()[0]
         observed["trade_id"] = setup.trade_id
         observed["has_reply_markup"] = "reply_markup" in kwargs
-        return True
+        return SimpleNamespace(delivered=True, message_id=101)
 
-    monkeypatch.setattr(chief_alert_notifier, "send_telegram_message", send)
+    monkeypatch.setattr(chief_alert_notifier, "send_tracked_telegram", send)
     assert chief_alert_notifier.send_trade_plan(
         {"confidence": 90, "decision": "alert"},
         _plan(),
@@ -205,8 +205,8 @@ def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
     monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", lambda *args: True)
     monkeypatch.setattr(
         chief_alert_notifier,
-        "send_telegram_message",
-        lambda *args, **kwargs: True,
+        "send_tracked_telegram",
+        lambda *args, **kwargs: SimpleNamespace(delivered=True, message_id=102),
     )
     assert chief_alert_notifier.send_trade_plan(
         candidate,
@@ -235,8 +235,8 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
     monkeypatch.setattr(
         chief_alert_notifier,
-        "send_telegram_message",
-        lambda *args, **kwargs: sent.update(kwargs) or True,
+        "send_tracked_telegram",
+        lambda *args, **kwargs: sent.update(kwargs) or SimpleNamespace(delivered=True, message_id=103),
     )
     candidate = {
         "confidence": 90,
@@ -279,8 +279,8 @@ def test_place_limit_reuses_pending_trade_id_for_reconciliation(
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
     monkeypatch.setattr(
         chief_alert_notifier,
-        "send_telegram_message",
-        lambda *args, **kwargs: True,
+        "send_tracked_telegram",
+        lambda *args, **kwargs: SimpleNamespace(delivered=True, message_id=104),
     )
     candidate = {
         "confidence": 90,
@@ -333,13 +333,15 @@ def test_terminal_market_status_cannot_resurrect(
     setup = pending_setup_registry.add_pending_setup(_setup())
     monkeypatch.setattr(
         pending_setup_notifier,
-        "send_telegram_message",
-        lambda *args, **kwargs: False,
+        "send_tracked_telegram",
+        lambda *args, **kwargs: SimpleNamespace(delivered=True, message_id=105),
     )
     result = PendingSetupMonitorResult(setup.symbol, status, 102.0, "terminal")
-    pending_setup_notifier.send_pending_setup_update(setup, result, "token", "chat")
+    assert pending_setup_notifier.send_pending_setup_update(setup, result, "token", "chat")
     assert pending_setup_registry.get_pending_setups() == []
-    assert pending_setup_registry._load_raw()[setup.symbol]["status"] == stored_status
+    raw = pending_setup_registry._load_raw()
+    row = raw.get(setup.trade_id) or raw.get(setup.symbol)
+    assert row["status"] == stored_status
     with pytest.raises(ValueError, match="No confirmable pending setup"):
         confirm_trade_id(setup.trade_id)
 
