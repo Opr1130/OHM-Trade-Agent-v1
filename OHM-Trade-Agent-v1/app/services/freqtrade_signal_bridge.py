@@ -99,7 +99,8 @@ def publish_qualified_long(
     pairlist_file: Path | None = None,
 ) -> dict[str, Any]:
     decision = _utc(decision_at)
-    pair = to_freqtrade_pair(base_asset, quote_asset)
+    quote = canonicalize_asset(str(quote_asset or "USD").strip().upper())
+    pair = to_freqtrade_pair(base_asset, quote)
     signal_id = build_signal_id(
         episode_id=episode_id,
         pair=pair,
@@ -116,7 +117,7 @@ def publish_qualified_long(
         "pair": pair,
         "ohm_symbol": str(ohm_symbol).upper(),
         "base_asset": canonicalize_asset(str(base_asset).upper()),
-        "quote_asset": str(quote_asset).upper(),
+        "quote_asset": quote,
         "direction": "LONG",
         "decision_at": decision.isoformat(),
         "expires_at": expires.isoformat(),
@@ -172,7 +173,6 @@ def publish_qualified_long(
             },
         )
 
-    quote = str(quote_asset).upper()
     target_pairlist = pairlist_file or (
         PAIRLIST_USDT_FILE if quote == "USDT" else PAIRLIST_USD_FILE
     )
