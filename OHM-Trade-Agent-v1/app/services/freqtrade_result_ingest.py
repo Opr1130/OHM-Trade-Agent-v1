@@ -435,6 +435,18 @@ def _ingest_freqtrade_dry_run_unlocked(
                         (datetime.now(timezone.utc).isoformat(), trade_key),
                     )
                     dedup.commit()
+                    try:
+                        from app.services.freqtrade_signal_bridge import mark_signal_terminal
+
+                        mark_signal_terminal(
+                            signal_id,
+                            terminal_at=close_time,
+                            outcome=str(payload.get("exit_reason") or "CLOSED"),
+                        )
+                    except Exception:
+                        # Learning is already durable. Terminal marking is
+                        # conservative capacity cleanup and remains fail-soft.
+                        pass
                     added += 1
                     new_keys.append(trade_key)
                 else:
