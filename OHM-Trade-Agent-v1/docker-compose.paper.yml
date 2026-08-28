@@ -7,6 +7,12 @@ services:
     cpus: "0.40"
     pids_limit: 256
     oom_score_adj: 500
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - paper-egress
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - |
@@ -54,3 +60,8 @@ services:
       timeout: 3s
       retries: 12
       start_period: 45s
+
+
+networks:
+  paper-egress:
+    driver: bridge
