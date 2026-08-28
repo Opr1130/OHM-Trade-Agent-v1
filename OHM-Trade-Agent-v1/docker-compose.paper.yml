@@ -54,7 +54,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "test -f /tmp/ohm_freqtrade_heartbeat_USD && test -f /tmp/ohm_freqtrade_heartbeat_USDT && find /tmp/ohm_freqtrade_heartbeat_USD -mmin -1 -print -quit | grep -q . && find /tmp/ohm_freqtrade_heartbeat_USDT -mmin -1 -print -quit | grep -q ."
+          "test -f /freqtrade/state/heartbeat_USD && test -f /freqtrade/state/heartbeat_USDT && find /freqtrade/state/heartbeat_USD -mmin -1 -print -quit | grep -q . && find /freqtrade/state/heartbeat_USDT -mmin -1 -print -quit | grep -q ."
         ]
       interval: 10s
       timeout: 3s
