@@ -102,7 +102,7 @@ def test_dashboard_html_is_public_but_analytics_api_requires_secret(monkeypatch)
     client = TestClient(app)
     page = client.get("/dashboard")
     assert page.status_code == 200
-    assert "OHM AI — Operations & Learning" in page.text
+    assert "O’Pip Intelligence Cockpit" in page.text
 
     response = client.get("/api/analytics/summary?scope=today")
     assert response.status_code == 401
