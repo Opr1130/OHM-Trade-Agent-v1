@@ -88,11 +88,11 @@ if [[ "$healthy" != "1" ]]; then
   false
 fi
 
-if [[ ! -x "$SCHEDULER_RECONCILE" ]]; then
-  echo "scheduler reconciliation script missing or not executable" >&2
+if [[ ! -s "$SCHEDULER_RECONCILE" ]]; then
+  echo "scheduler reconciliation script missing" >&2
   false
 fi
-"$SCHEDULER_RECONCILE"
+bash "$SCHEDULER_RECONCILE"
 
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
 trap - ERR
