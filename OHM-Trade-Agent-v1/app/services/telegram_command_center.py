@@ -596,7 +596,7 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             try:
                 _send(settings, format_market_insight(analyze_market(symbol)))
             except (MarketResolutionError, MarketInsightUnavailable) as exc:
-                _send(settings, f"⚠️ OHM SCAN — {str(exc)[:220]}")
+                _send(settings, f"⚠️ SCAN — {str(exc)[:220]}")
         elif command == "why":
             symbol = _require_symbol(args, "why")
             try:
