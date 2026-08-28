@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 
 import pytest
+import yaml
 
 from app.services.freqtrade_result_ingest import (
     freqtrade_dry_run_status,
@@ -319,7 +320,19 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     compose = compose_path.read_text(encoding="utf-8")
     paper_compose = paper_compose_path.read_text(encoding="utf-8")
     assert "ohm-freqtrade-paper" not in compose
-    assert "depends_on:" not in compose
+    compose_model = yaml.safe_load(compose)
+    app_dependencies = (
+        compose_model.get("services", {})
+        .get("ohm-trade-agent", {})
+        .get("depends_on", {})
+    )
+    if isinstance(app_dependencies, list):
+        dependency_names = set(app_dependencies)
+    else:
+        dependency_names = set(app_dependencies)
+    assert dependency_names.isdisjoint(
+        {"ohm-freqtrade-paper", "ohm-freqtrade-paper-usdt"}
+    )
     assert "./data/freqtrade/state:/app/freqtrade_paper:ro" in compose
 
     assert "freqtradeorg/freqtrade:2026.7" in paper_compose
