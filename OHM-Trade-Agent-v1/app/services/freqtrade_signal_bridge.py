@@ -15,7 +15,6 @@ PAIRLIST_USD_FILE = BRIDGE_DIR / "pairlist_usd.json"
 PAIRLIST_USDT_FILE = BRIDGE_DIR / "pairlist_usdt.json"
 # Backward-compatible alias for tests/importers that assume the primary USD path.
 PAIRLIST_FILE = PAIRLIST_USD_FILE
-CONTROL_FILE = BRIDGE_DIR / "control.json"
 SIGNAL_RETENTION = timedelta(days=7)
 
 
@@ -56,7 +55,6 @@ def ensure_bridge_files(
     signals_file: Path = SIGNALS_FILE,
     pairlist_usd_file: Path = PAIRLIST_USD_FILE,
     pairlist_usdt_file: Path = PAIRLIST_USDT_FILE,
-    control_file: Path = CONTROL_FILE,
 ) -> None:
     signals_file.parent.mkdir(parents=True, exist_ok=True)
     if not signals_file.exists():
@@ -64,47 +62,12 @@ def ensure_bridge_files(
     if not pairlist_usd_file.exists():
         save_json_atomic(
             pairlist_usd_file,
-            {"pairs": ["BTC/USD"], "refresh_period": 10},
+            {"pairs": ["BTC/USD"], "refresh_period": 10, "stake_currency": "USD"},
         )
     if not pairlist_usdt_file.exists():
         save_json_atomic(
             pairlist_usdt_file,
-            {"pairs": ["BTC/USDT"], "refresh_period": 10},
-        )
-    if not control_file.exists():
-        save_json_atomic(
-            control_file,
-            {
-                "schema_version": 1,
-                "enabled": False,
-                "source": "SYSTEM_DEFAULT",
-                "authoritative_engine": "FREQTRADE_DRY_RUN",
-                "exchange_write_authority": False,
-            },
-        )
-
-
-def mirror_control(
-    *,
-    enabled: bool,
-    updated_at: datetime,
-    updated_by: str,
-    control_file: Path = CONTROL_FILE,
-) -> None:
-    timestamp = _utc(updated_at)
-    control_file.parent.mkdir(parents=True, exist_ok=True)
-    lock = control_file.parent / f".{control_file.name}.lock"
-    with registry_lock(lock):
-        save_json_atomic(
-            control_file,
-            {
-                "schema_version": 1,
-                "enabled": bool(enabled),
-                "updated_at": timestamp.isoformat(),
-                "updated_by": str(updated_by),
-                "authoritative_engine": "FREQTRADE_DRY_RUN",
-                "exchange_write_authority": False,
-            },
+            {"pairs": ["BTC/USDT"], "refresh_period": 10, "stake_currency": "USDT"},
         )
 
 
