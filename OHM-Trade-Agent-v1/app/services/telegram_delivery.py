@@ -352,6 +352,44 @@ def record_telegram_suppression(
     )
 
 
+
+def record_telegram_not_eligible(
+    *,
+    identity: str,
+    alert_family: str,
+    event_type: str,
+    fingerprint: str,
+    reason: str,
+    symbol: str | None = None,
+    pair: str | None = None,
+    journey_id: str | None = None,
+    trade_id: str | None = None,
+    generated_at: datetime | None = None,
+    state_file: Path = STATE_FILE,
+    event_file: Path = EVENT_FILE,
+) -> TelegramDeliveryResult:
+    now = _utc()
+    return _record(
+        identity=identity,
+        alert_family=alert_family,
+        event_type=event_type,
+        fingerprint=fingerprint,
+        status="NOT_ELIGIBLE",
+        symbol=symbol,
+        pair=pair,
+        message_id=None,
+        journey_id=journey_id,
+        trade_id=trade_id,
+        suppression_reason=reason,
+        failure_reason=None,
+        generated_at=generated_at or now,
+        attempted_at=now,
+        latency_ms=0,
+        state_file=state_file,
+        event_file=event_file,
+    )
+
+
 def canonical_message_id(identity: str, *, state_file: Path = STATE_FILE) -> int | None:
     try:
         with registry_lock(LOCK_FILE):
