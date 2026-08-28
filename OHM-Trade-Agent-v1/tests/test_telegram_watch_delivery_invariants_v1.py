@@ -54,7 +54,7 @@ def test_nonmaterial_refresh_preserves_last_delivered_price_baseline(monkeypatch
     saved = []
     monkeypatch.setattr(commands, "get_watches", lambda: {"VVV": old})
     monkeypatch.setattr(commands, "analyze_market", lambda symbol: _insight(price=101.5))
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected edit")))
+    monkeypatch.setattr(commands, "send_tracked_telegram", lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected send")))
     monkeypatch.setattr(commands, "_put_watch", lambda symbol, row: saved.append(dict(row)))
 
     assert commands.refresh_market_watches(_settings(), force=True) == 0
@@ -73,8 +73,11 @@ def test_failed_material_delivery_preserves_delivered_state_for_retry(monkeypatc
         "analyze_market",
         lambda symbol: _insight(price=103.0, state="REVERSAL_RISK", action="WAIT", risk="HIGH"),
     )
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: False)
-    monkeypatch.setattr(commands, "send_telegram_message_with_id", lambda *a, **k: None)
+    monkeypatch.setattr(
+        commands,
+        "send_tracked_telegram",
+        lambda *a, **k: SimpleNamespace(delivered=False, message_id=None),
+    )
     monkeypatch.setattr(commands, "_put_watch", lambda symbol, row: saved.append(dict(row)))
 
     assert commands.refresh_market_watches(_settings(), force=True) == 0
@@ -92,7 +95,11 @@ def test_successful_material_delivery_advances_delivered_state(monkeypatch):
         "analyze_market",
         lambda symbol: _insight(price=103.0, state="REVERSAL_RISK", action="WAIT", risk="HIGH"),
     )
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: True)
+    monkeypatch.setattr(
+        commands,
+        "send_tracked_telegram",
+        lambda *a, **k: SimpleNamespace(delivered=True, message_id=77),
+    )
     monkeypatch.setattr(commands, "_put_watch", lambda symbol, row: saved.append(dict(row)))
 
     assert commands.refresh_market_watches(_settings(), force=True) == 1
@@ -119,16 +126,20 @@ def test_corrupt_watch_registry_emits_degraded_alert(monkeypatch):
     assert "WATCH DEGRADED" in sent[0]
 
 
-def test_invalid_persisted_message_id_falls_back_to_replacement_send(monkeypatch):
+def test_material_watch_transition_always_uses_fresh_push(monkeypatch):
     old = commands._watch_row(_insight(price=100.0), 9)
-    old["message_id"] = "not-an-int"
     saved = []
+    calls = []
     monkeypatch.setattr(commands, "get_watches", lambda: {"VVV": old})
     monkeypatch.setattr(commands, "analyze_market", lambda symbol: _insight(price=103.0))
-    monkeypatch.setattr(commands, "edit_telegram_message", lambda *a, **k: (_ for _ in ()).throw(AssertionError("edit with invalid id")))
-    monkeypatch.setattr(commands, "send_telegram_message_with_id", lambda *a, **k: 88)
+    monkeypatch.setattr(
+        commands,
+        "send_tracked_telegram",
+        lambda *a, **k: calls.append(k) or SimpleNamespace(delivered=True, message_id=88),
+    )
     monkeypatch.setattr(commands, "_put_watch", lambda symbol, row: saved.append(dict(row)))
 
     assert commands.refresh_market_watches(_settings(), force=True) == 1
+    assert calls[0]["success_status"] == "TRANSITION_PUSHED"
     assert saved[-1]["message_id"] == 88
     assert saved[-1]["last_price"] == 103.0
