@@ -6,8 +6,7 @@ from app.api.dashboard import router as dashboard_router
 from app.api.routes import router
 from app.core.config import get_settings
 from app.services.legacy_tradingview_guard import evaluate_legacy_tradingview_request
-from app.services.freqtrade_signal_bridge import ensure_bridge_files, mirror_control
-from app.services.paper_trade_control import get_paper_trade_control
+from app.services.freqtrade_signal_bridge import ensure_bridge_files
 from app.services.telegram_callback_listener import (
     start_telegram_callback_listener,
     stop_telegram_callback_listener,
@@ -51,21 +50,10 @@ app.include_router(dashboard_router)
 def startup_event() -> None:
     try:
         ensure_bridge_files()
-        paper = get_paper_trade_control()
-        if paper.updated_at:
-            from datetime import datetime
-            updated_at = datetime.fromisoformat(paper.updated_at.replace("Z", "+00:00"))
-        else:
-            from datetime import datetime, timezone
-            updated_at = datetime.now(timezone.utc)
-        mirror_control(
-            enabled=paper.enabled,
-            updated_at=updated_at,
-            updated_by=paper.updated_by,
-        )
     except Exception:
         # The bridge is paper-only and must never prevent the advisory app
-        # from starting. Freqtrade itself starts fail-safe OFF.
+        # from starting. Missing bridge state leaves Freqtrade unable to admit
+        # paper signals and therefore fails safe.
         pass
     start_telegram_callback_listener()
 
