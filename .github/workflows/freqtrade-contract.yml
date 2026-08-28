@@ -129,8 +129,8 @@ jobs:
           test "$(stat -c '%a' data/freqtrade_bridge/signals.json)" = "644"
           test "$(stat -c '%a' data/paper_trading/control.json)" = "644"
 
-          docker top ohm-freqtrade-paper -eo args             | grep -q -- '--config /freqtrade/config/config.json'
-          docker top ohm-freqtrade-paper -eo args             | grep -q -- '--config /freqtrade/config/config_usdt.json'
+          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config.json'
+          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config_usdt.json'
 
       - name: Prove dry-run and credential isolation
         run: |
