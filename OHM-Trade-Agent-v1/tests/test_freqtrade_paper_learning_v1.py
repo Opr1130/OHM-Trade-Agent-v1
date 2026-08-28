@@ -268,7 +268,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
         assert config["exchange"]["name"] == "kraken"
         assert config["exchange"]["key"] == ""
         assert config["exchange"]["secret"] == ""
-        assert config["api_server"]["enabled"] is False
+        assert "api_server" not in config
         assert "telegram" not in config
         assert config["pairlists"][0]["processing_mode"] == "append"
 
