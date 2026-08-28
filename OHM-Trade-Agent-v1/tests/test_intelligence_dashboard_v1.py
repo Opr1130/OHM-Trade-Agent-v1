@@ -141,3 +141,9 @@ def test_intelligence_dashboard_route_requires_secret_and_serves_graphs(monkeypa
     denied = client.get("/api/analytics/intelligence?scope=all")
     assert denied.status_code == 401
     get_settings.cache_clear()
+
+
+def test_dashboard_includes_opip_bird_mascot():
+    html = __import__("pathlib").Path("app/api/dashboard.html").read_text(encoding="utf-8")
+    assert 'aria-label="O’Pip bird mascot"' in html
+    assert "🐦" in html
