@@ -152,7 +152,7 @@ def _compact_card(signal) -> str:
         else "WATCH FOR PULLBACK"
     )
     return (
-        f"🚀 OHM EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
         f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
         f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | {signal.momentum_state}\n"
         f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
@@ -224,7 +224,7 @@ def _signal_quality_card(candidate: SignalQualityCandidate, *, reference_price: 
     pattern = str(candidate.pattern or "UNCLASSIFIED").replace("_", " ").title()
     stage = str(candidate.stage).replace("_", " ")
     return (
-        f"🚀 OHM EARLY WATCH — {display_market_label(candidate.symbol)}\n"
+        f"🚀 EARLY WATCH — {display_market_label(candidate.symbol)}\n"
         + (f"Price: {float(reference_price):.8g}\n" if isinstance(reference_price, (int, float)) and float(reference_price) > 0 else "")
         + f"Stage: {stage}\n"
         f"Pattern: {pattern}\n"
