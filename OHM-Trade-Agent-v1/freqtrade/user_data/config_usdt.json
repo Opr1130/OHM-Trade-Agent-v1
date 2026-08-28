@@ -32,7 +32,7 @@
     {
       "method": "RemotePairList",
       "mode": "whitelist",
-      "processing_mode": "filter",
+      "processing_mode": "append",
       "pairlist_url": "file:///freqtrade/bridge/pairlist_usdt.json",
       "refresh_period": 10,
       "keep_pairlist_on_failure": true,
@@ -65,5 +65,5 @@
     "heartbeat_interval": 60
   },
   "bot_name": "OHM-Freqtrade-Paper-USDT",
-  "db_url": "sqlite:////freqtrade/user_data/tradesv3.ohm_dry_run_usdt.sqlite"
+  "db_url": "sqlite:////freqtrade/state/tradesv3.ohm_dry_run_usdt.sqlite"
 }
