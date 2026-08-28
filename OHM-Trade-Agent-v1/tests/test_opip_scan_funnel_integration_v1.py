@@ -374,7 +374,9 @@ def test_ai_budget_suppression_is_not_an_operational_failure(monkeypatch, tmp_pa
     assert summary["terminal"]["top_reasons"] == {"AI_BUDGET_LIMIT": 1}
     assert summary["terminal"]["reason_classes"]["BUDGET"] == 1
     assert summary["funnel"]["operational_failures"] == 0
-    assert summary["funnel"]["rejected_by_policy"] == 1
+    assert summary["funnel"]["rejected_total"] == 1
+    assert summary["funnel"]["rejected_by_policy"] == 0
+    assert summary["funnel"]["rejected_by_budget"] == 1
     assert summary["ai_stage"]["budget_exhausted"] is True
     assert summary["ai_stage"]["unavailable"] is False
     _assert_equivalent(summary)
