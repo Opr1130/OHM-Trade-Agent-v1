@@ -714,10 +714,17 @@ def _paper_trade_rows(
                 row[1]
                 for row in connection.execute("PRAGMA table_info(trades)").fetchall()
             }
-            rows = connection.execute(
-                "SELECT * FROM trades WHERE enter_tag LIKE 'OHM:%' ORDER BY id DESC LIMIT 200"
+            open_rows = connection.execute(
+                "SELECT * FROM trades "
+                "WHERE enter_tag LIKE 'OHM:%' AND is_open = 1 "
+                "ORDER BY id DESC"
             ).fetchall()
-            for row in rows:
+            closed_rows = connection.execute(
+                "SELECT * FROM trades "
+                "WHERE enter_tag LIKE 'OHM:%' AND is_open = 0 "
+                "ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+            for row in [*open_rows, *closed_rows]:
                 get = lambda key, default=None: row[key] if key in columns else default
                 payload = {
                     "trade_id": get("id"),
@@ -753,7 +760,7 @@ def _paper_trade_rows(
             connection.close()
     opened.sort(key=lambda row: str(row.get("open_date") or ""), reverse=True)
     closed.sort(key=lambda row: str(row.get("close_date") or ""), reverse=True)
-    return {"open": opened[:30], "closed": closed[:50]}
+    return {"open": opened, "closed": closed[:50]}
 
 
 def _dead_letter_count() -> int:
@@ -778,6 +785,9 @@ def _source_health(
     scan_age = (now - last_scan).total_seconds() if last_scan else None
     event_age = (now - last_event).total_seconds() if last_event else None
     tv_status = str(tv.get("coverage_status") or "UNKNOWN").upper()
+    operations_status = str(
+        operations.get("_analytics_status") or "OK"
+    ).upper()
     return [
         {
             "source": "Kraken scan",
@@ -793,9 +803,19 @@ def _source_health(
         },
         {
             "source": "Chief AI",
-            "status": "OK" if int((operations.get("ai") or {}).get("chief_calls") or 0) >= 0 else "UNKNOWN",
+            "status": (
+                "OK"
+                if operations_status == "OK"
+                else operations_status
+            ),
             "age_seconds": None,
-            "detail": f"{(operations.get('ai') or {}).get('chief_calls', 0)} calls in current UTC day.",
+            "detail": (
+                f"{(operations.get('ai') or {}).get('chief_calls', 0)} calls "
+                "in current UTC day."
+                if operations_status == "OK"
+                else "Operations analytics source unavailable; Chief AI health "
+                "cannot be inferred from a zero call count."
+            ),
         },
         {
             "source": "O’Pip journeys",
@@ -1024,8 +1044,11 @@ def build_evolution_dashboard(scope: str = "30d") -> dict[str, Any]:
     )
     try:
         operations = build_operations_summary("today")
-    except Exception:
+        operations["_analytics_status"] = "OK"
+    except Exception as exc:
         operations = {
+            "_analytics_status": "UNAVAILABLE",
+            "_analytics_error": type(exc).__name__,
             "market": {},
             "ai": {},
             "current": {},
