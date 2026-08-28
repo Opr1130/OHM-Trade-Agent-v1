@@ -21,7 +21,10 @@ from app.services.chief_runtime_guard import (
     store_cached_review,
 )
 from app.services.economic_quality_gate import (
+    DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
     MIN_NET_PROFIT,
+    MIN_REWARD_TO_RISK,
+    MIN_TARGET_2_MOVE_PCT,
     PRODUCTION_MAX_CAPITAL_FRACTION,
     evaluate_economic_quality,
 )
@@ -151,7 +154,14 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
             "economic_rejection": economic.rejection_reason,
             "economic_assumed_capital": economic.recommended_capital,
             "economic_validation_leverage": getattr(economic, "leverage", 1.0),
+            "economic_reward_to_risk_2": float(getattr(plan, "reward_to_risk_2", 0.0)),
+            "economic_target_2_move_pct": economic.target_2_move_pct,
             "economic_account_risk_at_stop_pct": getattr(economic, "account_risk_at_stop_pct", 0.0),
+            "economic_max_account_risk_at_stop_pct": (
+                SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT
+                if direction == "SHORT"
+                else DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT
+            ),
             "hypothetical_target_2_net_profit_at_assumed_capital": economic.target_2_net_profit,
         }
     return quality_by_risk_level, viable_any
@@ -188,16 +198,74 @@ def _new_stage_evidence() -> dict:
     }
 
 
+def _economic_binding_constraint(level: dict) -> dict:
+    """Return the numeric policy constraint that actually rejected one plan.
+
+    Economic quality can fail on reward/risk, target move, net profit, or stop
+    exposure. Nearest-miss telemetry must quote the same metric that triggered
+    the rejection rather than assuming net profit was always binding.
+    """
+    rejection = str(level.get("economic_rejection") or "")
+    if rejection.startswith("Reward/risk "):
+        metric = "ECONOMIC_REWARD_TO_RISK"
+        measured = level.get("economic_reward_to_risk_2")
+        threshold = float(MIN_REWARD_TO_RISK)
+        higher_is_better = True
+    elif rejection.startswith("Projected Target 2 move "):
+        metric = "ECONOMIC_TARGET_2_MOVE_PCT"
+        measured = level.get("economic_target_2_move_pct")
+        threshold = float(MIN_TARGET_2_MOVE_PCT)
+        higher_is_better = True
+    elif rejection.startswith("Projected net profit $"):
+        metric = "ECONOMIC_NET_PROFIT_AT_TARGET_2"
+        measured = level.get(
+            "hypothetical_target_2_net_profit_at_assumed_capital"
+        )
+        threshold = float(MIN_NET_PROFIT)
+        higher_is_better = True
+    elif rejection.startswith("stop exposure "):
+        metric = "ECONOMIC_ACCOUNT_RISK_AT_STOP_PCT"
+        measured = level.get("economic_account_risk_at_stop_pct")
+        threshold = level.get("economic_max_account_risk_at_stop_pct")
+        higher_is_better = False
+    else:
+        return {
+            "metric": "ECONOMIC_REJECTION",
+            "measured": None,
+            "threshold": None,
+            "higher_is_better": True,
+            "distance": None,
+        }
+
+    try:
+        measured_value = float(measured)
+        threshold_value = float(threshold)
+    except (TypeError, ValueError):
+        distance = None
+    else:
+        if threshold_value == 0:
+            distance = None
+        else:
+            gap = (measured_value - threshold_value) / abs(threshold_value)
+            distance = gap if higher_is_better else -gap
+
+    return {
+        "metric": metric,
+        "measured": measured,
+        "threshold": threshold,
+        "higher_is_better": higher_is_better,
+        "distance": distance,
+    }
+
+
 def binding_deterministic_constraint(quality_by_risk_level: dict) -> dict:
     """Return the constraint that actually stopped a deterministic screen.
 
-    When no risk level clears the target gate, the target score is what stopped
-    the candidate. When the target gate cleared and only the economics failed,
-    the target score is irrelevant and quoting it would suggest the candidate
-    was comfortably clear when it was not.
-
-    Shared by the Chief prefilter evidence and the O'Pip shadow gate so the two
-    can never disagree about which number was binding.
+    When no risk level clears target quality, the best target score is binding.
+    When target quality clears but economics fails, the metric is derived from
+    the actual economic rejection for that risk level. If multiple target-
+    qualified risk variants fail economics, the closest comparable failing
+    constraint is reported.
     """
     levels = list(quality_by_risk_level.values())
     target_passed = any(
@@ -217,18 +285,38 @@ def binding_deterministic_constraint(quality_by_risk_level: dict) -> dict:
         ),
         default=0.0,
     )
-    if target_passed:
-        metric, measured, threshold = (
-            "ECONOMIC_NET_PROFIT_AT_TARGET_2",
-            best_net_profit,
-            float(MIN_NET_PROFIT),
-        )
+
+    if not target_passed:
+        binding = {
+            "metric": "TARGET_QUALITY_SCORE",
+            "measured": best_target_score,
+            "threshold": float(MIN_QUALIFYING_SCORE),
+            "higher_is_better": True,
+        }
     else:
-        metric, measured, threshold = (
-            "TARGET_QUALITY_SCORE",
-            best_target_score,
-            float(MIN_QUALIFYING_SCORE),
-        )
+        economic_constraints = [
+            _economic_binding_constraint(level)
+            for level in levels
+            if bool(level.get("target_quality_qualified"))
+            and not bool(level.get("economic_qualified"))
+        ]
+        comparable = [
+            item for item in economic_constraints if item.get("distance") is not None
+        ]
+        if comparable:
+            binding = max(comparable, key=lambda item: float(item["distance"]))
+        elif economic_constraints:
+            binding = economic_constraints[0]
+        else:
+            # Defensive fallback: this function is normally called only for a
+            # rejected deterministic screen. Avoid fabricating a threshold.
+            binding = {
+                "metric": "ECONOMIC_REJECTION",
+                "measured": None,
+                "threshold": None,
+                "higher_is_better": True,
+            }
+
     return {
         "target_qualified_any": target_passed,
         "economic_qualified_any": any(
@@ -236,11 +324,11 @@ def binding_deterministic_constraint(quality_by_risk_level: dict) -> dict:
         ),
         "best_target_quality_score": best_target_score,
         "best_economic_net_profit": best_net_profit,
-        "binding_metric": metric,
-        "binding_measured": measured,
-        "binding_threshold": threshold,
+        "binding_metric": binding["metric"],
+        "binding_measured": binding["measured"],
+        "binding_threshold": binding["threshold"],
+        "binding_higher_is_better": bool(binding["higher_is_better"]),
     }
-
 
 def _prefilter_evidence(candidate: MarketSnapshot, quality_by_risk_level: dict) -> dict:
     """Summarise why the deterministic prefilter dropped one finalist.
