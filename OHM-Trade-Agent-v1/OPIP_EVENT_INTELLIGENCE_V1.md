@@ -53,15 +53,19 @@ Existing unified cycle
 Event capture therefore does not depend on the current trading finalist list.
 CryptoPanic is queried for the point-in-time-safe known asset catalog.
 CoinMarketCal reuses safe historical mappings when available and incrementally
-discovers at most one missing mapping per capture by default. Newly discovered
-mappings are written to a Sequence 2-only shadow mapping cache; the existing
-finalist-oriented production cache is read-only to this layer.
+discovers at most one missing mapping per capture by default. Lookup selection
+rotates across unresolved assets so one provider mismatch cannot permanently
+starve later assets. Newly discovered mappings are written to a Sequence 2-only
+shadow mapping cache; the existing finalist-oriented production cache is
+read-only to this layer.
 
 It is scheduled only through the existing unified cycle: Sequence 2 adds no
 second scheduler, queue, service, Redis, Kafka, managed database, or host.
 
-The event observer runs only after existing real lifecycle protection. Provider
-latency or storage failure cannot delay active-position protection.
+The event observer runs only after the current cycle's existing real lifecycle
+protection. Provider I/O uses a bounded timeout (5 seconds by default) and the
+capture path fails open, reducing the risk that shadow evidence collection
+extends far enough to interfere with a subsequent unified-cycle pass.
 
 ## Temporal contract
 
@@ -141,10 +145,16 @@ The canonical model uses:
 - deterministic dedupe key
 - canonical sanitized payload hash
 
-An exact repeated payload has the same `event_id` and is a duplicate.
+An exact repeated provider payload has the same `event_id` and is a duplicate.
+Dedupe uses the provider's own instrument identity where available so later
+canonical identity knowledge cannot manufacture a second logical provider
+event.
 
-The same dedupe key with changed content is a new append-only revision and
-records `revision_of`. Previous evidence is never silently overwritten.
+The same dedupe key with changed provider content is a new append-only revision
+and records `revision_of`. Previous evidence is never silently overwritten.
+Point-in-time asset queries fold visible revisions and return only the latest
+visible revision for each logical event; raw deterministic replay preserves
+the canonical append sequence.
 
 Logical deduplication/revision lineage includes verified archives as well as
 HOT storage.
@@ -199,6 +209,9 @@ is archive-before-compact:
 If archive creation, checksum, verification, or HOT replacement fails, HOT
 evidence is not intentionally deleted. Replay de-duplicates by `event_id` so
 a crash after archive finalization but before HOT compaction remains safe.
+An interrupted trailing JSONL write is quarantined as forensic bytes before the
+invalid tail is truncated, preventing one partial write from permanently
+blocking later archive verification.
 
 Archives are included in deterministic replay and point-in-time reads. Local
 archive lifecycle beyond this foundation is a later storage-maturity concern;
