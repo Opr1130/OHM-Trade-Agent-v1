@@ -70,12 +70,54 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _repair_truncated_tail(path: Path) -> None:
+    """Repair only the final interrupted JSONL write, preserving forensic bytes."""
     if not path.exists() or path.stat().st_size <= 0:
         return
-    with path.open("rb") as reader:
-        reader.seek(-1, os.SEEK_END)
-        if reader.read(1) == b"\n":
-            return
+
+    raw = path.read_bytes()
+    if raw.endswith(b"\n"):
+        return
+
+    last_newline = raw.rfind(b"\n")
+    prefix_end = last_newline + 1 if last_newline >= 0 else 0
+    tail = raw[prefix_end:]
+    try:
+        _parse_event_line(tail + b"\n")
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        quarantine = path.with_name(
+            f"{path.name}.truncated-{stamp}.bin"
+        )
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{quarantine.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(tail)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, quarantine)
+            with path.open("r+b") as handle:
+                handle.truncate(prefix_end)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_dir(path.parent)
+            logger.critical(
+                "Quarantined malformed O'Pip JSONL tail at %s to %s",
+                path,
+                quarantine,
+            )
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+        return
+
+    # The final row was complete JSON but missed only its newline terminator.
     with path.open("ab") as handle:
         handle.write(b"\n")
         handle.flush()
@@ -446,17 +488,26 @@ class EventStore:
         include_archive: bool = True,
     ) -> tuple[OPipEvent, ...]:
         cutoff = require_utc(decision_at, field_name="decision_at")
-        result: list[OPipEvent] = []
+
+        # Fold revisions BEFORE asset matching. If a later visible revision
+        # invalidates or changes identity, an older revision must not remain
+        # attached merely because it used to map to the requested asset.
+        latest_by_dedupe: dict[str, OPipEvent] = {}
         for event in self.iter_events(include_archive=include_archive):
             visible = event.decision_visible_at_utc
             if visible is None or visible > cutoff:
                 continue
+            latest_by_dedupe[event.dedupe_key] = event
+
+        result: list[OPipEvent] = []
+        for event in latest_by_dedupe.values():
             if not include_expired and event.expires_at_utc is not None:
                 if event.expires_at_utc < cutoff:
                     continue
             if not self._matches_asset(event, asset_id):
                 continue
             result.append(event)
+
         result.sort(
             key=lambda item: (
                 item.decision_visible_at_utc
@@ -478,19 +529,12 @@ class EventStore:
             if through is not None
             else None
         )
-        result = [
+        # iter_events is the canonical append order (verified archives then
+        # HOT). Preserve that order rather than re-sorting equal timestamps,
+        # which could invert revision lineage during deterministic replay.
+        return tuple(
             event
             for event in self.iter_events(include_archive=True)
             if event.decision_visible_at_utc is not None
             and (cutoff is None or event.decision_visible_at_utc <= cutoff)
-        ]
-        result.sort(
-            key=lambda item: (
-                item.decision_visible_at_utc
-                or datetime.min.replace(tzinfo=timezone.utc),
-                item.provider,
-                item.dedupe_key,
-                item.event_id,
-            )
         )
-        return tuple(result)
