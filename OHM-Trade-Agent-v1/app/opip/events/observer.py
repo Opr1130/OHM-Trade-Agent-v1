@@ -205,7 +205,12 @@ def _capture_due(
     if previous.tzinfo is None or previous.utcoffset() is None:
         return True
     previous = previous.astimezone(timezone.utc)
-    return (now - previous).total_seconds() >= interval_seconds
+    elapsed = (now - previous).total_seconds()
+    if elapsed < 0:
+        # A future/corrupt cadence timestamp must not suppress evidence
+        # collection indefinitely after a clock correction.
+        return True
+    return elapsed >= interval_seconds
 
 
 def _save_attempt_state(path: Path, now: datetime) -> None:
