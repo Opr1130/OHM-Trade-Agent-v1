@@ -184,6 +184,17 @@ def normalize_cryptopanic_posts(
                 )
             )
             continue
+        if published > ingest + timedelta(minutes=5):
+            failures.append(
+                AdapterFailure(
+                    provider=CRYPTOPANIC,
+                    outcome=IngestOutcome.INVALID_TIMESTAMP,
+                    reason="published_at is materially in the future",
+                    provider_event_id=provider_id,
+                    payload_hash=payload_hash_for_error,
+                )
+            )
+            continue
 
         headline = _string(row.get("title"), limit=500) or "Untitled CryptoPanic news"
         description = _string(row.get("description"), limit=2000)
@@ -208,10 +219,13 @@ def normalize_cryptopanic_posts(
                 identity_kwargs["path"] = identity_registry_path
             identity = resolve_registry_identity(**identity_kwargs)
 
+            # Dedupe against the provider's own instrument identity, not
+            # O'Pip's current canonical mapping. A later identity resolution
+            # must not make the same provider post look like a new event.
             asset_key = (
-                identity.canonical_asset_id
-                or provider_asset_id
+                provider_asset_id
                 or source_symbol
+                or identity.canonical_asset_id
                 or "GLOBAL"
             )
             dedupe = _dedupe_key(
@@ -413,10 +427,12 @@ def normalize_coinmarketcal_events(
                 mapping_by_slug,
                 ingest_time=ingest,
             )
+            # CoinMarketCal slug is the stable provider identity. Keep
+            # dedupe independent of later canonical mapping knowledge.
             asset_key = (
-                identity.canonical_asset_id
-                or identity.provider_asset_id
+                identity.provider_asset_id
                 or identity.source_symbol
+                or identity.canonical_asset_id
                 or "GLOBAL"
             )
             dedupe = _dedupe_key(
