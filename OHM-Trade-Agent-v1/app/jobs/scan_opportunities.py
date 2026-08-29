@@ -91,9 +91,14 @@ def _record_coingecko_health_fail_open(settings, reference_summary, global_conte
             reasons.append(
                 f"{reference_unavailable} reference candidate(s) unavailable"
             )
-        age = getattr(global_context, "age_seconds", None)
-        if isinstance(age, (int, float)) and age > interval * 3:
-            reasons.append("global market context is stale")
+        reference_rate_limited = bool(
+            getattr(reference_summary, "rate_limited", False)
+        )
+        global_rate_limited = bool(
+            getattr(global_context, "rate_limited", False)
+        )
+        if reference_rate_limited or global_rate_limited:
+            reasons.append("one or more CoinGecko requests were rate limited")
 
         if global_available or reference_available:
             store.record_context_success(
@@ -105,13 +110,31 @@ def _record_coingecko_health_fail_open(settings, reference_summary, global_conte
                 degraded_reason="; ".join(reasons) or None,
             )
         else:
+            retry_after_values = [
+                value
+                for value in (
+                    getattr(reference_summary, "retry_after_seconds", None),
+                    getattr(global_context, "retry_after_seconds", None),
+                )
+                if isinstance(value, int)
+            ]
             store.record_unavailable(
                 provider="COINGECKO",
                 checked_at=now,
                 expected_interval_seconds=interval,
                 request_count=2,
+                rate_limited=reference_rate_limited or global_rate_limited,
+                retry_after_seconds=(
+                    max(retry_after_values)
+                    if retry_after_values
+                    else None
+                ),
                 reason="CoinGecko reference and global requests unavailable",
-                error_kind="CoinGeckoAPIError",
+                error_kind=(
+                    getattr(reference_summary, "provider_error_kind", None)
+                    or getattr(global_context, "provider_error_kind", None)
+                    or "CoinGeckoAPIError"
+                ),
             )
     except Exception:
         logger.exception("O'Pip CoinGecko health persistence failed open")
