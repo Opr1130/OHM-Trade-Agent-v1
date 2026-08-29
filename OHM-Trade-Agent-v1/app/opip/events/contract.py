@@ -126,6 +126,7 @@ class OPipEvent:
     dedupe_key: str
     provider: str
     provider_event_id: str | None
+    source_sequence: str | None
     event_class: EventClass
     payload_hash: str
     source_event_time_utc: datetime
@@ -268,6 +269,11 @@ class OPipEvent:
             provider_event_id=(
                 str(payload["provider_event_id"])
                 if payload.get("provider_event_id") is not None
+                else None
+            ),
+            source_sequence=(
+                str(payload["source_sequence"])
+                if payload.get("source_sequence") is not None
                 else None
             ),
             event_class=EventClass(str(payload["event_class"])),
