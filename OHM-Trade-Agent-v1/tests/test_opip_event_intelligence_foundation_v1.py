@@ -382,6 +382,32 @@ def test_point_in_time_inclusion_exclusion_and_expiry(tmp_path):
     )) == 1
 
 
+def test_ambiguous_evidence_never_attaches_by_ticker_only(tmp_path):
+    store = _store(tmp_path)
+    base = _canonical_event()
+    ambiguous = replace(
+        base,
+        event_id=stable_event_id(
+            "TEST:NEWS:ambiguous:SOL",
+            base.payload_hash,
+        ),
+        dedupe_key="TEST:NEWS:ambiguous:SOL",
+        identity=EventIdentity(
+            source_symbol="SOL",
+            source_name="Different Sol",
+            provider_asset_id="different-sol",
+            mapping_status=MappingStatus.AMBIGUOUS,
+            mapping_provenance="test:ambiguous",
+        ),
+    )
+    persisted_at = NOW + timedelta(seconds=2)
+    store.append(ambiguous, persisted_at=persisted_at)
+    assert store.get_visible_events(
+        asset_id="SOL",
+        decision_at=persisted_at,
+    ) == ()
+
+
 def test_archive_before_compact_is_replayable(tmp_path):
     store = _store(tmp_path, max_bytes=10_000_000, keep_lines=2)
     for index in range(4):
