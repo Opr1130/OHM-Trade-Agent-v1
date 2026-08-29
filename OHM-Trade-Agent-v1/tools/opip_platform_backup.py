@@ -50,6 +50,18 @@ def sqlite_online_copy(source: Path, destination: Path) -> None:
             if not result or result[0] != "ok":
                 raise RuntimeError(f"SQLite integrity check failed for {source}")
 
+    # A copied WAL-mode database can materialize transient sidecars beside the
+    # staged destination. They are runtime coordination artifacts, not backup
+    # payload, and must never be archived independently of the online copy.
+    for suffix in SQLITE_TRANSIENT_SUFFIXES:
+        Path(f"{destination}{suffix}").unlink(missing_ok=True)
+
+
+def tar_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    if Path(member.name).name.lower().endswith(SQLITE_TRANSIENT_SUFFIXES):
+        return None
+    return member
+
 
 def copy_data_tree(source: Path, stage_data: Path) -> list[dict]:
     records: list[dict] = []
@@ -135,7 +147,7 @@ def build_backup(source: Path, destination: Path, retention: int) -> Path:
         )
 
         with tarfile.open(archive, "w:gz") as tar:
-            tar.add(stage, arcname=".")
+            tar.add(stage, arcname=".", filter=tar_filter)
 
     checksum = sha256_file(archive)
     checksum_path = archive.with_suffix(archive.suffix + ".sha256")
