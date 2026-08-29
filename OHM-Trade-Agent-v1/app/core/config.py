@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # qualification, ranking, notification, paper admission, or exchange action.
     opip_event_store_enabled: bool = False
     opip_event_ingest_interval_seconds: int = Field(default=300, ge=60, le=3600)
+    # At most one new CoinMarketCal identity lookup per capture by default.
+    # This gradually expands non-finalist coverage without creating a burst of
+    # provider traffic or delaying higher-priority lifecycle work.
+    opip_event_mapping_lookups_per_capture: int = Field(default=1, ge=0, le=4)
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
