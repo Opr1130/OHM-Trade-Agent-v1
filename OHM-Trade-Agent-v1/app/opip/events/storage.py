@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Iterable
 
@@ -435,43 +436,99 @@ class EventStore:
             max(1, int(cold_after_days)) * 86400
         )
         moved = 0
-        for archive in sorted(self.archive_dir.rglob("events-*.jsonl.gz")):
+        for archive in sorted(self.archive_dir.glob("events-*.jsonl.gz")):
             if archive.stat().st_mtime > cutoff:
                 continue
-            verification = self._verify_archive_file(
+            source_verification = self._verify_archive_file(
                 archive,
                 tier="WARM",
-            )
-            year = datetime.fromtimestamp(
-                archive.stat().st_mtime,
-                tz=timezone.utc,
-            ).strftime("%Y")
-            month = datetime.fromtimestamp(
-                archive.stat().st_mtime,
-                tz=timezone.utc,
-            ).strftime("%m")
-            destination_dir = self.cold_archive_dir / year / month
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            destination = destination_dir / archive.name
-            destination_checksum = destination.with_suffix(
-                destination.suffix + ".sha256"
             )
             source_checksum = archive.with_suffix(
                 archive.suffix + ".sha256"
             )
-            if destination.exists() or destination_checksum.exists():
-                raise RuntimeError(
-                    f"cold archive destination already exists: {destination}"
-                )
-            os.replace(archive, destination)
-            os.replace(source_checksum, destination_checksum)
-            _fsync_dir(destination_dir)
-            verification = self._verify_archive_file(
-                destination,
-                tier="COLD",
+            archive_time = datetime.fromtimestamp(
+                archive.stat().st_mtime,
+                tz=timezone.utc,
             )
-            self._update_archive_manifest_locked(verification)
-            moved += 1
+            destination_parent = (
+                self.cold_archive_dir
+                / archive_time.strftime("%Y")
+                / archive_time.strftime("%m")
+            )
+            destination_parent.mkdir(parents=True, exist_ok=True)
+            final_segment = destination_parent / (
+                f"{archive.name}.segment"
+            )
+            final_archive = final_segment / archive.name
+            final_checksum = final_archive.with_suffix(
+                final_archive.suffix + ".sha256"
+            )
+
+            if final_segment.exists():
+                # A prior crash may have completed the COLD copy but failed
+                # before removing WARM. Verify the COLD segment before treating
+                # it as authoritative.
+                verification = self._verify_archive_file(
+                    final_archive,
+                    tier="COLD",
+                )
+                if verification.sha256 != source_verification.sha256:
+                    raise RuntimeError(
+                        f"cold archive collision for {archive.name}"
+                    )
+                self._update_archive_manifest_locked(verification)
+                archive.unlink(missing_ok=True)
+                source_checksum.unlink(missing_ok=True)
+                _fsync_dir(self.archive_dir)
+                moved += 1
+                continue
+
+            temp_segment = Path(
+                tempfile.mkdtemp(
+                    dir=destination_parent,
+                    prefix=f".{archive.name}.",
+                )
+            )
+            try:
+                temp_archive = temp_segment / archive.name
+                temp_checksum = temp_archive.with_suffix(
+                    temp_archive.suffix + ".sha256"
+                )
+                shutil.copy2(archive, temp_archive)
+                shutil.copy2(source_checksum, temp_checksum)
+                with temp_archive.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                with temp_checksum.open("rb") as handle:
+                    os.fsync(handle.fileno())
+
+                copied = self._verify_archive_file(
+                    temp_archive,
+                    tier="COLD",
+                )
+                if copied.sha256 != source_verification.sha256:
+                    raise RuntimeError(
+                        f"cold archive copy mismatch for {archive.name}"
+                    )
+
+                # One directory rename atomically publishes archive+checksum.
+                os.replace(temp_segment, final_segment)
+                _fsync_dir(destination_parent)
+                verification = self._verify_archive_file(
+                    final_archive,
+                    tier="COLD",
+                )
+                self._update_archive_manifest_locked(verification)
+
+                # WARM is removed only after the COLD segment is final,
+                # checksummed, reparsed, and represented in the manifest.
+                archive.unlink(missing_ok=True)
+                source_checksum.unlink(missing_ok=True)
+                _fsync_dir(self.archive_dir)
+                moved += 1
+            except Exception:
+                if temp_segment.exists():
+                    shutil.rmtree(temp_segment, ignore_errors=True)
+                raise
         return moved
 
     def maintain_lifecycle(
