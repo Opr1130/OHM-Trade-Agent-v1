@@ -69,7 +69,11 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
-def _repair_truncated_tail(path: Path) -> None:
+def _repair_truncated_tail(
+    path: Path,
+    *,
+    event_rows: bool = False,
+) -> None:
     """Repair only the final interrupted JSONL write, preserving forensic bytes."""
     if not path.exists() or path.stat().st_size <= 0:
         return
@@ -82,7 +86,10 @@ def _repair_truncated_tail(path: Path) -> None:
     prefix_end = last_newline + 1 if last_newline >= 0 else 0
     tail = raw[prefix_end:]
     try:
-        _parse_event_line(tail + b"\n")
+        if event_rows:
+            _parse_event_line(tail + b"\n")
+        else:
+            _parse_json_object_line(tail + b"\n")
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         quarantine = path.with_name(
@@ -134,14 +141,18 @@ def _reject_json_constant(token: str) -> None:
     raise ValueError(f"non-finite JSON numeric token {token}")
 
 
-def _parse_event_line(line: bytes) -> OPipEvent:
+def _parse_json_object_line(line: bytes) -> dict[str, Any]:
     payload = json.loads(
         line.decode("utf-8"),
         parse_constant=_reject_json_constant,
     )
     if not isinstance(payload, dict):
-        raise ValueError("event JSONL row must be an object")
-    return OPipEvent.from_dict(payload)
+        raise ValueError("JSONL row must be an object")
+    return payload
+
+
+def _parse_event_line(line: bytes) -> OPipEvent:
+    return OPipEvent.from_dict(_parse_json_object_line(line))
 
 
 def _write_atomic_lines(path: Path, lines: Iterable[bytes]) -> None:
@@ -237,7 +248,7 @@ class EventStore:
         self.event_file.parent.mkdir(parents=True, exist_ok=True)
 
         with registry_lock(self.lock_file):
-            _repair_truncated_tail(self.event_file)
+            _repair_truncated_tail(self.event_file, event_rows=True)
             self._ensure_logical_index_locked()
             if event.event_id in self._event_ids:
                 return AppendResult(
