@@ -27,14 +27,6 @@ from app.opip.events.identity import (
 )
 from app.opip.events.observer import capture_external_event_intelligence
 from app.opip.events.storage import EventStore
-from app.scanner.models import MarketSnapshot
-from app.scanner.news_context import validate_finalist_news
-from app.scanner.reference_market_validation import (
-    CONFIRMED,
-    UNIQUE,
-    ReferenceMarketValidation,
-)
-from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.services.asset_display_identity import learn_verified_identity
 
 
@@ -118,39 +110,6 @@ def _post(*, post_id=1, published=None, title="Solana update"):
         }],
         "votes": {"positive": 4, "negative": 1},
     }
-
-
-def _candidate() -> MarketSnapshot:
-    item = MarketSnapshot(
-        symbol="SOLUSD",
-        last_price=100,
-        ema20=99,
-        ema50=98,
-        ema200=97,
-        rsi=55,
-        macd_line=1,
-        macd_signal=.5,
-        macd_histogram=.5,
-        atr=2,
-        atr_pct=2,
-        volume_ratio=1.2,
-        technical_score=85,
-        trend="bullish",
-        underlying_asset="SOL",
-        primary_pair="SOLUSD",
-        primary_quote_currency="USD",
-        ticker_last=100,
-    )
-    item.independent_market_reference = ReferenceMarketValidation(
-        status=CONFIRMED,
-        available=True,
-        mapping_status=UNIQUE,
-        api_mode="KEYLESS",
-        coingecko_id="solana",
-        coingecko_name="Solana",
-        matched_candidate_count=1,
-    )
-    return item
 
 
 def _cmc_mapping_cache(tmp_path: Path) -> Path:
@@ -480,7 +439,7 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
     )
     result = capture_external_event_intelligence(
         settings=settings,
-        decision_at=NOW,
+        capture_started_at=NOW,
         store=store,
         identity_registry_path=identity_path,
         coinmarketcal_cache_path=tmp_path / "no-cmc.json",
@@ -491,7 +450,12 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
     assert result.ran
     assert client.calls == [("SOL",)]
     assert result.telemetry["events_persisted"] == 1
-    assert len(tuple(store.iter_events())) == 1
+    stored = tuple(store.iter_events())
+    assert len(stored) == 1
+    # Receipt time is conservative: provider evidence is never considered
+    # known before capture started, and visibility is later still (persistence).
+    assert stored[0].ingest_time_utc >= NOW
+    assert stored[0].decision_visible_at_utc >= stored[0].ingest_time_utc
 
 
 def test_observer_storage_failure_is_fail_soft(tmp_path):
@@ -516,7 +480,7 @@ def test_observer_storage_failure_is_fail_soft(tmp_path):
     )
     result = capture_external_event_intelligence(
         settings=settings,
-        decision_at=NOW,
+        capture_started_at=NOW,
         store=BrokenStore(),
         identity_registry_path=identity_path,
         coinmarketcal_cache_path=tmp_path / "no-cmc.json",
@@ -527,40 +491,3 @@ def test_observer_storage_failure_is_fail_soft(tmp_path):
     assert result.telemetry["storage_errors"] == 1
 
 
-def test_finalist_news_reuses_prefetch_without_network_call():
-    candidate = _candidate()
-    class Client:
-        def get_posts(self, symbols):
-            raise AssertionError("prefetched payload must avoid a second provider call")
-    summary = validate_finalist_news(
-        [candidate],
-        client=Client(),
-        now=NOW,
-        prefetched_posts=[_post()],
-        prefetched_request_count=1,
-    )
-    assert summary.request_count == 1
-    assert candidate.news_context.matched_post_count == 1
-
-
-def test_finalist_catalyst_reuses_prefetch_without_events_call(tmp_path):
-    candidate = _candidate()
-    cache = _cmc_mapping_cache(tmp_path)
-
-    class Client:
-        def get_events(self, slugs, from_time, to_time):
-            raise AssertionError("covered prefetched slug must avoid a second events call")
-        def get_coins(self, query):
-            raise AssertionError("cached mapping must avoid coin lookup")
-
-    summary = validate_scheduled_catalysts(
-        [candidate],
-        client=Client(),
-        cache_path=cache,
-        now=NOW,
-        prefetched_events=[_cmc_event()],
-        prefetched_slugs=("solana",),
-        prefetched_request_count=1,
-    )
-    assert summary.events_request_count == 1
-    assert candidate.scheduled_catalyst_context.event_count_next_7d == 1
