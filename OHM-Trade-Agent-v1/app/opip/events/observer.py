@@ -332,10 +332,17 @@ def capture_external_event_intelligence(
         getattr(settings, "cryptopanic_api_plan", "developer")
         or "developer"
     )
+    provider_timeout = float(
+        getattr(settings, "opip_event_provider_timeout_seconds", 5.0)
+    )
 
     crypto_posts: list[dict[str, Any]] = []
     if token and symbols:
-        client = cryptopanic_client or CryptoPanicClient(token, plan)
+        client = cryptopanic_client or CryptoPanicClient(
+            token,
+            plan,
+            timeout_seconds=provider_timeout,
+        )
         try:
             for batch_symbols in _chunks(
                 symbols,
@@ -390,7 +397,11 @@ def capture_external_event_intelligence(
         getattr(settings, "coinmarketcal_api_key", "") or ""
     ).strip()
     cmc_client = (
-        coinmarketcal_client or CoinMarketCalClient(api_key)
+        coinmarketcal_client
+        or CoinMarketCalClient(
+            api_key,
+            timeout_seconds=provider_timeout,
+        )
         if api_key
         else None
     )
