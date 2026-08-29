@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # Keep external evidence I/O bounded so a shadow provider cannot occupy
     # enough of the unified-cycle minute to starve the next risk-protection pass.
     opip_event_provider_timeout_seconds: float = Field(default=5.0, ge=1.0, le=10.0)
+    # Verified WARM event segments are promoted to local COLD storage after
+    # this age. COLD is never automatically purged by Event Intelligence.
+    opip_event_cold_after_days: int = Field(default=30, ge=1, le=3650)
     # At most one new CoinMarketCal identity lookup per capture by default.
     # This gradually expands non-finalist coverage without creating a burst of
     # provider traffic or delaying higher-priority lifecycle work.

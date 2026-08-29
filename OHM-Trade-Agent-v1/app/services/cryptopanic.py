@@ -10,7 +10,22 @@ ALLOWED_API_PLANS = {"developer", "growth", "enterprise"}
 
 
 class CryptoPanicAPIError(RuntimeError):
-    """Raised for expected CryptoPanic network/API/response failures."""
+    """Expected CryptoPanic failure with secret-safe health metadata."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def rate_limited(self) -> bool:
+        return self.status_code == 429
 
 
 class CryptoPanicClient:
@@ -46,7 +61,23 @@ class CryptoPanicClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise CryptoPanicAPIError("CryptoPanic posts request failed") from exc
+            status_code = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None
+            )
+            retry_after = None
+            if isinstance(exc, httpx.HTTPStatusError):
+                raw_retry = exc.response.headers.get("Retry-After")
+                try:
+                    retry_after = int(raw_retry) if raw_retry is not None else None
+                except ValueError:
+                    retry_after = None
+            raise CryptoPanicAPIError(
+                "CryptoPanic posts request failed",
+                status_code=status_code,
+                retry_after_seconds=retry_after,
+            ) from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
             raise CryptoPanicAPIError("CryptoPanic posts response was invalid")
         return [item for item in payload["results"] if isinstance(item, dict)]

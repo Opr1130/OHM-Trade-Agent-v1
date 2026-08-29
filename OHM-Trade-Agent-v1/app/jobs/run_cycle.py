@@ -161,6 +161,41 @@ def _run_event_intelligence_fail_open(*, settings) -> None:
         f"normalization={telemetry.get('normalization_errors', 0)}",
         f"storage={telemetry.get('storage_errors', 0)}",
     )
+    try:
+        from app.opip.events.provider_health import ProviderHealthStore
+        from app.opip.events.storage import EventStore
+
+        now = datetime.now(timezone.utc)
+        health_rows = ProviderHealthStore().read_all(as_of=now)
+        print("Provider health:")
+        for item in health_rows:
+            print(
+                f"  {item.provider}={item.state.value}",
+                f"configured={item.configured}",
+                f"failures={item.consecutive_failures}",
+                f"freshness_age={item.freshness_age_seconds if item.freshness_age_seconds is not None else 'N/A'}s",
+                f"last_success={item.last_success_at_utc.isoformat() if item.last_success_at_utc else 'N/A'}",
+                f"reason={item.reason or 'none'}",
+            )
+
+        stats = EventStore().storage_stats()
+        print(
+            "Event storage:",
+            f"hot_bytes={stats.hot_bytes}",
+            f"hot_lines={stats.hot_lines}",
+            f"warm_bytes={stats.warm_archive_bytes}",
+            f"warm_segments={stats.warm_archive_segments}",
+            f"cold_bytes={stats.cold_archive_bytes}",
+            f"cold_segments={stats.cold_archive_segments}",
+            f"dead_letter_bytes={stats.dead_letter_bytes}",
+            f"manifest_segments={stats.manifest_segments}",
+        )
+    except Exception as exc:
+        print(
+            "O'Pip provider-health/storage telemetry unavailable; "
+            "production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _run_cycle_once() -> None:

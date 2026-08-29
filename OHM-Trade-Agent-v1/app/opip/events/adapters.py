@@ -9,11 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
+import re
 from typing import Any, Iterable
 
 from app.opip.events.contract import (
     EventClass,
     EventIdentity,
+    EventProvenance,
+    EventSeverity,
+    EventType,
     IngestOutcome,
     MappingStatus,
     OPipEvent,
@@ -59,6 +63,70 @@ def _string(value: Any, *, limit: int | None = None) -> str | None:
 def _provider_event_id(value: Any) -> str | None:
     text = _string(value, limit=200)
     return text
+
+
+def _news_event_type(headline: str) -> EventType:
+    text = headline.casefold()
+    if re.search(
+        r"\b(hack(?:ed|ing)?|exploit(?:ed|s)?|breach|cyberattack|attack)\b",
+        text,
+    ):
+        return EventType.NEWS_SECURITY
+    if re.search(
+        r"\b(sec|regulator|regulation|lawsuit|court|ban(?:ned)?)\b",
+        text,
+    ):
+        return EventType.NEWS_REGULATORY
+    if re.search(r"\b(listing|delisting)\b|\blisted on\b", text):
+        return EventType.NEWS_LISTING
+    return EventType.NEWS_GENERAL
+
+
+def _news_severity(event_type: EventType) -> EventSeverity:
+    if event_type == EventType.NEWS_SECURITY:
+        return EventSeverity.HIGH
+    if event_type == EventType.NEWS_REGULATORY:
+        return EventSeverity.MEDIUM
+    if event_type == EventType.NEWS_LISTING:
+        return EventSeverity.LOW
+    return EventSeverity.INFO
+
+
+def _catalyst_event_type(
+    headline: str,
+    categories: list[str],
+) -> EventType:
+    text = " ".join([headline, *categories]).casefold()
+    mappings = (
+        (EventType.TOKEN_UNLOCK, ("token unlock", "unlock")),
+        (EventType.MAINNET, ("mainnet",)),
+        (EventType.FORK, ("hard fork", "fork")),
+        (EventType.LISTING, ("listing", "exchange listing")),
+        (EventType.GOVERNANCE, ("governance", "vote")),
+        (EventType.AIRDROP, ("airdrop",)),
+        (EventType.PARTNERSHIP, ("partnership",)),
+    )
+    for event_type, tokens in mappings:
+        if any(token in text for token in tokens):
+            return event_type
+    return EventType.CATALYST_GENERAL
+
+
+def _catalyst_severity(event_type: EventType) -> EventSeverity:
+    if event_type in {
+        EventType.TOKEN_UNLOCK,
+        EventType.MAINNET,
+        EventType.FORK,
+    }:
+        return EventSeverity.MEDIUM
+    if event_type in {
+        EventType.LISTING,
+        EventType.GOVERNANCE,
+        EventType.AIRDROP,
+        EventType.PARTNERSHIP,
+    }:
+        return EventSeverity.LOW
+    return EventSeverity.INFO
 
 
 def _safe_scalar(value: Any) -> bool | int | float | str | None:
@@ -238,6 +306,9 @@ def normalize_cryptopanic_posts(
             )
             canonical_payload = _news_payload(row, instrument)
             payload_hash = stable_payload_hash(canonical_payload)
+            source_payload_hash = stable_payload_hash(row)
+            event_type = _news_event_type(headline)
+            source_reference = source_domain
             events.append(
                 OPipEvent(
                     event_id=stable_event_id(dedupe, payload_hash),
@@ -251,8 +322,19 @@ def normalize_cryptopanic_posts(
                     normalized_at_utc=normalized,
                     identity=identity,
                     headline=headline,
+                    event_type=event_type,
+                    severity=_news_severity(event_type),
+                    provenance=EventProvenance(
+                        provider=CRYPTOPANIC,
+                        provider_event_id=provider_id,
+                        provider_asset_id=provider_asset_id,
+                        source_reference=source_reference,
+                        source_sequence=None,
+                        canonical_payload_hash=payload_hash,
+                        source_payload_hash=source_payload_hash,
+                    ),
                     summary=description,
-                    source_reference=source_domain,
+                    source_reference=source_reference,
                     source_metadata={
                         "kind": _string(row.get("kind"), limit=100),
                         "source_title": _string(source.get("title"), limit=300),
@@ -445,6 +527,22 @@ def normalize_coinmarketcal_events(
             )
             canonical_payload = _catalyst_payload(row, coin)
             payload_hash = stable_payload_hash(canonical_payload)
+            source_payload_hash = stable_payload_hash(row)
+            category_names = [
+                str(item.get("name"))
+                for item in (
+                    row.get("categories")
+                    if isinstance(row.get("categories"), list)
+                    else []
+                )
+                if isinstance(item, dict) and item.get("name")
+            ]
+            event_type = _catalyst_event_type(headline, category_names)
+            source_reference = (
+                f"coinmarketcal:event:{provider_id}"
+                if provider_id
+                else "coinmarketcal:event"
+            )
             numeric = {
                 "impact": _safe_scalar(row.get("impact")),
                 "is_estimated": row.get("isEstimated") is True,
@@ -462,12 +560,19 @@ def normalize_coinmarketcal_events(
                     normalized_at_utc=normalized,
                     identity=identity,
                     headline=headline,
-                    summary=summary,
-                    source_reference=(
-                        f"coinmarketcal:event:{provider_id}"
-                        if provider_id
-                        else "coinmarketcal:event"
+                    event_type=event_type,
+                    severity=_catalyst_severity(event_type),
+                    provenance=EventProvenance(
+                        provider=COINMARKETCAL,
+                        provider_event_id=provider_id,
+                        provider_asset_id=identity.provider_asset_id,
+                        source_reference=source_reference,
+                        source_sequence=None,
+                        canonical_payload_hash=payload_hash,
+                        source_payload_hash=source_payload_hash,
                     ),
+                    summary=summary,
+                    source_reference=source_reference,
                     source_metadata={
                         "date_end": _string(row.get("dateEnd"), limit=100),
                         "date_type": _string(row.get("dateType"), limit=100),
