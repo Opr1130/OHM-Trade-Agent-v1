@@ -140,7 +140,6 @@ class EventStore:
         self._index_loaded = False
         self._event_ids: set[str] = set()
         self._latest_by_dedupe: dict[str, str] = {}
-        self._latest_order_by_dedupe: dict[str, tuple[str, str]] = {}
         self._known_hot_signature: tuple[int, int] | None = None
 
     def _hot_signature(self) -> tuple[int, int] | None:
@@ -149,15 +148,6 @@ class EventStore:
         except FileNotFoundError:
             return None
         return stat.st_mtime_ns, stat.st_size
-
-    @staticmethod
-    def _event_order(event: OPipEvent) -> tuple[str, str]:
-        visible = (
-            event.decision_visible_at_utc
-            or event.persisted_at_utc
-            or event.normalized_at_utc
-        )
-        return visible.isoformat(), event.event_id
 
     def _load_logical_index_locked(self) -> None:
         """Index the complete logical store once, including verified archives.
@@ -168,17 +158,15 @@ class EventStore:
         """
         event_ids: set[str] = set()
         latest_by_dedupe: dict[str, str] = {}
-        latest_order: dict[str, tuple[str, str]] = {}
+        # iter_events preserves canonical append order across finalized
+        # archives followed by HOT. The last observed row for a dedupe key is
+        # therefore its current revision even if two writes share a timestamp.
         for event in self.iter_events(include_archive=True):
             event_ids.add(event.event_id)
-            order = self._event_order(event)
-            if order >= latest_order.get(event.dedupe_key, ("", "")):
-                latest_order[event.dedupe_key] = order
-                latest_by_dedupe[event.dedupe_key] = event.event_id
+            latest_by_dedupe[event.dedupe_key] = event.event_id
 
         self._event_ids = event_ids
         self._latest_by_dedupe = latest_by_dedupe
-        self._latest_order_by_dedupe = latest_order
         self._known_hot_signature = self._hot_signature()
         self._index_loaded = True
 
@@ -238,9 +226,6 @@ class EventStore:
 
             self._event_ids.add(persisted.event_id)
             self._latest_by_dedupe[persisted.dedupe_key] = persisted.event_id
-            self._latest_order_by_dedupe[persisted.dedupe_key] = (
-                self._event_order(persisted)
-            )
 
             # Archive failure must never delete HOT evidence. The event itself
             # has already been durably appended; retention is a separate
