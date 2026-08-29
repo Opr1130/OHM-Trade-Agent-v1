@@ -153,6 +153,8 @@ class OPipEvent:
             value = getattr(self, name)
             if value is not None:
                 require_utc(value, field_name=name)
+        if self.normalized_at_utc < self.ingest_time_utc:
+            raise ValueError("normalized_at_utc cannot precede ingest_time_utc")
         if self.persisted_at_utc is None and self.decision_visible_at_utc is not None:
             raise ValueError(
                 "decision_visible_at_utc cannot exist before successful persistence"
@@ -178,6 +180,8 @@ class OPipEvent:
 
     def with_persistence(self, persisted_at: datetime) -> "OPipEvent":
         persisted = require_utc(persisted_at, field_name="persisted_at_utc")
+        if persisted < self.normalized_at_utc:
+            raise ValueError("persisted_at_utc cannot precede normalized_at_utc")
         visible = max(self.ingest_time_utc, self.normalized_at_utc, persisted)
         return replace(
             self,
