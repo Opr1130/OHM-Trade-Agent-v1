@@ -18,13 +18,39 @@ import json
 from typing import Any
 
 
-SCHEMA_VERSION = 1
-NORMALIZER_VERSION = "opip-event-normalizer-v1"
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
+NORMALIZER_VERSION = "opip-event-normalizer-v2"
+ADAPTER_VERSION = "opip-event-adapter-v2"
 
 
 class EventClass(str, Enum):
     NEWS = "NEWS"
     CATALYST = "CATALYST"
+
+
+class EventType(str, Enum):
+    NEWS_GENERAL = "NEWS_GENERAL"
+    NEWS_LISTING = "NEWS_LISTING"
+    NEWS_REGULATORY = "NEWS_REGULATORY"
+    NEWS_SECURITY = "NEWS_SECURITY"
+    CATALYST_GENERAL = "CATALYST_GENERAL"
+    TOKEN_UNLOCK = "TOKEN_UNLOCK"
+    MAINNET = "MAINNET"
+    FORK = "FORK"
+    LISTING = "LISTING"
+    GOVERNANCE = "GOVERNANCE"
+    AIRDROP = "AIRDROP"
+    PARTNERSHIP = "PARTNERSHIP"
+    OTHER = "OTHER"
+
+
+class EventSeverity(str, Enum):
+    INFO = "INFO"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
 
 
 class MappingStatus(str, Enum):
@@ -98,6 +124,12 @@ class EventIdentity:
     mapping_confidence: float | None = None
     identity_learned_at_utc: datetime | None = None
     mapping_provenance: str | None = None
+    venue: str | None = None
+    venue_symbol: str | None = None
+    instrument_type: str | None = None
+    chain_id: str | None = None
+    contract_address: str | None = None
+    aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.identity_learned_at_utc is not None:
@@ -118,6 +150,29 @@ class EventIdentity:
                 raise ValueError(
                     "UNIQUE identity requires canonical id/name and knowledge time"
                 )
+        if bool(self.chain_id) != bool(self.contract_address):
+            raise ValueError(
+                "on-chain identity requires both chain_id and contract_address"
+            )
+
+
+@dataclass(frozen=True)
+class EventProvenance:
+    provider: str
+    provider_event_id: str | None
+    provider_asset_id: str | None
+    source_reference: str | None
+    source_sequence: str | None
+    raw_payload_hash: str
+    adapter_version: str = ADAPTER_VERSION
+
+    def __post_init__(self) -> None:
+        if not str(self.provider or "").strip():
+            raise ValueError("provenance.provider is required")
+        if not str(self.raw_payload_hash or "").strip():
+            raise ValueError("provenance.raw_payload_hash is required")
+        if not str(self.adapter_version or "").strip():
+            raise ValueError("provenance.adapter_version is required")
 
 
 @dataclass(frozen=True)
@@ -133,6 +188,9 @@ class OPipEvent:
     normalized_at_utc: datetime
     identity: EventIdentity
     headline: str
+    event_type: EventType = EventType.OTHER
+    severity: EventSeverity = EventSeverity.INFO
+    provenance: EventProvenance | None = None
     source_sequence: str | None = None
     summary: str | None = None
     source_reference: str | None = None
@@ -152,10 +210,23 @@ class OPipEvent:
         for name in ("event_id", "dedupe_key", "provider", "payload_hash"):
             if not str(getattr(self, name) or "").strip():
                 raise ValueError(f"{name} is required")
-        if self.schema_version != SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             raise ValueError(
                 f"unsupported O'Pip event schema_version={self.schema_version}"
             )
+        if self.schema_version >= 2 and self.provenance is None:
+            raise ValueError("schema v2 events require canonical provenance")
+        if self.provenance is not None:
+            if self.provenance.provider != self.provider:
+                raise ValueError("event provider must match provenance.provider")
+            if self.provenance.provider_event_id != self.provider_event_id:
+                raise ValueError(
+                    "provider_event_id must match provenance.provider_event_id"
+                )
+            if self.provenance.raw_payload_hash != self.payload_hash:
+                raise ValueError(
+                    "payload_hash must match provenance.raw_payload_hash"
+                )
         if not str(self.normalizer_version or "").strip():
             raise ValueError("normalizer_version is required")
         for name in (
@@ -211,6 +282,8 @@ class OPipEvent:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["event_class"] = self.event_class.value
+        payload["event_type"] = self.event_type.value
+        payload["severity"] = self.severity.value
         payload["identity"]["mapping_status"] = self.identity.mapping_status.value
         for key in (
             "source_event_time_utc",
@@ -224,6 +297,7 @@ class OPipEvent:
         payload["identity"]["identity_learned_at_utc"] = utc_iso(
             self.identity.identity_learned_at_utc
         )
+        payload["identity"]["aliases"] = list(self.identity.aliases)
         payload["warnings"] = list(self.warnings)
         return payload
 
@@ -247,6 +321,16 @@ class OPipEvent:
                 field_name="identity.identity_learned_at_utc",
             ),
             mapping_provenance=identity_raw.get("mapping_provenance"),
+            venue=identity_raw.get("venue"),
+            venue_symbol=identity_raw.get("venue_symbol"),
+            instrument_type=identity_raw.get("instrument_type"),
+            chain_id=identity_raw.get("chain_id"),
+            contract_address=identity_raw.get("contract_address"),
+            aliases=tuple(
+                str(item)
+                for item in (identity_raw.get("aliases") or [])
+                if str(item).strip()
+            ),
         )
         source_event_time = parse_utc(
             payload["source_event_time_utc"],
@@ -262,6 +346,46 @@ class OPipEvent:
         )
         if source_event_time is None or ingest_time is None or normalized_at is None:
             raise ValueError("required event timestamps cannot be null")
+        schema_version = int(
+            payload["schema_version"]
+            if "schema_version" in payload
+            else 1
+        )
+        provenance_raw = payload.get("provenance")
+        provenance = None
+        if isinstance(provenance_raw, dict):
+            provenance = EventProvenance(
+                provider=str(provenance_raw.get("provider") or payload["provider"]),
+                provider_event_id=(
+                    str(provenance_raw["provider_event_id"])
+                    if provenance_raw.get("provider_event_id") is not None
+                    else None
+                ),
+                provider_asset_id=(
+                    str(provenance_raw["provider_asset_id"])
+                    if provenance_raw.get("provider_asset_id") is not None
+                    else None
+                ),
+                source_reference=(
+                    str(provenance_raw["source_reference"])
+                    if provenance_raw.get("source_reference") is not None
+                    else None
+                ),
+                source_sequence=(
+                    str(provenance_raw["source_sequence"])
+                    if provenance_raw.get("source_sequence") is not None
+                    else None
+                ),
+                raw_payload_hash=str(
+                    provenance_raw.get("raw_payload_hash")
+                    or payload["payload_hash"]
+                ),
+                adapter_version=str(
+                    provenance_raw.get("adapter_version")
+                    or ADAPTER_VERSION
+                ),
+            )
+
         return cls(
             event_id=str(payload["event_id"]),
             dedupe_key=str(payload["dedupe_key"]),
@@ -283,6 +407,20 @@ class OPipEvent:
             normalized_at_utc=normalized_at,
             identity=identity,
             headline=str(payload.get("headline") or ""),
+            event_type=EventType(
+                str(
+                    payload.get("event_type")
+                    or (
+                        EventType.NEWS_GENERAL.value
+                        if str(payload.get("event_class")) == EventClass.NEWS.value
+                        else EventType.CATALYST_GENERAL.value
+                    )
+                )
+            ),
+            severity=EventSeverity(
+                str(payload.get("severity") or EventSeverity.INFO.value)
+            ),
+            provenance=provenance,
             summary=(
                 str(payload["summary"]) if payload.get("summary") is not None else None
             ),
@@ -319,11 +457,7 @@ class OPipEvent:
                 if payload.get("revision_of") is not None
                 else None
             ),
-            schema_version=int(
-                payload["schema_version"]
-                if "schema_version" in payload
-                else SCHEMA_VERSION
-            ),
+            schema_version=schema_version,
             normalizer_version=str(
                 payload["normalizer_version"]
                 if "normalizer_version" in payload
