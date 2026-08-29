@@ -34,6 +34,9 @@ LOCK_FILE = EVENT_DIR / ".events.lock"
 
 EVENTS_MAX_BYTES = 32 * 1024 * 1024
 EVENTS_KEEP_LINES = 100_000
+# Compact to 80% of the line cap rather than exactly the cap. Otherwise a
+# full HOT file would create one tiny gzip archive on every subsequent append.
+HOT_COMPACTION_FRACTION = 0.80
 DEAD_LETTER_MAX_BYTES = 4 * 1024 * 1024
 DEAD_LETTER_KEEP_LINES = 2_000
 
@@ -221,7 +224,13 @@ class EventStore:
             return None
 
         if len(lines) > self.keep_lines:
-            keep_count = self.keep_lines
+            keep_count = max(
+                1,
+                min(
+                    self.keep_lines,
+                    int(self.keep_lines * HOT_COMPACTION_FRACTION),
+                ),
+            )
         else:
             # Byte pressure with fewer than keep_lines: archive the oldest half
             # so the next append does not immediately trigger another rotation.
