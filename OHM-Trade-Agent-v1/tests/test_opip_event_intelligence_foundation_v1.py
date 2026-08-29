@@ -157,6 +157,20 @@ def _cmc_event(event_id=9):
     }
 
 
+def test_unique_identity_requires_canonical_identity_and_knowledge_time():
+    with pytest.raises(ValueError, match="UNIQUE identity requires"):
+        EventIdentity(mapping_status=MappingStatus.UNIQUE)
+
+
+def test_event_contract_rejects_explicit_unsupported_schema_version():
+    payload = _canonical_event().with_persistence(
+        NOW + timedelta(seconds=2)
+    ).to_dict()
+    payload["schema_version"] = 0
+    with pytest.raises(ValueError, match="unsupported O'Pip event schema_version=0"):
+        OPipEvent.from_dict(payload)
+
+
 def test_event_contract_rejects_naive_time():
     with pytest.raises(ValueError, match="timezone-aware UTC"):
         replace(_canonical_event(), ingest_time_utc=datetime(2026, 8, 29, 5, 0))
@@ -657,6 +671,22 @@ def test_reopened_store_deduplicates_and_revises_against_archive(tmp_path):
     assert revised.outcome.value == "REVISION"
     assert revised.event is not None
     assert revised.event.revision_of == original.event_id
+
+
+def test_nonfinite_json_event_row_is_rejected_from_replay(tmp_path):
+    store = _store(tmp_path)
+    store.event_file.parent.mkdir(parents=True, exist_ok=True)
+    store.event_file.write_text(
+        '{"event_id":"bad","dedupe_key":"bad","provider":"TEST",'
+        '"provider_event_id":"bad","event_class":"NEWS",'
+        '"payload_hash":"bad","source_event_time_utc":"2026-08-29T05:00:00+00:00",'
+        '"ingest_time_utc":"2026-08-29T05:00:00+00:00",'
+        '"normalized_at_utc":"2026-08-29T05:00:00+00:00",'
+        '"identity":{"mapping_status":"UNKNOWN"},'
+        '"headline":"bad","numeric":{"x":NaN}}\n',
+        encoding="utf-8",
+    )
+    assert store.replay_events() == ()
 
 
 def test_interrupted_jsonl_tail_is_quarantined_before_next_append(tmp_path):
