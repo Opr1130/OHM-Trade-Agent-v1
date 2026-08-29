@@ -114,7 +114,8 @@ def _event(key: str, *, ingest: datetime = NOW) -> OPipEvent:
             provider_asset_id="solana",
             source_reference="test",
             source_sequence=None,
-            raw_payload_hash=payload_hash,
+            canonical_payload_hash=payload_hash,
+            source_payload_hash=payload_hash,
         ),
         expires_at_utc=ingest + timedelta(hours=24),
     )
@@ -149,7 +150,8 @@ def test_cryptopanic_emits_canonical_type_severity_and_provenance(tmp_path):
     assert event.provenance is not None
     assert event.provenance.provider == "CRYPTOPANIC"
     assert event.provenance.provider_event_id == "1"
-    assert event.provenance.raw_payload_hash == event.payload_hash
+    assert event.provenance.canonical_payload_hash == event.payload_hash
+    assert event.provenance.source_payload_hash
     assert event.schema_version == 2
 
 
