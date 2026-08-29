@@ -2,8 +2,13 @@
 
 ## Status
 
-Sequence 2 foundation. Shadow / evidence-only. Dark by default with
-`OPIP_EVENT_STORE_ENABLED=false`.
+Sequence 2 foundation. Shadow / evidence-only.
+
+The application-level default remains dark with
+`OPIP_EVENT_STORE_ENABLED=false`. Production Docker Compose explicitly
+overrides that setting to `true` for approved shadow evidence collection.
+The event store still has no authority over qualification, ranking, alerts,
+paper admission, or exchange actions.
 
 This layer cannot qualify, rank, notify, admit paper trades, or execute orders.
 The existing production decision path does not read the event store in v1.

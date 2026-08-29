@@ -35,6 +35,11 @@ services:
         condition: service_started
     env_file:
       - .env
+    environment:
+      # O'Pip Sequence 2 production shadow activation.
+      # Evidence collection only; the event store is not consumed by
+      # qualification, ranking, alerts, paper admission, or exchange actions.
+      OPIP_EVENT_STORE_ENABLED: "true"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
