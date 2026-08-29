@@ -107,9 +107,12 @@ def _run_paper_monitor_fail_open() -> None:
 def _run_event_intelligence_fail_open(*, settings) -> None:
     """Run O'Pip external-event capture after every real protection workflow.
 
-    Sequence 2 is evidence-only.  It has its own bounded cadence, does not
+    Sequence 2 is evidence-only. It has its own bounded cadence, does not
     participate in qualification/ranking, and cannot block the unified cycle.
     """
+    if not bool(getattr(settings, "opip_event_store_enabled", False)):
+        return
+
     try:
         from app.opip.events.observer import capture_external_event_intelligence
 
