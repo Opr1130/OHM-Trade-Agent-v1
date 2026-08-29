@@ -137,18 +137,57 @@ class EventStore:
         self.keep_lines = int(keep_lines)
         if self.max_bytes < 1 or self.keep_lines < 1:
             raise ValueError("event retention limits must be positive")
+        self._index_loaded = False
+        self._event_ids: set[str] = set()
+        self._latest_by_dedupe: dict[str, str] = {}
+        self._latest_order_by_dedupe: dict[str, tuple[str, str]] = {}
+        self._known_hot_signature: tuple[int, int] | None = None
 
-    def _hot_index(self) -> tuple[set[str], dict[str, str]]:
+    def _hot_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.event_file.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    @staticmethod
+    def _event_order(event: OPipEvent) -> tuple[str, str]:
+        visible = (
+            event.decision_visible_at_utc
+            or event.persisted_at_utc
+            or event.normalized_at_utc
+        )
+        return visible.isoformat(), event.event_id
+
+    def _load_logical_index_locked(self) -> None:
+        """Index the complete logical store once, including verified archives.
+
+        Subsequent appends are O(1). If another process changes HOT between
+        appends, the file signature invalidates this cache under the same
+        cross-process writer lock.
+        """
         event_ids: set[str] = set()
         latest_by_dedupe: dict[str, str] = {}
-        for line in _read_lines(self.event_file):
-            try:
-                event = _parse_event_line(line)
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                continue
+        latest_order: dict[str, tuple[str, str]] = {}
+        for event in self.iter_events(include_archive=True):
             event_ids.add(event.event_id)
-            latest_by_dedupe[event.dedupe_key] = event.event_id
-        return event_ids, latest_by_dedupe
+            order = self._event_order(event)
+            if order >= latest_order.get(event.dedupe_key, ("", "")):
+                latest_order[event.dedupe_key] = order
+                latest_by_dedupe[event.dedupe_key] = event.event_id
+
+        self._event_ids = event_ids
+        self._latest_by_dedupe = latest_by_dedupe
+        self._latest_order_by_dedupe = latest_order
+        self._known_hot_signature = self._hot_signature()
+        self._index_loaded = True
+
+    def _ensure_logical_index_locked(self) -> None:
+        if (
+            not self._index_loaded
+            or self._known_hot_signature != self._hot_signature()
+        ):
+            self._load_logical_index_locked()
 
     def append(
         self,
@@ -162,15 +201,15 @@ class EventStore:
 
         with registry_lock(self.lock_file):
             _repair_truncated_tail(self.event_file)
-            event_ids, latest_by_dedupe = self._hot_index()
-            if event.event_id in event_ids:
+            self._ensure_logical_index_locked()
+            if event.event_id in self._event_ids:
                 return AppendResult(
                     outcome=IngestOutcome.DUPLICATE,
                     event=None,
                     existing_event_id=event.event_id,
                 )
 
-            previous = latest_by_dedupe.get(event.dedupe_key)
+            previous = self._latest_by_dedupe.get(event.dedupe_key)
             outcome = IngestOutcome.NORMALIZED
             candidate = event
             if previous and previous != event.event_id:
@@ -197,6 +236,12 @@ class EventStore:
                 handle.flush()
                 os.fsync(handle.fileno())
 
+            self._event_ids.add(persisted.event_id)
+            self._latest_by_dedupe[persisted.dedupe_key] = persisted.event_id
+            self._latest_order_by_dedupe[persisted.dedupe_key] = (
+                self._event_order(persisted)
+            )
+
             # Archive failure must never delete HOT evidence. The event itself
             # has already been durably appended; retention is a separate
             # fail-safe maintenance concern.
@@ -207,6 +252,7 @@ class EventStore:
                     "O'Pip event archive/compaction failed; HOT evidence preserved"
                 )
 
+            self._known_hot_signature = self._hot_signature()
             return AppendResult(
                 outcome=outcome,
                 event=persisted,
