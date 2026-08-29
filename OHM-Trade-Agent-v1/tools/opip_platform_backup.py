@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
 SKIP_SUFFIXES = {".lock", ".tmp", ".part"}
+SQLITE_TRANSIENT_SUFFIXES = ("-wal", "-shm", "-journal")
 SCHEMA_VERSION = 1
 
 
@@ -32,6 +33,8 @@ def should_skip(relative: Path) -> bool:
         return True
     if relative.suffix.lower() in SKIP_SUFFIXES:
         return True
+    if name.lower().endswith(SQLITE_TRANSIENT_SUFFIXES):
+        return True
     if name.startswith(".") and name.endswith(".swp"):
         return True
     return False
@@ -46,6 +49,18 @@ def sqlite_online_copy(source: Path, destination: Path) -> None:
             result = dst.execute("PRAGMA integrity_check").fetchone()
             if not result or result[0] != "ok":
                 raise RuntimeError(f"SQLite integrity check failed for {source}")
+
+    # A copied WAL-mode database can materialize transient sidecars beside the
+    # staged destination. They are runtime coordination artifacts, not backup
+    # payload, and must never be archived independently of the online copy.
+    for suffix in SQLITE_TRANSIENT_SUFFIXES:
+        Path(f"{destination}{suffix}").unlink(missing_ok=True)
+
+
+def tar_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    if Path(member.name).name.lower().endswith(SQLITE_TRANSIENT_SUFFIXES):
+        return None
+    return member
 
 
 def copy_data_tree(source: Path, stage_data: Path) -> list[dict]:
@@ -123,6 +138,7 @@ def build_backup(source: Path, destination: Path, retention: int) -> Path:
                 "*.tmp",
                 "*.part",
                 "editor swap files",
+                "SQLite transient sidecars (*-wal, *-shm, *-journal)",
             ],
         }
         (stage / "manifest.json").write_text(
@@ -131,7 +147,7 @@ def build_backup(source: Path, destination: Path, retention: int) -> Path:
         )
 
         with tarfile.open(archive, "w:gz") as tar:
-            tar.add(stage, arcname=".")
+            tar.add(stage, arcname=".", filter=tar_filter)
 
     checksum = sha256_file(archive)
     checksum_path = archive.with_suffix(archive.suffix + ".sha256")

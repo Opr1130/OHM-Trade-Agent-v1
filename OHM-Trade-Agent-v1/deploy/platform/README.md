@@ -70,10 +70,10 @@ A critical result exits non-zero. Warnings are reported but do not fail by defau
 Run:
 
 ```bash
-python tools/opip_platform_backup.py --source data --destination /var/backups/opip --retention 14
+python3 tools/opip_platform_backup.py --source data --destination /var/backups/opip --retention 14
 ```
 
-The backup utility never copies `.env`, skips transient lock/temp files, uses SQLite's online backup API for SQLite databases, writes a SHA-256 manifest for every archived file, writes a checksum for the final archive, and prunes only old O'Pip archives beyond the configured retention count.
+The backup utility never copies `.env`, skips transient lock/temp files and live SQLite `-wal`, `-shm`, and `-journal` sidecars, uses SQLite's online backup API for each SQLite database, writes a SHA-256 manifest for every archived file, writes a checksum for the final archive, and prunes only old O'Pip archives beyond the configured retention count.
 
 The resulting archive is a local recovery checkpoint only. It is not disaster recovery because it lives on the same Droplet.
 
@@ -82,7 +82,7 @@ The resulting archive is a local recovery checkpoint only. It is not disaster re
 Run:
 
 ```bash
-python tools/opip_platform_restore_verify.py /var/backups/opip/opip-data-<timestamp>.tar.gz
+python3 tools/opip_platform_restore_verify.py /var/backups/opip/opip-data-<timestamp>.tar.gz
 ```
 
 Verification performs archive checksum verification, safe temporary extraction, per-file hash and size verification, and SQLite `PRAGMA integrity_check`. It never overwrites production data.
