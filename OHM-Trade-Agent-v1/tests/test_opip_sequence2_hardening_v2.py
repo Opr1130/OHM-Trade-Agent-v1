@@ -155,6 +155,17 @@ def test_cryptopanic_emits_canonical_type_severity_and_provenance(tmp_path):
     assert event.schema_version == 2
 
 
+def test_news_event_type_does_not_treat_hackathon_as_security(tmp_path):
+    result = normalize_cryptopanic_posts(
+        [_post(title="Solana hackathon opens applications")],
+        ingest_time=NOW,
+        identity_registry_path=_identity_registry(tmp_path),
+        normalized_at=NOW + timedelta(seconds=1),
+    )
+    assert result.events[0].event_type == EventType.NEWS_GENERAL
+    assert result.events[0].severity == EventSeverity.INFO
+
+
 def test_coinmarketcal_emits_fine_event_type_and_provenance():
     mapping = {
         "symbol": "SOL",
