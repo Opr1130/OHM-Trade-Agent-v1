@@ -394,7 +394,13 @@ def normalize_chain_id(value: str | None) -> str:
 
 
 def normalize_contract_address(value: str | None) -> str:
-    return str(value or "").strip().casefold()
+    raw = str(value or "").strip()
+    # EVM hex addresses are case-insensitive for identity purposes; checksum
+    # casing is presentation/validation metadata. Other chains (for example
+    # Solana base58) may be case-sensitive, so preserve exact casing.
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}", raw):
+        return raw.lower()
+    return raw
 
 
 def _binding_learned_at(
