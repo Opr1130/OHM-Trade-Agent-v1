@@ -117,7 +117,7 @@ def _fingerprint(
 class AlertStateManager:
     """Family-isolated durable transition state. Evaluation and commit are split.
 
-    This two-phase shape lets the observer persist T0 attribution before the
+    This two-phase design lets the observer persist T0 attribution before the
     transition is committed. If T0 persistence fails after an assessment was
     stored, the next cycle sees the same previous alert state and can heal the
     missing T0 without losing the original notification decision.

@@ -527,7 +527,7 @@ def test_exposure_ceiling_is_enforced(tmp_path):
         tmp_path,
         events=[(_event(), NOW - timedelta(minutes=5))],
         exposures=exposures,
-        config=EventRiskShieldConfig(max_exposures=3),
+        config=EventRiskShieldConfig(enabled=True, max_exposures=3),
     )
     assert result.exposures_considered == 3
     assert result.exposures_truncated is True
@@ -599,7 +599,7 @@ def test_event_staleness_and_provider_staleness_are_separate(tmp_path):
             old_ingest + timedelta(seconds=2),
         )],
         exposures=(_exposure(),),
-        config=EventRiskShieldConfig(lookback_seconds=48 * 3600),
+        config=EventRiskShieldConfig(enabled=True, lookback_seconds=48 * 3600),
     )
     assert fresh_event_stale_provider.assessments[0].risk_state is RiskState.EXIT_REVIEW
     assert stale_event_healthy_provider.assessments[0].risk_state is RiskState.WATCH
@@ -623,16 +623,8 @@ def test_t0_record_contains_the_exposure_snapshot_used_by_the_policy(tmp_path):
     record = records[0]
     assessment = result.assessments[0]
     assert record.assessment_id == assessment.assessment_id
-    assert record.exposure_snapshot == {
-        "exposure_id": "OHM-SOL-1",
-        "exposure_family": "REAL_ADVISORY",
-        "exposure_state": "ACTIVE",
-        "direction": "LONG",
-        "pending": False,
-        "status": "active",
-        "canonical_asset_id": "solana",
-        "entry_price": 100.0,
-    }
+    assert record.exposure_snapshot == _exposure().full_snapshot()
+    assert record.policy_input_snapshot["exposure"] == _exposure().evidence_snapshot()
     assert record.input_evidence_hash == assessment.input_evidence_hash
     assert record.entry_price == 100.0
     assert record.position_age_seconds == 3 * 3600
@@ -844,6 +836,7 @@ def test_shield_failure_is_contained_and_reported(tmp_path, capsys):
         config=EventRiskShieldConfig(enabled=True),
         event_store=_store(tmp_path),
         exposure_provider=_explode,
+        health_resolver=lambda provider, at: _healthy(provider),
         storage_root=tmp_path / "risk",
     )
     assert result.available is False

@@ -567,10 +567,8 @@ def test_exposure_families_and_states_are_not_collapsed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         exposure_matcher,
-        "active_real_exposures",
-        lambda **kwargs: (
-            _exposure(),
-        ),
+        "_load_active_real",
+        lambda **kwargs: ([_exposure()], True, []),
     )
     monkeypatch.setattr(
         exposure_matcher,
