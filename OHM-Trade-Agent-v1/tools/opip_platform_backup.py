@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 SQLITE_SUFFIXES = {".sqlite", ".sqlite3", ".db"}
 SKIP_SUFFIXES = {".lock", ".tmp", ".part"}
+SQLITE_TRANSIENT_SUFFIXES = ("-wal", "-shm", "-journal")
 SCHEMA_VERSION = 1
 
 
@@ -31,6 +32,8 @@ def should_skip(relative: Path) -> bool:
     if name == ".env":
         return True
     if relative.suffix.lower() in SKIP_SUFFIXES:
+        return True
+    if name.lower().endswith(SQLITE_TRANSIENT_SUFFIXES):
         return True
     if name.startswith(".") and name.endswith(".swp"):
         return True
@@ -123,6 +126,7 @@ def build_backup(source: Path, destination: Path, retention: int) -> Path:
                 "*.tmp",
                 "*.part",
                 "editor swap files",
+                "SQLite transient sidecars (*-wal, *-shm, *-journal)",
             ],
         }
         (stage / "manifest.json").write_text(
