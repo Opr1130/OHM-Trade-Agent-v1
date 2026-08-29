@@ -255,6 +255,17 @@ def test_provider_health_state_machine_and_freshness(tmp_path):
     assert aged.state == ProviderHealthState.STALE
 
 
+def test_context_provider_success_becomes_stale_when_source_is_old(tmp_path):
+    store = ProviderHealthStore(tmp_path / "health-context.json")
+    snapshot = store.record_context_success(
+        provider="COINGECKO",
+        checked_at=NOW,
+        expected_interval_seconds=300,
+        source_observed_at=NOW - timedelta(minutes=20),
+    )
+    assert snapshot.state == ProviderHealthState.STALE
+
+
 def test_observer_distinguishes_missing_credentials_no_event_and_rate_limit(tmp_path):
     identity = _identity_registry(tmp_path)
     event_store = _store(tmp_path)
@@ -425,6 +436,31 @@ def test_structured_identity_bindings_are_point_in_time_safe(tmp_path):
         onchain.contract_address
         == "So11111111111111111111111111111111111111112"
     )
+
+
+def test_known_asset_cannot_bypass_unverified_structured_identity(tmp_path):
+    path = _identity_registry(tmp_path)
+    wrong_contract = resolve_structured_identity(
+        source_symbol="SOL",
+        source_name="Solana",
+        provider_asset_id="solana",
+        as_of=NOW,
+        chain_id="solana:mainnet",
+        contract_address="Different111111111111111111111111111111111",
+        path=path,
+    )
+    assert wrong_contract.mapping_status == MappingStatus.UNKNOWN
+
+    incomplete = resolve_structured_identity(
+        source_symbol="SOL",
+        source_name="Solana",
+        provider_asset_id="solana",
+        as_of=NOW,
+        chain_id="solana:mainnet",
+        path=path,
+    )
+    assert incomplete.mapping_status == MappingStatus.UNKNOWN
+    assert incomplete.mapping_provenance.endswith("incomplete_onchain_identity")
 
 
 def test_structured_identity_collision_and_text_mentions_fail_closed(tmp_path):
