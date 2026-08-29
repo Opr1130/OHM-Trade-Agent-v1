@@ -344,7 +344,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "USD_READY" in paper_compose
     assert "env_file:" not in paper_compose
     assert "ports:" not in paper_compose
-    assert 'mem_limit: 384m' in paper_compose
+    assert 'mem_limit: 768m' in paper_compose
     assert 'cpus: "0.40"' in paper_compose
     assert "tradesv3.ohm_dry_run_usd.sqlite" in paper_compose
     assert "tradesv3.ohm_dry_run_usdt.sqlite" in paper_compose
