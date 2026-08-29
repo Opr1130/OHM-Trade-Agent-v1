@@ -132,3 +132,14 @@ def test_existing_news_and_catalyst_modules_do_not_depend_on_event_store():
         source = (ROOT / relative).read_text(encoding="utf-8")
         assert "app.opip.events" not in source
         assert "get_visible_events(" not in source
+
+
+
+def test_production_compose_enables_event_intelligence_shadow_only():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    core = compose.split("  ohm-trade-agent:", 1)[1]
+    assert 'OPIP_EVENT_STORE_ENABLED: "true"' in core
+    # Activation is operational only. Code-level default remains dark so
+    # non-production/test contexts do not silently collect provider evidence.
+    settings = Settings(webhook_secret="123456789012")
+    assert settings.opip_event_store_enabled is False
