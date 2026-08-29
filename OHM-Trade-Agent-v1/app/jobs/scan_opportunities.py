@@ -87,51 +87,6 @@ def _paper_trade_enabled_safe() -> bool:
         return False
 
 
-def _capture_event_intelligence(settings, decision_at):
-    """Capture external evidence independently of finalist selection.
-
-    Sequence 2 is shadow-only and fail-soft. A provider, normalization or
-    persistence failure can never abort the production scan.
-    """
-    try:
-        from app.opip.events.observer import capture_external_event_intelligence
-
-        result = capture_external_event_intelligence(
-            settings=settings,
-            decision_at=decision_at,
-        )
-        if result.enabled and result.ran:
-            telemetry = result.telemetry
-            print("===== O'PIP EVENT INTELLIGENCE SHADOW =====")
-            print(
-                "Events:",
-                f"received={telemetry.get('events_received', 0)}",
-                f"normalized={telemetry.get('events_normalized', 0)}",
-                f"persisted={telemetry.get('events_persisted', 0)}",
-                f"duplicates={telemetry.get('duplicates', 0)}",
-                f"revisions={telemetry.get('revisions', 0)}",
-            )
-            print(
-                "Identity:",
-                f"unique={telemetry.get('mapping_unique', 0)}",
-                f"ambiguous={telemetry.get('mapping_ambiguous', 0)}",
-                f"unknown={telemetry.get('mapping_unknown', 0)}",
-            )
-            print(
-                "Failures:",
-                f"provider={telemetry.get('provider_errors', 0)}",
-                f"normalization={telemetry.get('normalization_errors', 0)}",
-                f"storage={telemetry.get('storage_errors', 0)}",
-            )
-        return result
-    except Exception as exc:
-        logger.warning(
-            "O'Pip event intelligence failed open: %s",
-            type(exc).__name__,
-        )
-        return None
-
-
 def _direction_counts(candidates):
     return (
         sum(c.trade_direction == "LONG" for c in candidates),
@@ -601,7 +556,6 @@ def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     decision_at = datetime.now(timezone.utc)
-    event_capture = _capture_event_intelligence(settings, decision_at)
     market_regime = evaluate_market_regime(scan.snapshots)
     local_movement_signals = [
         signal
@@ -843,35 +797,10 @@ def main():
         candidates,
         auth_token=getattr(settings, "cryptopanic_auth_token", None),
         api_plan=getattr(settings, "cryptopanic_api_plan", "developer"),
-        prefetched_posts=(
-            event_capture.cryptopanic_posts
-            if event_capture is not None
-            else None
-        ),
-        prefetched_request_count=(
-            event_capture.cryptopanic_request_count
-            if event_capture is not None
-            else 0
-        ),
     )
     catalyst_summary = validate_scheduled_catalysts(
         candidates,
         api_key=getattr(settings, "coinmarketcal_api_key", None),
-        prefetched_events=(
-            event_capture.coinmarketcal_events
-            if event_capture is not None
-            else None
-        ),
-        prefetched_slugs=(
-            event_capture.coinmarketcal_covered_slugs
-            if event_capture is not None
-            else ()
-        ),
-        prefetched_request_count=(
-            event_capture.coinmarketcal_request_count
-            if event_capture is not None
-            else 0
-        ),
     )
     print("===== OHM NEWS & CATALYSTS =====")
     print(
