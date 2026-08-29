@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.core.config import get_settings
 from app.opip.decision.observer import build_scan_observer
+from app.opip.events.provider_health import ProviderHealthStore
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
@@ -58,6 +59,62 @@ logger = logging.getLogger(__name__)
 # Backwards-compatible test/extension seam. Production default is the new mixed
 # directional selector; existing callers that patch select_candidates still work.
 select_candidates = select_directional_candidates
+
+
+def _record_coingecko_health_fail_open(settings, reference_summary, global_context) -> None:
+    """Persist reference-provider health without affecting scan decisions."""
+    if not bool(getattr(settings, "opip_event_store_enabled", False)):
+        return
+    try:
+        store = ProviderHealthStore()
+        now = datetime.now(timezone.utc)
+        interval = int(
+            getattr(settings, "opip_event_ingest_interval_seconds", 300)
+        )
+        source_observed = now
+        updated_at = getattr(global_context, "updated_at", None)
+        if isinstance(updated_at, int):
+            source_observed = datetime.fromtimestamp(
+                updated_at,
+                tz=timezone.utc,
+            )
+
+        global_available = getattr(global_context, "status", None) == "AVAILABLE"
+        reference_available = int(getattr(reference_summary, "available", 0) or 0)
+        reference_unavailable = int(
+            getattr(reference_summary, "unavailable", 0) or 0
+        )
+        reasons: list[str] = []
+        if not global_available:
+            reasons.append("global market context unavailable")
+        if reference_unavailable:
+            reasons.append(
+                f"{reference_unavailable} reference candidate(s) unavailable"
+            )
+        age = getattr(global_context, "age_seconds", None)
+        if isinstance(age, (int, float)) and age > interval * 3:
+            reasons.append("global market context is stale")
+
+        if global_available or reference_available:
+            store.record_context_success(
+                provider="COINGECKO",
+                checked_at=now,
+                expected_interval_seconds=interval,
+                request_count=2,
+                source_observed_at=source_observed,
+                degraded_reason="; ".join(reasons) or None,
+            )
+        else:
+            store.record_unavailable(
+                provider="COINGECKO",
+                checked_at=now,
+                expected_interval_seconds=interval,
+                request_count=2,
+                reason="CoinGecko reference and global requests unavailable",
+                error_kind="CoinGeckoAPIError",
+            )
+    except Exception:
+        logger.exception("O'Pip CoinGecko health persistence failed open")
 
 
 def _opip_scan_context(scan, technical_candidates: int) -> dict:
@@ -792,6 +849,11 @@ def main():
     print("CoinGeckoGlobal:", coingecko_global.status)
     print("MarketCap24hChange:", coingecko_global.market_cap_change_24h_pct if coingecko_global.market_cap_change_24h_pct is not None else "N/A")
     print("BTCDominance:", coingecko_global.btc_market_cap_percentage if coingecko_global.btc_market_cap_percentage is not None else "N/A")
+    _record_coingecko_health_fail_open(
+        settings,
+        reference_summary,
+        coingecko_global,
+    )
 
     news_summary = validate_finalist_news(
         candidates,
