@@ -214,6 +214,16 @@ def normalize_cryptopanic_posts(
                     headline=headline,
                     summary=description,
                     source_reference=source_domain,
+                    source_metadata={
+                        "kind": _string(row.get("kind"), limit=100),
+                        "source_title": _string(source.get("title"), limit=300),
+                        "source_domain": source_domain,
+                        "instrument": {
+                            "code": source_symbol or None,
+                            "title": source_name,
+                            "slug": provider_asset_id,
+                        },
+                    },
                     numeric={
                         "votes": (
                             dict(row.get("votes"))
@@ -419,6 +429,29 @@ def normalize_coinmarketcal_events(
                         if provider_id
                         else "coinmarketcal:event"
                     ),
+                    source_metadata={
+                        "date_end": _string(row.get("dateEnd"), limit=100),
+                        "date_type": _string(row.get("dateType"), limit=100),
+                        "is_estimated": row.get("isEstimated") is True,
+                        "displayed_date": _string(
+                            row.get("displayedDate"),
+                            limit=300,
+                        ),
+                        "categories": [
+                            _string(item.get("name"), limit=200)
+                            for item in (
+                                row.get("categories")
+                                if isinstance(row.get("categories"), list)
+                                else []
+                            )
+                            if isinstance(item, dict) and _string(item.get("name"), limit=200)
+                        ],
+                        "coin": {
+                            "slug": identity.provider_asset_id,
+                            "name": identity.source_name,
+                            "symbol": identity.source_symbol,
+                        },
+                    },
                     numeric=numeric,
                     expires_at_utc=event_time + timedelta(hours=24),
                 )
