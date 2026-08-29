@@ -27,6 +27,7 @@ from app.opip.events.identity import (
     resolve_registry_identity,
 )
 from app.opip.events.observer import (
+    _capture_due,
     _select_mapping_candidates,
     capture_external_event_intelligence,
 )
@@ -500,6 +501,15 @@ def test_failed_persistence_cannot_be_point_in_time_visible(tmp_path):
     assert event.decision_visible_at_utc is None
 
 
+def test_source_sequence_round_trips_when_provider_supplies_one():
+    event = replace(
+        _canonical_event(),
+        source_sequence="provider-seq-42",
+    ).with_persistence(NOW + timedelta(seconds=2))
+    restored = OPipEvent.from_dict(event.to_dict())
+    assert restored.source_sequence == "provider-seq-42"
+
+
 def test_reopened_store_preserves_schema_and_point_in_time_visibility(tmp_path):
     store = _store(tmp_path)
     persisted_at = NOW + timedelta(seconds=2)
@@ -763,6 +773,23 @@ def test_archive_failure_never_deletes_hot_evidence(tmp_path, monkeypatch):
 
     hot_lines = (tmp_path / "events" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(hot_lines) == 2
+
+
+def test_future_cadence_state_does_not_suppress_capture(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({
+            "last_attempt_at_utc": (
+                NOW + timedelta(hours=1)
+            ).isoformat()
+        }),
+        encoding="utf-8",
+    )
+    assert _capture_due(
+        now=NOW,
+        interval_seconds=300,
+        state_path=state_path,
+    )
 
 
 def test_mapping_lookup_selection_rotates_to_prevent_asset_starvation():
