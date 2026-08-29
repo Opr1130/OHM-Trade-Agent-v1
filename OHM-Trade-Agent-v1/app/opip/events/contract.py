@@ -126,6 +126,9 @@ class OPipEvent:
     headline: str
     summary: str | None = None
     source_reference: str | None = None
+    # Sanitized provider-specific evidence needed for future audit/replay.
+    # Secrets and credentials must never be placed here.
+    source_metadata: dict[str, Any] = field(default_factory=dict)
     numeric: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     expires_at_utc: datetime | None = None
@@ -259,6 +262,11 @@ class OPipEvent:
                 str(payload["source_reference"])
                 if payload.get("source_reference") is not None
                 else None
+            ),
+            source_metadata=(
+                dict(payload.get("source_metadata") or {})
+                if isinstance(payload.get("source_metadata") or {}, dict)
+                else {}
             ),
             numeric=(
                 dict(payload.get("numeric") or {})
