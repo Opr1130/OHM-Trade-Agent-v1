@@ -164,7 +164,7 @@ HOT storage.
 The v1 record includes:
 
 - `event_id`, `dedupe_key`, `schema_version`, `normalizer_version`
-- provider and provider event ID
+- provider, provider event ID, and optional provider source sequence
 - event class (NEWS or CATALYST)
 - payload hash
 - the complete temporal contract
