@@ -235,6 +235,8 @@ def validate_finalist_news(
     api_plan: str = "developer",
     client: CryptoPanicClient | None = None,
     now: datetime | None = None,
+    prefetched_posts: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    prefetched_request_count: int = 0,
 ) -> NewsValidationSummary:
     requested = candidates[:8]
     safely_identified: list[MarketSnapshot] = []
@@ -253,7 +255,7 @@ def validate_finalist_news(
             unresolved=len(requested),
         )
 
-    if client is None and not auth_token:
+    if prefetched_posts is None and client is None and not auth_token:
         for candidate in safely_identified:
             candidate.news_context = unavailable_news(
                 "CryptoPanic authentication token is not configured"
@@ -266,23 +268,31 @@ def validate_finalist_news(
             unresolved=len(requested) - len(safely_identified),
         )
 
-    client = client or CryptoPanicClient(auth_token or "", api_plan)
-    symbols = [candidate_symbol(item) for item in safely_identified]
-    try:
-        posts = client.get_posts(symbols)
-    except CryptoPanicAPIError:
-        for candidate in safely_identified:
-            candidate.news_context = unavailable_news(
-                "CryptoPanic batch request unavailable"
-            )
-    else:
+    request_count = max(0, int(prefetched_request_count))
+    if prefetched_posts is not None:
+        posts = [item for item in prefetched_posts if isinstance(item, dict)]
         for candidate in safely_identified:
             candidate.news_context = evaluate_news_context(candidate, posts, now)
+    else:
+        client = client or CryptoPanicClient(auth_token or "", api_plan)
+        symbols = [candidate_symbol(item) for item in safely_identified]
+        try:
+            posts = client.get_posts(symbols)
+        except CryptoPanicAPIError:
+            for candidate in safely_identified:
+                candidate.news_context = unavailable_news(
+                    "CryptoPanic batch request unavailable"
+                )
+        else:
+            for candidate in safely_identified:
+                candidate.news_context = evaluate_news_context(candidate, posts, now)
+        request_count = 1
+
     contexts = [candidate.news_context for candidate in requested]
     return NewsValidationSummary(
         requested=len(requested),
         available=sum(item is not None and item.status == AVAILABLE for item in contexts),
         unavailable=sum(item is not None and item.status == UNAVAILABLE for item in contexts),
-        request_count=1,
+        request_count=request_count,
         unresolved=sum(item is not None and item.status == UNRESOLVED for item in contexts),
     )
