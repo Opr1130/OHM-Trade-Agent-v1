@@ -120,3 +120,52 @@ def test_paper_sidecar_memory_limit_matches_two_worker_runtime():
     assert "mem_limit: 384m" not in text
     assert 'cpus: "0.40"' in text
     assert "oom_score_adj: 500" in text
+
+
+def test_platform_backup_excludes_sqlite_transient_sidecars(tmp_path):
+    source = tmp_path / "data"
+    source.mkdir()
+
+    db_path = source / "live.sqlite"
+    with sqlite3.connect(db_path) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("create table sample(id integer primary key, value text)")
+        db.execute("insert into sample(value) values ('ok')")
+        db.commit()
+
+        # SQLite WAL-mode sidecars are live runtime artifacts. They must not be
+        # archived independently from the consistent online backup of live.sqlite.
+        (source / "live.sqlite-wal").touch(exist_ok=True)
+        (source / "live.sqlite-shm").touch(exist_ok=True)
+        (source / "live.sqlite-journal").touch(exist_ok=True)
+
+        destination = tmp_path / "backups"
+        subprocess.run(
+            [
+                sys.executable,
+                str(BACKUP),
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    archive = next(destination.glob("opip-data-*.tar.gz"))
+    verified = subprocess.run(
+        [sys.executable, str(VERIFY), str(archive)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "VERIFIED" in verified.stdout
+
+    import tarfile
+    with tarfile.open(archive, "r:gz") as tar:
+        names = set(tar.getnames())
+    assert not any(name.endswith("-wal") for name in names)
+    assert not any(name.endswith("-shm") for name in names)
+    assert not any(name.endswith("-journal") for name in names)
