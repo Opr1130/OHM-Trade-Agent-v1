@@ -42,7 +42,7 @@ Do not resize production from repository automation. Capacity changes require ex
 6. Restore-verification utility.
 7. Backup/restore runbook and acceptance criteria.
 
-Resource memory caps are deliberately deferred until the 2 GB resize and at least one stable baseline window are observed. The current 1 GB host has limited headroom, and an incorrectly low cap would create avoidable OOM risk.
+The production resize to the 2 GB tier exposed a pre-existing paper-sidecar constraint: the two Freqtrade workers shared a 384 MB cgroup limit and repeatedly triggered cgroup OOM kills while the second worker initialized. Sequence 1A therefore raises only that paper-sidecar limit to 768 MB while retaining the existing 0.40 CPU cap and elevated OOM score. Core application memory remains uncapped until a stable post-resize baseline is observed.
 
 ## Platform check
 
@@ -110,5 +110,6 @@ Sequence 1A is complete when:
 - a local backup is created successfully
 - restore verification passes against that backup
 - off-host backup/snapshot policy is confirmed
+- the paper sidecar remains healthy with both USD and USDT workers under the 768 MB cap
 - a rollback/recovery runbook is validated
 - no trading authority, thresholds, or advisory behavior changed

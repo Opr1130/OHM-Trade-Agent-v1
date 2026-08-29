@@ -9,6 +9,7 @@ BACKUP = ROOT / "tools" / "opip_platform_backup.py"
 VERIFY = ROOT / "tools" / "opip_platform_restore_verify.py"
 CHECK = ROOT / "deploy" / "platform" / "opip-platform-check.sh"
 COMPOSE = ROOT / "docker-compose.yml"
+PAPER_COMPOSE = ROOT / "docker-compose.paper.yml"
 
 
 def test_platform_check_script_has_valid_bash_syntax():
@@ -111,3 +112,11 @@ def test_core_compose_has_bounded_logs_process_limits_and_healthcheck():
     assert "healthcheck:" in text
     assert "127.0.0.1:8000/health" in text
     assert "no-new-privileges:true" in text
+
+
+def test_paper_sidecar_memory_limit_matches_two_worker_runtime():
+    text = PAPER_COMPOSE.read_text(encoding="utf-8")
+    assert "mem_limit: 768m" in text
+    assert "mem_limit: 384m" not in text
+    assert 'cpus: "0.40"' in text
+    assert "oom_score_adj: 500" in text
