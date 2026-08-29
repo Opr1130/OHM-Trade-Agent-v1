@@ -398,8 +398,17 @@ class EventStore:
                     for line in handle:
                         if line.strip():
                             yield _parse_event_line(line)
-            except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                logger.exception("Skipping unreadable O'Pip event archive: %s", archive)
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                IndexError,
+                json.JSONDecodeError,
+            ):
+                logger.exception(
+                    "Skipping unreadable O'Pip event archive: %s",
+                    archive,
+                )
 
     def iter_events(self, *, include_archive: bool = True) -> Iterable[OPipEvent]:
         seen: set[str] = set()
