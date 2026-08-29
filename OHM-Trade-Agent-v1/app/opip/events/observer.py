@@ -39,6 +39,10 @@ from app.opip.events.identity import (
     resolve_coinmarketcal_identity_mapping,
     save_event_coinmarketcal_mapping,
 )
+from app.opip.events.provider_health import (
+    ProviderHealthSnapshot,
+    ProviderHealthStore,
+)
 from app.opip.events.storage import EventStore
 from app.services.coinmarketcal import CoinMarketCalAPIError, CoinMarketCalClient
 from app.services.cryptopanic import CryptoPanicAPIError, CryptoPanicClient
@@ -76,10 +80,13 @@ class IngestionTelemetry:
     coinmarketcal_requests: int = 0
     coinmarketcal_mapping_requests: int = 0
     lag_samples_seconds: list[float] | None = None
+    provider_health: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.lag_samples_seconds is None:
             self.lag_samples_seconds = []
+        if self.provider_health is None:
+            self.provider_health = {}
 
     def as_dict(self) -> dict[str, Any]:
         lags = list(self.lag_samples_seconds or [])
@@ -103,6 +110,7 @@ class IngestionTelemetry:
             "lag_min_seconds": min(lags) if lags else None,
             "lag_mean_seconds": mean(lags) if lags else None,
             "lag_max_seconds": max(lags) if lags else None,
+            "provider_health": dict(self.provider_health or {}),
         }
 
 
@@ -221,6 +229,34 @@ def _save_attempt_state(path: Path, now: datetime) -> None:
         save_json_atomic(path, state)
 
 
+def _record_health(
+    telemetry: IngestionTelemetry,
+    writer: Any,
+) -> ProviderHealthSnapshot | None:
+    try:
+        snapshot = writer()
+    except Exception:
+        telemetry.storage_errors += 1
+        logger.exception("O'Pip provider health persistence failed open")
+        return None
+    if telemetry.provider_health is not None:
+        telemetry.provider_health[snapshot.provider] = snapshot.state.value
+    return snapshot
+
+
+def _latest_event_lag_seconds(
+    events: Iterable[Any],
+) -> float | None:
+    rows = list(events)
+    if not rows:
+        return None
+    latest = max(rows, key=lambda item: item.source_event_time_utc)
+    return max(
+        0.0,
+        (latest.ingest_time_utc - latest.source_event_time_utc).total_seconds(),
+    )
+
+
 def _record_adapter_result(
     batch: AdapterBatchResult,
     *,
@@ -301,6 +337,7 @@ def capture_external_event_intelligence(
     state_path: Path = INGEST_STATE_FILE,
     cryptopanic_client: Any | None = None,
     coinmarketcal_client: Any | None = None,
+    health_store: ProviderHealthStore | None = None,
     sleep: Any = time.sleep,
     force: bool = False,
 ) -> ExternalEventCaptureResult:
@@ -333,6 +370,7 @@ def capture_external_event_intelligence(
 
     telemetry = IngestionTelemetry()
     active_store = store or EventStore()
+    active_health = health_store or ProviderHealthStore()
 
     try:
         _save_attempt_state(state_path, capture_started)
@@ -361,7 +399,29 @@ def capture_external_event_intelligence(
     )
 
     crypto_posts: list[dict[str, Any]] = []
-    if token and symbols:
+    crypto_error: CryptoPanicAPIError | None = None
+    crypto_request_succeeded = False
+    if not token:
+        _record_health(
+            telemetry,
+            lambda: active_health.record_missing_credentials(
+                provider="CRYPTOPANIC",
+                checked_at=capture_started,
+                expected_interval_seconds=interval,
+            ),
+        )
+    elif not symbols:
+        _record_health(
+            telemetry,
+            lambda: active_health.record_degraded(
+                provider="CRYPTOPANIC",
+                checked_at=capture_started,
+                expected_interval_seconds=interval,
+                configured=True,
+                reason="no point-in-time-safe asset identities available",
+            ),
+        )
+    else:
         client = cryptopanic_client or CryptoPanicClient(
             token,
             plan,
@@ -377,35 +437,97 @@ def capture_external_event_intelligence(
                 crypto_posts.extend(
                     row for row in rows if isinstance(row, dict)
                 )
-        except CryptoPanicAPIError:
+            crypto_request_succeeded = True
+        except CryptoPanicAPIError as exc:
+            crypto_error = exc
             telemetry.provider_errors += 1
             logger.warning(
                 "O'Pip CryptoPanic event ingestion unavailable"
             )
+            _record_health(
+                telemetry,
+                lambda exc=exc: active_health.record_unavailable(
+                    provider="CRYPTOPANIC",
+                    checked_at=datetime.now(timezone.utc),
+                    expected_interval_seconds=interval,
+                    request_count=telemetry.cryptopanic_requests,
+                    rate_limited=bool(getattr(exc, "rate_limited", False)),
+                    retry_after_seconds=getattr(
+                        exc,
+                        "retry_after_seconds",
+                        None,
+                    ),
+                    error_kind=type(exc).__name__,
+                ),
+            )
 
     telemetry.events_received += len(crypto_posts)
-    if crypto_posts:
-        # Conservative receipt time: all rows in this batch are treated as
-        # known no earlier than completion of provider I/O.
+    if crypto_request_succeeded:
         crypto_ingest_at = datetime.now(timezone.utc)
-        try:
-            batch = normalize_cryptopanic_posts(
-                crypto_posts,
-                ingest_time=crypto_ingest_at,
-                identity_registry_path=identity_registry_path,
-                normalized_at=datetime.now(timezone.utc),
+        crypto_batch: AdapterBatchResult | None = None
+        storage_before = telemetry.storage_errors
+        normalization_before = telemetry.normalization_errors
+        if crypto_posts:
+            try:
+                crypto_batch = normalize_cryptopanic_posts(
+                    crypto_posts,
+                    ingest_time=crypto_ingest_at,
+                    identity_registry_path=identity_registry_path,
+                    normalized_at=datetime.now(timezone.utc),
+                )
+                _record_adapter_result(
+                    crypto_batch,
+                    store=active_store,
+                    telemetry=telemetry,
+                    observed_at=crypto_ingest_at,
+                )
+            except Exception:
+                telemetry.normalization_errors += 1
+                logger.exception(
+                    "O'Pip CryptoPanic event normalization failed open"
+                )
+
+        if crypto_batch is None and crypto_posts:
+            degraded_reason = "normalization failed"
+            crypto_events: tuple[Any, ...] = ()
+        else:
+            crypto_events = crypto_batch.events if crypto_batch is not None else ()
+            reasons: list[str] = []
+            if crypto_batch is not None and crypto_batch.failures:
+                reasons.append("one or more provider rows were malformed")
+            if telemetry.storage_errors > storage_before:
+                reasons.append("one or more event rows failed persistence")
+            if telemetry.normalization_errors > normalization_before:
+                reasons.append("normalization error")
+            degraded_reason = "; ".join(reasons) or None
+
+        stale_count = sum(
+            bool(
+                item.expires_at_utc is not None
+                and item.expires_at_utc < crypto_ingest_at
             )
-            _record_adapter_result(
-                batch,
-                store=active_store,
-                telemetry=telemetry,
-                observed_at=crypto_ingest_at,
-            )
-        except Exception:
-            telemetry.normalization_errors += 1
-            logger.exception(
-                "O'Pip CryptoPanic event normalization failed open"
-            )
+            for item in crypto_events
+        )
+        _record_health(
+            telemetry,
+            lambda: active_health.record_success(
+                provider="CRYPTOPANIC",
+                checked_at=crypto_ingest_at,
+                expected_interval_seconds=interval,
+                request_count=telemetry.cryptopanic_requests,
+                event_source_times=(
+                    item.source_event_time_utc for item in crypto_events
+                ),
+                event_ingest_times=(
+                    item.ingest_time_utc for item in crypto_events
+                ),
+                stale_events=stale_count,
+                degraded_reason=degraded_reason,
+                latest_event_lag_seconds=_latest_event_lag_seconds(
+                    crypto_events
+                ),
+            ),
+        )
 
     mappings = _mappings_for_safe_assets(
         merge_point_in_time_mappings(
@@ -447,6 +569,7 @@ def capture_external_event_intelligence(
         if item.get("symbol") not in mapped_symbols
     ]
     cmc_requests_this_capture = 0
+    cmc_errors: list[CoinMarketCalAPIError] = []
     if cmc_client is not None and lookup_budget > 0:
         for asset in _select_mapping_candidates(
             unresolved_assets,
@@ -460,7 +583,8 @@ def capture_external_event_intelligence(
             cmc_requests_this_capture += 1
             try:
                 rows = cmc_client.get_coins(str(asset["symbol"]))
-            except CoinMarketCalAPIError:
+            except CoinMarketCalAPIError as exc:
+                cmc_errors.append(exc)
                 telemetry.provider_errors += 1
                 logger.warning(
                     "O'Pip CoinMarketCal identity lookup unavailable for %s",
@@ -502,6 +626,7 @@ def capture_external_event_intelligence(
         }
     )
     catalyst_rows: list[dict[str, Any]] = []
+    cmc_event_request_succeeded = False
     if cmc_client is not None and slugs:
         # Pace every CoinMarketCal request, including multiple mapping lookups
         # or multiple event batches, so increasing the bounded lookup budget
@@ -523,15 +648,20 @@ def capture_external_event_intelligence(
                 catalyst_rows.extend(
                     row for row in rows if isinstance(row, dict)
                 )
-        except CoinMarketCalAPIError:
+            cmc_event_request_succeeded = True
+        except CoinMarketCalAPIError as exc:
+            cmc_errors.append(exc)
             telemetry.provider_errors += 1
             logger.warning(
                 "O'Pip CoinMarketCal event ingestion unavailable"
             )
 
     telemetry.events_received += len(catalyst_rows)
+    catalyst_ingest_at = datetime.now(timezone.utc)
+    catalyst_batch: AdapterBatchResult | None = None
+    cmc_storage_before = telemetry.storage_errors
+    cmc_normalization_before = telemetry.normalization_errors
     if catalyst_rows:
-        catalyst_ingest_at = datetime.now(timezone.utc)
         try:
             # Only mappings actually learned by event receipt can resolve this
             # batch; this includes safe legacy mappings and any shadow mapping
@@ -546,14 +676,14 @@ def capture_external_event_intelligence(
                 ),
                 assets,
             )
-            batch = normalize_coinmarketcal_events(
+            catalyst_batch = normalize_coinmarketcal_events(
                 catalyst_rows,
                 ingest_time=catalyst_ingest_at,
                 mappings=visible_mappings,
                 normalized_at=datetime.now(timezone.utc),
             )
             _record_adapter_result(
-                batch,
+                catalyst_batch,
                 store=active_store,
                 telemetry=telemetry,
                 observed_at=catalyst_ingest_at,
@@ -563,6 +693,98 @@ def capture_external_event_intelligence(
             logger.exception(
                 "O'Pip CoinMarketCal event normalization failed open"
             )
+
+    if not api_key:
+        _record_health(
+            telemetry,
+            lambda: active_health.record_missing_credentials(
+                provider="COINMARKETCAL",
+                checked_at=catalyst_ingest_at,
+                expected_interval_seconds=interval,
+            ),
+        )
+    elif not assets:
+        _record_health(
+            telemetry,
+            lambda: active_health.record_degraded(
+                provider="COINMARKETCAL",
+                checked_at=catalyst_ingest_at,
+                expected_interval_seconds=interval,
+                configured=True,
+                reason="no point-in-time-safe asset identities available",
+                request_count=cmc_requests_this_capture,
+            ),
+        )
+    elif cmc_errors and not cmc_event_request_succeeded:
+        last_error = cmc_errors[-1]
+        _record_health(
+            telemetry,
+            lambda last_error=last_error: active_health.record_unavailable(
+                provider="COINMARKETCAL",
+                checked_at=catalyst_ingest_at,
+                expected_interval_seconds=interval,
+                request_count=cmc_requests_this_capture,
+                rate_limited=any(
+                    bool(getattr(item, "rate_limited", False))
+                    for item in cmc_errors
+                ),
+                retry_after_seconds=max(
+                    (
+                        int(item.retry_after_seconds)
+                        for item in cmc_errors
+                        if getattr(item, "retry_after_seconds", None)
+                        is not None
+                    ),
+                    default=None,
+                ),
+                error_kind=type(last_error).__name__,
+            ),
+        )
+    elif not slugs:
+        _record_health(
+            telemetry,
+            lambda: active_health.record_degraded(
+                provider="COINMARKETCAL",
+                checked_at=catalyst_ingest_at,
+                expected_interval_seconds=interval,
+                configured=True,
+                reason="no uniquely resolved CoinMarketCal asset mappings",
+                request_count=cmc_requests_this_capture,
+            ),
+        )
+    else:
+        catalyst_events = (
+            catalyst_batch.events if catalyst_batch is not None else ()
+        )
+        reasons: list[str] = []
+        if cmc_errors:
+            reasons.append("one or more identity mapping requests failed")
+        if catalyst_batch is None and catalyst_rows:
+            reasons.append("normalization failed")
+        elif catalyst_batch is not None and catalyst_batch.failures:
+            reasons.append("one or more provider rows were malformed")
+        if telemetry.storage_errors > cmc_storage_before:
+            reasons.append("one or more event rows failed persistence")
+        if telemetry.normalization_errors > cmc_normalization_before:
+            reasons.append("normalization error")
+        _record_health(
+            telemetry,
+            lambda: active_health.record_success(
+                provider="COINMARKETCAL",
+                checked_at=catalyst_ingest_at,
+                expected_interval_seconds=interval,
+                request_count=cmc_requests_this_capture,
+                event_source_times=(
+                    item.source_event_time_utc for item in catalyst_events
+                ),
+                event_ingest_times=(
+                    item.ingest_time_utc for item in catalyst_events
+                ),
+                stale_events=0,
+                degraded_reason="; ".join(reasons) or None,
+                latest_event_lag_seconds=None,
+            ),
+        )
 
     return ExternalEventCaptureResult(
         enabled=True,
