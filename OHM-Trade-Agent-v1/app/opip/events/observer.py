@@ -370,13 +370,16 @@ def capture_external_event_intelligence(
 
     telemetry = IngestionTelemetry()
     active_store = store or EventStore()
-    active_health = health_store or ProviderHealthStore(
-        (
-            active_store.event_file.parent / "provider_health.json"
-            if store is not None
+    if health_store is not None:
+        active_health = health_store
+    else:
+        event_file = getattr(active_store, "event_file", None)
+        health_path = (
+            event_file.parent / "provider_health.json"
+            if isinstance(event_file, Path)
             else ProviderHealthStore().path
         )
-    )
+        active_health = ProviderHealthStore(health_path)
 
     try:
         _save_attempt_state(state_path, capture_started)
