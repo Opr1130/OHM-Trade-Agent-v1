@@ -51,8 +51,14 @@ Existing unified cycle
 ```
 
 Event capture therefore does not depend on the current trading finalist list.
-It is also scheduled only through the existing unified cycle: Sequence 2 adds
-no second scheduler, queue, service, Redis, Kafka, managed database, or host.
+CryptoPanic is queried for the point-in-time-safe known asset catalog.
+CoinMarketCal reuses safe historical mappings when available and incrementally
+discovers at most one missing mapping per capture by default. Newly discovered
+mappings are written to a Sequence 2-only shadow mapping cache; the existing
+finalist-oriented production cache is read-only to this layer.
+
+It is scheduled only through the existing unified cycle: Sequence 2 adds no
+second scheduler, queue, service, Redis, Kafka, managed database, or host.
 
 The event observer runs only after existing real lifecycle protection. Provider
 latency or storage failure cannot delay active-position protection.
@@ -113,7 +119,14 @@ AMBIGUOUS and UNKNOWN events are retained as evidence, but canonical asset
 queries refuse to attach them merely by matching ticker text.
 
 CoinMarketCal's existing mapping cache already records `resolved_at`; only
-mappings resolved by the capture time are eligible.
+mappings resolved by the capture time are eligible. Sequence 2 may also learn
+the same identity-safe mapping independently into:
+
+`/app/data/opip/events/coinmarketcal_identity_map.json`
+
+That shadow cache uses the same strict symbol plus CoinGecko name/ID matching
+rule and records its own `resolved_at`. It never writes the current production
+finalist mapping cache.
 
 ## Event identity and revisions
 
@@ -204,7 +217,7 @@ Per-capture telemetry includes:
 - UNIQUE / AMBIGUOUS / UNKNOWN mapping counts
 - stale
 - provider / normalization / storage errors
-- provider request counts
+- provider request counts, including bounded CoinMarketCal identity lookups
 - min / mean / max NEWS ingestion lag
 
 Malformed evidence is dead-lettered without storing raw secrets.
