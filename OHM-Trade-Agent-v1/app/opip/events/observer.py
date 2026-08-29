@@ -24,7 +24,12 @@ from app.opip.events.adapters import (
     normalize_coinmarketcal_events,
     normalize_cryptopanic_posts,
 )
-from app.opip.events.contract import IngestOutcome, MappingStatus, require_utc
+from app.opip.events.contract import (
+    IngestOutcome,
+    MappingStatus,
+    parse_utc,
+    require_utc,
+)
 from app.opip.events.identity import (
     ASSET_IDENTITY_REGISTRY,
     COINMARKETCAL_MAPPING_CACHE,
@@ -118,19 +123,42 @@ def _mappings_for_safe_assets(
     assets: Iterable[dict[str, str]],
 ) -> list[dict[str, str]]:
     safe = {
-        str(asset.get("symbol") or ""): str(
-            asset.get("canonical_asset_id") or ""
-        )
+        str(asset.get("symbol") or ""): dict(asset)
         for asset in assets
         if asset.get("symbol") and asset.get("canonical_asset_id")
     }
-    return [
-        dict(item)
-        for item in mappings
-        if str(item.get("symbol") or "") in safe
-        and str(item.get("canonical_asset_id") or "")
-        == safe[str(item.get("symbol") or "")]
-    ]
+    result: list[dict[str, str]] = []
+    for item in mappings:
+        symbol = str(item.get("symbol") or "")
+        asset = safe.get(symbol)
+        if asset is None:
+            continue
+        if str(item.get("canonical_asset_id") or "") != str(
+            asset.get("canonical_asset_id") or ""
+        ):
+            continue
+        try:
+            asset_learned = parse_utc(
+                asset.get("learned_at_utc"),
+                field_name="asset.learned_at_utc",
+            )
+            mapping_learned = parse_utc(
+                item.get("resolved_at_utc"),
+                field_name="mapping.resolved_at_utc",
+            )
+        except ValueError:
+            continue
+        if asset_learned is None or mapping_learned is None:
+            continue
+        row = dict(item)
+        # The combined provider identity was not safe until BOTH the canonical
+        # asset mapping and CoinMarketCal mapping were known.
+        row["identity_visible_at_utc"] = max(
+            asset_learned,
+            mapping_learned,
+        ).isoformat()
+        result.append(row)
+    return result
 
 
 def _read_state(path: Path) -> dict[str, Any]:
