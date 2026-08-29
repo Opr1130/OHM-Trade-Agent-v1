@@ -154,6 +154,25 @@ def test_event_contract_rejects_naive_time():
         replace(_canonical_event(), ingest_time_utc=datetime(2026, 8, 29, 5, 0))
 
 
+def test_event_contract_rejects_normalization_before_ingest():
+    event = _canonical_event()
+    with pytest.raises(ValueError, match="cannot precede"):
+        replace(
+            event,
+            normalized_at_utc=event.ingest_time_utc - timedelta(seconds=1),
+        )
+
+
+def test_event_store_rejects_persistence_before_normalization(tmp_path):
+    store = _store(tmp_path)
+    event = _canonical_event()
+    with pytest.raises(ValueError, match="cannot precede"):
+        store.append(
+            event,
+            persisted_at=event.normalized_at_utc - timedelta(microseconds=1),
+        )
+
+
 def test_event_id_is_deterministic_and_content_revision_changes_id():
     first = _canonical_event(headline="v1")
     same = _canonical_event(headline="v1")
