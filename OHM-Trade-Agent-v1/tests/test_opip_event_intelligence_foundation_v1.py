@@ -557,7 +557,7 @@ def test_reopened_store_preserves_schema_and_point_in_time_visibility(tmp_path):
     persisted_at = NOW + timedelta(seconds=2)
     result = store.append(_canonical_event(), persisted_at=persisted_at)
     assert result.event is not None
-    assert result.event.schema_version == 1
+    assert result.event.schema_version == 2
 
     reopened = _store(tmp_path)
     rows = reopened.get_visible_events(
