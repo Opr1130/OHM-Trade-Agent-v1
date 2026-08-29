@@ -534,17 +534,38 @@ def resolve_structured_identity(
         as_of=cutoff,
         path=path,
     )
-    if base.mapping_status == MappingStatus.UNIQUE:
+    has_venue_identity = bool(
+        str(venue or "").strip() or str(venue_symbol or "").strip()
+    )
+    has_onchain_identity = bool(
+        str(chain_id or "").strip() or str(contract_address or "").strip()
+    )
+    if has_venue_identity and not (
+        str(venue or "").strip() and str(venue_symbol or "").strip()
+    ):
         return EventIdentity(
-            **{
-                **base.__dict__,
-                "venue": str(venue or "").strip().upper() or None,
-                "venue_symbol": str(venue_symbol or "").strip().upper() or None,
-                "instrument_type": str(instrument_type or "").strip().upper() or None,
-                "chain_id": normalize_chain_id(chain_id) or None,
-                "contract_address": normalize_contract_address(contract_address) or None,
-            }
+            source_symbol=source_symbol,
+            source_name=source_name,
+            provider_asset_id=provider_asset_id,
+            mapping_status=MappingStatus.UNKNOWN,
+            mapping_provenance="asset_identity_registry:incomplete_venue_identity",
         )
+    if has_onchain_identity and not (
+        str(chain_id or "").strip() and str(contract_address or "").strip()
+    ):
+        return EventIdentity(
+            source_symbol=source_symbol,
+            source_name=source_name,
+            provider_asset_id=provider_asset_id,
+            mapping_status=MappingStatus.UNKNOWN,
+            mapping_provenance="asset_identity_registry:incomplete_onchain_identity",
+        )
+    if (
+        base.mapping_status == MappingStatus.UNIQUE
+        and not has_venue_identity
+        and not has_onchain_identity
+    ):
+        return base
 
     payload = _safe_payload(path)
     assets = payload.get("assets")
