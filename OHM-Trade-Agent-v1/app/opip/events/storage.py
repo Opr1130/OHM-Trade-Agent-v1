@@ -130,8 +130,15 @@ def _read_lines(path: Path) -> list[bytes]:
     return [line for line in path.read_bytes().splitlines(keepends=True) if line.strip()]
 
 
+def _reject_json_constant(token: str) -> None:
+    raise ValueError(f"non-finite JSON numeric token {token}")
+
+
 def _parse_event_line(line: bytes) -> OPipEvent:
-    payload = json.loads(line.decode("utf-8"))
+    payload = json.loads(
+        line.decode("utf-8"),
+        parse_constant=_reject_json_constant,
+    )
     if not isinstance(payload, dict):
         raise ValueError("event JSONL row must be an object")
     return OPipEvent.from_dict(payload)
