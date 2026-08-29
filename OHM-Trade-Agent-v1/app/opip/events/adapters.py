@@ -309,6 +309,7 @@ def normalize_cryptopanic_posts(
             )
             canonical_payload = _news_payload(row, instrument)
             payload_hash = stable_payload_hash(canonical_payload)
+            source_payload_hash = stable_payload_hash(row)
             event_type = _news_event_type(headline)
             source_reference = source_domain
             events.append(
@@ -332,7 +333,8 @@ def normalize_cryptopanic_posts(
                         provider_asset_id=provider_asset_id,
                         source_reference=source_reference,
                         source_sequence=None,
-                        raw_payload_hash=payload_hash,
+                        canonical_payload_hash=payload_hash,
+                        source_payload_hash=source_payload_hash,
                     ),
                     summary=description,
                     source_reference=source_reference,
@@ -528,6 +530,7 @@ def normalize_coinmarketcal_events(
             )
             canonical_payload = _catalyst_payload(row, coin)
             payload_hash = stable_payload_hash(canonical_payload)
+            source_payload_hash = stable_payload_hash(row)
             category_names = [
                 str(item.get("name"))
                 for item in (
@@ -568,7 +571,8 @@ def normalize_coinmarketcal_events(
                         provider_asset_id=identity.provider_asset_id,
                         source_reference=source_reference,
                         source_sequence=None,
-                        raw_payload_hash=payload_hash,
+                        canonical_payload_hash=payload_hash,
+                        source_payload_hash=source_payload_hash,
                     ),
                     summary=summary,
                     source_reference=source_reference,
