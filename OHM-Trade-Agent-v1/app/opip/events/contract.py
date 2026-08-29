@@ -163,14 +163,17 @@ class EventProvenance:
     provider_asset_id: str | None
     source_reference: str | None
     source_sequence: str | None
-    raw_payload_hash: str
+    canonical_payload_hash: str
+    source_payload_hash: str
     adapter_version: str = ADAPTER_VERSION
 
     def __post_init__(self) -> None:
         if not str(self.provider or "").strip():
             raise ValueError("provenance.provider is required")
-        if not str(self.raw_payload_hash or "").strip():
-            raise ValueError("provenance.raw_payload_hash is required")
+        if not str(self.canonical_payload_hash or "").strip():
+            raise ValueError("provenance.canonical_payload_hash is required")
+        if not str(self.source_payload_hash or "").strip():
+            raise ValueError("provenance.source_payload_hash is required")
         if not str(self.adapter_version or "").strip():
             raise ValueError("provenance.adapter_version is required")
 
@@ -223,9 +226,9 @@ class OPipEvent:
                 raise ValueError(
                     "provider_event_id must match provenance.provider_event_id"
                 )
-            if self.provenance.raw_payload_hash != self.payload_hash:
+            if self.provenance.canonical_payload_hash != self.payload_hash:
                 raise ValueError(
-                    "payload_hash must match provenance.raw_payload_hash"
+                    "payload_hash must match provenance.canonical_payload_hash"
                 )
         if not str(self.normalizer_version or "").strip():
             raise ValueError("normalizer_version is required")
@@ -376,8 +379,14 @@ class OPipEvent:
                     if provenance_raw.get("source_sequence") is not None
                     else None
                 ),
-                raw_payload_hash=str(
-                    provenance_raw.get("raw_payload_hash")
+                canonical_payload_hash=str(
+                    provenance_raw.get("canonical_payload_hash")
+                    or provenance_raw.get("raw_payload_hash")
+                    or payload["payload_hash"]
+                ),
+                source_payload_hash=str(
+                    provenance_raw.get("source_payload_hash")
+                    or provenance_raw.get("raw_payload_hash")
                     or payload["payload_hash"]
                 ),
                 adapter_version=str(
