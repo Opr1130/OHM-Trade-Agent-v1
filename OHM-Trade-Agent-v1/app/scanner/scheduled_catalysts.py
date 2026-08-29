@@ -264,6 +264,9 @@ def validate_scheduled_catalysts(
     cache_path: Path = DEFAULT_MAPPING_CACHE,
     now: datetime | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    prefetched_events: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    prefetched_slugs: tuple[str, ...] = (),
+    prefetched_request_count: int = 0,
 ) -> ScheduledCatalystSummary:
     now = now or datetime.now(timezone.utc)
     requested = candidates[:8]
@@ -281,21 +284,26 @@ def validate_scheduled_catalysts(
                 "identity is ambiguous or unavailable"
             )
             continue
+        cached = _load_cached_mapping(candidate, cache)
+        if cached is not None:
+            resolved[symbol] = cached
+            continue
         if client is None and not api_key:
             candidate.scheduled_catalyst_context = _unavailable(
                 "CoinMarketCal API key is not configured"
             )
             continue
-        cached = _load_cached_mapping(candidate, cache)
-        if cached is not None:
-            resolved[symbol] = cached
-            continue
         unresolved_candidates.append(candidate)
 
-    active_client = client or CoinMarketCalClient(api_key or "")
+    active_client = client or (CoinMarketCalClient(api_key) if api_key else None)
     for index, candidate in enumerate(unresolved_candidates):
         if index:
             sleep(MAPPING_LOOKUP_INTERVAL_SECONDS)
+        if active_client is None:
+            candidate.scheduled_catalyst_context = _unavailable(
+                "CoinMarketCal API key is not configured"
+            )
+            continue
         try:
             rows = active_client.get_coins(candidate_symbol(candidate))
         except CoinMarketCalAPIError:
@@ -326,46 +334,69 @@ def validate_scheduled_catalysts(
             events_request_count=0,
         )
 
-    try:
-        event_rows = active_client.get_events(
-            [item.coinmarketcal_slug for item in resolved.values()],
-            now,
-            now + timedelta(days=7),
-        )
-    except CoinMarketCalAPIError:
-        for candidate in requested:
-            mapping = resolved.get(candidate_symbol(candidate))
-            if mapping is not None:
-                candidate.scheduled_catalyst_context = _unavailable(
-                    "CoinMarketCal events request unavailable",
-                    mapping_status=RESOLVED,
-                    slug=mapping.coinmarketcal_slug,
+    event_rows = [
+        row for row in (prefetched_events or ())
+        if isinstance(row, dict)
+    ]
+    covered_slugs = {str(item) for item in prefetched_slugs if str(item)}
+    required_slugs = {
+        item.coinmarketcal_slug for item in resolved.values()
+        if item.coinmarketcal_slug
+    }
+    missing_slugs = sorted(required_slugs - covered_slugs)
+    failed_slugs: set[str] = set()
+    events_request_count = max(0, int(prefetched_request_count))
+
+    if missing_slugs:
+        if active_client is None:
+            failed_slugs.update(missing_slugs)
+        else:
+            try:
+                fetched_rows = active_client.get_events(
+                    missing_slugs,
+                    now,
+                    now + timedelta(days=7),
                 )
-    else:
-        parsed_events = [parse_scheduled_event(row, now) for row in event_rows]
-        for candidate in requested:
-            mapping = resolved.get(candidate_symbol(candidate))
-            if mapping is None:
-                continue
-            matching = [
-                item
-                for item in parsed_events
-                if mapping.coinmarketcal_slug in item.coin_slugs
-            ]
-            matching.sort(
-                key=lambda item: (
-                    _parse_timestamp(item.date) or datetime.max.replace(tzinfo=timezone.utc)
+            except CoinMarketCalAPIError:
+                failed_slugs.update(missing_slugs)
+            else:
+                event_rows.extend(
+                    row for row in fetched_rows if isinstance(row, dict)
                 )
-            )
-            status = AVAILABLE if matching else NO_UPCOMING_EVENTS
-            candidate.scheduled_catalyst_context = ScheduledCatalystContext(
-                status=status,
+            events_request_count += 1
+
+    parsed_events = [parse_scheduled_event(row, now) for row in event_rows]
+    for candidate in requested:
+        mapping = resolved.get(candidate_symbol(candidate))
+        if mapping is None:
+            continue
+        if mapping.coinmarketcal_slug in failed_slugs:
+            candidate.scheduled_catalyst_context = _unavailable(
+                "CoinMarketCal events request unavailable",
                 mapping_status=RESOLVED,
-                coinmarketcal_slug=mapping.coinmarketcal_slug,
-                event_count_next_7d=len(matching),
-                nearest_event=matching[0] if matching else None,
-                events=tuple(matching[:MAX_CHIEF_CATALYST_ITEMS]),
+                slug=mapping.coinmarketcal_slug,
             )
+            continue
+        matching = [
+            item
+            for item in parsed_events
+            if mapping.coinmarketcal_slug in item.coin_slugs
+        ]
+        matching.sort(
+            key=lambda item: (
+                _parse_timestamp(item.date)
+                or datetime.max.replace(tzinfo=timezone.utc)
+            )
+        )
+        status = AVAILABLE if matching else NO_UPCOMING_EVENTS
+        candidate.scheduled_catalyst_context = ScheduledCatalystContext(
+            status=status,
+            mapping_status=RESOLVED,
+            coinmarketcal_slug=mapping.coinmarketcal_slug,
+            event_count_next_7d=len(matching),
+            nearest_event=matching[0] if matching else None,
+            events=tuple(matching[:MAX_CHIEF_CATALYST_ITEMS]),
+        )
 
     contexts = [item.scheduled_catalyst_context for item in requested]
     return ScheduledCatalystSummary(
@@ -377,5 +408,5 @@ def validate_scheduled_catalysts(
         unresolved=sum(item is not None and item.status == UNRESOLVED for item in contexts),
         unavailable=sum(item is not None and item.status == UNAVAILABLE for item in contexts),
         mapping_lookup_requests=lookup_requests,
-        events_request_count=1,
+        events_request_count=events_request_count,
     )
