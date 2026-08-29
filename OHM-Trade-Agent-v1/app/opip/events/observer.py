@@ -113,6 +113,26 @@ def _chunks(items: list[str], size: int) -> Iterable[list[str]]:
         yield items[index : index + size]
 
 
+def _mappings_for_safe_assets(
+    mappings: Iterable[dict[str, str]],
+    assets: Iterable[dict[str, str]],
+) -> list[dict[str, str]]:
+    safe = {
+        str(asset.get("symbol") or ""): str(
+            asset.get("canonical_asset_id") or ""
+        )
+        for asset in assets
+        if asset.get("symbol") and asset.get("canonical_asset_id")
+    }
+    return [
+        dict(item)
+        for item in mappings
+        if str(item.get("symbol") or "") in safe
+        and str(item.get("canonical_asset_id") or "")
+        == safe[str(item.get("symbol") or "")]
+    ]
+
+
 def _read_state(path: Path) -> dict[str, Any]:
     try:
         payload = load_json(path)
@@ -328,14 +348,15 @@ def capture_external_event_intelligence(
                 "O'Pip CryptoPanic event normalization failed open"
             )
 
-    mappings = list(
+    mappings = _mappings_for_safe_assets(
         merge_point_in_time_mappings(
             as_of=capture_started,
             paths=(
                 coinmarketcal_cache_path,
                 legacy_coinmarketcal_cache_path,
             ),
-        )
+        ),
+        assets,
     )
     api_key = str(
         getattr(settings, "coinmarketcal_api_key", "") or ""
@@ -391,14 +412,15 @@ def capture_external_event_intelligence(
             ):
                 telemetry.storage_errors += 1
                 continue
-            mappings = list(
+            mappings = _mappings_for_safe_assets(
                 merge_point_in_time_mappings(
                     as_of=datetime.now(timezone.utc),
                     paths=(
                         coinmarketcal_cache_path,
                         legacy_coinmarketcal_cache_path,
                     ),
-                )
+                ),
+                assets,
             )
             mapped_symbols.add(str(asset["symbol"]))
 
@@ -443,12 +465,15 @@ def capture_external_event_intelligence(
             # Only mappings actually learned by event receipt can resolve this
             # batch; this includes safe legacy mappings and any shadow mapping
             # learned earlier in this same capture.
-            visible_mappings = merge_point_in_time_mappings(
-                as_of=catalyst_ingest_at,
-                paths=(
-                    coinmarketcal_cache_path,
-                    legacy_coinmarketcal_cache_path,
+            visible_mappings = _mappings_for_safe_assets(
+                merge_point_in_time_mappings(
+                    as_of=catalyst_ingest_at,
+                    paths=(
+                        coinmarketcal_cache_path,
+                        legacy_coinmarketcal_cache_path,
+                    ),
                 ),
+                assets,
             )
             batch = normalize_coinmarketcal_events(
                 catalyst_rows,
