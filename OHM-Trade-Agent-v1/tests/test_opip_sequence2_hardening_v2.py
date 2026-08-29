@@ -408,6 +408,10 @@ def test_structured_identity_bindings_are_point_in_time_safe(tmp_path):
     )
     assert onchain.mapping_status == MappingStatus.UNIQUE
     assert onchain.chain_id == "solana:mainnet"
+    assert (
+        onchain.contract_address
+        == "So11111111111111111111111111111111111111112"
+    )
 
 
 def test_structured_identity_collision_and_text_mentions_fail_closed(tmp_path):
