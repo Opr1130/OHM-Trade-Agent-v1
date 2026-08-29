@@ -673,6 +673,36 @@ def test_reopened_store_deduplicates_and_revises_against_archive(tmp_path):
     assert revised.event.revision_of == original.event_id
 
 
+def test_complete_dead_letter_tail_without_newline_is_preserved(tmp_path):
+    store = _store(tmp_path)
+    store.dead_letter_file.parent.mkdir(parents=True, exist_ok=True)
+    first = {
+        "provider": "TEST",
+        "reason": "first",
+        "observed_at_utc": NOW.isoformat(),
+        "provider_event_id": "1",
+        "payload_hash": "abc",
+    }
+    store.dead_letter_file.write_text(
+        json.dumps(first),
+        encoding="utf-8",
+    )
+    store.record_dead_letter(
+        provider="TEST",
+        reason="second",
+        observed_at=NOW + timedelta(seconds=1),
+        provider_event_id="2",
+        payload_hash="def",
+    )
+    rows = [
+        json.loads(line)
+        for line in store.dead_letter_file.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [row["provider_event_id"] for row in rows] == ["1", "2"]
+
+
 def test_nonfinite_json_event_row_is_rejected_from_replay(tmp_path):
     store = _store(tmp_path)
     store.event_file.parent.mkdir(parents=True, exist_ok=True)
