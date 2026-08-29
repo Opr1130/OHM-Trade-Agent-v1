@@ -16,6 +16,9 @@ from app.opip.events.adapters import (
 from app.opip.events.contract import (
     EventClass,
     EventIdentity,
+    EventProvenance,
+    EventSeverity,
+    EventType,
     MappingStatus,
     OPipEvent,
     stable_event_id,
@@ -23,13 +26,20 @@ from app.opip.events.contract import (
 )
 from app.opip.events.identity import (
     known_unique_assets,
+    learn_identity_binding,
     merge_point_in_time_mappings,
+    resolve_news_mention,
     resolve_registry_identity,
+    resolve_structured_identity,
 )
 from app.opip.events.observer import (
     _capture_due,
     _select_mapping_candidates,
     capture_external_event_intelligence,
+)
+from app.opip.events.provider_health import (
+    ProviderHealthState,
+    ProviderHealthStore,
 )
 from app.opip.events.storage import EventStore
 from app.services.asset_display_identity import (
@@ -87,6 +97,16 @@ def _canonical_event(
         normalized_at_utc=ingest + timedelta(seconds=1),
         identity=identity,
         headline=headline,
+        event_type=EventType.NEWS_GENERAL,
+        severity=EventSeverity.INFO,
+        provenance=EventProvenance(
+            provider="TEST",
+            provider_event_id=event_key,
+            provider_asset_id="solana",
+            source_reference="test",
+            source_sequence=None,
+            raw_payload_hash=payload_hash,
+        ),
         expires_at_utc=ingest + timedelta(hours=24),
     )
 
@@ -170,6 +190,28 @@ def test_event_contract_rejects_explicit_unsupported_schema_version():
     payload["schema_version"] = 0
     with pytest.raises(ValueError, match="unsupported O'Pip event schema_version=0"):
         OPipEvent.from_dict(payload)
+
+
+def test_schema_v1_event_rows_remain_replay_compatible():
+    payload = _canonical_event().with_persistence(
+        NOW + timedelta(seconds=2)
+    ).to_dict()
+    payload["schema_version"] = 1
+    payload["normalizer_version"] = "opip-event-normalizer-v1"
+    payload.pop("event_type", None)
+    payload.pop("severity", None)
+    payload.pop("provenance", None)
+    restored = OPipEvent.from_dict(payload)
+    assert restored.schema_version == 1
+    assert restored.event_type == EventType.NEWS_GENERAL
+    assert restored.severity == EventSeverity.INFO
+    assert restored.provenance is None
+
+
+def test_schema_v2_requires_canonical_provenance():
+    event = _canonical_event()
+    with pytest.raises(ValueError, match="canonical provenance"):
+        replace(event, provenance=None)
 
 
 def test_event_contract_rejects_naive_time():
@@ -523,8 +565,8 @@ def test_reopened_store_preserves_schema_and_point_in_time_visibility(tmp_path):
         decision_at=persisted_at,
     )
     assert len(rows) == 1
-    assert rows[0].schema_version == 1
-    assert rows[0].normalizer_version == "opip-event-normalizer-v1"
+    assert rows[0].schema_version == 2
+    assert rows[0].normalizer_version == "opip-event-normalizer-v2"
 
 
 def test_duplicate_and_revision_semantics(tmp_path):
