@@ -379,6 +379,55 @@ class ProviderHealthStore:
             save_json_atomic(self.path, payload)
         return snapshot
 
+    def record_context_success(
+        self,
+        *,
+        provider: str,
+        checked_at: datetime,
+        expected_interval_seconds: int,
+        request_count: int = 1,
+        source_observed_at: datetime | None = None,
+        degraded_reason: str | None = None,
+    ) -> ProviderHealthSnapshot:
+        """Record non-event context/reference provider health."""
+        now = require_utc(checked_at, field_name="checked_at")
+        observed = (
+            require_utc(source_observed_at, field_name="source_observed_at")
+            if source_observed_at is not None
+            else now
+        )
+        with registry_lock(self.lock_path):
+            payload = self._load_payload()
+            prior = self._existing(payload, provider)
+            age = max(0.0, (now - observed).total_seconds())
+            snapshot = ProviderHealthSnapshot(
+                provider=provider,
+                state=(
+                    ProviderHealthState.DEGRADED
+                    if degraded_reason
+                    else ProviderHealthState.HEALTHY
+                ),
+                checked_at_utc=now,
+                configured=True,
+                expected_interval_seconds=expected_interval_seconds,
+                request_count=max(0, int(request_count)),
+                last_attempt_at_utc=now,
+                last_success_at_utc=now,
+                last_event_ingested_at_utc=(
+                    prior.last_event_ingested_at_utc if prior else None
+                ),
+                last_event_source_time_utc=observed,
+                last_error_at_utc=prior.last_error_at_utc if prior else None,
+                consecutive_failures=0,
+                freshness_age_seconds=age,
+                reason=degraded_reason,
+            )
+            providers = payload.setdefault("providers", {})
+            providers[provider] = snapshot.to_dict()
+            payload["updated_at_utc"] = now.isoformat()
+            save_json_atomic(self.path, payload)
+        return snapshot
+
     def record_degraded(
         self,
         *,
