@@ -387,3 +387,392 @@ def merge_point_in_time_mappings(
                 by_symbol[symbol] = dict(item)
 
     return tuple(by_symbol[key] for key in sorted(by_symbol))
+
+
+def normalize_chain_id(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9:_-]", "", str(value or "").casefold())
+
+
+def normalize_contract_address(value: str | None) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _binding_learned_at(
+    row: dict[str, Any],
+    *,
+    as_of: datetime,
+) -> datetime | None:
+    learned = _learned_at(row)
+    if learned is None or learned > as_of:
+        return None
+    return learned
+
+
+def learn_identity_binding(
+    *,
+    canonical_symbol: str,
+    binding_type: str,
+    learned_at: datetime,
+    path: Path = ASSET_IDENTITY_REGISTRY,
+    alias: str | None = None,
+    venue: str | None = None,
+    venue_symbol: str | None = None,
+    instrument_type: str | None = None,
+    chain_id: str | None = None,
+    contract_address: str | None = None,
+) -> bool:
+    """Attach a verified alias/instrument/contract to an existing asset."""
+    symbol = normalize_symbol(canonical_symbol)
+    learned = require_utc(learned_at, field_name="learned_at")
+    kind = str(binding_type or "").strip().upper()
+    if kind not in {"ALIAS", "VENUE_INSTRUMENT", "ONCHAIN"}:
+        return False
+
+    if kind == "ALIAS":
+        normalized_alias = normalize_symbol(alias)
+        if not normalized_alias:
+            return False
+        binding = {
+            "alias": normalized_alias,
+            "learned_at_utc": learned.isoformat(),
+        }
+        collection = "identity_aliases"
+        unique_key = ("alias",)
+    elif kind == "VENUE_INSTRUMENT":
+        normalized_venue = str(venue or "").strip().upper()
+        normalized_venue_symbol = str(venue_symbol or "").strip().upper()
+        normalized_type = str(instrument_type or "").strip().upper()
+        if not normalized_venue or not normalized_venue_symbol or not normalized_type:
+            return False
+        binding = {
+            "venue": normalized_venue,
+            "venue_symbol": normalized_venue_symbol,
+            "instrument_type": normalized_type,
+            "learned_at_utc": learned.isoformat(),
+        }
+        collection = "venue_instruments"
+        unique_key = ("venue", "venue_symbol", "instrument_type")
+    else:
+        normalized_chain = normalize_chain_id(chain_id)
+        normalized_contract = normalize_contract_address(contract_address)
+        if not normalized_chain or not normalized_contract:
+            return False
+        binding = {
+            "chain_id": normalized_chain,
+            "contract_address": normalized_contract,
+            "learned_at_utc": learned.isoformat(),
+        }
+        collection = "onchain_contracts"
+        unique_key = ("chain_id", "contract_address")
+
+    lock = path.parent / f".{path.name}.lock"
+    try:
+        with registry_lock(lock):
+            payload = _safe_payload(path)
+            assets = payload.get("assets")
+            if not isinstance(assets, dict):
+                return False
+            asset = assets.get(symbol)
+            if not isinstance(asset, dict) or bool(asset.get("ambiguous")):
+                return False
+            if (
+                not str(asset.get("source_id") or "").strip()
+                or not str(asset.get("display_name") or "").strip()
+                or _learned_at(asset) is None
+            ):
+                return False
+
+            rows = asset.get(collection)
+            if not isinstance(rows, list):
+                rows = []
+            for existing in rows:
+                if not isinstance(existing, dict):
+                    continue
+                if all(
+                    str(existing.get(key) or "") == str(binding.get(key) or "")
+                    for key in unique_key
+                ):
+                    existing_learned = _learned_at(existing)
+                    if existing_learned is None or learned < existing_learned:
+                        existing["learned_at_utc"] = learned.isoformat()
+                        save_json_atomic(path, payload)
+                    return True
+
+            rows.append(binding)
+            asset[collection] = rows
+            save_json_atomic(path, payload)
+        return True
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+
+
+def resolve_structured_identity(
+    *,
+    as_of: datetime,
+    source_symbol: str | None = None,
+    source_name: str | None = None,
+    provider_asset_id: str | None = None,
+    venue: str | None = None,
+    venue_symbol: str | None = None,
+    instrument_type: str | None = None,
+    chain_id: str | None = None,
+    contract_address: str | None = None,
+    path: Path = ASSET_IDENTITY_REGISTRY,
+) -> EventIdentity:
+    """Resolve timestamped aliases, venue instruments, or on-chain contracts."""
+    cutoff = require_utc(as_of, field_name="as_of")
+    base = resolve_registry_identity(
+        source_symbol=source_symbol,
+        source_name=source_name,
+        provider_asset_id=provider_asset_id,
+        as_of=cutoff,
+        path=path,
+    )
+    if base.mapping_status == MappingStatus.UNIQUE:
+        return EventIdentity(
+            **{
+                **base.__dict__,
+                "venue": str(venue or "").strip().upper() or None,
+                "venue_symbol": str(venue_symbol or "").strip().upper() or None,
+                "instrument_type": str(instrument_type or "").strip().upper() or None,
+                "chain_id": normalize_chain_id(chain_id) or None,
+                "contract_address": normalize_contract_address(contract_address) or None,
+            }
+        )
+
+    payload = _safe_payload(path)
+    assets = payload.get("assets")
+    if not isinstance(assets, dict):
+        return base
+
+    wanted_alias = normalize_symbol(source_symbol)
+    wanted_venue = str(venue or "").strip().upper()
+    wanted_venue_symbol = str(venue_symbol or "").strip().upper()
+    wanted_instrument_type = str(instrument_type or "").strip().upper()
+    wanted_chain = normalize_chain_id(chain_id)
+    wanted_contract = normalize_contract_address(contract_address)
+
+    matches: list[tuple[str, dict[str, Any], datetime, str]] = []
+    for raw_symbol, asset in assets.items():
+        if not isinstance(asset, dict) or bool(asset.get("ambiguous")):
+            continue
+        asset_learned = _binding_learned_at(asset, as_of=cutoff)
+        if asset_learned is None:
+            continue
+        canonical_id = str(asset.get("source_id") or "").strip()
+        canonical_name = str(asset.get("display_name") or "").strip()
+        if not canonical_id or not canonical_name:
+            continue
+
+        binding_candidates: list[tuple[dict[str, Any], str]] = []
+        if wanted_alias:
+            for row in asset.get("identity_aliases") or []:
+                if (
+                    isinstance(row, dict)
+                    and normalize_symbol(row.get("alias")) == wanted_alias
+                ):
+                    binding_candidates.append((row, "verified_alias"))
+        if wanted_venue and wanted_venue_symbol:
+            for row in asset.get("venue_instruments") or []:
+                if not isinstance(row, dict):
+                    continue
+                if (
+                    str(row.get("venue") or "").upper() == wanted_venue
+                    and str(row.get("venue_symbol") or "").upper()
+                    == wanted_venue_symbol
+                    and (
+                        not wanted_instrument_type
+                        or str(row.get("instrument_type") or "").upper()
+                        == wanted_instrument_type
+                    )
+                ):
+                    binding_candidates.append((row, "verified_venue_instrument"))
+        if wanted_chain and wanted_contract:
+            for row in asset.get("onchain_contracts") or []:
+                if not isinstance(row, dict):
+                    continue
+                if (
+                    normalize_chain_id(row.get("chain_id")) == wanted_chain
+                    and normalize_contract_address(row.get("contract_address"))
+                    == wanted_contract
+                ):
+                    binding_candidates.append((row, "verified_onchain_contract"))
+
+        for binding, provenance in binding_candidates:
+            binding_learned = _binding_learned_at(binding, as_of=cutoff)
+            if binding_learned is None:
+                continue
+            matches.append(
+                (
+                    normalize_symbol(str(raw_symbol)),
+                    asset,
+                    max(asset_learned, binding_learned),
+                    provenance,
+                )
+            )
+
+    canonical_matches = {
+        str(asset.get("source_id") or "")
+        for _, asset, _, _ in matches
+        if str(asset.get("source_id") or "")
+    }
+    if len(canonical_matches) > 1:
+        return EventIdentity(
+            source_symbol=wanted_alias or source_symbol,
+            source_name=source_name,
+            provider_asset_id=provider_asset_id,
+            mapping_status=MappingStatus.AMBIGUOUS,
+            venue=wanted_venue or None,
+            venue_symbol=wanted_venue_symbol or None,
+            instrument_type=wanted_instrument_type or None,
+            chain_id=wanted_chain or None,
+            contract_address=wanted_contract or None,
+            mapping_provenance="asset_identity_registry:structured_collision",
+        )
+    if len(matches) != 1:
+        return EventIdentity(
+            source_symbol=wanted_alias or source_symbol,
+            source_name=source_name,
+            provider_asset_id=provider_asset_id,
+            mapping_status=MappingStatus.UNKNOWN,
+            venue=wanted_venue or None,
+            venue_symbol=wanted_venue_symbol or None,
+            instrument_type=wanted_instrument_type or None,
+            chain_id=wanted_chain or None,
+            contract_address=wanted_contract or None,
+            mapping_provenance="asset_identity_registry:structured_unresolved",
+        )
+
+    canonical_symbol, asset, learned, provenance = matches[0]
+    aliases = tuple(
+        sorted(
+            {
+                normalize_symbol(item.get("alias"))
+                for item in (asset.get("identity_aliases") or [])
+                if isinstance(item, dict)
+                and _binding_learned_at(item, as_of=cutoff) is not None
+                and normalize_symbol(item.get("alias"))
+            }
+        )
+    )
+    return EventIdentity(
+        source_symbol=wanted_alias or canonical_symbol,
+        source_name=source_name,
+        provider_asset_id=provider_asset_id,
+        canonical_asset_id=str(asset.get("source_id") or ""),
+        canonical_asset_name=str(asset.get("display_name") or ""),
+        mapping_status=MappingStatus.UNIQUE,
+        mapping_confidence=1.0,
+        identity_learned_at_utc=learned,
+        mapping_provenance=f"asset_identity_registry:{provenance}",
+        venue=wanted_venue or None,
+        venue_symbol=wanted_venue_symbol or None,
+        instrument_type=wanted_instrument_type or None,
+        chain_id=wanted_chain or None,
+        contract_address=wanted_contract or None,
+        aliases=aliases,
+    )
+
+
+def resolve_news_mention(
+    text: str,
+    *,
+    as_of: datetime,
+    path: Path = ASSET_IDENTITY_REGISTRY,
+) -> EventIdentity:
+    """Resolve free text only when exactly one known asset matches."""
+    cutoff = require_utc(as_of, field_name="as_of")
+    raw_text = str(text or "")
+    lowered = raw_text.casefold()
+    payload = _safe_payload(path)
+    assets = payload.get("assets")
+    if not isinstance(assets, dict) or not raw_text.strip():
+        return EventIdentity(
+            mapping_status=MappingStatus.UNKNOWN,
+            mapping_provenance="asset_identity_registry:text_unresolved",
+        )
+
+    matches: list[tuple[str, dict[str, Any], datetime]] = []
+    for raw_symbol, asset in assets.items():
+        if not isinstance(asset, dict) or bool(asset.get("ambiguous")):
+            continue
+        learned = _binding_learned_at(asset, as_of=cutoff)
+        if learned is None:
+            continue
+        canonical_id = str(asset.get("source_id") or "").strip()
+        canonical_name = str(asset.get("display_name") or "").strip()
+        if not canonical_id or not canonical_name:
+            continue
+
+        phrases: set[str] = set()
+        if len(canonical_name) >= 4:
+            phrases.add(canonical_name.casefold())
+        symbol = normalize_symbol(str(raw_symbol))
+        symbol_patterns: list[str] = []
+        if symbol:
+            symbol_patterns.extend(
+                [
+                    rf"\${re.escape(symbol)}\b",
+                    rf"\({re.escape(symbol)}\)",
+                ]
+            )
+            if len(symbol) >= 4:
+                symbol_patterns.append(rf"\b{re.escape(symbol)}\b")
+
+        binding_times = [learned]
+        for row in asset.get("identity_aliases") or []:
+            if not isinstance(row, dict):
+                continue
+            alias_learned = _binding_learned_at(row, as_of=cutoff)
+            alias = normalize_symbol(row.get("alias"))
+            if alias_learned is None or not alias:
+                continue
+            binding_times.append(alias_learned)
+            symbol_patterns.extend(
+                [
+                    rf"\${re.escape(alias)}\b",
+                    rf"\({re.escape(alias)}\)",
+                ]
+            )
+            if len(alias) >= 4:
+                symbol_patterns.append(rf"\b{re.escape(alias)}\b")
+
+        phrase_match = any(
+            re.search(rf"\b{re.escape(phrase)}\b", lowered)
+            for phrase in phrases
+        )
+        symbol_match = any(
+            re.search(pattern, raw_text, flags=re.IGNORECASE)
+            for pattern in symbol_patterns
+        )
+        if phrase_match or symbol_match:
+            matches.append((symbol, asset, max(binding_times)))
+
+    canonical_ids = {
+        str(asset.get("source_id") or "")
+        for _, asset, _ in matches
+        if str(asset.get("source_id") or "")
+    }
+    if len(canonical_ids) > 1:
+        return EventIdentity(
+            mapping_status=MappingStatus.AMBIGUOUS,
+            mapping_provenance="asset_identity_registry:text_collision",
+        )
+    if len(matches) != 1:
+        return EventIdentity(
+            mapping_status=MappingStatus.UNKNOWN,
+            mapping_provenance="asset_identity_registry:text_unresolved",
+        )
+
+    symbol, asset, learned = matches[0]
+    return EventIdentity(
+        source_symbol=symbol,
+        source_name=str(asset.get("display_name") or ""),
+        provider_asset_id=str(asset.get("source_id") or ""),
+        canonical_asset_id=str(asset.get("source_id") or ""),
+        canonical_asset_name=str(asset.get("display_name") or ""),
+        mapping_status=MappingStatus.UNIQUE,
+        mapping_confidence=0.95,
+        identity_learned_at_utc=learned,
+        mapping_provenance="asset_identity_registry:verified_text_mention",
+    )
