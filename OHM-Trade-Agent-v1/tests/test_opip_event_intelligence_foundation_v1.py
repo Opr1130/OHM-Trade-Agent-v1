@@ -105,7 +105,8 @@ def _canonical_event(
             provider_asset_id="solana",
             source_reference="test",
             source_sequence=None,
-            raw_payload_hash=payload_hash,
+            canonical_payload_hash=payload_hash,
+            source_payload_hash=payload_hash,
         ),
         expires_at_utc=ingest + timedelta(hours=24),
     )
