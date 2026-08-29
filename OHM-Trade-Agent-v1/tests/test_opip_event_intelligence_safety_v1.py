@@ -74,7 +74,7 @@ def test_disabled_event_capture_performs_no_provider_work(tmp_path):
 
     result = capture_external_event_intelligence(
         settings=SimpleNamespace(opip_event_store_enabled=False),
-        decision_at=datetime.now(timezone.utc),
+        capture_started_at=datetime.now(timezone.utc),
         state_path=tmp_path / "state.json",
         identity_registry_path=tmp_path / "identity.json",
         coinmarketcal_cache_path=tmp_path / "cmc.json",
@@ -101,3 +101,32 @@ def test_event_foundation_files_do_not_reference_order_or_notification_actions()
     )
     for token in forbidden_tokens:
         assert token not in text
+
+
+def test_event_capture_runs_after_real_protection_and_before_search_gate():
+    source = (ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
+    active = source.index("monitor_active_main()")
+    pending = source.index("monitor_pending_main()", active)
+    early = source.index("_run_early_watch_if_due(", pending)
+    paper = source.index("_run_paper_monitor_fail_open()", early)
+    event = source.index("_run_event_intelligence_fail_open(settings=get_settings())", paper)
+    search_gate = source.index('if decision.effective_mode != "SEARCH":', event)
+    assert active < pending < early < paper < event < search_gate
+
+
+def test_current_opportunity_scanner_does_not_consume_event_store():
+    source = (ROOT / "app" / "jobs" / "scan_opportunities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "app.opip.events" not in source
+    assert "get_visible_events(" not in source
+
+
+def test_existing_news_and_catalyst_modules_do_not_depend_on_event_store():
+    for relative in (
+        "app/scanner/news_context.py",
+        "app/scanner/scheduled_catalysts.py",
+    ):
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "app.opip.events" not in source
+        assert "get_visible_events(" not in source
