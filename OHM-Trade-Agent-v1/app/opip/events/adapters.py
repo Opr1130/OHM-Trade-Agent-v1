@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
+import re
 from typing import Any, Iterable
 
 from app.opip.events.contract import (
@@ -66,21 +67,17 @@ def _provider_event_id(value: Any) -> str | None:
 
 def _news_event_type(headline: str) -> EventType:
     text = headline.casefold()
-    if any(token in text for token in ("hack", "exploit", "breach", "attack")):
+    if re.search(
+        r"\b(hack(?:ed|ing)?|exploit(?:ed|s)?|breach|cyberattack|attack)\b",
+        text,
+    ):
         return EventType.NEWS_SECURITY
-    if any(
-        token in text
-        for token in (
-            "sec ",
-            "regulator",
-            "regulation",
-            "lawsuit",
-            "court ",
-            "ban ",
-        )
+    if re.search(
+        r"\b(sec|regulator|regulation|lawsuit|court|ban(?:ned)?)\b",
+        text,
     ):
         return EventType.NEWS_REGULATORY
-    if any(token in text for token in ("listing", "listed on", "delisting")):
+    if re.search(r"\b(listing|delisting)\b|\blisted on\b", text):
         return EventType.NEWS_LISTING
     return EventType.NEWS_GENERAL
 
