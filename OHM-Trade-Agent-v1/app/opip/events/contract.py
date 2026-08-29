@@ -139,6 +139,12 @@ class OPipEvent:
     normalizer_version: str = NORMALIZER_VERSION
 
     def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported O'Pip event schema_version={self.schema_version}"
+            )
+        if not str(self.normalizer_version or "").strip():
+            raise ValueError("normalizer_version is required")
         for name in (
             "source_event_time_utc",
             "ingest_time_utc",
