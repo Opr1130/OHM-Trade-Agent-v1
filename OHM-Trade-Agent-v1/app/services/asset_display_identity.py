@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ class AssetDisplayIdentity:
     display_name: str | None
     source: str | None = None
     source_id: str | None = None
+    learned_at_utc: str | None = None
 
     @property
     def asset_text(self) -> str:
@@ -68,6 +70,7 @@ def learn_verified_identity(
     source: str,
     source_id: str,
     path: Path = REGISTRY_FILE,
+    learned_at: datetime | None = None,
 ) -> bool:
     """Persist a presentation-only identity that was resolved externally.
 
@@ -83,6 +86,11 @@ def learn_verified_identity(
     provider_id = str(source_id or "").strip()
     if not market or not base or not name or not provider or not provider_id:
         return False
+
+    learned = learned_at or datetime.now(timezone.utc)
+    if learned.tzinfo is None or learned.utcoffset() is None:
+        return False
+    learned_iso = learned.astimezone(timezone.utc).isoformat()
 
     lock = path.parent / f".{path.name}.lock"
     try:
@@ -101,11 +109,17 @@ def learn_verified_identity(
                 if old_id and old_id != provider_id:
                     return False
 
+            pair_learned_at = learned_iso
+            if isinstance(existing_pair, dict):
+                pair_learned_at = str(
+                    existing_pair.get("learned_at_utc") or learned_iso
+                )
             pairs[market] = {
                 "base_asset": base,
                 "display_name": name,
                 "source": provider,
                 "source_id": provider_id,
+                "learned_at_utc": pair_learned_at,
             }
 
             existing_asset = assets.get(base)
@@ -118,14 +132,19 @@ def learn_verified_identity(
                     assets[base] = {
                         "ambiguous": True,
                         "pairs": sorted(pair_list),
+                        "ambiguous_since_utc": learned_iso,
                     }
                 elif not ambiguous:
+                    asset_learned_at = str(
+                        existing_asset.get("learned_at_utc") or learned_iso
+                    )
                     assets[base] = {
                         "display_name": name,
                         "source": provider,
                         "source_id": provider_id,
                         "ambiguous": False,
                         "pairs": sorted(pair_list),
+                        "learned_at_utc": asset_learned_at,
                     }
             else:
                 assets[base] = {
@@ -134,6 +153,7 @@ def learn_verified_identity(
                     "source_id": provider_id,
                     "ambiguous": False,
                     "pairs": [market],
+                    "learned_at_utc": learned_iso,
                 }
 
             payload["pairs"] = pairs
@@ -186,6 +206,7 @@ def resolve_asset_identity(
             display_name=str(pair_row.get("display_name") or "") or None,
             source=str(pair_row.get("source") or "") or None,
             source_id=str(pair_row.get("source_id") or "") or None,
+            learned_at_utc=str(pair_row.get("learned_at_utc") or "") or None,
         )
 
     asset_row = assets.get(base) if isinstance(assets, dict) and base else None
@@ -196,6 +217,7 @@ def resolve_asset_identity(
             display_name=str(asset_row.get("display_name") or "") or None,
             source=str(asset_row.get("source") or "") or None,
             source_id=str(asset_row.get("source_id") or "") or None,
+            learned_at_utc=str(asset_row.get("learned_at_utc") or "") or None,
         )
 
     return AssetDisplayIdentity(
