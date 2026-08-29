@@ -729,7 +729,7 @@ class EventStore:
     def _iter_archive_events(self) -> Iterable[OPipEvent]:
         if not self.archive_dir.exists():
             return
-        for archive in sorted(self.archive_dir.glob("events-*.jsonl.gz")):
+        for archive in sorted(self.archive_dir.rglob("events-*.jsonl.gz")):
             checksum = archive.with_suffix(archive.suffix + ".sha256")
             if not checksum.exists():
                 logger.warning("Skipping O'Pip event archive without checksum: %s", archive)
