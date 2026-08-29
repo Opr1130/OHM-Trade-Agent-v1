@@ -400,12 +400,17 @@ class ProviderHealthStore:
             payload = self._load_payload()
             prior = self._existing(payload, provider)
             age = max(0.0, (now - observed).total_seconds())
+            stale_threshold = max(1, int(expected_interval_seconds)) * 3
             snapshot = ProviderHealthSnapshot(
                 provider=provider,
                 state=(
                     ProviderHealthState.DEGRADED
                     if degraded_reason
-                    else ProviderHealthState.HEALTHY
+                    else (
+                        ProviderHealthState.STALE
+                        if age > stale_threshold
+                        else ProviderHealthState.HEALTHY
+                    )
                 ),
                 checked_at_utc=now,
                 configured=True,
