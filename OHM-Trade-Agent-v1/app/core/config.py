@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # qualification, ranking, notification, paper admission, or exchange action.
     opip_event_store_enabled: bool = False
     opip_event_ingest_interval_seconds: int = Field(default=300, ge=60, le=3600)
+    # Keep external evidence I/O bounded so a shadow provider cannot occupy
+    # enough of the unified-cycle minute to starve the next risk-protection pass.
+    opip_event_provider_timeout_seconds: float = Field(default=5.0, ge=1.0, le=10.0)
     # At most one new CoinMarketCal identity lookup per capture by default.
     # This gradually expands non-finalist coverage without creating a burst of
     # provider traffic or delaying higher-priority lifecycle work.
