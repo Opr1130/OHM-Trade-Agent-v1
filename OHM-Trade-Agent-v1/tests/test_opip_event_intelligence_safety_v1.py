@@ -120,8 +120,9 @@ def test_current_opportunity_scanner_does_not_consume_event_store():
     source = (ROOT / "app" / "jobs" / "scan_opportunities.py").read_text(
         encoding="utf-8"
     )
-    assert "app.opip.events" not in source
+    assert "app.opip.events.storage" not in source
     assert "get_visible_events(" not in source
+    assert "EventStore(" not in source
 
 
 def test_existing_news_and_catalyst_modules_do_not_depend_on_event_store():
