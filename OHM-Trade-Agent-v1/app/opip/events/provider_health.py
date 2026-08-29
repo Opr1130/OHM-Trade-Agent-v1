@@ -54,6 +54,7 @@ class ProviderHealthSnapshot:
     last_success_at_utc: datetime | None = None
     last_event_ingested_at_utc: datetime | None = None
     last_event_source_time_utc: datetime | None = None
+    last_observation_at_utc: datetime | None = None
     last_error_at_utc: datetime | None = None
     consecutive_failures: int = 0
     latest_event_lag_seconds: float | None = None
@@ -73,6 +74,7 @@ class ProviderHealthSnapshot:
             "last_success_at_utc",
             "last_event_ingested_at_utc",
             "last_event_source_time_utc",
+            "last_observation_at_utc",
             "last_error_at_utc",
         ):
             value = getattr(self, name)
@@ -136,6 +138,10 @@ class ProviderHealthSnapshot:
             last_event_source_time_utc=parse_utc(
                 payload.get("last_event_source_time_utc"),
                 field_name="last_event_source_time_utc",
+            ),
+            last_observation_at_utc=parse_utc(
+                payload.get("last_observation_at_utc"),
+                field_name="last_observation_at_utc",
             ),
             last_error_at_utc=parse_utc(
                 payload.get("last_error_at_utc"),
@@ -241,6 +247,9 @@ class ProviderHealthStore:
                 last_event_source_time_utc=(
                     prior.last_event_source_time_utc if prior else None
                 ),
+                last_observation_at_utc=(
+                    prior.last_observation_at_utc if prior else None
+                ),
                 last_error_at_utc=prior.last_error_at_utc if prior else None,
                 consecutive_failures=0,
                 latest_event_lag_seconds=(
@@ -288,6 +297,9 @@ class ProviderHealthStore:
                 ),
                 last_event_source_time_utc=(
                     prior.last_event_source_time_utc if prior else None
+                ),
+                last_observation_at_utc=(
+                    prior.last_observation_at_utc if prior else None
                 ),
                 last_error_at_utc=now,
                 consecutive_failures=(
@@ -367,6 +379,7 @@ class ProviderHealthStore:
                 last_success_at_utc=now,
                 last_event_ingested_at_utc=latest_ingest,
                 last_event_source_time_utc=latest_source,
+                last_observation_at_utc=latest_ingest or now,
                 last_error_at_utc=prior.last_error_at_utc if prior else None,
                 consecutive_failures=0,
                 latest_event_lag_seconds=latest_event_lag_seconds,
@@ -421,7 +434,10 @@ class ProviderHealthStore:
                 last_event_ingested_at_utc=(
                     prior.last_event_ingested_at_utc if prior else None
                 ),
-                last_event_source_time_utc=observed,
+                last_event_source_time_utc=(
+                    prior.last_event_source_time_utc if prior else None
+                ),
+                last_observation_at_utc=observed,
                 last_error_at_utc=prior.last_error_at_utc if prior else None,
                 consecutive_failures=0,
                 freshness_age_seconds=age,
@@ -461,6 +477,9 @@ class ProviderHealthStore:
                 ),
                 last_event_source_time_utc=(
                     prior.last_event_source_time_utc if prior else None
+                ),
+                last_observation_at_utc=(
+                    prior.last_observation_at_utc if prior else None
                 ),
                 last_error_at_utc=prior.last_error_at_utc if prior else None,
                 consecutive_failures=prior.consecutive_failures if prior else 0,
