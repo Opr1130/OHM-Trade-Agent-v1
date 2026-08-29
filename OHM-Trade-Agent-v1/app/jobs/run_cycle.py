@@ -147,6 +147,12 @@ def _run_event_intelligence_fail_open(*, settings) -> None:
         f"unknown={telemetry.get('mapping_unknown', 0)}",
     )
     print(
+        "Sources:",
+        f"cryptopanic_requests={telemetry.get('cryptopanic_requests', 0)}",
+        f"coinmarketcal_requests={telemetry.get('coinmarketcal_requests', 0)}",
+        f"coinmarketcal_mapping_requests={telemetry.get('coinmarketcal_mapping_requests', 0)}",
+    )
+    print(
         "Failures:",
         f"provider={telemetry.get('provider_errors', 0)}",
         f"normalization={telemetry.get('normalization_errors', 0)}",
