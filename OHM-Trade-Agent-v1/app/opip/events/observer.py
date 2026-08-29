@@ -118,6 +118,25 @@ def _chunks(items: list[str], size: int) -> Iterable[list[str]]:
         yield items[index : index + size]
 
 
+def _select_mapping_candidates(
+    unresolved_assets: list[dict[str, str]],
+    *,
+    capture_started: datetime,
+    interval_seconds: int,
+    budget: int,
+) -> list[dict[str, str]]:
+    """Rotate bounded identity lookups so one unresolved asset cannot starve others."""
+    if not unresolved_assets or budget <= 0:
+        return []
+    count = min(int(budget), len(unresolved_assets))
+    bucket = int(capture_started.timestamp()) // max(1, int(interval_seconds))
+    start = bucket % len(unresolved_assets)
+    return [
+        unresolved_assets[(start + offset) % len(unresolved_assets)]
+        for offset in range(count)
+    ]
+
+
 def _mappings_for_safe_assets(
     mappings: Iterable[dict[str, str]],
     assets: Iterable[dict[str, str]],
@@ -424,7 +443,12 @@ def capture_external_event_intelligence(
     ]
     cmc_requests_this_capture = 0
     if cmc_client is not None and lookup_budget > 0:
-        for asset in unresolved_assets[:lookup_budget]:
+        for asset in _select_mapping_candidates(
+            unresolved_assets,
+            capture_started=capture_started,
+            interval_seconds=interval,
+            budget=lookup_budget,
+        ):
             if cmc_requests_this_capture:
                 sleep(1.05)
             telemetry.coinmarketcal_mapping_requests += 1
