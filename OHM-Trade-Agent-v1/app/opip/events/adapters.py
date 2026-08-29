@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
 from typing import Any, Iterable
 
 from app.opip.events.contract import (
@@ -60,6 +61,30 @@ def _provider_event_id(value: Any) -> str | None:
     return text
 
 
+def _safe_scalar(value: Any) -> bool | int | float | str | None:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:200]
+    return None
+
+
+def _bounded_mapping(value: Any, *, max_items: int = 20) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for raw_key in sorted(value, key=lambda item: str(item))[:max_items]:
+        safe = _safe_scalar(value.get(raw_key))
+        if safe is None and value.get(raw_key) is not None:
+            continue
+        result[str(raw_key)[:80]] = safe
+    return result
+
+
 def _dedupe_key(
     *,
     provider: str,
@@ -101,7 +126,7 @@ def _news_payload(row: dict[str, Any], instrument: dict[str, Any]) -> dict[str, 
             "title": instrument.get("title"),
             "slug": instrument.get("slug"),
         },
-        "votes": votes,
+        "votes": _bounded_mapping(votes),
     }
 
 
@@ -226,9 +251,7 @@ def normalize_cryptopanic_posts(
                     },
                     numeric={
                         "votes": (
-                            dict(row.get("votes"))
-                            if isinstance(row.get("votes"), dict)
-                            else {}
+                            _bounded_mapping(row.get("votes"))
                         )
                     },
                     expires_at_utc=published + timedelta(hours=24),
@@ -406,9 +429,8 @@ def normalize_coinmarketcal_events(
             canonical_payload = _catalyst_payload(row, coin)
             payload_hash = stable_payload_hash(canonical_payload)
             numeric = {
-                "impact": row.get("impact"),
+                "impact": _safe_scalar(row.get("impact")),
                 "is_estimated": row.get("isEstimated") is True,
-                "date_type": row.get("dateType"),
             }
             events.append(
                 OPipEvent(
@@ -443,8 +465,9 @@ def normalize_coinmarketcal_events(
                                 row.get("categories")
                                 if isinstance(row.get("categories"), list)
                                 else []
-                            )
-                            if isinstance(item, dict) and _string(item.get("name"), limit=200)
+                            )[:20]
+                            if isinstance(item, dict)
+                            and _string(item.get("name"), limit=200)
                         ],
                         "coin": {
                             "slug": identity.provider_asset_id,
