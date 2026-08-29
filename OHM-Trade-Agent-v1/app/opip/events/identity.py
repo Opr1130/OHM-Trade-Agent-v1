@@ -356,24 +356,34 @@ def merge_point_in_time_mappings(
     as_of: datetime,
     paths: tuple[Path, ...],
 ) -> tuple[dict[str, str], ...]:
-    """Merge safe mapping caches without allowing later rows to leak backward."""
-    combined: dict[tuple[str, str], dict[str, str]] = {}
+    """Merge safe mapping caches without silently accepting identity conflicts."""
+    by_symbol: dict[str, dict[str, str]] = {}
+    conflicts: set[str] = set()
     for path in paths:
         for item in known_coinmarketcal_mappings(as_of=as_of, path=path):
-            key = (
-                str(item.get("symbol") or ""),
-                str(item.get("coinmarketcal_slug") or ""),
-            )
-            existing = combined.get(key)
-            if existing is None:
-                combined[key] = dict(item)
+            symbol = str(item.get("symbol") or "")
+            if not symbol or symbol in conflicts:
                 continue
-            # Keep the earliest proven resolution time for identical mappings.
+            existing = by_symbol.get(symbol)
+            if existing is None:
+                by_symbol[symbol] = dict(item)
+                continue
+
+            same_identity = (
+                str(existing.get("canonical_asset_id") or "")
+                == str(item.get("canonical_asset_id") or "")
+                and str(existing.get("coinmarketcal_slug") or "")
+                == str(item.get("coinmarketcal_slug") or "")
+            )
+            if not same_identity:
+                conflicts.add(symbol)
+                by_symbol.pop(symbol, None)
+                continue
+
+            # Keep the earliest proven resolution time for an identical mapping.
             if str(item.get("resolved_at_utc") or "") < str(
                 existing.get("resolved_at_utc") or ""
             ):
-                combined[key] = dict(item)
-    return tuple(
-        combined[key]
-        for key in sorted(combined)
-    )
+                by_symbol[symbol] = dict(item)
+
+    return tuple(by_symbol[key] for key in sorted(by_symbol))
