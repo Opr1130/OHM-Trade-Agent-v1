@@ -4,6 +4,11 @@ HOT storage is bounded JSONL. Before any HOT compaction, removed canonical rows
 are written to an immutable gzip archive, checksummed, reopened, parsed and
 verified. Only after archive finalization succeeds may HOT be replaced.
 
+The archive mechanics now live in app.opip.storage.bounded_jsonl so that every
+O'Pip evidence family shares one proven implementation. Event semantics
+(dedupe, revision lineage, persistence stamping, point-in-time queries) remain
+here and are unchanged.
+
 This keeps the production footprint bounded without destroying replay evidence.
 """
 
@@ -11,17 +16,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-import gzip
-import hashlib
 import json
 import logging
 import os
 from pathlib import Path
-import shutil
-import tempfile
-from typing import Any, Iterable
+from typing import Iterable
 
 from app.opip.events.contract import IngestOutcome, OPipEvent, require_utc
+from app.opip.storage.bounded_jsonl import (
+    ArchiveVerification,
+    BoundedJsonlArchive,
+    encode_row,
+    fsync_dir as _fsync_dir,
+    parse_json_object_line as _parse_json_object_line,
+    read_lines as _read_lines,
+    repair_truncated_tail,
+    sha256_file as _sha256_file,
+    write_atomic_lines as _write_atomic_lines,
+)
 from app.services.registry_io import registry_lock
 
 
@@ -37,11 +49,21 @@ LOCK_FILE = EVENT_DIR / ".events.lock"
 
 EVENTS_MAX_BYTES = 32 * 1024 * 1024
 EVENTS_KEEP_LINES = 100_000
-# Compact to 80% of the line cap rather than exactly the cap. Otherwise a
-# full HOT file would create one tiny gzip archive on every subsequent append.
-HOT_COMPACTION_FRACTION = 0.80
 DEAD_LETTER_MAX_BYTES = 4 * 1024 * 1024
 DEAD_LETTER_KEEP_LINES = 2_000
+
+EVENT_ARCHIVE_PREFIX = "events"
+
+
+def _parse_event_line(line: bytes) -> OPipEvent:
+    return OPipEvent.from_dict(_parse_json_object_line(line))
+
+
+def _repair_truncated_tail(path: Path, *, event_rows: bool = False) -> None:
+    repair_truncated_tail(
+        path,
+        parse_line=_parse_event_line if event_rows else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -51,16 +73,16 @@ class AppendResult:
     existing_event_id: str | None = None
 
 
-@dataclass(frozen=True)
-class ArchiveVerification:
-    archive: str
-    tier: str
-    sha256: str
-    row_count: int
-    bytes: int
-    first_visible_at_utc: str | None
-    last_visible_at_utc: str | None
 
+
+@dataclass(frozen=True)
+class EventWindowRead:
+    events: tuple[OPipEvent, ...]
+    archive_segments_scanned: int
+    archive_segments_truncated: bool
+    rows_truncated: bool
+    coverage_complete: bool
+    warnings: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class EventStorageStats:
@@ -72,136 +94,6 @@ class EventStorageStats:
     cold_archive_segments: int
     dead_letter_bytes: int
     manifest_segments: int
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _fsync_dir(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
-
-
-def _repair_truncated_tail(
-    path: Path,
-    *,
-    event_rows: bool = False,
-) -> None:
-    """Repair only the final interrupted JSONL write, preserving forensic bytes."""
-    if not path.exists() or path.stat().st_size <= 0:
-        return
-
-    raw = path.read_bytes()
-    if raw.endswith(b"\n"):
-        return
-
-    last_newline = raw.rfind(b"\n")
-    prefix_end = last_newline + 1 if last_newline >= 0 else 0
-    tail = raw[prefix_end:]
-    try:
-        if event_rows:
-            _parse_event_line(tail + b"\n")
-        else:
-            _parse_json_object_line(tail + b"\n")
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        quarantine = path.with_name(
-            f"{path.name}.truncated-{stamp}.bin"
-        )
-        descriptor, temp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{quarantine.name}.",
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(tail)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, quarantine)
-            with path.open("r+b") as handle:
-                handle.truncate(prefix_end)
-                handle.flush()
-                os.fsync(handle.fileno())
-            _fsync_dir(path.parent)
-            logger.critical(
-                "Quarantined malformed O'Pip JSONL tail at %s to %s",
-                path,
-                quarantine,
-            )
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
-            raise
-        return
-
-    # The final row was complete JSON but missed only its newline terminator.
-    with path.open("ab") as handle:
-        handle.write(b"\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _read_lines(path: Path) -> list[bytes]:
-    if not path.exists():
-        return []
-    return [line for line in path.read_bytes().splitlines(keepends=True) if line.strip()]
-
-
-def _reject_json_constant(token: str) -> None:
-    raise ValueError(f"non-finite JSON numeric token {token}")
-
-
-def _parse_json_object_line(line: bytes) -> dict[str, Any]:
-    payload = json.loads(
-        line.decode("utf-8"),
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(payload, dict):
-        raise ValueError("JSONL row must be an object")
-    return payload
-
-
-def _parse_event_line(line: bytes) -> OPipEvent:
-    return OPipEvent.from_dict(_parse_json_object_line(line))
-
-
-def _write_atomic_lines(path: Path, lines: Iterable[bytes]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            for line in lines:
-                handle.write(line if line.endswith(b"\n") else line + b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, path)
-        _fsync_dir(path.parent)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 class EventStore:
@@ -220,9 +112,7 @@ class EventStore:
         self.event_file = event_file
         self.archive_dir = archive_dir
         self.cold_archive_dir = (
-            cold_archive_dir
-            if cold_archive_dir is not None
-            else archive_dir / "cold"
+            cold_archive_dir if cold_archive_dir is not None else archive_dir / "cold"
         )
         self.archive_manifest_file = (
             archive_manifest_file
@@ -239,13 +129,24 @@ class EventStore:
         self._event_ids: set[str] = set()
         self._latest_by_dedupe: dict[str, str] = {}
         self._known_hot_signature: tuple[int, int] | None = None
+        self._archive = BoundedJsonlArchive(
+            data_file=self.event_file,
+            archive_dir=self.archive_dir,
+            cold_archive_dir=self.cold_archive_dir,
+            manifest_file=self.archive_manifest_file,
+            max_bytes=self.max_bytes,
+            keep_lines=self.keep_lines,
+            archive_prefix=EVENT_ARCHIVE_PREFIX,
+            parse_line=_parse_event_line,
+            visible_at=lambda event: event.decision_visible_at_utc,
+            # Resolved through this module's globals at call time so that the
+            # existing archive-failure test, which patches _sha256_file here,
+            # continues to exercise the real failure path.
+            sha256_file_hook=lambda path: _sha256_file(path),
+        )
 
     def _hot_signature(self) -> tuple[int, int] | None:
-        try:
-            stat = self.event_file.stat()
-        except FileNotFoundError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
+        return self._archive.hot_signature()
 
     def _load_logical_index_locked(self) -> None:
         """Index the complete logical store once, including verified archives.
@@ -269,10 +170,7 @@ class EventStore:
         self._index_loaded = True
 
     def _ensure_logical_index_locked(self) -> None:
-        if (
-            not self._index_loaded
-            or self._known_hot_signature != self._hot_signature()
-        ):
+        if not self._index_loaded or self._known_hot_signature != self._hot_signature():
             self._load_logical_index_locked()
 
     def append(
@@ -281,12 +179,15 @@ class EventStore:
         *,
         persisted_at: datetime | None = None,
     ) -> AppendResult:
-        if event.persisted_at_utc is not None or event.decision_visible_at_utc is not None:
+        if (
+            event.persisted_at_utc is not None
+            or event.decision_visible_at_utc is not None
+        ):
             raise ValueError("EventStore.append expects an unpersisted canonical event")
         self.event_file.parent.mkdir(parents=True, exist_ok=True)
 
         with registry_lock(self.lock_file):
-            _repair_truncated_tail(self.event_file, event_rows=True)
+            self._archive.repair_tail()
             self._ensure_logical_index_locked()
             if event.event_id in self._event_ids:
                 return AppendResult(
@@ -306,21 +207,7 @@ class EventStore:
             persisted = candidate.with_persistence(
                 require_utc(stamp, field_name="persisted_at")
             )
-            encoded = (
-                json.dumps(
-                    persisted.to_dict(),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                + "\n"
-            ).encode("utf-8")
-
-            with self.event_file.open("ab") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
+            self._archive.append_encoded_locked(encode_row(persisted.to_dict()))
 
             self._event_ids.add(persisted.event_id)
             self._latest_by_dedupe[persisted.dedupe_key] = persisted.event_id
@@ -342,89 +229,14 @@ class EventStore:
                 existing_event_id=previous,
             )
 
-    def _verify_archive_file(
-        self,
-        archive: Path,
-        *,
-        tier: str,
-    ) -> ArchiveVerification:
-        checksum = archive.with_suffix(archive.suffix + ".sha256")
-        if not checksum.exists():
-            raise RuntimeError(f"missing archive checksum for {archive}")
-        tokens = checksum.read_text(encoding="utf-8").split()
-        if not tokens:
-            raise RuntimeError(f"empty archive checksum for {archive}")
-        expected = tokens[0]
-        actual = _sha256_file(archive)
-        if actual != expected:
-            raise RuntimeError(f"archive checksum mismatch for {archive}")
-
-        rows = 0
-        visible_times: list[datetime] = []
-        with gzip.open(archive, "rb") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                event = _parse_event_line(line)
-                rows += 1
-                if event.decision_visible_at_utc is not None:
-                    visible_times.append(event.decision_visible_at_utc)
-        if rows <= 0:
-            raise RuntimeError(f"archive contained no canonical event rows: {archive}")
-
-        return ArchiveVerification(
-            archive=str(archive.relative_to(self.archive_dir)),
-            tier=tier,
-            sha256=actual,
-            row_count=rows,
-            bytes=archive.stat().st_size,
-            first_visible_at_utc=(
-                min(visible_times).isoformat() if visible_times else None
-            ),
-            last_visible_at_utc=(
-                max(visible_times).isoformat() if visible_times else None
-            ),
-        )
+    def _verify_archive_file(self, archive: Path, *, tier: str) -> ArchiveVerification:
+        return self._archive.verify_archive_file(archive, tier=tier)
 
     def _update_archive_manifest_locked(
         self,
         verification: ArchiveVerification,
     ) -> None:
-        payload: dict[str, Any] = {}
-        if self.archive_manifest_file.exists():
-            try:
-                raw = json.loads(
-                    self.archive_manifest_file.read_text(encoding="utf-8")
-                )
-                if isinstance(raw, dict):
-                    payload = raw
-            except (OSError, ValueError, json.JSONDecodeError):
-                payload = {}
-        segments = payload.get("segments")
-        if not isinstance(segments, dict):
-            segments = {}
-        segments[verification.sha256] = {
-            "archive": verification.archive,
-            "tier": verification.tier,
-            "sha256": verification.sha256,
-            "row_count": verification.row_count,
-            "bytes": verification.bytes,
-            "first_visible_at_utc": verification.first_visible_at_utc,
-            "last_visible_at_utc": verification.last_visible_at_utc,
-            "verified_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
-        payload = {
-            "schema_version": 1,
-            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "segments": segments,
-        }
-        encoded = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8") + b"\n"
-        _write_atomic_lines(self.archive_manifest_file, [encoded])
+        self._archive.update_manifest_locked(verification)
 
     def _tier_warm_archives_locked(
         self,
@@ -432,104 +244,13 @@ class EventStore:
         now: datetime,
         cold_after_days: int = 30,
     ) -> int:
-        cutoff = require_utc(now, field_name="now").timestamp() - (
-            max(1, int(cold_after_days)) * 86400
+        return self._archive.tier_warm_archives_locked(
+            now=require_utc(now, field_name="now"),
+            cold_after_days=cold_after_days,
         )
-        moved = 0
-        for archive in sorted(self.archive_dir.glob("events-*.jsonl.gz")):
-            if archive.stat().st_mtime > cutoff:
-                continue
-            source_verification = self._verify_archive_file(
-                archive,
-                tier="WARM",
-            )
-            source_checksum = archive.with_suffix(
-                archive.suffix + ".sha256"
-            )
-            archive_time = datetime.fromtimestamp(
-                archive.stat().st_mtime,
-                tz=timezone.utc,
-            )
-            destination_parent = (
-                self.cold_archive_dir
-                / archive_time.strftime("%Y")
-                / archive_time.strftime("%m")
-            )
-            destination_parent.mkdir(parents=True, exist_ok=True)
-            final_segment = destination_parent / (
-                f"{archive.name}.segment"
-            )
-            final_archive = final_segment / archive.name
-            final_checksum = final_archive.with_suffix(
-                final_archive.suffix + ".sha256"
-            )
 
-            if final_segment.exists():
-                # A prior crash may have completed the COLD copy but failed
-                # before removing WARM. Verify the COLD segment before treating
-                # it as authoritative.
-                verification = self._verify_archive_file(
-                    final_archive,
-                    tier="COLD",
-                )
-                if verification.sha256 != source_verification.sha256:
-                    raise RuntimeError(
-                        f"cold archive collision for {archive.name}"
-                    )
-                self._update_archive_manifest_locked(verification)
-                archive.unlink(missing_ok=True)
-                source_checksum.unlink(missing_ok=True)
-                _fsync_dir(self.archive_dir)
-                moved += 1
-                continue
-
-            temp_segment = Path(
-                tempfile.mkdtemp(
-                    dir=destination_parent,
-                    prefix=f".{archive.name}.",
-                )
-            )
-            try:
-                temp_archive = temp_segment / archive.name
-                temp_checksum = temp_archive.with_suffix(
-                    temp_archive.suffix + ".sha256"
-                )
-                shutil.copy2(archive, temp_archive)
-                shutil.copy2(source_checksum, temp_checksum)
-                with temp_archive.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                with temp_checksum.open("rb") as handle:
-                    os.fsync(handle.fileno())
-
-                copied = self._verify_archive_file(
-                    temp_archive,
-                    tier="COLD",
-                )
-                if copied.sha256 != source_verification.sha256:
-                    raise RuntimeError(
-                        f"cold archive copy mismatch for {archive.name}"
-                    )
-
-                # One directory rename atomically publishes archive+checksum.
-                os.replace(temp_segment, final_segment)
-                _fsync_dir(destination_parent)
-                verification = self._verify_archive_file(
-                    final_archive,
-                    tier="COLD",
-                )
-                self._update_archive_manifest_locked(verification)
-
-                # WARM is removed only after the COLD segment is final,
-                # checksummed, reparsed, and represented in the manifest.
-                archive.unlink(missing_ok=True)
-                source_checksum.unlink(missing_ok=True)
-                _fsync_dir(self.archive_dir)
-                moved += 1
-            except Exception:
-                if temp_segment.exists():
-                    shutil.rmtree(temp_segment, ignore_errors=True)
-                raise
-        return moved
+    def _archive_before_compact_locked(self) -> Path | None:
+        return self._archive.compact_locked(cold_after_days=30)
 
     def maintain_lifecycle(
         self,
@@ -538,10 +259,7 @@ class EventStore:
         cold_after_days: int = 30,
     ) -> int:
         """Move verified WARM segments to local COLD; never purge automatically."""
-        current = require_utc(
-            now or datetime.now(timezone.utc),
-            field_name="now",
-        )
+        current = require_utc(now or datetime.now(timezone.utc), field_name="now")
         with registry_lock(self.lock_file):
             return self._tier_warm_archives_locked(
                 now=current,
@@ -549,144 +267,21 @@ class EventStore:
             )
 
     def storage_stats(self) -> EventStorageStats:
-        warm = list(self.archive_dir.glob("events-*.jsonl.gz"))
-        cold = (
-            list(self.cold_archive_dir.rglob("events-*.jsonl.gz"))
-            if self.cold_archive_dir.exists()
-            else []
-        )
-        manifest_segments = 0
-        if self.archive_manifest_file.exists():
-            try:
-                payload = json.loads(
-                    self.archive_manifest_file.read_text(encoding="utf-8")
-                )
-                segments = (
-                    payload.get("segments")
-                    if isinstance(payload, dict)
-                    else None
-                )
-                if isinstance(segments, dict):
-                    manifest_segments = len(segments)
-            except (OSError, ValueError, json.JSONDecodeError):
-                manifest_segments = 0
+        stats = self._archive.stats()
         return EventStorageStats(
-            hot_bytes=(
-                self.event_file.stat().st_size
-                if self.event_file.exists()
-                else 0
-            ),
-            hot_lines=len(_read_lines(self.event_file)),
-            warm_archive_bytes=sum(item.stat().st_size for item in warm),
-            warm_archive_segments=len(warm),
-            cold_archive_bytes=sum(item.stat().st_size for item in cold),
-            cold_archive_segments=len(cold),
+            hot_bytes=stats.hot_bytes,
+            hot_lines=stats.hot_lines,
+            warm_archive_bytes=stats.warm_archive_bytes,
+            warm_archive_segments=stats.warm_archive_segments,
+            cold_archive_bytes=stats.cold_archive_bytes,
+            cold_archive_segments=stats.cold_archive_segments,
             dead_letter_bytes=(
                 self.dead_letter_file.stat().st_size
                 if self.dead_letter_file.exists()
                 else 0
             ),
-            manifest_segments=manifest_segments,
+            manifest_segments=stats.manifest_segments,
         )
-
-    def _archive_before_compact_locked(self) -> Path | None:
-        if not self.event_file.exists():
-            return None
-        current_size = self.event_file.stat().st_size
-        lines = _read_lines(self.event_file)
-        if current_size <= self.max_bytes and len(lines) <= self.keep_lines:
-            return None
-        if len(lines) <= 1:
-            return None
-
-        if len(lines) > self.keep_lines:
-            keep_count = max(
-                1,
-                min(
-                    self.keep_lines,
-                    int(self.keep_lines * HOT_COMPACTION_FRACTION),
-                ),
-            )
-        else:
-            # Byte pressure with fewer than keep_lines: archive the oldest half
-            # so the next append does not immediately trigger another rotation.
-            keep_count = max(1, len(lines) // 2)
-
-        archive_lines = lines[:-keep_count]
-        hot_lines = lines[-keep_count:]
-        if not archive_lines:
-            return None
-
-        self.archive_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        content_digest = hashlib.sha256(b"".join(archive_lines)).hexdigest()[:12]
-        archive = self.archive_dir / (
-            f"events-{stamp}-{content_digest}.jsonl.gz"
-        )
-        checksum = archive.with_suffix(archive.suffix + ".sha256")
-        archive_tmp = archive.with_name(f".{archive.name}.tmp")
-        checksum_tmp = checksum.with_name(f".{checksum.name}.tmp")
-
-        try:
-            with gzip.open(archive_tmp, "wb") as handle:
-                for line in archive_lines:
-                    handle.write(line if line.endswith(b"\n") else line + b"\n")
-
-            # Make the compressed bytes durable before verification/finalization.
-            with archive_tmp.open("rb") as handle:
-                os.fsync(handle.fileno())
-
-            digest = _sha256_file(archive_tmp)
-            verified_rows = 0
-            with gzip.open(archive_tmp, "rb") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    _parse_event_line(line)
-                    verified_rows += 1
-            if verified_rows != len(archive_lines):
-                raise RuntimeError(
-                    "event archive row-count verification failed "
-                    f"expected={len(archive_lines)} actual={verified_rows}"
-                )
-
-            checksum_tmp.write_text(
-                f"{digest}  {archive.name}\n",
-                encoding="utf-8",
-            )
-            with checksum_tmp.open("rb") as handle:
-                os.fsync(handle.fileno())
-
-            os.replace(archive_tmp, archive)
-            os.replace(checksum_tmp, checksum)
-            _fsync_dir(self.archive_dir)
-
-            verification = self._verify_archive_file(
-                archive,
-                tier="WARM",
-            )
-            self._update_archive_manifest_locked(verification)
-
-            # Only after an immutable, verified archive, checksum and manifest
-            # entry are final may HOT evidence be compacted.
-            _write_atomic_lines(self.event_file, hot_lines)
-            try:
-                self._tier_warm_archives_locked(
-                    now=datetime.now(timezone.utc),
-                    cold_after_days=30,
-                )
-            except Exception:
-                logger.exception(
-                    "O'Pip WARM-to-COLD archive maintenance failed open"
-                )
-            return archive
-        except Exception:
-            archive_tmp.unlink(missing_ok=True)
-            checksum_tmp.unlink(missing_ok=True)
-            # If archive finalization succeeded but HOT compaction failed,
-            # leaving duplicated rows in HOT is safe and replay de-duplicates
-            # them by event_id.
-            raise
 
     def record_dead_letter(
         self,
@@ -727,33 +322,7 @@ class EventStore:
                 _write_atomic_lines(self.dead_letter_file, lines)
 
     def _iter_archive_events(self) -> Iterable[OPipEvent]:
-        if not self.archive_dir.exists():
-            return
-        for archive in sorted(self.archive_dir.rglob("events-*.jsonl.gz")):
-            checksum = archive.with_suffix(archive.suffix + ".sha256")
-            if not checksum.exists():
-                logger.warning("Skipping O'Pip event archive without checksum: %s", archive)
-                continue
-            try:
-                expected = checksum.read_text(encoding="utf-8").split()[0]
-                if _sha256_file(archive) != expected:
-                    logger.error("Skipping O'Pip event archive checksum mismatch: %s", archive)
-                    continue
-                with gzip.open(archive, "rb") as handle:
-                    for line in handle:
-                        if line.strip():
-                            yield _parse_event_line(line)
-            except (
-                OSError,
-                ValueError,
-                KeyError,
-                IndexError,
-                json.JSONDecodeError,
-            ):
-                logger.exception(
-                    "Skipping unreadable O'Pip event archive: %s",
-                    archive,
-                )
+        return self._archive.iter_archive_rows()
 
     def iter_events(self, *, include_archive: bool = True) -> Iterable[OPipEvent]:
         seen: set[str] = set()
@@ -764,15 +333,86 @@ class EventStore:
                 seen.add(event.event_id)
                 yield event
 
-        for line in _read_lines(self.event_file):
-            try:
-                event = _parse_event_line(line)
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                continue
+        for event in self._archive.iter_hot_rows():
             if event.event_id in seen:
                 continue
             seen.add(event.event_id)
             yield event
+
+    def read_visible_window(
+        self,
+        *,
+        start: datetime,
+        through: datetime,
+        max_archive_segments: int = 16,
+        max_rows: int = 4_000,
+    ) -> EventWindowRead:
+        """Read HOT plus only archive segments overlapping a visibility window.
+
+        This is the bounded Sequence 3 path. It uses the verified archive
+        manifest as an index so recent evidence remains visible after HOT
+        compaction without decompressing every historical archive each cycle.
+        """
+        start = require_utc(start, field_name="start")
+        through = require_utc(through, field_name="through")
+        if start > through:
+            raise ValueError("start cannot be after through")
+        selection = self._archive.archive_paths_for_visible_window(
+            start=start,
+            through=through,
+            max_segments=max(1, int(max_archive_segments)),
+        )
+        if int(max_rows) < 1:
+            raise ValueError("max_rows must be positive")
+        seen: set[str] = set()
+        rows: list[OPipEvent] = []
+        raw_truncated = False
+        # Preserve deterministic chronological input order, but bound memory.
+        # If the ceiling is reached the caller receives incomplete coverage and
+        # therefore may escalate observed risk but must not de-escalate.
+        warnings = list(selection.warnings)
+        archive_read_complete = True
+        for archive in selection.paths:
+            try:
+                source = self._archive.iter_archive_rows_from_paths((archive,), strict=True)
+                for event in source:
+                    if event.event_id in seen:
+                        continue
+                    seen.add(event.event_id)
+                    rows.append(event)
+                    if len(rows) > int(max_rows):
+                        raw_truncated = True
+                        rows = rows[-int(max_rows):]
+            except Exception:
+                logger.exception("O'Pip recent archive unreadable; risk coverage degraded: %s", archive)
+                archive_read_complete = False
+                warnings.append("ARCHIVE_SEGMENT_UNREADABLE")
+        hot_read_complete = True
+        try:
+            for event in self._archive.iter_hot_rows(skip_malformed=False):
+                if event.event_id in seen:
+                    continue
+                seen.add(event.event_id)
+                rows.append(event)
+                if len(rows) > int(max_rows):
+                    raw_truncated = True
+                    # Keep the newest bounded tail. This may omit older active
+                    # evidence, so coverage is explicitly incomplete.
+                    rows = rows[-int(max_rows):]
+        except Exception:
+            logger.exception("O'Pip HOT event evidence unreadable; risk coverage degraded")
+            hot_read_complete = False
+            warnings.append("HOT_EVENT_ROW_UNREADABLE")
+        if raw_truncated:
+            warnings.append("EVENT_RAW_ROW_CEILING_REACHED")
+        return EventWindowRead(
+            events=tuple(rows),
+            archive_segments_scanned=len(selection.paths),
+            archive_segments_truncated=selection.truncated,
+            rows_truncated=raw_truncated,
+            coverage_complete=selection.complete and archive_read_complete and hot_read_complete and not raw_truncated,
+            warnings=tuple(dict.fromkeys(warnings)),
+        )
 
     @staticmethod
     def _matches_asset(event: OPipEvent, asset_id: str) -> bool:
@@ -792,10 +432,7 @@ class EventStore:
             event.identity.source_symbol,
             event.identity.provider_asset_id,
         )
-        return any(
-            str(value or "").strip().casefold() == wanted
-            for value in values
-        )
+        return any(str(value or "").strip().casefold() == wanted for value in values)
 
     def get_visible_events(
         self,
@@ -843,9 +480,7 @@ class EventStore:
         through: datetime | None = None,
     ) -> tuple[OPipEvent, ...]:
         cutoff = (
-            require_utc(through, field_name="through")
-            if through is not None
-            else None
+            require_utc(through, field_name="through") if through is not None else None
         )
         # iter_events is the canonical append order (verified archives then
         # HOT). Preserve that order rather than re-sorting equal timestamps,
