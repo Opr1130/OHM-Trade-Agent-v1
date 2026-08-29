@@ -264,6 +264,8 @@ def test_context_provider_success_becomes_stale_when_source_is_old(tmp_path):
         source_observed_at=NOW - timedelta(minutes=20),
     )
     assert snapshot.state == ProviderHealthState.STALE
+    assert snapshot.last_observation_at_utc == NOW - timedelta(minutes=20)
+    assert snapshot.last_event_source_time_utc is None
 
 
 def test_observer_distinguishes_missing_credentials_no_event_and_rate_limit(tmp_path):
