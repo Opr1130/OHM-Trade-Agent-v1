@@ -63,6 +63,7 @@ def test_event_store_is_dark_by_default():
     settings = Settings(webhook_secret="123456789012")
     assert settings.opip_event_store_enabled is False
     assert settings.opip_event_ingest_interval_seconds == 300
+    assert settings.opip_event_mapping_lookups_per_capture == 1
 
 
 def test_disabled_event_capture_performs_no_provider_work(tmp_path):
