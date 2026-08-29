@@ -383,11 +383,13 @@ def capture_external_event_intelligence(
         for item in assets
         if item.get("symbol") not in mapped_symbols
     ]
-    mapping_request_made = False
+    cmc_requests_this_capture = 0
     if cmc_client is not None and lookup_budget > 0:
         for asset in unresolved_assets[:lookup_budget]:
+            if cmc_requests_this_capture:
+                sleep(1.05)
             telemetry.coinmarketcal_mapping_requests += 1
-            mapping_request_made = True
+            cmc_requests_this_capture += 1
             try:
                 rows = cmc_client.get_coins(str(asset["symbol"]))
             except CoinMarketCalAPIError:
@@ -433,17 +435,18 @@ def capture_external_event_intelligence(
     )
     catalyst_rows: list[dict[str, Any]] = []
     if cmc_client is not None and slugs:
-        # The current CoinMarketCal plan is paced conservatively. If this
-        # capture performed a coin-identity lookup, leave one interval before
-        # the batched event request.
-        if mapping_request_made:
-            sleep(1.05)
+        # Pace every CoinMarketCal request, including multiple mapping lookups
+        # or multiple event batches, so increasing the bounded lookup budget
+        # cannot accidentally create a provider burst.
         try:
             for batch_slugs in _chunks(
                 slugs,
                 COINMARKETCAL_BATCH_SIZE,
             ):
+                if cmc_requests_this_capture:
+                    sleep(1.05)
                 telemetry.coinmarketcal_requests += 1
+                cmc_requests_this_capture += 1
                 rows = cmc_client.get_events(
                     batch_slugs,
                     capture_started,
