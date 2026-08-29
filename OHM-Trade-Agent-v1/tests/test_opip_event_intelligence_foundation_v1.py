@@ -323,6 +323,42 @@ def test_malformed_provider_payload_is_contained():
     assert result.failures[0].outcome.value == "MALFORMED_PAYLOAD"
 
 
+def test_cryptopanic_future_timestamp_is_rejected(tmp_path):
+    path = _identity_path(tmp_path)
+    row = _post(published=NOW + timedelta(minutes=6))
+    result = normalize_cryptopanic_posts(
+        [row],
+        ingest_time=NOW,
+        identity_registry_path=path,
+    )
+    assert result.events == ()
+    assert result.failures
+    assert result.failures[0].outcome.value == "INVALID_TIMESTAMP"
+    assert "future" in result.failures[0].reason
+
+
+def test_news_dedupe_key_is_stable_across_identity_resolution(tmp_path):
+    unknown_path = tmp_path / "unknown-identity.json"
+    unknown = normalize_cryptopanic_posts(
+        [_post()],
+        ingest_time=NOW,
+        identity_registry_path=unknown_path,
+    )
+    assert len(unknown.events) == 1
+    assert unknown.events[0].identity.mapping_status == MappingStatus.UNKNOWN
+
+    known_path = _identity_path(tmp_path)
+    known = normalize_cryptopanic_posts(
+        [_post()],
+        ingest_time=NOW,
+        identity_registry_path=known_path,
+    )
+    assert len(known.events) == 1
+    assert known.events[0].identity.mapping_status == MappingStatus.UNIQUE
+    assert unknown.events[0].dedupe_key == known.events[0].dedupe_key
+    assert unknown.events[0].event_id == known.events[0].event_id
+
+
 def test_cryptopanic_invalid_timestamp_fails_safely(tmp_path):
     path = _identity_path(tmp_path)
     row = _post()
