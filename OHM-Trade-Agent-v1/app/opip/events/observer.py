@@ -377,7 +377,7 @@ def capture_external_event_intelligence(
         health_path = (
             event_file.parent / "provider_health.json"
             if isinstance(event_file, Path)
-            else ProviderHealthStore().path
+            else state_path.parent / "provider_health.json"
         )
         active_health = ProviderHealthStore(health_path)
 
