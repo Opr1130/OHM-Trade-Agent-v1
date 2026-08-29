@@ -795,6 +795,19 @@ def capture_external_event_intelligence(
             ),
         )
 
+    try:
+        active_store.maintain_lifecycle(
+            now=datetime.now(timezone.utc),
+            cold_after_days=int(
+                getattr(settings, "opip_event_cold_after_days", 30)
+            ),
+        )
+    except Exception:
+        telemetry.storage_errors += 1
+        logger.exception(
+            "O'Pip event storage lifecycle maintenance failed open"
+        )
+
     return ExternalEventCaptureResult(
         enabled=True,
         ran=True,
