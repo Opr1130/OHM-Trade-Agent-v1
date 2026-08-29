@@ -289,8 +289,9 @@ def _catalyst_identity(
 
     try:
         learned = parse_utc(
-            mapping.get("resolved_at_utc"),
-            field_name="resolved_at_utc",
+            mapping.get("identity_visible_at_utc")
+            or mapping.get("resolved_at_utc"),
+            field_name="identity_visible_at_utc",
         )
     except ValueError:
         learned = None
