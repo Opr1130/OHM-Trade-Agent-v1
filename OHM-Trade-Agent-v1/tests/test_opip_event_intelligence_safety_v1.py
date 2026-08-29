@@ -105,7 +105,7 @@ def test_event_foundation_files_do_not_reference_order_or_notification_actions()
 
 def test_event_capture_runs_after_real_protection_and_before_search_gate():
     source = (ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
-    active = source.index("monitor_active_main()")
+    active = source.rindex("monitor_active_main()")
     pending = source.index("monitor_pending_main()", active)
     early = source.index("_run_early_watch_if_due(", pending)
     paper = source.index("_run_paper_monitor_fail_open()", early)
