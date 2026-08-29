@@ -26,7 +26,10 @@ from app.opip.events.identity import (
     merge_point_in_time_mappings,
     resolve_registry_identity,
 )
-from app.opip.events.observer import capture_external_event_intelligence
+from app.opip.events.observer import (
+    _select_mapping_candidates,
+    capture_external_event_intelligence,
+)
 from app.opip.events.storage import EventStore
 from app.services.asset_display_identity import learn_verified_identity
 from app.services.cryptopanic import CryptoPanicAPIError
@@ -509,6 +512,52 @@ def test_point_in_time_inclusion_exclusion_and_expiry(tmp_path):
     )) == 1
 
 
+def test_visible_event_query_returns_latest_revision_only(tmp_path):
+    store = _store(tmp_path)
+    first = _canonical_event(headline="v1")
+    revised = _canonical_event(headline="v2")
+    first_visible = NOW + timedelta(seconds=2)
+    revised_visible = NOW + timedelta(seconds=4)
+    store.append(first, persisted_at=first_visible)
+    store.append(revised, persisted_at=revised_visible)
+
+    before_revision = store.get_visible_events(
+        asset_id="SOL",
+        decision_at=NOW + timedelta(seconds=3),
+    )
+    assert len(before_revision) == 1
+    assert before_revision[0].headline == "v1"
+
+    after_revision = store.get_visible_events(
+        asset_id="SOL",
+        decision_at=NOW + timedelta(seconds=5),
+    )
+    assert len(after_revision) == 1
+    assert after_revision[0].headline == "v2"
+    assert after_revision[0].revision_of == first.event_id
+
+
+def test_replay_preserves_canonical_append_order_for_equal_timestamps(tmp_path):
+    store = _store(tmp_path)
+    stamp = NOW + timedelta(seconds=2)
+    first = replace(
+        _canonical_event(event_key="z"),
+        event_id="zz-event",
+        dedupe_key="TEST:NEWS:Z:solana",
+    )
+    second = replace(
+        _canonical_event(event_key="a"),
+        event_id="aa-event",
+        dedupe_key="TEST:NEWS:A:solana",
+    )
+    store.append(first, persisted_at=stamp)
+    store.append(second, persisted_at=stamp)
+    assert [event.event_id for event in store.replay_events()] == [
+        "zz-event",
+        "aa-event",
+    ]
+
+
 def test_ambiguous_evidence_never_attaches_by_ticker_only(tmp_path):
     store = _store(tmp_path)
     base = _canonical_event()
@@ -578,6 +627,33 @@ def test_reopened_store_deduplicates_and_revises_against_archive(tmp_path):
     assert revised.event.revision_of == original.event_id
 
 
+def test_interrupted_jsonl_tail_is_quarantined_before_next_append(tmp_path):
+    store = _store(tmp_path)
+    store.append(
+        _canonical_event(event_key="first"),
+        persisted_at=NOW + timedelta(seconds=1),
+    )
+    with store.event_file.open("ab") as handle:
+        handle.write(b'{"event_id":"partial"')
+
+    reopened = _store(tmp_path)
+    reopened.append(
+        _canonical_event(event_key="second"),
+        persisted_at=NOW + timedelta(seconds=2),
+    )
+
+    quarantined = list(
+        store.event_file.parent.glob(
+            f"{store.event_file.name}.truncated-*.bin"
+        )
+    )
+    assert len(quarantined) == 1
+    assert b'"event_id":"partial"' in quarantined[0].read_bytes()
+    assert [
+        event.provider_event_id for event in reopened.replay_events()
+    ] == ["first", "second"]
+
+
 def test_archive_failure_never_deletes_hot_evidence(tmp_path, monkeypatch):
     import app.opip.events.storage as storage_module
 
@@ -595,6 +671,28 @@ def test_archive_failure_never_deletes_hot_evidence(tmp_path, monkeypatch):
 
     hot_lines = (tmp_path / "events" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(hot_lines) == 2
+
+
+def test_mapping_lookup_selection_rotates_to_prevent_asset_starvation():
+    assets = [
+        {"symbol": "AAA"},
+        {"symbol": "BBB"},
+        {"symbol": "CCC"},
+    ]
+    first = _select_mapping_candidates(
+        assets,
+        capture_started=NOW,
+        interval_seconds=300,
+        budget=1,
+    )
+    second = _select_mapping_candidates(
+        assets,
+        capture_started=NOW + timedelta(seconds=300),
+        interval_seconds=300,
+        budget=1,
+    )
+    assert len(first) == len(second) == 1
+    assert first[0]["symbol"] != second[0]["symbol"]
 
 
 def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path):
