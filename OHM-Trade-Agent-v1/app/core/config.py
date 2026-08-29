@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     cryptopanic_api_plan: str = "developer"
     coinmarketcal_api_key: str | None = None
 
+    # O'Pip Sequence 2 Event Intelligence Foundation. Dark by default.
+    # Enabling this records external evidence only; it does not participate in
+    # qualification, ranking, notification, paper admission, or exchange action.
+    opip_event_store_enabled: bool = False
+    opip_event_ingest_interval_seconds: int = Field(default=300, ge=60, le=3600)
+
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_enabled: bool = False
