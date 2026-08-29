@@ -109,6 +109,15 @@ class EventIdentity:
             0.0 <= float(self.mapping_confidence) <= 1.0
         ):
             raise ValueError("mapping_confidence must be between 0 and 1")
+        if self.mapping_status == MappingStatus.UNIQUE:
+            if (
+                not str(self.canonical_asset_id or "").strip()
+                or not str(self.canonical_asset_name or "").strip()
+                or self.identity_learned_at_utc is None
+            ):
+                raise ValueError(
+                    "UNIQUE identity requires canonical id/name and knowledge time"
+                )
 
 
 @dataclass(frozen=True)
@@ -139,6 +148,9 @@ class OPipEvent:
     normalizer_version: str = NORMALIZER_VERSION
 
     def __post_init__(self) -> None:
+        for name in ("event_id", "dedupe_key", "provider", "payload_hash"):
+            if not str(getattr(self, name) or "").strip():
+                raise ValueError(f"{name} is required")
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported O'Pip event schema_version={self.schema_version}"
@@ -301,8 +313,14 @@ class OPipEvent:
                 if payload.get("revision_of") is not None
                 else None
             ),
-            schema_version=int(payload.get("schema_version") or SCHEMA_VERSION),
+            schema_version=int(
+                payload["schema_version"]
+                if "schema_version" in payload
+                else SCHEMA_VERSION
+            ),
             normalizer_version=str(
-                payload.get("normalizer_version") or NORMALIZER_VERSION
+                payload["normalizer_version"]
+                if "normalizer_version" in payload
+                else NORMALIZER_VERSION
             ),
         )
