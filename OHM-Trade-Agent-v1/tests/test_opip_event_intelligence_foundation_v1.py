@@ -271,6 +271,8 @@ def test_cryptopanic_adapter_preserves_provenance_and_identity(tmp_path):
     assert event.provider == "CRYPTOPANIC"
     assert event.identity.mapping_status == MappingStatus.UNIQUE
     assert event.identity.canonical_asset_id == "solana"
+    assert event.source_metadata["source_domain"] == "example.com"
+    assert event.source_metadata["instrument"]["slug"] == "solana"
     assert event.persisted_at_utc is None
     assert event.decision_visible_at_utc is None
 
@@ -309,6 +311,7 @@ def test_coinmarketcal_adapter_uses_point_in_time_mapping(tmp_path):
     assert len(result.events) == 1
     assert result.events[0].identity.mapping_status == MappingStatus.UNIQUE
     assert result.events[0].event_class == EventClass.CATALYST
+    assert result.events[0].source_metadata["categories"] == ["Release"]
 
 
 def test_persistence_stamps_visibility_only_on_durable_row(tmp_path):
