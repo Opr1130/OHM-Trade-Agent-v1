@@ -102,6 +102,7 @@ class ProviderHealthSnapshot:
             "last_success_at_utc",
             "last_event_ingested_at_utc",
             "last_event_source_time_utc",
+            "last_observation_at_utc",
             "last_error_at_utc",
         ):
             value = getattr(self, name)
