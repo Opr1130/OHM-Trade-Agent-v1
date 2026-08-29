@@ -28,6 +28,7 @@ from app.opip.events.identity import (
 from app.opip.events.observer import capture_external_event_intelligence
 from app.opip.events.storage import EventStore
 from app.services.asset_display_identity import learn_verified_identity
+from app.services.cryptopanic import CryptoPanicAPIError
 
 
 NOW = datetime(2026, 8, 29, 5, 0, tzinfo=timezone.utc)
@@ -296,6 +297,31 @@ def test_cryptopanic_adapter_preserves_provenance_and_identity(tmp_path):
     assert event.decision_visible_at_utc is None
 
 
+def test_provider_timestamp_is_normalized_to_utc(tmp_path):
+    path = _identity_path(tmp_path)
+    row = _post()
+    row["published_at"] = "2026-08-29T01:00:00-04:00"
+    result = normalize_cryptopanic_posts(
+        [row],
+        ingest_time=NOW,
+        identity_registry_path=path,
+    )
+    assert len(result.events) == 1
+    assert result.events[0].source_event_time_utc == datetime(
+        2026, 8, 29, 5, 0, tzinfo=timezone.utc
+    )
+
+
+def test_malformed_provider_payload_is_contained():
+    result = normalize_cryptopanic_posts(
+        [None],  # type: ignore[list-item]
+        ingest_time=NOW,
+    )
+    assert result.events == ()
+    assert len(result.failures) == 1
+    assert result.failures[0].outcome.value == "MALFORMED_PAYLOAD"
+
+
 def test_cryptopanic_invalid_timestamp_fails_safely(tmp_path):
     path = _identity_path(tmp_path)
     row = _post()
@@ -361,6 +387,23 @@ def test_failed_persistence_cannot_be_point_in_time_visible(tmp_path):
         store.append(event)
     assert event.persisted_at_utc is None
     assert event.decision_visible_at_utc is None
+
+
+def test_reopened_store_preserves_schema_and_point_in_time_visibility(tmp_path):
+    store = _store(tmp_path)
+    persisted_at = NOW + timedelta(seconds=2)
+    result = store.append(_canonical_event(), persisted_at=persisted_at)
+    assert result.event is not None
+    assert result.event.schema_version == 1
+
+    reopened = _store(tmp_path)
+    rows = reopened.get_visible_events(
+        asset_id="solana",
+        decision_at=persisted_at,
+    )
+    assert len(rows) == 1
+    assert rows[0].schema_version == 1
+    assert rows[0].normalizer_version == "opip-event-normalizer-v1"
 
 
 def test_duplicate_and_revision_semantics(tmp_path):
@@ -530,6 +573,36 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
     # known before capture started, and visibility is later still (persistence).
     assert stored[0].ingest_time_utc >= NOW
     assert stored[0].decision_visible_at_utc >= stored[0].ingest_time_utc
+
+
+def test_provider_api_failure_is_fail_soft(tmp_path):
+    identity_path = _identity_path(tmp_path)
+    store = _store(tmp_path)
+
+    class OfflineCryptoClient:
+        def get_posts(self, symbols):
+            raise CryptoPanicAPIError("offline")
+
+    settings = SimpleNamespace(
+        opip_event_store_enabled=True,
+        opip_event_ingest_interval_seconds=300,
+        cryptopanic_auth_token="token",
+        cryptopanic_api_plan="developer",
+        coinmarketcal_api_key=None,
+    )
+    result = capture_external_event_intelligence(
+        settings=settings,
+        capture_started_at=NOW,
+        store=store,
+        identity_registry_path=identity_path,
+        coinmarketcal_cache_path=tmp_path / "no-cmc.json",
+        state_path=tmp_path / "state.json",
+        cryptopanic_client=OfflineCryptoClient(),
+        force=True,
+    )
+    assert result.ran
+    assert result.telemetry["provider_errors"] == 1
+    assert result.telemetry["events_persisted"] == 0
 
 
 def test_observer_storage_failure_is_fail_soft(tmp_path):
