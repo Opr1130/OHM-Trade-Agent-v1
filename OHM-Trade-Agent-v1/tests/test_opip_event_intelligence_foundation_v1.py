@@ -602,6 +602,42 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
     assert stored[0].decision_visible_at_utc >= stored[0].ingest_time_utc
 
 
+def test_coinmarketcal_cache_cannot_bypass_current_safe_identity(tmp_path):
+    legacy = _cmc_mapping_cache(tmp_path)
+    store = _store(tmp_path)
+
+    class CMCClient:
+        def get_coins(self, query):
+            raise AssertionError("unsafe mapping must not trigger identity lookup")
+        def get_events(self, slugs, from_time, to_time):
+            raise AssertionError("unsafe mapping must not trigger event fetch")
+
+    settings = SimpleNamespace(
+        opip_event_store_enabled=True,
+        opip_event_ingest_interval_seconds=300,
+        opip_event_mapping_lookups_per_capture=1,
+        cryptopanic_auth_token=None,
+        cryptopanic_api_plan="developer",
+        coinmarketcal_api_key="key",
+    )
+    result = capture_external_event_intelligence(
+        settings=settings,
+        capture_started_at=NOW,
+        store=store,
+        identity_registry_path=tmp_path / "missing-identity.json",
+        coinmarketcal_cache_path=tmp_path / "event-cmc.json",
+        legacy_coinmarketcal_cache_path=legacy,
+        state_path=tmp_path / "state.json",
+        coinmarketcal_client=CMCClient(),
+        sleep=lambda _: None,
+        force=True,
+    )
+    assert result.ran
+    assert result.telemetry["coinmarketcal_requests"] == 0
+    assert result.telemetry["coinmarketcal_mapping_requests"] == 0
+    assert tuple(store.iter_events()) == ()
+
+
 def test_coinmarketcal_non_finalist_identity_is_discovered_and_captured(tmp_path):
     identity_path = _identity_path(tmp_path)
     store = _store(tmp_path)
