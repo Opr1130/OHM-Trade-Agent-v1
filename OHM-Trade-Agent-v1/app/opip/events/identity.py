@@ -13,11 +13,23 @@ import re
 from typing import Any
 
 from app.opip.events.contract import EventIdentity, MappingStatus, parse_utc, require_utc
-from app.services.registry_io import RegistryIOError, load_json
+from app.services.registry_io import (
+    RegistryIOError,
+    load_json,
+    registry_lock,
+    save_json_atomic,
+)
 
 
 ASSET_IDENTITY_REGISTRY = Path("/app/data/asset_identity_registry.json")
-COINMARKETCAL_MAPPING_CACHE = Path("/app/data/coinmarketcal_coin_map.json")
+LEGACY_COINMARKETCAL_MAPPING_CACHE = Path("/app/data/coinmarketcal_coin_map.json")
+EVENT_COINMARKETCAL_MAPPING_CACHE = Path(
+    "/app/data/opip/events/coinmarketcal_identity_map.json"
+)
+# Backward-compatible name inside the Sequence 2 package. New shadow mappings
+# are kept separate from the current finalist-oriented production cache so
+# evidence collection cannot silently alter today's catalyst decision path.
+COINMARKETCAL_MAPPING_CACHE = EVENT_COINMARKETCAL_MAPPING_CACHE
 SYMBOL_ALIASES = {"XBT": "BTC", "XDG": "DOGE"}
 
 
@@ -229,3 +241,139 @@ def known_coinmarketcal_mappings(
         )
     result.sort(key=lambda item: (item["symbol"], item["coinmarketcal_slug"]))
     return tuple(result)
+
+
+
+def resolve_coinmarketcal_identity_mapping(
+    asset: dict[str, str],
+    rows: list[dict[str, Any]],
+    *,
+    resolved_at: datetime,
+) -> dict[str, str] | None:
+    """Resolve exactly one CoinMarketCal coin against verified CoinGecko identity."""
+    learned = require_utc(resolved_at, field_name="resolved_at")
+    symbol = normalize_symbol(asset.get("symbol"))
+    canonical_id = str(asset.get("canonical_asset_id") or "").strip()
+    canonical_name = str(asset.get("canonical_asset_name") or "").strip()
+    if not symbol or not canonical_id or not canonical_name:
+        return None
+
+    plausible: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_symbol = normalize_symbol(str(row.get("symbol") or ""))
+        row_name = str(row.get("name") or "").strip()
+        row_slug = str(row.get("slug") or "").strip()
+        identity_match = (
+            normalize_identity_text(row_name)
+            == normalize_identity_text(canonical_name)
+            or normalize_identity_text(row_slug)
+            == normalize_identity_text(canonical_id)
+        )
+        if row_symbol == symbol and row_slug and identity_match:
+            plausible.append(row)
+
+    if len(plausible) != 1:
+        return None
+
+    selected = plausible[0]
+    return {
+        "underlying_symbol": symbol,
+        "coingecko_id": canonical_id,
+        "coingecko_name": canonical_name,
+        "coinmarketcal_slug": str(selected.get("slug") or "").strip(),
+        "coinmarketcal_name": str(selected.get("name") or "").strip(),
+        "coinmarketcal_symbol": normalize_symbol(
+            str(selected.get("symbol") or "")
+        ),
+        "resolved_at": learned.isoformat(),
+    }
+
+
+def save_event_coinmarketcal_mapping(
+    mapping: dict[str, str],
+    *,
+    path: Path = EVENT_COINMARKETCAL_MAPPING_CACHE,
+) -> bool:
+    """Persist an identity-safe shadow mapping without touching production cache."""
+    symbol = normalize_symbol(mapping.get("underlying_symbol"))
+    required = (
+        "coingecko_id",
+        "coingecko_name",
+        "coinmarketcal_slug",
+        "coinmarketcal_name",
+        "coinmarketcal_symbol",
+        "resolved_at",
+    )
+    if not symbol or not all(str(mapping.get(key) or "").strip() for key in required):
+        return False
+    try:
+        parse_utc(str(mapping["resolved_at"]), field_name="resolved_at")
+    except ValueError:
+        return False
+
+    lock = path.parent / f".{path.name}.lock"
+    try:
+        with registry_lock(lock):
+            payload = _safe_payload(path)
+            stored = payload.get("mappings")
+            if not isinstance(stored, dict):
+                stored = {}
+            existing = stored.get(symbol)
+            if isinstance(existing, dict):
+                existing_id = str(existing.get("coingecko_id") or "").strip()
+                existing_slug = str(existing.get("coinmarketcal_slug") or "").strip()
+                if (
+                    existing_id
+                    and existing_id != str(mapping["coingecko_id"])
+                ) or (
+                    existing_slug
+                    and existing_slug != str(mapping["coinmarketcal_slug"])
+                ):
+                    # A conflict is not silently reassigned. The next operator
+                    # review can inspect provider identity evidence.
+                    return False
+                first_resolved = str(
+                    existing.get("resolved_at") or mapping["resolved_at"]
+                )
+            else:
+                first_resolved = str(mapping["resolved_at"])
+
+            row = dict(mapping)
+            row["underlying_symbol"] = symbol
+            row["resolved_at"] = first_resolved
+            stored[symbol] = row
+            payload["mappings"] = stored
+            save_json_atomic(path, payload)
+        return True
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+
+
+def merge_point_in_time_mappings(
+    *,
+    as_of: datetime,
+    paths: tuple[Path, ...],
+) -> tuple[dict[str, str], ...]:
+    """Merge safe mapping caches without allowing later rows to leak backward."""
+    combined: dict[tuple[str, str], dict[str, str]] = {}
+    for path in paths:
+        for item in known_coinmarketcal_mappings(as_of=as_of, path=path):
+            key = (
+                str(item.get("symbol") or ""),
+                str(item.get("coinmarketcal_slug") or ""),
+            )
+            existing = combined.get(key)
+            if existing is None:
+                combined[key] = dict(item)
+                continue
+            # Keep the earliest proven resolution time for identical mappings.
+            if str(item.get("resolved_at_utc") or "") < str(
+                existing.get("resolved_at_utc") or ""
+            ):
+                combined[key] = dict(item)
+    return tuple(
+        combined[key]
+        for key in sorted(combined)
+    )
