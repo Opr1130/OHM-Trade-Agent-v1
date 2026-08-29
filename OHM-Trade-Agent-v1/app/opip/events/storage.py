@@ -370,6 +370,13 @@ class EventStore:
         wanted = str(asset_id or "").strip().casefold()
         if not wanted:
             return True
+
+        # AMBIGUOUS/UNKNOWN evidence is retained for audit and later resolution,
+        # but must never silently attach to a canonical asset query merely
+        # because a ticker string happens to match.
+        if event.identity.mapping_status.value != "UNIQUE":
+            return False
+
         values = (
             event.identity.canonical_asset_id,
             event.identity.canonical_asset_name,
