@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 from statistics import mean
+import time
 from typing import Any, Iterable
 
 from app.opip.events.adapters import (
@@ -27,8 +28,11 @@ from app.opip.events.contract import IngestOutcome, MappingStatus, require_utc
 from app.opip.events.identity import (
     ASSET_IDENTITY_REGISTRY,
     COINMARKETCAL_MAPPING_CACHE,
-    known_coinmarketcal_mappings,
+    LEGACY_COINMARKETCAL_MAPPING_CACHE,
     known_unique_assets,
+    merge_point_in_time_mappings,
+    resolve_coinmarketcal_identity_mapping,
+    save_event_coinmarketcal_mapping,
 )
 from app.opip.events.storage import EventStore
 from app.services.coinmarketcal import CoinMarketCalAPIError, CoinMarketCalClient
@@ -65,6 +69,7 @@ class IngestionTelemetry:
     storage_errors: int = 0
     cryptopanic_requests: int = 0
     coinmarketcal_requests: int = 0
+    coinmarketcal_mapping_requests: int = 0
     lag_samples_seconds: list[float] | None = None
 
     def __post_init__(self) -> None:
@@ -89,6 +94,7 @@ class IngestionTelemetry:
             "storage_errors": self.storage_errors,
             "cryptopanic_requests": self.cryptopanic_requests,
             "coinmarketcal_requests": self.coinmarketcal_requests,
+            "coinmarketcal_mapping_requests": self.coinmarketcal_mapping_requests,
             "lag_min_seconds": min(lags) if lags else None,
             "lag_mean_seconds": mean(lags) if lags else None,
             "lag_max_seconds": max(lags) if lags else None,
@@ -219,9 +225,11 @@ def capture_external_event_intelligence(
     store: EventStore | None = None,
     identity_registry_path: Path = ASSET_IDENTITY_REGISTRY,
     coinmarketcal_cache_path: Path = COINMARKETCAL_MAPPING_CACHE,
+    legacy_coinmarketcal_cache_path: Path = LEGACY_COINMARKETCAL_MAPPING_CACHE,
     state_path: Path = INGEST_STATE_FILE,
     cryptopanic_client: Any | None = None,
     coinmarketcal_client: Any | None = None,
+    sleep: Any = time.sleep,
     force: bool = False,
 ) -> ExternalEventCaptureResult:
     """Capture discrete provider evidence without current finalist selection."""
@@ -320,10 +328,80 @@ def capture_external_event_intelligence(
                 "O'Pip CryptoPanic event normalization failed open"
             )
 
-    mappings = known_coinmarketcal_mappings(
-        as_of=capture_started,
-        path=coinmarketcal_cache_path,
+    mappings = list(
+        merge_point_in_time_mappings(
+            as_of=capture_started,
+            paths=(
+                coinmarketcal_cache_path,
+                legacy_coinmarketcal_cache_path,
+            ),
+        )
     )
+    api_key = str(
+        getattr(settings, "coinmarketcal_api_key", "") or ""
+    ).strip()
+    cmc_client = (
+        coinmarketcal_client or CoinMarketCalClient(api_key)
+        if api_key
+        else None
+    )
+
+    # Expand catalyst coverage independently of trading finalists. New
+    # mappings are written only to the Sequence 2 shadow cache; the existing
+    # production finalist mapping cache is read-only here.
+    mapped_symbols = {
+        str(item.get("symbol") or "")
+        for item in mappings
+        if item.get("symbol")
+    }
+    lookup_budget = int(
+        getattr(settings, "opip_event_mapping_lookups_per_capture", 1)
+    )
+    unresolved_assets = [
+        item
+        for item in assets
+        if item.get("symbol") not in mapped_symbols
+    ]
+    mapping_request_made = False
+    if cmc_client is not None and lookup_budget > 0:
+        for asset in unresolved_assets[:lookup_budget]:
+            telemetry.coinmarketcal_mapping_requests += 1
+            mapping_request_made = True
+            try:
+                rows = cmc_client.get_coins(str(asset["symbol"]))
+            except CoinMarketCalAPIError:
+                telemetry.provider_errors += 1
+                logger.warning(
+                    "O'Pip CoinMarketCal identity lookup unavailable for %s",
+                    asset.get("symbol"),
+                )
+                continue
+
+            learned_at = datetime.now(timezone.utc)
+            mapping = resolve_coinmarketcal_identity_mapping(
+                asset,
+                rows,
+                resolved_at=learned_at,
+            )
+            if mapping is None:
+                continue
+            if not save_event_coinmarketcal_mapping(
+                mapping,
+                path=coinmarketcal_cache_path,
+            ):
+                telemetry.storage_errors += 1
+                continue
+            mappings = list(
+                merge_point_in_time_mappings(
+                    as_of=datetime.now(timezone.utc),
+                    paths=(
+                        coinmarketcal_cache_path,
+                        legacy_coinmarketcal_cache_path,
+                    ),
+                )
+            )
+            mapped_symbols.add(str(asset["symbol"]))
+
     slugs = sorted(
         {
             item["coinmarketcal_slug"]
@@ -331,19 +409,20 @@ def capture_external_event_intelligence(
             if item.get("coinmarketcal_slug")
         }
     )
-    api_key = str(
-        getattr(settings, "coinmarketcal_api_key", "") or ""
-    ).strip()
     catalyst_rows: list[dict[str, Any]] = []
-    if api_key and slugs:
-        client = coinmarketcal_client or CoinMarketCalClient(api_key)
+    if cmc_client is not None and slugs:
+        # The current CoinMarketCal plan is paced conservatively. If this
+        # capture performed a coin-identity lookup, leave one interval before
+        # the batched event request.
+        if mapping_request_made:
+            sleep(1.05)
         try:
             for batch_slugs in _chunks(
                 slugs,
                 COINMARKETCAL_BATCH_SIZE,
             ):
                 telemetry.coinmarketcal_requests += 1
-                rows = client.get_events(
+                rows = cmc_client.get_events(
                     batch_slugs,
                     capture_started,
                     capture_started + timedelta(days=7),
@@ -361,10 +440,20 @@ def capture_external_event_intelligence(
     if catalyst_rows:
         catalyst_ingest_at = datetime.now(timezone.utc)
         try:
+            # Only mappings actually learned by event receipt can resolve this
+            # batch; this includes safe legacy mappings and any shadow mapping
+            # learned earlier in this same capture.
+            visible_mappings = merge_point_in_time_mappings(
+                as_of=catalyst_ingest_at,
+                paths=(
+                    coinmarketcal_cache_path,
+                    legacy_coinmarketcal_cache_path,
+                ),
+            )
             batch = normalize_coinmarketcal_events(
                 catalyst_rows,
                 ingest_time=catalyst_ingest_at,
-                mappings=mappings,
+                mappings=visible_mappings,
                 normalized_at=datetime.now(timezone.utc),
             )
             _record_adapter_result(
