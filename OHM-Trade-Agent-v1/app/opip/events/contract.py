@@ -126,7 +126,6 @@ class OPipEvent:
     dedupe_key: str
     provider: str
     provider_event_id: str | None
-    source_sequence: str | None
     event_class: EventClass
     payload_hash: str
     source_event_time_utc: datetime
@@ -134,6 +133,7 @@ class OPipEvent:
     normalized_at_utc: datetime
     identity: EventIdentity
     headline: str
+    source_sequence: str | None = None
     summary: str | None = None
     source_reference: str | None = None
     # Sanitized provider-specific evidence needed for future audit/replay.
