@@ -2,7 +2,7 @@
 
 ## Status
 
-Sequence 2 foundation. Shadow / evidence-only.
+Sequence 2 foundation and hardening. Shadow / evidence-only.
 
 The application-level default remains dark with
 `OPIP_EVENT_STORE_ENABLED=false`. Production Docker Compose explicitly
@@ -127,6 +127,13 @@ current identity-safe validation relearns them with a timestamp.
 AMBIGUOUS and UNKNOWN events are retained as evidence, but canonical asset
 queries refuse to attach them merely by matching ticker text.
 
+The identity registry also supports separately timestamped verified aliases,
+venue instruments/perpetual identifiers, chain+contract identities, and
+conservative exact free-text mention resolution. These bindings never create a
+canonical asset on their own and are eligible only when their own knowledge
+timestamp is not later than the point-in-time query. Collisions fail closed to
+AMBIGUOUS.
+
 CoinMarketCal's existing mapping cache already records `resolved_at`; only
 mappings resolved by the capture time are eligible. Sequence 2 may also learn
 the same identity-safe mapping independently into:
@@ -166,11 +173,15 @@ HOT storage.
 
 ## Canonical event record
 
-The v1 record includes:
+New writes use schema v2; schema v1 rows remain replay-compatible. The record
+includes:
 
 - `event_id`, `dedupe_key`, `schema_version`, `normalizer_version`
 - provider, provider event ID, and optional provider source sequence
 - event class (NEWS or CATALYST)
+- finer canonical event type (for example NEWS_SECURITY or TOKEN_UNLOCK)
+- canonical severity (INFO / LOW / MEDIUM / HIGH / CRITICAL)
+- canonical provenance object with provider/source lineage and adapter version
 - payload hash
 - the complete temporal contract
 - source identity and canonical identity state
@@ -218,9 +229,50 @@ An interrupted trailing JSONL write is quarantined as forensic bytes before the
 invalid tail is truncated, preventing one partial write from permanently
 blocking later archive verification.
 
-Archives are included in deterministic replay and point-in-time reads. Local
-archive lifecycle beyond this foundation is a later storage-maturity concern;
-canonical history is not silently purged in Sequence 2.
+Archives are included in deterministic replay and point-in-time reads.
+
+The lifecycle now has explicit local tiers:
+
+```text
+HOT events.jsonl
+    -> verified WARM gzip segments
+    -> verified local COLD segments after the age threshold
+```
+
+WARM-to-COLD promotion copies archive+checksum into a temporary segment,
+re-verifies the copy, atomically publishes the segment directory, records it in
+the archive manifest, and only then removes the WARM copy. COLD evidence is
+never automatically purged. Storage statistics expose HOT, WARM, COLD and
+dead-letter growth. Off-host retention remains the platform backup concern,
+not an event-ingestion authority.
+
+## Provider health and freshness
+
+O'Pip persists a canonical provider-health state independently of decision
+authority:
+
+- `HEALTHY`
+- `NO_EVENT`
+- `STALE`
+- `UNAVAILABLE`
+- `RATE_LIMITED`
+- `MISSING_CREDENTIALS`
+- `DEGRADED`
+
+The durable provider snapshot records last attempt, last success, last event
+ingest/source time, last error, consecutive failures, request/event counts,
+fresh/stale counts, retry-after information, latest lag, freshness age and a
+secret-safe reason.
+
+CryptoPanic and CoinMarketCal are updated directly by the independent event
+observer. CoinGecko health is updated from the existing reference/global
+context calls, and Coinalyze health is updated from the existing market
+intelligence provider results. These writes are fail-soft and cannot influence
+the evidence consumer or trading path.
+
+This explicitly distinguishes a successful request with zero events
+(`NO_EVENT`) from missing credentials, stale observations, rate limiting,
+provider failure, and partial/degraded evidence.
 
 ## Failure isolation and observability
 
