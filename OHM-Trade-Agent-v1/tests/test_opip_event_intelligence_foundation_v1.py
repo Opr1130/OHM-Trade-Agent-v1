@@ -31,7 +31,10 @@ from app.opip.events.observer import (
     capture_external_event_intelligence,
 )
 from app.opip.events.storage import EventStore
-from app.services.asset_display_identity import learn_verified_identity
+from app.services.asset_display_identity import (
+    learn_verified_identity,
+    resolve_asset_identity,
+)
 from app.services.cryptopanic import CryptoPanicAPIError
 
 
@@ -199,6 +202,35 @@ def test_identity_learned_before_event_is_eligible(tmp_path):
     assert identity.mapping_status == MappingStatus.UNIQUE
     assert identity.canonical_asset_id == "solana"
     assert identity.identity_learned_at_utc == NOW - timedelta(hours=2)
+
+
+def test_identity_revalidation_preserves_first_known_time(tmp_path):
+    path = tmp_path / "asset_identity_registry.json"
+    first_known = NOW - timedelta(hours=3)
+    assert learn_verified_identity(
+        base_asset="SOL",
+        pair="SOLUSD",
+        display_name="Solana",
+        source="COINGECKO",
+        source_id="solana",
+        path=path,
+        learned_at=first_known,
+    )
+    assert learn_verified_identity(
+        base_asset="SOL",
+        pair="SOLUSD",
+        display_name="Solana",
+        source="COINGECKO",
+        source_id="solana",
+        path=path,
+        learned_at=NOW,
+    )
+    identity = resolve_asset_identity(
+        base_asset="SOL",
+        pair="SOLUSD",
+        path=path,
+    )
+    assert identity.learned_at_utc == first_known.isoformat()
 
 
 def test_identity_learned_after_event_is_not_retroactive(tmp_path):
