@@ -9,12 +9,18 @@ services:
       - ./deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
     read_only: true
+    pids_limit: 128
     security_opt:
       - no-new-privileges:true
     tmpfs:
       - /var/cache/nginx
       - /var/run
       - /tmp
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     entrypoint:
       - nginx
       - -g
@@ -34,3 +40,24 @@ services:
     volumes:
       - ./data:/app/data
       - ./data/freqtrade/state:/app/freqtrade_paper:ro
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); assert r.status == 200 and b'\"status\":\"ok\"' in r.read()"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

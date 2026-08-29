@@ -48,7 +48,9 @@ services:
     depends_on:
       ohm-freqtrade-paper-init:
         condition: service_completed_successfully
-    mem_limit: 384m
+    # Two Freqtrade workers share this container. 384m caused repeat cgroup OOM kills
+    # during second-worker startup on the 2 GB production host.
+    mem_limit: 768m
     cpus: "0.40"
     pids_limit: 256
     oom_score_adj: 500
