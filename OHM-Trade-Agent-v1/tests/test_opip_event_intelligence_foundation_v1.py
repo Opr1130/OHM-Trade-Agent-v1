@@ -560,6 +560,7 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
         store=store,
         identity_registry_path=identity_path,
         coinmarketcal_cache_path=tmp_path / "no-cmc.json",
+        legacy_coinmarketcal_cache_path=tmp_path / "no-legacy-cmc.json",
         state_path=tmp_path / "ingest-state.json",
         cryptopanic_client=client,
         force=True,
@@ -573,6 +574,55 @@ def test_observer_captures_non_finalist_known_asset_without_candidates(tmp_path)
     # known before capture started, and visibility is later still (persistence).
     assert stored[0].ingest_time_utc >= NOW
     assert stored[0].decision_visible_at_utc >= stored[0].ingest_time_utc
+
+
+def test_coinmarketcal_non_finalist_identity_is_discovered_and_captured(tmp_path):
+    identity_path = _identity_path(tmp_path)
+    store = _store(tmp_path)
+    event_mapping_path = tmp_path / "event-cmc-map.json"
+
+    class CMCClient:
+        def __init__(self):
+            self.coin_calls = []
+            self.event_calls = []
+        def get_coins(self, query):
+            self.coin_calls.append(query)
+            return [{"symbol": "SOL", "name": "Solana", "slug": "solana"}]
+        def get_events(self, slugs, from_time, to_time):
+            self.event_calls.append(tuple(slugs))
+            return [_cmc_event()]
+
+    client = CMCClient()
+    settings = SimpleNamespace(
+        opip_event_store_enabled=True,
+        opip_event_ingest_interval_seconds=300,
+        opip_event_mapping_lookups_per_capture=1,
+        cryptopanic_auth_token=None,
+        cryptopanic_api_plan="developer",
+        coinmarketcal_api_key="key",
+    )
+    result = capture_external_event_intelligence(
+        settings=settings,
+        capture_started_at=NOW,
+        store=store,
+        identity_registry_path=identity_path,
+        coinmarketcal_cache_path=event_mapping_path,
+        legacy_coinmarketcal_cache_path=tmp_path / "legacy-cmc.json",
+        state_path=tmp_path / "state.json",
+        coinmarketcal_client=client,
+        sleep=lambda _: None,
+        force=True,
+    )
+    assert result.ran
+    assert client.coin_calls == ["SOL"]
+    assert client.event_calls == [("solana",)]
+    assert result.telemetry["coinmarketcal_mapping_requests"] == 1
+    assert result.telemetry["events_persisted"] == 1
+    stored = tuple(store.iter_events())
+    assert len(stored) == 1
+    assert stored[0].event_class == EventClass.CATALYST
+    assert stored[0].identity.mapping_status == MappingStatus.UNIQUE
+    assert event_mapping_path.exists()
 
 
 def test_provider_api_failure_is_fail_soft(tmp_path):
@@ -596,6 +646,7 @@ def test_provider_api_failure_is_fail_soft(tmp_path):
         store=store,
         identity_registry_path=identity_path,
         coinmarketcal_cache_path=tmp_path / "no-cmc.json",
+        legacy_coinmarketcal_cache_path=tmp_path / "no-legacy-cmc.json",
         state_path=tmp_path / "state.json",
         cryptopanic_client=OfflineCryptoClient(),
         force=True,
@@ -631,6 +682,7 @@ def test_observer_storage_failure_is_fail_soft(tmp_path):
         store=BrokenStore(),
         identity_registry_path=identity_path,
         coinmarketcal_cache_path=tmp_path / "no-cmc.json",
+        legacy_coinmarketcal_cache_path=tmp_path / "no-legacy-cmc.json",
         state_path=tmp_path / "state.json",
         cryptopanic_client=CryptoClient(),
         force=True,
