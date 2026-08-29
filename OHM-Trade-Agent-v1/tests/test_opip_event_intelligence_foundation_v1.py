@@ -23,6 +23,7 @@ from app.opip.events.contract import (
 )
 from app.opip.events.identity import (
     known_unique_assets,
+    merge_point_in_time_mappings,
     resolve_registry_identity,
 )
 from app.opip.events.observer import capture_external_event_intelligence
@@ -334,6 +335,31 @@ def test_cryptopanic_invalid_timestamp_fails_safely(tmp_path):
     assert result.events == ()
     assert result.failures
     assert result.failures[0].outcome.value == "INVALID_TIMESTAMP"
+
+
+def test_conflicting_coinmarketcal_mapping_caches_fail_closed(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    base = {
+        "underlying_symbol": "SOL",
+        "coingecko_id": "solana",
+        "coingecko_name": "Solana",
+        "coinmarketcal_name": "Solana",
+        "coinmarketcal_symbol": "SOL",
+        "resolved_at": (NOW - timedelta(days=1)).isoformat(),
+    }
+    first.write_text(
+        json.dumps({"mappings": {"SOL": {**base, "coinmarketcal_slug": "solana"}}}),
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps({"mappings": {"SOL": {**base, "coinmarketcal_slug": "wrong-sol"}}}),
+        encoding="utf-8",
+    )
+    assert merge_point_in_time_mappings(
+        as_of=NOW,
+        paths=(first, second),
+    ) == ()
 
 
 def test_coinmarketcal_adapter_uses_point_in_time_mapping(tmp_path):
