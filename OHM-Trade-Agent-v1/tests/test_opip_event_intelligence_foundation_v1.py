@@ -447,6 +447,32 @@ def test_archive_before_compact_is_replayable(tmp_path):
     assert [item.provider_event_id for item in replay] == ["0", "1", "2", "3"]
 
 
+def test_reopened_store_deduplicates_and_revises_against_archive(tmp_path):
+    store = _store(tmp_path, max_bytes=10_000_000, keep_lines=1)
+    original = _canonical_event(event_key="archive-key", headline="v1")
+    store.append(original, persisted_at=NOW + timedelta(seconds=1))
+    store.append(
+        _canonical_event(event_key="other"),
+        persisted_at=NOW + timedelta(seconds=2),
+    )
+    assert list((tmp_path / "events" / "archive").glob("events-*.jsonl.gz"))
+
+    reopened = _store(tmp_path, max_bytes=10_000_000, keep_lines=1)
+    duplicate = reopened.append(
+        _canonical_event(event_key="archive-key", headline="v1"),
+        persisted_at=NOW + timedelta(seconds=3),
+    )
+    assert duplicate.outcome.value == "DUPLICATE"
+
+    revised = reopened.append(
+        _canonical_event(event_key="archive-key", headline="v2"),
+        persisted_at=NOW + timedelta(seconds=4),
+    )
+    assert revised.outcome.value == "REVISION"
+    assert revised.event is not None
+    assert revised.event.revision_of == original.event_id
+
+
 def test_archive_failure_never_deletes_hot_evidence(tmp_path, monkeypatch):
     import app.opip.events.storage as storage_module
 
