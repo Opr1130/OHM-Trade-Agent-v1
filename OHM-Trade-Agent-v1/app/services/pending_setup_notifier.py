@@ -122,10 +122,10 @@ def format_pending_setup_message(
         f"Entry zone: {float(setup.entry_low):.8g} - {float(setup.entry_high):.8g}\n"
         f"Do not chase: {float(setup.chase_limit):.8g} | Stop: {float(setup.stop_price):.8g}\n"
         f"T1 / T2: {float(setup.target_1):.8g} / {float(setup.target_2):.8g}\n"
-        f"Confidence*: {int(setup.confidence)}% | Risk: {setup.risk_level.upper()} | Downside: {downside:.1f}%\n"
+        f"Setup Score: {int(setup.confidence)}/100 (not probability) | Risk: {setup.risk_level.upper()} | Downside: {downside:.1f}%\n"
         f"Reason: {one_line_reason(result.reason)}\n"
         f"Action: {action}\n"
-        "*Heuristic confidence, not probability."
+        "Score is deterministic setup quality, not a calibrated probability."
     )
 
 
@@ -518,23 +518,3 @@ def send_pending_setup_update(
         bot_token=bot_token,
         chat_id=chat_id,
         message=format_pending_setup_message(setup, result),
-        identity=identity,
-        alert_family="PENDING_SETUP",
-        event_type=result.status,
-        fingerprint=fingerprint,
-        symbol=setup.symbol,
-        trade_id=setup.trade_id,
-    )
-
-    if delivery.delivered:
-        _persist_delivered_state(
-            setup=setup,
-            result=result,
-            message_id=delivery.message_id,
-        )
-        record_emitted(
-            identity=identity,
-            event_type=result.status,
-            fingerprint=fingerprint,
-        )
-    return delivery.delivered
