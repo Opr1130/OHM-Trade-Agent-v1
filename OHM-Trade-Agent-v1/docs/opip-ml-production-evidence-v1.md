@@ -43,6 +43,11 @@ The ML seed contains market/technical/momentum/volatility/liquidity evidence
 such as price, EMA, RSI, MACD, ATR, volume ratio, range statistics, momentum,
 ticker bid/ask, and cross-pair market measurements.
 
+Price semantics are source-specific. The contemporaneous ticker is stored as
+ticker_last/reference_price. completed_close is populated only for
+LIVE_OPPORTUNITY_SCAN, where last_price is explicitly a completed-candle close;
+ticker-only LIVE_FULL_MARKET observations leave completed_close missing.
+
 The following remain outside the independent ML feature mapping:
 
 - opportunity_score
@@ -54,15 +59,22 @@ Those values may appear only in the capture wrapper's audit_context.
 
 ## Storage
 
-FeatureSnapshots are immutable deterministic contracts and are appended to:
+FeatureSnapshots are immutable deterministic contracts stored as atomic,
+compressed JSONL batch chunks under:
 
-/app/data/opip_ml_feature_snapshots_v1.jsonl.gz
+/app/data/opip_ml_feature_snapshots_v1/
 
-The gzip file is append-only compressed evidence. A separate durable checkpoint
-tracks the accepted P1 evidence-ledger cursor. Before appending, the worker
-reconstructs deterministic ML snapshot identities from the compressed store, so
-a crash after a durable write but before checkpoint persistence is deduplicated
-on retry.
+Each batch is serialized and gzip-compressed in memory, fsynced to a temporary
+file, and atomically renamed into the snapshot directory. An interrupted write
+therefore cannot publish a truncated gzip member. Chunk names are deterministic
+from the consumed ledger range and compressed payload; if a crash occurs after
+the chunk rename but before checkpoint persistence, the retry recognizes the
+same chunk instead of publishing duplicate training evidence.
+
+The durable checkpoint stores both next_line and byte_offset. Each capture pass
+seeks directly to the last committed byte in the P1 evidence ledger and reads
+only a bounded batch of new complete JSONL rows. Historical snapshot chunks and
+the historical ledger prefix are not rescanned on every minute.
 
 Health:
 
@@ -106,7 +118,8 @@ A healthy production capture should show:
 - temporal_violations = 0
 - malformed = 0 or understood/dead-lettered
 - processed > 0 after a new broad scan
-- compressed FeatureSnapshot rows with max_visible_at_utc <= decision_at_utc
+- atomic compressed FeatureSnapshot chunks with max_visible_at_utc <= decision_at_utc
+- byte_offset advancing monotonically without historical rescans
 - Phase 3C outcomes maturing independently
 - no change to deterministic alerts, risk gates, paper admission, or exchange
   authority
