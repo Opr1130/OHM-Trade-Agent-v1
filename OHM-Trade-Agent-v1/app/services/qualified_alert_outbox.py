@@ -77,6 +77,7 @@ def queue_qualified_alert(
         row["action"] = str(action)
         row["direction"] = str(direction).upper()
         row["identity"] = str(identity)
+        row["policy_identity"] = f"{str(direction).upper()}:{plan.symbol}"
         row["fingerprint"] = str(fingerprint)
         row["symbol"] = plan.symbol
         row["plan"] = asdict(plan)
@@ -228,8 +229,9 @@ def _retry_one(
         _remove(trade_id, token=lease_token)
         return "DELIVERED"
 
+    policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(
-        identity=identity,
+        identity=policy_identity,
         event_type="OPPORTUNITY",
         fingerprint=fingerprint,
     )
@@ -252,7 +254,7 @@ def _retry_one(
     )
     if not delivery.delivered:
         release_emit(
-            identity=identity,
+            identity=policy_identity,
             event_type="OPPORTUNITY",
             reservation_token=reservation,
         )
@@ -260,7 +262,7 @@ def _retry_one(
         return "SEND_FAILED"
 
     confirm_emit(
-        identity=identity,
+        identity=policy_identity,
         event_type="OPPORTUNITY",
         fingerprint=fingerprint,
         reservation_token=reservation,
