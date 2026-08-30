@@ -173,3 +173,18 @@ def test_binance_connect_and_subscribe_contract(monkeypatch):
         "ethusdt@forceOrder",
     }
     assert captured["kwargs"]["max_queue"] == 16
+
+
+def test_binance_reconnect_epoch_is_explicit_boundary():
+    adapter = BinancePublicAdapter(symbols=("BTCUSDT",))
+    payload = {
+        "e": "aggTrade", "E": 1, "a": 100, "s": "BTCUSDT",
+        "p": "60000", "q": "1", "T": 1788048000000, "m": False,
+    }
+    first = adapter.normalize(_queued(StreamType.AGG_TRADE, payload, epoch=0))
+    next_epoch = adapter.normalize(
+        _queued(StreamType.AGG_TRADE, dict(payload, a=101), epoch=1)
+    )
+    assert first.sequence.status is SequenceStatus.FIRST
+    assert next_epoch.sequence.status is SequenceStatus.RESET_NEW_EPOCH
+    assert next_epoch.sequence.epoch_changed is True
