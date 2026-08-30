@@ -230,8 +230,10 @@ def _feature_snapshot_metrics(
             continue
 
         features = feature_snapshot.get("features")
-        if not isinstance(features, list) or not features:
-            safe.append(wrapper)
+        if not isinstance(features, list):
+            malformed += 1
+            continue
+        if not features:
             continue
 
         feature_temporal_violation = False
@@ -287,6 +289,14 @@ def _feature_snapshot_metrics(
         regimes,
         assets,
     )
+
+
+def _positive_revision(row: Mapping[str, Any], field: str) -> bool:
+    """Return whether one evidence revision is a positive integer."""
+    try:
+        return int(row.get(field)) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _horizon_counts(linkages: Iterable[Any]) -> Counter[str]:
@@ -354,18 +364,30 @@ def build_ml_data_readiness_report(
         + int(health.get("temporal_violations", 0) or 0)
         + dead_letter_pit
     )
-    phase_malformed = sum(
-        1
-        for row in phase_all
-        if not str(row.get("snapshot_id") or "").strip()
-        or not str(row.get("outcome_record_id") or "").strip()
-    )
-    paper_malformed = sum(
-        1
-        for row in paper_all
-        if not str(row.get("paper_trade_id") or "").strip()
-        or not str(row.get("episode_id") or "").strip()
-    )
+    phase_safe: list[Mapping[str, Any]] = []
+    phase_malformed = 0
+    for row in phase_all:
+        if (
+            not str(row.get("snapshot_id") or "").strip()
+            or not str(row.get("outcome_record_id") or "").strip()
+            or not _positive_revision(row, "outcome_revision")
+        ):
+            phase_malformed += 1
+            continue
+        phase_safe.append(row)
+
+    paper_safe: list[Mapping[str, Any]] = []
+    paper_malformed = 0
+    for row in paper_all:
+        if (
+            not str(row.get("paper_trade_id") or "").strip()
+            or not str(row.get("episode_id") or "").strip()
+            or not _positive_revision(row, "revision")
+        ):
+            paper_malformed += 1
+            continue
+        paper_safe.append(row)
+
     malformed_records = (
         canonical_malformed
         + feature_malformed
@@ -375,14 +397,18 @@ def build_ml_data_readiness_report(
         + int(health.get("malformed", 0) or 0)
     )
 
-    # Conflicting duplicate identities are removed above, so linkage remains
-    # deterministic and never silently picks an arbitrary duplicate.
-    linkages = build_learning_linkage_records(
-        canonical_rows=canonical_safe,
-        ml_snapshot_rows=ml_safe,
-        phase3c_outcome_rows=phase_all,
-        paper_trade_rows=paper_all,
-    )
+    # Linkage conflicts fail closed into malformed evidence rather than aborting
+    # the readiness report.
+    try:
+        linkages = build_learning_linkage_records(
+            canonical_rows=canonical_safe,
+            ml_snapshot_rows=ml_safe,
+            phase3c_outcome_rows=phase_safe,
+            paper_trade_rows=paper_safe,
+        )
+    except ValueError:
+        malformed_records += 1
+        linkages = ()
 
     feature_bearing = sum(
         1
@@ -413,12 +439,6 @@ def build_ml_data_readiness_report(
         row.cohort is LearningCohort.OBSERVATION_ONLY for row in linkages
     )
     usable = sum(row.primary_supervised_eligible for row in linkages)
-    training_direction: Counter[str] = Counter(
-        str(row.normalized_outcome.direction)
-        for row in linkages
-        if row.primary_supervised_eligible
-        and row.normalized_outcome.direction in {"LONG", "SHORT"}
-    )
 
     exclusions: Counter[str] = Counter()
     censored = ambiguous = data_gap = mfe_available = mae_available = 0
@@ -456,9 +476,12 @@ def build_ml_data_readiness_report(
     if missing_rate > active_policy.maximum_missing_feature_rate:
         blockers.append("FEATURE_MISSINGNESS_ABOVE_POLICY")
         structural = True
-    trainable_direction_count = sum(training_direction.values())
-    if feature_bearing > 0 and final_truth > 0 and trainable_direction_count == 0:
-        blockers.append("NO_TRAINABLE_DIRECTION_LINKAGE")
+    trainable_direction_count = direction.get("LONG", 0) + direction.get("SHORT", 0)
+    if feature_bearing > 0 and trainable_direction_count == 0:
+        blockers.append("NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS")
+        structural = True
+    if exclusions.get("ML_DIRECTION_NOT_TRAINABLE", 0):
+        blockers.append("ML_DIRECTION_LINKAGE_NOT_TRAINABLE")
         structural = True
     if exclusions.get("DIRECTION_LINK_MISMATCH", 0):
         blockers.append("DIRECTION_LINK_MISMATCH_PRESENT")
@@ -473,10 +496,10 @@ def build_ml_data_readiness_report(
     if usable < active_policy.minimum_primary_supervised_rows:
         blockers.append("INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT")
     if active_policy.require_long_and_short:
-        if training_direction.get("LONG", 0) == 0:
-            blockers.append("LONG_TRAINING_DIRECTION_MISSING")
-        if training_direction.get("SHORT", 0) == 0:
-            blockers.append("SHORT_TRAINING_DIRECTION_MISSING")
+        if direction.get("LONG", 0) == 0:
+            blockers.append("LONG_FEATURE_COVERAGE_MISSING")
+        if direction.get("SHORT", 0) == 0:
+            blockers.append("SHORT_FEATURE_COVERAGE_MISSING")
 
     if structural:
         state = MLReadinessState.NOT_READY
