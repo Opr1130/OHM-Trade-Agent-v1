@@ -14,6 +14,18 @@ from app.opip.ml.contracts import (
 from app.opip.ml.temporal import require_utc
 
 
+_COHORT_FIELDS = frozenset(
+    {"canonical_asset_id", "venue", "pair", "direction", "lane", "regime", "candidate_id"}
+)
+
+
+def _matches_cohort(snapshot: FeatureSnapshot, cohort_filter: Mapping[str, object]) -> bool:
+    unsupported = sorted(set(cohort_filter) - _COHORT_FIELDS)
+    if unsupported:
+        raise ValueError("unsupported cohort_filter keys: " + ", ".join(unsupported))
+    return all(getattr(snapshot, key) == value for key, value in cohort_filter.items())
+
+
 def build_dataset_manifest(
     *,
     snapshots: Iterable[FeatureSnapshot],
@@ -75,7 +87,9 @@ def build_dataset_manifest(
         )
         historical = labels_by_snapshot.get(snapshot.snapshot_id, [])
 
-        if snapshot.feature_schema_version != feature_schema_version:
+        if not _matches_cohort(snapshot, cohort_filter):
+            reason = "COHORT_FILTER_MISMATCH"
+        elif snapshot.feature_schema_version != feature_schema_version:
             reason = "FEATURE_SCHEMA_MISMATCH"
         elif snapshot.feature_calc_version != feature_calc_version:
             reason = "FEATURE_CALC_VERSION_MISMATCH"
@@ -161,6 +175,7 @@ def build_dataset_manifest(
             "censored": "EXCLUDE",
             "execution_path_ambiguous": "EXCLUDE",
             "data_gap": "EXCLUDE",
+            "cohort_filter": "APPLY_EXACT_MATCH",
             "deterministic_audit_fields": "EXCLUDE_FROM_FEATURES",
             "label_schema_version_match": "REQUIRE_EXACT",
             "label_version_match": "REQUIRE_EXACT",
