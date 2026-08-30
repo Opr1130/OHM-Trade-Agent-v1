@@ -76,6 +76,14 @@ class StreamProviderAdapter(Protocol):
         ...
 
     async def receive(self) -> RawProviderFrame:
+        """Return the next complete provider frame.
+
+        Implementations must be cancellation-safe. The runtime wraps receive
+        in asyncio.wait_for, so a timeout cancels this coroutine and may call
+        receive again on the same adapter. Adapters must leave transport and
+        partial-read state consistent across cancellation and must not lose or
+        duplicate a partially received frame solely because the wait timed out.
+        """
         ...
 
     async def heartbeat(self) -> None:
