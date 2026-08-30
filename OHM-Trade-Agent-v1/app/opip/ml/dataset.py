@@ -22,6 +22,7 @@ def build_dataset_manifest(
     cutoff_at_utc: datetime,
     feature_schema_version: str,
     feature_calc_version: str,
+    label_schema_version: int,
     label_calc_version: str,
     cohort_filter: Mapping[str, object],
     embargo_seconds: int,
@@ -37,12 +38,13 @@ def build_dataset_manifest(
 
     labels_by_snapshot: dict[str, list[SupervisedLabelRecord]] = defaultdict(list)
     exact_labels: dict[
-        tuple[str, str, str, str], SupervisedLabelRecord
+        tuple[str, int, str, str, str], SupervisedLabelRecord
     ] = {}
     for label in labels:
         labels_by_snapshot[label.snapshot_id].append(label)
         key = (
             label.snapshot_id,
+            label.schema_version,
             label.label_calc_version,
             label.fee_model_version,
             label.slippage_model_version,
@@ -65,6 +67,7 @@ def build_dataset_manifest(
         label = exact_labels.get(
             (
                 snapshot.snapshot_id,
+                label_schema_version,
                 label_calc_version,
                 fee_model_version,
                 slippage_model_version,
@@ -81,17 +84,25 @@ def build_dataset_manifest(
         elif label is None and not historical:
             reason = "LABEL_MISSING"
         elif label is None and not any(
-            row.label_calc_version == label_calc_version for row in historical
+            row.schema_version == label_schema_version for row in historical
+        ):
+            reason = "LABEL_SCHEMA_VERSION_MISMATCH"
+        elif label is None and not any(
+            row.schema_version == label_schema_version
+            and row.label_calc_version == label_calc_version
+            for row in historical
         ):
             reason = "LABEL_CALC_VERSION_MISMATCH"
         elif label is None and not any(
-            row.label_calc_version == label_calc_version
+            row.schema_version == label_schema_version
+            and row.label_calc_version == label_calc_version
             and row.fee_model_version == fee_model_version
             for row in historical
         ):
             reason = "FEE_MODEL_VERSION_MISMATCH"
         elif label is None and not any(
-            row.label_calc_version == label_calc_version
+            row.schema_version == label_schema_version
+            and row.label_calc_version == label_calc_version
             and row.fee_model_version == fee_model_version
             and row.slippage_model_version == slippage_model_version
             for row in historical
@@ -99,6 +110,10 @@ def build_dataset_manifest(
             reason = "SLIPPAGE_MODEL_VERSION_MISMATCH"
         elif label is None:
             reason = "LABEL_VERSION_SELECTION_FAILED"
+        elif label.direction != snapshot.direction:
+            reason = "LABEL_DIRECTION_MISMATCH"
+        elif label.candidate_id != snapshot.candidate_id:
+            reason = "LABEL_CANDIDATE_MISMATCH"
         elif label.label_available_at_utc > cutoff:
             reason = "LABEL_NOT_AVAILABLE_AT_CUTOFF"
         elif label.execution_path_ambiguous:
@@ -119,6 +134,7 @@ def build_dataset_manifest(
         "cutoff_at_utc": cutoff,
         "feature_schema_version": feature_schema_version,
         "feature_calc_version": feature_calc_version,
+        "label_schema_version": label_schema_version,
         "label_calc_version": label_calc_version,
         "cohort_filter": dict(cohort_filter),
         "embargo_seconds": embargo_seconds,
@@ -138,7 +154,7 @@ def build_dataset_manifest(
         cutoff_at_utc=cutoff,
         feature_schema_version=feature_schema_version,
         feature_calc_version=feature_calc_version,
-        label_schema_version=1,
+        label_schema_version=label_schema_version,
         label_calc_version=label_calc_version,
         cohort_filter=dict(cohort_filter),
         exclusion_policy={
@@ -146,7 +162,9 @@ def build_dataset_manifest(
             "execution_path_ambiguous": "EXCLUDE",
             "data_gap": "EXCLUDE",
             "deterministic_audit_fields": "EXCLUDE_FROM_FEATURES",
+            "label_schema_version_match": "REQUIRE_EXACT",
             "label_version_match": "REQUIRE_EXACT",
+            "label_snapshot_semantics": "REQUIRE_DIRECTION_AND_CANDIDATE_MATCH",
             "fee_model_version_match": "REQUIRE_EXACT",
             "slippage_model_version_match": "REQUIRE_EXACT",
         },
