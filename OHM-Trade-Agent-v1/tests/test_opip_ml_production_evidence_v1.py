@@ -224,6 +224,31 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
     assert not snapshot_file.exists()
 
 
+def test_custom_evidence_path_is_forwarded_to_p1_drain(tmp_path, monkeypatch):
+    evidence = tmp_path / "isolated-evidence.jsonl"
+    captured = {}
+
+    def drain(**kwargs):
+        captured.update(kwargs)
+        return _drain_stub()
+
+    monkeypatch.setattr(
+        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        drain,
+    )
+
+    capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_path=tmp_path / "ml.jsonl.gz",
+        checkpoint_path=tmp_path / "checkpoint.json",
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=tmp_path / "health.json",
+        enabled=True,
+    )
+
+    assert captured["evidence_path"] == evidence
+
+
 def test_retry_after_checkpoint_loss_does_not_duplicate_snapshot(
     tmp_path, monkeypatch
 ):
