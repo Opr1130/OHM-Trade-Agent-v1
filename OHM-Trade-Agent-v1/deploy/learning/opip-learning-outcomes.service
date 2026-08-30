@@ -6,6 +6,7 @@ Requires=docker.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/opip-learning-job outcomes
+ExecStopPost=/usr/local/sbin/opip-learning-cleanup outcomes
 RuntimeMaxSec=540
 TimeoutStopSec=25
 KillMode=control-group
