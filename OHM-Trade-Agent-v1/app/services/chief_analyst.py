@@ -430,6 +430,55 @@ def _request_payload(payload: list[dict], *, market_regime_context: object | Non
     }
 
 
+def _attach_ai_route_context(
+    candidates: list[MarketSnapshot],
+    route: object,
+) -> None:
+    """Attach advisory route metadata for downstream outcome attribution."""
+    if not isinstance(route, dict):
+        return
+    route_context = {
+        "provider": route.get("provider"),
+        "model": route.get("model"),
+        "route_tier": route.get("route_tier"),
+        "route_reason": route.get("route_reason"),
+        "reasoning_effort": route.get("reasoning_effort"),
+        "advisory_only": True,
+        "funded_trade_authority_changed": False,
+    }
+    for candidate in candidates:
+        try:
+            existing = getattr(candidate, "_wave8_market_intelligence", None)
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged["ai_route"] = dict(route_context)
+            setattr(candidate, "_wave8_market_intelligence", merged)
+        except Exception:
+            # Attribution is measurement-only and may never block Chief review.
+            continue
+
+
+def _apply_cached_route_stage(
+    stage_evidence: dict[str, object],
+    cached: dict[str, object],
+) -> None:
+    route = cached.get("opip_ai_route")
+    if not isinstance(route, dict):
+        return
+    for key in (
+        "provider",
+        "model",
+        "route_tier",
+        "route_reason",
+        "reasoning_effort",
+    ):
+        stage_evidence[key] = route.get(key)
+    attempts = route.get("attempts")
+    if isinstance(attempts, list):
+        stage_evidence["router_attempts"] = [
+            dict(item) for item in attempts if isinstance(item, dict)
+        ]
+
+
 def review_candidates(
     candidates: list[MarketSnapshot],
     model: str,
@@ -603,6 +652,11 @@ def review_candidates(
         stage_evidence["returned_candidate_count"] = len(
             cached.get("top_candidates") or []
         )
+        _apply_cached_route_stage(stage_evidence, cached)
+        _attach_ai_route_context(
+            chief_eligible_candidates,
+            cached.get("opip_ai_route"),
+        )
         cached["opip_stage_evidence"] = stage_evidence
         return cached
 
@@ -618,6 +672,26 @@ def review_candidates(
             stage_evidence["model"] = route_plan.targets[0].model
             stage_evidence["reasoning_effort"] = route_plan.targets[0].reasoning_effort
             stage_evidence["route_reason"] = route_plan.route_reason
+            fingerprint = build_chief_fingerprint(
+                request_payload,
+                route_key=route_plan.cache_key,
+            )
+            cached = get_cached_review(fingerprint)
+            if cached is not None:
+                cached["chief_api_skipped"] = True
+                cached["chief_cache_reused"] = True
+                cached["chief_eligible_candidates"] = len(payload)
+                stage_evidence["invocation_status"] = CHIEF_CACHE_REUSED
+                stage_evidence["returned_candidate_count"] = len(
+                    cached.get("top_candidates") or []
+                )
+                _apply_cached_route_stage(stage_evidence, cached)
+                _attach_ai_route_context(
+                    chief_eligible_candidates,
+                    cached.get("opip_ai_route"),
+                )
+                cached["opip_stage_evidence"] = stage_evidence
+                return cached
         else:
             _trace_chief_failure(
                 chief_eligible_candidates,
@@ -678,6 +752,10 @@ def review_candidates(
         if not isinstance(review, dict):
             raise ValueError("Chief response JSON was not an object")
         review["opip_ai_route"] = routed.route_evidence()
+        _attach_ai_route_context(
+            chief_eligible_candidates,
+            review["opip_ai_route"],
+        )
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         _trace_chief_failure(
