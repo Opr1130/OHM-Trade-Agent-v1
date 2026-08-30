@@ -152,7 +152,6 @@ def test_ready_fast_recheck_only_requests_full_scan(monkeypatch):
     }
     snapshot = SimpleNamespace(symbol="SOLUSD")
     plan = SimpleNamespace(valid_now=True)
-    removed = []
     deferred = []
 
     monkeypatch.setattr(entry_watch_recheck, "due_entry_watch", lambda **kwargs: [row])
@@ -168,11 +167,6 @@ def test_ready_fast_recheck_only_requests_full_scan(monkeypatch):
     )
     monkeypatch.setattr(
         entry_watch_recheck,
-        "remove_entry_watch",
-        lambda symbol, direction: removed.append((symbol, direction)) or True,
-    )
-    monkeypatch.setattr(
-        entry_watch_recheck,
         "defer_entry_watch",
         lambda *args, **kwargs: deferred.append(args) or True,
     )
@@ -181,8 +175,7 @@ def test_ready_fast_recheck_only_requests_full_scan(monkeypatch):
 
     assert summary.full_scan_required is True
     assert summary.ready_symbols == ("SOLUSD",)
-    assert removed == [("SOLUSD", "LONG")]
-    assert deferred == []
+    assert deferred == [("SOLUSD", "LONG")]
 
 
 def test_not_ready_fast_recheck_defers_without_full_scan(monkeypatch):
@@ -207,7 +200,6 @@ def test_not_ready_fast_recheck_defers_without_full_scan(monkeypatch):
         "build_entry_exit_plan",
         lambda *args, **kwargs: plan,
     )
-    monkeypatch.setattr(entry_watch_recheck, "remove_entry_watch", lambda *args: True)
     monkeypatch.setattr(
         entry_watch_recheck,
         "defer_entry_watch",
