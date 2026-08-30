@@ -1081,89 +1081,90 @@ def main():
             alert["margin_leverage"] = SHORT_VALIDATION_LEVERAGE
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
 
-        candidate_id = str(
-            alert.get("signal_id")
-            or f"W9:{snapshot.symbol}:{direction}:{decision_at.isoformat()}"
-        )
-        feature_snapshot = build_trade_feature_snapshot(
-            snapshot,
-            decision_at=decision_at,
-            episode_id=f"W9EP:{candidate_id}",
-            candidate_id=candidate_id,
-            regime=market_regime.regime,
-        )
-        trade_quality = assess_trade_quality(feature_snapshot, plan)
-        alert["feature_snapshot_id"] = feature_snapshot.snapshot_id
-        alert["continuation_score"] = trade_quality.continuation.score
-        alert["continuation_decision"] = trade_quality.continuation.decision
-        alert["continuation_evidence_quality"] = (
-            trade_quality.continuation.evidence_quality
-        )
-        alert["entry_quality_score"] = trade_quality.entry.quality_score
-        alert["entry_quality_decision"] = trade_quality.entry.decision
-        alert["exhaustion_state"] = trade_quality.entry.exhaustion_risk
-        alert["trade_quality_actionable"] = trade_quality.actionable
-        alert["score_is_probability"] = False
-        try:
-            alert["trade_quality_evidence_id"] = record_trade_quality_evidence(
-                feature_snapshot=feature_snapshot,
-                assessment=trade_quality,
-                plan=plan,
-                candidate=alert,
+        if bool(getattr(settings, "opip_trade_quality_v2_enabled", False)):
+            candidate_id = str(
+                alert.get("signal_id")
+                or f"W9:{snapshot.symbol}:{direction}:{decision_at.isoformat()}"
+            )
+            feature_snapshot = build_trade_feature_snapshot(
+                snapshot,
                 decision_at=decision_at,
-                market_regime=market_regime.regime,
+                episode_id=f"W9EP:{candidate_id}",
+                candidate_id=candidate_id,
+                regime=market_regime.regime,
             )
-        except Exception as exc:
-            print(
-                f"TRADE QUALITY evidence capture failed open "
-                f"{direction} {snapshot.symbol}: {type(exc).__name__}: {exc}"
+            trade_quality = assess_trade_quality(feature_snapshot, plan)
+            alert["feature_snapshot_id"] = feature_snapshot.snapshot_id
+            alert["continuation_score"] = trade_quality.continuation.score
+            alert["continuation_decision"] = trade_quality.continuation.decision
+            alert["continuation_evidence_quality"] = (
+                trade_quality.continuation.evidence_quality
             )
-
-        if (
-            trade_quality.continuation.decision == "PASS"
-            and trade_quality.entry.decision == "WAIT"
-        ):
+            alert["entry_quality_score"] = trade_quality.entry.quality_score
+            alert["entry_quality_decision"] = trade_quality.entry.decision
+            alert["exhaustion_state"] = trade_quality.entry.exhaustion_risk
+            alert["trade_quality_actionable"] = trade_quality.actionable
+            alert["score_is_probability"] = False
             try:
-                enqueue_entry_watch(
-                    symbol=snapshot.symbol,
-                    direction=direction,
-                    candidate_id=candidate_id,
-                    continuation_score=trade_quality.continuation.score,
-                    now=decision_at,
+                alert["trade_quality_evidence_id"] = record_trade_quality_evidence(
+                    feature_snapshot=feature_snapshot,
+                    assessment=trade_quality,
+                    plan=plan,
+                    candidate=alert,
+                    decision_at=decision_at,
+                    market_regime=market_regime.regime,
                 )
             except Exception as exc:
                 print(
-                    f"ENTRY WATCH enqueue failed open {direction} {snapshot.symbol}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"TRADE QUALITY evidence capture failed open "
+                    f"{direction} {snapshot.symbol}: {type(exc).__name__}: {exc}"
                 )
 
-        if not trade_quality.actionable:
-            quality_reason = (
-                f"Continuation={trade_quality.continuation.decision}/"
-                f"{trade_quality.continuation.score} "
-                f"Entry={trade_quality.entry.decision}/"
-                f"{trade_quality.entry.quality_score} "
-                f"Exhaustion={trade_quality.entry.exhaustion_risk}"
-            )
-            print(
-                f"TRADE QUALITY MONITOR {direction} {snapshot.symbol}: "
-                f"{quality_reason}"
-            )
-            capture_snapshot_decision(
-                snapshot,
-                decision="TRADE_QUALITY_MONITOR",
-                market_regime=market_regime.regime,
-                reason=quality_reason,
-                source="wave9_trade_quality_gate",
-            )
-            continue
+            if (
+                trade_quality.continuation.decision == "PASS"
+                and trade_quality.entry.decision == "WAIT"
+            ):
+                try:
+                    enqueue_entry_watch(
+                        symbol=snapshot.symbol,
+                        direction=direction,
+                        candidate_id=candidate_id,
+                        continuation_score=trade_quality.continuation.score,
+                        now=decision_at,
+                    )
+                except Exception as exc:
+                    print(
+                        f"ENTRY WATCH enqueue failed open {direction} {snapshot.symbol}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
 
-        print(
-            f"TRADE QUALITY PASS {direction} {snapshot.symbol}: "
-            f"Continuation={trade_quality.continuation.score}/100 "
-            f"Entry={trade_quality.entry.quality_score}/100 "
-            f"Snapshot={feature_snapshot.snapshot_id}"
-        )
+            if not trade_quality.actionable:
+                quality_reason = (
+                    f"Continuation={trade_quality.continuation.decision}/"
+                    f"{trade_quality.continuation.score} "
+                    f"Entry={trade_quality.entry.decision}/"
+                    f"{trade_quality.entry.quality_score} "
+                    f"Exhaustion={trade_quality.entry.exhaustion_risk}"
+                )
+                print(
+                    f"TRADE QUALITY MONITOR {direction} {snapshot.symbol}: "
+                    f"{quality_reason}"
+                )
+                capture_snapshot_decision(
+                    snapshot,
+                    decision="TRADE_QUALITY_MONITOR",
+                    market_regime=market_regime.regime,
+                    reason=quality_reason,
+                    source="wave9_trade_quality_gate",
+                )
+                continue
+
+            print(
+                f"TRADE QUALITY PASS {direction} {snapshot.symbol}: "
+                f"Continuation={trade_quality.continuation.score}/100 "
+                f"Entry={trade_quality.entry.quality_score}/100 "
+                f"Snapshot={feature_snapshot.snapshot_id}"
+            )
 
         target_quality = _target_quality(plan, snapshot)
         opip.record_target_quality(snapshot, target_quality)
