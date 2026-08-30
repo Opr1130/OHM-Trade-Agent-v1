@@ -87,6 +87,7 @@ class ArmEvaluation:
 @dataclass(frozen=True)
 class ChampionChallengerEvaluation:
     support: EvaluationSupport
+    cohort: str
     paired_samples: int
     minimum_support: int
     champion: ArmEvaluation
@@ -102,6 +103,7 @@ class ChampionChallengerEvaluation:
     def as_dict(self) -> dict[str, Any]:
         return {
             "support": self.support.value,
+            "cohort": self.cohort,
             "paired_samples": self.paired_samples,
             "minimum_support": self.minimum_support,
             "champion": self.champion.as_dict(),
@@ -295,6 +297,12 @@ def evaluate_champion_challenger(
     ids = [row.sample_id for row in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("paired evaluation sample ids must be unique")
+    cohorts = {str(row.cohort or "").strip() for row in rows}
+    if "" in cohorts:
+        raise ValueError("paired evaluation cohort is required")
+    if len(cohorts) > 1:
+        raise ValueError("paired evaluation cannot aggregate mixed cohorts")
+    cohort = next(iter(cohorts), "UNSPECIFIED")
     support = (
         EvaluationSupport.SUFFICIENT
         if len(rows) >= minimum_support
@@ -312,6 +320,7 @@ def evaluate_champion_challenger(
     )
     return ChampionChallengerEvaluation(
         support=support,
+        cohort=cohort,
         paired_samples=len(rows),
         minimum_support=minimum_support,
         champion=champion,
