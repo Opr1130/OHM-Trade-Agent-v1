@@ -182,6 +182,7 @@ def test_backoff_is_bounded_and_deterministic():
     assert policy.delay_for(0, jitter_unit=0) == 1
     assert policy.delay_for(1, jitter_unit=0) == 2
     assert policy.delay_for(9, jitter_unit=0) == 8
+    assert policy.delay_for(10_000, jitter_unit=0) == 8
     assert policy.delay_for(1, jitter_unit=-1) == pytest.approx(1.5)
     assert policy.delay_for(1, jitter_unit=1) == pytest.approx(2.5)
 
@@ -278,6 +279,110 @@ def test_heartbeat_timeout_causes_supervised_reconnect():
     assert provider.heartbeat_timeouts >= 1
     assert provider.connect_attempts >= 2
     assert provider.reconnects >= 1
+
+
+def test_owned_task_failure_is_observable_and_running_turns_false():
+    async def scenario():
+        runtime = StreamingRuntime(
+            {StreamProvider.BINANCE: FakeAdapter([])},
+            config=_runtime_config(),
+        )
+        await runtime.start()
+
+        async def boom():
+            raise RuntimeError("synthetic-owned-task-failure")
+
+        task = asyncio.create_task(boom())
+        await asyncio.gather(task, return_exceptions=True)
+        runtime._owned_task_done(task)
+        snapshot = runtime.snapshot()
+        assert runtime.running is False
+        assert isinstance(runtime.fatal_exception, RuntimeError)
+        assert snapshot.runtime_failed is True
+        assert snapshot.fatal_error_type == "RuntimeError"
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_resource_sampling_failure_is_counted_and_does_not_fail_runtime(monkeypatch):
+    async def scenario():
+        runtime = StreamingRuntime(
+            {StreamProvider.BINANCE: FakeAdapter([])},
+            config=_runtime_config(resource_sample_interval_seconds=0.001),
+        )
+        calls = {"count": 0}
+        original = runtime._sample_resources_once
+
+        def flaky_sample(**kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("synthetic-resource-sample-failure")
+            return original(**kwargs)
+
+        monkeypatch.setattr(runtime, "_sample_resources_once", flaky_sample)
+        await runtime.start()
+        for _ in range(100):
+            if runtime.snapshot().resource_sample_errors >= 1:
+                break
+            await asyncio.sleep(0.002)
+        snapshot = runtime.snapshot()
+        assert snapshot.resource_sample_errors >= 1
+        assert snapshot.runtime_failed is False
+        assert runtime.running is True
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_symbol_limit_uses_dedicated_telemetry_not_processing_error():
+    async def scenario():
+        adapter = FakeAdapter([_raw(1), _raw(2, symbol="ETHUSDT")])
+        runtime = StreamingRuntime(
+            {StreamProvider.BINANCE: adapter},
+            config=_runtime_config(max_symbols=1),
+            utc_now=lambda: NOW + timedelta(milliseconds=10),
+        )
+
+        original_normalize = adapter.normalize
+
+        def normalize(frame):
+            normalized = original_normalize(frame)
+            if frame.frame.provider_symbol == "ETHUSDT":
+                envelope = normalized.envelope
+                normalized = NormalizedStreamObservation(
+                    envelope=StreamEnvelope(
+                        provider=envelope.provider,
+                        stream_type=envelope.stream_type,
+                        provider_symbol="ETHUSDT",
+                        provider_timestamp_utc=envelope.provider_timestamp_utc,
+                        ingest_timestamp_utc=envelope.ingest_timestamp_utc,
+                        connection_id=envelope.connection_id,
+                        reconnect_epoch=envelope.reconnect_epoch,
+                        provider_sequence=envelope.provider_sequence,
+                        sequence_status=envelope.sequence_status,
+                        is_aggregate=envelope.is_aggregate,
+                        identity_status=MappingStatus.UNIQUE,
+                        canonical_asset_id="ethereum",
+                        payload=envelope.payload,
+                    ),
+                    sequence=normalized.sequence,
+                )
+            return normalized
+
+        adapter.normalize = normalize
+        await runtime.start()
+        for _ in range(100):
+            if runtime.snapshot().symbol_limit_rejections >= 1:
+                break
+            await asyncio.sleep(0.002)
+        snapshot = runtime.snapshot()
+        await runtime.stop()
+        return snapshot
+
+    snapshot = asyncio.run(scenario())
+    assert snapshot.symbol_limit_rejections == 1
+    assert snapshot.processing_errors == 0
 
 
 def test_stale_previous_epoch_frame_is_rejected():
