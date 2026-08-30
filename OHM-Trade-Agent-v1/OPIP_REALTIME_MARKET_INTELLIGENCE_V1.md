@@ -220,8 +220,12 @@ still cannot combine.
 - No new networking dependency in `requirements.txt`.
 - The repository-wide, pre-existing `test_opip_modules_reference_no_futures_
   surface` / `test_no_ml_dependency_is_introduced` safety tests (scoped to
-  all of `app/opip`, predating Sequence 4) pass unmodified — see Findings
-  below for how that shaped naming in this build.
+  all of `app/opip`, predating Sequence 4) pass unmodified. `StreamProvider`
+  is named `BINANCE`, not `BINANCE_FUTURES` as the architecture prompt's
+  example JSON literally used — this was flagged as an open naming/scope
+  question during implementation and explicitly reviewed and confirmed by
+  the project owner (2026-08-29): keep `BINANCE`, make no change to the
+  pre-existing safety test. This is settled, not an open item for BUILD 4.2.
 
 ## What BUILD 4.1 intentionally does NOT do
 
