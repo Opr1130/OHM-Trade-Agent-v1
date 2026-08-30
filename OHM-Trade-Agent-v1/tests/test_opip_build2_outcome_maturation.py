@@ -115,3 +115,36 @@ def test_canonical_capture_coverage_detects_missing_pair():
     assert coverage["captured_unique_episode_rows"] == 1
     assert coverage["coverage"] == 0.5
     assert coverage["meets_target"] is False
+
+
+def test_outcome_maturation_repairs_only_truncated_final_record(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    valid_first = outcomes.read_bytes()
+    assert valid_first.endswith(b"\n")
+
+    with outcomes.open("ab") as handle:
+        handle.write(b'{"snapshot_id":"BROKEN"')
+
+    rebuilt = build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    assert len(rebuilt) == 1
+    payload = outcomes.read_bytes()
+    assert payload == valid_first
+    assert b"BROKEN" not in payload
