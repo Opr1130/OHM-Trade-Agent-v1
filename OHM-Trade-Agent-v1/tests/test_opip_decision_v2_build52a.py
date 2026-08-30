@@ -211,6 +211,40 @@ def test_entirely_omitted_candidate_is_detected_by_independent_denominator():
     assert "EXPECTED_COMPARISON_MISSING" in result.blockers
 
 
+def test_distinct_days_come_from_independent_scan_expectations():
+    first = _pair(
+        scan_id="SCAN:1",
+        candidate_id="OPIPC:1",
+        when=NOW,
+    )
+    second = _pair(
+        scan_id="SCAN:2",
+        candidate_id="OPIPC:2",
+        when=NOW + timedelta(days=10),
+    )
+    expectations = (
+        ScanCoverageExpectation(
+            scan_id="SCAN:1",
+            expected_at_utc=NOW,
+            expected_candidate_ids=("OPIPC:1",),
+        ),
+        ScanCoverageExpectation(
+            scan_id="SCAN:2",
+            expected_at_utc=NOW,
+            expected_candidate_ids=("OPIPC:2",),
+        ),
+    )
+    result = evaluate_shadow_equivalence(
+        [first, second],
+        criteria=_criteria(2, 2, 2),
+        coverage_expectations=expectations,
+    )
+    assert result.status is PromotionEvaluationStatus.INSUFFICIENT_EVIDENCE
+    assert result.distinct_scans == 2
+    assert result.distinct_days == 1
+    assert "INSUFFICIENT_DISTINCT_DAYS" in result.blockers
+
+
 def test_one_divergence_blocks_engine_equivalence():
     rows = [
         _pair(scan_id="SCAN:1", candidate_id="OPIPC:1"),
