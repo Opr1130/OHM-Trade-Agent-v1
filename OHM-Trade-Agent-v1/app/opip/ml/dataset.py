@@ -52,12 +52,12 @@ def build_dataset_manifest(
             reason = "LABEL_CALC_VERSION_MISMATCH"
         elif label.label_available_at_utc > cutoff:
             reason = "LABEL_NOT_AVAILABLE_AT_CUTOFF"
-        elif label.censored:
-            reason = "LABEL_CENSORED"
         elif label.execution_path_ambiguous:
             reason = "EXECUTION_PATH_AMBIGUOUS"
         elif label.data_gap:
             reason = "LABEL_DATA_GAP"
+        elif label.censored:
+            reason = "LABEL_CENSORED"
 
         if reason is None:
             included.append(snapshot.snapshot_id)
