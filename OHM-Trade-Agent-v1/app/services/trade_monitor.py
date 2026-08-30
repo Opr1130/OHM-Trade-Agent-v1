@@ -58,8 +58,8 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     _require_finite_trade_geometry(trade)
     client = KrakenClient()
     candles = client.get_ohlc(trade.symbol, interval=60)
-    if len(candles) < 36:
-        raise ValueError(f"{trade.symbol}: insufficient OHLC history for active-trade monitoring")
+    if not candles:
+        raise ValueError(f"{trade.symbol}: no OHLC history for active-trade monitoring")
 
     closes = [float(c.close) for c in candles]
     volumes = [float(c.volume) for c in candles]
@@ -69,6 +69,68 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
         raise ValueError(f"{trade.symbol}: OHLC volume data must be finite and non-negative")
 
     current_price = closes[-1]
+    direction = trade.direction.upper()
+
+    # New listings and recently activated markets may not yet have enough
+    # completed 1H candles for EMA/MACD/RSI. Stop/target geometry is still
+    # protection-critical, so fail soft to price-only protection instead of
+    # dropping the position from monitoring entirely.
+    if len(candles) < 36:
+        raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
+        unrealized_pct = -raw_move if direction == "SHORT" else raw_move
+        reasons: list[str] = [
+            f"Limited OHLC history ({len(candles)} candles); technical deterioration checks unavailable"
+        ]
+        action = "HOLD"
+        if direction == "SHORT":
+            if current_price >= trade.stop_price:
+                action = "EXIT_NOW"
+                reasons.insert(0, "Short stop price breached")
+            elif current_price <= trade.target_2:
+                action = "TAKE_PROFIT"
+                reasons.insert(0, "Short Target 2 reached")
+            elif current_price <= trade.target_1:
+                action = "TAKE_PROFIT"
+                reasons.insert(0, "Short Target 1 reached")
+        else:
+            if current_price <= trade.stop_price:
+                action = "EXIT_NOW"
+                reasons.insert(0, "Stop price breached")
+            elif current_price >= trade.target_2:
+                action = "TAKE_PROFIT"
+                reasons.insert(0, "Target 2 reached")
+            elif current_price >= trade.target_1:
+                action = "TAKE_PROFIT"
+                reasons.insert(0, "Target 1 reached")
+
+        pnl = None
+        if trade.capital is not None and trade.capital > 0:
+            if not math.isfinite(float(trade.capital)):
+                raise ValueError(f"{trade.symbol}: capital must be finite")
+            pnl = calculate_fee_aware_pnl(
+                direction=direction,
+                entry_price=trade.entry_price,
+                current_or_exit_price=current_price,
+                capital=trade.capital,
+                leverage=trade.margin_leverage,
+                actual_entry_fee=trade.actual_entry_fee,
+                financing_fee=trade.financing_fee,
+            )
+
+        return TradeMonitorResult(
+            symbol=trade.symbol,
+            action=action,
+            current_price=round(current_price, 8),
+            unrealized_pct=round(unrealized_pct, 2),
+            reasons=reasons,
+            gross_pnl=(pnl.gross_pnl if pnl else None),
+            estimated_total_costs=(pnl.total_costs if pnl else None),
+            net_pnl=(pnl.net_pnl if pnl else None),
+            net_pnl_pct=(pnl.net_pnl_pct_on_capital if pnl else None),
+            break_even_move_pct=(pnl.break_even_move_pct if pnl else None),
+            fee_source=(pnl.fee_source if pnl else None),
+        )
+
     # Current price is live monitoring evidence; technical corroboration is
     # intentionally based on completed bars so a partial 1H candle cannot
     # repaint EMA/MACD/RSI state while the monitor is running.
@@ -78,8 +140,6 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     rsi_value = rsi(completed_closes, 14)
     macd_line, macd_signal, _ = macd(completed_closes)
     vol_ratio = volume_ratio(completed_volumes, 20)
-    direction = trade.direction.upper()
-
     raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
     unrealized_pct = -raw_move if direction == "SHORT" else raw_move
     reasons: list[str] = []
