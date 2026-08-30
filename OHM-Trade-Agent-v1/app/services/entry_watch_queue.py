@@ -41,6 +41,7 @@ def enqueue_entry_watch(
     direction: str,
     candidate_id: str,
     continuation_score: int,
+    risk_level: str = "low",
     now: datetime | None = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     recheck_seconds: int = DEFAULT_RECHECK_SECONDS,
@@ -60,6 +61,11 @@ def enqueue_entry_watch(
             }
         row["candidate_id"] = candidate_id
         row["continuation_score"] = int(continuation_score)
+        row["risk_level"] = (
+            str(risk_level).lower()
+            if str(risk_level).lower() in {"low", "medium"}
+            else "low"
+        )
         row["updated_at"] = current.isoformat()
         row["next_due_at"] = (
             current + timedelta(seconds=max(60, min(120, int(recheck_seconds))))
