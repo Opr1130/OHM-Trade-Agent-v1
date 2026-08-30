@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.opip.learning.paper_readiness import (
+    PaperDirectionReadiness,
+    PaperLearningReadinessReport,
     PaperReadinessState,
     assess_paper_learning_readiness,
 )
@@ -316,3 +318,51 @@ def test_readiness_paper_source_corruption_is_counted_without_mutation(tmp_path)
     assert path.exists()
     assert path.read_text(encoding="utf-8") == original
     assert list(tmp_path.iterdir()) == [path]
+
+
+def test_metadata_only_paper_state_is_one_malformed_source(tmp_path):
+    """Verify metadata wrappers without lifecycles fail closed once, not per key."""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"schema_version":1,"paper_only":true}',
+        encoding="utf-8",
+    )
+    rows, malformed = _paper_rows(path)
+    assert rows == []
+    assert malformed == 1
+
+
+def test_whitespace_only_canonical_episode_is_counted_malformed():
+    """Verify whitespace-only canonical episode identity cannot silently disappear."""
+    row = _canonical("S:1", " ")
+    report = build_ml_data_readiness_report(
+        canonical_rows=[row],
+        ml_snapshot_rows=[_ml("S:1", "E:1")],
+        phase3c_outcome_rows=[_phase("S:1", "E:1")],
+        policy=MLReadinessPolicy(minimum_primary_supervised_rows=2),
+    )
+    assert report.malformed_records >= 1
+    assert report.readiness_state is MLReadinessState.NOT_READY
+    assert "MALFORMED_EVIDENCE_PRESENT" in report.blockers
+
+
+def test_paper_readiness_report_rejects_authority_escalation():
+    """Verify report serialization cannot hide unsafe authority field values."""
+    long = PaperDirectionReadiness(
+        direction="LONG",
+        state=PaperReadinessState.READY,
+        reasons=(),
+    )
+    short = PaperDirectionReadiness(
+        direction="SHORT",
+        state=PaperReadinessState.NOT_READY,
+        reasons=("SHORT_NOT_READY",),
+    )
+    import pytest
+    with pytest.raises(ValueError, match="funded trade authority"):
+        PaperLearningReadinessReport(
+            long=long,
+            short=short,
+            extended_short_learning_ready=False,
+            funded_execution_allowed=True,
+        )
