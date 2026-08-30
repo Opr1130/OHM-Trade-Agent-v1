@@ -11,6 +11,7 @@ from pathlib import Path
 class ResourceGuardConfig:
     memory_soft_limit_bytes: int = 150 * 1024 * 1024
     loop_lag_soft_limit_seconds: float = 0.25
+    cpu_soft_limit_fraction: float = 0.40
     queue_utilization_soft_limit_pct: float = 90.0
 
     def __post_init__(self) -> None:
@@ -22,6 +23,11 @@ class ResourceGuardConfig:
         ):
             raise ValueError("loop lag limit must be finite and non-negative")
         if (
+            not math.isfinite(float(self.cpu_soft_limit_fraction))
+            or not 0 < self.cpu_soft_limit_fraction <= 1
+        ):
+            raise ValueError("cpu soft limit must be finite in (0, 1]")
+        if (
             not math.isfinite(float(self.queue_utilization_soft_limit_pct))
             or not 0 <= self.queue_utilization_soft_limit_pct <= 100
         ):
@@ -32,6 +38,7 @@ class ResourceGuardConfig:
 class ResourceAssessment:
     rss_bytes: int | None
     loop_lag_seconds: float
+    cpu_fraction: float | None
     queue_utilization_pct: float
     degraded: bool
     reasons: tuple[str, ...]
@@ -55,10 +62,15 @@ def assess_resources(
     config: ResourceGuardConfig,
     rss_bytes: int | None,
     loop_lag_seconds: float,
+    cpu_fraction: float | None,
     queue_utilization_pct: float,
 ) -> ResourceAssessment:
     if not math.isfinite(float(loop_lag_seconds)) or loop_lag_seconds < 0:
         raise ValueError("loop_lag_seconds must be finite and non-negative")
+    if cpu_fraction is not None and (
+        not math.isfinite(float(cpu_fraction)) or cpu_fraction < 0
+    ):
+        raise ValueError("cpu_fraction must be finite and non-negative")
     if (
         not math.isfinite(float(queue_utilization_pct))
         or not 0 <= queue_utilization_pct <= 100
@@ -69,11 +81,17 @@ def assess_resources(
         reasons.append("MEMORY_SOFT_LIMIT_EXCEEDED")
     if loop_lag_seconds > config.loop_lag_soft_limit_seconds:
         reasons.append("EVENT_LOOP_LAG_SOFT_LIMIT_EXCEEDED")
+    if (
+        cpu_fraction is not None
+        and cpu_fraction > config.cpu_soft_limit_fraction
+    ):
+        reasons.append("CPU_SOFT_LIMIT_EXCEEDED")
     if queue_utilization_pct > config.queue_utilization_soft_limit_pct:
         reasons.append("QUEUE_UTILIZATION_SOFT_LIMIT_EXCEEDED")
     return ResourceAssessment(
         rss_bytes=rss_bytes,
         loop_lag_seconds=float(loop_lag_seconds),
+        cpu_fraction=(None if cpu_fraction is None else float(cpu_fraction)),
         queue_utilization_pct=float(queue_utilization_pct),
         degraded=bool(reasons),
         reasons=tuple(reasons),
