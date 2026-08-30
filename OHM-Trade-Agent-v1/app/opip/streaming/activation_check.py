@@ -41,6 +41,31 @@ def main() -> int:
     if any(str(state) != "CONNECTED" for state in providers.values()):
         return 1
 
+    # Current production workers publish detailed per-provider diagnostics.
+    # When present, require real trade evidence from BOTH venues and at least
+    # one emitted cross-venue feature. This prevents a connected-but-silent
+    # socket from satisfying the production activation gate. The fallback is
+    # retained only for compatibility with older stored health fixtures.
+    publication = health.get("publication")
+    pair_emissions: int | None = None
+    if publication is not None:
+        if not isinstance(publication, dict):
+            return 1
+        trade_counts = publication.get("trade_observations_by_provider")
+        if not isinstance(trade_counts, dict):
+            return 1
+        try:
+            if any(
+                int(trade_counts.get(provider) or 0) <= 0
+                for provider in _REQUIRED_PROVIDERS
+            ):
+                return 1
+            pair_emissions = int(publication.get("pair_emissions") or 0)
+        except (TypeError, ValueError):
+            return 1
+        if pair_emissions <= 0:
+            return 1
+
     try:
         received = int(health.get("raw_frames_received") or 0)
         drop_pct = float(health.get("raw_drop_pct") or 0.0)

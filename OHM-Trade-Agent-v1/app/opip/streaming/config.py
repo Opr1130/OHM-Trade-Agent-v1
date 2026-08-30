@@ -4,8 +4,12 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.opip.streaming.binance import DEFAULT_BINANCE_PUBLIC_STREAM_URL
 from app.opip.streaming.bybit import DEFAULT_BYBIT_PUBLIC_LINEAR_URL
+
+
+# Binance's 2026 WebSocket split classifies aggTrade and forceOrder under the
+# unauthenticated /market route, not the high-frequency /public route.
+DEFAULT_BINANCE_MARKET_STREAM_URL = "wss://fstream.binance.com/market/stream"
 
 
 class StreamingWorkerSettings(BaseSettings):
@@ -18,7 +22,7 @@ class StreamingWorkerSettings(BaseSettings):
 
     enabled: bool = False
     symbols: str = "BTCUSDT,ETHUSDT,SOLUSDT"
-    binance_url: str = DEFAULT_BINANCE_PUBLIC_STREAM_URL
+    binance_url: str = DEFAULT_BINANCE_MARKET_STREAM_URL
     bybit_url: str = DEFAULT_BYBIT_PUBLIC_LINEAR_URL
     queue_maxsize: int = Field(default=5000, ge=100, le=10000)
     retention_hours: int = Field(default=72, ge=24, le=168)
