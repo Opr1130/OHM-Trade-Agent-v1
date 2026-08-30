@@ -239,14 +239,16 @@ def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bo
     try:
         state = _load_state()
     except (OSError, TimeoutError, RegistryIOError):
-        # Opportunity notifications fail closed when dedup state is unhealthy.
-        return False
+        # This file is only a convenience dedup cache. Qualified actionable
+        # trades must not disappear because it is unreadable; the atomic
+        # notification policy and delivery ledger remain authoritative.
+        state = {}
     if state.get(plan.symbol) == current_key:
         return False
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     return should_emit(
         identity=f"{direction}:{plan.symbol}",
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         fingerprint=current_key,
     )
 
@@ -442,7 +444,7 @@ def send_trade_plan(
 
     reservation = reserve_emit(
         identity=f"{direction}:{plan.symbol}",
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         fingerprint=key,
     )
     if reservation is None:
@@ -482,7 +484,7 @@ def send_trade_plan(
             pass
         confirm_emit(
             identity=f"{direction}:{plan.symbol}",
-            event_type="OPPORTUNITY",
+            event_type="ACTIONABLE_TRADE",
             fingerprint=key,
             reservation_token=reservation,
         )
@@ -490,7 +492,7 @@ def send_trade_plan(
 
     release_emit(
         identity=f"{direction}:{plan.symbol}",
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         reservation_token=reservation,
     )
     if trade_id:
