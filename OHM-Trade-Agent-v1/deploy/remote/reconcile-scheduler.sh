@@ -118,7 +118,7 @@ bash "$STREAM_RECONCILE"
 trap - ERR
 rm -rf "$tmpdir"
 
-echo "O'Pip scheduler reconciliation: OK"
+echo "OHM scheduler reconciliation: OK"
 echo "canonical=$CANONICAL_DST"
 echo "cadence=1 minute"
 echo "entrypoint=app.jobs.run_cycle"
