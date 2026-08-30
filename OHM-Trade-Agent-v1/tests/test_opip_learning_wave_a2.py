@@ -22,6 +22,7 @@ NOW = datetime(2026, 8, 30, tzinfo=timezone.utc)
 
 
 def test_learning_lifecycle_requires_explicit_human_acceptance():
+    """Verify learning lifecycle requires explicit human acceptance."""
     row = create_learning_observation(
         hypothesis_key="reduce-false-positive",
         created_at_utc=NOW,
@@ -65,6 +66,7 @@ def test_learning_lifecycle_requires_explicit_human_acceptance():
 
 
 def test_learning_lifecycle_rejects_backward_time():
+    """Verify learning lifecycle rejects backward time."""
     row = create_learning_observation(
         hypothesis_key="time-order",
         created_at_utc=NOW,
@@ -84,6 +86,7 @@ def test_learning_lifecycle_rejects_backward_time():
 
 
 def test_learning_lifecycle_rejects_invalid_transition():
+    """Verify learning lifecycle rejects invalid transition."""
     row = create_learning_observation(
         hypothesis_key="x",
         created_at_utc=NOW,
@@ -100,6 +103,7 @@ def test_learning_lifecycle_rejects_invalid_transition():
 
 
 def _samples(n=40):
+    """Return samples."""
     rows = []
     for index in range(n):
         positive = index % 2 == 0
@@ -118,6 +122,7 @@ def _samples(n=40):
 
 
 def test_paired_evaluation_is_measurement_only_and_support_gated():
+    """Verify paired evaluation is measurement only and support gated."""
     result = evaluate_champion_challenger(_samples(), minimum_support=20)
     assert result.support is EvaluationSupport.SUFFICIENT
     assert result.cohort == "QUALIFIED_PAPER"
@@ -130,6 +135,7 @@ def test_paired_evaluation_is_measurement_only_and_support_gated():
 
 
 def test_paired_evaluation_marks_small_sample_insufficient():
+    """Verify paired evaluation marks small sample insufficient."""
     result = evaluate_champion_challenger(_samples(5), minimum_support=20)
     assert result.support is EvaluationSupport.INSUFFICIENT
     assert result.champion.net_expectancy.support is EvaluationSupport.INSUFFICIENT
@@ -137,6 +143,7 @@ def test_paired_evaluation_marks_small_sample_insufficient():
 
 
 def test_paired_evaluation_rejects_mixed_cohorts():
+    """Verify paired evaluation rejects mixed cohorts."""
     rows = _samples(4)
     rows[1] = PairedEvaluationSample(
         sample_id=rows[1].sample_id,
@@ -150,6 +157,7 @@ def test_paired_evaluation_rejects_mixed_cohorts():
 
 
 def test_paired_evaluation_rejects_duplicate_t0_sample_identity():
+    """Verify paired evaluation rejects duplicate t0 sample identity."""
     rows = _samples(2)
     rows[1] = PairedEvaluationSample(
         sample_id=rows[0].sample_id,
@@ -163,6 +171,7 @@ def test_paired_evaluation_rejects_duplicate_t0_sample_identity():
 
 
 def test_zero_trade_diagnostic_uses_structured_gate_and_health_evidence():
+    """Verify zero trade diagnostic uses structured gate and health evidence."""
     diagnostic = build_zero_trade_diagnostic(
         [
             {
