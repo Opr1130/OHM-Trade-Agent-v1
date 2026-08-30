@@ -77,9 +77,11 @@ def _paper(
         "direction": direction,
         "paper_only": True,
         "exchange_write_authority": False,
-        "net_pnl": 5.0,
-        "net_pnl_pct": 1.5,
-        "outcome": "WIN",
+        "closed_at": "2026-08-30T00:00:00+00:00" if status == "CLOSED" else None,
+        "exit_price": 101.0 if status == "CLOSED" else None,
+        "net_pnl": 5.0 if status == "CLOSED" else None,
+        "net_pnl_pct": 1.5 if status == "CLOSED" else None,
+        "outcome": "WIN" if status == "CLOSED" else None,
     }
 
 
@@ -131,6 +133,26 @@ def test_missing_feature_snapshot_fails_closed_without_symbol_time_fallback():
     assert row.cohort is LearningCohort.INELIGIBLE_UNLINKED
     assert row.linkage_status is LinkageStatus.MISSING_FEATURE_SNAPSHOT
     assert row.primary_supervised_eligible is False
+
+
+def test_reused_episode_across_multiple_canonical_snapshots_is_not_exact_paper_link():
+    rows = build_learning_linkage_records(
+        canonical_rows=[
+            _canonical(snapshot_id="SNAP:1", episode_id="EP:shared"),
+            _canonical(snapshot_id="SNAP:2", episode_id="EP:shared"),
+        ],
+        ml_snapshot_rows=[
+            _ml(snapshot_id="SNAP:1", ml_id="MLSNAP:1"),
+            _ml(snapshot_id="SNAP:2", ml_id="MLSNAP:2"),
+        ],
+        paper_trade_rows=[_paper(episode_id="EP:shared")],
+    )
+    assert all(row.linkage_status is LinkageStatus.AMBIGUOUS_PAPER_LINK for row in rows)
+    assert all(row.primary_supervised_eligible is False for row in rows)
+    assert all(
+        "AMBIGUOUS_CANONICAL_SNAPSHOT_FOR_PAPER_EPISODE" in row.exclusion_reasons
+        for row in rows
+    )
 
 
 def test_multiple_paper_trades_for_same_episode_are_ambiguous_not_guessed():
