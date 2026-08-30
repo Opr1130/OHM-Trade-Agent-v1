@@ -162,16 +162,11 @@ def test_capture_worker_writes_compressed_snapshot_and_advances_checkpoint(
     checkpoint = tmp_path / "checkpoint.json"
     dead = tmp_path / "dead.jsonl"
     health = tmp_path / "health.json"
-    outcome_state = tmp_path / "outcome.json"
     evidence.write_text(json.dumps(_canonical_row()) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(
         "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
         _drain_stub,
-    )
-    monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture._run_outcome_maturation_if_due",
-        lambda **_kwargs: (False, 0, 0, 0, 0),
     )
 
     summary = capture_ml_production_evidence(
@@ -180,7 +175,6 @@ def test_capture_worker_writes_compressed_snapshot_and_advances_checkpoint(
         checkpoint_path=checkpoint,
         dead_letter_path=dead,
         health_path=health,
-        outcome_state_path=outcome_state,
         enabled=True,
     )
 
@@ -214,10 +208,6 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
         "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
         _drain_stub,
     )
-    monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture._run_outcome_maturation_if_due",
-        lambda **_kwargs: (False, 0, 0, 0, 0),
-    )
 
     summary = capture_ml_production_evidence(
         evidence_path=evidence,
@@ -225,7 +215,6 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
         checkpoint_path=checkpoint,
         dead_letter_path=tmp_path / "dead.jsonl",
         health_path=health,
-        outcome_state_path=tmp_path / "outcome.json",
         enabled=True,
     )
 
@@ -233,6 +222,49 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
     assert summary.legacy_without_seed == 1
     assert summary.next_line == 1
     assert not snapshot_file.exists()
+
+
+def test_retry_after_checkpoint_loss_does_not_duplicate_snapshot(
+    tmp_path, monkeypatch
+):
+    evidence = tmp_path / "p1_evidence.jsonl"
+    snapshot_file = tmp_path / "ml.jsonl.gz"
+    checkpoint = tmp_path / "checkpoint.json"
+    health = tmp_path / "health.json"
+    evidence.write_text(json.dumps(_canonical_row()) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        _drain_stub,
+    )
+
+    first = capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_path=snapshot_file,
+        checkpoint_path=checkpoint,
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=health,
+        enabled=True,
+    )
+    assert first.processed == 1
+
+    # Simulate a lost checkpoint after the compressed snapshot was durable.
+    checkpoint.write_text(json.dumps({"next_line": 0}), encoding="utf-8")
+    second = capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_path=snapshot_file,
+        checkpoint_path=checkpoint,
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=health,
+        enabled=True,
+    )
+
+    assert second.processed == 0
+    assert second.duplicate_snapshots_skipped == 1
+    assert json.loads(checkpoint.read_text())["next_line"] == 1
+    with gzip.open(snapshot_file, "rt", encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    assert len(rows) == 1
 
 
 def test_ml_capture_service_has_no_exchange_order_or_position_imports():
