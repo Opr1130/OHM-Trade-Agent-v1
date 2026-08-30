@@ -35,3 +35,12 @@ def test_scheduler_reconcile_installs_and_validates_ml_evidence_cron():
     assert 'install -o root -g root -m 0644 "$ML_EVIDENCE_SRC" "$ML_EVIDENCE_DST"' in source
     assert "app.jobs.run_opip_ml_capture" in source
     assert "app.jobs.build_phase3c_forward_outcomes" in source
+
+
+def test_deploy_probes_ml_capture_without_making_it_authoritative():
+    source = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
+        encoding="utf-8"
+    )
+    assert "python -m app.jobs.run_opip_ml_capture" in source
+    assert "if docker compose exec -T ohm-trade-agent" in source
+    assert "production unaffected" in source
