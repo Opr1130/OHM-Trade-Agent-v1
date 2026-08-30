@@ -72,6 +72,14 @@ def purged_chronological_split(
                 validation.append(sample.sample_id)
         elif test_start <= sample.decision_at_utc <= test_end:
             test.append(sample.sample_id)
+        else:
+            # Embargo-window and post-test samples remain explicitly accounted
+            # for rather than silently disappearing from validation lineage.
+            purged.append(sample.sample_id)
+
+    accounted = train + validation + test + purged
+    if len(accounted) != len(set(accounted)):
+        raise ValueError("sample IDs must be unique across split accounting")
     return PurgedSplit(
         train_ids=tuple(train),
         validation_ids=tuple(validation),
