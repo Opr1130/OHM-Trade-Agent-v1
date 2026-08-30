@@ -269,6 +269,10 @@ class CrossVenueFeatureAccumulator:
         )
         bucket.emitted = True
         self.pair_emissions += 1
+        # Once both provider qualities have finalized, the immutable snapshot
+        # in _ready owns the completed evidence. Keeping the emitted bucket
+        # would turn normal bounded retention into a false evidence-drop signal.
+        self._buckets.pop(key, None)
 
     def diagnostics(self) -> dict[str, Any]:
         missing_provider_counts = {"BINANCE": 0, "BYBIT": 0, "BOTH": 0}
@@ -322,5 +326,6 @@ class CrossVenueFeatureAccumulator:
         if len(self._buckets) < self._max_buckets:
             return
         oldest = min(self._buckets, key=lambda item: item[1])
-        self._buckets.pop(oldest, None)
-        self.dropped_buckets += 1
+        evicted = self._buckets.pop(oldest, None)
+        if evicted is not None and not evicted.emitted:
+            self.dropped_buckets += 1
