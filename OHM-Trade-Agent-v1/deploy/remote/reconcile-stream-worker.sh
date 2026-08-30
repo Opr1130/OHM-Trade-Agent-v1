@@ -54,6 +54,22 @@ fi
 
 docker exec "$SERVICE" python -m app.opip.streaming.healthcheck
 
+ready=0
+for _ in $(seq 1 45); do
+  if docker exec "$SERVICE" python -m app.opip.streaming.activation_check; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$ready" != "1" ]]; then
+  echo "O'Pip stream worker activation check failed" >&2
+  cat "$STREAM_DATA/health.json" >&2 || true
+  cat "$STREAM_DATA/latest_features.json" >&2 || true
+  docker compose logs --tail=120 "$SERVICE" >&2 || true
+  exit 1
+fi
+
 echo "OPIP stream worker reconciliation: OK"
 docker compose ps "$SERVICE"
 cat "$STREAM_DATA/health.json"
