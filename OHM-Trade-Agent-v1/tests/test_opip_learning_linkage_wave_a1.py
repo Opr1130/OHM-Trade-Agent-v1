@@ -118,16 +118,16 @@ def test_production_scored_eligible_maps_to_primary_paper_cohort():
     assert row.primary_supervised_eligible is True
 
 
-def test_feature_direction_none_cannot_enter_primary_supervised_cohort():
-    """Verify production direction NONE remains excluded from primary training."""
+def test_feature_direction_none_can_bind_only_from_exact_final_paper_lifecycle():
+    """Verify production direction NONE binds only to the exact paper trade side."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
         ml_snapshot_rows=[_ml(direction="NONE")],
         paper_trade_rows=[_paper(direction="LONG")],
     )[0]
     assert row.linkage_status is LinkageStatus.COMPLETE_FINAL
-    assert row.primary_supervised_eligible is False
-    assert "ML_DIRECTION_NOT_TRAINABLE" in row.exclusion_reasons
+    assert row.primary_supervised_eligible is True
+    assert "DIRECTION_BOUND_FROM_EXACT_PAPER_LIFECYCLE" in row.exclusion_reasons
 
 
 def test_feature_paper_direction_mismatch_cannot_train():
@@ -229,6 +229,41 @@ def test_multiple_paper_trades_for_same_episode_are_ambiguous_not_guessed():
     assert row.linkage_status is LinkageStatus.AMBIGUOUS_PAPER_LINK
     assert row.normalized_outcome.source_quality is OutcomeSourceQuality.UNUSABLE
     assert row.primary_supervised_eligible is False
+
+
+def test_ml_wrapper_without_immutable_snapshot_id_fails_closed():
+    """Verify exact ML linkage requires an immutable wrapper identity."""
+    bad = _ml()
+    bad["ml_snapshot_id"] = ""
+    with pytest.raises(ValueError, match="ml_snapshot_id is required"):
+        build_learning_linkage_records(
+            canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+            ml_snapshot_rows=[bad],
+            paper_trade_rows=[_paper()],
+        )
+
+
+def test_ml_wrapper_identity_must_match_nested_snapshot_identity():
+    """Verify wrapper and nested ML snapshot identities cannot diverge."""
+    bad = _ml()
+    bad["feature_snapshot"]["snapshot_id"] = "MLSNAP:other"
+    with pytest.raises(ValueError, match="must match"):
+        build_learning_linkage_records(
+            canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+            ml_snapshot_rows=[bad],
+            paper_trade_rows=[_paper()],
+        )
+
+
+def test_paper_lifecycle_revision_must_be_positive():
+    """Verify final paper authority requires a positive immutable revision."""
+    bad = _paper(revision=0)
+    with pytest.raises(ValueError, match="revision must be positive"):
+        build_learning_linkage_records(
+            canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+            ml_snapshot_rows=[_ml()],
+            paper_trade_rows=[bad],
+        )
 
 
 def test_latest_phase3c_revision_is_selected_by_explicit_revision():
