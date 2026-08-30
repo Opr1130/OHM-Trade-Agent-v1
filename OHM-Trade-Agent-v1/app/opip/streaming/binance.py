@@ -91,18 +91,16 @@ class BinancePublicAdapter:
         self._ws = None
         self._connection_id: str | None = None
         self._reconnect_epoch = -1
-        self._trade_trackers: dict[str, StrictIncrementingSequenceTracker] = {}
-        self._liquidation_trackers: dict[str, NoSequenceTracker] = {}
+        self._trade_trackers: dict[str, StrictIncrementingSequenceTracker] = {
+            symbol: StrictIncrementingSequenceTracker() for symbol in self.symbols
+        }
+        self._liquidation_trackers: dict[str, NoSequenceTracker] = {
+            symbol: NoSequenceTracker() for symbol in self.symbols
+        }
 
     async def connect(self, *, connection_id: str, reconnect_epoch: int) -> None:
         self._connection_id = str(connection_id)
         self._reconnect_epoch = int(reconnect_epoch)
-        self._trade_trackers = {
-            symbol: StrictIncrementingSequenceTracker() for symbol in self.symbols
-        }
-        self._liquidation_trackers = {
-            symbol: NoSequenceTracker() for symbol in self.symbols
-        }
         self._ws = await connect(
             self.url,
             open_timeout=10,
@@ -148,6 +146,8 @@ class BinancePublicAdapter:
                 continue
             data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
             if not isinstance(data, dict):
+                continue
+            if data.get("st") not in (None, 1):
                 continue
             event = str(data.get("e") or "")
             symbol = str(
