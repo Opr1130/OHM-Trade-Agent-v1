@@ -19,6 +19,7 @@ from app.opip.decision.equivalence_store import (
     opip_equivalence_ledger_enabled,
     read_equivalence_ledger,
 )
+from app.opip.decision.identity import opip_candidate_id
 from app.opip.decision.models_v2 import DecisionRole, from_v1_decision
 from app.opip.decision.policy_snapshot import GatePolicySnapshot, _freeze, _thaw
 from app.opip.decision.promotion import (
@@ -36,7 +37,7 @@ def _pair(
     *,
     when=NOW,
     scan_id: str = "SCAN:1",
-    candidate_id: str = "OPIPC:build51",
+    candidate_key: str = "build51",
     shadow_mutator=None,
     both_mutator=None,
 ):
@@ -44,9 +45,17 @@ def _pair(
     candidate.execution_validation = execution(
         estimated_visible_round_trip_market_drag_pct=0.1
     )
+    episode_id = f"EP:{candidate_key}"
+    canonical_candidate_id = opip_candidate_id(
+        episode_id=episode_id,
+        pair="SOLUSD",
+        direction="LONG",
+        market_type="SPOT",
+    )
     row = evidence(
         decision_time_utc=when,
-        candidate_id=candidate_id,
+        episode_id=episode_id,
+        candidate_id=canonical_candidate_id,
         candidate_snapshot=candidate,
     )
     live = OPipDecisionEngine(
@@ -170,7 +179,7 @@ def test_promotion_requires_sustained_exact_homogeneous_evidence():
         _pair(
             when=NOW + timedelta(days=index, minutes=index),
             scan_id=f"SCAN:{index}",
-            candidate_id=f"OPIPC:{index}",
+            candidate_key=f"candidate-{index}",
         )
         for index in range(3)
     )
@@ -194,11 +203,11 @@ def test_no_expected_denominator_can_never_be_ready():
 
 
 def test_entirely_omitted_candidate_is_detected_by_independent_denominator():
-    kept = _pair(scan_id="SCAN:1", candidate_id="OPIPC:kept")
+    kept = _pair(scan_id="SCAN:1", candidate_key="kept")
     expectation = ScanCoverageExpectation(
         scan_id="SCAN:1",
         expected_at_utc=NOW,
-        expected_candidate_ids=("OPIPC:kept", "OPIPC:omitted"),
+        expected_candidate_ids=(kept.candidate_id, "OPIPC:omitted"),
     )
     result = evaluate_shadow_equivalence(
         [kept],
@@ -214,24 +223,24 @@ def test_entirely_omitted_candidate_is_detected_by_independent_denominator():
 def test_distinct_days_come_from_independent_scan_expectations():
     first = _pair(
         scan_id="SCAN:1",
-        candidate_id="OPIPC:1",
+        candidate_key="one",
         when=NOW,
     )
     second = _pair(
         scan_id="SCAN:2",
-        candidate_id="OPIPC:2",
+        candidate_key="two",
         when=NOW + timedelta(days=10),
     )
     expectations = (
         ScanCoverageExpectation(
             scan_id="SCAN:1",
             expected_at_utc=NOW,
-            expected_candidate_ids=("OPIPC:1",),
+            expected_candidate_ids=(first.candidate_id,),
         ),
         ScanCoverageExpectation(
             scan_id="SCAN:2",
             expected_at_utc=NOW,
-            expected_candidate_ids=("OPIPC:2",),
+            expected_candidate_ids=(second.candidate_id,),
         ),
     )
     result = evaluate_shadow_equivalence(
@@ -247,10 +256,10 @@ def test_distinct_days_come_from_independent_scan_expectations():
 
 def test_one_divergence_blocks_engine_equivalence():
     rows = [
-        _pair(scan_id="SCAN:1", candidate_id="OPIPC:1"),
+        _pair(scan_id="SCAN:1", candidate_key="one"),
         _pair(
             scan_id="SCAN:2",
-            candidate_id="OPIPC:2",
+            candidate_key="two",
             when=NOW + timedelta(days=1),
         ),
     ]
@@ -264,7 +273,7 @@ def test_one_divergence_blocks_engine_equivalence():
 
     divergent = _pair(
         scan_id="SCAN:2",
-        candidate_id="OPIPC:2",
+        candidate_key="two",
         when=NOW + timedelta(days=1),
         shadow_mutator=mutate_gate,
     )
@@ -278,10 +287,10 @@ def test_one_divergence_blocks_engine_equivalence():
 
 
 def test_incomplete_instrumentation_blocks_even_with_exact_pairs():
-    exact = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    exact = _pair(scan_id="SCAN:1", candidate_key="one")
     candidate = snapshot()
     candidate.execution_validation = execution()
-    row = evidence(candidate_id="OPIPC:2", candidate_snapshot=candidate)
+    row = evidence(candidate_key="two", candidate_snapshot=candidate)
     missing = build_equivalence_observation(
         observed_at_utc=NOW + timedelta(minutes=1),
         scan_id="SCAN:2",
@@ -311,7 +320,7 @@ def test_incomplete_ledger_coverage_blocks_promotion():
 
 
 def test_version_mix_blocks_aggregation():
-    first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    first = _pair(scan_id="SCAN:1", candidate_key="one")
     def alternate_code(production, shadow):
         fingerprint = "ACF:" + ("f" * 64)
         return (
@@ -321,7 +330,7 @@ def test_version_mix_blocks_aggregation():
 
     second = _pair(
         scan_id="SCAN:2",
-        candidate_id="OPIPC:2",
+        candidate_key="two",
         when=NOW + timedelta(days=1),
         both_mutator=alternate_code,
     )
@@ -334,7 +343,7 @@ def test_version_mix_blocks_aggregation():
 
 
 def test_duplicate_candidate_observations_block_readiness():
-    first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    first = _pair(scan_id="SCAN:1", candidate_key="one")
     def mutate_gate(value):
         last = value.gate_results_ordered[-1]
         changed = replace(last, reason=last.reason + " duplicate-key")
@@ -345,7 +354,7 @@ def test_duplicate_candidate_observations_block_readiness():
 
     second = _pair(
         scan_id="SCAN:1",
-        candidate_id="OPIPC:1",
+        candidate_key="one",
         shadow_mutator=mutate_gate,
     )
     result = evaluate_shadow_equivalence(
