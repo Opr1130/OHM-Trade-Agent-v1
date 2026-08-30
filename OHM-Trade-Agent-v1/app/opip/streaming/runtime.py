@@ -530,22 +530,22 @@ class StreamingRuntime:
         stream_type = frame.frame.stream_type.value
         symbol = frame.frame.provider_symbol
         for seconds in self.config.window_seconds:
-            matched = False
             for key, current in tuple(self._windows.items()):
                 if (
                     key[0] == provider
                     and key[1] == stream_type
                     and key[3] == seconds
                     and self._window_provider_symbols.get(key) == symbol
-                    and not current.sealed
                 ):
                     self._windows[key] = current.record_dropped_frame()
-                    matched = True
-            if not matched:
-                pending_key = (provider, stream_type, symbol, seconds)
-                self._pending_drops[pending_key] = (
-                    self._pending_drops.get(pending_key, 0) + 1
-                )
+
+            # The raw frame is deliberately not parsed on overflow, so its
+            # semantic timestamp is unknown. Conservatively degrade the next
+            # matching window as well as any retained matching window.
+            pending_key = (provider, stream_type, symbol, seconds)
+            self._pending_drops[pending_key] = (
+                self._pending_drops.get(pending_key, 0) + 1
+            )
 
     def _seal_and_prune(self, now_utc: datetime) -> None:
         retention = timedelta(
