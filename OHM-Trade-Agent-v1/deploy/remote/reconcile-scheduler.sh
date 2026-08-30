@@ -4,6 +4,8 @@ set -Eeuo pipefail
 APP_ROOT="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
 CANONICAL_SRC="$APP_ROOT/deploy/cron.d/ohm-unified-cycle"
 CANONICAL_DST="/etc/cron.d/ohm-unified-cycle"
+ML_EVIDENCE_SRC="$APP_ROOT/deploy/cron.d/opip-ml-evidence"
+ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 
@@ -23,6 +25,10 @@ if [[ ! -s "$CANONICAL_SRC" ]]; then
   echo "canonical scheduler missing: $CANONICAL_SRC" >&2
   exit 69
 fi
+if [[ ! -s "$ML_EVIDENCE_SRC" ]]; then
+  echo "O'Pip ML evidence scheduler missing: $ML_EVIDENCE_SRC" >&2
+  exit 69
+fi
 if [[ ! -s "$STREAM_RECONCILE" ]]; then
   echo "stream worker reconciliation missing: $STREAM_RECONCILE" >&2
   exit 69
@@ -30,12 +36,17 @@ fi
 
 tmpdir="$(mktemp -d)"
 had_canonical=0
+had_ml_evidence=0
 had_legacy=0
 had_root_crontab=0
 
 if [[ -e "$CANONICAL_DST" ]]; then
   cp -a "$CANONICAL_DST" "$tmpdir/canonical.before"
   had_canonical=1
+fi
+if [[ -e "$ML_EVIDENCE_DST" ]]; then
+  cp -a "$ML_EVIDENCE_DST" "$tmpdir/ml-evidence.before"
+  had_ml_evidence=1
 fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   cp -a "$LEGACY_MOVEMENT" "$tmpdir/legacy.before"
@@ -55,6 +66,11 @@ rollback() {
   else
     rm -f "$CANONICAL_DST"
   fi
+  if [[ "$had_ml_evidence" == "1" ]]; then
+    cp -a "$tmpdir/ml-evidence.before" "$ML_EVIDENCE_DST"
+  else
+    rm -f "$ML_EVIDENCE_DST"
+  fi
   if [[ "$had_legacy" == "1" ]]; then
     cp -a "$tmpdir/legacy.before" "$LEGACY_MOVEMENT"
   else
@@ -71,6 +87,7 @@ rollback() {
 trap rollback ERR
 
 install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
+install -o root -g root -m 0644 "$ML_EVIDENCE_SRC" "$ML_EVIDENCE_DST"
 rm -f "$LEGACY_MOVEMENT"
 
 # Remove only legacy O'Pip direct/unified scheduler lines from root's personal
@@ -79,6 +96,14 @@ grep -v -E 'app\.jobs\.(run_cycle|scan_movers|scan_opportunities)'   "$tmpdir/ro
 crontab "$tmpdir/root.after"
 
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
+grep -q 'app.jobs.run_opip_ml_capture' "$ML_EVIDENCE_DST"
+grep -q 'app.jobs.build_phase3c_forward_outcomes' "$ML_EVIDENCE_DST"
+grep -q '/var/run/opip-ml-capture.lock' "$ML_EVIDENCE_DST"
+grep -q '/var/run/opip-ml-outcomes.lock' "$ML_EVIDENCE_DST"
+if grep -q '/var/run/ohm-unified-cycle.lock' "$ML_EVIDENCE_DST"; then
+  echo "O'Pip ML scheduler must not use the unified-cycle lock" >&2
+  false
+fi
 if [[ -e "$LEGACY_MOVEMENT" ]]; then
   echo "legacy movement scheduler still exists" >&2
   false
@@ -93,7 +118,12 @@ bash "$STREAM_RECONCILE"
 trap - ERR
 rm -rf "$tmpdir"
 
-echo "OHM scheduler reconciliation: OK"
+echo "O'Pip scheduler reconciliation: OK"
 echo "canonical=$CANONICAL_DST"
 echo "cadence=1 minute"
 echo "entrypoint=app.jobs.run_cycle"
+echo "ml_evidence=$ML_EVIDENCE_DST"
+echo "ml_capture_cadence=1 minute"
+echo "ml_capture_entrypoint=app.jobs.run_opip_ml_capture"
+echo "ml_outcome_cadence=10 minutes"
+echo "ml_outcome_entrypoint=app.jobs.build_phase3c_forward_outcomes"
