@@ -22,6 +22,7 @@ from app.services.full_market_transition_learning import build_full_market_trans
 from app.services.intelligence_journey import record_watch_observation
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
+from app.services.opportunity_monitor_queue import CandidateObservation, upsert_candidate
 from app.services.signal_scoring import (
     SignalQualityCandidate,
     SignalQualityConfig,
@@ -326,6 +327,70 @@ def _broad_watch_feed(
     ]
 
 
+
+def _enqueue_wave9_monitoring(full_market, signals, *, observed_at: datetime) -> tuple[int, int]:
+    """Feed Wave 9's silent monitoring queue from existing discovery evidence."""
+    queued = 0
+    failures = 0
+
+    if full_market is not None:
+        reference_prices = getattr(full_market, "signal_quality_reference_prices", {}) or {}
+        for candidate in getattr(full_market, "signal_quality_candidates", ()) or ():
+            try:
+                if bool(getattr(candidate, "suppressed", False)):
+                    continue
+                upsert_candidate(
+                    CandidateObservation(
+                        symbol=str(candidate.symbol),
+                        direction=str(getattr(candidate, "direction", "LONG") or "LONG"),
+                        source="FULL_MARKET_RELATIVE_STRENGTH_VOLUME",
+                        observed_at=observed_at,
+                        price=reference_prices.get(candidate.symbol),
+                        relative_strength_percentile=float(
+                            getattr(candidate, "relative_strength_percentile", 0.0)
+                        ),
+                        volume_acceleration_score=float(
+                            getattr(candidate, "volume_acceleration_score", 0.0)
+                        ),
+                        liquidity_usd=float(
+                            getattr(candidate, "liquidity_24h_usd_approx", 0.0)
+                        ),
+                        priority_score=float(
+                            getattr(candidate, "opportunity_score", 0.0)
+                        ),
+                    )
+                )
+                queued += 1
+            except Exception:
+                failures += 1
+
+    for signal in signals or ():
+        try:
+            # Deep early-mover evidence adds a second independent discovery
+            # source. The queue merges by market/direction and remains silent.
+            volume_score = max(0.0, min(100.0, float(signal.relative_volume) * 25.0))
+            upsert_candidate(
+                CandidateObservation(
+                    symbol=str(signal.symbol),
+                    direction=str(signal.direction or "LONG"),
+                    source="EARLY_MOVER_PARTICIPATION",
+                    observed_at=observed_at,
+                    price=float(getattr(signal, "reference_price", 0.0) or 0.0),
+                    relative_strength_percentile=None,
+                    volume_acceleration_score=volume_score,
+                    liquidity_usd=float(signal.liquidity_24h_usd_approx),
+                    priority_score=float(
+                        max(signal.discovery_score, signal.entry_quality)
+                    ),
+                )
+            )
+            queued += 1
+        except Exception:
+            failures += 1
+
+    return queued, failures
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -343,6 +408,20 @@ def main() -> None:
     )
 
     coarse, signals = scan_early_movers()
+
+    try:
+        queue_added, queue_failures = _enqueue_wave9_monitoring(
+            full_market,
+            signals,
+            observed_at=decision_at,
+        )
+        print(
+            "Wave 9 silent monitoring queue:",
+            f"observations={queue_added}",
+            f"failures={queue_failures}",
+        )
+    except Exception as exc:
+        print("Wave 9 silent monitoring queue: fail-soft", type(exc).__name__)
 
     print("===== OHM MOVEMENT DISCOVERY V2.1 + WAVE 5.2 =====")
     if full_market is not None:
