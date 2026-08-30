@@ -243,3 +243,22 @@ def test_streaming_has_no_private_credentials_or_order_endpoints():
         source = path.read_text(encoding="utf-8").lower()
         for token in forbidden:
             assert token not in source, f"{path} contains private/trading token {token}"
+
+
+def test_first_stream_worker_deploy_uses_existing_trusted_reconcile_hook():
+    deploy = Path("deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    scheduler = Path("deploy/remote/reconcile-scheduler.sh").read_text(
+        encoding="utf-8"
+    )
+    worker = Path("deploy/remote/reconcile-stream-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = Path("../.github/workflows/deploy-production.yml").read_text(
+        encoding="utf-8"
+    )
+    assert 'bash "$SCHEDULER_RECONCILE"' in deploy
+    assert 'bash "$STREAM_RECONCILE"' in scheduler
+    assert "app.opip.streaming.activation_check" in worker
+    assert "OPIP stream worker reconciliation: OK" in worker
+    assert "OPIP stream worker reconciliation: OK" in workflow
+    assert "--remove-orphans ohm-trade-agent" in deploy
