@@ -33,6 +33,7 @@ from app.services.registry_io import registry_lock
 
 SCHEMA_VERSION = 1
 RECORD_TYPE = "CANONICAL_EPISODE_SNAPSHOT"
+ML_FEATURE_SEED_SCHEMA_VERSION = 1
 
 
 def _require_utc(value: datetime) -> datetime:
@@ -76,6 +77,113 @@ def _decision_reference_price(observation: Any, scan_source: str) -> float | Non
 def _hash(prefix: str, value: str, *, length: int = 32) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
     return f"{prefix}:{digest}"
+
+
+def _ml_feature_seed(
+    observation: Any,
+    *,
+    decision: datetime,
+    scan_source: str,
+    reference_price: float | None,
+) -> dict[str, Any]:
+    """Return conservative ML-ready values already present before decision_at.
+
+    Provider source-event timestamps are not fabricated. Because decision is
+    captured only after the synchronous market scan has returned, every value
+    below was already in O'Pip memory by that instant. Stamping local ingest
+    and visibility at the decision boundary is conservative.
+    """
+
+    numeric_fields = {
+        "completed_close": "last_price",
+        "ema20": "ema20",
+        "ema50": "ema50",
+        "ema200": "ema200",
+        "rsi": "rsi",
+        "macd_line": "macd_line",
+        "macd_signal": "macd_signal",
+        "macd_histogram": "macd_histogram",
+        "atr": "atr",
+        "atr_pct": "atr_pct",
+        "volume_ratio": "volume_ratio",
+        "bollinger_bandwidth_pct": "bollinger_bandwidth_pct",
+        "bollinger_bandwidth_percentile": "bollinger_bandwidth_percentile",
+        "atr_percentile": "atr_percentile",
+        "movement_volume_ratio": "movement_volume_ratio",
+        "confirmed_price_change_1h_pct": "confirmed_price_change_1h_pct",
+        "recent_24h_high": "recent_24h_high",
+        "recent_24h_low": "recent_24h_low",
+        "recent_72h_high": "recent_72h_high",
+        "recent_72h_low": "recent_72h_low",
+        "momentum_6h_pct": "momentum_6h_pct",
+        "momentum_24h_pct": "momentum_24h_pct",
+        "momentum_72h_pct": "momentum_72h_pct",
+        "distance_to_24h_high_pct": "distance_to_24h_high_pct",
+        "distance_to_72h_high_pct": "distance_to_72h_high_pct",
+        "distance_to_24h_low_pct": "distance_to_24h_low_pct",
+        "distance_to_72h_low_pct": "distance_to_72h_low_pct",
+        "realized_range_24h_pct": "realized_range_24h_pct",
+        "realized_range_72h_pct": "realized_range_72h_pct",
+        "average_hourly_range_24h_pct": "average_hourly_range_24h_pct",
+        "average_hourly_range_72h_pct": "average_hourly_range_72h_pct",
+        "rolling_24h_range_median_pct": "rolling_24h_range_median_pct",
+        "rolling_24h_range_p75_pct": "rolling_24h_range_p75_pct",
+        "rolling_24h_range_p90_pct": "rolling_24h_range_p90_pct",
+        "rolling_72h_range_median_pct": "rolling_72h_range_median_pct",
+        "rolling_72h_range_p75_pct": "rolling_72h_range_p75_pct",
+        "rolling_72h_range_p90_pct": "rolling_72h_range_p90_pct",
+        "rolling_24h_upside_median_pct": "rolling_24h_upside_median_pct",
+        "rolling_24h_upside_p75_pct": "rolling_24h_upside_p75_pct",
+        "rolling_24h_upside_p90_pct": "rolling_24h_upside_p90_pct",
+        "rolling_72h_upside_median_pct": "rolling_72h_upside_median_pct",
+        "rolling_72h_upside_p75_pct": "rolling_72h_upside_p75_pct",
+        "rolling_72h_upside_p90_pct": "rolling_72h_upside_p90_pct",
+        "rolling_24h_downside_median_pct": "rolling_24h_downside_median_pct",
+        "rolling_24h_downside_p75_pct": "rolling_24h_downside_p75_pct",
+        "rolling_24h_downside_p90_pct": "rolling_24h_downside_p90_pct",
+        "rolling_72h_downside_median_pct": "rolling_72h_downside_median_pct",
+        "rolling_72h_downside_p75_pct": "rolling_72h_downside_p75_pct",
+        "rolling_72h_downside_p90_pct": "rolling_72h_downside_p90_pct",
+        "primary_24h_liquidity_usd": "primary_24h_liquidity_usd",
+        "secondary_24h_liquidity_usd": "secondary_24h_liquidity_usd",
+        "combined_24h_liquidity_usd": "combined_24h_liquidity_usd",
+        "ticker_bid": "ticker_bid",
+        "ticker_ask": "ticker_ask",
+        "cross_pair_price_divergence_pct": "cross_pair_price_divergence_pct",
+    }
+    feature_values: dict[str, Any] = {"reference_price": reference_price}
+    feature_values.update(
+        {
+            output_name: _finite(getattr(observation, attribute_name, None))
+            for output_name, attribute_name in numeric_fields.items()
+        }
+    )
+    for name in (
+        "trend",
+        "movement_timeframe",
+        "movement_data_status",
+        "cross_pair_confirmation_status",
+        "cross_pair_price_status",
+    ):
+        value = getattr(observation, name, None)
+        feature_values[name] = str(value) if value is not None else None
+
+    stamp = {
+        "source_at_utc": None,
+        "ingested_at_utc": decision.isoformat(),
+        "visible_at_utc": decision.isoformat(),
+        "source_version": (
+            f"canonical-episode-v{SCHEMA_VERSION}:"
+            f"{str(scan_source or 'LIVE_FULL_MARKET').upper()}"
+        ),
+    }
+    return {
+        "schema_version": ML_FEATURE_SEED_SCHEMA_VERSION,
+        "feature_values": feature_values,
+        "availability": stamp,
+        "availability_basis": "CONSERVATIVE_DECISION_BOUNDARY",
+        "deterministic_outputs_excluded": True,
+    }
 
 
 def canonical_cohort_id(
@@ -266,6 +374,12 @@ def _build_snapshot(
         "distance_from_24h_high_pct": _first_finite(
             getattr(observation, "distance_from_24h_high_pct", None),
             getattr(observation, "distance_to_24h_high_pct", None),
+        ),
+        "ml_feature_seed": _ml_feature_seed(
+            observation,
+            decision=decision,
+            scan_source=scan_source,
+            reference_price=decision_reference_price,
         ),
         "signal_quality_enabled": bool(signal_quality_enabled),
         "decision_status": decision_status,
