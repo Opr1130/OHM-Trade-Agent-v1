@@ -42,7 +42,7 @@ from app.services.economic_quality_gate import (
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
-from app.services.entry_watch_queue import enqueue_entry_watch
+from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
     get_latest_price_movement,
@@ -686,6 +686,14 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings):
             continue
 
         eligible.append(ranked)
+        try:
+            remove_entry_watch(plan.symbol, direction)
+        except Exception as exc:
+            # Accepted trade remains valid; queue cleanup is operational only.
+            print(
+                f"ENTRY WATCH cleanup failed open {direction} {plan.symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
         projected_trades.append(
             SimpleNamespace(
                 symbol=plan.symbol,
