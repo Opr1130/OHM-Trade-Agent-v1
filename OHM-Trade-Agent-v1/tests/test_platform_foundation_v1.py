@@ -114,12 +114,14 @@ def test_core_compose_has_bounded_logs_process_limits_and_healthcheck():
     assert "no-new-privileges:true" in text
 
 
-def test_paper_sidecar_memory_limit_matches_two_worker_runtime():
+def test_paper_workers_have_independent_resource_boundaries():
     text = PAPER_COMPOSE.read_text(encoding="utf-8")
-    assert "mem_limit: 768m" in text
-    assert "mem_limit: 384m" not in text
-    assert 'cpus: "0.40"' in text
-    assert "oom_score_adj: 500" in text
+    assert "ohm-freqtrade-paper-usdt:" in text
+    assert text.count("mem_limit: 448m") == 2
+    assert "mem_limit: 768m" not in text
+    assert text.count('cpus: "0.20"') == 2
+    assert text.count("oom_score_adj: 500") == 2
+    assert "./data/freqtrade/user_data_usdt:/freqtrade/user_data" in text
 
 
 def test_platform_backup_excludes_sqlite_transient_sidecars(tmp_path):
