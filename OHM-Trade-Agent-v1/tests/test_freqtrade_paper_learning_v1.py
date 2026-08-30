@@ -344,7 +344,8 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "ohm-freqtrade-paper-usdt:" in paper_compose
     assert "env_file:" not in paper_compose
     assert "ports:" not in paper_compose
-    assert paper_compose.count('mem_limit: 448m') == 2
+    assert paper_compose.count('mem_limit: 384m') == 2
+    assert paper_compose.count('memswap_limit: 384m') == 2
     assert 'mem_limit: 768m' not in paper_compose
     assert paper_compose.count('cpus: "0.20"') == 2
     assert "tradesv3.ohm_dry_run_usd.sqlite" in paper_compose
