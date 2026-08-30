@@ -1,0 +1,18 @@
+[Unit]
+Description=O'Pip Learning Evidence Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/opip-learning-sync
+TimeoutStartSec=90
+TimeoutStopSec=20
+KillMode=control-group
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opip-learning /var/lock
+PrivateTmp=true
