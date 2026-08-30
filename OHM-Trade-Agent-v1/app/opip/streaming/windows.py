@@ -190,11 +190,17 @@ class WindowAccumulator:
         )
 
     def record_dropped_frame(self) -> "WindowAccumulator":
-        """Account for a raw frame the caller chose to drop (e.g. under
-        queue-overflow backpressure) without folding it into the aggregate."""
+        """Account for one dropped raw frame without folding its payload."""
+        return self.record_dropped_frames(1)
+
+    def record_dropped_frames(self, count: int) -> "WindowAccumulator":
+        """Account for one or more dropped frames in O(1) bounded state."""
+        amount = int(count)
+        if amount <= 0:
+            raise ValueError("dropped frame count must be positive")
         if self.sealed:
             raise ValueError("cannot record into a sealed window")
-        return replace(self, dropped_frame_count=self.dropped_frame_count + 1)
+        return replace(self, dropped_frame_count=self.dropped_frame_count + amount)
 
     def record_late_frame(self) -> "WindowAccumulator":
         """Account for a late frame without mutating the sealed aggregate
