@@ -141,7 +141,16 @@ def _latest_revision_by_key(
         key = str(row.get(key_field) or "").strip()
         if not key:
             continue
-        revision = int(row.get(revision_field, 0) or 0)
+        try:
+            revision = int(row.get(revision_field))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{revision_field} is required for immutable revision selection"
+            )
+        if revision <= 0:
+            raise ValueError(
+                f"{revision_field} must be positive for immutable revision selection"
+            )
         if identity_field is not None:
             identity = str(row.get(identity_field) or "").strip()
             if not identity:
@@ -209,6 +218,19 @@ def _index_unique(
         if not key:
             continue
         identity = str(row.get(identity_field) or "").strip()
+        if not identity:
+            raise ValueError(
+                f"{identity_field} is required for exact linkage selection"
+            )
+        if identity_field == "ml_snapshot_id":
+            snapshot = row.get("feature_snapshot")
+            if not isinstance(snapshot, Mapping):
+                raise ValueError("feature_snapshot is required for exact ML linkage")
+            nested_identity = str(snapshot.get("snapshot_id") or "").strip()
+            if not nested_identity or nested_identity != identity:
+                raise ValueError(
+                    "ml_snapshot_id must match feature_snapshot.snapshot_id"
+                )
         prior = identities.get(key)
         if prior is not None and prior != identity:
             raise ValueError(
@@ -573,15 +595,25 @@ def build_learning_linkage_records(
                     status = LinkageStatus.FEATURE_LINKED_NO_OUTCOME
                     reasons.append("PAPER_OUTCOME_NOT_FINAL_OR_UNUSABLE")
                 ml_direction = _ml_direction(ml_row)
-                if ml_direction is None:
-                    reasons.append("ML_DIRECTION_NOT_TRAINABLE")
-                elif outcome.direction != ml_direction:
+                effective_direction = ml_direction
+                if ml_direction is None and outcome.direction in {"LONG", "SHORT"}:
+                    # Current production capture seals generic observation snapshots
+                    # with direction=NONE. An exact paper lifecycle binds the trade
+                    # side selected for that same episode; this is decision/action
+                    # provenance, not a future market label.
+                    effective_direction = outcome.direction
+                    reasons.append("DIRECTION_BOUND_FROM_EXACT_PAPER_LIFECYCLE")
+                elif (
+                    ml_direction is not None
+                    and outcome.direction is not None
+                    and outcome.direction != ml_direction
+                ):
                     reasons.append("DIRECTION_LINK_MISMATCH")
                 primary = (
                     cohort is LearningCohort.QUALIFIED_PAPER
                     and outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
-                    and ml_direction in {"LONG", "SHORT"}
-                    and outcome.direction == ml_direction
+                    and effective_direction in {"LONG", "SHORT"}
+                    and outcome.direction == effective_direction
                     and not outcome.censored
                     and not outcome.data_gap
                     and not outcome.execution_path_ambiguous
