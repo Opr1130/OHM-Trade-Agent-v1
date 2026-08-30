@@ -64,6 +64,25 @@ def test_learning_lifecycle_requires_explicit_human_acceptance():
     assert accepted.evidence_ids == ("EV:1", "EV:2")
 
 
+def test_learning_lifecycle_rejects_backward_time():
+    row = create_learning_observation(
+        hypothesis_key="time-order",
+        created_at_utc=NOW,
+        evidence_ids=("EV:1",),
+    )
+    row = transition_learning(
+        row,
+        target=LearningStage.HYPOTHESIS,
+        updated_at_utc=NOW + timedelta(minutes=2),
+    )
+    with pytest.raises(ValueError, match="time cannot move backward"):
+        transition_learning(
+            row,
+            target=LearningStage.SHADOW_TEST,
+            updated_at_utc=NOW + timedelta(minutes=1),
+        )
+
+
 def test_learning_lifecycle_rejects_invalid_transition():
     row = create_learning_observation(
         hypothesis_key="x",
@@ -101,6 +120,7 @@ def _samples(n=40):
 def test_paired_evaluation_is_measurement_only_and_support_gated():
     result = evaluate_champion_challenger(_samples(), minimum_support=20)
     assert result.support is EvaluationSupport.SUFFICIENT
+    assert result.cohort == "QUALIFIED_PAPER"
     assert result.paired_samples == 40
     assert result.can_promote is False
     assert result.automatic_promotion is False
@@ -114,6 +134,19 @@ def test_paired_evaluation_marks_small_sample_insufficient():
     assert result.support is EvaluationSupport.INSUFFICIENT
     assert result.champion.net_expectancy.support is EvaluationSupport.INSUFFICIENT
     assert result.champion.net_expectancy.ci_low is None
+
+
+def test_paired_evaluation_rejects_mixed_cohorts():
+    rows = _samples(4)
+    rows[1] = PairedEvaluationSample(
+        sample_id=rows[1].sample_id,
+        cohort="COUNTERFACTUAL_REJECTED",
+        champion_admitted=rows[1].champion_admitted,
+        challenger_admitted=rows[1].challenger_admitted,
+        realized_net_return=rows[1].realized_net_return,
+    )
+    with pytest.raises(ValueError, match="mixed cohorts"):
+        evaluate_champion_challenger(rows, minimum_support=2)
 
 
 def test_paired_evaluation_rejects_duplicate_t0_sample_identity():
@@ -169,6 +202,8 @@ def test_zero_trade_diagnostic_uses_structured_gate_and_health_evidence():
     )
     assert diagnostic.candidate_count == 2
     assert diagnostic.qualified_count == 0
+    assert diagnostic.rejected_count == 2
+    assert diagnostic.unscored_count == 0
     assert diagnostic.binding_gate == "EVENT_RISK"
     assert diagnostic.event_or_risk_restriction == "EVENT_RESTRICTION"
     assert diagnostic.nearest_miss_candidate_id == "C:2"
