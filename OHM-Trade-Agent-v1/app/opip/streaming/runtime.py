@@ -328,26 +328,23 @@ class StreamingRuntime:
         provider: StreamProvider,
     ) -> RawProviderFrame:
         telemetry = self._telemetry.provider[provider]
-        try:
-            return await asyncio.wait_for(
-                adapter.receive(),
-                timeout=self.config.heartbeat_interval_seconds,
-            )
-        except asyncio.TimeoutError:
-            telemetry.heartbeat_sent += 1
-            telemetry.last_heartbeat_monotonic = self._monotonic()
+        while True:
             try:
-                await asyncio.wait_for(
-                    adapter.heartbeat(),
-                    timeout=self.config.heartbeat_timeout_seconds,
+                return await asyncio.wait_for(
+                    adapter.receive(),
+                    timeout=self.config.heartbeat_interval_seconds,
                 )
-            except asyncio.TimeoutError as exc:
-                telemetry.heartbeat_timeouts += 1
-                raise _HeartbeatTimeout("stream heartbeat timeout") from exc
-            return await asyncio.wait_for(
-                adapter.receive(),
-                timeout=self.config.heartbeat_interval_seconds,
-            )
+            except asyncio.TimeoutError:
+                telemetry.heartbeat_sent += 1
+                telemetry.last_heartbeat_monotonic = self._monotonic()
+                try:
+                    await asyncio.wait_for(
+                        adapter.heartbeat(),
+                        timeout=self.config.heartbeat_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    telemetry.heartbeat_timeouts += 1
+                    raise _HeartbeatTimeout("stream heartbeat timeout") from exc
 
     def _enqueue_if_current(self, frame: QueuedRawFrame) -> bool:
         telemetry = self._telemetry.provider[frame.provider]
