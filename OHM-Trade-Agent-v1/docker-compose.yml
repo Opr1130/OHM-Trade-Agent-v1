@@ -9,6 +9,10 @@ services:
       - ./deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
     read_only: true
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: "0.05"
+    oom_score_adj: 700
     pids_limit: 128
     security_opt:
       - no-new-privileges:true
@@ -48,6 +52,12 @@ services:
       # readable by the application but only the isolated worker may write it.
       - ./data/opip/streaming:/app/data/opip/streaming:ro
       - ./data/freqtrade/state:/app/freqtrade_paper:ro
+    # The deterministic core was small after the evidence jobs were moved out
+    # of this cgroup. Bound it so a future leak cannot consume the whole 2 GB host.
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: "0.45"
+    oom_score_adj: 100
     pids_limit: 256
     security_opt:
       - no-new-privileges:true
@@ -93,8 +103,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    mem_limit: 256m
-    cpus: "0.40"
+    mem_limit: 192m
+    memswap_limit: 192m
+    cpus: "0.35"
     pids_limit: 128
     cap_drop:
       - ALL

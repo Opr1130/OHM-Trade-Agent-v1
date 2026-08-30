@@ -98,39 +98,42 @@ jobs:
             | tee "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
           grep -q 'SOL/USDT' "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
 
-      - name: Boot production paper sidecar and require both worker heartbeats
+      - name: Boot isolated production paper workers and require both heartbeats
         run: |
           rm -rf data/freqtrade data/freqtrade_bridge data/paper_trading
-          mkdir -p data/freqtrade/user_data data/freqtrade/state data/freqtrade_bridge data/paper_trading
+          mkdir -p data/freqtrade/user_data data/freqtrade/user_data_usdt data/freqtrade/state data/freqtrade_bridge data/paper_trading
           cp "$RUNNER_TEMP/ohm-ft-bridge/"*.json data/freqtrade_bridge/
           cp "$RUNNER_TEMP/ohm-ft-control/control.json" data/paper_trading/control.json
 
           # Reproduce the restrictive root-created modes seen in production.
           chmod 0600 data/freqtrade_bridge/*.json data/paper_trading/control.json
 
-          docker compose -f docker-compose.paper.yml up -d ohm-freqtrade-paper
+          docker compose -f docker-compose.paper.yml up -d ohm-freqtrade-paper ohm-freqtrade-paper-usdt
 
-          STATUS=""
-          for _ in $(seq 1 45); do
-            STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ohm-freqtrade-paper 2>/dev/null || true)"
-            if [ "$STATUS" = "healthy" ]; then
-              break
-            fi
-            if [ "$(docker inspect --format='{{.State.Restarting}}' ohm-freqtrade-paper 2>/dev/null || true)" = "true" ]; then
-              docker compose -f docker-compose.paper.yml logs --tail=200
-              exit 1
-            fi
-            sleep 2
+          for CONTAINER in ohm-freqtrade-paper ohm-freqtrade-paper-usdt; do
+            STATUS=""
+            for _ in $(seq 1 45); do
+              STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER" 2>/dev/null || true)"
+              if [ "$STATUS" = "healthy" ]; then
+                break
+              fi
+              if [ "$(docker inspect --format='{{.State.Restarting}}' "$CONTAINER" 2>/dev/null || true)" = "true" ]; then
+                docker compose -f docker-compose.paper.yml logs --tail=200
+                exit 1
+              fi
+              sleep 2
+            done
+            test "$STATUS" = "healthy"
           done
-
-          test "$STATUS" = "healthy"
           test -s data/freqtrade/state/heartbeat_USD
           test -s data/freqtrade/state/heartbeat_USDT
           test "$(stat -c '%a' data/freqtrade_bridge/signals.json)" = "644"
           test "$(stat -c '%a' data/paper_trading/control.json)" = "644"
 
-          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config.json'
-          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config_usdt.json'
+          docker top ohm-freqtrade-paper -eo pid,args \
+            | grep -q -- '--config /freqtrade/config/config.json'
+          docker top ohm-freqtrade-paper-usdt -eo pid,args \
+            | grep -q -- '--config /freqtrade/config/config_usdt.json'
 
       - name: Prove dry-run and credential isolation
         run: |
@@ -169,8 +172,12 @@ jobs:
           assert "ports:" not in paper
           assert "./data/paper_trading:/freqtrade/control:ro" in paper
           assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper
-          assert "mem_limit: 768m" in paper
-          assert 'cpus: "0.40"' in paper
+          assert paper.count("mem_limit: 384m") == 2
+          assert paper.count("memswap_limit: 384m") == 2
+          assert "mem_limit: 768m" not in paper
+          assert paper.count('cpus: "0.20"') == 2
+          assert "ohm-freqtrade-paper-usdt:" in paper
+          assert "./data/freqtrade/user_data_usdt:/freqtrade/user_data" in paper
           print("Freqtrade paper authority/isolation boundary: PASS")
           PY
 

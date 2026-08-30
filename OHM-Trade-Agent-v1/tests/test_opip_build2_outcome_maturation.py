@@ -115,3 +115,69 @@ def test_canonical_capture_coverage_detects_missing_pair():
     assert coverage["captured_unique_episode_rows"] == 1
     assert coverage["coverage"] == 0.5
     assert coverage["meets_target"] is False
+
+
+def test_outcome_maturation_repairs_only_truncated_final_record(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    valid_first = outcomes.read_bytes()
+    assert valid_first.endswith(b"\n")
+
+    with outcomes.open("ab") as handle:
+        handle.write(b'{"snapshot_id":"BROKEN"')
+
+    rebuilt = build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    assert len(rebuilt) == 1
+    payload = outcomes.read_bytes()
+    assert payload == valid_first
+    assert b"BROKEN" not in payload
+
+
+
+def test_outcome_maturation_preserves_valid_final_record_without_newline(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    first = build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    assert len(first) == 1
+
+    valid = outcomes.read_bytes()
+    assert valid.endswith(b"\n")
+    outcomes.write_bytes(valid[:-1])
+
+    rebuilt = build_outcomes(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+    )
+    assert len(rebuilt) == 1
+    assert rebuilt[0]["outcome_record_id"] == first[0]["outcome_record_id"]
+    assert outcomes.read_bytes() == valid

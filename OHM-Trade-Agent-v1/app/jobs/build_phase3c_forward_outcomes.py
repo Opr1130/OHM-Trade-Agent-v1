@@ -25,6 +25,54 @@ DEFAULT_SNAPSHOT_LEDGER = Path("/app/data/p1_evidence_ledger.jsonl")
 DEFAULT_OUTPUT = Path("/app/data/phase3c_forward_outcomes.jsonl")
 
 
+def _repair_truncated_jsonl_tail(path: Path) -> bool:
+    """Discard only an incomplete final JSONL record left by abrupt termination."""
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+
+    with path.open("r+b") as handle:
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return False
+
+        end = handle.tell()
+        cursor = end
+        last_newline = -1
+        chunk_size = 4096
+        while cursor > 0 and last_newline < 0:
+            start = max(0, cursor - chunk_size)
+            handle.seek(start)
+            chunk = handle.read(cursor - start)
+            pos = chunk.rfind(b"\n")
+            if pos >= 0:
+                last_newline = start + pos
+                break
+            cursor = start
+
+        tail_start = last_newline + 1 if last_newline >= 0 else 0
+        handle.seek(tail_start)
+        tail = handle.read()
+
+        # A complete JSON object may have reached disk before the writer was
+        # killed while emitting only the trailing newline. Preserve that valid
+        # record and normalize its terminator; discard only an unparsable tail.
+        try:
+            parsed = json.loads(tail.decode("utf-8"))
+            valid_complete_record = isinstance(parsed, dict)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            valid_complete_record = False
+
+        if valid_complete_record:
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
+        else:
+            handle.truncate(tail_start)
+
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
+
+
 def _canonical_label_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
@@ -71,6 +119,10 @@ def build_outcomes(
     # scheduler invocations therefore cannot both decide that the same
     # maturation state is new and append duplicate revisions.
     with registry_lock(lock):
+        # A SIGKILL/OOM can interrupt the final append between bytes. Repair
+        # only that incomplete tail before parsing so the next append cannot
+        # concatenate onto a corrupt partial JSON record.
+        _repair_truncated_jsonl_tail(output_path)
         existing = read_jsonl(output_path)
         latest = _latest_by_snapshot(existing)
         revisions: dict[str, int] = {}

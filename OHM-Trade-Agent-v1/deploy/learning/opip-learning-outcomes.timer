@@ -1,0 +1,12 @@
+[Unit]
+Description=Run O'Pip Phase 3C maturation every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:3/10:30
+AccuracySec=10s
+Persistent=true
+RandomizedDelaySec=5s
+Unit=opip-learning-outcomes.service
+
+[Install]
+WantedBy=timers.target

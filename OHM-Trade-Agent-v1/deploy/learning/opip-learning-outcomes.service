@@ -1,0 +1,19 @@
+[Unit]
+Description=O'Pip Phase 3C Forward Outcome Maturation
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/opip-learning-job outcomes
+ExecStopPost=/usr/local/sbin/opip-learning-cleanup outcomes
+RuntimeMaxSec=540
+TimeoutStopSec=25
+KillMode=control-group
+MemoryMax=760M
+CPUQuota=85%
+OOMScoreAdjust=750
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opip-learning /var/lock /var/run/docker.sock
+PrivateTmp=true
