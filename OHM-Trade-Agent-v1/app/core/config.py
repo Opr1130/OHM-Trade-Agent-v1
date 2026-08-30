@@ -50,16 +50,20 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_enabled: bool = False
+    # Wave 9 external-alert contract. When true, discovery/watch/movement
+    # evidence remains internal and Telegram is reserved for actionable new
+    # trades plus material existing-position actions.
+    opip_actionable_only_alerts: bool = True
     # Optional second boundary for group chats. When set, Telegram commands
     # and lifecycle callback buttons are accepted only from this Telegram user
     # inside the already-configured chat.
     telegram_command_user_id: str | None = None
     telegram_command_rate_limit_per_minute: int = Field(default=12, ge=1, le=60)
 
-    # PRICE_MOVEMENT_MODE: off disables the radar, shadow records evidence and
-    # outcomes without messages, alert additionally permits non-actionable
-    # WATCH/READY Telegram updates. Confirmed entries still require every
-    # existing OHM trade gate.
+    # PRICE_MOVEMENT_MODE: off disables the radar; shadow records evidence;
+    # alert permits legacy movement Telegram only when
+    # OPIP_ACTIONABLE_ONLY_ALERTS is false. Under the Wave 9 default, movement
+    # states are internal evidence until a full trade is actionable.
     price_movement_mode: str = Field(
         default="shadow",
         pattern=r"^(off|shadow|alert)$",
