@@ -33,11 +33,23 @@ def register_reconciliation_intent(
     direction: str,
     leverage: float,
     trade_id: str,
+    reconciliation_is_enabled: bool | None = None,
+    reconciliation_mode_value: str | None = None,
 ) -> None:
     """Create the read-only reconciliation identity for a qualified action."""
     if candidate.get("economic_qualified") is not True:
         return
-    if not reconciliation_enabled() or reconciliation_mode() != "apply":
+    enabled = (
+        reconciliation_enabled()
+        if reconciliation_is_enabled is None
+        else bool(reconciliation_is_enabled)
+    )
+    mode = (
+        reconciliation_mode()
+        if reconciliation_mode_value is None
+        else str(reconciliation_mode_value).lower()
+    )
+    if not enabled or mode != "apply":
         raise RuntimeError("Kraken reconciliation apply mode is required")
 
     capital = candidate.get("recommended_capital")
