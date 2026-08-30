@@ -5,7 +5,7 @@ from app.core.config import get_settings
 from app.services.active_trade_registry import get_active_trades
 from app.services.kraken_exposure_resolver import KrakenExposureResolver, ResolvedExposure
 from app.services.kraken_position_verification import KrakenPositionVerifier
-from app.opip.protection.position_materiality import refine_protection_action
+from app.services.position_materiality import refine_protection_action
 from app.services.asset_display_identity import display_market_label
 from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
