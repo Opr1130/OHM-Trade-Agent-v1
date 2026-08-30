@@ -17,7 +17,7 @@ _LIST_TAG = "__OPIP_FROZEN_LIST__"
 
 
 def _freeze(value: Any) -> Any:
-    """Freeze JSON-shaped policy values without losing container type."""
+    """Freeze JSON-compatible policy values without losing container type."""
     value = canonical_data(value)
     if isinstance(value, dict):
         return (
@@ -46,7 +46,7 @@ def _thaw(value: Any) -> Any:
     ):
         return [_thaw(item) for item in value[1]]
     if isinstance(value, tuple):
-        # Legacy BUILD 5.1 representation. Ambiguous list shapes were never
+        # Legacy BUILD 5.1 representation. Ambiguous list forms were never
         # validly persisted because integrity validation failed closed.
         if all(
             isinstance(item, tuple)
