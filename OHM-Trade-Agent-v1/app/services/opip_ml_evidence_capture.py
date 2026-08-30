@@ -20,6 +20,7 @@ from app.opip.ml.snapshot import seal_feature_snapshot
 from app.opip.ml.temporal import AvailabilityStamp, TemporalIntegrityError, require_utc
 from app.services.p1_shadow_outbox import (
     DEFAULT_EVIDENCE_LEDGER,
+    DrainResult,
     drain_outbox_to_evidence_ledger,
     p1_shadow_outbox_enabled,
 )
@@ -261,7 +262,17 @@ def capture_ml_production_evidence(
     if batch_limit < 1:
         raise ValueError("batch_limit must be >= 1")
 
-    p1 = drain_outbox_to_evidence_ledger(\n        evidence_path=evidence_path,\n        batch_limit=batch_limit,\n    )\n    lines = _read_complete_lines(evidence_path)
+    if evidence_path == DEFAULT_EVIDENCE_LEDGER:
+        p1 = drain_outbox_to_evidence_ledger(
+            evidence_path=evidence_path,
+            batch_limit=batch_limit,
+        )
+    else:
+        # Custom/replay ledgers must never consume the production-default P1
+        # outbox or advance its checkpoint implicitly.
+        p1 = DrainResult(0, 0, 0, 0, False)
+
+    lines = _read_complete_lines(evidence_path)
     start = _load_next_line(checkpoint_path)
     if start > len(lines):
         summary = MLCaptureSummary(
