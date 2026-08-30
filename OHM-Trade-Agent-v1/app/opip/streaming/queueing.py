@@ -61,6 +61,18 @@ class DropNewestQueue:
     async def join(self) -> None:
         await self._queue.join()
 
+    def discard_all(self) -> int:
+        """Discard remaining accepted frames during bounded shutdown."""
+        count = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            count += 1
+        return count
+
     def snapshot(self) -> QueueSnapshot:
         return QueueSnapshot(
             depth=self._queue.qsize(),
