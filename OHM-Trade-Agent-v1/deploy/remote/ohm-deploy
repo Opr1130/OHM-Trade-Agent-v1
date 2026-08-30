@@ -5,10 +5,13 @@ TARGET_SHA="${1:-}"
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 LOCK_FILE="/var/lock/ohm-deploy.lock"
+BACKGROUND_LOCK_FILE="/var/run/opip-background.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 BACKGROUND_RUNNER="$APP_ROOT/deploy/remote/run-opip-background-job.sh"
+PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
+SCHEDULER_SNAPSHOT=""
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "invalid target sha" >&2
@@ -22,8 +25,119 @@ if ! flock -n 9; then
   exit 75
 fi
 
+# Serialize deploy/startup against non-authoritative background containers.
+# Holding this lock also makes cron triggers skip rather than pile up.
+exec 8>"$BACKGROUND_LOCK_FILE"
+if ! flock -w 120 8; then
+  echo "background evidence lane did not quiesce for deployment" >&2
+  exit 75
+fi
+
 REPO_OWNER="$(stat -c '%U' "$REPO_ROOT/.git")"
 GIT=(sudo -u "$REPO_OWNER" git -C "$REPO_ROOT")
+
+wait_core_health() {
+  local healthy=0
+  for _ in $(seq 1 30); do
+    if curl --fail --silent --show-error http://127.0.0.1:8000/health \
+      | grep -q '"status":"ok"'; then
+      healthy=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$healthy" == "1" ]]
+}
+
+paper_services() {
+  docker compose -f "$PAPER_COMPOSE" config --services \
+    | grep -E '^ohm-freqtrade-paper(-usdt)?$' || true
+}
+
+stop_paper_stack() {
+  if [[ -s "$PAPER_COMPOSE" ]]; then
+    docker compose -f "$PAPER_COMPOSE" stop >/dev/null 2>&1 || true
+  fi
+}
+
+start_paper_stack() {
+  [[ -s "$PAPER_COMPOSE" ]] || {
+    echo "paper compose missing: $PAPER_COMPOSE" >&2
+    return 1
+  }
+  docker compose -f "$PAPER_COMPOSE" up -d --remove-orphans
+}
+
+wait_paper_health() {
+  local services service cid status all_healthy
+  services="$(paper_services)"
+  [[ -n "$services" ]] || {
+    echo "no Freqtrade paper services declared" >&2
+    return 1
+  }
+
+  for _ in $(seq 1 45); do
+    all_healthy=1
+    while IFS= read -r service; do
+      [[ -n "$service" ]] || continue
+      cid="$(docker compose -f "$PAPER_COMPOSE" ps -q "$service")"
+      if [[ -z "$cid" ]]; then
+        all_healthy=0
+        continue
+      fi
+      status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+      if [[ "$status" != "healthy" ]]; then
+        all_healthy=0
+      fi
+    done <<< "$services"
+
+    if [[ "$all_healthy" == "1" ]] && docker compose exec -T ohm-trade-agent \
+      python -c 'from app.services.freqtrade_result_ingest import freqtrade_dry_run_status; s=freqtrade_dry_run_status(); assert s.get("status") == "OK", s; assert s.get("mode") == "DRY_RUN", s; assert s.get("exchange_write_authority") is False, s; assert set((s.get("workers") or {}).keys()) == {"USD","USDT"}, s'; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Freqtrade paper topology failed health/authority validation" >&2
+  docker compose -f "$PAPER_COMPOSE" ps >&2 || true
+  return 1
+}
+
+snapshot_scheduler_state() {
+  SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
+  for name in ohm-unified-cycle opip-ml-evidence ohm-movement-discovery; do
+    if [[ -e "/etc/cron.d/$name" ]]; then
+      cp -a "/etc/cron.d/$name" "$SCHEDULER_SNAPSHOT/$name"
+    fi
+  done
+  if crontab -l > "$SCHEDULER_SNAPSHOT/root.crontab" 2>/dev/null; then
+    : > "$SCHEDULER_SNAPSHOT/root.crontab.present"
+  else
+    : > "$SCHEDULER_SNAPSHOT/root.crontab"
+  fi
+}
+
+restore_scheduler_state() {
+  [[ -n "$SCHEDULER_SNAPSHOT" && -d "$SCHEDULER_SNAPSHOT" ]] || return 0
+  for name in ohm-unified-cycle opip-ml-evidence ohm-movement-discovery; do
+    if [[ -e "$SCHEDULER_SNAPSHOT/$name" ]]; then
+      cp -a "$SCHEDULER_SNAPSHOT/$name" "/etc/cron.d/$name"
+    else
+      rm -f "/etc/cron.d/$name"
+    fi
+  done
+  if [[ -e "$SCHEDULER_SNAPSHOT/root.crontab.present" ]]; then
+    crontab "$SCHEDULER_SNAPSHOT/root.crontab"
+  else
+    crontab -r 2>/dev/null || true
+  fi
+}
+
+cleanup_snapshot() {
+  if [[ -n "$SCHEDULER_SNAPSHOT" && -d "$SCHEDULER_SNAPSHOT" ]]; then
+    rm -rf "$SCHEDULER_SNAPSHOT"
+  fi
+}
 
 "${GIT[@]}" fetch --prune origin main
 REMOTE_MAIN_SHA="$("${GIT[@]}" rev-parse origin/main)"
@@ -42,31 +156,61 @@ fi
 PREVIOUS_SHA="$("${GIT[@]}" rev-parse main)"
 if [[ -s "$LAST_GOOD_FILE" ]]; then
   RECORDED_SHA="$(cat "$LAST_GOOD_FILE")"
-  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] && "${GIT[@]}" cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
+  if [[ "$RECORDED_SHA" =~ ^[0-9a-f]{40}$ ]] \
+    && "${GIT[@]}" cat-file -e "$RECORDED_SHA^{commit}" 2>/dev/null; then
     PREVIOUS_SHA="$RECORDED_SHA"
   fi
 fi
+
+snapshot_scheduler_state
 
 rollback() {
   rc=$?
   trap - ERR
   echo "deployment failed; rolling back to $PREVIOUS_SHA" >&2
+
+  # Free paper-worker memory before rebuilding the previous deterministic core.
+  stop_paper_stack
+
   "${GIT[@]}" checkout -f main
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
   cd "$APP_ROOT"
+
   docker compose build ohm-trade-agent
   docker compose up -d --remove-orphans ohm-trade-agent
-  for _ in $(seq 1 30); do
-    if curl --fail --silent --show-error http://127.0.0.1:8000/health | grep -q '"status":"ok"'; then
-      echo "rollback health check passed" >&2
-      exit "$rc"
-    fi
-    sleep 2
-  done
-  echo "rollback health check failed" >&2
+
+  if ! wait_core_health; then
+    echo "rollback core health check failed" >&2
+    restore_scheduler_state
+    cleanup_snapshot
+    flock -u 8 || true
+    exit "$rc"
+  fi
+
+  # Restore the exact scheduler state that was installed before this deploy.
+  # This preserves any emergency production containment that is newer than the
+  # previous repository revision.
+  restore_scheduler_state
+
+  if ! start_paper_stack || ! wait_paper_health; then
+    echo "rollback paper topology validation failed" >&2
+    cleanup_snapshot
+    flock -u 8 || true
+    exit "$rc"
+  fi
+
+  printf '%s\n' "$PREVIOUS_SHA" > "$LAST_GOOD_FILE"
+  cleanup_snapshot
+  flock -u 8 || true
+  echo "rollback health and paper checks passed" >&2
   exit "$rc"
 }
 trap rollback ERR
+
+# Stop paper workers during the build/recreate window. Their dry-run state is
+# bind-mounted and survives the stop, while roughly two worker RSS footprints
+# are released during the deployment's highest transient-memory phase.
+stop_paper_stack
 
 "${GIT[@]}" checkout -f main
 "${GIT[@]}" reset --hard "$TARGET_SHA"
@@ -75,17 +219,8 @@ cd "$APP_ROOT"
 docker compose build ohm-trade-agent
 docker compose up -d --remove-orphans ohm-trade-agent
 
-healthy=0
-for _ in $(seq 1 30); do
-  if curl --fail --silent --show-error http://127.0.0.1:8000/health | grep -q '"status":"ok"'; then
-    healthy=1
-    break
-  fi
-  sleep 2
-done
-
-if [[ "$healthy" != "1" ]]; then
-  echo "production health check failed" >&2
+if ! wait_core_health; then
+  echo "production core health check failed" >&2
   false
 fi
 
@@ -95,23 +230,28 @@ if [[ ! -s "$SCHEDULER_RECONCILE" ]]; then
 fi
 bash "$SCHEDULER_RECONCILE"
 
-# Evidence capture is intentionally non-authoritative. Probe it once so the
-# deployment log records whether the production evidence boundary is enabled
-# and whether the worker can read/write its local stores. A probe failure must
-# never roll back otherwise healthy deterministic trading protection.
+# Applying the SHA is not complete until the paper topology from that same SHA
+# has been recreated and both authoritative dry-run workers are healthy.
+start_paper_stack
+wait_paper_health
+
+# Evidence capture is intentionally non-authoritative. The deploy still owns
+# the shared background lock here, so cron cannot overlap this bounded probe.
 echo "O'Pip ML evidence capture smoke probe"
-if flock -n /var/run/opip-background.lock -c \
-  "/bin/bash $BACKGROUND_RUNNER app.jobs.run_opip_ml_capture"; then
-  echo "O'Pip ML evidence capture smoke probe: completed"
+if "/bin/bash" "$BACKGROUND_RUNNER" app.jobs.run_opip_ml_capture; then
+  echo "O'Pip ML evidence capture smoke probe: completed or safely skipped by memory guard"
 else
-  echo "O'Pip ML evidence capture smoke probe: skipped/degraded; background lane busy or bounded probe failed; production unaffected" >&2
+  echo "O'Pip ML evidence capture smoke probe: degraded; bounded probe failed; production unaffected" >&2
 fi
 
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
+cleanup_snapshot
+flock -u 8
 trap - ERR
 
-echo "OHM deployment succeeded"
+echo "O'Pip deployment succeeded"
 echo "sha=$TARGET_SHA"
 docker compose ps
+docker compose -f "$PAPER_COMPOSE" ps
 curl --fail --silent --show-error http://127.0.0.1:8000/health
 echo
