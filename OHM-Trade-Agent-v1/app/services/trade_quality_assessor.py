@@ -216,7 +216,7 @@ def assess_entry(
     continuation: ContinuationAssessment,
 ) -> EntryAssessment:
     if continuation.snapshot_id != snapshot.snapshot_id:
-        raise ValueError("continuation assessment was not computed from this snapshot")
+        raise ValueError("continuation assessment must be computed from the same snapshot")
 
     features = snapshot.ml_feature_mapping()
     exhaustion_state, extension_atr = _exhaustion(features)
