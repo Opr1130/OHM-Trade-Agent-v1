@@ -330,3 +330,56 @@ def test_activation_check_blocks_high_drop_or_confirming_liquidation(
         {"assets": {"bitcoin": {"liquidation_confirmable": True}}},
     )
     assert module.main() == 1
+
+
+def test_drop_after_seal_degrades_retained_window_and_next_window():
+    notices = []
+    adapter = FakeAdapter([])
+    runtime = StreamingRuntime(
+        {StreamProvider.BINANCE: adapter},
+        config=_runtime_config(
+            queue_maxsize=1,
+            sealed_window_retention_seconds=2.0,
+            window_grace_seconds=0.001,
+            window_seconds=(15,),
+        ),
+        utc_now=lambda: RUNTIME_NOW,
+        sealed_window_sink=notices.append,
+    )
+    runtime._accepting = True
+    runtime._epochs[StreamProvider.BINANCE] = 0
+
+    first = _queued(epoch=0)
+    normalized = adapter.normalize(first)
+    assert runtime._record_windows(
+        normalized,
+        now_utc=RUNTIME_NOW + timedelta(milliseconds=10),
+    ) is True
+    window = next(iter(runtime._windows.values()))
+    runtime._seal_and_prune(
+        window.bounds.end_utc + timedelta(milliseconds=2)
+    )
+    assert next(iter(runtime._windows.values())).sealed is True
+
+    assert runtime._enqueue_if_current(first) is True
+    dropped = QueuedRawFrame(
+        provider=StreamProvider.BINANCE,
+        frame=_raw(2),
+        connection_id="binance-0",
+        reconnect_epoch=0,
+        received_monotonic=2.0,
+        ingest_timestamp_utc=RUNTIME_NOW,
+    )
+    assert runtime._enqueue_if_current(dropped) is False
+    retained = next(iter(runtime._windows.values()))
+    assert retained.dropped_frame_count == 1
+    assert runtime._pending_drops
+
+    runtime._seal_and_prune(
+        window.bounds.end_utc + timedelta(seconds=3)
+    )
+    notices_15s = [
+        notice for notice in notices if notice.window_seconds == 15
+    ]
+    assert len(notices_15s) == 1
+    assert notices_15s[0].quality.state is EvidenceQualityState.INCOMPLETE
