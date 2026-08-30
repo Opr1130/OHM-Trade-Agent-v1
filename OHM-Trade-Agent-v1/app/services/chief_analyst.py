@@ -4,6 +4,8 @@ import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 
+from openai import OpenAI
+
 from app.scanner.models import MarketSnapshot
 from app.scanner.short_technical_scorer import score_short_snapshot
 from app.scanner.technical_scorer import score_snapshot
@@ -638,6 +640,7 @@ def review_candidates(
             system_prompt=SYSTEM_PROMPT,
             request_payload=request_payload,
             max_output_tokens=max_output_tokens,
+            client_factory=OpenAI,
         )
 
         stage_evidence["provider"] = routed.provider
