@@ -479,7 +479,8 @@ def main() -> None:
     early_mover_delivery: dict[str, tuple[str, bool]] = {}
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     if (
-        str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
+        not bool(getattr(settings, "opip_actionable_only_alerts", True))
+        and str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
         and settings.telegram_bot_token
         and settings.telegram_chat_id
@@ -757,7 +758,3 @@ def main() -> None:
     print("Broad-market watch cards created:", broad_created)
     print("Broad-market watch cards edited:", broad_edited)
     print("Broad-market watch updates suppressed:", broad_suppressed)
-
-
-if __name__ == "__main__":
-    main()
