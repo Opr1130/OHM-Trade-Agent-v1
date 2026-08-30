@@ -335,6 +335,7 @@ class DatasetManifest:
     serialization_version: int
     random_seed: int
     included_snapshot_ids: tuple[str, ...]
+    included_label_ids: tuple[str, ...]
     excluded_snapshot_ids: Mapping[str, str]
     schema_version: int = DATASET_MANIFEST_SCHEMA_VERSION
 
@@ -360,6 +361,11 @@ class DatasetManifest:
         object.__setattr__(
             self, "included_snapshot_ids", tuple(self.included_snapshot_ids)
         )
+        object.__setattr__(
+            self, "included_label_ids", tuple(self.included_label_ids)
+        )
+        if len(self.included_snapshot_ids) != len(self.included_label_ids):
+            raise ValueError("included snapshot and label identities must align")
         object.__setattr__(
             self, "excluded_snapshot_ids", _freeze_jsonish(self.excluded_snapshot_ids)
         )
