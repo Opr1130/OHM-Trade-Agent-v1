@@ -10,6 +10,7 @@ the live Phase 1 decision path.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -200,14 +201,6 @@ class _CheckpointInvariantError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
-
-
-class _NullContext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 def _checkpoint_anchor(source: Path, byte_offset: int) -> tuple[int, int, str | None]:
@@ -501,6 +494,79 @@ def _set_metadata_int(connection: sqlite3.Connection, key: str, value: int) -> N
     )
 
 
+def _metadata_text(
+    connection: sqlite3.Connection,
+    key: str,
+) -> str | None:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _set_metadata_text(
+    connection: sqlite3.Connection,
+    key: str,
+    value: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def _ledger_index_anchor_matches(
+    connection: sqlite3.Connection,
+    ledger: Path,
+    indexed_offset: int,
+) -> bool:
+    if indexed_offset <= 0:
+        return True
+    expected = _metadata_text(connection, "indexed_anchor_sha256")
+    start = _metadata_int(connection, "indexed_anchor_start", -1)
+    size = _metadata_int(connection, "indexed_anchor_size", -1)
+    if (
+        not expected
+        or start < 0
+        or size <= 0
+        or start + size != indexed_offset
+    ):
+        return False
+    try:
+        with ledger.open("rb") as handle:
+            handle.seek(start)
+            payload = handle.read(size)
+    except OSError:
+        return False
+    return (
+        len(payload) == size
+        and hashlib.sha256(payload).hexdigest() == expected
+    )
+
+
+def _set_ledger_index_checkpoint(
+    connection: sqlite3.Connection,
+    ledger: Path,
+    indexed_offset: int,
+) -> None:
+    _set_metadata_int(connection, "indexed_offset", indexed_offset)
+    if indexed_offset <= 0:
+        _set_metadata_int(connection, "indexed_anchor_start", 0)
+        _set_metadata_int(connection, "indexed_anchor_size", 0)
+        _set_metadata_text(connection, "indexed_anchor_sha256", "")
+        return
+    start, size, digest = _checkpoint_anchor(ledger, indexed_offset)
+    _set_metadata_int(connection, "indexed_anchor_start", start)
+    _set_metadata_int(connection, "indexed_anchor_size", size)
+    _set_metadata_text(connection, "indexed_anchor_sha256", digest or "")
+
+
 def _reconcile_ledger_index(
     connection: sqlite3.Connection,
     ledger: Path,
@@ -510,18 +576,23 @@ def _reconcile_ledger_index(
     if not ledger.exists():
         if indexed_offset:
             connection.execute("DELETE FROM snapshot_ids")
-            _set_metadata_int(connection, "indexed_offset", 0)
+            _set_ledger_index_checkpoint(connection, ledger, 0)
             connection.commit()
         return
 
     size = ledger.stat().st_size
-    if indexed_offset > size:
-        # The ledger is contractually append-only. Rebuild if an operator
-        # replaced/truncated it rather than trusting stale dedup state.
+    if (
+        indexed_offset > size
+        or not _ledger_index_anchor_matches(connection, ledger, indexed_offset)
+    ):
+        # A replaced, truncated, or rewritten ledger invalidates all cached
+        # dedup state. Rebuild from byte zero rather than silently dropping
+        # replacement evidence as "already seen".
         connection.execute("DELETE FROM snapshot_ids")
         indexed_offset = 0
 
     last_complete = indexed_offset
+    partial_raw: bytes | None = None
     with ledger.open("rb") as handle:
         handle.seek(indexed_offset)
         while True:
@@ -530,6 +601,7 @@ def _reconcile_ledger_index(
                 break
             end = handle.tell()
             if not raw.endswith(b"\n"):
+                partial_raw = raw
                 break
             last_complete = end
             try:
@@ -545,7 +617,35 @@ def _reconcile_ledger_index(
                     (snapshot_id,),
                 )
 
-    _set_metadata_int(connection, "indexed_offset", last_complete)
+    if partial_raw is not None:
+        try:
+            row = json.loads(partial_raw.decode("utf-8"))
+            valid_complete = isinstance(row, dict)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            row = None
+            valid_complete = False
+
+        if valid_complete:
+            snapshot_id = str(row.get("snapshot_id", "") or "")
+            if snapshot_id:
+                connection.execute(
+                    "INSERT OR IGNORE INTO snapshot_ids(snapshot_id) VALUES (?)",
+                    (snapshot_id,),
+                )
+            with ledger.open("ab") as handle:
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                last_complete = handle.tell()
+        else:
+            # A crashed partial append is not a durable evidence record. Remove
+            # only that incomplete tail before any later payload is appended.
+            with ledger.open("r+b") as handle:
+                handle.truncate(last_complete)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    _set_ledger_index_checkpoint(connection, ledger, last_complete)
     connection.commit()
 
 
@@ -587,7 +687,7 @@ def _append_ledger_payload(
         "INSERT OR IGNORE INTO snapshot_ids(snapshot_id) VALUES (?)",
         (snapshot_id,),
     )
-    _set_metadata_int(connection, "indexed_offset", end_offset)
+    _set_ledger_index_checkpoint(connection, ledger, end_offset)
     connection.commit()
 
 
@@ -639,7 +739,7 @@ def _drain_outbox_locked(
             connection = _open_ledger_index(_ledger_index_path(ledger))
             ledger_context = registry_lock(ledger_lock)
         else:
-            ledger_context = _NullContext()
+            ledger_context = nullcontext()
 
         with ledger_context:
             if connection is not None:
@@ -664,14 +764,23 @@ def _drain_outbox_locked(
                             "measurement_only": True,
                         },
                     )
-                    next_line = item.line_number + 1
-                    next_offset = item.end_offset
-                    _save_checkpoint_state(
-                        checkpoint,
-                        source,
-                        next_line=next_line,
-                        byte_offset=next_offset,
-                    )
+                    candidate_next_line = item.line_number + 1
+                    candidate_next_offset = item.end_offset
+                    try:
+                        _save_checkpoint_state(
+                            checkpoint,
+                            source,
+                            next_line=candidate_next_line,
+                            byte_offset=candidate_next_offset,
+                        )
+                    except (_CheckpointInvariantError, OSError) as exc:
+                        stopped = True
+                        error_type = getattr(
+                            exc, "code", type(exc).__name__
+                        )
+                        break
+                    next_line = candidate_next_line
+                    next_offset = candidate_next_offset
                     continue
 
                 try:
@@ -703,14 +812,23 @@ def _drain_outbox_locked(
                     next_line = item.line_number
                     break
 
-                next_line = item.line_number + 1
-                next_offset = item.end_offset
-                _save_checkpoint_state(
-                    checkpoint,
-                    source,
-                    next_line=next_line,
-                    byte_offset=next_offset,
-                )
+                candidate_next_line = item.line_number + 1
+                candidate_next_offset = item.end_offset
+                try:
+                    _save_checkpoint_state(
+                        checkpoint,
+                        source,
+                        next_line=candidate_next_line,
+                        byte_offset=candidate_next_offset,
+                    )
+                except (_CheckpointInvariantError, OSError) as exc:
+                    stopped = True
+                    error_type = getattr(
+                        exc, "code", type(exc).__name__
+                    )
+                    break
+                next_line = candidate_next_line
+                next_offset = candidate_next_offset
     finally:
         if connection is not None:
             connection.close()
