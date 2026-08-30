@@ -1,0 +1,9 @@
+# O'Pip ML evidence jobs — independent from the real-risk unified cycle.
+# Both jobs are evidence-only and use their own locks so ML work can never
+# consume /var/run/ohm-unified-cycle.lock or delay deterministic protection.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+* * * * * root flock -n /var/run/opip-ml-capture.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.run_opip_ml_capture >> /var/log/opip-ml-capture.log 2>&1'
+
+*/10 * * * * root flock -n /var/run/opip-ml-outcomes.lock -c 'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.build_phase3c_forward_outcomes >> /var/log/opip-ml-outcomes.log 2>&1'
