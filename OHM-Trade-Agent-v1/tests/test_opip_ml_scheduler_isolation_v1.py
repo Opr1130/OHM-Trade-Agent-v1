@@ -265,6 +265,8 @@ def test_learning_capture_uses_bounded_outbox_cursor_and_disk_dedup():
     assert "OUTBOX_CHECKPOINT_SCHEMA_VERSION = 2" in source
     assert "byte_offset" in source
     assert "anchor_sha256" in source
+    assert "source_tail_sha256" in source
+    assert "source_size" in source
     assert "CHECKPOINT_SOURCE_DIVERGED" in source
     assert "sqlite3.connect" in source
     assert "snapshot_ids" in source
