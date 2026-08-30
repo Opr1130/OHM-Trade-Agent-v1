@@ -92,8 +92,9 @@ def test_no_ml_dependency_imports():
                 assert top not in banned_modules, f"{path} imports banned dependency {name}"
 
 
-def test_no_network_or_websocket_imports():
-    banned_modules = {"websockets", "aiohttp", "socket", "requests", "httpx"}
+def test_network_imports_are_limited_to_public_provider_adapters():
+    network_modules = {"websockets", "aiohttp", "socket", "requests", "httpx"}
+    allowed = {"binance.py", "bybit.py"}
     for path in _all_py_files():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -105,7 +106,14 @@ def test_no_network_or_websocket_imports():
                 continue
             for name in names:
                 top = name.split(".")[0]
-                assert top not in banned_modules, f"{path} imports networking module {name}"
+                if top in network_modules:
+                    assert path.name in allowed, (
+                        f"{path} imports networking module {name}; only public "
+                        "provider adapters may own transport"
+                    )
+                    assert top == "websockets", (
+                        f"{path} uses unapproved network dependency {name}"
+                    )
 
 
 def test_no_telegram_or_notification_identifiers():
@@ -165,10 +173,31 @@ def test_no_unbounded_or_raw_event_list_fields_on_window_accumulator():
     assert not (field_names & banned), field_names & banned
 
 
-def test_no_docker_or_worker_service_files_added():
-    forbidden_names = {"worker.py", "service.py", "binance_client.py", "bybit_client.py"}
+def test_only_canonical_worker_entrypoint_is_allowed():
+    forbidden_names = {"service.py", "binance_client.py", "bybit_client.py"}
     present = {path.name for path in _all_py_files()}
     assert not (present & forbidden_names), present & forbidden_names
+    workers = [path for path in _all_py_files() if path.name == "worker.py"]
+    assert [path.as_posix() for path in workers] == [
+        "app/opip/streaming/worker.py"
+    ]
+
+
+def test_stream_worker_has_no_exchange_authority_imports():
+    path = STREAMING_PACKAGE / "worker.py"
+    source = path.read_text(encoding="utf-8").lower()
+    forbidden = (
+        "app.exchanges",
+        "kraken",
+        "place_order",
+        "cancel_order",
+        "modify_order",
+        "telegram",
+        "app.opip.decision",
+        "app.opip.risk",
+    )
+    for token in forbidden:
+        assert token not in source
 
 
 def test_build42_declares_only_approved_streaming_dependencies():
@@ -183,3 +212,33 @@ def test_no_kraken_private_api_reference():
     for path in _all_py_files():
         source = path.read_text(encoding="utf-8").lower()
         assert "kraken" not in source, f"{path} references Kraken; streaming must stay venue-neutral"
+
+
+def test_production_compose_stream_worker_is_isolated():
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    assert "opip-stream-worker:" in compose
+    assert 'container_name: opip-stream-worker' in compose
+    assert 'mem_limit: 256m' in compose
+    assert 'cpus: "0.40"' in compose
+    assert './data:/app/data:ro' in compose
+    assert './data/opip/streaming:/app/data/opip/streaming:rw' in compose
+    assert './data/opip/streaming:/app/data/opip/streaming:ro' in compose
+    worker = compose.split("  opip-stream-worker:", 1)[1]
+    assert "\n    ports:" not in worker
+    assert 'OPIP_STREAMING_ENABLED: "true"' in worker
+    assert "app.opip.streaming.worker" in worker
+
+
+def test_streaming_has_no_private_credentials_or_order_endpoints():
+    forbidden = (
+        "api_key",
+        "api_secret",
+        "listenkey",
+        "/private",
+        "/v5/trade",
+        "ws-fapi.binance.com",
+    )
+    for path in _all_py_files():
+        source = path.read_text(encoding="utf-8").lower()
+        for token in forbidden:
+            assert token not in source, f"{path} contains private/trading token {token}"
