@@ -123,10 +123,16 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         else:
             ranking_note += f"Quality Rank: #{candidate['profit_rank']}\n"
     if candidate.get("profit_rank_score") is not None:
-        ranking_note += (
-            f"Base Quality Score: "
-            f"{float(candidate['profit_rank_score']):.2f}/100\n"
-        )
+        if candidate.get("opportunity_rank") is None:
+            ranking_note += (
+                f"Profit Rank Score: "
+                f"{float(candidate['profit_rank_score']):.2f}/100\n"
+            )
+        else:
+            ranking_note += (
+                f"Base Quality Score: "
+                f"{float(candidate['profit_rank_score']):.2f}/100\n"
+            )
     if candidate.get("hold_proxy_hours") is not None:
         ranking_note += (
             f"Hold Proxy: ~{float(candidate['hold_proxy_hours']):.1f}h "
