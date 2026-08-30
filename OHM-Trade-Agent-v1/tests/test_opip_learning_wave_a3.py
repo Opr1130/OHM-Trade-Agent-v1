@@ -153,6 +153,20 @@ def test_zero_feature_bearing_snapshots_fail_closed():
     assert "NO_FEATURE_BEARING_SNAPSHOTS" in report.blockers
 
 
+def test_direction_none_is_structural_not_ready():
+    """Verify production-style direction NONE cannot be treated as trainable."""
+    report = build_ml_data_readiness_report(
+        canonical_rows=[_canonical("S:1", "E:1")],
+        ml_snapshot_rows=[_ml("S:1", "E:1", direction="NONE")],
+        paper_trade_rows=[_paper("P:1", "E:1", direction="LONG")],
+        policy=MLReadinessPolicy(minimum_primary_supervised_rows=2),
+    )
+    assert report.readiness_state is MLReadinessState.NOT_READY
+    assert "NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS" in report.blockers
+    assert "ML_DIRECTION_LINKAGE_NOT_TRAINABLE" in report.blockers
+    assert report.primary_supervised_usable_rows == 0
+
+
 def test_feature_visibility_after_decision_is_pit_violation():
     """Verify late features are excluded and block readiness."""
     late = NOW + timedelta(seconds=1)
