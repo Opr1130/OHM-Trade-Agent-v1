@@ -1,0 +1,18 @@
+[Unit]
+Description=O'Pip ML Feature Evidence Capture
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/opip-learning-job capture
+RuntimeMaxSec=240
+TimeoutStopSec=25
+KillMode=control-group
+MemoryMax=620M
+CPUQuota=80%
+OOMScoreAdjust=700
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/opip-learning /var/lock /var/run/docker.sock
+PrivateTmp=true
