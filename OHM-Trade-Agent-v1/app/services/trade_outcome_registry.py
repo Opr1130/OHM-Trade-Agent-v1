@@ -10,7 +10,7 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 OUTCOME_FILE = Path("/app/data/trade_outcomes.json")
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 3
 
 
 def registry_lock_file() -> Path:
@@ -124,6 +124,7 @@ def record_recommendation(
             "exhaustion_state": candidate.get("exhaustion_state"),
             "trade_quality_actionable": candidate.get("trade_quality_actionable"),
             "quality_score_is_probability": False,
+            "wave9_extension_version": 1,
             "outcome_event_definition": (
                 "TARGET_1_BEFORE_STOP_WITHIN_HORIZON"
             ),
