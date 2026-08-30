@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 from typing import Any, Callable, Iterable, Mapping
 
 from app.services.p1_intelligence_contracts import build_live_scan_snapshot
@@ -170,49 +172,342 @@ class DrainResult:
     error_type: str | None = None
 
 
-def _load_checkpoint(path: Path) -> int:
-    if not path.exists():
+OUTBOX_CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_ANCHOR_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class _OutboxCheckpoint:
+    next_line: int = 0
+    byte_offset: int = 0
+    anchor_start: int = 0
+    anchor_size: int = 0
+    anchor_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class _OutboxLine:
+    line_number: int
+    raw: bytes
+    end_offset: int
+
+
+class _CheckpointInvariantError(ValueError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _NullContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _checkpoint_anchor(source: Path, byte_offset: int) -> tuple[int, int, str | None]:
+    if byte_offset <= 0:
+        return 0, 0, None
+    start = max(0, byte_offset - CHECKPOINT_ANCHOR_BYTES)
+    size = byte_offset - start
+    with source.open("rb") as handle:
+        handle.seek(start)
+        payload = handle.read(size)
+    if len(payload) != size:
+        raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+    return start, size, hashlib.sha256(payload).hexdigest()
+
+
+def _seek_legacy_line_offset(source: Path, next_line: int) -> int:
+    """Migrate a legacy line cursor without materializing the whole source."""
+    if next_line <= 0:
         return 0
+    if not source.exists():
+        raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+    with source.open("rb") as handle:
+        for _ in range(next_line):
+            raw = handle.readline()
+            if not raw or not raw.endswith(b"\n"):
+                raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+        return handle.tell()
+
+
+def _load_checkpoint_state(path: Path, source: Path) -> _OutboxCheckpoint:
+    if not path.exists():
+        return _OutboxCheckpoint()
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return max(0, int(payload.get("next_line", 0)))
-    except Exception:
-        return 0
+        next_line = int(payload.get("next_line", 0))
+        if next_line < 0:
+            raise ValueError("negative checkpoint")
+
+        schema = int(payload.get("schema_version", 1) or 1)
+        if schema >= OUTBOX_CHECKPOINT_SCHEMA_VERSION and "byte_offset" in payload:
+            byte_offset = int(payload.get("byte_offset", 0))
+            anchor_start = int(payload.get("anchor_start", 0))
+            anchor_size = int(payload.get("anchor_size", 0))
+            anchor_sha256 = str(payload.get("anchor_sha256") or "") or None
+            if min(byte_offset, anchor_start, anchor_size) < 0:
+                raise ValueError("negative checkpoint component")
+            return _OutboxCheckpoint(
+                next_line=next_line,
+                byte_offset=byte_offset,
+                anchor_start=anchor_start,
+                anchor_size=anchor_size,
+                anchor_sha256=anchor_sha256,
+            )
+
+        # Legacy checkpoints stored only a line index. Resolve that index once
+        # with a streaming scan, then persist schema 2 on the next advancement.
+        byte_offset = _seek_legacy_line_offset(source, next_line)
+        anchor_start, anchor_size, anchor_sha256 = _checkpoint_anchor(
+            source, byte_offset
+        )
+        return _OutboxCheckpoint(
+            next_line=next_line,
+            byte_offset=byte_offset,
+            anchor_start=anchor_start,
+            anchor_size=anchor_size,
+            anchor_sha256=anchor_sha256,
+        )
+    except _CheckpointInvariantError:
+        raise
+    except Exception as exc:
+        raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE") from exc
 
 
-def _ledger_snapshot_ids(path: Path) -> set[str]:
-    if not path.exists():
-        return set()
-    ids: set[str] = set()
+def _verify_checkpoint_continuity(source: Path, checkpoint: _OutboxCheckpoint) -> None:
+    if not source.exists():
+        if checkpoint.byte_offset:
+            raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+        return
+
+    size = source.stat().st_size
+    if checkpoint.byte_offset > size:
+        raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+
+    if not checkpoint.anchor_sha256:
+        return
+
+    if (
+        checkpoint.anchor_start < 0
+        or checkpoint.anchor_size < 0
+        or checkpoint.anchor_start + checkpoint.anchor_size != checkpoint.byte_offset
+    ):
+        raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE")
+
+    with source.open("rb") as handle:
+        handle.seek(checkpoint.anchor_start)
+        payload = handle.read(checkpoint.anchor_size)
+    if (
+        len(payload) != checkpoint.anchor_size
+        or hashlib.sha256(payload).hexdigest() != checkpoint.anchor_sha256
+    ):
+        raise _CheckpointInvariantError("CHECKPOINT_SOURCE_DIVERGED")
+
+
+def _save_checkpoint_state(
+    path: Path,
+    source: Path,
+    *,
+    next_line: int,
+    byte_offset: int,
+) -> None:
+    anchor_start, anchor_size, anchor_sha256 = _checkpoint_anchor(source, byte_offset)
+    save_json_atomic(
+        path,
+        {
+            "schema_version": OUTBOX_CHECKPOINT_SCHEMA_VERSION,
+            "next_line": next_line,
+            "byte_offset": byte_offset,
+            "anchor_start": anchor_start,
+            "anchor_size": anchor_size,
+            "anchor_sha256": anchor_sha256,
+        },
+    )
+
+
+def _read_complete_outbox_batch(
+    source: Path,
+    *,
+    checkpoint: _OutboxCheckpoint,
+    batch_limit: int,
+) -> list[_OutboxLine]:
+    """Read only the next complete bounded JSONL batch from the byte cursor."""
+    if not source.exists():
+        return []
+
+    source_lock = source.parent / f".{source.name}.lock"
+    rows: list[_OutboxLine] = []
+    with registry_lock(source_lock):
+        _verify_checkpoint_continuity(source, checkpoint)
+        with source.open("rb") as handle:
+            handle.seek(checkpoint.byte_offset)
+            line_number = checkpoint.next_line
+            while len(rows) < batch_limit:
+                raw = handle.readline()
+                if not raw:
+                    break
+                end = handle.tell()
+                if not raw.endswith(b"\n"):
+                    # Writer has not completed the final JSONL record yet.
+                    break
+                rows.append(
+                    _OutboxLine(
+                        line_number=line_number,
+                        raw=raw,
+                        end_offset=end,
+                    )
+                )
+                line_number += 1
+    return rows
+
+
+def _ledger_index_path(ledger: Path) -> Path:
+    return ledger.parent / f".{ledger.name}.dedup.sqlite3"
+
+
+def _open_ledger_index(path: Path) -> sqlite3.Connection:
+    """Open the disk-backed dedup index; no historical id set lives in RAM."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_ids (
+            snapshot_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def _metadata_int(connection: sqlite3.Connection, key: str, default: int = 0) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return default
     try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            if not raw.strip():
-                continue
+        return int(row[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def _set_metadata_int(connection: sqlite3.Connection, key: str, value: int) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(int(value))),
+    )
+
+
+def _reconcile_ledger_index(
+    connection: sqlite3.Connection,
+    ledger: Path,
+) -> None:
+    """Catch the SQLite index up to the append-only ledger in constant memory."""
+    indexed_offset = _metadata_int(connection, "indexed_offset", 0)
+    if not ledger.exists():
+        if indexed_offset:
+            connection.execute("DELETE FROM snapshot_ids")
+            _set_metadata_int(connection, "indexed_offset", 0)
+            connection.commit()
+        return
+
+    size = ledger.stat().st_size
+    if indexed_offset > size:
+        # The ledger is contractually append-only. Rebuild if an operator
+        # replaced/truncated it rather than trusting stale dedup state.
+        connection.execute("DELETE FROM snapshot_ids")
+        indexed_offset = 0
+
+    last_complete = indexed_offset
+    with ledger.open("rb") as handle:
+        handle.seek(indexed_offset)
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            end = handle.tell()
+            if not raw.endswith(b"\n"):
+                break
+            last_complete = end
             try:
-                row = json.loads(raw)
-            except json.JSONDecodeError:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(row, dict):
                 continue
             snapshot_id = str(row.get("snapshot_id", "") or "")
             if snapshot_id:
-                ids.add(snapshot_id)
-    except OSError:
-        return set()
-    return ids
+                connection.execute(
+                    "INSERT OR IGNORE INTO snapshot_ids(snapshot_id) VALUES (?)",
+                    (snapshot_id,),
+                )
+
+    _set_metadata_int(connection, "indexed_offset", last_complete)
+    connection.commit()
 
 
-def _default_ledger_processor(
-    row: dict[str, Any],
-    *,
-    evidence_path: Path,
-    known_ids: set[str],
+def _ledger_has_snapshot(
+    connection: sqlite3.Connection,
+    snapshot_id: str,
 ) -> bool:
-    snapshot_id = str(row.get("snapshot_id", "") or "")
+    return (
+        connection.execute(
+            "SELECT 1 FROM snapshot_ids WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _append_ledger_payload(
+    connection: sqlite3.Connection,
+    ledger: Path,
+    payload: Mapping[str, Any],
+) -> None:
+    snapshot_id = str(payload.get("snapshot_id", "") or "")
     if not snapshot_id:
         raise ValueError("snapshot_id missing")
-    if snapshot_id in known_ids:
-        return False
 
-    payload = {
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(dict(payload), sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    with ledger.open("ab") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+        end_offset = handle.tell()
+
+    # Ledger durability happens before index commit. If the process dies
+    # between them, the next reconciliation recovers the missing index row.
+    connection.execute(
+        "INSERT OR IGNORE INTO snapshot_ids(snapshot_id) VALUES (?)",
+        (snapshot_id,),
+    )
+    _set_metadata_int(connection, "indexed_offset", end_offset)
+    connection.commit()
+
+
+def _default_ledger_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
         **row,
         "evidence_schema_version": 1,
         "evidence_status": "SNAPSHOT_ACCEPTED",
@@ -224,30 +519,6 @@ def _default_ledger_processor(
         "trade_authority_changed": False,
         "production_execution_gate_changed": False,
     }
-    _append_jsonl(evidence_path, payload)
-    known_ids.add(snapshot_id)
-    return True
-
-
-def _read_complete_outbox_lines(source: Path) -> list[str]:
-    """Read a stable outbox snapshot and never consume a partial tail record.
-
-    The producer and reader share the same file lock, so a concurrent append
-    cannot be observed mid-write. If a prior process crashed with a truncated
-    final line, the incomplete tail is deliberately left pending instead of
-    being dead-lettered and checkpointed past. A later producer first inserts a
-    newline boundary before appending, turning the orphan tail into its own
-    dead-letterable row without corrupting the new snapshot.
-    """
-    source_lock = source.parent / f".{source.name}.lock"
-    with registry_lock(source_lock):
-        text = source.read_text(encoding="utf-8")
-    if not text:
-        return []
-    lines = text.splitlines()
-    if not text.endswith("\n") and lines:
-        lines = lines[:-1]
-    return lines
 
 
 def _drain_outbox_locked(
@@ -259,73 +530,105 @@ def _drain_outbox_locked(
     batch_limit: int,
     processor: Callable[[dict[str, Any]], None] | None,
 ) -> DrainResult:
-    start_line = _load_checkpoint(checkpoint)
     try:
-        lines = _read_complete_outbox_lines(source)
-    except OSError as exc:
-        return DrainResult(0, 0, 0, start_line, True, type(exc).__name__)
-
-    # A line-index checkpoint cannot safely follow an outbox that has been
-    # externally truncated or rotated. Do not silently report "caught up" and
-    # skip the new generation; surface the invariant violation explicitly.
-    if start_line > len(lines):
-        return DrainResult(
-            0,
-            0,
-            0,
-            start_line,
-            True,
-            "CHECKPOINT_AHEAD_OF_OUTBOX",
+        state = _load_checkpoint_state(checkpoint, source)
+        batch = _read_complete_outbox_batch(
+            source,
+            checkpoint=state,
+            batch_limit=batch_limit,
         )
+    except _CheckpointInvariantError as exc:
+        return DrainResult(0, 0, 0, 0, True, exc.code)
 
-    known_ids = _ledger_snapshot_ids(ledger)
     processed = duplicates = malformed = 0
-    next_line = start_line
+    next_line = state.next_line
+    next_offset = state.byte_offset
     stopped = False
     error_type: str | None = None
 
-    for index in range(start_line, min(len(lines), start_line + batch_limit)):
-        raw = lines[index]
-        try:
-            row = json.loads(raw)
-            if not isinstance(row, dict):
-                raise ValueError("outbox row must be a JSON object")
-        except Exception as exc:
-            malformed += 1
-            _append_jsonl(
-                dead_letter,
-                {
-                    "dead_letter_source": "P1_OUTBOX_CONSUMER",
-                    "line_number": index,
-                    "error_type": type(exc).__name__,
-                    "raw": raw,
-                    "measurement_only": True,
-                },
-            )
-            next_line = index + 1
-            save_json_atomic(checkpoint, {"next_line": next_line})
-            continue
+    connection: sqlite3.Connection | None = None
+    ledger_lock = ledger.parent / f".{ledger.name}.lock"
 
-        try:
-            if processor is not None:
-                processor(row)
-                wrote = True
-            else:
-                wrote = _default_ledger_processor(
-                    row, evidence_path=ledger, known_ids=known_ids
+    try:
+        if processor is None:
+            connection = _open_ledger_index(_ledger_index_path(ledger))
+            ledger_context = registry_lock(ledger_lock)
+        else:
+            ledger_context = _NullContext()
+
+        with ledger_context:
+            if connection is not None:
+                _reconcile_ledger_index(connection, ledger)
+
+            for item in batch:
+                try:
+                    row = json.loads(item.raw.decode("utf-8"))
+                    if not isinstance(row, dict):
+                        raise ValueError("outbox row must be a JSON object")
+                except Exception as exc:
+                    malformed += 1
+                    _append_jsonl(
+                        dead_letter,
+                        {
+                            "dead_letter_source": "P1_OUTBOX_CONSUMER",
+                            "line_number": item.line_number,
+                            "error_type": type(exc).__name__,
+                            "raw": item.raw.decode(
+                                "utf-8", errors="replace"
+                            ).rstrip("\n"),
+                            "measurement_only": True,
+                        },
+                    )
+                    next_line = item.line_number + 1
+                    next_offset = item.end_offset
+                    _save_checkpoint_state(
+                        checkpoint,
+                        source,
+                        next_line=next_line,
+                        byte_offset=next_offset,
+                    )
+                    continue
+
+                try:
+                    if processor is not None:
+                        processor(row)
+                        wrote = True
+                    else:
+                        assert connection is not None
+                        snapshot_id = str(row.get("snapshot_id", "") or "")
+                        if not snapshot_id:
+                            raise ValueError("snapshot_id missing")
+                        if _ledger_has_snapshot(connection, snapshot_id):
+                            wrote = False
+                        else:
+                            _append_ledger_payload(
+                                connection,
+                                ledger,
+                                _default_ledger_payload(row),
+                            )
+                            wrote = True
+
+                    if wrote:
+                        processed += 1
+                    else:
+                        duplicates += 1
+                except Exception as exc:
+                    stopped = True
+                    error_type = type(exc).__name__
+                    next_line = item.line_number
+                    break
+
+                next_line = item.line_number + 1
+                next_offset = item.end_offset
+                _save_checkpoint_state(
+                    checkpoint,
+                    source,
+                    next_line=next_line,
+                    byte_offset=next_offset,
                 )
-            if wrote:
-                processed += 1
-            else:
-                duplicates += 1
-        except Exception as exc:
-            stopped = True
-            error_type = type(exc).__name__
-            next_line = index
-            break
-
-        next_line = index + 1
-        save_json_atomic(checkpoint, {"next_line": next_line})
+    finally:
+        if connection is not None:
+            connection.close()
 
     return DrainResult(
         processed=processed,
@@ -346,12 +649,12 @@ def drain_outbox_to_evidence_ledger(
     batch_limit: int = 100,
     processor: Callable[[dict[str, Any]], None] | None = None,
 ) -> DrainResult:
-    """Consume snapshots after the live path and advance a durable line cursor.
+    """Consume a bounded batch using a byte cursor and disk-backed dedup index.
 
-    A processor failure does not advance the failing line, so it can be retried.
-    Malformed complete JSON is moved to a dead-letter stream and the cursor
-    advances. A partial trailing line is never treated as malformed. A dedicated
-    consumer lock prevents two workers from racing the same checkpoint/ledger.
+    Total historical outbox size no longer determines resident memory. The
+    schema-2 checkpoint stores a byte offset and continuity anchor so an
+    atomically replaced export may grow append-only while truncation or
+    rewritten history fails closed instead of silently skipping evidence.
     """
     source = outbox_path or DEFAULT_OUTBOX_FILE
     ledger = evidence_path or DEFAULT_EVIDENCE_LEDGER
@@ -374,6 +677,26 @@ def drain_outbox_to_evidence_ledger(
         )
 
 
+def _checkpoint_next_line(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return max(0, int(payload.get("next_line", 0)))
+    except Exception:
+        return 0
+
+
+def _count_source_rows(source: Path) -> int:
+    if not source.exists():
+        return 0
+    total = 0
+    with source.open("rb") as handle:
+        for _ in handle:
+            total += 1
+    return total
+
+
 def outbox_health(
     *,
     outbox_path: Path | None = None,
@@ -381,19 +704,27 @@ def outbox_health(
 ) -> dict[str, Any]:
     source = outbox_path or DEFAULT_OUTBOX_FILE
     checkpoint = checkpoint_path or DEFAULT_CHECKPOINT_FILE
-    next_line = _load_checkpoint(checkpoint)
+    next_line = _checkpoint_next_line(checkpoint)
+
     try:
-        total = len(source.read_text(encoding="utf-8").splitlines()) if source.exists() else 0
+        total = _count_source_rows(source)
     except OSError:
         total = 0
+
     checkpoint_ahead = next_line > total
+    status = "CHECKPOINT_AHEAD_OF_OUTBOX" if checkpoint_ahead else "OK"
+    if not checkpoint_ahead and checkpoint.exists() and source.exists():
+        try:
+            state = _load_checkpoint_state(checkpoint, source)
+            _verify_checkpoint_continuity(source, state)
+        except _CheckpointInvariantError as exc:
+            status = exc.code
+
     return {
         "total_rows": total,
         "processed_through_line": next_line,
         "backlog_rows": max(0, total - next_line),
-        "status": (
-            "CHECKPOINT_AHEAD_OF_OUTBOX" if checkpoint_ahead else "OK"
-        ),
+        "status": status,
         "checkpoint_ahead_of_outbox": checkpoint_ahead,
         "measurement_only": True,
         "affects_live_decisions": False,
