@@ -28,7 +28,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y docker.io docker-compose-v2 git rsync openssh-client ca-certificates
+apt-get install -y docker.io docker-compose-v2 git openssh-client ca-certificates
 
 systemctl enable --now docker
 install -d -o root -g root -m 0755 "$ROOT" "$DATA_ROOT/data" "$DATA_ROOT/state"
@@ -75,9 +75,8 @@ EOF
 chmod 0600 "$ENV_FILE"
 
 systemctl daemon-reload
-systemctl enable opip-learning-sync.timer
-systemctl enable opip-learning-capture.timer
-systemctl enable opip-learning-outcomes.timer
+# Timers intentionally remain disabled until SSH host-key validation,
+# production reader authorization, and all one-shot checks have passed.
 
 echo "O'Pip learning worker staged."
 echo "sha=$TARGET_SHA"
@@ -91,4 +90,4 @@ echo "After production reader access and known_hosts are configured, run:"
 echo "  systemctl start opip-learning-sync.service"
 echo "  systemctl start opip-learning-capture.service"
 echo "  systemctl start opip-learning-outcomes.service"
-echo "  systemctl start opip-learning-sync.timer opip-learning-capture.timer opip-learning-outcomes.timer"
+echo "  systemctl enable --now opip-learning-sync.timer opip-learning-capture.timer opip-learning-outcomes.timer"
