@@ -51,6 +51,7 @@ class RuntimeTelemetrySnapshot:
     active_window_count: int
     active_symbol_count: int
     rss_bytes: int | None
+    cpu_fraction: float | None
     event_loop_lag_seconds: float | None
     resource_degraded: bool
     resource_reasons: tuple[str, ...]
@@ -115,6 +116,7 @@ class RuntimeTelemetry:
         self.degraded_windows = 0
         self.incomplete_windows = 0
         self.rss_bytes: int | None = None
+        self.cpu_fraction: float | None = None
         self.event_loop_lag_seconds: float | None = None
         self.resource_degraded = False
         self.resource_reasons: tuple[str, ...] = ()
@@ -159,6 +161,7 @@ class RuntimeTelemetry:
             active_window_count=active_window_count,
             active_symbol_count=active_symbol_count,
             rss_bytes=self.rss_bytes,
+            cpu_fraction=self.cpu_fraction,
             event_loop_lag_seconds=self.event_loop_lag_seconds,
             resource_degraded=self.resource_degraded,
             resource_reasons=self.resource_reasons,
