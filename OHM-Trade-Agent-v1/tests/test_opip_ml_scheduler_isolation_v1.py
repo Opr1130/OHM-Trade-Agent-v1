@@ -12,7 +12,7 @@ def test_ml_evidence_cron_is_independent_from_unified_cycle_lock():
     assert "app.jobs.run_opip_ml_capture" in cron
     assert "app.jobs.build_phase3c_forward_outcomes" in cron
     assert "/var/run/opip-ml-capture-trigger.lock" in cron
-    assert "flock -n /var/run/opip-ml-capture-trigger.lock" not in cron
+    assert "flock -n /var/run/opip-ml-capture.lock" not in cron
     assert "/var/run/opip-ml-outcomes.lock" in cron
     executable = "\n".join(
         line for line in cron.splitlines()
