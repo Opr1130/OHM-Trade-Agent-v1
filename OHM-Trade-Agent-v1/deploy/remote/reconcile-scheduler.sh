@@ -113,7 +113,12 @@ if crontab -l 2>/dev/null | grep -Eq 'app\.jobs\.(run_cycle|scan_movers|scan_opp
   false
 fi
 
-bash "$STREAM_RECONCILE"
+if bash "$STREAM_RECONCILE"; then
+  echo "O'Pip stream worker reconciliation: healthy"
+else
+  stream_rc=$?
+  echo "O'Pip stream worker reconciliation: degraded (rc=$stream_rc); shadow evidence unavailable or incomplete; production core unaffected" >&2
+fi
 
 trap - ERR
 rm -rf "$tmpdir"
