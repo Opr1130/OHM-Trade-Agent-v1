@@ -135,7 +135,8 @@ def test_background_runner_is_resource_bounded_and_networkless():
     assert "--oom-score-adj 800" in source
     assert "--read-only" in source
     assert "--cap-drop ALL" in source
-    assert "app.jobs.run_opip_ml_capture|app.jobs.build_phase3c_forward_outcomes" in source
+    assert "app.jobs.run_opip_ml_capture)" in source
+    assert "app.jobs.build_phase3c_forward_outcomes)" in source
     assert "docker inspect --format '{{.Image}}'" in source
     assert 'P1_SHADOW_OUTBOX_ENABLED="$P1_SHADOW_OUTBOX_ENABLED"' in source
     assert '--env-file "$APP_ROOT/.env"' not in source
