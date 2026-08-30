@@ -171,13 +171,12 @@ def test_no_docker_or_worker_service_files_added():
     assert not (present & forbidden_names), present & forbidden_names
 
 
-def test_no_new_network_dependency_declared_in_requirements():
+def test_build42_declares_only_approved_streaming_dependencies():
     requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
-    for banned in ("websockets", "aiohttp", "orjson"):
-        assert banned not in requirements, (
-            f"requirements.txt gained {banned}; BUILD 4.1 must not add "
-            "networking/speculative dependencies"
-        )
+    assert "websockets" in requirements
+    assert "orjson" in requirements
+    for banned in ("aiohttp", "requests"):
+        assert banned not in requirements
 
 
 def test_no_kraken_private_api_reference():
