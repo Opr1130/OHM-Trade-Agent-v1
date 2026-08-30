@@ -24,7 +24,8 @@ module reads the wall clock.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import math
 
 from app.opip.events.contract import require_utc
 from app.opip.streaming.contract import ArrivalDecision, SequenceStatus
@@ -75,9 +76,18 @@ class WindowBounds:
         moment = require_utc(timestamp_utc, field_name="timestamp_utc")
         if int(window_seconds) <= 0:
             raise ValueError("window_seconds must be positive")
-        epoch_seconds = moment.timestamp()
-        bucket_start = (epoch_seconds // window_seconds) * window_seconds
-        start = datetime.fromtimestamp(bucket_start, tz=moment.tzinfo)
+        moment_utc = moment.astimezone(timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        delta = moment_utc - epoch
+        total_microseconds = (
+            (delta.days * 86_400 + delta.seconds) * 1_000_000
+            + delta.microseconds
+        )
+        window_microseconds = int(window_seconds) * 1_000_000
+        bucket_start_microseconds = (
+            total_microseconds // window_microseconds
+        ) * window_microseconds
+        start = epoch + timedelta(microseconds=bucket_start_microseconds)
         end = start + timedelta(seconds=int(window_seconds))
         return cls(
             asset=asset,
@@ -95,8 +105,8 @@ class WindowBounds:
         """Physical closure is controlled by local ingest/clock time so a
         provider clock anomaly cannot prevent a window from ever closing."""
         now = require_utc(now_utc, field_name="now_utc")
-        if grace_seconds < 0:
-            raise ValueError("grace_seconds cannot be negative")
+        if not math.isfinite(float(grace_seconds)) or grace_seconds < 0:
+            raise ValueError("grace_seconds must be finite and non-negative")
         return now >= self.end_utc + timedelta(seconds=grace_seconds)
 
 

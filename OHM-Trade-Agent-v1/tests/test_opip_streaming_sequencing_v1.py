@@ -87,11 +87,11 @@ def test_non_decreasing_allows_non_contiguous_increase():
     assert obs.status == SequenceStatus.CONTIGUOUS
 
 
-def test_non_decreasing_repeat_is_duplicate():
+def test_non_decreasing_repeat_is_contiguous_not_duplicate():
     tracker = NonDecreasingSequenceTracker()
     tracker.observe("100", reconnect_epoch=0)
     obs = tracker.observe("100", reconnect_epoch=0)
-    assert obs.status == SequenceStatus.DUPLICATE
+    assert obs.status == SequenceStatus.CONTIGUOUS
 
 
 def test_non_decreasing_decrease_is_out_of_order():

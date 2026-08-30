@@ -14,6 +14,7 @@ here rather than letting each caller re-implement the threshold logic.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from app.opip.streaming.contract import EVIDENCE_QUALITY_RANK, EvidenceQualityState
 from app.opip.streaming.windows import WindowAccumulator
@@ -65,6 +66,14 @@ def assess_window_quality(
     max_dropped_frame_ratio: float = DEFAULT_MAX_DROPPED_FRAME_RATIO,
 ) -> EvidenceQuality:
     """Deterministic quality verdict from one window's bounded counters."""
+    for name, value in (
+        ("max_out_of_order_ratio", max_out_of_order_ratio),
+        ("max_late_frame_ratio", max_late_frame_ratio),
+        ("max_dropped_frame_ratio", max_dropped_frame_ratio),
+    ):
+        if not math.isfinite(float(value)) or not 0 <= float(value) <= 1:
+            raise ValueError(f"{name} must be finite and within [0, 1]")
+
     if accumulator.is_empty:
         return EvidenceQuality(
             state=EvidenceQualityState.INCOMPLETE,

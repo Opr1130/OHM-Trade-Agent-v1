@@ -5,8 +5,8 @@ Different venues encode "no gap happened" differently:
 * Some streams (e.g. a strict per-symbol update counter) are meant to
   increment by exactly one; any larger jump is a genuine gap.
 * Some streams intentionally emit non-contiguous, non-decreasing IDs (gaps
-  between values are normal and carry no meaning); only a decrease or an
-  exact repeat is informative.
+  between values are normal and carry no meaning); a decrease is informative,
+  while an exact repeat may still represent a distinct valid message.
 * Some streams carry no usable sequence value at all.
 
 A single global rule ("current != previous + 1 => gap") is unsafe across
@@ -180,11 +180,12 @@ class StrictIncrementingSequenceTracker(_EpochAwareTracker):
 
 
 class NonDecreasingSequenceTracker(_EpochAwareTracker):
-    """For streams where non-contiguous IDs are normal and carry no meaning.
+    """For streams where non-contiguous IDs and repeated IDs are valid.
 
-    Only a repeat (DUPLICATE) or a decrease (OUT_OF_ORDER) is informative;
-    any increase, regardless of size, is CONTIGUOUS. This tracker never
-    reports GAP, because "gap size" has no meaning for this policy.
+    Any equal-or-increasing value is CONTIGUOUS. A decrease is OUT_OF_ORDER.
+    This tracker never reports GAP or DUPLICATE because sequence identity is
+    not message identity for this policy; a future provider adapter must use
+    the provider's own event/message identity for deduplication.
     """
 
     def __init__(self) -> None:
@@ -234,7 +235,7 @@ class NonDecreasingSequenceTracker(_EpochAwareTracker):
 
         if parsed == previous:
             return SequenceObservation(
-                status=SequenceStatus.DUPLICATE,
+                status=SequenceStatus.CONTIGUOUS,
                 sequence_value=str(parsed),
                 previous_sequence_value=str(previous),
                 reconnect_epoch=reconnect_epoch,

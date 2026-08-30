@@ -12,8 +12,11 @@ Sequence 2/3 rather than inventing a second asset-identity model.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+import math
+from types import MappingProxyType
 from typing import Any
 
 from app.opip.events.contract import MappingStatus, parse_utc, require_utc, utc_iso
@@ -30,6 +33,36 @@ from app.opip.streaming.contract import (
 # construction. An envelope built with an inconsistent combination (e.g.
 # status=DUPLICATE but duplicate=False) fails closed at construction time
 # rather than silently propagating a self-contradictory record.
+def _deep_freeze_jsonish(value: Any) -> Any:
+    """Deep-freeze JSON-like evidence so frozen envelopes are truly immutable."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("streaming envelope numeric evidence must be finite")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("streaming envelope mapping keys must be strings")
+            frozen[key] = _deep_freeze_jsonish(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_jsonish(item) for item in value)
+    raise TypeError(
+        f"unsupported streaming envelope payload type: {type(value).__name__}"
+    )
+
+
+def _deep_thaw_jsonish(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw_jsonish(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw_jsonish(item) for item in value]
+    return value
+
+
 _EXPECTED_FLAGS: dict[SequenceStatus, tuple[bool, bool, bool]] = {
     # (gap_before, out_of_order, duplicate)
     SequenceStatus.FIRST: (False, False, False),
@@ -64,8 +97,8 @@ class StreamEnvelope:
     # Free-form, provider-specific payload (raw price/qty/side strings etc.).
     # Feature modules never read this directly; they consume typed
     # TradeObservation/LiquidationObservation built from it by an adapter.
-    payload: dict[str, Any] = field(default_factory=dict)
-    quality: dict[str, Any] = field(default_factory=dict)
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    quality: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = STREAMING_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -100,6 +133,9 @@ class StreamEnvelope:
                 f"expected {expected}, got {actual}"
             )
 
+        object.__setattr__(self, "payload", _deep_freeze_jsonish(dict(self.payload)))
+        object.__setattr__(self, "quality", _deep_freeze_jsonish(dict(self.quality)))
+
     @property
     def has_unique_identity(self) -> bool:
         return self.identity_status == MappingStatus.UNIQUE
@@ -121,8 +157,8 @@ class StreamEnvelope:
             "out_of_order": bool(self.out_of_order),
             "duplicate": bool(self.duplicate),
             "is_aggregate": bool(self.is_aggregate),
-            "quality": dict(self.quality),
-            "payload": dict(self.payload),
+            "quality": _deep_thaw_jsonish(self.quality),
+            "payload": _deep_thaw_jsonish(self.payload),
             "schema_version": self.schema_version,
         }
 

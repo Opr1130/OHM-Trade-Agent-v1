@@ -248,3 +248,27 @@ signature — only construct instances of them from live data. Backpressure
 policy (when to call `record_dropped_frame()` under queue overflow) and the
 transport-state → provider-health derivation mentioned above are BUILD 4.2
 concerns, not resolved here.
+
+
+## BUILD 4.1 independent-review remediation
+
+Independent review before merge identified five deterministic-hardening issues
+and they were remediated in BUILD 4.1 rather than deferred to the async worker:
+
+- StreamEnvelope payload/quality are now recursively frozen at construction;
+  canonical bytes cannot change if the caller mutates its original dict/list.
+- NonDecreasingSequenceTracker treats repeated sequence values as valid
+  CONTIGUOUS evidence, explicitly separating sequence continuity from message
+  deduplication for Bybit-style repeated-sequence semantics.
+- Trade/liquidation/CVD numeric inputs fail closed on NaN/Infinity.
+- Cross-venue state/quality key mismatch degrades to INCOMPLETE evidence
+  without accidental KeyError or false agreement.
+- PIT grid alignment uses integer microseconds from the UTC epoch, eliminating
+  float-boundary ambiguity.
+- Liquidation synchronization is identity-safe and searches for an actual
+  cross-venue time cluster rather than comparing only each venue's earliest
+  event.
+
+Reconnect boundaries and unsupported sequence capability remain conservative
+DEGRADED evidence in V1 by design; BUILD 4.2 may add provider-capability-aware
+metadata, but neither state may independently confirm evidence today.
