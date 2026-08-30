@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # provider traffic or delaying higher-priority lifecycle work.
     opip_event_mapping_lookups_per_capture: int = Field(default=1, ge=0, le=4)
 
+    # O'Pip Sequence 4 production shadow streaming worker. This is public
+    # market-data evidence only and carries no exchange/trading authority.
+    opip_streaming_enabled: bool = False
+    opip_streaming_symbols: str = "BTCUSDT,ETHUSDT,SOLUSDT"
+    opip_streaming_binance_url: str = "wss://fstream.binance.com/public/stream"
+    opip_streaming_bybit_url: str = "wss://stream.bybit.com/v5/public/linear"
+    opip_streaming_queue_maxsize: int = Field(default=5000, ge=100, le=10000)
+    opip_streaming_retention_hours: int = Field(default=72, ge=24, le=168)
+    opip_streaming_health_interval_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_enabled: bool = False
