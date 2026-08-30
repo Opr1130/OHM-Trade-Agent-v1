@@ -27,7 +27,7 @@ from app.services.p1_shadow_outbox import (
 from app.services.registry_io import registry_lock, save_json_atomic
 
 
-DEFAULT_ML_SNAPSHOT_FILE = Path("/app/data/opip_ml_feature_snapshots_v1.jsonl.gz")
+DEFAULT_ML_SNAPSHOT_DIR = Path("/app/data/opip_ml_feature_snapshots_v1")
 DEFAULT_ML_CHECKPOINT_FILE = Path("/app/data/opip_ml_capture_checkpoint.json")
 DEFAULT_ML_DEAD_LETTER_FILE = Path("/app/data/opip_ml_capture_dead_letter.jsonl")
 DEFAULT_ML_HEALTH_FILE = Path("/app/data/opip_ml_capture_health.json")
@@ -37,9 +37,19 @@ ML_FEATURE_CALC_VERSION = "canonical-episode-ml-v1"
 
 
 @dataclass(frozen=True)
+class EvidenceLine:
+    line_number: int
+    start_offset: int
+    end_offset: int
+    raw: bytes
+
+
+@dataclass(frozen=True)
 class MLCaptureSummary:
     enabled: bool
     ledger_rows_seen: int = 0
+    ledger_bytes_seen: int = 0
+    batch_rows: int = 0
     processed: int = 0
     legacy_without_seed: int = 0
     malformed: int = 0
@@ -48,6 +58,7 @@ class MLCaptureSummary:
     missing_feature_values: int = 0
     feature_values: int = 0
     next_line: int = 0
+    byte_offset: int = 0
     p1_drained: int = 0
     p1_duplicates: int = 0
     p1_malformed: int = 0
@@ -170,28 +181,59 @@ def build_ml_snapshot_from_canonical(row: Mapping[str, Any]):
     )
 
 
-def _read_complete_lines(path: Path) -> list[str]:
+def _load_checkpoint(path: Path) -> tuple[int, int]:
     if not path.exists():
-        return []
+        return 0, 0
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    next_line = int(payload.get("next_line", 0))
+    byte_offset = int(payload.get("byte_offset", 0))
+    if next_line < 0 or byte_offset < 0:
+        raise ValueError("ML capture checkpoint cannot be negative")
+    return next_line, byte_offset
+
+
+def _read_complete_batch(
+    path: Path,
+    *,
+    next_line: int,
+    byte_offset: int,
+    batch_limit: int,
+) -> tuple[list[EvidenceLine], int]:
+    """Read only complete new JSONL records after the durable byte checkpoint."""
+
+    if not path.exists():
+        if byte_offset != 0:
+            raise ValueError("checkpoint byte_offset is ahead of missing evidence ledger")
+        return [], 0
+
     lock = path.parent / f".{path.name}.lock"
+    rows: list[EvidenceLine] = []
     with registry_lock(lock):
-        text = path.read_text(encoding="utf-8")
-    if not text:
-        return []
-    lines = text.splitlines()
-    if not text.endswith("\n") and lines:
-        lines = lines[:-1]
-    return lines
-
-
-def _load_next_line(path: Path) -> int:
-    if not path.exists():
-        return 0
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return max(0, int(payload.get("next_line", 0)))
-    except Exception:
-        return 0
+        size = path.stat().st_size
+        if byte_offset > size:
+            raise ValueError("checkpoint byte_offset is ahead of evidence ledger")
+        with path.open("rb") as handle:
+            handle.seek(byte_offset)
+            line_number = next_line
+            while len(rows) < batch_limit:
+                start = handle.tell()
+                raw = handle.readline()
+                if not raw:
+                    break
+                end = handle.tell()
+                if not raw.endswith(b"\n"):
+                    # Writer has not completed the final JSONL record yet.
+                    break
+                rows.append(
+                    EvidenceLine(
+                        line_number=line_number,
+                        start_offset=start,
+                        end_offset=end,
+                        raw=raw,
+                    )
+                )
+                line_number += 1
+    return rows, size
 
 
 def _append_dead_letter(path: Path, payload: Mapping[str, Any]) -> None:
@@ -207,51 +249,102 @@ def _append_dead_letter(path: Path, payload: Mapping[str, Any]) -> None:
                 pass
 
 
-def _append_gzip_snapshot(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.parent / f".{path.name}.lock"
-    with registry_lock(lock):
-        with gzip.open(path, "at", encoding="utf-8") as handle:
-            handle.write(json.dumps(dict(payload), sort_keys=True, allow_nan=False) + "\n")
+def _chunk_bytes(wrappers: list[Mapping[str, Any]]) -> bytes:
+    raw = b"".join(
+        (
+            json.dumps(
+                dict(wrapper),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        for wrapper in wrappers
+    )
+    return gzip.compress(raw, compresslevel=6, mtime=0)
 
 
-def _existing_ml_snapshot_ids(path: Path) -> set[str]:
-    """Read deterministic snapshot identities for crash-safe retry deduplication."""
-    if not path.exists():
-        return set()
-    lock = path.parent / f".{path.name}.lock"
-    ids: set[str] = set()
-    with registry_lock(lock):
-        with gzip.open(path, "rt", encoding="utf-8") as handle:
-            for raw in handle:
-                if not raw.strip():
-                    continue
-                row = json.loads(raw)
-                if not isinstance(row, dict):
-                    raise ValueError("ML snapshot store contains a non-object row")
-                snapshot_id = str(row.get("ml_snapshot_id") or "")
-                if not snapshot_id:
-                    raise ValueError("ML snapshot store row has no ml_snapshot_id")
-                ids.add(snapshot_id)
-    return ids
+def _chunk_name(
+    *,
+    start_line: int,
+    end_line: int,
+    start_offset: int,
+    end_offset: int,
+    compressed_payload: bytes,
+) -> str:
+    digest = hashlib.sha256(compressed_payload).hexdigest()[:20]
+    return (
+        f"chunk-{start_line:012d}-{end_line:012d}-"
+        f"{start_offset:020d}-{end_offset:020d}-{digest}.jsonl.gz"
+    )
+
+
+def _write_snapshot_chunk_atomic(
+    snapshot_dir: Path,
+    *,
+    wrappers: list[Mapping[str, Any]],
+    batch: list[EvidenceLine],
+) -> tuple[bool, Path | None]:
+    """Atomically publish one compressed immutable chunk for a ledger batch."""
+
+    if not wrappers or not batch:
+        return False, None
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    compressed = _chunk_bytes(wrappers)
+    name = _chunk_name(
+        start_line=batch[0].line_number,
+        end_line=batch[-1].line_number + 1,
+        start_offset=batch[0].start_offset,
+        end_offset=batch[-1].end_offset,
+        compressed_payload=compressed,
+    )
+    destination = snapshot_dir / name
+    if destination.exists():
+        return False, destination
+
+    temp = snapshot_dir / f".{name}.{os.getpid()}.tmp"
+    try:
+        with temp.open("wb") as handle:
+            handle.write(compressed)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Atomic rename means a killed process leaves either the old namespace
+        # or one complete gzip member, never a truncated published chunk.
+        os.replace(temp, destination)
+        try:
+            directory_fd = os.open(snapshot_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True, destination
 
 
 def capture_ml_production_evidence(
     *,
     evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
-    snapshot_path: Path = DEFAULT_ML_SNAPSHOT_FILE,
+    snapshot_dir: Path = DEFAULT_ML_SNAPSHOT_DIR,
     checkpoint_path: Path = DEFAULT_ML_CHECKPOINT_FILE,
     dead_letter_path: Path = DEFAULT_ML_DEAD_LETTER_FILE,
     health_path: Path = DEFAULT_ML_HEALTH_FILE,
     batch_limit: int = 250,
     enabled: bool | None = None,
 ) -> MLCaptureSummary:
-    """Drain canonical evidence into compressed FeatureSnapshots, fail-open.
+    """Drain canonical evidence into atomic compressed FeatureSnapshot chunks.
 
-    The P1 durable outbox is drained first using its existing independent
-    checkpoint. This worker then consumes only the accepted evidence ledger and
-    advances its own cursor. Old rows without the v1.1 seed are intentionally
-    skipped; they are not backfilled with fabricated availability timestamps.
+    The P1 durable outbox is drained first only for the production-default
+    ledger. The consumer then reads complete ledger bytes from its durable
+    byte-offset checkpoint. Old rows without the v1.1 seed are intentionally
+    skipped; they are never backfilled with fabricated availability timestamps.
     """
 
     active = p1_shadow_outbox_enabled() if enabled is None else bool(enabled)
@@ -272,45 +365,34 @@ def capture_ml_production_evidence(
         # outbox or advance its checkpoint implicitly.
         p1 = DrainResult(0, 0, 0, 0, False)
 
-    lines = _read_complete_lines(evidence_path)
-    start = _load_next_line(checkpoint_path)
-    if start > len(lines):
+    try:
+        start_line, start_offset = _load_checkpoint(checkpoint_path)
+        batch, ledger_size = _read_complete_batch(
+            evidence_path,
+            next_line=start_line,
+            byte_offset=start_offset,
+            batch_limit=batch_limit,
+        )
+    except Exception as exc:
         summary = MLCaptureSummary(
             enabled=True,
-            ledger_rows_seen=len(lines),
-            next_line=start,
+            next_line=0,
+            byte_offset=0,
             p1_drained=p1.processed,
             p1_duplicates=p1.duplicates,
             p1_malformed=p1.malformed,
             p1_stopped_on_error=p1.stopped_on_error,
-            error_type="CHECKPOINT_AHEAD_OF_EVIDENCE_LEDGER",
+            error_type=f"ML_CAPTURE_CURSOR_UNREADABLE:{type(exc).__name__}",
         )
         save_json_atomic(health_path, summary.as_dict())
         return summary
 
     processed = legacy = malformed = temporal = missing = feature_count = 0
-    duplicate_snapshots = 0
-    try:
-        known_ml_snapshot_ids = _existing_ml_snapshot_ids(snapshot_path)
-    except Exception as exc:
-        summary = MLCaptureSummary(
-            enabled=True,
-            ledger_rows_seen=len(lines),
-            next_line=start,
-            p1_drained=p1.processed,
-            p1_duplicates=p1.duplicates,
-            p1_malformed=p1.malformed,
-            p1_stopped_on_error=p1.stopped_on_error,
-            error_type=f"ML_SNAPSHOT_STORE_UNREADABLE:{type(exc).__name__}",
-        )
-        save_json_atomic(health_path, summary.as_dict())
-        return summary
-    next_line = start
-    upper = min(len(lines), start + batch_limit)
-    for index in range(start, upper):
-        raw = lines[index]
+    wrappers: list[dict[str, Any]] = []
+
+    for item in batch:
         try:
-            row = json.loads(raw)
+            row = json.loads(item.raw.decode("utf-8"))
             if not isinstance(row, dict):
                 raise ValueError("evidence row must be an object")
         except Exception as exc:
@@ -318,24 +400,19 @@ def capture_ml_production_evidence(
             _append_dead_letter(
                 dead_letter_path,
                 {
-                    "line_number": index,
+                    "line_number": item.line_number,
+                    "byte_offset": item.start_offset,
                     "error_type": type(exc).__name__,
                     "reason": "MALFORMED_EVIDENCE_ROW",
                     "measurement_only": True,
                 },
             )
-            next_line = index + 1
-            save_json_atomic(checkpoint_path, {"next_line": next_line})
             continue
 
         if str(row.get("record_type") or "") != "CANONICAL_EPISODE_SNAPSHOT":
-            next_line = index + 1
-            save_json_atomic(checkpoint_path, {"next_line": next_line})
             continue
         if not isinstance(row.get("ml_feature_seed"), Mapping):
             legacy += 1
-            next_line = index + 1
-            save_json_atomic(checkpoint_path, {"next_line": next_line})
             continue
 
         try:
@@ -343,38 +420,35 @@ def capture_ml_production_evidence(
             values = snapshot.ml_feature_mapping()
             feature_count += len(values)
             missing += sum(value is None for value in values.values())
-            wrapper = {
-                "record_type": "OPIP_ML_FEATURE_SNAPSHOT",
-                "capture_schema_version": ML_CAPTURE_SCHEMA_VERSION,
-                "canonical_snapshot_id": str(row.get("snapshot_id") or ""),
-                "episode_id": snapshot.episode_id,
-                "ml_snapshot_id": snapshot.snapshot_id,
-                "decision_at_utc": snapshot.decision_at_utc.isoformat(),
-                "symbol": snapshot.pair,
-                "feature_snapshot": snapshot.to_dict(),
-                "audit_context": {
-                    "decision_status": row.get("decision_status"),
-                    "candidate_rank": row.get("candidate_rank"),
-                    "opportunity_score": row.get("opportunity_score"),
-                    "suppressed": row.get("suppressed"),
-                },
-                "measurement_only": True,
-                "advisory_only": True,
-                "affects_live_decisions": False,
-                "trade_authority_changed": False,
-            }
-            if snapshot.snapshot_id in known_ml_snapshot_ids:
-                duplicate_snapshots += 1
-            else:
-                _append_gzip_snapshot(snapshot_path, wrapper)
-                known_ml_snapshot_ids.add(snapshot.snapshot_id)
-                processed += 1
+            wrappers.append(
+                {
+                    "record_type": "OPIP_ML_FEATURE_SNAPSHOT",
+                    "capture_schema_version": ML_CAPTURE_SCHEMA_VERSION,
+                    "canonical_snapshot_id": str(row.get("snapshot_id") or ""),
+                    "episode_id": snapshot.episode_id,
+                    "ml_snapshot_id": snapshot.snapshot_id,
+                    "decision_at_utc": snapshot.decision_at_utc.isoformat(),
+                    "symbol": snapshot.pair,
+                    "feature_snapshot": snapshot.to_dict(),
+                    "audit_context": {
+                        "decision_status": row.get("decision_status"),
+                        "candidate_rank": row.get("candidate_rank"),
+                        "opportunity_score": row.get("opportunity_score"),
+                        "suppressed": row.get("suppressed"),
+                    },
+                    "measurement_only": True,
+                    "advisory_only": True,
+                    "affects_live_decisions": False,
+                    "trade_authority_changed": False,
+                }
+            )
         except TemporalIntegrityError as exc:
             temporal += 1
             _append_dead_letter(
                 dead_letter_path,
                 {
-                    "line_number": index,
+                    "line_number": item.line_number,
+                    "byte_offset": item.start_offset,
                     "canonical_snapshot_id": str(row.get("snapshot_id") or ""),
                     "error_type": type(exc).__name__,
                     "reason": str(exc),
@@ -386,7 +460,8 @@ def capture_ml_production_evidence(
             _append_dead_letter(
                 dead_letter_path,
                 {
-                    "line_number": index,
+                    "line_number": item.line_number,
+                    "byte_offset": item.start_offset,
                     "canonical_snapshot_id": str(row.get("snapshot_id") or ""),
                     "error_type": type(exc).__name__,
                     "reason": "ML_SNAPSHOT_BUILD_FAILED",
@@ -394,12 +469,63 @@ def capture_ml_production_evidence(
                 },
             )
 
-        next_line = index + 1
-        save_json_atomic(checkpoint_path, {"next_line": next_line})
+    duplicate_snapshots = 0
+    if batch:
+        try:
+            created, _ = _write_snapshot_chunk_atomic(
+                snapshot_dir,
+                wrappers=wrappers,
+                batch=batch,
+            )
+        except Exception as exc:
+            summary = MLCaptureSummary(
+                enabled=True,
+                ledger_rows_seen=start_line + len(batch),
+                ledger_bytes_seen=ledger_size,
+                batch_rows=len(batch),
+                legacy_without_seed=legacy,
+                malformed=malformed,
+                temporal_violations=temporal,
+                missing_feature_values=missing,
+                feature_values=feature_count,
+                next_line=start_line,
+                byte_offset=start_offset,
+                p1_drained=p1.processed,
+                p1_duplicates=p1.duplicates,
+                p1_malformed=p1.malformed,
+                p1_stopped_on_error=p1.stopped_on_error,
+                error_type=f"ML_SNAPSHOT_CHUNK_WRITE_FAILED:{type(exc).__name__}",
+            )
+            save_json_atomic(health_path, summary.as_dict())
+            return summary
+
+        if wrappers:
+            if created:
+                processed = len(wrappers)
+            else:
+                # The deterministic chunk already exists: this is a crash retry
+                # after durable chunk publication but before checkpoint commit.
+                duplicate_snapshots = len(wrappers)
+
+        next_line = batch[-1].line_number + 1
+        next_offset = batch[-1].end_offset
+        save_json_atomic(
+            checkpoint_path,
+            {
+                "schema_version": 1,
+                "next_line": next_line,
+                "byte_offset": next_offset,
+            },
+        )
+    else:
+        next_line = start_line
+        next_offset = start_offset
 
     summary = MLCaptureSummary(
         enabled=True,
-        ledger_rows_seen=len(lines),
+        ledger_rows_seen=next_line,
+        ledger_bytes_seen=ledger_size,
+        batch_rows=len(batch),
         processed=processed,
         legacy_without_seed=legacy,
         malformed=malformed,
@@ -408,6 +534,7 @@ def capture_ml_production_evidence(
         missing_feature_values=missing,
         feature_values=feature_count,
         next_line=next_line,
+        byte_offset=next_offset,
         p1_drained=p1.processed,
         p1_duplicates=p1.duplicates,
         p1_malformed=p1.malformed,
