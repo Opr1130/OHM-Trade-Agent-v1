@@ -36,7 +36,7 @@ def _canonical(
     }
 
 
-def _ml(snapshot_id="SNAP:1", *, ml_id="MLSNAP:1"):
+def _ml(snapshot_id="SNAP:1", *, ml_id="MLSNAP:1", direction="LONG"):
     """Return ml."""
     return {
         "record_type": "OPIP_ML_FEATURE_SNAPSHOT",
@@ -44,6 +44,7 @@ def _ml(snapshot_id="SNAP:1", *, ml_id="MLSNAP:1"):
         "ml_snapshot_id": ml_id,
         "feature_snapshot": {
             "snapshot_id": ml_id,
+            "direction": direction,
             "features": [{"name": "x", "value": 1.0}],
         },
     }
@@ -115,6 +116,29 @@ def test_production_scored_eligible_maps_to_primary_paper_cohort():
     assert row.normalized_outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
     assert row.paper_trade_id == "PT:1"
     assert row.primary_supervised_eligible is True
+
+
+def test_feature_direction_none_cannot_enter_primary_supervised_cohort():
+    """Verify production direction NONE remains excluded from primary training."""
+    row = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+        ml_snapshot_rows=[_ml(direction="NONE")],
+        paper_trade_rows=[_paper(direction="LONG")],
+    )[0]
+    assert row.linkage_status is LinkageStatus.COMPLETE_FINAL
+    assert row.primary_supervised_eligible is False
+    assert "ML_DIRECTION_NOT_TRAINABLE" in row.exclusion_reasons
+
+
+def test_feature_paper_direction_mismatch_cannot_train():
+    """Verify explicit direction disagreement fails supervised eligibility."""
+    row = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+        ml_snapshot_rows=[_ml(direction="SHORT")],
+        paper_trade_rows=[_paper(direction="LONG")],
+    )[0]
+    assert row.primary_supervised_eligible is False
+    assert "DIRECTION_LINK_MISMATCH" in row.exclusion_reasons
 
 
 def test_production_scored_suppressed_is_counterfactual_research_only():
