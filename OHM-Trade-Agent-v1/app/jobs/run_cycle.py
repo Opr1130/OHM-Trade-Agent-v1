@@ -75,6 +75,38 @@ def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
         )
 
 
+
+def _run_qualified_alert_retry_fail_open(*, settings) -> None:
+    """Retry already-qualified actions after real-position protection.
+
+    This path never rescans or re-qualifies a market. It only recovers
+    operational tracking/Telegram failures for a still-live pending lifecycle.
+    """
+    bot_token = str(getattr(settings, "telegram_bot_token", "") or "")
+    chat_id = str(getattr(settings, "telegram_chat_id", "") or "")
+    if not bool(getattr(settings, "telegram_enabled", True)) or not bot_token or not chat_id:
+        return
+    try:
+        from app.services.qualified_alert_outbox import retry_qualified_alerts
+
+        delivered, pending = retry_qualified_alerts(
+            bot_token=bot_token,
+            chat_id=chat_id,
+        )
+    except Exception as exc:
+        print(
+            "O'Pip qualified alert recovery unavailable; production protection unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+    if delivered or pending:
+        print(
+            "O'Pip qualified alert recovery:",
+            f"delivered={delivered}",
+            f"pending={pending}",
+        )
+
+
 def _run_paper_monitor_fail_open() -> None:
     """Run paper simulation only after live protection has completed."""
     try:
@@ -305,6 +337,10 @@ def _run_cycle_once() -> None:
     # Active positions always receive deterministic protection outside
     # MAINTENANCE, including overnight quiet hours.
     monitor_active_main()
+
+    # Recover previously qualified but operationally undelivered actions only
+    # after existing positions have received their protection pass.
+    _run_qualified_alert_retry_fail_open(settings=get_settings())
 
     # Pending opportunities are routine discovery/lifecycle noise while the
     # operator is asleep. They resume after 05:00 ET; active risk protection
