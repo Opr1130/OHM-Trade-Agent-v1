@@ -669,6 +669,7 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings):
         plan = opportunity.plan
         direction = str(opportunity.snapshot.trade_direction or "LONG").upper()
         alert["opportunity_rank"] = ranked.rank
+        alert.setdefault("profit_rank", ranked.rank)
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
         gate = apply_action_gate(
