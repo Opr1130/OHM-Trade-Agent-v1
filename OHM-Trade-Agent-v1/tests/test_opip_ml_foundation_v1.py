@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from app.opip.ml.contracts import (
+    DriftHealthRecord,
     FeatureSnapshot,
     FeatureValue,
+    ModelEvidence,
     ModelHealth,
     ModelLifecycle,
     ModelRegistryRecord,
@@ -17,7 +19,13 @@ from app.opip.ml.contracts import (
 )
 from app.opip.ml.dataset import build_dataset_manifest
 from app.opip.ml.labels import HorizonClose, PriceBar, resolve_barrier_labels
-from app.opip.ml.registry import mark_statistical_degradation, transition_model
+from app.opip.ml.registry import (
+    apply_structural_health_failure,
+    mark_statistical_degradation,
+    promote_single_challenger,
+    transition_model,
+)
+from app.opip.ml.runtime import ModelAdapter
 from app.opip.ml.snapshot import seal_feature_snapshot
 from app.opip.ml.temporal import AvailabilityStamp, TemporalIntegrityError
 from app.opip.ml.validation import TemporalSample, purged_chronological_split
@@ -36,7 +44,12 @@ def _stamp(*, visible_offset_seconds: int = 0) -> AvailabilityStamp:
     )
 
 
-def _snapshot(*, direction: str = "LONG", candidate_id: str | None = "OPIPC:test"):
+def _snapshot(
+    *,
+    direction: str = "LONG",
+    candidate_id: str | None = "OPIPC:test",
+    lane: str = "PAPER",
+):
     return seal_feature_snapshot(
         episode_id="EP:test",
         candidate_id=candidate_id,
@@ -45,7 +58,7 @@ def _snapshot(*, direction: str = "LONG", candidate_id: str | None = "OPIPC:test
         venue="KRAKEN",
         pair="BTCUSD",
         direction=direction,
-        lane="PAPER",
+        lane=lane,
         regime="TREND",
         feature_values={"volume_24h": 1000.0, "lift_from_low_pct": 5.0},
         availability={
@@ -423,6 +436,27 @@ def test_label_availability_tracks_delayed_input_visibility():
     )
 
 
+def test_dataset_applies_cohort_filter_to_membership():
+    snapshot = _snapshot(lane="PAPER")
+    label = _clean_label(snapshot)
+    included = _manifest(snapshot, [label], cohort_filter={"lane": "PAPER"})
+    excluded = _manifest(snapshot, [label], cohort_filter={"lane": "LIVE"})
+    assert included.included_snapshot_ids == (snapshot.snapshot_id,)
+    assert excluded.included_snapshot_ids == ()
+    assert (
+        excluded.excluded_snapshot_ids[snapshot.snapshot_id]
+        == "COHORT_FILTER_MISMATCH"
+    )
+    assert included.dataset_id != excluded.dataset_id
+
+
+def test_dataset_rejects_unsupported_cohort_filter_key():
+    snapshot = _snapshot()
+    label = _clean_label(snapshot)
+    with pytest.raises(ValueError, match="unsupported cohort_filter"):
+        _manifest(snapshot, [label], cohort_filter={"not_a_snapshot_field": "x"})
+
+
 def test_dataset_requires_exact_fee_and_slippage_versions():
     snapshot = _snapshot()
     wrong_fee = _clean_label(snapshot, fee_model_version="fees-v2")
@@ -576,9 +610,63 @@ def test_purged_split_removes_training_label_overlap():
     assert split.test_ids == ("test-safe",)
 
 
-def _registry_record(lifecycle=ModelLifecycle.REGISTERED):
+def test_purged_split_accounts_for_embargo_windows_and_all_sample_ids():
+    samples = [
+        TemporalSample("train", NOW, NOW + timedelta(hours=1)),
+        TemporalSample(
+            "embargo-1",
+            NOW + timedelta(days=1, hours=12),
+            NOW + timedelta(days=1, hours=13),
+        ),
+        TemporalSample(
+            "validation",
+            NOW + timedelta(days=3),
+            NOW + timedelta(days=3, hours=1),
+        ),
+        TemporalSample(
+            "embargo-2",
+            NOW + timedelta(days=4, hours=12),
+            NOW + timedelta(days=4, hours=13),
+        ),
+        TemporalSample(
+            "test",
+            NOW + timedelta(days=6),
+            NOW + timedelta(days=6, hours=1),
+        ),
+        TemporalSample(
+            "after-test",
+            NOW + timedelta(days=8),
+            NOW + timedelta(days=8, hours=1),
+        ),
+    ]
+    split = purged_chronological_split(
+        samples,
+        train_end_utc=NOW + timedelta(days=1),
+        validation_start_utc=NOW + timedelta(days=2),
+        validation_end_utc=NOW + timedelta(days=4),
+        test_start_utc=NOW + timedelta(days=5),
+        test_end_utc=NOW + timedelta(days=7),
+        embargo=timedelta(days=1),
+    )
+    assert {"embargo-1", "embargo-2", "after-test"} <= set(split.purged_ids)
+    accounted = (
+        split.train_ids
+        + split.validation_ids
+        + split.test_ids
+        + split.purged_ids
+    )
+    assert sorted(accounted) == sorted(sample.sample_id for sample in samples)
+
+
+def _registry_record(
+    lifecycle=ModelLifecycle.REGISTERED,
+    *,
+    model_id: str = "model-1",
+    health: ModelHealth = ModelHealth.HEALTHY,
+    approved: bool = False,
+):
     return ModelRegistryRecord(
-        model_id="model-1",
+        model_id=model_id,
         model_family="XGBOOST",
         model_version="1",
         artifact_hash="artifact",
@@ -595,7 +683,9 @@ def _registry_record(lifecycle=ModelLifecycle.REGISTERED):
         calibration_dataset_id=None,
         validation_report_id="report",
         lifecycle=lifecycle,
-        health=ModelHealth.HEALTHY,
+        health=health,
+        approval_principal="authorized-human" if approved else None,
+        approved_at_utc=NOW if approved else None,
     )
 
 
@@ -604,20 +694,49 @@ def test_challenger_cannot_be_constructed_without_approval_metadata():
         _registry_record(ModelLifecycle.CHALLENGER)
 
 
-def test_model_promotion_is_manual_and_sequential():
+def test_model_promotion_requires_registry_wide_operation():
     record = _registry_record()
     record = transition_model(record, target=ModelLifecycle.VALIDATED)
     record = transition_model(record, target=ModelLifecycle.SHADOW)
-    with pytest.raises(ValueError, match="approval"):
+    with pytest.raises(ValueError, match="registry-wide"):
         transition_model(record, target=ModelLifecycle.CHALLENGER)
-    promoted = transition_model(
-        record,
-        target=ModelLifecycle.CHALLENGER,
+
+    promoted_records = promote_single_challenger(
+        [record],
+        model_id=record.model_id,
         approval_principal="authorized-human",
         approved_at_utc=NOW,
     )
+    promoted = promoted_records[0]
     assert promoted.lifecycle == ModelLifecycle.CHALLENGER
     assert promoted.approval_principal == "authorized-human"
+
+
+def test_registry_rejects_second_active_challenger():
+    first = _registry_record(
+        ModelLifecycle.CHALLENGER,
+        model_id="model-1",
+        approved=True,
+    )
+    second = _registry_record(ModelLifecycle.SHADOW, model_id="model-2")
+    with pytest.raises(ValueError, match="another CHALLENGER"):
+        promote_single_challenger(
+            [first, second],
+            model_id="model-2",
+            approval_principal="authorized-human",
+            approved_at_utc=NOW,
+        )
+
+
+def test_statistical_degradation_cannot_override_structural_suspension():
+    record = _registry_record(ModelLifecycle.SHADOW)
+    suspended = apply_structural_health_failure(record, reason="SCHEMA_MISMATCH")
+    degraded = mark_statistical_degradation(
+        suspended,
+        sample_count=1000,
+        minimum_sample_count=100,
+    )
+    assert degraded.health == ModelHealth.SUSPENDED
 
 
 def test_statistical_degradation_requires_minimum_sample_support():
@@ -628,6 +747,36 @@ def test_statistical_degradation_requires_minimum_sample_support():
     assert mark_statistical_degradation(
         record, sample_count=100, minimum_sample_count=100
     ).health == ModelHealth.DEGRADED
+
+
+def test_model_adapter_contract_returns_typed_model_evidence():
+    annotations = ModelAdapter.score.__annotations__
+    assert annotations["snapshot"] == "FeatureSnapshot"
+    assert annotations["return"] == "ModelEvidence"
+
+
+def test_drift_health_record_rejects_inverted_window():
+    with pytest.raises(ValueError, match="rolling window end"):
+        DriftHealthRecord(
+            model_id="model-1",
+            model_version="1",
+            evaluated_at_utc=NOW,
+            rolling_window_start_utc=NOW,
+            rolling_window_end_utc=NOW - timedelta(minutes=1),
+            sample_count=1,
+            input_distribution_drift={},
+            missingness_drift={},
+            out_of_training_support_rate=None,
+            prediction_distribution_drift=None,
+            label_base_rate_drift=None,
+            rolling_brier_score=None,
+            rolling_calibration_error=None,
+            performance_decay=None,
+            model_staleness_seconds=None,
+            schema_incompatibility_count=0,
+            operational_failure_rate=None,
+            health=ModelHealth.HEALTHY,
+        )
 
 
 def test_ml_package_has_no_exchange_or_execution_imports():
