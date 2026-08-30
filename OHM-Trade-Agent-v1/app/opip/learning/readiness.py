@@ -163,12 +163,14 @@ def _structurally_valid_canonical(
     malformed = 0
     for row in materialized:
         snapshot_id = str(row.get("snapshot_id") or "").strip()
+        episode_id = str(row.get("episode_id") or "").strip()
         if (
             not snapshot_id
             or counts[snapshot_id] != 1
-            or not str(row.get("episode_id") or "").strip()
+            or not episode_id
         ):
-            malformed += 1 if not snapshot_id or not row.get("episode_id") else 0
+            if not snapshot_id or not episode_id:
+                malformed += 1
             continue
         valid.append(row)
     return valid, malformed
