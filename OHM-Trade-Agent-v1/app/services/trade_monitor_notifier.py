@@ -230,9 +230,10 @@ def send_monitor_update(
     else:
         fingerprint = f"{trade.direction}:{result.action}:{reason_signature}"
 
+    policy_event_type = "POSITION_WARNING" if result.action == "WARNING" else result.action
     if not should_emit(
         identity=identity,
-        event_type=result.action,
+        event_type=policy_event_type,
         fingerprint=fingerprint,
         now=now,
     ):
@@ -279,7 +280,7 @@ def send_monitor_update(
             pass
         record_emitted(
             identity=identity,
-            event_type=result.action,
+            event_type=policy_event_type,
             fingerprint=fingerprint,
             now=now,
         )
