@@ -290,7 +290,18 @@ def test_incomplete_instrumentation_blocks_even_with_exact_pairs():
     exact = _pair(scan_id="SCAN:1", candidate_key="one")
     candidate = snapshot()
     candidate.execution_validation = execution()
-    row = evidence(candidate_key="two", candidate_snapshot=candidate)
+    episode_id = "EP:two"
+    canonical_candidate_id = opip_candidate_id(
+        episode_id=episode_id,
+        pair="SOLUSD",
+        direction="LONG",
+        market_type="SPOT",
+    )
+    row = evidence(
+        episode_id=episode_id,
+        candidate_id=canonical_candidate_id,
+        candidate_snapshot=candidate,
+    )
     missing = build_equivalence_observation(
         observed_at_utc=NOW + timedelta(minutes=1),
         scan_id="SCAN:2",
