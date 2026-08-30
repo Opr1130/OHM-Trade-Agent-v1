@@ -518,3 +518,23 @@ def send_pending_setup_update(
         bot_token=bot_token,
         chat_id=chat_id,
         message=format_pending_setup_message(setup, result),
+        identity=identity,
+        alert_family="PENDING_SETUP",
+        event_type=result.status,
+        fingerprint=fingerprint,
+        symbol=setup.symbol,
+        trade_id=setup.trade_id,
+    )
+
+    if delivery.delivered:
+        _persist_delivered_state(
+            setup=setup,
+            result=result,
+            message_id=delivery.message_id,
+        )
+        record_emitted(
+            identity=identity,
+            event_type=result.status,
+            fingerprint=fingerprint,
+        )
+    return delivery.delivered
