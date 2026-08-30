@@ -157,3 +157,98 @@ def test_processor_failure_does_not_advance_failing_line(tmp_path):
     assert result.stopped_on_error is True
     assert result.error_type == "TimeoutError"
     assert outbox_health(outbox_path=outbox, checkpoint_path=checkpoint)["backlog_rows"] == 1
+
+
+def test_checkpoint_v2_persists_bounded_byte_cursor_and_anchor(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["next_line"] == 1
+    assert 0 < saved["byte_offset"] < outbox.stat().st_size
+    assert saved["anchor_size"] > 0
+    assert len(saved["anchor_sha256"]) == 64
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.processed == 1
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_checkpoint_anchor_rejects_rewritten_processed_prefix(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+
+    payload = outbox.read_bytes()
+    assert b"AUSD" in payload
+    outbox.write_bytes(payload.replace(b"AUSD", b"ZUSD", 1))
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.stopped_on_error is True
+    assert second.error_type == "CHECKPOINT_SOURCE_DIVERGED"
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_legacy_line_checkpoint_migrates_without_full_file_materialization(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+    checkpoint.write_text('{"next_line": 1}\n', encoding="utf-8")
+
+    result = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert result.processed == 1
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["next_line"] == 2
+    assert saved["byte_offset"] == outbox.stat().st_size
