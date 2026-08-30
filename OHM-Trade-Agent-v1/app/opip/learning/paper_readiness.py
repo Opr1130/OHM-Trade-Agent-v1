@@ -62,15 +62,22 @@ class PaperLearningReadinessReport:
     funded_execution_allowed: bool = False
     trade_authority_changed: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate the report-level paper authority boundary."""
+        if not self.measurement_only:
+            raise ValueError("paper readiness report must remain measurement-only")
+        if self.funded_execution_allowed or self.trade_authority_changed:
+            raise ValueError("paper readiness report cannot change funded trade authority")
+
     def as_dict(self) -> dict[str, Any]:
         """Return the combined LONG/SHORT readiness report."""
         return {
             "long": self.long.as_dict(),
             "short": self.short.as_dict(),
             "extended_short_learning_ready": self.extended_short_learning_ready,
-            "measurement_only": True,
-            "funded_execution_allowed": False,
-            "trade_authority_changed": False,
+            "measurement_only": self.measurement_only,
+            "funded_execution_allowed": self.funded_execution_allowed,
+            "trade_authority_changed": self.trade_authority_changed,
         }
 
 
