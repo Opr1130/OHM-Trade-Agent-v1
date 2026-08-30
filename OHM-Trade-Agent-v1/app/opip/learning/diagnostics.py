@@ -23,6 +23,7 @@ class ZeroTradeDiagnostic:
     candidate_count: int
     rejected_count: int
     qualified_count: int
+    unscored_count: int
     top_candidate_id: str | None
     top_pair: str | None
     binding_gate: str | None
@@ -106,7 +107,13 @@ def build_zero_trade_diagnostic(
 ) -> ZeroTradeDiagnostic:
     rows = tuple(candidates)
     qualified = [row for row in rows if _status(row) == "QUALIFIED"]
-    rejected = [row for row in rows if _status(row) != "QUALIFIED"]
+    rejected_states = {"REJECTED", "BLOCKED", "NOT_QUALIFIED", "DISQUALIFIED"}
+    rejected = [row for row in rows if _status(row) in rejected_states]
+    unscored = [
+        row
+        for row in rows
+        if _status(row) not in rejected_states | {"QUALIFIED"}
+    ]
     ordered = sorted(rows, key=_rank_key)
     top = ordered[0] if ordered else {}
     binding_gate = str(
@@ -156,6 +163,7 @@ def build_zero_trade_diagnostic(
         candidate_count=len(rows),
         rejected_count=len(rejected),
         qualified_count=len(qualified),
+        unscored_count=len(unscored),
         top_candidate_id=(
             str(top.get("candidate_id") or top.get("snapshot_id") or "") or None
         ),
