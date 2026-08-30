@@ -87,6 +87,12 @@ class StreamProviderAdapter(Protocol):
         ...
 
     async def heartbeat(self) -> None:
+        """Send and verify one provider-specific liveness probe.
+
+        The coroutine must not return until the provider has acknowledged
+        liveness. If data messages are consumed while waiting for the
+        acknowledgement, the adapter must buffer them for the next receive().
+        """
         ...
 
     async def close(self) -> None:
