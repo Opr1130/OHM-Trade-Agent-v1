@@ -44,6 +44,9 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
+      # Sequence 4 core-consumer boundary: streaming shadow evidence is
+      # readable by the application but only the isolated worker may write it.
+      - ./data/opip/streaming:/app/data/opip/streaming:ro
       - ./data/freqtrade/state:/app/freqtrade_paper:ro
     pids_limit: 256
     security_opt:
@@ -66,3 +69,50 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  opip-stream-worker:
+    build: .
+    container_name: opip-stream-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      OPIP_STREAMING_ENABLED: "true"
+      OPIP_STREAMING_SYMBOLS: "BTCUSDT,ETHUSDT,SOLUSDT"
+      PYTHONDONTWRITEBYTECODE: "1"
+    command:
+      - python
+      - -m
+      - app.opip.streaming.worker
+    volumes:
+      - ./data:/app/data:ro
+      - ./data/opip/streaming:/app/data/opip/streaming:rw
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 256m
+    cpus: "0.40"
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-m",
+          "app.opip.streaming.healthcheck"
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
