@@ -98,7 +98,7 @@ def test_scheduler_validator_ignores_comment_only_unified_lock_mentions():
         if line.strip() and not line.lstrip().startswith("#")
     )
     assert "/var/run/ohm-unified-cycle.lock" not in executable
-    assert (
-        "grep -v -E '^[[:space:]]*#' \"$ML_EVIDENCE_DST\" | "
-        "grep -q '/var/run/ohm-unified-cycle.lock'"
-    ) in source
+    assert "for cmd in install crontab grep awk mktemp cp rm" in source
+    assert "!/^[[:space:]]*#/" in source
+    assert "/\\/var\\/run\\/ohm-unified-cycle\\.lock/" in source
+    assert "grep -v -E '^[[:space:]]*#' \"$ML_EVIDENCE_DST\" | grep -q" not in source
