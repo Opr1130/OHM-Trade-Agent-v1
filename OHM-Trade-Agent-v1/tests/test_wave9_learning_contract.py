@@ -153,7 +153,8 @@ def test_recommendation_links_wave9_quality_to_outcome_registry(tmp_path, monkey
         action="ENTER_NOW",
     )
 
-    assert row["schema_version"] == 4
+    assert row["schema_version"] == 3
+    assert row["wave9_extension_version"] == 1
     assert row["feature_snapshot_id"] == "MLSNAP:abc"
     assert row["trade_quality_evidence_id"] == "W9Q:def"
     assert row["opportunity_rank"] == 1
