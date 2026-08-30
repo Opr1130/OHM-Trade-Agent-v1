@@ -260,5 +260,6 @@ def test_first_stream_worker_deploy_uses_existing_trusted_reconcile_hook():
     assert 'bash "$STREAM_RECONCILE"' in scheduler
     assert "app.opip.streaming.activation_check" in worker
     assert "OPIP stream worker reconciliation: OK" in worker
-    assert "OPIP stream worker reconciliation: OK" in workflow
+    assert "OHM scheduler reconciliation: OK" in workflow
+    assert "&& grep -q 'OPIP stream worker reconciliation: OK' deploy.log" not in workflow
     assert "--remove-orphans ohm-trade-agent" in deploy
