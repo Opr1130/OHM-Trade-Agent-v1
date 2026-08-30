@@ -156,7 +156,7 @@ def _duplicates(rows: Iterable[Mapping[str, Any]], field: str) -> int:
 def _structurally_valid_canonical(
     rows: Iterable[Mapping[str, Any]],
 ) -> tuple[list[Mapping[str, Any]], int]:
-    """Retain canonical rows with unique identity and required evidence shape."""
+    """Retain canonical rows with unique identity and required evidence structure."""
     materialized = list(rows)
     counts = Counter(str(row.get("snapshot_id") or "").strip() for row in materialized)
     valid: list[Mapping[str, Any]] = []
