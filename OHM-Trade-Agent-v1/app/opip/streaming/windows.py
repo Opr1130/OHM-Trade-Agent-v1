@@ -198,8 +198,9 @@ class WindowAccumulator:
         amount = int(count)
         if amount <= 0:
             raise ValueError("dropped frame count must be positive")
-        if self.sealed:
-            raise ValueError("cannot record into a sealed window")
+        # Like late_frame_count, drop counters are post-seal quality metadata.
+        # Updating them during the retention interval never changes the sealed
+        # aggregate values; it only prevents false COMPLETE classification.
         return replace(self, dropped_frame_count=self.dropped_frame_count + amount)
 
     def record_late_frame(self) -> "WindowAccumulator":
