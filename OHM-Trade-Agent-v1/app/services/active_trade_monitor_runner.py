@@ -2,7 +2,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.core.config import get_settings
-from app.opip.protection.exposure_resolver import KrakenExposureResolver, ResolvedExposure
+from app.services.active_trade_registry import get_active_trades
+from app.services.kraken_exposure_resolver import KrakenExposureResolver, ResolvedExposure
+from app.services.kraken_position_verification import KrakenPositionVerifier
 from app.opip.protection.position_materiality import refine_protection_action
 from app.services.asset_display_identity import display_market_label
 from app.services.emergency_alert_notifier import send_emergency_alert
@@ -132,7 +134,10 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     failures: list[str] = []
 
     try:
-        resolution = KrakenExposureResolver().resolve()
+        resolution = KrakenExposureResolver(
+            trade_loader=get_active_trades,
+            managed_verifier_factory=KrakenPositionVerifier,
+        ).resolve()
     except Exception as exc:
         reason = f"Kraken-first exposure resolution failed: {exc}"
         _notify_monitor_degraded(settings=settings, reason=reason)
