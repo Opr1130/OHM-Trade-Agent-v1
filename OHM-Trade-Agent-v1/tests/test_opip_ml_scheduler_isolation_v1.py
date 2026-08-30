@@ -78,7 +78,7 @@ def test_scheduler_reconcile_installs_bounded_background_lane():
     assert 'install -o root -g root -m 0644 "$ML_EVIDENCE_SRC" "$ML_EVIDENCE_DST"' in source
     assert "/var/run/opip-background.lock" in source
     assert "run-opip-background-job.sh" in source
-    assert "ml_background_memory_limit=512m" in source
+    assert "ml_background_memory_limits=capture:192m,outcomes:256m" in source
 
 
 def test_deploy_probes_ml_capture_through_bounded_background_lane():
@@ -86,9 +86,9 @@ def test_deploy_probes_ml_capture_through_bounded_background_lane():
         encoding="utf-8"
     )
     assert 'BACKGROUND_RUNNER="$APP_ROOT/deploy/remote/run-opip-background-job.sh"' in source
-    assert "flock -n /var/run/opip-background.lock" in source
+    assert "flock -w 120 8" in source
     assert "app.jobs.run_opip_ml_capture" in source
-    assert "background lane busy or bounded probe failed" in source
+    assert "completed or safely skipped by memory guard" in source
     assert "production unaffected" in source
 
 
@@ -158,7 +158,7 @@ def test_background_launch_lock_is_distinct_from_capture_state_lock():
 
     assert launch != state
     assert f"flock -n {launch}" in cron
-    assert f"flock -n {launch}" in deploy
+    assert launch in deploy\n    assert "flock -w 120 8" in deploy
     assert f'DEFAULT_ML_CAPTURE_LOCK_FILE = Path("{state}")' in service
     assert f"flock -n {state}" not in cron
     assert f"flock -n {state}" not in deploy
