@@ -25,6 +25,7 @@ def _canonical(
     suppressed=False,
     counterfactual=False,
 ):
+    """Return canonical."""
     return {
         "record_type": "CANONICAL_EPISODE_SNAPSHOT",
         "snapshot_id": snapshot_id,
@@ -36,6 +37,7 @@ def _canonical(
 
 
 def _ml(snapshot_id="SNAP:1", *, ml_id="MLSNAP:1"):
+    """Return ml."""
     return {
         "record_type": "OPIP_ML_FEATURE_SNAPSHOT",
         "canonical_snapshot_id": snapshot_id,
@@ -48,6 +50,7 @@ def _ml(snapshot_id="SNAP:1", *, ml_id="MLSNAP:1"):
 
 
 def _phase(snapshot_id="SNAP:1", *, revision=1, record_id=None):
+    """Return phase."""
     return {
         "snapshot_id": snapshot_id,
         "canonical_episode_id": "EP:1",
@@ -69,6 +72,7 @@ def _paper(
     status="CLOSED",
     direction="LONG",
 ):
+    """Return paper."""
     return {
         "paper_trade_id": trade_id,
         "episode_id": episode_id,
@@ -86,6 +90,7 @@ def _paper(
 
 
 def test_provisional_phase3c_never_becomes_primary_supervised_truth():
+    """Verify provisional phase3c never becomes primary supervised truth."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical()],
         ml_snapshot_rows=[_ml()],
@@ -98,6 +103,7 @@ def test_provisional_phase3c_never_becomes_primary_supervised_truth():
 
 
 def test_production_scored_eligible_maps_to_primary_paper_cohort():
+    """Verify production scored eligible maps to primary paper cohort."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
         ml_snapshot_rows=[_ml()],
@@ -112,6 +118,7 @@ def test_production_scored_eligible_maps_to_primary_paper_cohort():
 
 
 def test_production_scored_suppressed_is_counterfactual_research_only():
+    """Verify production scored suppressed is counterfactual research only."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical(status="SCORED_SUPPRESSED", suppressed=True)],
         ml_snapshot_rows=[_ml()],
@@ -122,6 +129,7 @@ def test_production_scored_suppressed_is_counterfactual_research_only():
 
 
 def test_counterfactual_rejected_is_research_only_even_with_final_paper_row():
+    """Verify counterfactual rejected is research only even with final paper row."""
     row = build_learning_linkage_records(
         canonical_rows=[
             _canonical(status="REJECTED", counterfactual=True)
@@ -135,6 +143,7 @@ def test_counterfactual_rejected_is_research_only_even_with_final_paper_row():
 
 
 def test_missing_feature_snapshot_fails_closed_without_symbol_time_fallback():
+    """Verify missing feature snapshot fails closed without symbol time fallback."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical(snapshot_id="SNAP:canonical")],
         ml_snapshot_rows=[_ml(snapshot_id="SNAP:other")],
@@ -146,6 +155,7 @@ def test_missing_feature_snapshot_fails_closed_without_symbol_time_fallback():
 
 
 def test_reused_episode_across_multiple_canonical_snapshots_is_not_exact_paper_link():
+    """Verify reused episode across multiple canonical snapshots is not exact paper link."""
     rows = build_learning_linkage_records(
         canonical_rows=[
             _canonical(snapshot_id="SNAP:1", episode_id="EP:shared"),
@@ -166,6 +176,7 @@ def test_reused_episode_across_multiple_canonical_snapshots_is_not_exact_paper_l
 
 
 def test_multiple_paper_trades_for_same_episode_are_ambiguous_not_guessed():
+    """Verify multiple paper trades for same episode are ambiguous not guessed."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical()],
         ml_snapshot_rows=[_ml()],
@@ -180,6 +191,7 @@ def test_multiple_paper_trades_for_same_episode_are_ambiguous_not_guessed():
 
 
 def test_latest_phase3c_revision_is_selected_by_explicit_revision():
+    """Verify latest phase3c revision is selected by explicit revision."""
     latest = select_latest_phase3c_outcomes(
         [_phase(revision=1), _phase(revision=3), _phase(revision=2)]
     )
@@ -188,6 +200,7 @@ def test_latest_phase3c_revision_is_selected_by_explicit_revision():
 
 
 def test_conflicting_same_revision_phase3c_records_fail_closed():
+    """Verify conflicting same revision phase3c records fail closed."""
     with pytest.raises(ValueError, match="conflicting immutable revisions"):
         select_latest_phase3c_outcomes(
             [
@@ -198,6 +211,7 @@ def test_conflicting_same_revision_phase3c_records_fail_closed():
 
 
 def test_duplicate_canonical_snapshot_identity_fails_closed():
+    """Verify duplicate canonical snapshot identity fails closed."""
     with pytest.raises(ValueError, match="duplicate canonical snapshot identity"):
         build_learning_linkage_records(
             canonical_rows=[_canonical(), _canonical()],
@@ -207,6 +221,7 @@ def test_duplicate_canonical_snapshot_identity_fails_closed():
 
 @pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity", "1e309"])
 def test_nonfinite_final_paper_values_are_unusable(bad_value):
+    """Verify nonfinite final paper values are unusable."""
     row = _paper()
     row["net_pnl"] = bad_value
     row["net_pnl_pct"] = bad_value
@@ -223,6 +238,7 @@ def test_nonfinite_final_paper_values_are_unusable(bad_value):
 
 @pytest.mark.parametrize("bad_flag", ["false", "true", 0, 1, None])
 def test_malformed_paper_authority_flags_are_unusable(bad_flag):
+    """Verify malformed paper authority flags are unusable."""
     row = _paper()
     row["paper_only"] = bad_flag
     normalized = normalize_paper_outcome(row)
@@ -235,6 +251,7 @@ def test_malformed_paper_authority_flags_are_unusable(bad_flag):
 
 
 def test_nonclosed_or_authoritative_paper_record_is_unusable():
+    """Verify nonclosed or authoritative paper record is unusable."""
     open_row = normalize_paper_outcome(_paper(status="OPEN"))
     assert open_row.source_quality is OutcomeSourceQuality.UNUSABLE
 
@@ -245,6 +262,7 @@ def test_nonclosed_or_authoritative_paper_record_is_unusable():
 
 
 def test_learning_package_has_no_execution_authority_imports():
+    """Verify learning package has no execution authority imports."""
     root = Path(__file__).resolve().parents[1] / "app" / "opip" / "learning"
     forbidden = (
         "kraken_private",
