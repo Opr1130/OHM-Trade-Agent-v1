@@ -48,6 +48,7 @@ def _health_payload(
     *,
     runtime_snapshot,
     accumulator: CrossVenueFeatureAccumulator,
+    provider_buffer_dropped: int,
     features_persisted: int,
     store_errors: int,
     last_feature_snapshot_utc: str | None,
@@ -64,10 +65,12 @@ def _health_payload(
         runtime_snapshot.resource_degraded
         or runtime_snapshot.runtime_failed
         or dropped > 0
+        or provider_buffer_dropped > 0
         or runtime_snapshot.observation_sink_errors > 0
         or runtime_snapshot.window_sink_errors > 0
         or accumulator.dropped_buckets > 0
         or accumulator.dropped_ready_snapshots > 0
+        or accumulator.invalid_payload_observations > 0
         or any(state != "CONNECTED" for state in provider_states.values())
     )
     return {
@@ -82,6 +85,7 @@ def _health_payload(
         "raw_frames_enqueued": runtime_snapshot.raw_frames_enqueued,
         "raw_frames_dropped_newest": dropped,
         "raw_drop_pct": drop_pct,
+        "provider_buffer_dropped": int(provider_buffer_dropped),
         "frames_processed": runtime_snapshot.frames_processed,
         "normalized_observations": runtime_snapshot.normalized_observations,
         "malformed_frames": runtime_snapshot.malformed_frames,
@@ -105,6 +109,8 @@ def _health_payload(
         "feature_buckets_dropped": accumulator.dropped_buckets,
         "feature_snapshots_dropped": accumulator.dropped_ready_snapshots,
         "invalid_identity_observations": accumulator.invalid_identity_observations,
+        "invalid_payload_observations": accumulator.invalid_payload_observations,
+        "missing_venue_windows": accumulator.missing_venue_windows,
         "publication": publication,
         "features_persisted": int(features_persisted),
         "last_feature_snapshot_utc": last_feature_snapshot_utc,
@@ -135,16 +141,18 @@ async def run_worker() -> int:
 
     symbols = _parse_symbols(settings.symbols)
     accumulator = CrossVenueFeatureAccumulator()
+    binance_adapter = BinancePublicAdapter(
+        url=settings.binance_url,
+        symbols=symbols,
+    )
+    bybit_adapter = BybitPublicAdapter(
+        url=settings.bybit_url,
+        symbols=symbols,
+    )
     runtime = StreamingRuntime(
         {
-            StreamProvider.BINANCE: BinancePublicAdapter(
-                url=settings.binance_url,
-                symbols=symbols,
-            ),
-            StreamProvider.BYBIT: BybitPublicAdapter(
-                url=settings.bybit_url,
-                symbols=symbols,
-            ),
+            StreamProvider.BINANCE: binance_adapter,
+            StreamProvider.BYBIT: bybit_adapter,
         },
         config=StreamingRuntimeConfig(
             queue_maxsize=settings.queue_maxsize,
@@ -181,6 +189,7 @@ async def run_worker() -> int:
             except asyncio.TimeoutError:
                 pass
 
+            provider_buffer_dropped = bybit_adapter.discarded_frame_count
             if not runtime.running:
                 snapshot = runtime.snapshot()
                 store.write_health(
@@ -188,6 +197,7 @@ async def run_worker() -> int:
                         **_health_payload(
                             runtime_snapshot=snapshot,
                             accumulator=accumulator,
+                            provider_buffer_dropped=provider_buffer_dropped,
                             features_persisted=features_persisted,
                             store_errors=store_errors,
                             last_feature_snapshot_utc=last_feature_snapshot_utc,
@@ -217,6 +227,7 @@ async def run_worker() -> int:
                     _health_payload(
                         runtime_snapshot=snapshot,
                         accumulator=accumulator,
+                        provider_buffer_dropped=provider_buffer_dropped,
                         features_persisted=features_persisted,
                         store_errors=store_errors,
                         last_feature_snapshot_utc=last_feature_snapshot_utc,
@@ -245,6 +256,7 @@ async def run_worker() -> int:
                 **_health_payload(
                     runtime_snapshot=final_snapshot,
                     accumulator=accumulator,
+                    provider_buffer_dropped=bybit_adapter.discarded_frame_count,
                     features_persisted=features_persisted,
                     store_errors=store_errors,
                     last_feature_snapshot_utc=last_feature_snapshot_utc,
