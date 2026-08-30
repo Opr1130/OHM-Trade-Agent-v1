@@ -77,6 +77,9 @@ def _health_payload(
         "runtime_failed": runtime_snapshot.runtime_failed,
         "fatal_error_type": runtime_snapshot.fatal_error_type,
         "provider_states": provider_states,
+        "provider_runtime": [
+            asdict(item) for item in runtime_snapshot.providers
+        ],
         "queue": asdict(runtime_snapshot.queue),
         "raw_frames_received": received,
         "raw_frames_enqueued": runtime_snapshot.raw_frames_enqueued,
