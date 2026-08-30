@@ -457,6 +457,11 @@ def _reconcile_snapshot_queue(
             if not snapshot_id or decision_at is None:
                 continue
 
+            normalized_snapshot = {
+                **snapshot,
+                "decision_at_utc": decision_at.isoformat(),
+            }
+
             prior = _latest_outcome_row(connection, snapshot_id)
             if prior is not None and bool(prior.get("window_complete", False)):
                 connection.execute(
@@ -492,7 +497,11 @@ def _reconcile_snapshot_queue(
                     snapshot_id,
                     decision_at.isoformat(),
                     next_due.isoformat(),
-                    json.dumps(snapshot, sort_keys=True, allow_nan=False),
+                    json.dumps(
+                        normalized_snapshot,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
                 ),
             )
 
