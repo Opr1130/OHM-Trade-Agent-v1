@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.economic_quality_gate import MIN_NET_PROFIT
+from app.services.portfolio_risk import evaluate_portfolio_risk
 from app.services.trade_decision_intelligence import (
     TradeDecisionIntelligence,
     evaluate_trade_decision,
@@ -58,6 +60,90 @@ def apply_action_gate(
             None,
         )
 
+    capacity_reason: str | None = None
+    ceiling = candidate.get("liquidity_capacity_ceiling_usd")
+    if isinstance(ceiling, (int, float)) and float(ceiling) > 0:
+        direction = str(
+            candidate.get("direction") or plan.direction or "LONG"
+        ).upper()
+        leverage = float(
+            candidate.get("margin_leverage")
+            or (2.0 if direction == "SHORT" else 1.0)
+        )
+        max_capital_by_capacity = float(ceiling) / leverage
+        original_capital = float(
+            intelligence.allocation.recommended_capital
+        )
+        if original_capital > max_capital_by_capacity:
+            capped_capital = max(0.0, max_capital_by_capacity)
+            ratio = (
+                capped_capital / original_capital
+                if original_capital > 0
+                else 0.0
+            )
+            capped_allocation = replace(
+                intelligence.allocation,
+                recommended_capital=round(capped_capital, 2),
+                risk_dollars=round(
+                    intelligence.allocation.risk_dollars * ratio,
+                    2,
+                ),
+                position_pct=round(
+                    capped_capital / account_capital * 100.0,
+                    2,
+                ),
+                reason=(
+                    intelligence.allocation.reason
+                    + "; capped by Wave 9 liquidity capacity"
+                ),
+            )
+            capped_portfolio = evaluate_portfolio_risk(
+                active_trades=trades,
+                proposed_symbol=plan.symbol,
+                proposed_direction=direction,
+                proposed_capital=capped_allocation.recommended_capital,
+                proposed_leverage=leverage,
+                account_capital=account_capital,
+            )
+            intelligence = replace(
+                intelligence,
+                allocation=capped_allocation,
+                portfolio_risk=capped_portfolio,
+            )
+            candidate["liquidity_capacity_capped"] = True
+            candidate["liquidity_capacity_max_capital"] = round(
+                max_capital_by_capacity,
+                2,
+            )
+
+            validation_capital = candidate.get(
+                "economic_validation_capital"
+            )
+            validation_net = candidate.get(
+                "economic_validation_net_t2"
+            )
+            if (
+                isinstance(validation_capital, (int, float))
+                and float(validation_capital) > 0
+                and isinstance(validation_net, (int, float))
+            ):
+                economic_scale = min(
+                    1.0,
+                    capped_capital / float(validation_capital),
+                )
+                adjusted_net = float(validation_net) * economic_scale
+                candidate["capacity_adjusted_validation_net_t2"] = round(
+                    adjusted_net,
+                    2,
+                )
+                if adjusted_net < MIN_NET_PROFIT:
+                    capacity_reason = (
+                        f"capacity-capped validation net profit "
+                        f"USD {adjusted_net:.2f} is below economic minimum "
+                        f"USD {MIN_NET_PROFIT:.2f}"
+                    )
+        else:
+            candidate["liquidity_capacity_capped"] = False
     candidate["recommended_capital"] = intelligence.allocation.recommended_capital
     candidate["recommended_risk_dollars"] = intelligence.allocation.risk_dollars
     candidate["projected_net_edge_pct"] = intelligence.projected_net_edge_pct
@@ -66,16 +152,21 @@ def apply_action_gate(
     candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
     candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
     candidate["action_gate_evaluated"] = True
-    candidate["action_gate_allowed"] = intelligence.allowed
+    allowed = intelligence.allowed and capacity_reason is None
+    candidate["action_gate_allowed"] = allowed
 
     reason = (
-        "capital and portfolio guardrails passed"
-        if intelligence.allowed
-        else intelligence.portfolio_risk.reason
-        or intelligence.allocation.reason
+        capacity_reason
+        if capacity_reason is not None
+        else (
+            "capital, liquidity-capacity, and portfolio guardrails passed"
+            if intelligence.allowed
+            else intelligence.portfolio_risk.reason
+            or intelligence.allocation.reason
+        )
     )
     return ActionGateDecision(
-        intelligence.allowed,
+        allowed,
         reason,
         intelligence,
     )
