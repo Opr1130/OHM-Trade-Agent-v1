@@ -95,19 +95,16 @@ class BybitPublicAdapter:
             raise ValueError("Bybit adapter requires 1..5 symbols")
         self._ws = None
         self._pending: deque[RawProviderFrame] = deque()
-        self._trade_trackers: dict[str, NonDecreasingSequenceTracker] = {}
-        self._liq_trackers: dict[str, NoSequenceTracker] = {}
+        self._trade_trackers: dict[str, NonDecreasingSequenceTracker] = {
+            symbol: NonDecreasingSequenceTracker() for symbol in self.symbols
+        }
+        self._liq_trackers: dict[str, NoSequenceTracker] = {
+            symbol: NoSequenceTracker() for symbol in self.symbols
+        }
         self._deduper = _BoundedEventDeduper()
 
     async def connect(self, *, connection_id: str, reconnect_epoch: int) -> None:
         self._pending.clear()
-        self._trade_trackers = {
-            symbol: NonDecreasingSequenceTracker() for symbol in self.symbols
-        }
-        self._liq_trackers = {
-            symbol: NoSequenceTracker() for symbol in self.symbols
-        }
-        self._deduper = _BoundedEventDeduper()
         self._ws = await connect(
             self.url,
             open_timeout=10,
@@ -127,88 +124,94 @@ class BybitPublicAdapter:
             )
         await self._ws.send(orjson.dumps({"op": "subscribe", "args": topics}))
 
+    def _ingest_payload(self, payload: dict) -> bool:
+        """Queue data frames; return True when a heartbeat acknowledgement arrives."""
+        op = str(payload.get("op") or "").lower()
+        if op == "subscribe":
+            return False
+        if op == "pong" or (
+            op == "ping"
+            and str(payload.get("ret_msg") or "").lower() == "pong"
+        ):
+            return True
+
+        topic = str(payload.get("topic") or "")
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return False
+
+        if topic.startswith("publicTrade."):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("s") or "").upper()
+                event_id = str(item.get("i") or "")
+                if symbol not in self.symbols or not event_id:
+                    continue
+                if self._deduper.seen(f"trade:{symbol}:{event_id}"):
+                    continue
+                self._pending.append(
+                    RawProviderFrame(
+                        stream_type=StreamType.AGG_TRADE,
+                        provider_symbol=symbol,
+                        payload=orjson.dumps(
+                            {"topic": topic, "ts": payload.get("ts"), "item": item}
+                        ),
+                    )
+                )
+        elif topic.startswith("allLiquidation."):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("s") or "").upper()
+                if symbol not in self.symbols:
+                    continue
+                event_id = (
+                    f"{item.get('T')}:{symbol}:{item.get('S')}:"
+                    f"{item.get('v')}:{item.get('p')}"
+                )
+                if self._deduper.seen(f"liq:{event_id}"):
+                    continue
+                self._pending.append(
+                    RawProviderFrame(
+                        stream_type=StreamType.LIQUIDATION,
+                        provider_symbol=symbol,
+                        payload=orjson.dumps(
+                            {"topic": topic, "ts": payload.get("ts"), "item": item}
+                        ),
+                    )
+                )
+        return False
+
+    async def _receive_payload(self) -> dict:
+        if self._ws is None:
+            raise ConnectionError("Bybit adapter is not connected")
+        message = await self._ws.recv()
+        raw = message.encode("utf-8") if isinstance(message, str) else message
+        if not isinstance(raw, bytes):
+            raise TypeError("unsupported Bybit websocket frame type")
+        payload = orjson.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("Bybit websocket message must be an object")
+        return payload
+
     async def receive(self) -> RawProviderFrame:
         if self._ws is None:
             raise ConnectionError("Bybit adapter is not connected")
         while True:
             if self._pending:
                 return self._pending.popleft()
-
-            message = await self._ws.recv()
-            raw = message.encode("utf-8") if isinstance(message, str) else message
-            if not isinstance(raw, bytes):
-                raise TypeError("unsupported Bybit websocket frame type")
-            payload = orjson.loads(raw)
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("op") in {"ping", "pong", "subscribe"}:
-                continue
-            if "success" in payload and payload.get("op") == "subscribe":
-                continue
-
-            topic = str(payload.get("topic") or "")
-            data = payload.get("data")
-            if not isinstance(data, list):
-                continue
-
-            if topic.startswith("publicTrade."):
-                stream_type = StreamType.AGG_TRADE
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = str(item.get("s") or "").upper()
-                    event_id = str(item.get("i") or "")
-                    if symbol not in self.symbols or not event_id:
-                        continue
-                    if self._deduper.seen(f"trade:{symbol}:{event_id}"):
-                        continue
-                    self._pending.append(
-                        RawProviderFrame(
-                            stream_type=stream_type,
-                            provider_symbol=symbol,
-                            payload=orjson.dumps(
-                                {
-                                    "topic": topic,
-                                    "ts": payload.get("ts"),
-                                    "item": item,
-                                }
-                            ),
-                        )
-                    )
-            elif topic.startswith("allLiquidation."):
-                stream_type = StreamType.LIQUIDATION
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = str(item.get("s") or "").upper()
-                    if symbol not in self.symbols:
-                        continue
-                    event_id = (
-                        f"{item.get('T')}:{symbol}:{item.get('S')}:"
-                        f"{item.get('v')}:{item.get('p')}"
-                    )
-                    if self._deduper.seen(f"liq:{event_id}"):
-                        continue
-                    self._pending.append(
-                        RawProviderFrame(
-                            stream_type=stream_type,
-                            provider_symbol=symbol,
-                            payload=orjson.dumps(
-                                {
-                                    "topic": topic,
-                                    "ts": payload.get("ts"),
-                                    "item": item,
-                                }
-                            ),
-                        )
-                    )
-            if self._pending:
-                return self._pending.popleft()
+            payload = await self._receive_payload()
+            self._ingest_payload(payload)
 
     async def heartbeat(self) -> None:
         if self._ws is None:
             raise ConnectionError("Bybit adapter is not connected")
         await self._ws.send(orjson.dumps({"op": "ping"}))
+        while True:
+            payload = await self._receive_payload()
+            if self._ingest_payload(payload):
+                return
 
     async def close(self) -> None:
         ws, self._ws = self._ws, None
