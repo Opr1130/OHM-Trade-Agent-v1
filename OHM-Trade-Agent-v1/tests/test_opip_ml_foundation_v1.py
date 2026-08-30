@@ -104,6 +104,33 @@ def test_snapshot_hash_is_reproducible():
     assert _snapshot().snapshot_id == _snapshot().snapshot_id
 
 
+def test_snapshot_nested_evidence_is_immutable_after_hashing():
+    source_versions = {"kraken": "test-v1"}
+    snapshot = seal_feature_snapshot(
+        episode_id="EP:immutable",
+        candidate_id=None,
+        decision_at_utc=NOW,
+        canonical_asset_id="bitcoin",
+        venue="KRAKEN",
+        pair="BTCUSD",
+        direction="LONG",
+        lane="PAPER",
+        regime=None,
+        feature_values={"nested": {"a": [1, 2]}},
+        availability={"nested": _stamp()},
+        feature_schema_version="v1",
+        feature_calc_version="calc",
+        feature_dag_hash="dag",
+        source_versions=source_versions,
+    )
+    source_versions["kraken"] = "mutated"
+    assert snapshot.source_versions["kraken"] == "test-v1"
+    with pytest.raises(TypeError):
+        snapshot.source_versions["kraken"] = "mutated"
+    with pytest.raises(TypeError):
+        snapshot.features[0].value["a"] = (3,)
+
+
 def test_same_candle_tp_sl_collision_is_ambiguous_not_forced_sl():
     snapshot = _snapshot()
     bar = PriceBar(
@@ -289,6 +316,11 @@ def _registry_record(lifecycle=ModelLifecycle.REGISTERED):
         lifecycle=lifecycle,
         health=ModelHealth.HEALTHY,
     )
+
+
+def test_challenger_cannot_be_constructed_without_approval_metadata():
+    with pytest.raises(ValueError, match="CHALLENGER"):
+        _registry_record(ModelLifecycle.CHALLENGER)
 
 
 def test_model_promotion_is_manual_and_sequential():
