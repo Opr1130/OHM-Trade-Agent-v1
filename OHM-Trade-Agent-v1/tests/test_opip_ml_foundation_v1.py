@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import ast
 from pathlib import Path
@@ -190,6 +191,148 @@ def test_direction_aware_short_return_is_positive_when_price_falls():
     )
     assert label.tp1_before_sl is True
     assert label.net_returns_bps["1h"] == pytest.approx(490.0)
+
+
+@pytest.mark.parametrize(
+    ("direction", "bar", "tp1_price", "tp2_price", "sl_price"),
+    [
+        (
+            "LONG",
+            PriceBar(
+                observed_at_utc=NOW + timedelta(minutes=1),
+                high=107.0,
+                low=106.0,
+                close=106.5,
+            ),
+            105.0,
+            110.0,
+            95.0,
+        ),
+        (
+            "SHORT",
+            PriceBar(
+                observed_at_utc=NOW + timedelta(minutes=1),
+                high=94.0,
+                low=93.0,
+                close=93.5,
+            ),
+            95.0,
+            90.0,
+            105.0,
+        ),
+    ],
+)
+def test_price_gaps_beyond_target_count_as_barrier_crossings(
+    direction, bar, tp1_price, tp2_price, sl_price
+):
+    snapshot = _snapshot()
+    label = resolve_barrier_labels(
+        snapshot_id=snapshot.snapshot_id,
+        candidate_id=snapshot.candidate_id,
+        decision_at_utc=NOW,
+        direction=direction,
+        entry_price=100.0,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+        sl_price=sl_price,
+        bars=[bar],
+        horizon_end_utc=NOW + timedelta(hours=1),
+        fixed_horizon_closes={"1h": bar.close},
+        label_calc_version="labels-v1",
+        fee_model_version="fees-v1",
+        slippage_model_version="slip-v1",
+    )
+    assert label.tp1_before_sl is True
+    assert label.sl_before_tp1 is False
+
+
+def _clean_label(
+    snapshot,
+    *,
+    label_calc_version="labels-v1",
+    fee_model_version="fees-v1",
+    slippage_model_version="slip-v1",
+):
+    return resolve_barrier_labels(
+        snapshot_id=snapshot.snapshot_id,
+        candidate_id=snapshot.candidate_id,
+        decision_at_utc=NOW,
+        direction="LONG",
+        entry_price=100.0,
+        tp1_price=105.0,
+        tp2_price=110.0,
+        sl_price=95.0,
+        bars=[
+            PriceBar(
+                observed_at_utc=NOW + timedelta(minutes=1),
+                high=106.0,
+                low=99.0,
+                close=105.0,
+            )
+        ],
+        horizon_end_utc=NOW + timedelta(hours=1),
+        fixed_horizon_closes={"1h": 105.0},
+        label_calc_version=label_calc_version,
+        fee_model_version=fee_model_version,
+        slippage_model_version=slippage_model_version,
+    )
+
+
+def _manifest(snapshot, labels, **overrides):
+    args = {
+        "snapshots": [snapshot],
+        "labels": labels,
+        "created_at_utc": NOW + timedelta(hours=2),
+        "cutoff_at_utc": NOW + timedelta(hours=2),
+        "feature_schema_version": "ml-features-v1",
+        "feature_calc_version": "test-sha",
+        "label_calc_version": "labels-v1",
+        "cohort_filter": {"lane": "PAPER"},
+        "embargo_seconds": 3600,
+        "fee_model_version": "fees-v1",
+        "slippage_model_version": "slip-v1",
+        "training_code_hash": "code",
+        "environment_hash": "env",
+        "random_seed": 7,
+    }
+    args.update(overrides)
+    return build_dataset_manifest(**args)
+
+
+def test_dataset_requires_exact_fee_and_slippage_versions():
+    snapshot = _snapshot()
+    wrong_fee = _clean_label(snapshot, fee_model_version="fees-v2")
+    manifest = _manifest(snapshot, [wrong_fee])
+    assert (
+        manifest.excluded_snapshot_ids[snapshot.snapshot_id]
+        == "FEE_MODEL_VERSION_MISMATCH"
+    )
+
+    wrong_slippage = _clean_label(snapshot, slippage_model_version="slip-v2")
+    manifest = _manifest(snapshot, [wrong_slippage])
+    assert (
+        manifest.excluded_snapshot_ids[snapshot.snapshot_id]
+        == "SLIPPAGE_MODEL_VERSION_MISMATCH"
+    )
+
+
+def test_dataset_label_version_selection_is_input_order_independent():
+    snapshot = _snapshot()
+    requested = _clean_label(snapshot, label_calc_version="labels-v1")
+    historical = _clean_label(snapshot, label_calc_version="labels-v2")
+    forward = _manifest(snapshot, [requested, historical])
+    reverse = _manifest(snapshot, [historical, requested])
+    assert forward.dataset_id == reverse.dataset_id
+    assert forward.included_snapshot_ids == (snapshot.snapshot_id,)
+    assert forward.included_label_ids == (requested.label_id,)
+
+
+def test_conflicting_duplicate_label_version_fails_closed():
+    snapshot = _snapshot()
+    label = _clean_label(snapshot)
+    conflicting = replace(label, label_id="MLLBL:conflicting")
+    with pytest.raises(ValueError, match="conflicting duplicate"):
+        _manifest(snapshot, [label, conflicting])
 
 
 def test_dataset_manifest_excludes_ambiguous_labels_with_specific_reason():
