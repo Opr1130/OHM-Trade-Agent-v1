@@ -234,6 +234,52 @@ def test_router_fails_closed_when_no_provider_is_configured(monkeypatch):
         )
 
 
+def test_failover_cache_key_uses_actual_provider_not_planned_primary(
+    monkeypatch,
+):
+    _clear_router_env(monkeypatch)
+    monkeypatch.setenv("DIGITALOCEAN_INFERENCE_KEY", "do-test-key")
+    monkeypatch.setenv("OPIP_AI_DIGITALOCEAN_MODEL", "kimi-test-model")
+
+    payload = _payload(count=2, score=90)
+    plan = router.plan_chief_route(
+        payload,
+        default_model="gpt-5.6",
+        openai_api_key="openai-test-key",
+    )
+    planned_key = chief_analyst._planned_route_cache_key(plan)
+    routed = router.RouterResponse(
+        output_text="{}",
+        usage=None,
+        provider="digitalocean",
+        model="kimi-test-model",
+        route_tier="premium",
+        route_reason="finalist_count<=3",
+        reasoning_effort=None,
+        latency_ms=10,
+        attempts=(),
+    )
+    actual_key = chief_analyst._actual_route_cache_key(routed)
+
+    assert planned_key == "openai:gpt-5.6:high"
+    assert actual_key == "digitalocean:kimi-test-model:none"
+    assert build_chief_fingerprint(payload, route_key=planned_key) != (
+        build_chief_fingerprint(payload, route_key=actual_key)
+    )
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "services"
+        / "chief_analyst.py"
+    ).read_text(encoding="utf-8")
+    actual_assignment = source.index(
+        "route_key=_actual_route_cache_key(routed)"
+    )
+    cache_store = source.index("store_cached_review(fingerprint, review)")
+    assert actual_assignment < cache_store
+
+
 def test_chief_cache_fingerprint_is_partitioned_by_ai_route():
     payload = _payload(count=2, score=90)
     openai = build_chief_fingerprint(
