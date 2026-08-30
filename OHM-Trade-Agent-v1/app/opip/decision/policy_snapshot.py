@@ -12,19 +12,42 @@ from app.opip.decision.versioning import GATE_POLICY_VERSION, gate_policy_finger
 
 
 POLICY_SNAPSHOT_SCHEMA_VERSION = 1
+_DICT_TAG = "__OPIP_FROZEN_DICT__"
+_LIST_TAG = "__OPIP_FROZEN_LIST__"
 
 
 def _freeze(value: Any) -> Any:
+    """Freeze JSON-shaped policy values without losing container type."""
     value = canonical_data(value)
     if isinstance(value, dict):
-        return tuple((key, _freeze(item)) for key, item in sorted(value.items()))
+        return (
+            _DICT_TAG,
+            tuple((key, _freeze(item)) for key, item in sorted(value.items())),
+        )
     if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
+        return (_LIST_TAG, tuple(_freeze(item) for item in value))
     return value
 
 
 def _thaw(value: Any) -> Any:
+    """Restore tagged values; retain compatibility with BUILD 5.1 tuples."""
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and value[0] == _DICT_TAG
+        and isinstance(value[1], tuple)
+    ):
+        return {key: _thaw(item) for key, item in value[1]}
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and value[0] == _LIST_TAG
+        and isinstance(value[1], tuple)
+    ):
+        return [_thaw(item) for item in value[1]]
     if isinstance(value, tuple):
+        # Legacy BUILD 5.1 representation. Ambiguous list shapes were never
+        # validly persisted because integrity validation failed closed.
         if all(
             isinstance(item, tuple)
             and len(item) == 2

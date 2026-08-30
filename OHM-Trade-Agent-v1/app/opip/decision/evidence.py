@@ -22,6 +22,9 @@ class EvidenceCompleteness(str, Enum):
     COMPLETE = "COMPLETE"
     DEGRADED = "DEGRADED"
     INCOMPLETE = "INCOMPLETE"
+    # Reserved compatibility value for pre-construction capture failures.
+    # A successfully constructed OPipDecisionEvidence is syntactically usable
+    # by definition and therefore never emits this state.
     UNUSABLE = "UNUSABLE"
 
 
@@ -240,8 +243,6 @@ class OPipDecisionEvidence:
 
     @property
     def evidence_completeness(self) -> EvidenceCompleteness:
-        if not self.canonical_asset_id or not self.candidate_snapshot_json:
-            return EvidenceCompleteness.UNUSABLE
         if self.computed_missing_evidence:
             return EvidenceCompleteness.INCOMPLETE
         if self.degraded_evidence:
