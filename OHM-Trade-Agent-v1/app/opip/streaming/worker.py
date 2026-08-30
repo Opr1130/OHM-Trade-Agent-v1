@@ -166,6 +166,7 @@ async def run_worker() -> int:
     store_errors = 0
     consecutive_store_errors = 0
     last_feature_snapshot_utc: str | None = None
+    pending_feature_rows = ()
     last_prune = time.monotonic()
 
     await runtime.start()
@@ -197,13 +198,16 @@ async def run_worker() -> int:
                 return 1
 
             snapshot = runtime.snapshot()
-            rows = accumulator.drain_ready()
+            if not pending_feature_rows:
+                pending_feature_rows = accumulator.drain_ready()
             try:
-                if rows:
-                    features_persisted += store.append_features(rows)
+                if pending_feature_rows:
+                    persisted = store.append_features(pending_feature_rows)
+                    features_persisted += persisted
                     last_feature_snapshot_utc = max(
-                        row.window_end_utc for row in rows
+                        row.window_end_utc for row in pending_feature_rows
                     ).isoformat()
+                    pending_feature_rows = ()
                 store.write_telemetry(snapshot)
                 now_monotonic = time.monotonic()
                 if now_monotonic - last_prune >= _PRUNE_INTERVAL_SECONDS:
@@ -232,7 +236,7 @@ async def run_worker() -> int:
 
     final_snapshot = runtime.snapshot()
     try:
-        remaining = accumulator.drain_ready()
+        remaining = pending_feature_rows + accumulator.drain_ready()
         if remaining:
             features_persisted += store.append_features(remaining)
         store.write_telemetry(final_snapshot)
