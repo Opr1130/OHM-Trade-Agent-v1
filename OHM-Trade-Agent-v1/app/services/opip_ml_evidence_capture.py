@@ -8,7 +8,7 @@ protection. Every failure is evidence-only and fail-open to production.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 import gzip
 import hashlib
 import json
@@ -43,7 +43,7 @@ class MLCaptureSummary:
     legacy_without_seed: int = 0
     malformed: int = 0
     temporal_violations: int = 0
-    duplicates_possible: int = 0
+    duplicate_snapshots_skipped: int = 0
     missing_feature_values: int = 0
     feature_values: int = 0
     next_line: int = 0
@@ -214,6 +214,27 @@ def _append_gzip_snapshot(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(json.dumps(dict(payload), sort_keys=True, allow_nan=False) + "\n")
 
 
+def _existing_ml_snapshot_ids(path: Path) -> set[str]:
+    """Read deterministic snapshot identities for crash-safe retry deduplication."""
+    if not path.exists():
+        return set()
+    lock = path.parent / f".{path.name}.lock"
+    ids: set[str] = set()
+    with registry_lock(lock):
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            for raw in handle:
+                if not raw.strip():
+                    continue
+                row = json.loads(raw)
+                if not isinstance(row, dict):
+                    raise ValueError("ML snapshot store contains a non-object row")
+                snapshot_id = str(row.get("ml_snapshot_id") or "")
+                if not snapshot_id:
+                    raise ValueError("ML snapshot store row has no ml_snapshot_id")
+                ids.add(snapshot_id)
+    return ids
+
+
 def capture_ml_production_evidence(
     *,
     evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
@@ -222,7 +243,6 @@ def capture_ml_production_evidence(
     dead_letter_path: Path = DEFAULT_ML_DEAD_LETTER_FILE,
     health_path: Path = DEFAULT_ML_HEALTH_FILE,
     batch_limit: int = 250,
-    now: datetime | None = None,
     enabled: bool | None = None,
 ) -> MLCaptureSummary:
     """Drain canonical evidence into compressed FeatureSnapshots, fail-open.
@@ -259,6 +279,22 @@ def capture_ml_production_evidence(
         return summary
 
     processed = legacy = malformed = temporal = missing = feature_count = 0
+    duplicate_snapshots = 0
+    try:
+        known_ml_snapshot_ids = _existing_ml_snapshot_ids(snapshot_path)
+    except Exception as exc:
+        summary = MLCaptureSummary(
+            enabled=True,
+            ledger_rows_seen=len(lines),
+            next_line=start,
+            p1_drained=p1.processed,
+            p1_duplicates=p1.duplicates,
+            p1_malformed=p1.malformed,
+            p1_stopped_on_error=p1.stopped_on_error,
+            error_type=f"ML_SNAPSHOT_STORE_UNREADABLE:{type(exc).__name__}",
+        )
+        save_json_atomic(health_path, summary.as_dict())
+        return summary
     next_line = start
     upper = min(len(lines), start + batch_limit)
     for index in range(start, upper):
@@ -317,8 +353,12 @@ def capture_ml_production_evidence(
                 "affects_live_decisions": False,
                 "trade_authority_changed": False,
             }
-            _append_gzip_snapshot(snapshot_path, wrapper)
-            processed += 1
+            if snapshot.snapshot_id in known_ml_snapshot_ids:
+                duplicate_snapshots += 1
+            else:
+                _append_gzip_snapshot(snapshot_path, wrapper)
+                known_ml_snapshot_ids.add(snapshot.snapshot_id)
+                processed += 1
         except TemporalIntegrityError as exc:
             temporal += 1
             _append_dead_letter(
@@ -347,8 +387,6 @@ def capture_ml_production_evidence(
         next_line = index + 1
         save_json_atomic(checkpoint_path, {"next_line": next_line})
 
-    require_utc(now or datetime.now(timezone.utc), field_name="now")
-
     summary = MLCaptureSummary(
         enabled=True,
         ledger_rows_seen=len(lines),
@@ -356,6 +394,7 @@ def capture_ml_production_evidence(
         legacy_without_seed=legacy,
         malformed=malformed,
         temporal_violations=temporal,
+        duplicate_snapshots_skipped=duplicate_snapshots,
         missing_feature_values=missing,
         feature_values=feature_count,
         next_line=next_line,
