@@ -40,9 +40,23 @@ class BackoffPolicy:
             raise ValueError("attempt cannot be negative")
         if not math.isfinite(float(jitter_unit)) or not -1 <= jitter_unit <= 1:
             raise ValueError("jitter_unit must be finite in [-1, 1]")
+        retry_attempt = int(attempt)
+        if self.multiplier == 1 or self.maximum_seconds == self.minimum_seconds:
+            effective_attempt = 0
+        else:
+            saturation_attempt = max(
+                0,
+                math.ceil(
+                    math.log(
+                        self.maximum_seconds / self.minimum_seconds,
+                        self.multiplier,
+                    )
+                ),
+            )
+            effective_attempt = min(retry_attempt, saturation_attempt)
         base = min(
             self.maximum_seconds,
-            self.minimum_seconds * (self.multiplier ** int(attempt)),
+            self.minimum_seconds * (self.multiplier ** effective_attempt),
         )
         jitter = base * self.jitter_ratio * float(jitter_unit)
         return max(0.0, min(self.maximum_seconds, base + jitter))
