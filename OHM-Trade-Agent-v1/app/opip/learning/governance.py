@@ -32,12 +32,14 @@ _ALLOWED_TRANSITIONS = {
 
 
 def _utc(value: datetime, *, field_name: str) -> datetime:
+    """Return utc."""
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(timezone.utc)
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
+    """Return canonical json."""
     return json.dumps(
         dict(value),
         sort_keys=True,
@@ -65,6 +67,7 @@ class LearningLifecycleRecord:
     trade_authority_changed: bool = False
 
     def __post_init__(self) -> None:
+        """Return  post init  ."""
         object.__setattr__(
             self, "created_at_utc", _utc(self.created_at_utc, field_name="created_at_utc")
         )
@@ -106,12 +109,14 @@ class LearningLifecycleRecord:
 
     @property
     def metrics(self) -> dict[str, Any]:
+        """Return metrics."""
         value = json.loads(self.metrics_json)
         if not isinstance(value, dict):
             raise ValueError("metrics_json must encode an object")
         return value
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         return {
             "learning_id": self.learning_id,
             "stage": self.stage.value,
@@ -143,6 +148,7 @@ def create_learning_observation(
     metrics: Mapping[str, Any] | None = None,
     known_regressions: tuple[str, ...] = (),
 ) -> LearningLifecycleRecord:
+    """Return create learning observation."""
     created = _utc(created_at_utc, field_name="created_at_utc")
     evidence = tuple(sorted({str(item) for item in evidence_ids if str(item)}))
     if not str(hypothesis_key or "").strip():
@@ -181,6 +187,7 @@ def transition_learning(
     effective_ref: str | None = None,
     rollback_ref: str | None = None,
 ) -> LearningLifecycleRecord:
+    """Return transition learning."""
     target = LearningStage(target)
     if target not in _ALLOWED_TRANSITIONS[record.stage]:
         raise ValueError(f"invalid learning transition {record.stage.value} -> {target.value}")
