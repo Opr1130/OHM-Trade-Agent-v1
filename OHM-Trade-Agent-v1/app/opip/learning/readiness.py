@@ -234,6 +234,7 @@ def _feature_snapshot_metrics(
             safe.append(wrapper)
             continue
 
+        feature_temporal_violation = False
         for feature in features:
             if not isinstance(feature, Mapping):
                 malformed += 1
@@ -242,9 +243,22 @@ def _feature_snapshot_metrics(
             if not name:
                 malformed += 1
                 continue
+            visible = _parse_utc(feature.get("visible_at_utc"))
+            if visible is None or visible > decision:
+                feature_temporal_violation = True
             observed_by_name[name] += 1
-            if bool(feature.get("missing", False)) or feature.get("value") is None:
+            missing_flag = feature.get("missing")
+            if (
+                missing_flag is True
+                or feature.get("value") is None
+            ):
                 missing_by_name[name] += 1
+            elif missing_flag not in {False, None}:
+                malformed += 1
+
+        if feature_temporal_violation:
+            pit_violations += 1
+            continue
 
         direction[str(feature_snapshot.get("direction") or "UNKNOWN").upper()] += 1
         lanes[str(feature_snapshot.get("lane") or "UNKNOWN")] += 1
@@ -321,9 +335,23 @@ def build_ml_data_readiness_report(
     )
     health = capture_health or {}
     pit_violations = derived_pit + int(health.get("temporal_violations", 0) or 0)
+    phase_malformed = sum(
+        1
+        for row in phase_all
+        if not str(row.get("snapshot_id") or "").strip()
+        or not str(row.get("outcome_record_id") or "").strip()
+    )
+    paper_malformed = sum(
+        1
+        for row in paper_all
+        if not str(row.get("paper_trade_id") or "").strip()
+        or not str(row.get("episode_id") or "").strip()
+    )
     malformed_records = (
         canonical_malformed
         + feature_malformed
+        + phase_malformed
+        + paper_malformed
         + int(health.get("malformed", 0) or 0)
     )
 
