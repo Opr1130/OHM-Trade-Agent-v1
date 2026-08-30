@@ -23,23 +23,26 @@ def _trade() -> ActiveTrade:
     )
 
 
-def _result(action: str = "HOLD") -> TradeMonitorResult:
+def _result(action: str = "HOLD", *, price: float = 103.0, pnl: float = 3.0, reasons=None) -> TradeMonitorResult:
     return TradeMonitorResult(
         symbol="BTCUSD",
         action=action,
-        current_price=103.0,
-        unrealized_pct=3.0,
-        reasons=["Trade structure remains healthy"],
+        current_price=price,
+        unrealized_pct=pnl,
+        reasons=reasons or ["Trade structure remains healthy"],
     )
 
 
-def test_active_trade_same_action_is_suppressed_only_until_heartbeat(monkeypatch):
+def test_same_warning_without_material_change_does_not_repeat(monkeypatch):
     now = datetime.now(timezone.utc)
     state = {
         "BTCUSD": {
-            "action": "HOLD",
-            "updated_at": now.isoformat(),
+            "action": "WARNING",
+            "updated_at": (now - timedelta(hours=2)).isoformat(),
             "message_id": 1,
+            "price": 103.0,
+            "pnl_pct": 3.0,
+            "reason_signature": "MACD turned bearish|Price lost EMA20",
         }
     }
     monkeypatch.setattr(notifier, "_load_state", lambda: state)
@@ -53,21 +56,30 @@ def test_active_trade_same_action_is_suppressed_only_until_heartbeat(monkeypatch
         notifier,
         "send_tracked_telegram",
         lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("same-action heartbeat must not send before due")
+            AssertionError("routine WARNING must not repeat on time alone")
         ),
     )
 
-    assert notifier.send_monitor_update(_trade(), _result(), "token", "chat") is False
-    assert suppressions[-1]["reason"] == "SAME_ACTION_HEARTBEAT_NOT_DUE"
+    result = _result(
+        "WARNING",
+        price=102.5,
+        pnl=2.5,
+        reasons=["MACD turned bearish", "Price lost EMA20"],
+    )
+    assert notifier.send_monitor_update(_trade(), result, "token", "chat") is False
+    assert suppressions[-1]["reason"] == "NO_MATERIAL_CHANGE"
 
 
-def test_active_trade_same_action_reemits_after_heartbeat(monkeypatch):
+def test_warning_realerts_on_material_price_change(monkeypatch):
     now = datetime.now(timezone.utc)
     state = {
         "BTCUSD": {
-            "action": "HOLD",
-            "updated_at": (now - timedelta(minutes=31)).isoformat(),
+            "action": "WARNING",
+            "updated_at": now.isoformat(),
             "message_id": 1,
+            "price": 103.0,
+            "pnl_pct": 3.0,
+            "reason_signature": "MACD turned bearish|Price lost EMA20",
         }
     }
     monkeypatch.setattr(notifier, "_load_state", lambda: state)
@@ -79,25 +91,81 @@ def test_active_trade_same_action_reemits_after_heartbeat(monkeypatch):
         lambda **kwargs: sent.append(kwargs)
         or SimpleNamespace(delivered=True, message_id=2),
     )
-    saved = []
-    monkeypatch.setattr(notifier, "_save_state", lambda value: saved.append(dict(value)))
+    monkeypatch.setattr(notifier, "_save_state", lambda value: None)
     monkeypatch.setattr(notifier, "record_emitted", lambda **kwargs: None)
 
-    assert notifier.send_monitor_update(_trade(), _result(), "token", "chat") is True
+    result = _result(
+        "WARNING",
+        price=100.8,
+        pnl=0.8,
+        reasons=["MACD turned bearish", "Price lost EMA20"],
+    )
+    assert notifier.send_monitor_update(_trade(), result, "token", "chat") is True
+    assert sent[0]["event_type"] == "WARNING"
+
+
+def test_warning_realerts_when_reason_changes(monkeypatch):
+    state = {
+        "BTCUSD": {
+            "action": "WARNING",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "message_id": 1,
+            "price": 103.0,
+            "pnl_pct": 3.0,
+            "reason_signature": "MACD turned bearish|Price lost EMA20",
+        }
+    }
+    monkeypatch.setattr(notifier, "_load_state", lambda: state)
+    monkeypatch.setattr(notifier, "should_emit", lambda **kwargs: True)
+    sent = []
+    monkeypatch.setattr(
+        notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs)
+        or SimpleNamespace(delivered=True, message_id=3),
+    )
+    monkeypatch.setattr(notifier, "_save_state", lambda value: None)
+    monkeypatch.setattr(notifier, "record_emitted", lambda **kwargs: None)
+
+    result = _result(
+        "WARNING",
+        price=102.8,
+        pnl=2.8,
+        reasons=["Heavy selling pressure increasing", "Price lost EMA20"],
+    )
+    assert notifier.send_monitor_update(_trade(), result, "token", "chat") is True
     assert sent
-    assert sent[0]["alert_family"] == "ACTIVE_TRADE"
-    assert sent[0]["event_type"] == "HOLD"
-    assert sent[0]["fingerprint"].startswith("LONG:HOLD:")
-    assert saved[-1]["BTCUSD"]["action"] == "HOLD"
-    assert saved[-1]["BTCUSD"]["price"] == 103.0
+
+
+def test_actionable_states_repeat_until_resolved(monkeypatch):
+    now = datetime.now(timezone.utc)
+    state = {
+        "BTCUSD": {
+            "action": "EXIT_NOW",
+            "updated_at": (now - timedelta(minutes=6)).isoformat(),
+            "message_id": 1,
+            "price": 94.0,
+            "pnl_pct": -6.0,
+            "reason_signature": "Stop price breached",
+        }
+    }
+    monkeypatch.setattr(notifier, "_load_state", lambda: state)
+    monkeypatch.setattr(notifier, "should_emit", lambda **kwargs: True)
+    sent = []
+    monkeypatch.setattr(
+        notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs)
+        or SimpleNamespace(delivered=True, message_id=4),
+    )
+    monkeypatch.setattr(notifier, "_save_state", lambda value: None)
+    monkeypatch.setattr(notifier, "record_emitted", lambda **kwargs: None)
+
+    result = _result("EXIT_NOW", price=94.0, pnl=-6.0, reasons=["Stop price breached"])
+    assert notifier.send_monitor_update(_trade(), result, "token", "chat") is True
+    assert ":REPEAT:" in sent[0]["fingerprint"]
 
 
 def test_active_position_states_bypass_noncritical_attention_budget():
     assert "HOLD" in notification_policy.CRITICAL_EVENTS
     assert "WARNING" in notification_policy.CRITICAL_EVENTS
-
-
-def test_active_trade_heartbeat_cadence_prioritizes_risk():
-    assert notifier.HEARTBEAT_SECONDS["EXIT_NOW"] < notifier.HEARTBEAT_SECONDS["TAKE_PROFIT"]
-    assert notifier.HEARTBEAT_SECONDS["TAKE_PROFIT"] < notifier.HEARTBEAT_SECONDS["WARNING"]
-    assert notifier.HEARTBEAT_SECONDS["WARNING"] < notifier.HEARTBEAT_SECONDS["HOLD"]
