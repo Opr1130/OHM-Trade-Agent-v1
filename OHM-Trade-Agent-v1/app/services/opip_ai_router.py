@@ -208,7 +208,7 @@ def _openai_target(
         ).strip()
         effort = _normalized_reasoning(
             os.getenv("OPIP_AI_OPENAI_PREMIUM_REASONING_EFFORT"),
-            "high",
+            os.getenv("OPENAI_REASONING_EFFORT") or "high",
         )
     else:
         model = (os.getenv("OPIP_AI_OPENAI_MODEL") or default_model).strip()
