@@ -174,6 +174,52 @@ def test_openai_failure_falls_back_to_digitalocean(monkeypatch, tmp_path):
     assert evidence["funded_trade_authority_changed"] is False
 
 
+def test_malformed_primary_json_falls_back_to_digitalocean(
+    monkeypatch, tmp_path
+):
+    _clear_router_env(monkeypatch)
+    monkeypatch.setenv("DIGITALOCEAN_INFERENCE_KEY", "do-test-key")
+    monkeypatch.setenv("OPIP_AI_DIGITALOCEAN_MODEL", "kimi-test-model")
+    monkeypatch.setattr(router, "ROUTER_USAGE_FILE", tmp_path / "usage.jsonl")
+    monkeypatch.setattr(router, "ROUTER_USAGE_LOCK", tmp_path / ".usage.lock")
+
+    plan = router.plan_chief_route(
+        _payload(count=5, score=70),
+        default_model="gpt-5.6",
+        openai_api_key="openai-test-key",
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.provider = "digitalocean" if kwargs.get("base_url") else "openai"
+            self.responses = self
+
+        def create(self, **_kwargs):
+            if self.provider == "openai":
+                return SimpleNamespace(output_text="{truncated", usage=None)
+            return SimpleNamespace(
+                output_text=(
+                    '{"market_view":"","recommended_action":"no_trade",'
+                    '"top_candidates":[],"summary":"ok"}'
+                ),
+                usage=None,
+            )
+
+    result = router.invoke_chief_review(
+        plan,
+        system_prompt="system",
+        request_payload=_payload(count=5, score=70),
+        max_output_tokens=800,
+        client_factory=FakeClient,
+    )
+
+    assert result.provider == "digitalocean"
+    assert result.attempts[0]["provider"] == "openai"
+    assert result.attempts[0]["status"] == "failed"
+    assert result.attempts[0]["error_type"] == "ValueError"
+    assert result.attempts[1]["status"] == "succeeded"
+
+
 def test_openai_budget_can_remove_only_openai_from_route(monkeypatch):
     _clear_router_env(monkeypatch)
     monkeypatch.setenv("DIGITALOCEAN_INFERENCE_KEY", "do-test-key")
