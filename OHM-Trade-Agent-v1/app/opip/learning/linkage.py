@@ -414,6 +414,16 @@ def _paper_by_episode(
     return by_episode
 
 
+def _ml_direction(row: Mapping[str, Any] | None) -> str | None:
+    """Return an explicit LONG/SHORT direction from one ML wrapper."""
+    if row is None:
+        return None
+    snapshot = row.get("feature_snapshot")
+    if not isinstance(snapshot, Mapping):
+        return None
+    return _direction(snapshot.get("direction"))
+
+
 def build_learning_linkage_records(
     *,
     canonical_rows: Iterable[Mapping[str, Any]],
@@ -548,9 +558,16 @@ def build_learning_linkage_records(
                 else:
                     status = LinkageStatus.FEATURE_LINKED_NO_OUTCOME
                     reasons.append("PAPER_OUTCOME_NOT_FINAL_OR_UNUSABLE")
+                ml_direction = _ml_direction(ml_row)
+                if ml_direction is None:
+                    reasons.append("ML_DIRECTION_NOT_TRAINABLE")
+                elif outcome.direction != ml_direction:
+                    reasons.append("DIRECTION_LINK_MISMATCH")
                 primary = (
                     cohort is LearningCohort.QUALIFIED_PAPER
                     and outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
+                    and ml_direction in {"LONG", "SHORT"}
+                    and outcome.direction == ml_direction
                     and not outcome.censored
                     and not outcome.data_gap
                     and not outcome.execution_path_ambiguous
