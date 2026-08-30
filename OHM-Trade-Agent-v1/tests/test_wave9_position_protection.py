@@ -7,7 +7,7 @@ from app.services.kraken_exposure_resolver import (
     KrakenExposureResolver,
     ResolvedExposure,
 )
-from app.opip.protection.position_materiality import refine_protection_action
+from app.services.position_materiality import refine_protection_action
 from app.services import active_trade_monitor_runner, trade_monitor, trade_monitor_notifier
 from app.services.active_trade_registry import ActiveTrade
 from app.services.trade_monitor import TradeMonitorResult
