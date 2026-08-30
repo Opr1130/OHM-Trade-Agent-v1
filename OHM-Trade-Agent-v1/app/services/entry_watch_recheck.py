@@ -32,7 +32,7 @@ def recheck_due_entry_watch(
 ) -> EntryWatchRecheckSummary:
     """Cheap fast recheck that can only request a fresh full qualification scan.
 
-    It never sends Telegram and never authorizes a trade. A candidate that
+    It emits no external message and grants no trade authority. A candidate that
     becomes entry-valid is removed from the fast queue and causes the unified
     cycle to rerun the complete opportunity pipeline, including intelligence,
     target/economic gates, global ranking and capital allocation.
