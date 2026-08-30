@@ -14,7 +14,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep mktemp cp rm; do
+for cmd in install crontab grep awk mktemp cp rm; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
@@ -100,9 +100,9 @@ grep -q 'app.jobs.run_opip_ml_capture' "$ML_EVIDENCE_DST"
 grep -q 'app.jobs.build_phase3c_forward_outcomes' "$ML_EVIDENCE_DST"
 grep -q '/var/run/opip-ml-capture.lock' "$ML_EVIDENCE_DST"
 grep -q '/var/run/opip-ml-outcomes.lock' "$ML_EVIDENCE_DST"
-# Only executable cron content is authoritative. Comments may document the
-# forbidden legacy lock without constituting scheduler usage.
-if grep -v -E '^[[:space:]]*#' "$ML_EVIDENCE_DST" | grep -q '/var/run/ohm-unified-cycle.lock'; then
+# Only executable cron content is authoritative. Scan the complete file in one
+# pass so pipefail/SIGPIPE cannot turn a real forbidden-lock match into success.
+if awk '!/^[[:space:]]*#/ && /\/var\/run\/ohm-unified-cycle\.lock/ { found=1 } END { exit !found }' "$ML_EVIDENCE_DST"; then
   echo "O'Pip ML scheduler must not use the unified-cycle lock" >&2
   false
 fi
