@@ -1,11 +1,10 @@
 """Independent read-only O'Pip ML data-readiness report job."""
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
-
-from app.opip.learning.linkage import read_jsonl, read_ml_snapshot_chunks
 from app.opip.learning.paper_readiness import assess_paper_learning_readiness
 from app.opip.learning.readiness import build_ml_data_readiness_report
 from app.services.registry_io import load_json, save_json_atomic
@@ -19,15 +18,70 @@ CAPTURE_HEALTH = Path("/app/data/opip_ml_capture_health.json")
 READINESS_REPORT = Path("/app/data/opip_ml_data_readiness_v1.json")
 
 
-def _paper_rows(path: Path) -> list[dict[str, Any]]:
-    """Load current paper lifecycle state without mutating paper control."""
+def _jsonl_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Read JSONL evidence and count malformed records instead of crashing."""
     if not path.exists():
-        return []
-    payload = load_json(path)
+        return [], 0
+    rows: list[dict[str, Any]] = []
+    malformed = 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                if not raw.strip():
+                    continue
+                try:
+                    value = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    malformed += 1
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+                else:
+                    malformed += 1
+    except OSError:
+        return [], 1
+    return rows, malformed
+
+
+def _ml_rows(snapshot_dir: Path) -> tuple[list[dict[str, Any]], int]:
+    """Read immutable gzip chunks and count corrupt rows/chunks fail-closed."""
+    if not snapshot_dir.exists():
+        return [], 0
+    rows: list[dict[str, Any]] = []
+    malformed = 0
+    for path in sorted(snapshot_dir.glob("*.jsonl.gz")):
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for raw in handle:
+                    if not raw.strip():
+                        continue
+                    try:
+                        value = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        malformed += 1
+                        continue
+                    if isinstance(value, dict):
+                        rows.append(value)
+                    else:
+                        malformed += 1
+        except (OSError, EOFError):
+            malformed += 1
+    return rows, malformed
+
+
+def _paper_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Load paper lifecycle state without mutating paper control."""
+    if not path.exists():
+        return [], 0
+    try:
+        payload = load_json(path)
+    except Exception:
+        return [], 1
     rows = payload.get("lifecycles", payload)
     if not isinstance(rows, dict):
-        raise ValueError("paper state must contain lifecycle objects")
-    return [dict(row) for row in rows.values() if isinstance(row, dict)]
+        return [], 1
+    malformed = sum(1 for row in rows.values() if not isinstance(row, dict))
+    return [dict(row) for row in rows.values() if isinstance(row, dict)], malformed
 
 
 def _capture_health(path: Path) -> dict[str, Any]:
@@ -48,12 +102,20 @@ def build_production_readiness_report(
     long_paper_production_verified: bool = False,
 ) -> dict[str, Any]:
     """Build one bounded production-evidence readiness snapshot."""
+    canonical_rows, canonical_malformed = _jsonl_rows(canonical_path)
+    ml_rows, ml_malformed = _ml_rows(snapshot_dir)
+    phase3c_rows, phase3c_malformed = _jsonl_rows(phase3c_path)
+    paper_rows, paper_malformed = _paper_rows(paper_state_path)
+    health = _capture_health(capture_health_path)
+    health["malformed"] = int(health.get("malformed", 0) or 0) + (
+        canonical_malformed + ml_malformed + phase3c_malformed + paper_malformed
+    )
     report = build_ml_data_readiness_report(
-        canonical_rows=read_jsonl(canonical_path),
-        ml_snapshot_rows=read_ml_snapshot_chunks(snapshot_dir),
-        phase3c_outcome_rows=read_jsonl(phase3c_path),
-        paper_trade_rows=_paper_rows(paper_state_path),
-        capture_health=_capture_health(capture_health_path),
+        canonical_rows=canonical_rows,
+        ml_snapshot_rows=ml_rows,
+        phase3c_outcome_rows=phase3c_rows,
+        paper_trade_rows=paper_rows,
+        capture_health=health,
     )
     return {
         "record_type": "OPIP_ML_DATA_READINESS_V1",
