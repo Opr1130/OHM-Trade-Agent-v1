@@ -1252,49 +1252,58 @@ def main():
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
 
-    capital_ranked = rank_capital_efficiency(ranked_opportunities)
-    print("===== O'PIP GLOBAL CAPITAL EFFICIENCY =====")
-    global_ranked_opportunities: list[RankedOpportunity] = []
-    for item in capital_ranked:
-        original = item.ranked_opportunity
-        alert = original.opportunity.alert
-        result = item.capital_efficiency
-        alert["profit_rank"] = item.original_rank
-        alert["opportunity_rank"] = item.rank
-        alert["capital_efficiency_score"] = result.total_score
-        alert["hold_proxy_hours"] = result.hold_proxy_hours
-        alert["net_return_velocity_proxy_pct_per_hour"] = (
-            result.net_return_velocity_pct_per_hour
-        )
-        alert["risk_efficiency_ratio"] = result.risk_efficiency_ratio
-        print(
-            f"GLOBAL RANK {item.rank} "
-            f"{original.opportunity.snapshot.trade_direction} "
-            f"{result.symbol}: "
-            f"CapitalEfficiency={result.total_score:.2f} "
-            f"ProfitRank={item.original_rank} "
-            f"HoldProxy={result.hold_proxy_hours:.2f}h "
-            f"NetReturnVelocity={result.net_return_velocity_pct_per_hour:.4f}%/h "
-            f"RiskEfficiency={result.risk_efficiency_ratio:.4f}"
-        )
-        global_ranked_opportunities.append(
-            RankedOpportunity(
-                rank=item.rank,
-                opportunity=original.opportunity,
-                profit_ranking=original.profit_ranking,
+    if bool(getattr(settings, "opip_global_capital_ranking_enabled", False)):
+        capital_ranked = rank_capital_efficiency(ranked_opportunities)
+        print("===== O'PIP GLOBAL CAPITAL EFFICIENCY =====")
+        global_ranked_opportunities: list[RankedOpportunity] = []
+        for item in capital_ranked:
+            original = item.ranked_opportunity
+            alert = original.opportunity.alert
+            result = item.capital_efficiency
+            alert["profit_rank"] = item.original_rank
+            alert["opportunity_rank"] = item.rank
+            alert["capital_efficiency_score"] = result.total_score
+            alert["hold_proxy_hours"] = result.hold_proxy_hours
+            alert["net_return_velocity_proxy_pct_per_hour"] = (
+                result.net_return_velocity_pct_per_hour
             )
-        )
-    ranked_opportunities = global_ranked_opportunities
+            alert["risk_efficiency_ratio"] = result.risk_efficiency_ratio
+            print(
+                f"GLOBAL RANK {item.rank} "
+                f"{original.opportunity.snapshot.trade_direction} "
+                f"{result.symbol}: "
+                f"CapitalEfficiency={result.total_score:.2f} "
+                f"ProfitRank={item.original_rank} "
+                f"HoldProxy={result.hold_proxy_hours:.2f}h "
+                f"NetReturnVelocity={result.net_return_velocity_pct_per_hour:.4f}%/h "
+                f"RiskEfficiency={result.risk_efficiency_ratio:.4f}"
+            )
+            global_ranked_opportunities.append(
+                RankedOpportunity(
+                    rank=item.rank,
+                    opportunity=original.opportunity,
+                    profit_ranking=original.profit_ranking,
+                )
+            )
+        ranked_opportunities = global_ranked_opportunities
 
-    actionable_ranked_opportunities = _apply_ranked_action_gates(
-        ranked_opportunities,
-        settings=settings,
-    )
-    print(
-        "Actionable survivors after capital/portfolio gate:",
-        len(actionable_ranked_opportunities),
-    )
-    ranked_opportunities = actionable_ranked_opportunities
+        actionable_ranked_opportunities = _apply_ranked_action_gates(
+            ranked_opportunities,
+            settings=settings,
+        )
+        print(
+            "Actionable survivors after capital/portfolio gate:",
+            len(actionable_ranked_opportunities),
+        )
+        ranked_opportunities = actionable_ranked_opportunities
+    else:
+        # Compatibility path for legacy test/extension settings only. Real
+        # Settings default the Wave 9 global gate on.
+        for ranked in ranked_opportunities:
+            ranked.opportunity.alert["profit_rank"] = ranked.rank
+            ranked.opportunity.alert["profit_rank_score"] = (
+                ranked.profit_ranking.total_score
+            )
 
     lineage_prepared, lineage_failures = _prepare_qualified_lineage(
         ranked_opportunities,
