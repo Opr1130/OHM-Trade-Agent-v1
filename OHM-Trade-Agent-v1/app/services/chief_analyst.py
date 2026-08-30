@@ -430,6 +430,17 @@ def _request_payload(payload: list[dict], *, market_regime_context: object | Non
     }
 
 
+def _planned_route_cache_key(route_plan) -> str:
+    if route_plan.targets:
+        return route_plan.targets[0].cache_key
+    return route_plan.cache_key
+
+
+def _actual_route_cache_key(routed) -> str:
+    effort = routed.reasoning_effort or "none"
+    return f"{routed.provider}:{routed.model}:{effort}"
+
+
 def _attach_ai_route_context(
     candidates: list[MarketSnapshot],
     route: object,
@@ -641,7 +652,7 @@ def review_candidates(
 
     fingerprint = build_chief_fingerprint(
         request_payload,
-        route_key=route_plan.cache_key,
+        route_key=_planned_route_cache_key(route_plan),
     )
     cached = get_cached_review(fingerprint)
     if cached is not None:
@@ -674,7 +685,7 @@ def review_candidates(
             stage_evidence["route_reason"] = route_plan.route_reason
             fingerprint = build_chief_fingerprint(
                 request_payload,
-                route_key=route_plan.cache_key,
+                route_key=_planned_route_cache_key(route_plan),
             )
             cached = get_cached_review(fingerprint)
             if cached is not None:
@@ -755,6 +766,10 @@ def review_candidates(
         _attach_ai_route_context(
             chief_eligible_candidates,
             review["opip_ai_route"],
+        )
+        fingerprint = build_chief_fingerprint(
+            request_payload,
+            route_key=_actual_route_cache_key(routed),
         )
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
