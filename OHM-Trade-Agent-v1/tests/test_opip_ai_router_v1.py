@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import app.services.opip_ai_router as router
+from app.services import chief_analyst
 from app.services.chief_runtime_guard import build_chief_fingerprint
 
 
@@ -245,6 +246,59 @@ def test_chief_cache_fingerprint_is_partitioned_by_ai_route():
     )
 
     assert openai != digitalocean
+
+
+def test_successful_route_is_attached_to_candidate_learning_context():
+    candidate = SimpleNamespace(
+        _wave8_market_intelligence={"existing": "context"}
+    )
+    route = {
+        "provider": "digitalocean",
+        "model": "kimi-test-model",
+        "route_tier": "premium",
+        "route_reason": "openai_budget_blocked",
+        "reasoning_effort": None,
+    }
+
+    chief_analyst._attach_ai_route_context([candidate], route)
+
+    context = candidate._wave8_market_intelligence
+    assert context["existing"] == "context"
+    assert context["ai_route"]["provider"] == "digitalocean"
+    assert context["ai_route"]["model"] == "kimi-test-model"
+    assert context["ai_route"]["advisory_only"] is True
+    assert context["ai_route"]["funded_trade_authority_changed"] is False
+
+
+def test_cached_route_restores_actual_provider_stage_evidence():
+    stage = {
+        "provider": "openai",
+        "model": "gpt-5.6",
+        "router_attempts": [],
+    }
+    cached = {
+        "opip_ai_route": {
+            "provider": "digitalocean",
+            "model": "deepseek-test-model",
+            "route_tier": "standard",
+            "route_reason": "openai_budget_blocked",
+            "reasoning_effort": None,
+            "attempts": [
+                {
+                    "provider": "digitalocean",
+                    "status": "succeeded",
+                    "latency_ms": 10,
+                }
+            ],
+        }
+    }
+
+    chief_analyst._apply_cached_route_stage(stage, cached)
+
+    assert stage["provider"] == "digitalocean"
+    assert stage["model"] == "deepseek-test-model"
+    assert stage["route_reason"] == "openai_budget_blocked"
+    assert stage["router_attempts"][0]["status"] == "succeeded"
 
 
 def test_router_has_no_exchange_order_position_or_telegram_imports():
