@@ -21,7 +21,7 @@ Production exports only:
 - `full_market_observations.jsonl`
 - `manifest.env`
 
-The export path is `/var/lib/opip-learning-export`.
+The export path is `/var/lib/opip-learning-export`. The learning SSH key is bound to a forced read-only export command and the learning droplet's private source address; it cannot open an interactive shell or execute arbitrary commands with that key.
 
 ## Learning worker contract
 
@@ -72,7 +72,8 @@ sync/capture/outcomes cannot overlap.
 
    ```bash
    sudo bash deploy/remote/configure-opip-learning-reader.sh \
-     'ssh-ed25519 AAAA... opip-learning-worker'
+     'ssh-ed25519 AAAA... opip-learning-worker' \
+     10.116.0.4/32
    ```
 
 7. On the learning worker, verify the production SSH host fingerprint and add
@@ -101,7 +102,7 @@ sync/capture/outcomes cannot overlap.
 10. Enable timers only after all one-shot checks pass:
 
    ```bash
-   sudo systemctl start \
+   sudo systemctl enable --now \
      opip-learning-sync.timer \
      opip-learning-capture.timer \
      opip-learning-outcomes.timer
