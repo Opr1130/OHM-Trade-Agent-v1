@@ -77,7 +77,7 @@ services:
     environment:
       OPIP_STREAMING_ENABLED: "true"
       OPIP_STREAMING_SYMBOLS: "BTCUSDT,ETHUSDT,SOLUSDT"
-      OPIP_STREAMING_BINANCE_URL: "wss://fstream.binance.com/public/stream"
+      OPIP_STREAMING_BINANCE_URL: "wss://fstream.binance.com/market/stream"
       OPIP_STREAMING_BYBIT_URL: "wss://stream.bybit.com/v5/public/linear"
       OPIP_STREAMING_QUEUE_MAXSIZE: "5000"
       OPIP_STREAMING_RETENTION_HOURS: "72"
@@ -118,4 +118,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-
