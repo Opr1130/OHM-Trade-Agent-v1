@@ -1,0 +1,236 @@
+"""Sequence 4 BUILD 4.5 production shadow integration tests."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.opip.streaming.contract import EvidenceQualityState, StreamProvider
+from app.opip.streaming.feature_accumulator import StreamingFeatureSnapshot
+from app.opip.streaming.healthcheck import main as healthcheck_main
+from app.opip.streaming.read_model import read_streaming_shadow_status
+from app.opip.streaming.runtime import StreamingRuntime
+from app.opip.streaming.store import StreamingShadowStore
+from app.opip.streaming.worker import _parse_symbols
+from app.services.registry_io import load_json, save_json_atomic
+from tests.test_opip_streaming_runtime_v1 import (
+    FakeAdapter,
+    NOW as RUNTIME_NOW,
+    _queued,
+    _raw,
+    _runtime_config,
+)
+from app.opip.streaming.adapter import QueuedRawFrame
+
+
+NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+
+
+def _feature(asset="bitcoin", start=NOW):
+    return StreamingFeatureSnapshot(
+        canonical_asset_id=asset,
+        window_start_utc=start,
+        window_end_utc=start + timedelta(seconds=15),
+        cvd_signed_notional_usd=1000.0,
+        per_venue_cvd_notional_usd={"BINANCE": 600.0, "BYBIT": 400.0},
+        venue_agreement="ALIGNED_POSITIVE",
+        evidence_quality="COMPLETE",
+        degradations=(),
+        liquidation_long_notional_usd=0.0,
+        liquidation_short_notional_usd=0.0,
+        liquidation_unknown_notional_usd=0.0,
+        liquidation_sync_state="INSUFFICIENT_EVIDENCE",
+        liquidation_venues=(),
+    )
+
+
+def test_shadow_store_rotates_hourly_and_preserves_latest_assets(tmp_path):
+    store = StreamingShadowStore(base_dir=tmp_path, retention_hours=72)
+    assert store.append_features([_feature("bitcoin")]) == 1
+    assert store.append_features([_feature("ethereum")]) == 1
+
+    files = sorted(tmp_path.glob("features-*.jsonl"))
+    assert len(files) == 1
+    assert files[0].name == "features-20260830T12.jsonl"
+    assert len(files[0].read_text(encoding="utf-8").splitlines()) == 2
+
+    latest = load_json(tmp_path / "latest_features.json")
+    assert set(latest["assets"]) == {"bitcoin", "ethereum"}
+    assert not list(tmp_path.glob("*raw*"))
+
+
+def test_shadow_store_prunes_only_expired_hour_files(tmp_path):
+    store = StreamingShadowStore(base_dir=tmp_path, retention_hours=72)
+    old = tmp_path / "features-20260825T00.jsonl"
+    recent = tmp_path / "features-20260830T11.jsonl"
+    old.write_text("{}\n", encoding="utf-8")
+    recent.write_text("{}\n", encoding="utf-8")
+    removed = store.prune(now_utc=NOW)
+    assert removed == 1
+    assert not old.exists()
+    assert recent.exists()
+
+
+def test_read_model_is_explicitly_non_authoritative(tmp_path):
+    health = tmp_path / "health.json"
+    telemetry = tmp_path / "telemetry.json"
+    latest = tmp_path / "latest.json"
+    save_json_atomic(health, {"status": "RUNNING"})
+    save_json_atomic(telemetry, {"runtime": {"frames_processed": 10}})
+    save_json_atomic(latest, {"assets": {"bitcoin": {}}})
+    result = read_streaming_shadow_status(
+        health_path=health,
+        telemetry_path=telemetry,
+        latest_features_path=latest,
+    )
+    assert result["authoritative"] is False
+    assert result["can_trade"] is False
+    assert result["can_change_policy"] is False
+
+
+def test_healthcheck_requires_fresh_running_heartbeat(tmp_path, monkeypatch):
+    import app.opip.streaming.healthcheck as module
+
+    path = tmp_path / "health.json"
+    monkeypatch.setattr(module, "HEALTH_FILE", path)
+    save_json_atomic(
+        path,
+        {
+            "status": "RUNNING",
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "runtime_failed": False,
+        },
+    )
+    assert module.main() == 0
+    save_json_atomic(
+        path,
+        {
+            "status": "RUNNING",
+            "updated_at_utc": (
+                datetime.now(timezone.utc) - timedelta(minutes=2)
+            ).isoformat(),
+            "runtime_failed": False,
+        },
+    )
+    assert module.main() == 1
+
+
+def test_worker_initial_universe_is_explicitly_bound():
+    assert _parse_symbols("BTCUSDT,ETHUSDT,SOLUSDT") == (
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+    )
+    with pytest.raises(ValueError):
+        _parse_symbols("BTCUSDT,XRPUSDT")
+
+
+def test_queue_drop_is_attributed_to_matching_windows():
+    adapter = FakeAdapter([])
+    runtime = StreamingRuntime(
+        {StreamProvider.BINANCE: adapter},
+        config=_runtime_config(queue_maxsize=1),
+        utc_now=lambda: RUNTIME_NOW + timedelta(milliseconds=10),
+    )
+    runtime._accepting = True
+    runtime._epochs[StreamProvider.BINANCE] = 0
+
+    first = _queued(epoch=0)
+    second = QueuedRawFrame(
+        provider=StreamProvider.BINANCE,
+        frame=_raw(2),
+        connection_id="binance-0",
+        reconnect_epoch=0,
+        received_monotonic=2.0,
+        ingest_timestamp_utc=RUNTIME_NOW,
+    )
+    assert runtime._enqueue_if_current(first) is True
+    assert runtime._enqueue_if_current(second) is False
+
+    normalized = adapter.normalize(first)
+    assert runtime._record_windows(
+        normalized,
+        now_utc=RUNTIME_NOW + timedelta(milliseconds=10),
+    ) is True
+    assert runtime._windows
+    assert all(
+        window.dropped_frame_count == 1
+        for window in runtime._windows.values()
+    )
+
+
+def test_late_after_seal_never_reaches_feature_acceptance_and_degrades_quality():
+    notices = []
+    adapter = FakeAdapter([])
+    runtime = StreamingRuntime(
+        {StreamProvider.BINANCE: adapter},
+        config=_runtime_config(
+            sealed_window_retention_seconds=1.0,
+            window_grace_seconds=0.001,
+        ),
+        utc_now=lambda: RUNTIME_NOW,
+        sealed_window_sink=notices.append,
+    )
+    runtime._epochs[StreamProvider.BINANCE] = 0
+
+    first = _queued(epoch=0)
+    normalized = adapter.normalize(first)
+    assert runtime._record_windows(
+        normalized,
+        now_utc=RUNTIME_NOW + timedelta(milliseconds=10),
+    ) is True
+    window = next(iter(runtime._windows.values()))
+    seal_at = window.bounds.end_utc + timedelta(milliseconds=2)
+    runtime._seal_and_prune(seal_at)
+    assert notices == []
+
+    late = QueuedRawFrame(
+        provider=StreamProvider.BINANCE,
+        frame=_raw(2),
+        connection_id="binance-0",
+        reconnect_epoch=0,
+        received_monotonic=2.0,
+        ingest_timestamp_utc=RUNTIME_NOW,
+    )
+    late_normalized = adapter.normalize(late)
+    assert runtime._record_windows(
+        late_normalized,
+        now_utc=seal_at,
+    ) is False
+
+    runtime._seal_and_prune(
+        window.bounds.end_utc + timedelta(seconds=2)
+    )
+    assert notices
+    assert all(
+        notice.quality.state is EvidenceQualityState.DEGRADED
+        for notice in notices
+    )
+
+
+def test_far_future_provider_timestamp_fails_closed():
+    adapter = FakeAdapter([])
+    runtime = StreamingRuntime(
+        {StreamProvider.BINANCE: adapter},
+        config=_runtime_config(provider_future_tolerance_seconds=1.0),
+        utc_now=lambda: RUNTIME_NOW,
+    )
+    queued = _queued(epoch=0)
+    normalized = adapter.normalize(queued)
+    future_envelope = normalized.envelope.__class__(
+        **{
+            **normalized.envelope.to_dict(),
+            "provider": normalized.envelope.provider,
+            "stream_type": normalized.envelope.stream_type,
+            "provider_timestamp_utc": RUNTIME_NOW + timedelta(seconds=10),
+            "ingest_timestamp_utc": normalized.envelope.ingest_timestamp_utc,
+            "sequence_status": normalized.envelope.sequence_status,
+            "identity_status": normalized.envelope.identity_status,
+        }
+    )
+    future_normalized = normalized.__class__(
+        envelope=future_envelope,
+        sequence=normalized.sequence,
+    )
+    with pytest.raises(ValueError):
+        runtime._record_windows(future_normalized, now_utc=RUNTIME_NOW)
