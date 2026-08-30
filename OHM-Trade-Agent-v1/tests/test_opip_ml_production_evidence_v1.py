@@ -224,12 +224,15 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
     assert not snapshot_file.exists()
 
 
-def test_custom_evidence_path_is_forwarded_to_p1_drain(tmp_path, monkeypatch):
+def test_custom_evidence_path_does_not_consume_production_p1_outbox(
+    tmp_path, monkeypatch
+):
     evidence = tmp_path / "isolated-evidence.jsonl"
-    captured = {}
+    called = False
 
-    def drain(**kwargs):
-        captured.update(kwargs)
+    def drain(**_kwargs):
+        nonlocal called
+        called = True
         return _drain_stub()
 
     monkeypatch.setattr(
@@ -237,7 +240,7 @@ def test_custom_evidence_path_is_forwarded_to_p1_drain(tmp_path, monkeypatch):
         drain,
     )
 
-    capture_ml_production_evidence(
+    summary = capture_ml_production_evidence(
         evidence_path=evidence,
         snapshot_path=tmp_path / "ml.jsonl.gz",
         checkpoint_path=tmp_path / "checkpoint.json",
@@ -246,7 +249,8 @@ def test_custom_evidence_path_is_forwarded_to_p1_drain(tmp_path, monkeypatch):
         enabled=True,
     )
 
-    assert captured["evidence_path"] == evidence
+    assert called is False
+    assert summary.p1_drained == 0
 
 
 def test_retry_after_checkpoint_loss_does_not_duplicate_snapshot(
