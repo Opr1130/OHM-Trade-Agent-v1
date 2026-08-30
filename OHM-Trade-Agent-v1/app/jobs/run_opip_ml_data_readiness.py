@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from app.opip.learning.paper_readiness import assess_paper_learning_readiness
 from app.opip.learning.readiness import build_ml_data_readiness_report
-from app.services.registry_io import load_json, save_json_atomic
+from app.services.registry_io import save_json_atomic
 
 
 CANONICAL_EVIDENCE = Path("/app/data/p1_evidence_ledger.jsonl")
@@ -69,27 +69,43 @@ def _ml_rows(snapshot_dir: Path) -> tuple[list[dict[str, Any]], int]:
     return rows, malformed
 
 
-def _paper_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
-    """Load paper lifecycle state without mutating paper control."""
+def _json_object(path: Path) -> tuple[dict[str, Any], int]:
+    """Read one JSON object without quarantine, rename, or source mutation."""
     if not path.exists():
-        return [], 0
+        return {}, 0
     try:
-        payload = load_json(path)
-    except Exception:
-        return [], 1
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(
+            raw,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON token {token}")
+            ),
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}, 1
+    if not isinstance(payload, dict):
+        return {}, 1
+    return dict(payload), 0
+
+
+def _paper_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
+    """Load paper lifecycle state without mutating paper control/state."""
+    payload, malformed = _json_object(path)
+    if malformed:
+        return [], malformed
     rows = payload.get("lifecycles", payload)
     if not isinstance(rows, dict):
         return [], 1
-    malformed = sum(1 for row in rows.values() if not isinstance(row, dict))
-    return [dict(row) for row in rows.values() if isinstance(row, dict)], malformed
+    malformed_rows = sum(1 for row in rows.values() if not isinstance(row, dict))
+    return (
+        [dict(row) for row in rows.values() if isinstance(row, dict)],
+        malformed_rows,
+    )
 
 
-def _capture_health(path: Path) -> dict[str, Any]:
-    """Load evidence-capture health when available."""
-    if not path.exists():
-        return {}
-    payload = load_json(path)
-    return dict(payload) if isinstance(payload, dict) else {}
+def _capture_health(path: Path) -> tuple[dict[str, Any], int]:
+    """Load evidence-capture health without mutating its source file."""
+    return _json_object(path)
 
 
 def build_production_readiness_report(
@@ -106,9 +122,13 @@ def build_production_readiness_report(
     ml_rows, ml_malformed = _ml_rows(snapshot_dir)
     phase3c_rows, phase3c_malformed = _jsonl_rows(phase3c_path)
     paper_rows, paper_malformed = _paper_rows(paper_state_path)
-    health = _capture_health(capture_health_path)
+    health, health_malformed = _capture_health(capture_health_path)
     health["malformed"] = int(health.get("malformed", 0) or 0) + (
-        canonical_malformed + ml_malformed + phase3c_malformed + paper_malformed
+        canonical_malformed
+        + ml_malformed
+        + phase3c_malformed
+        + paper_malformed
+        + health_malformed
     )
     report = build_ml_data_readiness_report(
         canonical_rows=canonical_rows,
