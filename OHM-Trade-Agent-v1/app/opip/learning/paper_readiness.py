@@ -74,12 +74,23 @@ class PaperLearningReadinessReport:
         }
 
 
-def assess_paper_learning_readiness() -> PaperLearningReadinessReport:
-    """Report the audited capabilities of the current production paper engine."""
+def assess_paper_learning_readiness(
+    *,
+    long_production_verified: bool = False,
+) -> PaperLearningReadinessReport:
+    """Report current paper capability, failing closed on unverified production health."""
     long = PaperDirectionReadiness(
         direction="LONG",
-        state=PaperReadinessState.READY,
-        reasons=(),
+        state=(
+            PaperReadinessState.READY
+            if long_production_verified
+            else PaperReadinessState.NOT_READY
+        ),
+        reasons=(
+            ()
+            if long_production_verified
+            else ("LONG_PAPER_PRODUCTION_HEALTH_NOT_VERIFIED",)
+        ),
     )
     short = PaperDirectionReadiness(
         direction="SHORT",
