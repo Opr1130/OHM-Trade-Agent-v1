@@ -8,6 +8,7 @@ ML_EVIDENCE_SRC="$APP_ROOT/deploy/cron.d/opip-ml-evidence"
 ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
+BACKGROUND_RUNNER="$APP_ROOT/deploy/remote/run-opip-background-job.sh"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run this scheduler reconciliation with sudo" >&2
@@ -31,6 +32,10 @@ if [[ ! -s "$ML_EVIDENCE_SRC" ]]; then
 fi
 if [[ ! -s "$STREAM_RECONCILE" ]]; then
   echo "stream worker reconciliation missing: $STREAM_RECONCILE" >&2
+  exit 69
+fi
+if [[ ! -s "$BACKGROUND_RUNNER" ]]; then
+  echo "O'Pip background runner missing: $BACKGROUND_RUNNER" >&2
   exit 69
 fi
 
@@ -98,8 +103,9 @@ crontab "$tmpdir/root.after"
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
 grep -q 'app.jobs.run_opip_ml_capture' "$ML_EVIDENCE_DST"
 grep -q 'app.jobs.build_phase3c_forward_outcomes' "$ML_EVIDENCE_DST"
-grep -q '/var/run/opip-ml-capture-trigger.lock' "$ML_EVIDENCE_DST"
-grep -q '/var/run/opip-ml-outcomes.lock' "$ML_EVIDENCE_DST"
+grep -q '/var/run/opip-background.lock' "$ML_EVIDENCE_DST"
+grep -q 'run-opip-background-job.sh' "$ML_EVIDENCE_DST"
+grep -q '2,12,22,32,42,52' "$ML_EVIDENCE_DST"
 # Only executable cron content is authoritative. Scan the full file in one pass
 # so pipefail/SIGPIPE cannot hide a real forbidden-lock match.
 if awk '!/^[[:space:]]*#/ && /\/var\/run\/ohm-unified-cycle\.lock/ { found=1 } END { exit !found }' "$ML_EVIDENCE_DST"; then
@@ -130,7 +136,9 @@ echo "canonical=$CANONICAL_DST"
 echo "cadence=1 minute"
 echo "entrypoint=app.jobs.run_cycle"
 echo "ml_evidence=$ML_EVIDENCE_DST"
-echo "ml_capture_cadence=1 minute"
+echo "ml_background_lock=/var/run/opip-background.lock"
+echo "ml_background_memory_limit=512m"
+echo "ml_capture_cadence=1 minute + 25s offset"
 echo "ml_capture_entrypoint=app.jobs.run_opip_ml_capture"
-echo "ml_outcome_cadence=10 minutes"
+echo "ml_outcome_cadence=10 minutes + 20s offset"
 echo "ml_outcome_entrypoint=app.jobs.build_phase3c_forward_outcomes"
