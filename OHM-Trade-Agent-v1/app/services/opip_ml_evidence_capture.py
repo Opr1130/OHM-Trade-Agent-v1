@@ -131,6 +131,25 @@ def _availability_from_seed(
     return stamp
 
 
+def _capture_direction(row: Mapping[str, Any]) -> str:
+    """Return the decision-time paper-learning side for current Kraken spot evidence.
+
+    Production Paper Trade v1 is LONG-only. Only an explicitly unsuppressed
+    SCORED_ELIGIBLE Kraken spot decision is direction-bearing; every other
+    observation remains NONE and cannot enter supervised training.
+    """
+    status = str(row.get("decision_status") or "").strip().upper()
+    source_exchange = str(row.get("source_exchange") or "").strip().upper()
+    suppressed = row.get("suppressed")
+    if (
+        source_exchange == "KRAKEN_SPOT"
+        and status == "SCORED_ELIGIBLE"
+        and suppressed is False
+    ):
+        return "LONG"
+    return "NONE"
+
+
 def build_ml_snapshot_from_canonical(row: Mapping[str, Any]):
     """Seal one canonical episode row into the Foundation v1 FeatureSnapshot."""
 
@@ -167,7 +186,7 @@ def build_ml_snapshot_from_canonical(row: Mapping[str, Any]):
         canonical_asset_id=base_asset,
         venue="KRAKEN",
         pair=symbol,
-        direction="NONE",
+        direction=_capture_direction(row),
         lane="PRODUCTION_SHADOW",
         regime=None,
         feature_values={str(key): value for key, value in feature_values.items()},
@@ -178,6 +197,7 @@ def build_ml_snapshot_from_canonical(row: Mapping[str, Any]):
         source_versions={
             "canonical_episode": f"v{int(row.get('schema_version', 1) or 1)}",
             "scan_source": str(row.get("scan_source") or "UNKNOWN"),
+            "direction_basis": "kraken-spot-paper-v1",
         },
     )
 
