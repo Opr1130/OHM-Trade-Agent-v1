@@ -202,8 +202,25 @@ def evaluate_shadow_equivalence(
     )
     exact = tuple(row for row in complete_expected if row.exact_match)
     divergent = tuple(row for row in complete_expected if not row.exact_match)
-    scans = {row.scan_id for row in complete_expected}
-    days = {row.observed_at_utc.date().isoformat() for row in complete_expected}
+
+    expectation_by_scan = {item.scan_id: item for item in expectations}
+    fully_covered_scans: set[str] = set()
+    for expectation in expectations:
+        scan_keys = {
+            (expectation.scan_id, candidate_id)
+            for candidate_id in expectation.expected_candidate_ids
+        }
+        if scan_keys and all(
+            len(rows_by_key.get(key, [])) == 1
+            and rows_by_key[key][0].pairing_state is PairingState.COMPLETE
+            for key in scan_keys
+        ):
+            fully_covered_scans.add(expectation.scan_id)
+    scans = fully_covered_scans
+    days = {
+        expectation_by_scan[scan_id].expected_at_utc.date().isoformat()
+        for scan_id in fully_covered_scans
+    }
     policies = tuple(
         sorted(
             {
