@@ -585,7 +585,7 @@ def _send_movement_notification(movement, settings) -> tuple[bool, bool]:
     from the actual notification path are surfaced and counted.
     """
     if (
-        bool(getattr(settings, "opip_actionable_only_alerts", True))
+        bool(getattr(settings, "opip_actionable_only_alerts", False))
         or str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
         or not _telegram_delivery_ready(settings)
     ):
