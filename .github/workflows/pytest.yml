@@ -28,3 +28,15 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
       - run: python -m compileall -q app
+      - name: Validate production Compose
+        run: |
+          test ! -e .env
+          : > .env
+          trap 'rm -f .env' EXIT
+          docker compose config -q
+      - name: Validate deployment shell
+        run: |
+          bash -n deploy/remote/ohm-deploy
+          bash -n deploy/remote/ohm-deploy-ssh
+          bash -n deploy/remote/reconcile-scheduler.sh
+          bash -n deploy/remote/reconcile-stream-worker.sh

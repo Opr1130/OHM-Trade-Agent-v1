@@ -5,6 +5,7 @@ APP_ROOT="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
 CANONICAL_SRC="$APP_ROOT/deploy/cron.d/ohm-unified-cycle"
 CANONICAL_DST="/etc/cron.d/ohm-unified-cycle"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
+STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run this scheduler reconciliation with sudo" >&2
@@ -20,6 +21,10 @@ done
 
 if [[ ! -s "$CANONICAL_SRC" ]]; then
   echo "canonical scheduler missing: $CANONICAL_SRC" >&2
+  exit 69
+fi
+if [[ ! -s "$STREAM_RECONCILE" ]]; then
+  echo "stream worker reconciliation missing: $STREAM_RECONCILE" >&2
   exit 69
 fi
 
@@ -82,6 +87,8 @@ if crontab -l 2>/dev/null | grep -Eq 'app\.jobs\.(run_cycle|scan_movers|scan_opp
   echo "legacy O'Pip scheduler line remains in root crontab" >&2
   false
 fi
+
+bash "$STREAM_RECONCILE"
 
 trap - ERR
 rm -rf "$tmpdir"

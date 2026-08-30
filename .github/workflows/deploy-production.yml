@@ -155,7 +155,10 @@ jobs:
             "deploy $TARGET_SHA" 2>&1 | tee deploy.log
           RC=${PIPESTATUS[0]}
 
-          if [[ "$RC" -eq 0 ]] && grep -q 'OHM deployment succeeded' deploy.log && grep -q '"status":"ok"' deploy.log; then
+          if [[ "$RC" -eq 0 ]] \
+             && grep -q 'OHM deployment succeeded' deploy.log \
+             && grep -q '"status":"ok"' deploy.log \
+             && grep -q 'OPIP stream worker reconciliation: OK' deploy.log; then
             RESULT="SUCCESS"
             HEALTH="OK"
             ROLLBACK="NO"

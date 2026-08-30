@@ -25,6 +25,7 @@ from app.opip.streaming.contract import (
     SequenceStatus,
     StreamProvider,
     StreamTransportState,
+    StreamType,
 )
 from app.opip.streaming.quality import assess_window_quality
 from app.opip.streaming.queueing import DropNewestQueue
@@ -32,6 +33,11 @@ from app.opip.streaming.resources import (
     ResourceGuardConfig,
     assess_resources,
     current_rss_bytes,
+)
+from app.opip.streaming.sinks import (
+    ObservationSink,
+    SealedWindowNotice,
+    SealedWindowSink,
 )
 from app.opip.streaming.telemetry import RuntimeTelemetry, RuntimeTelemetrySnapshot
 from app.opip.streaming.windows import WindowAccumulator, WindowBounds, empty_window
@@ -51,6 +57,7 @@ class StreamingRuntimeConfig:
     heartbeat_interval_seconds: float = 20.0
     heartbeat_timeout_seconds: float = 10.0
     window_grace_seconds: float = 2.0
+    provider_future_tolerance_seconds: float = 5.0
     sealed_window_retention_seconds: float = 30.0
     shutdown_drain_timeout_seconds: float = 5.0
     consumer_idle_seconds: float = 0.10
@@ -66,6 +73,7 @@ class StreamingRuntimeConfig:
             ("heartbeat_interval_seconds", self.heartbeat_interval_seconds),
             ("heartbeat_timeout_seconds", self.heartbeat_timeout_seconds),
             ("window_grace_seconds", self.window_grace_seconds),
+            ("provider_future_tolerance_seconds", self.provider_future_tolerance_seconds),
             ("sealed_window_retention_seconds", self.sealed_window_retention_seconds),
             ("shutdown_drain_timeout_seconds", self.shutdown_drain_timeout_seconds),
             ("consumer_idle_seconds", self.consumer_idle_seconds),
@@ -100,6 +108,8 @@ class StreamingRuntime:
         utc_now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter_source: Callable[[], float] = random.random,
+        observation_sink: ObservationSink | None = None,
+        sealed_window_sink: SealedWindowSink | None = None,
     ) -> None:
         self.config = config or StreamingRuntimeConfig()
         self._adapters = dict(adapters)
@@ -114,6 +124,8 @@ class StreamingRuntime:
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._jitter_source = jitter_source
+        self._observation_sink = observation_sink
+        self._sealed_window_sink = sealed_window_sink
         self._queue = DropNewestQueue(maxsize=self.config.queue_maxsize)
         self._telemetry = RuntimeTelemetry(tuple(self._adapters))
         self._stop_event = asyncio.Event()
@@ -127,6 +139,10 @@ class StreamingRuntime:
         self._windows: dict[
             tuple[str, str, str, int, datetime], WindowAccumulator
         ] = {}
+        self._window_provider_symbols: dict[
+            tuple[str, str, str, int, datetime], str
+        ] = {}
+        self._pending_drops: dict[tuple[str, str, str, int], int] = {}
         self._active_symbols: set[str] = set()
 
     @property
@@ -312,23 +328,23 @@ class StreamingRuntime:
         provider: StreamProvider,
     ) -> RawProviderFrame:
         telemetry = self._telemetry.provider[provider]
-        try:
-            return await asyncio.wait_for(
-                adapter.receive(),
-                timeout=self.config.heartbeat_interval_seconds,
-            )
-        except asyncio.TimeoutError:
-            await adapter.heartbeat()
-            telemetry.heartbeat_sent += 1
-            telemetry.last_heartbeat_monotonic = self._monotonic()
+        while True:
             try:
                 return await asyncio.wait_for(
                     adapter.receive(),
-                    timeout=self.config.heartbeat_timeout_seconds,
+                    timeout=self.config.heartbeat_interval_seconds,
                 )
-            except asyncio.TimeoutError as exc:
-                telemetry.heartbeat_timeouts += 1
-                raise _HeartbeatTimeout("stream liveness timeout") from exc
+            except asyncio.TimeoutError:
+                telemetry.heartbeat_sent += 1
+                telemetry.last_heartbeat_monotonic = self._monotonic()
+                try:
+                    await asyncio.wait_for(
+                        adapter.heartbeat(),
+                        timeout=self.config.heartbeat_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    telemetry.heartbeat_timeouts += 1
+                    raise _HeartbeatTimeout("stream heartbeat timeout") from exc
 
     def _enqueue_if_current(self, frame: QueuedRawFrame) -> bool:
         telemetry = self._telemetry.provider[frame.provider]
@@ -346,6 +362,7 @@ class StreamingRuntime:
             return True
         self._telemetry.raw_frames_dropped_newest += 1
         telemetry.transport_state = StreamTransportState.OVERFLOW
+        self._mark_raw_drop(frame)
         return False
 
     async def _consumer_loop(self) -> None:
@@ -380,12 +397,21 @@ class StreamingRuntime:
                 self._validate_normalized(frame, normalized)
                 self._telemetry.normalized_observations += 1
                 self._record_sequence(normalized)
-                self._record_windows(normalized)
+                now_utc = self._require_runtime_utc()
+                accepted_for_features = self._record_windows(
+                    normalized,
+                    now_utc=now_utc,
+                )
+                if accepted_for_features and self._observation_sink is not None:
+                    try:
+                        self._observation_sink(normalized)
+                    except Exception:
+                        self._telemetry.observation_sink_errors += 1
                 self._telemetry.frames_processed += 1
                 self._telemetry.last_processed_at_utc = (
                     normalized.envelope.ingest_timestamp_utc
                 )
-                self._seal_and_prune(self._require_runtime_utc())
+                self._seal_and_prune(now_utc)
             except _SymbolLimitExceeded:
                 self._telemetry.symbol_limit_rejections += 1
             except (ValueError, TypeError):
@@ -430,15 +456,24 @@ class StreamingRuntime:
             self._telemetry.reconnect_boundaries += 1
 
     def _record_windows(
-        self, normalized: NormalizedStreamObservation
-    ) -> None:
+        self,
+        normalized: NormalizedStreamObservation,
+        *,
+        now_utc: datetime,
+    ) -> bool:
         envelope = normalized.envelope
+        if envelope.provider_timestamp_utc > now_utc + timedelta(
+            seconds=self.config.provider_future_tolerance_seconds
+        ):
+            raise ValueError("provider timestamp exceeds future tolerance")
+
         asset = envelope.canonical_asset_id or envelope.provider_symbol
         if asset not in self._active_symbols:
             if len(self._active_symbols) >= self.config.max_symbols:
                 raise _SymbolLimitExceeded("streaming max_symbols bound exceeded")
             self._active_symbols.add(asset)
 
+        accepted_any = False
         for seconds in self.config.window_seconds:
             bounds = WindowBounds.for_timestamp(
                 asset=asset,
@@ -454,9 +489,30 @@ class StreamingRuntime:
                 bounds.start_utc,
             )
             current = self._windows.get(key)
+
+            if current is None and bounds.is_sealable(
+                now_utc=now_utc,
+                grace_seconds=self.config.window_grace_seconds,
+            ):
+                # The target window is already historical and absent from
+                # retained state. Never recreate/backfill a sealed past window.
+                self._telemetry.late_frames += 1
+                continue
+
             if current is None:
                 current = empty_window(bounds)
+                pending_key = (
+                    envelope.provider.value,
+                    envelope.stream_type.value,
+                    envelope.provider_symbol,
+                    seconds,
+                )
+                pending = self._pending_drops.pop(pending_key, 0)
+                if pending:
+                    current = current.record_dropped_frames(pending)
                 self._telemetry.windows_opened += 1
+                self._window_provider_symbols[key] = envelope.provider_symbol
+
             if current.sealed:
                 self._windows[key] = current.record_late_frame()
                 self._telemetry.late_frames += 1
@@ -465,6 +521,31 @@ class StreamingRuntime:
                     envelope,
                     normalized.sequence,
                 )
+                accepted_any = True
+        return accepted_any
+
+    def _mark_raw_drop(self, frame: QueuedRawFrame) -> None:
+        """Conservatively attribute queue loss to current/next matching windows."""
+        provider = frame.provider.value
+        stream_type = frame.frame.stream_type.value
+        symbol = frame.frame.provider_symbol
+        for seconds in self.config.window_seconds:
+            for key, current in tuple(self._windows.items()):
+                if (
+                    key[0] == provider
+                    and key[1] == stream_type
+                    and key[3] == seconds
+                    and self._window_provider_symbols.get(key) == symbol
+                ):
+                    self._windows[key] = current.record_dropped_frame()
+
+            # The raw frame is deliberately not parsed on overflow, so its
+            # semantic timestamp is unknown. Conservatively degrade the next
+            # matching window as well as any retained matching window.
+            pending_key = (provider, stream_type, symbol, seconds)
+            self._pending_drops[pending_key] = (
+                self._pending_drops.get(pending_key, 0) + 1
+            )
 
     def _seal_and_prune(self, now_utc: datetime) -> None:
         retention = timedelta(
@@ -482,7 +563,36 @@ class StreamingRuntime:
                 current = current.seal()
                 self._windows[key] = current
                 self._telemetry.windows_sealed += 1
-                quality = assess_window_quality(current)
+
+            if (
+                current.sealed
+                and now_utc >= current.bounds.end_utc + retention
+            ):
+                quality = assess_window_quality(
+                    current,
+                    max_late_frame_ratio=0.0,
+                    max_dropped_frame_ratio=0.0,
+                )
+                if self._sealed_window_sink is not None:
+                    try:
+                        self._sealed_window_sink(
+                            SealedWindowNotice(
+                                provider=key[0],
+                                stream_type=StreamType(key[1]),
+                                canonical_asset_id=(
+                                    current.bounds.asset
+                                    if current.bounds.asset
+                                    != self._window_provider_symbols.get(key)
+                                    else None
+                                ),
+                                window_seconds=key[3],
+                                start_utc=current.bounds.start_utc,
+                                end_utc=current.bounds.end_utc,
+                                quality=quality,
+                            )
+                        )
+                    except Exception:
+                        self._telemetry.window_sink_errors += 1
                 if quality.state is EvidenceQualityState.DEGRADED:
                     self._telemetry.degraded_windows += 1
                 elif quality.state in {
@@ -490,12 +600,8 @@ class StreamingRuntime:
                     EvidenceQualityState.UNUSABLE,
                 }:
                     self._telemetry.incomplete_windows += 1
-
-            if (
-                current.sealed
-                and now_utc >= current.bounds.end_utc + retention
-            ):
                 self._windows.pop(key, None)
+                self._window_provider_symbols.pop(key, None)
 
         active_assets = {
             key[2] for key in self._windows
