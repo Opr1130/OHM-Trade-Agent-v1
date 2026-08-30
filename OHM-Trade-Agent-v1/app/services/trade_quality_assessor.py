@@ -91,21 +91,52 @@ def assess_continuation(
     if exhaustion_state == "HIGH":
         vetoes.append("SEVERE_EXTENSION")
 
-    technical = _number(features, "technical_score_input")
-    if technical is not None:
-        score += max(0.0, min(30.0, technical * 0.30))
-        if technical >= 70:
-            supporting.append("TECHNICAL_QUALITY")
+    price = _number(features, "last_price")
+    ema20 = _number(features, "ema20")
+    ema50 = _number(features, "ema50")
+    ema200 = _number(features, "ema200")
+    ema_aligned = False
+    if all(value is not None for value in (price, ema20, ema50, ema200)):
+        if direction == "SHORT":
+            ema_aligned = bool(price < ema20 < ema50 < ema200)
+        else:
+            ema_aligned = bool(price > ema20 > ema50 > ema200)
+    if ema_aligned:
+        score += 20.0
+        supporting.append("EMA_STRUCTURE_ALIGNED")
 
     trend = str(features.get("trend") or "neutral").lower()
     aligned = (direction == "LONG" and trend == "bullish") or (
         direction == "SHORT" and trend == "bearish"
     )
     if aligned:
-        score += 20.0
+        score += 15.0
         supporting.append("TREND_ALIGNED")
     elif trend == "neutral":
-        score += 8.0
+        score += 5.0
+
+    rsi = _number(features, "rsi")
+    if rsi is not None:
+        if direction == "LONG":
+            if rsi >= 82.0:
+                vetoes.append("RSI_EXHAUSTED")
+            elif 45.0 <= rsi <= 70.0:
+                score += 10.0
+                supporting.append("RSI_CONTINUATION_ZONE")
+        else:
+            if rsi <= 18.0:
+                vetoes.append("RSI_EXHAUSTED")
+            elif 30.0 <= rsi <= 55.0:
+                score += 10.0
+                supporting.append("RSI_CONTINUATION_ZONE")
+
+    macd_histogram = _directional(
+        _number(features, "macd_histogram"),
+        direction,
+    )
+    if macd_histogram is not None and macd_histogram > 0:
+        score += 10.0
+        supporting.append("MACD_DIRECTION_ALIGNED")
 
     volume = _number(features, "volume_ratio")
     if volume is not None:
@@ -117,15 +148,13 @@ def assess_continuation(
     m24 = _directional(_number(features, "momentum_24h_pct"), direction)
     if m6 is not None:
         if m6 > 0:
-            score += 7.0
+            score += 5.0
         if m6 >= 2.0:
-            score += 4.0
+            score += 5.0
             supporting.append("MOMENTUM_6H_ALIGNED")
-    if m24 is not None:
-        if m24 > 0:
-            score += 6.0
+    if m24 is not None and m24 > 0:
+        score += 5.0
         if m24 >= 5.0:
-            score += 4.0
             supporting.append("MOMENTUM_24H_ALIGNED")
 
     cross = str(features.get("cross_pair_confirmation_status") or "UNAVAILABLE").upper()
