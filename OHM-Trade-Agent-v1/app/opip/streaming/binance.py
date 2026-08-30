@@ -1,15 +1,13 @@
-"""Binance USDⓈ-M public streaming adapter for BUILD 4.3.
+"""Binance USDⓈ-M market streaming adapter for O'Pip Sequence 4.
 
-Market data only. The adapter connects to the public combined-stream endpoint,
-subscribes to aggregate trades and per-symbol liquidation snapshots, and
-normalizes them into the provider-neutral BUILD 4.1/4.2 contracts.
+Market data only. Aggregate trades and liquidation streams are connected through
+Binance's 2026 `/market` route and normalized into provider-neutral contracts.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import math
 from typing import Any
-from uuid import uuid4
 
 import orjson
 from websockets.asyncio.client import connect
@@ -35,7 +33,7 @@ from app.opip.streaming.sequencing import (
 )
 
 
-DEFAULT_BINANCE_PUBLIC_STREAM_URL = "wss://fstream.binance.com/public/stream"
+DEFAULT_BINANCE_PUBLIC_STREAM_URL = "wss://fstream.binance.com/market/stream"
 
 
 def _utc_from_ms(value: Any, *, field: str) -> datetime:
@@ -67,10 +65,7 @@ def _sequence_flags(status: SequenceStatus) -> dict[str, bool]:
 
 
 class BinancePublicAdapter:
-    """Public USDⓈ-M aggregate-trade/liquidation adapter.
-
-    No credentials or trading endpoints are accepted by this class.
-    """
+    """Unauthenticated USDⓈ-M aggregate-trade/liquidation adapter."""
 
     provider = StreamProvider.BINANCE
 
@@ -81,7 +76,7 @@ class BinancePublicAdapter:
         symbols: tuple[str, ...] | None = None,
     ) -> None:
         if not str(url or "").startswith("wss://"):
-            raise ValueError("Binance public stream URL must use wss://")
+            raise ValueError("Binance market stream URL must use wss://")
         self.url = str(url)
         self.symbols = tuple(
             str(item).upper() for item in (symbols or initial_symbols(self.provider))
@@ -91,6 +86,7 @@ class BinancePublicAdapter:
         self._ws = None
         self._connection_id: str | None = None
         self._reconnect_epoch = -1
+        self._request_id = 0
         self._trade_trackers: dict[str, StrictIncrementingSequenceTracker] = {
             symbol: StrictIncrementingSequenceTracker() for symbol in self.symbols
         }
@@ -118,12 +114,14 @@ class BinancePublicAdapter:
         for symbol in self.symbols:
             lower = symbol.lower()
             params.extend((f"{lower}@aggTrade", f"{lower}@forceOrder"))
+        self._request_id += 1
         await self._ws.send(
             orjson.dumps(
                 {
                     "method": "SUBSCRIBE",
                     "params": params,
-                    "id": uuid4().hex,
+                    # Binance USDⓈ-M requires an unsigned integer request ID.
+                    "id": self._request_id,
                 }
             )
         )
@@ -142,6 +140,11 @@ class BinancePublicAdapter:
             payload = orjson.loads(raw)
             if not isinstance(payload, dict):
                 continue
+            if "code" in payload and "msg" in payload:
+                raise ValueError(
+                    f"Binance websocket protocol error {payload.get('code')}: "
+                    f"{payload.get('msg')}"
+                )
             if "result" in payload and "id" in payload:
                 continue
             data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
