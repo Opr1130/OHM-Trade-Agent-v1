@@ -184,6 +184,9 @@ def test_checkpoint_v2_persists_bounded_byte_cursor_and_anchor(tmp_path):
     assert 0 < saved["byte_offset"] < outbox.stat().st_size
     assert saved["anchor_size"] > 0
     assert len(saved["anchor_sha256"]) == 64
+    assert saved["source_size"] == outbox.stat().st_size
+    assert saved["source_tail_size"] > 0
+    assert len(saved["source_tail_sha256"]) == 64
 
     second = drain_outbox_to_evidence_ledger(
         outbox_path=outbox,
@@ -252,3 +255,45 @@ def test_legacy_line_checkpoint_migrates_without_full_file_materialization(tmp_p
     assert saved["schema_version"] == 2
     assert saved["next_line"] == 2
     assert saved["byte_offset"] == outbox.stat().st_size
+
+
+def test_checkpoint_rejects_truncate_and_regrow_after_cursor(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    cursor = int(saved["byte_offset"])
+    prior_size = int(saved["source_size"])
+
+    original = outbox.read_bytes()
+    prefix = original[:cursor]
+    # Preserve every byte already processed, but replace the unprocessed
+    # generation and regrow past the prior size. Cursor-only continuity would
+    # accept this; the prior-source tail anchor must reject it.
+    replacement = prefix + (b'{"snapshot_id":"REPLACEMENT"}\n' * 200)
+    assert len(replacement) > prior_size
+    outbox.write_bytes(replacement)
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.stopped_on_error is True
+    assert second.error_type == "CHECKPOINT_SOURCE_DIVERGED"
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 1
