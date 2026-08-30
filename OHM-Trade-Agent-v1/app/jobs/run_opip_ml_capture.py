@@ -15,6 +15,7 @@ def main() -> None:
     print("Processed:", summary.processed)
     print("Legacy skipped:", summary.legacy_without_seed)
     print("Temporal violations:", summary.temporal_violations)
+    print("Duplicate snapshots skipped:", summary.duplicate_snapshots_skipped)
     print("Malformed:", summary.malformed)
     print("Missing feature values:", summary.missing_feature_values)
     print("Feature values:", summary.feature_values)
