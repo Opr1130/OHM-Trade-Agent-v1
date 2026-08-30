@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import app.services.opip_ai_router as router
+from app.services.chief_runtime_guard import build_chief_fingerprint
 
 
 def _payload(*, count: int, score: int = 70, movement: str | None = None) -> dict:
@@ -230,6 +231,20 @@ def test_router_fails_closed_when_no_provider_is_configured(monkeypatch):
             request_payload=_payload(count=5, score=70),
             max_output_tokens=800,
         )
+
+
+def test_chief_cache_fingerprint_is_partitioned_by_ai_route():
+    payload = _payload(count=2, score=90)
+    openai = build_chief_fingerprint(
+        payload,
+        route_key="premium|openai:gpt-5.6:high",
+    )
+    digitalocean = build_chief_fingerprint(
+        payload,
+        route_key="premium|digitalocean:kimi-test:none",
+    )
+
+    assert openai != digitalocean
 
 
 def test_router_has_no_exchange_order_position_or_telegram_imports():
