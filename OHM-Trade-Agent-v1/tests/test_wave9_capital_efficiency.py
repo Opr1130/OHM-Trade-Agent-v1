@@ -15,17 +15,25 @@ def ranked(
     hourly_range_pct: float = 2.0,
     rr2: float = 3.0,
     original_rank: int = 1,
+    liquidity_24h: float = 5_000_000.0,
+    bid_depth_050: float = 50_000.0,
+    ask_depth_050: float = 50_000.0,
 ):
     snapshot = SimpleNamespace(
         symbol=symbol,
         average_hourly_range_24h_pct=hourly_range_pct,
         atr_pct=hourly_range_pct,
+        combined_24h_liquidity_usd=liquidity_24h,
         execution_validation=SimpleNamespace(
             estimated_visible_round_trip_market_drag_pct=0.2,
+            bid_depth_050_usd=bid_depth_050,
+            ask_depth_050_usd=ask_depth_050,
         ),
     )
     economic = SimpleNamespace(
         recommended_capital=capital,
+        position_notional=capital,
+        leverage=1.0,
         target_2_net_profit=net_profit,
         target_2_move_pct=target_move_pct,
         stop_pct=stop_pct,
@@ -104,6 +112,67 @@ def test_base_quality_still_materially_affects_global_rank():
     result = rank_capital_efficiency([weak, high_quality])
 
     assert result[0].capital_efficiency.symbol == "QUALITYUSD"
+
+
+def test_capacity_caps_thin_market_deployability():
+    deep = ranked(
+        "DEEPUSD",
+        liquidity_24h=5_000_000.0,
+        bid_depth_050=50_000.0,
+        ask_depth_050=50_000.0,
+        original_rank=2,
+    )
+    thin = ranked(
+        "THINUSD",
+        liquidity_24h=1_000_000.0,
+        bid_depth_050=20_000.0,
+        ask_depth_050=20_000.0,
+        original_rank=1,
+    )
+
+    result = rank_capital_efficiency([thin, deep])
+    by_symbol = {
+        item.capital_efficiency.symbol: item.capital_efficiency
+        for item in result
+    }
+
+    assert by_symbol["DEEPUSD"].capacity_status == "PASS"
+    assert by_symbol["DEEPUSD"].capacity_scalable_fraction == 1.0
+    assert by_symbol["THINUSD"].capacity_status == "CAPPED"
+    assert by_symbol["THINUSD"].capacity_scalable_fraction == 0.5
+    assert (
+        by_symbol["THINUSD"].capital_deployability_score
+        < by_symbol["DEEPUSD"].capital_deployability_score
+    )
+    assert result[0].capital_efficiency.symbol == "DEEPUSD"
+
+
+def test_unknown_or_too_small_capacity_cannot_win_global_rank():
+    strong_but_unexecutable = ranked(
+        "THINUSD",
+        base_score=100.0,
+        target_move_pct=30.0,
+        net_profit=600.0,
+        liquidity_24h=50_000.0,
+        bid_depth_050=400.0,
+        ask_depth_050=400.0,
+        original_rank=1,
+    )
+    executable = ranked(
+        "EXECUSD",
+        base_score=70.0,
+        original_rank=2,
+    )
+
+    result = rank_capital_efficiency(
+        [strong_but_unexecutable, executable]
+    )
+
+    assert result[0].capital_efficiency.symbol == "EXECUSD"
+    thin_result = result[-1].capital_efficiency
+    assert thin_result.symbol == "THINUSD"
+    assert thin_result.capacity_eligible is False
+    assert thin_result.total_score == 0.0
 
 
 def test_score_is_bounded_and_rank_is_deterministic():
