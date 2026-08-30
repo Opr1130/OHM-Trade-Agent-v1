@@ -1,7 +1,7 @@
 """Paper-learning direction readiness for O'Pip Sequence 5 Wave A3.
 
 This module reports capability; it never enables paper or funded execution.
-Current production Paper Trade v1 is spot-LONG only. SHORT/futures learning
+Current production Paper Trade v1 is spot-LONG only. SHORT/extended_short learning
 therefore remains explicitly NOT_READY until direction-safe lifecycle and cost
 accounting are implemented and reviewed.
 """
@@ -57,7 +57,7 @@ class PaperDirectionReadiness:
 class PaperLearningReadinessReport:
     long: PaperDirectionReadiness
     short: PaperDirectionReadiness
-    futures_learning_ready: bool
+    extended_short_learning_ready: bool
     measurement_only: bool = True
     funded_execution_allowed: bool = False
     trade_authority_changed: bool = False
@@ -67,7 +67,7 @@ class PaperLearningReadinessReport:
         return {
             "long": self.long.as_dict(),
             "short": self.short.as_dict(),
-            "futures_learning_ready": self.futures_learning_ready,
+            "extended_short_learning_ready": self.extended_short_learning_ready,
             "measurement_only": True,
             "funded_execution_allowed": False,
             "trade_authority_changed": False,
@@ -105,5 +105,5 @@ def assess_paper_learning_readiness(
     return PaperLearningReadinessReport(
         long=long,
         short=short,
-        futures_learning_ready=False,
+        extended_short_learning_ready=False,
     )
