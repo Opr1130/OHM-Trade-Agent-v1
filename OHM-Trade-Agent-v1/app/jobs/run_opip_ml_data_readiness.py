@@ -15,6 +15,7 @@ ML_SNAPSHOT_DIR = Path("/app/data/opip_ml_feature_snapshots_v1")
 PHASE3C_OUTCOMES = Path("/app/data/phase3c_forward_outcomes.jsonl")
 PAPER_STATE = Path("/app/data/paper_trading/state.json")
 CAPTURE_HEALTH = Path("/app/data/opip_ml_capture_health.json")
+CAPTURE_DEAD_LETTER = Path("/app/data/opip_ml_capture_dead_letter.jsonl")
 READINESS_REPORT = Path("/app/data/opip_ml_data_readiness_v1.json")
 
 
@@ -115,6 +116,7 @@ def build_production_readiness_report(
     phase3c_path: Path = PHASE3C_OUTCOMES,
     paper_state_path: Path = PAPER_STATE,
     capture_health_path: Path = CAPTURE_HEALTH,
+    capture_dead_letter_path: Path = CAPTURE_DEAD_LETTER,
     long_paper_production_verified: bool = False,
 ) -> dict[str, Any]:
     """Build one bounded production-evidence readiness snapshot."""
@@ -122,12 +124,14 @@ def build_production_readiness_report(
     ml_rows, ml_malformed = _ml_rows(snapshot_dir)
     phase3c_rows, phase3c_malformed = _jsonl_rows(phase3c_path)
     paper_rows, paper_malformed = _paper_rows(paper_state_path)
+    dead_letter_rows, dead_letter_malformed = _jsonl_rows(capture_dead_letter_path)
     health, health_malformed = _capture_health(capture_health_path)
     health["malformed"] = int(health.get("malformed", 0) or 0) + (
         canonical_malformed
         + ml_malformed
         + phase3c_malformed
         + paper_malformed
+        + dead_letter_malformed
         + health_malformed
     )
     report = build_ml_data_readiness_report(
@@ -136,6 +140,7 @@ def build_production_readiness_report(
         phase3c_outcome_rows=phase3c_rows,
         paper_trade_rows=paper_rows,
         capture_health=health,
+        capture_dead_letter_rows=dead_letter_rows,
     )
     return {
         "record_type": "OPIP_ML_DATA_READINESS_V1",
