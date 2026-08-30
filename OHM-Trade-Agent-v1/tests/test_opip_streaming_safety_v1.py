@@ -225,6 +225,7 @@ def test_production_compose_stream_worker_is_isolated():
     assert './data/opip/streaming:/app/data/opip/streaming:ro' in compose
     worker = compose.split("  opip-stream-worker:", 1)[1]
     assert "\n    ports:" not in worker
+    assert "\n    env_file:" not in worker
     assert 'OPIP_STREAMING_ENABLED: "true"' in worker
     assert "app.opip.streaming.worker" in worker
 
