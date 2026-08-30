@@ -89,8 +89,9 @@ class CrossVenueFeatureAccumulator:
             raise ValueError("max_buckets must be at least 6")
         self._max_buckets = int(max_buckets)
         self._buckets: dict[tuple[str, datetime], _FeatureBucket] = {}
-        self._ready: deque[StreamingFeatureSnapshot] = deque(maxlen=max_buckets)
+        self._ready: deque[StreamingFeatureSnapshot] = deque()
         self.dropped_buckets = 0
+        self.dropped_ready_snapshots = 0
         self.invalid_identity_observations = 0
 
     def record(self, normalized: NormalizedStreamObservation) -> None:
@@ -192,6 +193,9 @@ class CrossVenueFeatureAccumulator:
         else:
             sync_state = LiquidationSyncState.INSUFFICIENT_EVIDENCE
 
+        if len(self._ready) >= self._max_buckets:
+            self._ready.popleft()
+            self.dropped_ready_snapshots += 1
         self._ready.append(
             StreamingFeatureSnapshot(
                 canonical_asset_id=bucket.asset,
