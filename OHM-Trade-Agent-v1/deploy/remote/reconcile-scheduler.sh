@@ -98,7 +98,7 @@ crontab "$tmpdir/root.after"
 grep -q 'app.jobs.run_cycle' "$CANONICAL_DST"
 grep -q 'app.jobs.run_opip_ml_capture' "$ML_EVIDENCE_DST"
 grep -q 'app.jobs.build_phase3c_forward_outcomes' "$ML_EVIDENCE_DST"
-grep -q '/var/run/opip-ml-capture.lock' "$ML_EVIDENCE_DST"
+grep -q '/var/run/opip-ml-capture-trigger.lock' "$ML_EVIDENCE_DST"
 grep -q '/var/run/opip-ml-outcomes.lock' "$ML_EVIDENCE_DST"
 # Only executable cron content is authoritative. Scan the full file in one pass
 # so pipefail/SIGPIPE cannot hide a real forbidden-lock match.
