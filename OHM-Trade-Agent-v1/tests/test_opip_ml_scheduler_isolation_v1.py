@@ -162,3 +162,26 @@ def test_background_launch_lock_is_distinct_from_capture_state_lock():
     assert f'DEFAULT_ML_CAPTURE_LOCK_FILE = Path("{state}")' in service
     assert f"flock -n {state}" not in cron
     assert f"flock -n {state}" not in deploy
+
+
+def test_deploy_reconciles_paper_topology_before_marking_last_good():
+    source = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
+        encoding="utf-8"
+    )
+    assert 'PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"' in source
+    assert "start_paper_stack" in source
+    assert "wait_paper_health" in source
+    assert "freqtrade_dry_run_status" in source
+    assert "exchange_write_authority" in source
+    assert "snapshot_scheduler_state" in source
+    assert "restore_scheduler_state" in source
+    assert source.rfind("wait_paper_health") < source.rfind('> "$LAST_GOOD_FILE"')
+
+
+def test_deploy_stops_paper_before_target_build():
+    source = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
+        encoding="utf-8"
+    )
+    marker = "# Stop paper workers during the build/recreate window."
+    section = source[source.index(marker):]
+    assert section.index("stop_paper_stack") < section.index("docker compose build ohm-trade-agent")
