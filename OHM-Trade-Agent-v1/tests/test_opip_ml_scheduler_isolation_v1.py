@@ -123,9 +123,9 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert "--cap-drop ALL" in source
     assert "trap cleanup EXIT INT TERM" in source
     assert 'docker rm -f "${remaining_ids[@]}"' in source
-    assert 'MEMORY_LIMIT="384m"' in source
-    assert 'MEMORY_LIMIT="512m"' in source
-    assert "MIN_AVAILABLE_KB" in source
+    assert source.count('MEMORY_LIMIT="384m"') == 2
+    assert 'MEMORY_LIMIT="512m"' not in source
+    assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
 
 
 def test_learning_systemd_services_enforce_post_run_cleanup():
@@ -138,7 +138,8 @@ def test_learning_systemd_services_enforce_post_run_cleanup():
     for source, job in ((capture, "capture"), (outcomes, "outcomes")):
         assert "Type=oneshot" in source
         assert "KillMode=control-group" in source
-        assert "RuntimeMaxSec=" in source
+        assert "TimeoutStartSec=" in source
+        assert "RuntimeMaxSec=" not in source
         assert f"ExecStart=/usr/local/sbin/opip-learning-job {job}" in source
         assert f"ExecStopPost=/usr/local/sbin/opip-learning-cleanup {job}" in source
 
@@ -255,3 +256,32 @@ def test_learning_bootstrap_keeps_timers_disabled_until_validation():
 def test_learning_cleanup_checks_all_container_states():
     cleanup = (LEARNING / "opip-learning-cleanup.sh").read_text(encoding="utf-8")
     assert 'docker ps -aq --filter "label=$LABEL"' in cleanup
+
+
+def test_learning_capture_uses_bounded_outbox_cursor_and_disk_dedup():
+    source = (
+        ROOT / "app" / "services" / "p1_shadow_outbox.py"
+    ).read_text(encoding="utf-8")
+    assert "OUTBOX_CHECKPOINT_SCHEMA_VERSION = 2" in source
+    assert "byte_offset" in source
+    assert "anchor_sha256" in source
+    assert "source_tail_sha256" in source
+    assert "source_size" in source
+    assert "CHECKPOINT_SOURCE_DIVERGED" in source
+    assert "sqlite3.connect" in source
+    assert "snapshot_ids" in source
+    assert "_read_complete_outbox_lines" not in source
+    assert "_ledger_snapshot_ids" not in source
+
+
+def test_learning_outcomes_use_bounded_queue_and_filtered_observations():
+    source = (
+        ROOT / "app" / "jobs" / "build_phase3c_forward_outcomes.py"
+    ).read_text(encoding="utf-8")
+    assert "build_outcomes_bounded" in source
+    assert "snapshot_queue" in source
+    assert "latest_outcomes" in source
+    assert "max_snapshots" in source
+    assert "symbols=symbols" in source
+    assert "start_at=min(decision_times)" in source
+    assert "end_at=max(decision_times)" in source

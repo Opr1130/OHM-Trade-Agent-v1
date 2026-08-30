@@ -9,10 +9,12 @@ no Telegram action, and no trading-state mutation.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 from app.services.phase3c_outcomes import build_forward_outcome_labels
@@ -99,6 +101,645 @@ def _latest_by_snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
             latest[snapshot_id] = row
     return latest
 
+
+
+BOUNDED_MAX_SNAPSHOTS = 500
+BOUNDED_BASELINE_LOOKBACK = timedelta(hours=24)
+BOUNDED_FORWARD_GRACE = timedelta(hours=25)
+BOUNDED_RETRY_DELAY = timedelta(hours=1)
+BOUNDED_CHECKPOINT_ANCHOR_BYTES = 4096
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _bounded_state_path(output_path: Path) -> Path:
+    return output_path.parent / f".{output_path.name}.state.sqlite3"
+
+
+def _open_bounded_state(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS latest_outcomes (
+            snapshot_id TEXT PRIMARY KEY,
+            outcome_record_id TEXT NOT NULL,
+            outcome_revision INTEGER NOT NULL,
+            window_complete INTEGER NOT NULL,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snapshot_queue (
+            snapshot_id TEXT PRIMARY KEY,
+            decision_at TEXT NOT NULL,
+            next_due_at TEXT NOT NULL,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_queue_due "
+        "ON snapshot_queue(next_due_at, decision_at)"
+    )
+    connection.commit()
+    return connection
+
+
+def _state_int(connection: sqlite3.Connection, key: str, default: int = 0) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return default
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def _set_state_int(connection: sqlite3.Connection, key: str, value: int) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(int(value))),
+    )
+
+
+def _state_text(
+    connection: sqlite3.Connection,
+    key: str,
+) -> str | None:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _set_state_text(
+    connection: sqlite3.Connection,
+    key: str,
+    value: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def _file_anchor(path: Path, offset: int) -> tuple[int, int, str | None]:
+    if offset <= 0:
+        return 0, 0, None
+    start = max(0, offset - BOUNDED_CHECKPOINT_ANCHOR_BYTES)
+    size = offset - start
+    with path.open("rb") as handle:
+        handle.seek(start)
+        payload = handle.read(size)
+    if len(payload) != size:
+        raise RuntimeError("LEDGER_CHECKPOINT_SHORT_READ")
+    return start, size, hashlib.sha256(payload).hexdigest()
+
+
+def _state_checkpoint_matches(
+    connection: sqlite3.Connection,
+    path: Path,
+    prefix: str,
+    offset: int,
+) -> bool:
+    if offset <= 0:
+        return True
+    expected = _state_text(connection, f"{prefix}_anchor_sha256")
+    start = _state_int(connection, f"{prefix}_anchor_start", -1)
+    size = _state_int(connection, f"{prefix}_anchor_size", -1)
+    if (
+        not expected
+        or start < 0
+        or size <= 0
+        or start + size != offset
+    ):
+        return False
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            payload = handle.read(size)
+    except OSError:
+        return False
+    return (
+        len(payload) == size
+        and hashlib.sha256(payload).hexdigest() == expected
+    )
+
+
+def _set_state_checkpoint(
+    connection: sqlite3.Connection,
+    path: Path,
+    prefix: str,
+    offset: int,
+) -> None:
+    _set_state_int(connection, f"{prefix}_indexed_offset", offset)
+    if offset <= 0:
+        _set_state_int(connection, f"{prefix}_anchor_start", 0)
+        _set_state_int(connection, f"{prefix}_anchor_size", 0)
+        _set_state_text(connection, f"{prefix}_anchor_sha256", "")
+        return
+    start, size, digest = _file_anchor(path, offset)
+    _set_state_int(connection, f"{prefix}_anchor_start", start)
+    _set_state_int(connection, f"{prefix}_anchor_size", size)
+    _set_state_text(connection, f"{prefix}_anchor_sha256", digest or "")
+
+
+def _upsert_latest_outcome(
+    connection: sqlite3.Connection,
+    row: dict[str, Any],
+) -> None:
+    snapshot_id = str(row.get("snapshot_id", "") or "")
+    if not snapshot_id:
+        return
+    connection.execute(
+        """
+        INSERT INTO latest_outcomes(
+            snapshot_id,
+            outcome_record_id,
+            outcome_revision,
+            window_complete,
+            row_json
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_id) DO UPDATE SET
+            outcome_record_id = excluded.outcome_record_id,
+            outcome_revision = excluded.outcome_revision,
+            window_complete = excluded.window_complete,
+            row_json = excluded.row_json
+        WHERE excluded.outcome_revision >= latest_outcomes.outcome_revision
+        """,
+        (
+            snapshot_id,
+            str(row.get("outcome_record_id", "") or ""),
+            int(row.get("outcome_revision", 0) or 0),
+            1 if bool(row.get("window_complete", False)) else 0,
+            json.dumps(row, sort_keys=True, allow_nan=False),
+        ),
+    )
+
+
+def _reconcile_output_state(
+    connection: sqlite3.Connection,
+    output_path: Path,
+) -> None:
+    indexed_offset = _state_int(connection, "output_indexed_offset", 0)
+    if not output_path.exists():
+        if indexed_offset:
+            raise RuntimeError("OUTCOME_LEDGER_TRUNCATED")
+        return
+
+    size = output_path.stat().st_size
+    if indexed_offset > size:
+        raise RuntimeError("OUTCOME_LEDGER_TRUNCATED")
+    if not _state_checkpoint_matches(
+        connection,
+        output_path,
+        "output",
+        indexed_offset,
+    ):
+        raise RuntimeError("OUTCOME_LEDGER_DIVERGED")
+
+    last_complete = indexed_offset
+    with output_path.open("rb") as handle:
+        handle.seek(indexed_offset)
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            end = handle.tell()
+            if not raw.endswith(b"\n"):
+                break
+            last_complete = end
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(row, dict):
+                _upsert_latest_outcome(connection, row)
+
+    _set_state_checkpoint(
+        connection,
+        output_path,
+        "output",
+        last_complete,
+    )
+    connection.commit()
+
+
+def _next_due_at(
+    row: dict[str, Any],
+    *,
+    evaluated_at: datetime,
+) -> datetime | None:
+    if bool(row.get("window_complete", False)):
+        return None
+    reference_at = _parse_utc(
+        row.get("reference_at", row.get("decision_at_utc"))
+    )
+    if reference_at is None:
+        return evaluated_at + BOUNDED_RETRY_DELAY
+
+    milestones = (
+        timedelta(minutes=5),
+        timedelta(minutes=15),
+        timedelta(minutes=30),
+        timedelta(minutes=60),
+        timedelta(hours=4),
+        timedelta(hours=8),
+        timedelta(hours=24),
+    )
+    for delta in milestones:
+        due = reference_at + delta
+        if due > evaluated_at:
+            return due
+    if evaluated_at >= reference_at + BOUNDED_FORWARD_GRACE:
+        return None
+    return evaluated_at + BOUNDED_RETRY_DELAY
+
+
+def _latest_outcome_row(
+    connection: sqlite3.Connection,
+    snapshot_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT row_json FROM latest_outcomes WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _reconcile_snapshot_queue(
+    connection: sqlite3.Connection,
+    snapshot_path: Path,
+    *,
+    now: datetime,
+) -> None:
+    indexed_offset = _state_int(connection, "snapshot_indexed_offset", 0)
+    if not snapshot_path.exists():
+        if indexed_offset:
+            raise RuntimeError("SNAPSHOT_LEDGER_TRUNCATED")
+        return
+
+    size = snapshot_path.stat().st_size
+    if indexed_offset > size:
+        raise RuntimeError("SNAPSHOT_LEDGER_TRUNCATED")
+    if not _state_checkpoint_matches(
+        connection,
+        snapshot_path,
+        "snapshot",
+        indexed_offset,
+    ):
+        raise RuntimeError("SNAPSHOT_LEDGER_DIVERGED")
+
+    last_complete = indexed_offset
+    with snapshot_path.open("rb") as handle:
+        handle.seek(indexed_offset)
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            end = handle.tell()
+            if not raw.endswith(b"\n"):
+                break
+            last_complete = end
+            try:
+                snapshot = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict):
+                continue
+
+            snapshot_id = str(snapshot.get("snapshot_id", "") or "")
+            decision_at = _parse_utc(snapshot.get("decision_at_utc"))
+            if not snapshot_id or decision_at is None:
+                continue
+
+            normalized_snapshot = {
+                **snapshot,
+                "decision_at_utc": decision_at.isoformat(),
+            }
+
+            prior = _latest_outcome_row(connection, snapshot_id)
+            if prior is not None and bool(prior.get("window_complete", False)):
+                connection.execute(
+                    "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                )
+                continue
+
+            next_due = (
+                _next_due_at(prior, evaluated_at=now)
+                if prior is not None
+                else decision_at
+            )
+            if next_due is None:
+                connection.execute(
+                    "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                )
+                continue
+            connection.execute(
+                """
+                INSERT INTO snapshot_queue(
+                    snapshot_id,
+                    decision_at,
+                    next_due_at,
+                    row_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    row_json = excluded.row_json,
+                    decision_at = excluded.decision_at
+                """,
+                (
+                    snapshot_id,
+                    decision_at.isoformat(),
+                    next_due.isoformat(),
+                    json.dumps(
+                        normalized_snapshot,
+                        sort_keys=True,
+                        allow_nan=False,
+                    ),
+                ),
+            )
+
+    _set_state_checkpoint(
+        connection,
+        snapshot_path,
+        "snapshot",
+        last_complete,
+    )
+    connection.commit()
+
+
+def _due_snapshot_batch(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT row_json
+        FROM snapshot_queue
+        WHERE next_due_at <= ?
+        ORDER BY decision_at, snapshot_id
+        LIMIT ?
+        """,
+        (now.isoformat(), int(limit)),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for (raw,) in rows:
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def _schedule_snapshot_after_evaluation(
+    connection: sqlite3.Connection,
+    row: dict[str, Any],
+    *,
+    evaluated_at: datetime,
+) -> None:
+    snapshot_id = str(row.get("snapshot_id", "") or "")
+    if not snapshot_id:
+        return
+    next_due = _next_due_at(row, evaluated_at=evaluated_at)
+    if next_due is None:
+        connection.execute(
+            "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        return
+    connection.execute(
+        "UPDATE snapshot_queue SET next_due_at = ? WHERE snapshot_id = ?",
+        (next_due.isoformat(), snapshot_id),
+    )
+
+
+def build_outcomes_bounded(
+    *,
+    snapshot_path: Path = DEFAULT_SNAPSHOT_LEDGER,
+    observation_path: Path = DEFAULT_OBSERVATION_FILE,
+    output_path: Path = DEFAULT_OUTPUT,
+    state_path: Path | None = None,
+    max_snapshots: int = BOUNDED_MAX_SNAPSHOTS,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Mature only a bounded due queue and a bounded observation time slice.
+
+    Snapshot/output cursors live in a disk-backed SQLite sidecar. Historical
+    JSONL files are scanned incrementally and never expanded wholesale into
+    Python objects on each timer run. Completed 24h labels leave the active
+    queue permanently; partial labels are revisited only at the next useful
+    horizon milestone.
+    """
+    if max_snapshots < 1:
+        raise ValueError("max_snapshots must be >= 1")
+    evaluated_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = output_path.parent / f".{output_path.name}.lock"
+    state_db = state_path or _bounded_state_path(output_path)
+
+    with registry_lock(lock):
+        _repair_truncated_jsonl_tail(output_path)
+        connection = _open_bounded_state(state_db)
+        try:
+            _reconcile_output_state(connection, output_path)
+            _reconcile_snapshot_queue(
+                connection,
+                snapshot_path,
+                now=evaluated_at,
+            )
+            snapshots = _due_snapshot_batch(
+                connection,
+                now=evaluated_at,
+                limit=max_snapshots,
+            )
+            if not snapshots:
+                return []
+
+            decision_times = [
+                parsed
+                for parsed in (
+                    _parse_utc(row.get("decision_at_utc"))
+                    for row in snapshots
+                )
+                if parsed is not None
+            ]
+            symbols = {
+                str(row.get("symbol", "") or "").upper()
+                for row in snapshots
+                if str(row.get("symbol", "") or "").strip()
+            }
+            if not decision_times or not symbols:
+                for snapshot in snapshots:
+                    connection.execute(
+                        "UPDATE snapshot_queue SET next_due_at = ? WHERE snapshot_id = ?",
+                        (
+                            (evaluated_at + BOUNDED_RETRY_DELAY).isoformat(),
+                            str(snapshot.get("snapshot_id", "") or ""),
+                        ),
+                    )
+                connection.commit()
+                return []
+
+            ingestion = read_observations(
+                observation_path,
+                symbols=symbols,
+                start_at=min(decision_times) - BOUNDED_BASELINE_LOOKBACK,
+                end_at=max(decision_times) + BOUNDED_FORWARD_GRACE,
+            )
+            labels = build_forward_outcome_labels(
+                snapshots,
+                ingestion.observations,
+            )
+            labels_by_snapshot = {
+                str(row.get("snapshot_id", "") or ""): row
+                for row in labels
+                if str(row.get("snapshot_id", "") or "")
+            }
+
+            current: list[dict[str, Any]] = []
+            pending: list[dict[str, Any]] = []
+            for snapshot in snapshots:
+                snapshot_id = str(snapshot.get("snapshot_id", "") or "")
+                label = labels_by_snapshot.get(snapshot_id)
+                if label is None:
+                    next_due = _next_due_at(
+                        snapshot,
+                        evaluated_at=evaluated_at,
+                    )
+                    if next_due is None:
+                        connection.execute(
+                            "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                            (snapshot_id,),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE snapshot_queue SET next_due_at = ? "
+                            "WHERE snapshot_id = ?",
+                            (next_due.isoformat(), snapshot_id),
+                        )
+                    continue
+
+                record_id = _outcome_record_id(label)
+                prior = _latest_outcome_row(connection, snapshot_id)
+                if (
+                    prior is not None
+                    and str(prior.get("outcome_record_id", "") or "") == record_id
+                ):
+                    current.append(prior)
+                    _schedule_snapshot_after_evaluation(
+                        connection,
+                        prior,
+                        evaluated_at=evaluated_at,
+                    )
+                    continue
+
+                revision = (
+                    int(prior.get("outcome_revision", 0) or 0) + 1
+                    if prior is not None
+                    else 1
+                )
+                row = {
+                    **label,
+                    "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
+                    "outcome_record_id": record_id,
+                    "outcome_revision": revision,
+                    "append_only": True,
+                }
+                pending.append(row)
+                current.append(row)
+
+            if pending:
+                with output_path.open("ab") as handle:
+                    for row in pending:
+                        handle.write(
+                            (
+                                json.dumps(
+                                    row,
+                                    sort_keys=True,
+                                    allow_nan=False,
+                                )
+                                + "\n"
+                            ).encode("utf-8")
+                        )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    end_offset = handle.tell()
+
+                for row in pending:
+                    _upsert_latest_outcome(connection, row)
+                    _schedule_snapshot_after_evaluation(
+                        connection,
+                        row,
+                        evaluated_at=evaluated_at,
+                    )
+                _set_state_checkpoint(
+                    connection,
+                    output_path,
+                    "output",
+                    end_offset,
+                )
+
+            connection.commit()
+            return sorted(
+                current,
+                key=lambda row: (
+                    str(row.get("reference_at", "")),
+                    str(row.get("symbol", "")),
+                    str(row.get("snapshot_id", "")),
+                ),
+            )
+        finally:
+            connection.close()
 
 def build_outcomes(
     *,
@@ -188,7 +829,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
-    labels = build_outcomes(
+    labels = build_outcomes_bounded(
         snapshot_path=args.snapshots,
         observation_path=args.observations,
         output_path=args.output,

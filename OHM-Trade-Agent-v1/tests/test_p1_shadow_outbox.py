@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import app.services.p1_shadow_outbox as p1_outbox
+
 from app.services.p1_shadow_outbox import (
     append_live_scan_snapshots,
     drain_outbox_to_evidence_ledger,
@@ -157,3 +159,251 @@ def test_processor_failure_does_not_advance_failing_line(tmp_path):
     assert result.stopped_on_error is True
     assert result.error_type == "TimeoutError"
     assert outbox_health(outbox_path=outbox, checkpoint_path=checkpoint)["backlog_rows"] == 1
+
+
+def test_checkpoint_v2_persists_bounded_byte_cursor_and_anchor(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["next_line"] == 1
+    assert 0 < saved["byte_offset"] < outbox.stat().st_size
+    assert saved["anchor_size"] > 0
+    assert len(saved["anchor_sha256"]) == 64
+    assert saved["source_size"] == outbox.stat().st_size
+    assert saved["source_tail_size"] > 0
+    assert len(saved["source_tail_sha256"]) == 64
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.processed == 1
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_checkpoint_anchor_rejects_rewritten_processed_prefix(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+
+    payload = outbox.read_bytes()
+    assert b"AUSD" in payload
+    outbox.write_bytes(payload.replace(b"AUSD", b"ZUSD", 1))
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.stopped_on_error is True
+    assert second.error_type == "CHECKPOINT_SOURCE_DIVERGED"
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_legacy_line_checkpoint_migrates_without_full_file_materialization(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+    checkpoint.write_text('{"next_line": 1}\n', encoding="utf-8")
+
+    result = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert result.processed == 1
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["next_line"] == 2
+    assert saved["byte_offset"] == outbox.stat().st_size
+
+
+def test_checkpoint_rejects_truncate_and_regrow_after_cursor(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    cursor = int(saved["byte_offset"])
+    prior_size = int(saved["source_size"])
+
+    original = outbox.read_bytes()
+    prefix = original[:cursor]
+    # Preserve every byte already processed, but replace the unprocessed
+    # generation and regrow past the prior size. Cursor-only continuity would
+    # accept this; the prior-source tail anchor must reject it.
+    replacement = prefix + (b'{"snapshot_id":"REPLACEMENT"}\n' * 200)
+    assert len(replacement) > prior_size
+    outbox.write_bytes(replacement)
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.stopped_on_error is True
+    assert second.error_type == "CHECKPOINT_SOURCE_DIVERGED"
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_ledger_partial_tail_is_repaired_before_next_append(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+
+    append_live_scan_snapshots(
+        [candidate("AUSD"), candidate("BUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert first.processed == 1
+
+    with ledger.open("ab") as handle:
+        handle.write(b'{"snapshot_id":"BROKEN"')
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+    )
+    assert second.processed == 1
+    rows = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 2
+    assert all(row.get("snapshot_id") != "BROKEN" for row in rows)
+
+
+def test_checkpoint_save_failure_returns_stopped_result(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+
+    append_live_scan_snapshots(
+        [candidate("AUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+
+    def fail_save(*args, **kwargs):
+        raise FileNotFoundError("simulated source replacement")
+
+    monkeypatch.setattr(p1_outbox, "_save_checkpoint_state", fail_save)
+
+    result = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+    )
+    assert result.stopped_on_error is True
+    assert result.error_type == "FileNotFoundError"
+    assert result.remaining_from_line == 0
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_rewritten_ledger_rebuilds_disk_dedup_index(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+
+    append_live_scan_snapshots(
+        [candidate("AUSD")],
+        decision_at=NOW,
+        path=outbox,
+        enabled=True,
+    )
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+    )
+    assert first.processed == 1
+
+    original = json.loads(ledger.read_text(encoding="utf-8").strip())
+    replacement = {
+        **original,
+        "snapshot_id": "REPLACEMENT-" + str(original["snapshot_id"]),
+    }
+    ledger.write_text(
+        json.dumps(replacement, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    checkpoint.unlink()
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+    )
+    assert second.processed == 1
+    assert second.duplicates == 0
+    rows = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(rows) == 2

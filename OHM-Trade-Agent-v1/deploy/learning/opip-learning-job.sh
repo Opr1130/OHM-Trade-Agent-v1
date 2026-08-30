@@ -26,9 +26,11 @@ case "$JOB" in
     ;;
   outcomes)
     MODULE="app.jobs.build_phase3c_forward_outcomes"
-    MEMORY_LIMIT="512m"
+    # Bounded queue/window processing keeps the Python working set below this
+    # hard cap; preserve host headroom on the 1 GiB learning worker.
+    MEMORY_LIMIT="384m"
     CPU_LIMIT="0.70"
-    MIN_AVAILABLE_KB=$((640 * 1024))
+    MIN_AVAILABLE_KB=$((512 * 1024))
     TIMEOUT_SECONDS=480
     ;;
   *)
