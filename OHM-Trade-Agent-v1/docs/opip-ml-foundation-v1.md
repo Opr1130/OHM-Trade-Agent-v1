@@ -11,8 +11,11 @@ cannot mutate deterministic risk/safety configuration.
 ## Point-in-time invariant
 
 ML features are eligible only when `visible_at <= decision_at`. Each feature
-carries `source_at`, `ingested_at`, `visible_at`, and a source version. Late or
-revised information is not allowed to rewrite historical decision-time state.
+carries mandatory `ingested_at` and `visible_at` plus a source version.
+`source_at` is retained when the provider exposes a trustworthy event timestamp;
+it remains explicitly absent when the provider does not. O'Pip never fabricates
+source time from receipt time. Late or revised information is not allowed to
+rewrite historical decision-time state.
 
 ## FeatureSnapshot
 
@@ -22,15 +25,21 @@ from the primary independent ML feature mapping.
 
 ## Labels
 
-Labels are direction-aware. Same-candle target/stop collisions are not assigned
-an invented order: when finer-grained evidence is unavailable the affected
-label is marked ambiguous/censored and excluded from the primary supervised
-training cohort.
+Labels are direction-aware. Each price bar declares its covered interval and
+actual `visible_at`; fixed-horizon closes carry their own availability time.
+The full barrier path must be contiguous through the declared horizon or the
+record is censored. Same-bar target/stop collisions are not assigned an invented
+order: when finer-grained evidence is unavailable the affected label is marked
+ambiguous/censored and excluded from the primary supervised training cohort.
+Label IDs hash the exact immutable label payload, including availability and
+cost-model versions.
 
 ## Dataset/validation
 
 Dataset manifests are immutable and versioned. Censored, ambiguous, data-gap,
-late-label, and schema-mismatched rows are excluded with explicit reasons.
+late-label, schema-mismatched, cost-model-mismatched, and semantically mislinked
+rows are excluded with explicit reasons. Included rows bind the exact snapshot
+and label identities used for training.
 Financial validation uses chronological splits with purge and embargo semantics;
 random train/test splitting is not the principal validation path.
 
