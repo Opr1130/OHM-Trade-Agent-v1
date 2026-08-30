@@ -41,6 +41,9 @@ def _feature(asset="bitcoin", start=NOW):
         liquidation_unknown_notional_usd=0.0,
         liquidation_sync_state="INSUFFICIENT_EVIDENCE",
         liquidation_venues=(),
+        liquidation_evidence_quality="INCOMPLETE",
+        liquidation_degradations=("EMPTY_WINDOW",),
+        liquidation_confirmable=False,
     )
 
 
@@ -179,8 +182,10 @@ def test_late_after_seal_never_reaches_feature_acceptance_and_degrades_quality()
         normalized,
         now_utc=RUNTIME_NOW + timedelta(milliseconds=10),
     ) is True
-    window = next(iter(runtime._windows.values()))
-    seal_at = window.bounds.end_utc + timedelta(milliseconds=2)
+    final_end = max(
+        window.bounds.end_utc for window in runtime._windows.values()
+    )
+    seal_at = final_end + timedelta(milliseconds=2)
     runtime._seal_and_prune(seal_at)
     assert notices == []
 
@@ -199,7 +204,7 @@ def test_late_after_seal_never_reaches_feature_acceptance_and_degrades_quality()
     ) is False
 
     runtime._seal_and_prune(
-        window.bounds.end_utc + timedelta(seconds=2)
+        final_end + timedelta(seconds=2)
     )
     assert notices
     assert all(
