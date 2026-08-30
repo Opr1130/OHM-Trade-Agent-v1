@@ -9,9 +9,9 @@ import signal
 import sys
 import time
 
-from app.core.config import get_settings
 from app.opip.streaming.binance import BinancePublicAdapter
 from app.opip.streaming.bybit import BybitPublicAdapter
+from app.opip.streaming.config import StreamingWorkerSettings
 from app.opip.streaming.contract import StreamProvider
 from app.opip.streaming.feature_accumulator import CrossVenueFeatureAccumulator
 from app.opip.streaming.instruments import initial_symbols
@@ -105,11 +105,11 @@ def _health_payload(
 
 
 async def run_worker() -> int:
-    settings = get_settings()
+    settings = StreamingWorkerSettings()
     store = StreamingShadowStore(
-        retention_hours=settings.opip_streaming_retention_hours
+        retention_hours=settings.retention_hours
     )
-    if not settings.opip_streaming_enabled:
+    if not settings.enabled:
         store.write_health(
             {
                 "schema_version": 1,
@@ -122,21 +122,21 @@ async def run_worker() -> int:
         )
         return 0
 
-    symbols = _parse_symbols(settings.opip_streaming_symbols)
+    symbols = _parse_symbols(settings.symbols)
     accumulator = CrossVenueFeatureAccumulator()
     runtime = StreamingRuntime(
         {
             StreamProvider.BINANCE: BinancePublicAdapter(
-                url=settings.opip_streaming_binance_url,
+                url=settings.binance_url,
                 symbols=symbols,
             ),
             StreamProvider.BYBIT: BybitPublicAdapter(
-                url=settings.opip_streaming_bybit_url,
+                url=settings.bybit_url,
                 symbols=symbols,
             ),
         },
         config=StreamingRuntimeConfig(
-            queue_maxsize=settings.opip_streaming_queue_maxsize,
+            queue_maxsize=settings.queue_maxsize,
             max_symbols=len(symbols),
         ),
         observation_sink=accumulator.record,
@@ -163,7 +163,7 @@ async def run_worker() -> int:
             try:
                 await asyncio.wait_for(
                     stop_event.wait(),
-                    timeout=settings.opip_streaming_health_interval_seconds,
+                    timeout=settings.health_interval_seconds,
                 )
                 break
             except asyncio.TimeoutError:
