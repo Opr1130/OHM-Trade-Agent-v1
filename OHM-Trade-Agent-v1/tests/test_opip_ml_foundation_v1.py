@@ -60,6 +60,34 @@ def _snapshot():
     )
 
 
+def test_feature_snapshot_preserves_missing_provider_source_time():
+    stamp = AvailabilityStamp(
+        source_at_utc=None,
+        ingested_at_utc=NOW - timedelta(seconds=1),
+        visible_at_utc=NOW,
+        source_version="kraken-rest-ticker-v1",
+    )
+    snapshot = seal_feature_snapshot(
+        episode_id="EP:no-source-time",
+        candidate_id=None,
+        decision_at_utc=NOW,
+        canonical_asset_id="bitcoin",
+        venue="KRAKEN",
+        pair="BTCUSD",
+        direction="LONG",
+        lane="PAPER",
+        regime=None,
+        feature_values={"last_price": 100.0},
+        availability={"last_price": stamp},
+        feature_schema_version="v1",
+        feature_calc_version="calc",
+        feature_dag_hash="dag",
+    )
+    row = snapshot.to_dict()["features"][0]
+    assert row["source_at_utc"] is None
+    assert row["visible_at_utc"] == NOW.isoformat()
+
+
 def test_feature_snapshot_rejects_future_visible_input():
     with pytest.raises(TemporalIntegrityError):
         seal_feature_snapshot(
