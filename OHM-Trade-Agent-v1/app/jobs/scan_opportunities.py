@@ -24,6 +24,7 @@ from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
 from app.services.active_trade_registry import get_active_trades
+from app.services.capital_efficiency_ranking import rank_capital_efficiency
 from app.services.canonical_episode_capture import (
     append_canonical_episode_snapshots,
     canonical_cohort_id,
@@ -49,7 +50,11 @@ from app.services.price_movement_learning import (
 )
 from app.services.price_movement_notifier import send_price_movement_update
 from app.services.price_movement_radar import evaluate_price_movement
-from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
+from app.services.profit_ranking import (
+    QualifiedOpportunity,
+    RankedOpportunity,
+    rank_profit_opportunities,
+)
 from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
 from app.services.short_target_attainability import evaluate_short_target_attainability
@@ -661,7 +666,7 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings):
         alert = opportunity.alert
         plan = opportunity.plan
         direction = str(opportunity.snapshot.trade_direction or "LONG").upper()
-        alert["profit_rank"] = ranked.rank
+        alert["opportunity_rank"] = ranked.rank
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
         gate = apply_action_gate(
@@ -1229,6 +1234,40 @@ def main():
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
 
+    capital_ranked = rank_capital_efficiency(ranked_opportunities)
+    print("===== O'PIP GLOBAL CAPITAL EFFICIENCY =====")
+    global_ranked_opportunities: list[RankedOpportunity] = []
+    for item in capital_ranked:
+        original = item.ranked_opportunity
+        alert = original.opportunity.alert
+        result = item.capital_efficiency
+        alert["profit_rank"] = item.original_rank
+        alert["opportunity_rank"] = item.rank
+        alert["capital_efficiency_score"] = result.total_score
+        alert["hold_proxy_hours"] = result.hold_proxy_hours
+        alert["net_return_velocity_proxy_pct_per_hour"] = (
+            result.net_return_velocity_pct_per_hour
+        )
+        alert["risk_efficiency_ratio"] = result.risk_efficiency_ratio
+        print(
+            f"GLOBAL RANK {item.rank} "
+            f"{original.opportunity.snapshot.trade_direction} "
+            f"{result.symbol}: "
+            f"CapitalEfficiency={result.total_score:.2f} "
+            f"ProfitRank={item.original_rank} "
+            f"HoldProxy={result.hold_proxy_hours:.2f}h "
+            f"NetReturnVelocity={result.net_return_velocity_pct_per_hour:.4f}%/h "
+            f"RiskEfficiency={result.risk_efficiency_ratio:.4f}"
+        )
+        global_ranked_opportunities.append(
+            RankedOpportunity(
+                rank=item.rank,
+                opportunity=original.opportunity,
+                profit_ranking=original.profit_ranking,
+            )
+        )
+    ranked_opportunities = global_ranked_opportunities
+
     actionable_ranked_opportunities = _apply_ranked_action_gates(
         ranked_opportunities,
         settings=settings,
@@ -1254,7 +1293,7 @@ def main():
         alert = opportunity.alert
         plan = opportunity.plan
         direction = opportunity.snapshot.trade_direction
-        alert["profit_rank"] = ranked.rank
+        alert["opportunity_rank"] = ranked.rank
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
         capture_snapshot_decision(
