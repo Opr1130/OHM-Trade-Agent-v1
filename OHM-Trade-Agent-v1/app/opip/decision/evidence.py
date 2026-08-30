@@ -12,6 +12,7 @@ from typing import Any
 from app.opip.decision.identity import normalize_direction
 from app.opip.decision.policy_snapshot import GatePolicySnapshot
 from app.opip.decision.serialization import canonical_data, canonical_serialize
+from app.opip.decision.versioning import app_code_fingerprint
 
 
 EVIDENCE_SCHEMA_VERSION = 2
@@ -55,12 +56,14 @@ class OPipDecisionEvidence:
     asset_identity_provenance: tuple[tuple[str, str], ...]
     candidate_snapshot_json: str
     gate_policy_snapshot: GatePolicySnapshot
+    engine_code_fingerprint: str
 
     cohort_id: str | None = None
     signal_id: str | None = None
     asset_display_name: str | None = None
     account_equity: float | None = None
     ai_evidence_json: str | None = None
+    ai_item_json: str | None = None
     market_intelligence_json: str | None = None
 
     provider_health_snapshot_ref: str | None = None
@@ -106,6 +109,8 @@ class OPipDecisionEvidence:
             raise ValueError("canonical identity, pair and market_type are required")
         if not self.asset_identity_provenance:
             raise ValueError("asset identity provenance is required")
+        if not str(self.engine_code_fingerprint or "").startswith("ACF:"):
+            raise ValueError("engine_code_fingerprint must use ACF: identity")
         if self.account_equity is not None:
             equity = float(self.account_equity)
             if not math.isfinite(equity) or equity < 0:
@@ -118,6 +123,11 @@ class OPipDecisionEvidence:
         for optional in (self.ai_evidence_json, self.market_intelligence_json):
             if optional is not None:
                 canonical_serialize(json.loads(optional))
+        if self.ai_item_json is not None:
+            ai_item = json.loads(self.ai_item_json)
+            if not isinstance(ai_item, dict):
+                raise ValueError("ai_item_json must encode an object")
+            canonical_serialize(ai_item)
         self.gate_policy_snapshot.validate_integrity()
 
     @classmethod
@@ -134,11 +144,13 @@ class OPipDecisionEvidence:
         asset_identity_provenance: tuple[tuple[str, str], ...],
         candidate_snapshot: Any,
         gate_policy_snapshot: GatePolicySnapshot,
+        engine_code_fingerprint: str | None = None,
         cohort_id: str | None = None,
         signal_id: str | None = None,
         asset_display_name: str | None = None,
         account_equity: float | None = None,
         ai_evidence: Any = None,
+        ai_item: Any = None,
         market_intelligence: Any = None,
         provider_health_snapshot_ref: str | None = None,
         event_snapshot_ref: str | None = None,
@@ -160,11 +172,17 @@ class OPipDecisionEvidence:
                 candidate_snapshot, field_name="candidate_snapshot"
             ),
             gate_policy_snapshot=gate_policy_snapshot,
+            engine_code_fingerprint=str(
+                engine_code_fingerprint or app_code_fingerprint()
+            ),
             cohort_id=cohort_id,
             signal_id=signal_id,
             asset_display_name=asset_display_name,
             account_equity=account_equity,
             ai_evidence_json=_optional_json(ai_evidence),
+            ai_item_json=(
+                None if ai_item is None else _object_json(ai_item, field_name="ai_item")
+            ),
             market_intelligence_json=_optional_json(market_intelligence),
             provider_health_snapshot_ref=provider_health_snapshot_ref,
             event_snapshot_ref=event_snapshot_ref,
@@ -185,6 +203,15 @@ class OPipDecisionEvidence:
         value = json.loads(self.ai_evidence_json)
         if not isinstance(value, dict):
             raise ValueError("ai_evidence must decode to an object")
+        return value
+
+    @property
+    def ai_item(self) -> dict[str, Any] | None:
+        if self.ai_item_json is None:
+            return None
+        value = json.loads(self.ai_item_json)
+        if not isinstance(value, dict):
+            raise ValueError("ai_item must decode to an object")
         return value
 
     @property
@@ -237,8 +264,10 @@ class OPipDecisionEvidence:
             "asset_identity_provenance": self.asset_identity_provenance,
             "candidate_snapshot": self.candidate_snapshot,
             "gate_policy_snapshot": self.gate_policy_snapshot.as_dict(),
+            "engine_code_fingerprint": self.engine_code_fingerprint,
             "account_equity": self.account_equity,
             "ai_evidence": self.ai_evidence,
+            "ai_item": self.ai_item,
             "market_intelligence": self.market_intelligence,
             "provider_health_snapshot_ref": self.provider_health_snapshot_ref,
             "event_snapshot_ref": self.event_snapshot_ref,

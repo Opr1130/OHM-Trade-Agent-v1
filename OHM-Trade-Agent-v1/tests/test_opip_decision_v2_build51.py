@@ -9,6 +9,7 @@ import pytest
 
 from app.opip.decision.engine import CandidateEvidence, OPipDecisionEngine
 from app.opip.decision.evidence import EvidenceCompleteness, OPipDecisionEvidence
+from app.opip.decision.funnel import AI_SUCCEEDED, AIStageEvidence
 from app.opip.decision.models import GATE_INDEX
 from app.opip.decision.models_v2 import (
     DecisionRole,
@@ -18,12 +19,13 @@ from app.opip.decision.models_v2 import (
 )
 from app.opip.decision.policy_snapshot import GatePolicySnapshot
 from app.opip.decision.replay import (
+    EngineCodeFingerprintMismatchError,
     EngineVersionMismatchError,
     PolicyVersionMismatchError,
     replay_decision,
 )
 from app.opip.decision.serialization import canonical_serialize
-from app.opip.decision.versioning import gate_policy_fingerprint
+from app.opip.decision.versioning import app_code_fingerprint, gate_policy_fingerprint
 from tests.test_opip_decision_engine_v1 import execution, snapshot
 
 
@@ -167,6 +169,30 @@ def test_identity_provenance_changes_hash():
     ).evidence_hash
 
 
+def test_ai_item_is_sealed_and_changes_evidence_hash():
+    ai_item = {
+        "decision": "reject",
+        "risk_level": "low",
+        "direction": "LONG",
+        "confidence": 95,
+        "rank": 1,
+    }
+    row = evidence(ai_item=ai_item)
+    before = row.evidence_hash
+    ai_item["decision"] = "alert"
+    assert row.evidence_hash == before
+    assert row.ai_item["decision"] == "reject"
+    assert before != evidence(
+        ai_item={
+            "decision": "alert",
+            "risk_level": "low",
+            "direction": "LONG",
+            "confidence": 95,
+            "rank": 1,
+        }
+    ).evidence_hash
+
+
 def test_decision_id_is_deterministic_and_role_scoped():
     row = evidence()
     common = dict(
@@ -184,6 +210,24 @@ def test_decision_id_is_deterministic_and_role_scoped():
     assert first != build_decision_id(
         decision_role=DecisionRole.CHALLENGER, **common
     )
+
+
+def test_decision_id_structured_hash_prevents_delimiter_collision():
+    left = build_decision_id(
+        candidate_id="candidate",
+        decision_role=DecisionRole.SHADOW_ENGINE,
+        engine_version="E|GPF:1",
+        gate_policy_fingerprint="EVH:1",
+        evidence_hash="X",
+    )
+    right = build_decision_id(
+        candidate_id="candidate",
+        decision_role=DecisionRole.SHADOW_ENGINE,
+        engine_version="E",
+        gate_policy_fingerprint="GPF:1|EVH:1",
+        evidence_hash="X",
+    )
+    assert left != right
 
 
 def test_v2_preserves_v1_result_and_gate_order():
@@ -210,6 +254,54 @@ def test_v2_preserves_v1_result_and_gate_order():
     assert v2.first_terminal_gate == v1.first_terminal_gate
 
 
+def test_live_and_replay_match_when_candidate_reaches_ai_stage():
+    candidate = snapshot()
+    candidate.execution_validation = execution(
+        estimated_visible_round_trip_market_drag_pct=0.1
+    )
+    ai_stage = AIStageEvidence(
+        invocation_status=AI_SUCCEEDED,
+        eligible_candidates_before_ai=1,
+        candidates_returned_by_ai=1,
+        confidences=[95],
+    )
+    ai_item = {
+        "decision": "reject",
+        "risk_level": "low",
+        "direction": "LONG",
+        "confidence": 95,
+        "rank": 1,
+    }
+    row = evidence(
+        candidate_snapshot=candidate,
+        ai_evidence=ai_stage,
+        ai_item=ai_item,
+    )
+    live = OPipDecisionEngine(
+        account_equity=row.account_equity,
+        decision_at=NOW,
+        ai_stage=ai_stage,
+    ).evaluate(
+        CandidateEvidence(
+            snapshot=candidate,
+            episode_id=row.episode_id,
+            signal_id=row.signal_id,
+            asset_display_name=row.asset_display_name,
+            pair=row.pair,
+            ai_item=ai_item,
+            market_intelligence=row.market_intelligence,
+        )
+    )
+    replayed = replay_decision(row)
+
+    assert replayed.decision == live.decision
+    assert replayed.first_terminal_gate == live.first_terminal_gate
+    assert replayed.terminal_reason_code == live.terminal_reason_code.value
+    assert [item.as_dict() for item in replayed.gate_results_ordered] == [
+        item.as_dict() for item in live.gate_results
+    ]
+
+
 def test_replay_is_byte_stable():
     first = replay_decision(evidence())
     second = replay_decision(evidence())
@@ -220,6 +312,22 @@ def test_replay_is_byte_stable():
 def test_replay_refuses_wrong_engine_version():
     with pytest.raises(EngineVersionMismatchError):
         replay_decision(evidence(), engine_version="OLD")
+
+
+def test_evidence_captures_current_application_code_fingerprint():
+    row = evidence()
+    assert row.engine_code_fingerprint == app_code_fingerprint()
+    assert row.engine_code_fingerprint.startswith("ACF:")
+    assert len(row.engine_code_fingerprint) == 68
+
+
+def test_replay_refuses_code_fingerprint_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        "app.opip.decision.replay.app_code_fingerprint",
+        lambda: "ACF:" + ("0" * 64),
+    )
+    with pytest.raises(EngineCodeFingerprintMismatchError):
+        replay_decision(evidence())
 
 
 def test_replay_refuses_policy_mismatch(monkeypatch):
@@ -255,6 +363,23 @@ def test_replay_does_not_read_event_store(monkeypatch):
         ),
     )
     replay_decision(evidence())
+
+
+def test_v2_rejects_duplicate_or_nonprefix_gate_sequences():
+    row = evidence()
+    decision = replay_decision(row)
+    first = decision.gate_results_ordered[0]
+    with pytest.raises(ValueError):
+        replace(decision, gate_results_ordered=(first, first))
+    if len(decision.gate_results_ordered) >= 3:
+        with pytest.raises(ValueError):
+            replace(
+                decision,
+                gate_results_ordered=(
+                    decision.gate_results_ordered[0],
+                    decision.gate_results_ordered[2],
+                ),
+            )
 
 
 def test_replay_keeps_engine_non_authoritative():

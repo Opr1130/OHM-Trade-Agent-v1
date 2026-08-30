@@ -14,7 +14,7 @@ from app.opip.decision.models_v2 import (
     ENGINE_VERSION,
     from_v1_decision,
 )
-from app.opip.decision.versioning import gate_policy_fingerprint
+from app.opip.decision.versioning import app_code_fingerprint, gate_policy_fingerprint
 
 
 class PolicyVersionMismatchError(RuntimeError):
@@ -22,6 +22,10 @@ class PolicyVersionMismatchError(RuntimeError):
 
 
 class EngineVersionMismatchError(RuntimeError):
+    pass
+
+
+class EngineCodeFingerprintMismatchError(RuntimeError):
     pass
 
 
@@ -65,6 +69,12 @@ def verify_exact_replay_runtime(
         raise EngineVersionMismatchError(
             f"requested engine {engine_version} != {ENGINE_VERSION}"
         )
+    current_code = app_code_fingerprint()
+    if current_code != evidence.engine_code_fingerprint:
+        raise EngineCodeFingerprintMismatchError(
+            "application code fingerprint differs from frozen evidence; "
+            "exact replay requires the matching source checkout"
+        )
 
 
 def replay_decision(
@@ -90,7 +100,7 @@ def replay_decision(
             signal_id=evidence.signal_id,
             asset_display_name=evidence.asset_display_name,
             pair=evidence.pair,
-            ai_item=(evidence.ai_evidence or {}).get("ai_item"),
+            ai_item=evidence.ai_item,
             market_intelligence=evidence.market_intelligence,
         )
     )

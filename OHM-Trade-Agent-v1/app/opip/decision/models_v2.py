@@ -14,6 +14,7 @@ from app.opip.decision.models import (
     GateName,
     GateResult,
     GATE_INDEX,
+    GATE_ORDER,
     ReasonClass,
 )
 from app.opip.decision.serialization import canonical_serialize
@@ -40,14 +41,14 @@ def build_decision_id(
     evidence_hash: str,
 ) -> str:
     role = DecisionRole(decision_role).value
-    basis = "|".join(
-        (
-            str(candidate_id),
-            role,
-            str(engine_version),
-            str(gate_policy_fingerprint),
-            str(evidence_hash),
-        )
+    basis = canonical_serialize(
+        {
+            "candidate_id": str(candidate_id),
+            "decision_role": role,
+            "engine_version": str(engine_version),
+            "gate_policy_fingerprint": str(gate_policy_fingerprint),
+            "evidence_hash": str(evidence_hash),
+        }
     )
     return "DEC:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
@@ -82,6 +83,7 @@ class AdmissionDecisionV2:
     gate_policy_fingerprint: str
     policy_snapshot_hash: str
     engine_version: str
+    engine_code_fingerprint: str
     feature_schema_version: str | None = FEATURE_SCHEMA_VERSION
     model_version: str | None = MODEL_VERSION
     schema_version: int = DECISION_SCHEMA_VERSION
@@ -103,10 +105,20 @@ class AdmissionDecisionV2:
             raise ValueError("evidence_hash must use EVH: identity")
         if self.evidence_snapshot_id != self.evidence_hash:
             raise ValueError("evidence_snapshot_id must retain the full evidence hash")
+        if not str(self.engine_code_fingerprint or "").startswith("ACF:"):
+            raise ValueError("engine_code_fingerprint must use ACF: identity")
 
-        indexes = [GATE_INDEX.get(result.gate, -1) for result in self.gate_results_ordered]
-        if indexes != sorted(indexes):
-            raise ValueError("gate_results_ordered must follow canonical GATE_ORDER")
+        gates = tuple(result.gate for result in self.gate_results_ordered)
+        expected_prefix = GATE_ORDER[: len(gates)]
+        if gates != expected_prefix:
+            raise ValueError(
+                "gate_results_ordered must be a duplicate-free canonical GATE_ORDER prefix"
+            )
+        if self.decision is DecisionOutcome.QUALIFIED:
+            if not gates or gates[-1] is not GateName.FINAL_QUALIFICATION:
+                raise ValueError(
+                    "QUALIFIED Decision V2 must include the full qualification gate prefix"
+                )
 
     @property
     def is_admitted(self) -> bool:
@@ -148,6 +160,7 @@ class AdmissionDecisionV2:
             "gate_policy_fingerprint": self.gate_policy_fingerprint,
             "policy_snapshot_hash": self.policy_snapshot_hash,
             "engine_version": self.engine_version,
+            "engine_code_fingerprint": self.engine_code_fingerprint,
             "feature_schema_version": self.feature_schema_version,
             "model_version": self.model_version,
         }
@@ -204,4 +217,5 @@ def from_v1_decision(
         gate_policy_fingerprint=fingerprint,
         policy_snapshot_hash=evidence.gate_policy_snapshot.snapshot_hash,
         engine_version=engine_version,
+        engine_code_fingerprint=evidence.engine_code_fingerprint,
     )

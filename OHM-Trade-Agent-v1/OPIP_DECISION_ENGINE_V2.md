@@ -15,8 +15,10 @@ engine.
 
 ## Evidence
 
-OPipDecisionEvidence seals candidate, AI, context, identity provenance and
-policy evidence at T0. Mutable objects are canonicalized to JSON when sealed.
+OPipDecisionEvidence seals candidate, AI-stage evidence, the selected
+candidate-specific AI item, context, identity provenance, policy evidence and
+an application-source fingerprint at T0. Mutable objects are canonicalized to
+JSON when sealed.
 The evidence identity is the full SHA-256 EVH digest; there is no truncated
 secondary identifier.
 
@@ -34,18 +36,19 @@ evidence only; BUILD 5.1 never writes frozen values into runtime policy.
 AdmissionDecisionV2 is built from V1 output and preserves gate_results as an
 ordered immutable tuple. Decision identity is:
 
-DEC:SHA256(candidate_id | decision_role | engine_version |
-           gate_policy_fingerprint | evidence_hash)
+DEC:SHA256(canonical structured JSON over candidate_id, decision_role,
+           engine_version, gate_policy_fingerprint and evidence_hash)
 
 Roles are PRODUCTION_REFERENCE, SHADOW_ENGINE, CHAMPION and CHALLENGER. Merely
 recording a role never changes trading authority.
 
 ## Replay boundary
 
-BUILD 5.1 claims exact re-evaluation only when both the current deterministic
-policy fingerprint and the compatible engine version match the frozen record.
-A mismatch raises explicitly. It does not silently run today's thresholds over
-old evidence and call that historical replay.
+BUILD 5.1 claims exact re-evaluation only when the current deterministic
+policy fingerprint, compatible engine version, and cached SHA-256 fingerprint
+of the application Python source tree match the frozen record. Any mismatch
+raises explicitly. It does not silently run today's thresholds or today's code
+over old evidence and call that historical replay.
 
 Replay consumes only the sealed evidence bundle; it does not query current
 provider health, EventStore, Risk Shield, asset aliases, market data, an
@@ -56,3 +59,18 @@ exchange, or a network service.
 BUILD 5.1 does not implement the sustained promotion ledger/cutover, Outcome
 Registry, counterfactual routing, learning governance, generalized
 champion/challenger promotion, futures, ML, merge, or deployment.
+
+
+## Independent-review remediation
+
+BUILD 5.1 was hardened after adversarial review before merge. Candidate-specific
+AI selection evidence is sealed independently from AI-stage telemetry and is
+replayed exactly. Decision identity now hashes a canonical structured object
+rather than delimiter-joined strings. Evidence also carries an ACF application
+source fingerprint, and replay refuses a different source checkout even when a
+manual engine label is unchanged. Decision V2 gate results must be a
+duplicate-free prefix of canonical gate order, and QUALIFIED decisions must
+reach FINAL_QUALIFICATION.
+
+The policy freeze/thaw representation cleanup and evidence-reference retention
+contract remain non-blocking BUILD 5.2A hardening.
