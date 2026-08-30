@@ -1091,14 +1091,41 @@ def main():
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
 
         if bool(getattr(settings, "opip_trade_quality_v2_enabled", False)):
-            candidate_id = str(
-                alert.get("signal_id")
-                or f"W9:{snapshot.symbol}:{direction}:{decision_at.isoformat()}"
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
             )
+            base_asset = str(
+                snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or (
+                    "USDT"
+                    if str(snapshot.symbol).upper().endswith("USDT")
+                    else "USD"
+                )
+            ).upper()
+            pair = to_freqtrade_pair(base_asset, quote_asset)
+            candidate_id = build_signal_id(
+                episode_id=episode_id,
+                pair=pair,
+                decision_at=decision_at,
+                direction=direction,
+            )
+            alert["signal_id"] = candidate_id
+            alert["_lineage_episode_id"] = episode_id
+            alert["_lineage_pair"] = pair
+            alert["_lineage_base_asset"] = base_asset
+            alert["_lineage_quote_asset"] = quote_asset
             feature_snapshot = build_trade_feature_snapshot(
                 snapshot,
                 decision_at=decision_at,
-                episode_id=f"W9EP:{candidate_id}",
+                episode_id=episode_id,
                 candidate_id=candidate_id,
                 regime=market_regime.regime,
             )
