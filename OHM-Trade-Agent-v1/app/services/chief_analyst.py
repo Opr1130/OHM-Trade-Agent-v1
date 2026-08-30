@@ -609,15 +609,16 @@ def review_candidates(
 
     blocked = budget_block_reason()
     if blocked:
-        alternate_plan = route_plan.without_provider("openai")
+        alternate_plan = route_plan.without_provider(
+            "openai",
+            reason_suffix="openai_budget_blocked",
+        )
         if alternate_plan.targets:
             route_plan = alternate_plan
             stage_evidence["provider"] = route_plan.targets[0].provider
             stage_evidence["model"] = route_plan.targets[0].model
             stage_evidence["reasoning_effort"] = route_plan.targets[0].reasoning_effort
-            stage_evidence["route_reason"] = (
-                f"{route_plan.route_reason}; openai_budget_blocked"
-            )
+            stage_evidence["route_reason"] = route_plan.route_reason
         else:
             _trace_chief_failure(
                 chief_eligible_candidates,
