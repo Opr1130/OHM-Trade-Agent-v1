@@ -157,7 +157,7 @@ def resolve_barrier_labels(
     if total_cost_bps < 0 or not math.isfinite(float(total_cost_bps)):
         raise ValueError("total_cost_bps must be finite and non-negative")
 
-    rows = sorted(
+    relevant_rows = sorted(
         (
             bar
             for bar in bars
@@ -165,10 +165,23 @@ def resolve_barrier_labels(
         ),
         key=lambda bar: (bar.interval_start_utc, bar.interval_end_utc),
     )
-    data_gap = not _path_is_complete(
+    boundary_straddle = any(
+        bar.interval_start_utc < decision or bar.interval_end_utc > horizon
+        for bar in relevant_rows
+    )
+    rows = [
+        bar
+        for bar in relevant_rows
+        if bar.interval_start_utc >= decision and bar.interval_end_utc <= horizon
+    ]
+    overlapping_intervals = any(
+        current.interval_start_utc < previous.interval_end_utc
+        for previous, current in zip(rows, rows[1:])
+    )
+    data_gap = boundary_straddle or not _path_is_complete(
         rows, decision_at_utc=decision, horizon_end_utc=horizon
     )
-    ambiguous = False
+    ambiguous = overlapping_intervals
     tp1_time = tp2_time = sl_time = None
 
     for bar in rows:
@@ -216,7 +229,7 @@ def resolve_barrier_labels(
             tp1_time is None or sl_time < tp1_time
         )
 
-    if rows and not data_gap:
+    if rows and not censored:
         favorable = [
             _signed_return_bps(entry_price, bar.high, direction)
             if direction == "LONG"
@@ -235,15 +248,21 @@ def resolve_barrier_labels(
         mfe_bps = mae_bps = None
 
     input_visibility = [horizon]
-    input_visibility.extend(bar.visible_at_utc for bar in rows)
+    input_visibility.extend(bar.visible_at_utc for bar in relevant_rows)
     input_visibility.extend(close_visibility)
     available = max(input_visibility)
     if computed < available:
         raise ValueError("computed_at_utc cannot precede label input availability")
 
-    time_to_tp1 = (tp1_time - decision).total_seconds() if tp1_time else None
-    time_to_tp2 = (tp2_time - decision).total_seconds() if tp2_time else None
-    time_to_sl = (sl_time - decision).total_seconds() if sl_time else None
+    time_to_tp1 = (
+        (tp1_time - decision).total_seconds() if tp1_time is not None and not censored else None
+    )
+    time_to_tp2 = (
+        (tp2_time - decision).total_seconds() if tp2_time is not None and not censored else None
+    )
+    time_to_sl = (
+        (sl_time - decision).total_seconds() if sl_time is not None and not censored else None
+    )
 
     hash_payload = {
         "snapshot_id": snapshot_id,
