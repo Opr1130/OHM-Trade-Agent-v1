@@ -197,6 +197,24 @@ def test_ml_snapshot_uses_conservative_decision_visibility_and_no_source_fabrica
     assert "decision_status" not in snapshot.ml_feature_mapping()
 
 
+def test_ml_snapshot_marks_only_unsuppressed_scored_eligible_spot_as_long():
+    row = _canonical_row()
+    row["decision_status"] = "SCORED_ELIGIBLE"
+    row["suppressed"] = False
+    row["source_exchange"] = "KRAKEN_SPOT"
+    snapshot = build_ml_snapshot_from_canonical(row)
+    assert snapshot.direction == "LONG"
+
+    suppressed = dict(row)
+    suppressed["decision_status"] = "SCORED_SUPPRESSED"
+    suppressed["suppressed"] = True
+    assert build_ml_snapshot_from_canonical(suppressed).direction == "NONE"
+
+    malformed_suppression = dict(row)
+    malformed_suppression["suppressed"] = "false"
+    assert build_ml_snapshot_from_canonical(malformed_suppression).direction == "NONE"
+
+
 def test_ml_snapshot_rejects_seed_visible_after_decision():
     row = _canonical_row()
     row["ml_feature_seed"]["availability"]["visible_at_utc"] = (

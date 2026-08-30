@@ -118,16 +118,16 @@ def test_production_scored_eligible_maps_to_primary_paper_cohort():
     assert row.primary_supervised_eligible is True
 
 
-def test_feature_direction_none_can_bind_only_from_exact_final_paper_lifecycle():
-    """Verify production direction NONE binds only to the exact paper trade side."""
+def test_feature_direction_none_cannot_enter_primary_supervised_cohort():
+    """Verify direction NONE remains non-trainable even with exact final paper evidence."""
     row = build_learning_linkage_records(
         canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
         ml_snapshot_rows=[_ml(direction="NONE")],
         paper_trade_rows=[_paper(direction="LONG")],
     )[0]
     assert row.linkage_status is LinkageStatus.COMPLETE_FINAL
-    assert row.primary_supervised_eligible is True
-    assert "DIRECTION_BOUND_FROM_EXACT_PAPER_LIFECYCLE" in row.exclusion_reasons
+    assert row.primary_supervised_eligible is False
+    assert "ML_DIRECTION_NOT_TRAINABLE" in row.exclusion_reasons
 
 
 def test_feature_paper_direction_mismatch_cannot_train():
