@@ -11,6 +11,7 @@ from enum import Enum
 import hashlib
 import json
 import math
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.ml.temporal import AvailabilityStamp, assert_point_in_time, require_utc
@@ -23,7 +24,15 @@ MODEL_EVIDENCE_SCHEMA_VERSION = 1
 MODEL_REGISTRY_SCHEMA_VERSION = 1
 
 
-def _clean(value: Any) -> Any:
+def _freeze_jsonish(value: Any) -> Any:
+    """Deep-freeze deterministic JSON-like evidence.
+
+    Unsupported objects are rejected rather than converted to strings because
+    object representations can contain process-specific state and break replay
+    hashing.
+    """
+    if isinstance(value, Enum):
+        return _freeze_jsonish(value.value)
     if value is None or isinstance(value, (str, bool, int)):
         return value
     if isinstance(value, float):
@@ -33,12 +42,44 @@ def _clean(value: Any) -> Any:
     if isinstance(value, datetime):
         return require_utc(value, field_name="timestamp").isoformat()
     if isinstance(value, Mapping):
-        return {str(key): _clean(item) for key, item in sorted(value.items())}
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("evidence mapping keys must be strings")
+            frozen[key] = _freeze_jsonish(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_jsonish(item) for item in value)
+    raise TypeError(f"unsupported evidence type: {type(value).__name__}")
+
+
+def _clean(value: Any) -> Any:
+    """Convert frozen JSON-like evidence to canonical serialization values."""
+    if isinstance(value, Enum):
+        return _clean(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite numeric evidence is not allowed")
+        return value
+    if isinstance(value, datetime):
+        return require_utc(value, field_name="timestamp").isoformat()
+    if isinstance(value, Mapping):
+        items = []
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("evidence mapping keys must be strings")
+            items.append((key, _clean(item)))
+        return {key: item for key, item in sorted(items)}
     if isinstance(value, (tuple, list)):
         return [_clean(item) for item in value]
-    if isinstance(value, Enum):
-        return value.value
-    return str(value)
+    raise TypeError(f"unsupported evidence type: {type(value).__name__}")
+
+
+def _optional_finite(value: float | None, *, field_name: str) -> None:
+    if value is not None and not math.isfinite(float(value)):
+        raise ValueError(f"{field_name} must be finite when present")
 
 
 def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -67,8 +108,8 @@ class FeatureValue:
     def __post_init__(self) -> None:
         if not str(self.name or "").strip():
             raise ValueError("feature name is required")
-        _clean(self.value)
-        _clean(self.provenance)
+        object.__setattr__(self, "value", _freeze_jsonish(self.value))
+        object.__setattr__(self, "provenance", _freeze_jsonish(self.provenance))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -122,18 +163,25 @@ class FeatureSnapshot:
             raise ValueError("feature_dag_hash is required")
         if self.serialization_version <= 0:
             raise ValueError("serialization_version must be positive")
-        names = [feature.name for feature in self.features]
+        features = tuple(self.features)
+        names = [feature.name for feature in features]
         if len(names) != len(set(names)):
             raise ValueError("feature names must be unique")
         assert_point_in_time(
-            (feature.availability for feature in self.features),
+            (feature.availability for feature in features),
             decision_at_utc=decision,
         )
-        if self.audit_deterministic_score is not None and not math.isfinite(
-            float(self.audit_deterministic_score)
-        ):
-            raise ValueError("audit_deterministic_score must be finite")
+        _optional_finite(
+            self.audit_deterministic_score,
+            field_name="audit_deterministic_score",
+        )
+        frozen_versions = _freeze_jsonish(dict(self.source_versions))
+        for key, value in frozen_versions.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"source version for {key} must be a non-empty string")
         object.__setattr__(self, "decision_at_utc", decision)
+        object.__setattr__(self, "features", features)
+        object.__setattr__(self, "source_versions", frozen_versions)
         expected = stable_hash("MLSNAP", self.hash_payload())
         if self.snapshot_id != expected:
             raise ValueError("snapshot_id does not match canonical snapshot payload")
@@ -165,7 +213,30 @@ class FeatureSnapshot:
     def build(cls, **kwargs: Any) -> "FeatureSnapshot":
         payload = dict(kwargs)
         payload.setdefault("schema_version", FEATURE_SNAPSHOT_SCHEMA_VERSION)
+        payload.setdefault("source_versions", {})
+        payload.setdefault("audit_deterministic_engine_version", None)
+        payload.setdefault("audit_deterministic_score", None)
+        payload.setdefault("audit_deterministic_classification", None)
         payload["features"] = tuple(payload.get("features") or ())
+        required = (
+            "episode_id",
+            "candidate_id",
+            "decision_at_utc",
+            "canonical_asset_id",
+            "venue",
+            "pair",
+            "direction",
+            "lane",
+            "regime",
+            "feature_schema_version",
+            "feature_calc_version",
+            "feature_dag_hash",
+            "serialization_version",
+            "features",
+        )
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise TypeError("missing FeatureSnapshot fields: " + ", ".join(missing))
         provisional = cls.__new__(cls)
         for key, value in payload.items():
             object.__setattr__(provisional, key, value)
@@ -180,7 +251,7 @@ class FeatureSnapshot:
 
     def ml_feature_mapping(self) -> dict[str, Any]:
         """Runtime training/scoring inputs; deterministic audit fields excluded."""
-        return {feature.name: feature.value for feature in self.features}
+        return {feature.name: _clean(feature.value) for feature in self.features}
 
     def to_dict(self) -> dict[str, Any]:
         payload = self.hash_payload()
@@ -229,9 +300,18 @@ class SupervisedLabelRecord:
             raise ValueError("label direction must be LONG or SHORT")
         if not self.fee_model_version or not self.slippage_model_version:
             raise ValueError("fee and slippage model versions are required")
-        _clean(self.net_returns_bps)
+        for name in (
+            "mfe_bps",
+            "mae_bps",
+            "time_to_tp1_seconds",
+            "time_to_tp2_seconds",
+            "time_to_sl_seconds",
+        ):
+            _optional_finite(getattr(self, name), field_name=name)
+        frozen_returns = _freeze_jsonish(dict(self.net_returns_bps))
         object.__setattr__(self, "label_available_at_utc", available)
         object.__setattr__(self, "horizon_end_utc", horizon)
+        object.__setattr__(self, "net_returns_bps", frozen_returns)
 
 
 @dataclass(frozen=True)
@@ -273,6 +353,16 @@ class DatasetManifest:
             raise ValueError("embargo_seconds cannot be negative")
         if self.serialization_version <= 0:
             raise ValueError("serialization_version must be positive")
+        object.__setattr__(self, "cohort_filter", _freeze_jsonish(self.cohort_filter))
+        object.__setattr__(
+            self, "exclusion_policy", _freeze_jsonish(self.exclusion_policy)
+        )
+        object.__setattr__(
+            self, "included_snapshot_ids", tuple(self.included_snapshot_ids)
+        )
+        object.__setattr__(
+            self, "excluded_snapshot_ids", _freeze_jsonish(self.excluded_snapshot_ids)
+        )
 
 
 class ModelLifecycle(str, Enum):
@@ -314,6 +404,21 @@ class ModelRegistryRecord:
     rollback_model_id: str | None = None
     schema_version: int = MODEL_REGISTRY_SCHEMA_VERSION
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "hyperparameters", _freeze_jsonish(dict(self.hyperparameters))
+        )
+        approved = self.approved_at_utc
+        if approved is not None:
+            approved = require_utc(approved, field_name="approved_at_utc")
+            object.__setattr__(self, "approved_at_utc", approved)
+        if (self.approval_principal is None) != (approved is None):
+            raise ValueError("approval principal and timestamp must be supplied together")
+        if self.lifecycle == ModelLifecycle.CHALLENGER and (
+            not str(self.approval_principal or "").strip() or approved is None
+        ):
+            raise ValueError("CHALLENGER requires explicit approval metadata")
+
 
 @dataclass(frozen=True)
 class ModelEvidence:
@@ -344,6 +449,9 @@ class ModelEvidence:
             "scored_at_utc",
             require_utc(self.scored_at_utc, field_name="scored_at_utc"),
         )
+        object.__setattr__(
+            self, "out_of_distribution_flags", tuple(self.out_of_distribution_flags)
+        )
         for value in (
             self.p_tp1_before_sl,
             self.p_tp2_before_sl,
@@ -351,6 +459,11 @@ class ModelEvidence:
         ):
             if value is not None and not 0.0 <= float(value) <= 1.0:
                 raise ValueError("model probabilities must be in [0, 1]")
+        _optional_finite(
+            self.expected_net_return_bps, field_name="expected_net_return_bps"
+        )
+        if not math.isfinite(float(self.inference_latency_ms)):
+            raise ValueError("inference_latency_ms must be finite")
         if self.inference_latency_ms < 0:
             raise ValueError("inference_latency_ms cannot be negative")
 
@@ -389,3 +502,26 @@ class DriftHealthRecord:
             )
         if self.sample_count < 0:
             raise ValueError("sample_count cannot be negative")
+        if self.schema_incompatibility_count < 0:
+            raise ValueError("schema_incompatibility_count cannot be negative")
+        object.__setattr__(
+            self,
+            "input_distribution_drift",
+            _freeze_jsonish(dict(self.input_distribution_drift)),
+        )
+        object.__setattr__(
+            self,
+            "missingness_drift",
+            _freeze_jsonish(dict(self.missingness_drift)),
+        )
+        for name in (
+            "out_of_training_support_rate",
+            "prediction_distribution_drift",
+            "label_base_rate_drift",
+            "rolling_brier_score",
+            "rolling_calibration_error",
+            "performance_decay",
+            "model_staleness_seconds",
+            "operational_failure_rate",
+        ):
+            _optional_finite(getattr(self, name), field_name=name)
