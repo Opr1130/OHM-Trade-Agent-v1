@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 
@@ -21,10 +22,46 @@ def test_ml_evidence_cron_is_independent_from_unified_cycle_lock():
     assert "*/10 * * * * root" in cron
 
 
+def _module_path(module: str) -> Path | None:
+    candidate = ROOT / Path(*module.split("."))
+    file_path = candidate.with_suffix(".py")
+    if file_path.is_file():
+        return file_path
+    package_path = candidate / "__init__.py"
+    if package_path.is_file():
+        return package_path
+    return None
+
+
+def _first_party_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(
+                alias.name for alias in node.names if alias.name.startswith("app.")
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == "app" or node.module.startswith("app."):
+                names.add(node.module)
+    return names
+
+
 def test_unified_cycle_does_not_import_or_run_ml_capture():
-    source = (ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
-    assert "opip_ml_evidence_capture" not in source
-    assert "run_opip_ml_capture" not in source
+    seen: set[str] = set()
+    pending = ["app.jobs.run_cycle"]
+    while pending:
+        module = pending.pop()
+        if module in seen:
+            continue
+        seen.add(module)
+        path = _module_path(module)
+        if path is None:
+            continue
+        pending.extend(_first_party_imports(path) - seen)
+
+    assert "app.services.opip_ml_evidence_capture" not in seen
+    assert "app.jobs.run_opip_ml_capture" not in seen
 
 
 def test_scheduler_reconcile_installs_and_validates_ml_evidence_cron():
