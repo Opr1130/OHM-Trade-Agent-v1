@@ -186,6 +186,33 @@ def test_openai_budget_can_remove_only_openai_from_route(monkeypatch):
     assert [target.provider for target in plan.targets] == ["digitalocean"]
 
 
+def test_single_provider_failure_preserves_original_error_type(
+    monkeypatch, tmp_path
+):
+    _clear_router_env(monkeypatch)
+    monkeypatch.setattr(router, "ROUTER_USAGE_FILE", tmp_path / "usage.jsonl")
+    monkeypatch.setattr(router, "ROUTER_USAGE_LOCK", tmp_path / ".usage.lock")
+
+    plan = router.plan_chief_route(
+        _payload(count=5, score=70),
+        default_model="gpt-5.6",
+        openai_api_key="openai-test-key",
+    )
+
+    def fail(_target, **_kwargs):
+        raise RuntimeError("simulated connection refused")
+
+    monkeypatch.setattr(router, "_invoke_target", fail)
+
+    with pytest.raises(RuntimeError, match="simulated connection refused"):
+        router.invoke_chief_review(
+            plan,
+            system_prompt="system",
+            request_payload=_payload(count=5, score=70),
+            max_output_tokens=800,
+        )
+
+
 def test_router_fails_closed_when_no_provider_is_configured(monkeypatch):
     _clear_router_env(monkeypatch)
 
