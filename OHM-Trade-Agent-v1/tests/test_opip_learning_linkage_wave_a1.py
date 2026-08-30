@@ -97,9 +97,9 @@ def test_provisional_phase3c_never_becomes_primary_supervised_truth():
     assert "OUTCOME_PROVISIONAL_NOT_SUPERVISED_TRUTH" in row.exclusion_reasons
 
 
-def test_closed_exact_paper_outcome_can_qualify_primary_cohort():
+def test_production_scored_eligible_maps_to_primary_paper_cohort():
     row = build_learning_linkage_records(
-        canonical_rows=[_canonical()],
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
         ml_snapshot_rows=[_ml()],
         phase3c_outcome_rows=[_phase()],
         paper_trade_rows=[_paper()],
@@ -109,6 +109,16 @@ def test_closed_exact_paper_outcome_can_qualify_primary_cohort():
     assert row.normalized_outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
     assert row.paper_trade_id == "PT:1"
     assert row.primary_supervised_eligible is True
+
+
+def test_production_scored_suppressed_is_counterfactual_research_only():
+    row = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_SUPPRESSED", suppressed=True)],
+        ml_snapshot_rows=[_ml()],
+        paper_trade_rows=[_paper()],
+    )[0]
+    assert row.cohort is LearningCohort.COUNTERFACTUAL_REJECTED
+    assert row.primary_supervised_eligible is False
 
 
 def test_counterfactual_rejected_is_research_only_even_with_final_paper_row():
@@ -193,6 +203,35 @@ def test_duplicate_canonical_snapshot_identity_fails_closed():
             canonical_rows=[_canonical(), _canonical()],
             ml_snapshot_rows=[_ml()],
         )
+
+
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_nonfinite_final_paper_values_are_unusable(bad_value):
+    row = _paper()
+    row["net_pnl"] = bad_value
+    row["net_pnl_pct"] = bad_value
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
+
+    linkage = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+        ml_snapshot_rows=[_ml()],
+        paper_trade_rows=[row],
+    )[0]
+    assert linkage.primary_supervised_eligible is False
+
+
+@pytest.mark.parametrize("bad_flag", ["false", "true", 0, 1, None])
+def test_malformed_paper_authority_flags_are_unusable(bad_flag):
+    row = _paper()
+    row["paper_only"] = bad_flag
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
+
+    row = _paper()
+    row["exchange_write_authority"] = bad_flag
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
 
 
 def test_nonclosed_or_authoritative_paper_record_is_unusable():
