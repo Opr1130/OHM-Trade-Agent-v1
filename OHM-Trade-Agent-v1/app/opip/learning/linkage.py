@@ -595,25 +595,18 @@ def build_learning_linkage_records(
                     status = LinkageStatus.FEATURE_LINKED_NO_OUTCOME
                     reasons.append("PAPER_OUTCOME_NOT_FINAL_OR_UNUSABLE")
                 ml_direction = _ml_direction(ml_row)
-                effective_direction = ml_direction
-                if ml_direction is None and outcome.direction in {"LONG", "SHORT"}:
-                    # Current production capture seals generic observation snapshots
-                    # with direction=NONE. An exact paper lifecycle binds the trade
-                    # side selected for that same episode; this is decision/action
-                    # provenance, not a future market label.
-                    effective_direction = outcome.direction
-                    reasons.append("DIRECTION_BOUND_FROM_EXACT_PAPER_LIFECYCLE")
+                if ml_direction is None:
+                    reasons.append("ML_DIRECTION_NOT_TRAINABLE")
                 elif (
-                    ml_direction is not None
-                    and outcome.direction is not None
+                    outcome.direction is not None
                     and outcome.direction != ml_direction
                 ):
                     reasons.append("DIRECTION_LINK_MISMATCH")
                 primary = (
                     cohort is LearningCohort.QUALIFIED_PAPER
                     and outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
-                    and effective_direction in {"LONG", "SHORT"}
-                    and outcome.direction == effective_direction
+                    and ml_direction in {"LONG", "SHORT"}
+                    and outcome.direction == ml_direction
                     and not outcome.censored
                     and not outcome.data_gap
                     and not outcome.execution_path_ambiguous
