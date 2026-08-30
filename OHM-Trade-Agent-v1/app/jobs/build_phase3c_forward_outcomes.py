@@ -107,6 +107,7 @@ BOUNDED_MAX_SNAPSHOTS = 500
 BOUNDED_BASELINE_LOOKBACK = timedelta(hours=24)
 BOUNDED_FORWARD_GRACE = timedelta(hours=25)
 BOUNDED_RETRY_DELAY = timedelta(hours=1)
+BOUNDED_CHECKPOINT_ANCHOR_BYTES = 4096
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -120,7 +121,7 @@ def _parse_utc(value: Any) -> datetime | None:
     else:
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
@@ -193,6 +194,94 @@ def _set_state_int(connection: sqlite3.Connection, key: str, value: int) -> None
     )
 
 
+def _state_text(
+    connection: sqlite3.Connection,
+    key: str,
+) -> str | None:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _set_state_text(
+    connection: sqlite3.Connection,
+    key: str,
+    value: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def _file_anchor(path: Path, offset: int) -> tuple[int, int, str | None]:
+    if offset <= 0:
+        return 0, 0, None
+    start = max(0, offset - BOUNDED_CHECKPOINT_ANCHOR_BYTES)
+    size = offset - start
+    with path.open("rb") as handle:
+        handle.seek(start)
+        payload = handle.read(size)
+    if len(payload) != size:
+        raise RuntimeError("LEDGER_CHECKPOINT_SHORT_READ")
+    return start, size, hashlib.sha256(payload).hexdigest()
+
+
+def _state_checkpoint_matches(
+    connection: sqlite3.Connection,
+    path: Path,
+    prefix: str,
+    offset: int,
+) -> bool:
+    if offset <= 0:
+        return True
+    expected = _state_text(connection, f"{prefix}_anchor_sha256")
+    start = _state_int(connection, f"{prefix}_anchor_start", -1)
+    size = _state_int(connection, f"{prefix}_anchor_size", -1)
+    if (
+        not expected
+        or start < 0
+        or size <= 0
+        or start + size != offset
+    ):
+        return False
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            payload = handle.read(size)
+    except OSError:
+        return False
+    return (
+        len(payload) == size
+        and hashlib.sha256(payload).hexdigest() == expected
+    )
+
+
+def _set_state_checkpoint(
+    connection: sqlite3.Connection,
+    path: Path,
+    prefix: str,
+    offset: int,
+) -> None:
+    _set_state_int(connection, f"{prefix}_indexed_offset", offset)
+    if offset <= 0:
+        _set_state_int(connection, f"{prefix}_anchor_start", 0)
+        _set_state_int(connection, f"{prefix}_anchor_size", 0)
+        _set_state_text(connection, f"{prefix}_anchor_sha256", "")
+        return
+    start, size, digest = _file_anchor(path, offset)
+    _set_state_int(connection, f"{prefix}_anchor_start", start)
+    _set_state_int(connection, f"{prefix}_anchor_size", size)
+    _set_state_text(connection, f"{prefix}_anchor_sha256", digest or "")
+
+
 def _upsert_latest_outcome(
     connection: sqlite3.Connection,
     row: dict[str, Any],
@@ -239,6 +328,13 @@ def _reconcile_output_state(
     size = output_path.stat().st_size
     if indexed_offset > size:
         raise RuntimeError("OUTCOME_LEDGER_TRUNCATED")
+    if not _state_checkpoint_matches(
+        connection,
+        output_path,
+        "output",
+        indexed_offset,
+    ):
+        raise RuntimeError("OUTCOME_LEDGER_DIVERGED")
 
     last_complete = indexed_offset
     with output_path.open("rb") as handle:
@@ -258,7 +354,12 @@ def _reconcile_output_state(
             if isinstance(row, dict):
                 _upsert_latest_outcome(connection, row)
 
-    _set_state_int(connection, "output_indexed_offset", last_complete)
+    _set_state_checkpoint(
+        connection,
+        output_path,
+        "output",
+        last_complete,
+    )
     connection.commit()
 
 
@@ -288,6 +389,8 @@ def _next_due_at(
         due = reference_at + delta
         if due > evaluated_at:
             return due
+    if evaluated_at >= reference_at + BOUNDED_FORWARD_GRACE:
+        return None
     return evaluated_at + BOUNDED_RETRY_DELAY
 
 
@@ -323,6 +426,13 @@ def _reconcile_snapshot_queue(
     size = snapshot_path.stat().st_size
     if indexed_offset > size:
         raise RuntimeError("SNAPSHOT_LEDGER_TRUNCATED")
+    if not _state_checkpoint_matches(
+        connection,
+        snapshot_path,
+        "snapshot",
+        indexed_offset,
+    ):
+        raise RuntimeError("SNAPSHOT_LEDGER_DIVERGED")
 
     last_complete = indexed_offset
     with snapshot_path.open("rb") as handle:
@@ -361,6 +471,10 @@ def _reconcile_snapshot_queue(
                 else decision_at
             )
             if next_due is None:
+                connection.execute(
+                    "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                )
                 continue
             connection.execute(
                 """
@@ -382,7 +496,12 @@ def _reconcile_snapshot_queue(
                 ),
             )
 
-    _set_state_int(connection, "snapshot_indexed_offset", last_complete)
+    _set_state_checkpoint(
+        connection,
+        snapshot_path,
+        "snapshot",
+        last_complete,
+    )
     connection.commit()
 
 
@@ -524,13 +643,21 @@ def build_outcomes_bounded(
                 snapshot_id = str(snapshot.get("snapshot_id", "") or "")
                 label = labels_by_snapshot.get(snapshot_id)
                 if label is None:
-                    connection.execute(
-                        "UPDATE snapshot_queue SET next_due_at = ? WHERE snapshot_id = ?",
-                        (
-                            (evaluated_at + BOUNDED_RETRY_DELAY).isoformat(),
-                            snapshot_id,
-                        ),
+                    next_due = _next_due_at(
+                        snapshot,
+                        evaluated_at=evaluated_at,
                     )
+                    if next_due is None:
+                        connection.execute(
+                            "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                            (snapshot_id,),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE snapshot_queue SET next_due_at = ? "
+                            "WHERE snapshot_id = ?",
+                            (next_due.isoformat(), snapshot_id),
+                        )
                     continue
 
                 record_id = _outcome_record_id(label)
@@ -586,9 +713,10 @@ def build_outcomes_bounded(
                         row,
                         evaluated_at=evaluated_at,
                     )
-                _set_state_int(
+                _set_state_checkpoint(
                     connection,
-                    "output_indexed_offset",
+                    output_path,
+                    "output",
                     end_offset,
                 )
 
