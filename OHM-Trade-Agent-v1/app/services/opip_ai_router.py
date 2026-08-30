@@ -55,10 +55,19 @@ class RoutePlan:
     def has_non_openai_provider(self) -> bool:
         return any(target.provider != "openai" for target in self.targets)
 
-    def without_provider(self, provider: str) -> "RoutePlan":
+    def without_provider(
+        self,
+        provider: str,
+        *,
+        reason_suffix: str | None = None,
+    ) -> "RoutePlan":
         name = provider.strip().lower()
+        reason = self.route_reason
+        if reason_suffix:
+            reason = f"{reason}; {reason_suffix}"
         return replace(
             self,
+            route_reason=reason,
             targets=tuple(target for target in self.targets if target.provider != name),
         )
 
