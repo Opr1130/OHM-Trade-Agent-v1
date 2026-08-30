@@ -142,11 +142,19 @@ def _latest_revision_by_key(
         if not key:
             continue
         revision = int(row.get(revision_field, 0) or 0)
-        identity = (
-            str(row.get(identity_field) or "")
-            if identity_field is not None
-            else json.dumps(dict(row), sort_keys=True, allow_nan=False, default=str)
-        )
+        if identity_field is not None:
+            identity = str(row.get(identity_field) or "").strip()
+            if not identity:
+                raise ValueError(
+                    f"{identity_field} is required for immutable revision selection"
+                )
+        else:
+            identity = json.dumps(
+                dict(row),
+                sort_keys=True,
+                allow_nan=False,
+                default=str,
+            )
         duplicate_key = (key, revision)
         prior_identity = identities.get(duplicate_key)
         if prior_identity is not None and prior_identity != identity:
@@ -390,14 +398,20 @@ def classify_learning_cohort(
     suppressed = bool(canonical_row.get("suppressed", False))
     counterfactual = bool(canonical_row.get("counterfactual_eligible", False))
 
-    if status in {"QUALIFIED", "SCORED_ELIGIBLE"} and not suppressed:
-        return LearningCohort.QUALIFIED_PAPER
     if (
         counterfactual
         or suppressed
-        or status in {"REJECTED", "BLOCKED", "NOT_QUALIFIED", "DISQUALIFIED", "SCORED_SUPPRESSED"}
+        or status in {
+            "REJECTED",
+            "BLOCKED",
+            "NOT_QUALIFIED",
+            "DISQUALIFIED",
+            "SCORED_SUPPRESSED",
+        }
     ):
         return LearningCohort.COUNTERFACTUAL_REJECTED
+    if status in {"QUALIFIED", "SCORED_ELIGIBLE"}:
+        return LearningCohort.QUALIFIED_PAPER
     return LearningCohort.OBSERVATION_ONLY
 
 
