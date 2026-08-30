@@ -232,7 +232,7 @@ def _retry_one(
     policy_identity = str(row.get("policy_identity") or f"{direction}:{plan.symbol}")
     reservation = reserve_emit(
         identity=policy_identity,
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         fingerprint=fingerprint,
     )
     if reservation is None:
@@ -255,7 +255,7 @@ def _retry_one(
     if not delivery.delivered:
         release_emit(
             identity=policy_identity,
-            event_type="OPPORTUNITY",
+            event_type="ACTIONABLE_TRADE",
             reservation_token=reservation,
         )
         _release(trade_id, lease_token)
@@ -263,7 +263,7 @@ def _retry_one(
 
     confirm_emit(
         identity=policy_identity,
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         fingerprint=fingerprint,
         reservation_token=reservation,
     )
