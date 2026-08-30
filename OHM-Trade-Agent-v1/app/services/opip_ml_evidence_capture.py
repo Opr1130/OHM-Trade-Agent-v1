@@ -8,7 +8,7 @@ protection. Every failure is evidence-only and fail-open to production.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.jobs.build_phase3c_forward_outcomes import build_outcomes
 from app.opip.ml.snapshot import seal_feature_snapshot
 from app.opip.ml.temporal import AvailabilityStamp, TemporalIntegrityError, require_utc
 from app.services.p1_shadow_outbox import (
@@ -31,8 +30,6 @@ DEFAULT_ML_SNAPSHOT_FILE = Path("/app/data/opip_ml_feature_snapshots_v1.jsonl.gz
 DEFAULT_ML_CHECKPOINT_FILE = Path("/app/data/opip_ml_capture_checkpoint.json")
 DEFAULT_ML_DEAD_LETTER_FILE = Path("/app/data/opip_ml_capture_dead_letter.jsonl")
 DEFAULT_ML_HEALTH_FILE = Path("/app/data/opip_ml_capture_health.json")
-DEFAULT_OUTCOME_STATE_FILE = Path("/app/data/opip_ml_outcome_scheduler.json")
-DEFAULT_OUTCOME_INTERVAL_SECONDS = 600
 ML_CAPTURE_SCHEMA_VERSION = 1
 ML_FEATURE_SCHEMA_VERSION = "canonical-market-v1"
 ML_FEATURE_CALC_VERSION = "canonical-episode-ml-v1"
@@ -54,11 +51,6 @@ class MLCaptureSummary:
     p1_duplicates: int = 0
     p1_malformed: int = 0
     p1_stopped_on_error: bool = False
-    outcome_job_ran: bool = False
-    outcome_rows: int = 0
-    mature_24h_rows: int = 0
-    partial_outcome_rows: int = 0
-    no_forward_data_rows: int = 0
     error_type: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -222,61 +214,6 @@ def _append_gzip_snapshot(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(json.dumps(dict(payload), sort_keys=True, allow_nan=False) + "\n")
 
 
-def _outcome_due(
-    now: datetime,
-    *,
-    state_path: Path,
-    interval_seconds: int,
-) -> bool:
-    if interval_seconds < 60:
-        raise ValueError("outcome interval must be at least 60 seconds")
-    if not state_path.exists():
-        return True
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-        last = _parse_utc(payload.get("last_started_at"), field_name="last_started_at")
-    except Exception:
-        return True
-    return (now - last).total_seconds() >= interval_seconds
-
-
-def _run_outcome_maturation_if_due(
-    *,
-    now: datetime,
-    state_path: Path,
-    interval_seconds: int,
-) -> tuple[bool, int, int, int, int]:
-    if not _outcome_due(
-        now,
-        state_path=state_path,
-        interval_seconds=interval_seconds,
-    ):
-        return False, 0, 0, 0, 0
-
-    save_json_atomic(
-        state_path,
-        {
-            "last_started_at": now.isoformat(),
-            "interval_seconds": interval_seconds,
-            "measurement_only": True,
-        },
-    )
-    rows = build_outcomes()
-    mature = sum(
-        1 for row in rows
-        if str(row.get("maturation_status") or "") == "MATURE_24H"
-    )
-    partial = sum(
-        1 for row in rows
-        if str(row.get("maturation_status") or "") == "PARTIAL_FORWARD_WINDOW"
-    )
-    no_data = sum(
-        1 for row in rows
-        if str(row.get("maturation_status") or "") == "NO_FORWARD_DATA"
-    )
-    return True, len(rows), mature, partial, no_data
-
-
 def capture_ml_production_evidence(
     *,
     evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
@@ -284,9 +221,7 @@ def capture_ml_production_evidence(
     checkpoint_path: Path = DEFAULT_ML_CHECKPOINT_FILE,
     dead_letter_path: Path = DEFAULT_ML_DEAD_LETTER_FILE,
     health_path: Path = DEFAULT_ML_HEALTH_FILE,
-    outcome_state_path: Path = DEFAULT_OUTCOME_STATE_FILE,
     batch_limit: int = 250,
-    outcome_interval_seconds: int = DEFAULT_OUTCOME_INTERVAL_SECONDS,
     now: datetime | None = None,
     enabled: bool | None = None,
 ) -> MLCaptureSummary:
@@ -412,21 +347,7 @@ def capture_ml_production_evidence(
         next_line = index + 1
         save_json_atomic(checkpoint_path, {"next_line": next_line})
 
-    current = require_utc(now or datetime.now(timezone.utc), field_name="now")
-    outcome_ran = False
-    outcome_rows = mature = partial = no_data = 0
-    try:
-        outcome_ran, outcome_rows, mature, partial, no_data = (
-            _run_outcome_maturation_if_due(
-                now=current,
-                state_path=outcome_state_path,
-                interval_seconds=outcome_interval_seconds,
-            )
-        )
-    except Exception:
-        # Outcome maturation is lower priority than snapshot capture and never
-        # converts a capture success into a production failure.
-        pass
+    require_utc(now or datetime.now(timezone.utc), field_name="now")
 
     summary = MLCaptureSummary(
         enabled=True,
@@ -442,11 +363,6 @@ def capture_ml_production_evidence(
         p1_duplicates=p1.duplicates,
         p1_malformed=p1.malformed,
         p1_stopped_on_error=p1.stopped_on_error,
-        outcome_job_ran=outcome_ran,
-        outcome_rows=outcome_rows,
-        mature_24h_rows=mature,
-        partial_outcome_rows=partial,
-        no_forward_data_rows=no_data,
         error_type=p1.error_type if p1.stopped_on_error else None,
     )
     save_json_atomic(health_path, summary.as_dict())
