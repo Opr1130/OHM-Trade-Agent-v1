@@ -1,13 +1,13 @@
 """Sequence 4 BUILD 4.5 production shadow integration tests."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.opip.streaming.contract import EvidenceQualityState, StreamProvider
 from app.opip.streaming.feature_accumulator import StreamingFeatureSnapshot
-from app.opip.streaming.healthcheck import main as healthcheck_main
 from app.opip.streaming.read_model import read_streaming_shadow_status
 from app.opip.streaming.runtime import StreamingRuntime
 from app.opip.streaming.store import StreamingShadowStore
@@ -217,16 +217,9 @@ def test_far_future_provider_timestamp_fails_closed():
     )
     queued = _queued(epoch=0)
     normalized = adapter.normalize(queued)
-    future_envelope = normalized.envelope.__class__(
-        **{
-            **normalized.envelope.to_dict(),
-            "provider": normalized.envelope.provider,
-            "stream_type": normalized.envelope.stream_type,
-            "provider_timestamp_utc": RUNTIME_NOW + timedelta(seconds=10),
-            "ingest_timestamp_utc": normalized.envelope.ingest_timestamp_utc,
-            "sequence_status": normalized.envelope.sequence_status,
-            "identity_status": normalized.envelope.identity_status,
-        }
+    future_envelope = replace(
+        normalized.envelope,
+        provider_timestamp_utc=RUNTIME_NOW + timedelta(seconds=10),
     )
     future_normalized = normalized.__class__(
         envelope=future_envelope,
