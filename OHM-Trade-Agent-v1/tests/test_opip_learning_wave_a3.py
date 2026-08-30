@@ -110,7 +110,7 @@ def test_current_short_futures_paper_readiness_fails_closed():
     assert report.short.state is PaperReadinessState.NOT_READY
     assert "PAPER_ENGINE_V1_LONG_ONLY" in report.short.reasons
     assert "FUNDING_MARGIN_LIQUIDATION_ACCOUNTING_UNVERIFIED" in report.short.reasons
-    assert report.futures_learning_ready is False
+    assert report.extended_short_learning_ready is False
     assert report.funded_execution_allowed is False
 
 
@@ -119,7 +119,7 @@ def test_verified_long_does_not_unlock_short_or_futures():
     report = assess_paper_learning_readiness(long_production_verified=True)
     assert report.long.state is PaperReadinessState.READY
     assert report.short.state is PaperReadinessState.NOT_READY
-    assert report.futures_learning_ready is False
+    assert report.extended_short_learning_ready is False
 
 
 def test_provisional_only_outcomes_are_not_ready_for_training():
@@ -154,18 +154,18 @@ def test_zero_feature_bearing_snapshots_fail_closed():
     assert "NO_FEATURE_BEARING_SNAPSHOTS" in report.blockers
 
 
-def test_direction_none_is_structural_not_ready():
-    """Verify production-style direction NONE cannot be treated as trainable."""
+def test_direction_none_binds_to_exact_final_paper_but_stays_support_gated():
+    """Verify production direction NONE can bind only through exact final paper evidence."""
     report = build_ml_data_readiness_report(
         canonical_rows=[_canonical("S:1", "E:1")],
         ml_snapshot_rows=[_ml("S:1", "E:1", direction="NONE")],
         paper_trade_rows=[_paper("P:1", "E:1", direction="LONG")],
         policy=MLReadinessPolicy(minimum_primary_supervised_rows=2),
     )
-    assert report.readiness_state is MLReadinessState.NOT_READY
-    assert "NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS" in report.blockers
-    assert "ML_DIRECTION_LINKAGE_NOT_TRAINABLE" in report.blockers
-    assert report.primary_supervised_usable_rows == 0
+    assert report.readiness_state is MLReadinessState.COLLECT_MORE_DATA
+    assert "INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT" in report.blockers
+    assert report.primary_supervised_usable_rows == 1
+    assert report.direction_coverage.get("NONE") == 1
 
 
 def test_feature_visibility_after_decision_is_pit_violation():
