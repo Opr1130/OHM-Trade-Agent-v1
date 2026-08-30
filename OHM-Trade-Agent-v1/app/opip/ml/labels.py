@@ -30,8 +30,14 @@ class PriceBar:
             raise ValueError("bar low cannot exceed high")
 
 
-def _touches(bar: PriceBar, level: float) -> bool:
-    return bar.low <= level <= bar.high
+def _hits_target(bar: PriceBar, level: float, direction: str) -> bool:
+    """Treat a gap beyond a target as a barrier crossing."""
+    return bar.high >= level if direction == "LONG" else bar.low <= level
+
+
+def _hits_stop(bar: PriceBar, level: float, direction: str) -> bool:
+    """Treat a gap beyond a stop as a barrier crossing."""
+    return bar.low <= level if direction == "LONG" else bar.high >= level
 
 
 def _signed_return_bps(entry: float, price: float, direction: str) -> float:
@@ -85,9 +91,9 @@ def resolve_barrier_labels(
     tp1_time = tp2_time = sl_time = None
 
     for bar in rows:
-        hit_tp1 = _touches(bar, tp1_price)
-        hit_tp2 = _touches(bar, tp2_price)
-        hit_sl = _touches(bar, sl_price)
+        hit_tp1 = _hits_target(bar, tp1_price, direction)
+        hit_tp2 = _hits_target(bar, tp2_price, direction)
+        hit_sl = _hits_stop(bar, sl_price, direction)
         if hit_sl and (hit_tp1 or hit_tp2):
             ambiguous = True
             break
