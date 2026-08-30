@@ -17,6 +17,8 @@ CRITICAL_EVENTS = {
     "CLOSED",
     "EMERGENCY",
     "FILLED",
+    "HOLD",
+    "WARNING",
     "TAKE_PROFIT",
     "EXIT_NOW",
     "INVALIDATED",
