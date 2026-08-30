@@ -6,10 +6,14 @@ construction, and validation gates are proven.
 """
 from __future__ import annotations
 
-from typing import Mapping, Protocol
+from typing import Protocol
+
+from app.opip.ml.contracts import FeatureSnapshot, ModelEvidence
 
 
 class ModelAdapter(Protocol):
+    """Evidence-only scoring boundary with no trading side effects."""
+
     @property
     def model_id(self) -> str:
         ...
@@ -18,6 +22,10 @@ class ModelAdapter(Protocol):
     def model_family(self) -> str:
         ...
 
-    def score(self, features: Mapping[str, object]) -> Mapping[str, float | None]:
-        """Return evidence-only scores; no side effects or trading authority."""
+    @property
+    def model_version(self) -> str:
+        ...
+
+    def score(self, snapshot: FeatureSnapshot) -> ModelEvidence:
+        """Score one immutable snapshot and return immutable typed evidence."""
         ...
