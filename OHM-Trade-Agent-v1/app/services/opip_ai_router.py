@@ -386,6 +386,12 @@ def _invoke_target(
     output_text = str(getattr(response, "output_text", "") or "")
     if not output_text.strip():
         raise ValueError("AI provider returned an empty response")
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("AI provider returned malformed JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("AI provider response JSON was not an object")
     return output_text, getattr(response, "usage", None)
 
 
