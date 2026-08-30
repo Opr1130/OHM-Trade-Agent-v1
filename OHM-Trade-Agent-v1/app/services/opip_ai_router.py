@@ -393,6 +393,7 @@ def invoke_chief_review(
 
     attempts: list[dict[str, Any]] = []
     candidate_count = len(_candidate_rows(request_payload))
+    first_error: Exception | None = None
 
     for target in plan.targets:
         started = time.perf_counter()
@@ -405,6 +406,8 @@ def invoke_chief_review(
                 client_factory=client_factory,
             )
         except Exception as exc:
+            if first_error is None:
+                first_error = exc
             latency_ms = int((time.perf_counter() - started) * 1000)
             attempt = {
                 "provider": target.provider,
@@ -454,6 +457,9 @@ def invoke_chief_review(
             latency_ms=latency_ms,
             attempts=tuple(attempts),
         )
+
+    if len(plan.targets) == 1 and first_error is not None:
+        raise first_error
 
     summary = ", ".join(
         f"{item['provider']}:{item['error_type']}" for item in attempts
