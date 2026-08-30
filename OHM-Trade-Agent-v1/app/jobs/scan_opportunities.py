@@ -1,6 +1,7 @@
 import logging
 from collections import Counter
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.opip.decision.observer import build_scan_observer
@@ -22,6 +23,7 @@ from app.scanner.reference_market_validation import validate_finalist_references
 from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
+from app.services.active_trade_registry import get_active_trades
 from app.services.canonical_episode_capture import (
     append_canonical_episode_snapshots,
     canonical_cohort_id,
@@ -51,6 +53,7 @@ from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
+from app.services.trade_action_gate import apply_action_gate
 
 
 logger = logging.getLogger(__name__)
@@ -632,6 +635,65 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
     return payload
 
 
+
+def _apply_ranked_action_gates(ranked_opportunities, *, settings):
+    """Apply scarce-capital/portfolio eligibility in global rank order.
+
+    Approved candidates are added to a projected exposure list so lower-ranked
+    signals cannot independently allocate the same capital/position slots.
+    A vetoed higher-ranked candidate does not block the next-best candidate.
+    """
+    try:
+        projected_trades = list(get_active_trades())
+    except Exception as exc:
+        print(
+            "ACTION GATE unavailable; no new trade alert authorized:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return []
+
+    eligible = []
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(opportunity.snapshot.trade_direction or "LONG").upper()
+        alert["profit_rank"] = ranked.rank
+        alert["profit_rank_score"] = ranked.profit_ranking.total_score
+
+        gate = apply_action_gate(
+            candidate=alert,
+            plan=plan,
+            account_capital=float(settings.account_equity),
+            active_trades=projected_trades,
+        )
+        if not gate.allowed:
+            print(
+                f"ACTION GATE REJECT rank={ranked.rank} {direction} {plan.symbol}: "
+                f"{gate.reason}"
+            )
+            continue
+
+        eligible.append(ranked)
+        projected_trades.append(
+            SimpleNamespace(
+                symbol=plan.symbol,
+                status="active",
+                direction=direction,
+                capital=float(alert.get("recommended_capital") or 0.0),
+                margin_leverage=float(
+                    alert.get("margin_leverage")
+                    or (2.0 if direction == "SHORT" else 1.0)
+                ),
+            )
+        )
+        print(
+            f"ACTION GATE PASS rank={ranked.rank} {direction} {plan.symbol}: "
+            f"capital={float(alert.get('recommended_capital') or 0.0):.2f}"
+        )
+    return eligible
+
+
 def main():
     settings = get_settings()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
@@ -1093,6 +1155,16 @@ def main():
             f"ValidationNetT2=${economic.target_2_net_profit:.2f} "
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
+
+    actionable_ranked_opportunities = _apply_ranked_action_gates(
+        ranked_opportunities,
+        settings=settings,
+    )
+    print(
+        "Actionable survivors after capital/portfolio gate:",
+        len(actionable_ranked_opportunities),
+    )
+    ranked_opportunities = actionable_ranked_opportunities
 
     lineage_prepared, lineage_failures = _prepare_qualified_lineage(
         ranked_opportunities,
