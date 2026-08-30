@@ -11,6 +11,7 @@ import pytest
 
 from app.opip.ml.temporal import TemporalIntegrityError
 from app.services.canonical_episode_capture import build_canonical_episode_snapshots
+import app.services.opip_ml_evidence_capture as capture_module
 from app.services.opip_ml_evidence_capture import (
     build_ml_snapshot_from_canonical,
     capture_ml_production_evidence,
@@ -91,13 +92,17 @@ def _observation(symbol: str = "BTCUSD"):
     )
 
 
-def _canonical_row():
+def _canonical_row(
+    *,
+    decision_at: datetime = NOW,
+    scan_source: str = "LIVE_OPPORTUNITY_SCAN",
+):
     return build_canonical_episode_snapshots(
         [_observation()],
         candidates=(),
-        decision_at=NOW,
+        decision_at=decision_at,
         signal_quality_enabled=False,
-        scan_source="LIVE_OPPORTUNITY_SCAN",
+        scan_source=scan_source,
     )[0]
 
 
@@ -111,6 +116,29 @@ def _drain_stub(**_kwargs):
     )
 
 
+def _published_chunks(snapshot_dir: Path) -> list[Path]:
+    return sorted(snapshot_dir.glob("chunk-*.jsonl.gz"))
+
+
+def _read_chunk(path: Path) -> list[dict]:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def test_canonical_seed_preserves_source_specific_price_semantics():
+    opportunity = _canonical_row(scan_source="LIVE_OPPORTUNITY_SCAN")
+    opportunity_features = opportunity["ml_feature_seed"]["feature_values"]
+    assert opportunity_features["reference_price"] == pytest.approx(100.5)
+    assert opportunity_features["ticker_last"] == pytest.approx(100.5)
+    assert opportunity_features["completed_close"] == pytest.approx(100.0)
+
+    full_market = _canonical_row(scan_source="LIVE_FULL_MARKET")
+    full_market_features = full_market["ml_feature_seed"]["feature_values"]
+    assert full_market_features["reference_price"] == pytest.approx(100.0)
+    assert full_market_features["ticker_last"] == pytest.approx(100.0)
+    assert full_market_features["completed_close"] is None
+
+
 def test_canonical_seed_captures_raw_features_without_deterministic_outputs():
     row = _canonical_row()
     seed = row["ml_feature_seed"]
@@ -118,8 +146,6 @@ def test_canonical_seed_captures_raw_features_without_deterministic_outputs():
 
     assert seed["availability_basis"] == "CONSERVATIVE_DECISION_BOUNDARY"
     assert seed["deterministic_outputs_excluded"] is True
-    assert features["reference_price"] == pytest.approx(100.5)
-    assert features["completed_close"] == pytest.approx(100.0)
     assert features["rsi"] == pytest.approx(58.0)
     assert features["momentum_24h_pct"] == pytest.approx(5.0)
     assert features["ticker_bid"] == pytest.approx(100.4)
@@ -154,24 +180,25 @@ def test_ml_snapshot_rejects_seed_visible_after_decision():
         build_ml_snapshot_from_canonical(row)
 
 
-def test_capture_worker_writes_compressed_snapshot_and_advances_checkpoint(
+def test_capture_worker_writes_atomic_compressed_chunk_and_advances_byte_checkpoint(
     tmp_path, monkeypatch
 ):
     evidence = tmp_path / "p1_evidence.jsonl"
-    snapshot_file = tmp_path / "ml.jsonl.gz"
+    snapshot_dir = tmp_path / "ml-snapshots"
     checkpoint = tmp_path / "checkpoint.json"
     dead = tmp_path / "dead.jsonl"
     health = tmp_path / "health.json"
     evidence.write_text(json.dumps(_canonical_row()) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
         _drain_stub,
     )
 
     summary = capture_ml_production_evidence(
         evidence_path=evidence,
-        snapshot_path=snapshot_file,
+        snapshot_dir=snapshot_dir,
         checkpoint_path=checkpoint,
         dead_letter_path=dead,
         health_path=health,
@@ -181,16 +208,23 @@ def test_capture_worker_writes_compressed_snapshot_and_advances_checkpoint(
     assert summary.processed == 1
     assert summary.temporal_violations == 0
     assert summary.next_line == 1
-    assert json.loads(checkpoint.read_text())["next_line"] == 1
+    assert summary.byte_offset == evidence.stat().st_size
+    saved = json.loads(checkpoint.read_text())
+    assert saved["next_line"] == 1
+    assert saved["byte_offset"] == evidence.stat().st_size
 
-    with gzip.open(snapshot_file, "rt", encoding="utf-8") as handle:
-        wrapper = json.loads(handle.readline())
+    chunks = _published_chunks(snapshot_dir)
+    assert len(chunks) == 1
+    rows = _read_chunk(chunks[0])
+    assert len(rows) == 1
+    wrapper = rows[0]
     assert wrapper["record_type"] == "OPIP_ML_FEATURE_SNAPSHOT"
     assert wrapper["canonical_snapshot_id"].startswith("SNAP:")
     assert wrapper["ml_snapshot_id"].startswith("MLSNAP:")
     assert wrapper["feature_snapshot"]["max_visible_at_utc"] == NOW.isoformat()
     assert wrapper["affects_live_decisions"] is False
     assert wrapper["trade_authority_changed"] is False
+    assert not list(snapshot_dir.glob("*.tmp"))
 
 
 def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
@@ -199,19 +233,20 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
     row = _canonical_row()
     row.pop("ml_feature_seed")
     evidence = tmp_path / "p1_evidence.jsonl"
-    snapshot_file = tmp_path / "ml.jsonl.gz"
+    snapshot_dir = tmp_path / "ml-snapshots"
     checkpoint = tmp_path / "checkpoint.json"
     health = tmp_path / "health.json"
     evidence.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
         _drain_stub,
     )
 
     summary = capture_ml_production_evidence(
         evidence_path=evidence,
-        snapshot_path=snapshot_file,
+        snapshot_dir=snapshot_dir,
         checkpoint_path=checkpoint,
         dead_letter_path=tmp_path / "dead.jsonl",
         health_path=health,
@@ -221,7 +256,7 @@ def test_legacy_canonical_row_is_not_backfilled_with_invented_timestamps(
     assert summary.processed == 0
     assert summary.legacy_without_seed == 1
     assert summary.next_line == 1
-    assert not snapshot_file.exists()
+    assert not snapshot_dir.exists()
 
 
 def test_custom_evidence_path_does_not_consume_production_p1_outbox(
@@ -236,13 +271,14 @@ def test_custom_evidence_path_does_not_consume_production_p1_outbox(
         return _drain_stub()
 
     monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
         drain,
     )
 
     summary = capture_ml_production_evidence(
         evidence_path=evidence,
-        snapshot_path=tmp_path / "ml.jsonl.gz",
+        snapshot_dir=tmp_path / "ml-snapshots",
         checkpoint_path=tmp_path / "checkpoint.json",
         dead_letter_path=tmp_path / "dead.jsonl",
         health_path=tmp_path / "health.json",
@@ -253,35 +289,40 @@ def test_custom_evidence_path_does_not_consume_production_p1_outbox(
     assert summary.p1_drained == 0
 
 
-def test_retry_after_checkpoint_loss_does_not_duplicate_snapshot(
+def test_retry_after_checkpoint_loss_reuses_atomic_chunk_without_duplicate(
     tmp_path, monkeypatch
 ):
     evidence = tmp_path / "p1_evidence.jsonl"
-    snapshot_file = tmp_path / "ml.jsonl.gz"
+    snapshot_dir = tmp_path / "ml-snapshots"
     checkpoint = tmp_path / "checkpoint.json"
     health = tmp_path / "health.json"
     evidence.write_text(json.dumps(_canonical_row()) + "\n", encoding="utf-8")
 
     monkeypatch.setattr(
-        "app.services.opip_ml_evidence_capture.drain_outbox_to_evidence_ledger",
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
         _drain_stub,
     )
 
     first = capture_ml_production_evidence(
         evidence_path=evidence,
-        snapshot_path=snapshot_file,
+        snapshot_dir=snapshot_dir,
         checkpoint_path=checkpoint,
         dead_letter_path=tmp_path / "dead.jsonl",
         health_path=health,
         enabled=True,
     )
     assert first.processed == 1
+    assert len(_published_chunks(snapshot_dir)) == 1
 
-    # Simulate a lost checkpoint after the compressed snapshot was durable.
-    checkpoint.write_text(json.dumps({"next_line": 0}), encoding="utf-8")
+    # Simulate a lost checkpoint after the atomic chunk rename was durable.
+    checkpoint.write_text(
+        json.dumps({"schema_version": 1, "next_line": 0, "byte_offset": 0}),
+        encoding="utf-8",
+    )
     second = capture_ml_production_evidence(
         evidence_path=evidence,
-        snapshot_path=snapshot_file,
+        snapshot_dir=snapshot_dir,
         checkpoint_path=checkpoint,
         dead_letter_path=tmp_path / "dead.jsonl",
         health_path=health,
@@ -290,10 +331,97 @@ def test_retry_after_checkpoint_loss_does_not_duplicate_snapshot(
 
     assert second.processed == 0
     assert second.duplicate_snapshots_skipped == 1
+    assert len(_published_chunks(snapshot_dir)) == 1
     assert json.loads(checkpoint.read_text())["next_line"] == 1
-    with gzip.open(snapshot_file, "rt", encoding="utf-8") as handle:
-        rows = [json.loads(line) for line in handle if line.strip()]
-    assert len(rows) == 1
+
+
+def test_interrupted_unpublished_temp_chunk_does_not_poison_future_capture(
+    tmp_path, monkeypatch
+):
+    evidence = tmp_path / "p1_evidence.jsonl"
+    snapshot_dir = tmp_path / "ml-snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / ".interrupted.jsonl.gz.tmp").write_bytes(b"truncated-gzip")
+    evidence.write_text(json.dumps(_canonical_row()) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
+        _drain_stub,
+    )
+
+    summary = capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_dir=snapshot_dir,
+        checkpoint_path=tmp_path / "checkpoint.json",
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=tmp_path / "health.json",
+        enabled=True,
+    )
+
+    assert summary.processed == 1
+    chunks = _published_chunks(snapshot_dir)
+    assert len(chunks) == 1
+    assert len(_read_chunk(chunks[0])) == 1
+
+
+def test_second_capture_starts_from_durable_byte_offset_not_ledger_origin(
+    tmp_path, monkeypatch
+):
+    evidence = tmp_path / "p1_evidence.jsonl"
+    snapshot_dir = tmp_path / "ml-snapshots"
+    checkpoint = tmp_path / "checkpoint.json"
+    health = tmp_path / "health.json"
+    first_row = _canonical_row()
+    evidence.write_text(json.dumps(first_row) + "\n", encoding="utf-8")
+    first_size = evidence.stat().st_size
+
+    monkeypatch.setattr(
+        capture_module,
+        "drain_outbox_to_evidence_ledger",
+        _drain_stub,
+    )
+
+    first = capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_dir=snapshot_dir,
+        checkpoint_path=checkpoint,
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=health,
+        enabled=True,
+    )
+    assert first.byte_offset == first_size
+
+    second_row = _canonical_row(decision_at=NOW + timedelta(minutes=1))
+    with evidence.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(second_row) + "\n")
+
+    original_reader = capture_module._read_complete_batch
+    observed = {}
+
+    def read_from_checkpoint(path, *, next_line, byte_offset, batch_limit):
+        observed["byte_offset"] = byte_offset
+        return original_reader(
+            path,
+            next_line=next_line,
+            byte_offset=byte_offset,
+            batch_limit=batch_limit,
+        )
+
+    monkeypatch.setattr(capture_module, "_read_complete_batch", read_from_checkpoint)
+    second = capture_ml_production_evidence(
+        evidence_path=evidence,
+        snapshot_dir=snapshot_dir,
+        checkpoint_path=checkpoint,
+        dead_letter_path=tmp_path / "dead.jsonl",
+        health_path=health,
+        enabled=True,
+    )
+
+    assert observed["byte_offset"] == first_size
+    assert second.batch_rows == 1
+    assert second.processed == 1
+    assert len(_published_chunks(snapshot_dir)) == 2
 
 
 def test_ml_capture_service_has_no_exchange_order_or_position_imports():
