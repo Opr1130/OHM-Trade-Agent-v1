@@ -8,6 +8,7 @@ LOCK_FILE="/var/lock/ohm-deploy.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
+BACKGROUND_RUNNER="$APP_ROOT/deploy/remote/run-opip-background-job.sh"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "invalid target sha" >&2
@@ -99,11 +100,11 @@ bash "$SCHEDULER_RECONCILE"
 # and whether the worker can read/write its local stores. A probe failure must
 # never roll back otherwise healthy deterministic trading protection.
 echo "O'Pip ML evidence capture smoke probe"
-if flock -n /var/run/opip-ml-capture-trigger.lock -c \
-  'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.run_opip_ml_capture'; then
+if flock -n /var/run/opip-background.lock -c \
+  "/bin/bash $BACKGROUND_RUNNER app.jobs.run_opip_ml_capture"; then
   echo "O'Pip ML evidence capture smoke probe: completed"
 else
-  echo "O'Pip ML evidence capture smoke probe: skipped/degraded; capture lock busy or probe failed; production unaffected" >&2
+  echo "O'Pip ML evidence capture smoke probe: skipped/degraded; background lane busy or bounded probe failed; production unaffected" >&2
 fi
 
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
