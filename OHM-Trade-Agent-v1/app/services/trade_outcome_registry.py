@@ -90,6 +90,8 @@ def record_recommendation(
             "schema_version": SCHEMA_VERSION,
             "trade_id": trade_id or "",
             "record_key": key,
+            "signal_id": candidate.get("signal_id"),
+            "journey_id": candidate.get("journey_id"),
             "symbol": symbol,
             "direction": direction,
             "margin_leverage": float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0)),
