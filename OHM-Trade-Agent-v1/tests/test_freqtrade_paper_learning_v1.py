@@ -341,11 +341,12 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "ohm-freqtrade-paper-init" in paper_compose
     assert "network_mode: none" in paper_compose
     assert "condition: service_completed_successfully" in paper_compose
-    assert "USD_READY" in paper_compose
+    assert "ohm-freqtrade-paper-usdt:" in paper_compose
     assert "env_file:" not in paper_compose
     assert "ports:" not in paper_compose
-    assert 'mem_limit: 768m' in paper_compose
-    assert 'cpus: "0.40"' in paper_compose
+    assert paper_compose.count('mem_limit: 448m') == 2
+    assert 'mem_limit: 768m' not in paper_compose
+    assert paper_compose.count('cpus: "0.20"') == 2
     assert "tradesv3.ohm_dry_run_usd.sqlite" in paper_compose
     assert "tradesv3.ohm_dry_run_usdt.sqlite" in paper_compose
     assert "heartbeat_USD" in paper_compose
@@ -353,6 +354,7 @@ def test_freqtrade_artifacts_enforce_dry_run_and_secret_isolation():
     assert "oom_score_adj: 500" in paper_compose
     assert "no-new-privileges:true" in paper_compose
     assert "./data/freqtrade/state:/freqtrade/state" in paper_compose
+    assert "./data/freqtrade/user_data_usdt:/freqtrade/user_data" in paper_compose
     assert "./data/paper_trading:/freqtrade/control:ro" in paper_compose
     assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper_compose
 
