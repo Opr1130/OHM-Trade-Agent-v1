@@ -264,3 +264,55 @@ def test_bybit_connect_and_subscribe_contract(monkeypatch):
         "allLiquidation.ETHUSDT",
     }
     assert captured["kwargs"]["max_queue"] == 16
+
+
+def test_bybit_reconnect_epoch_is_explicit_boundary():
+    adapter = BybitPublicAdapter(symbols=("BTCUSDT",))
+    first = adapter.normalize(
+        _queued(StreamType.AGG_TRADE, "BTCUSDT", _trade(seq=100, trade_id="a"), epoch=0)
+    )
+    next_epoch = adapter.normalize(
+        _queued(StreamType.AGG_TRADE, "BTCUSDT", _trade(seq=101, trade_id="b"), epoch=1)
+    )
+    assert first.sequence.status is SequenceStatus.FIRST
+    assert next_epoch.sequence.status is SequenceStatus.RESET_NEW_EPOCH
+    assert next_epoch.sequence.epoch_changed is True
+
+
+def test_bybit_heartbeat_buffers_data_received_before_pong():
+    import asyncio
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+            self.messages = [
+                orjson.dumps(
+                    {
+                        "topic": "publicTrade.BTCUSDT",
+                        "type": "snapshot",
+                        "ts": 1788048001000,
+                        "data": [_trade(seq=100, trade_id="heartbeat-data")],
+                    }
+                ),
+                orjson.dumps({"op": "pong"}),
+            ]
+
+        async def send(self, payload):
+            self.sent.append(orjson.loads(payload))
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+    async def scenario():
+        adapter = BybitPublicAdapter(symbols=("BTCUSDT",))
+        adapter._ws = FakeWs()
+        await adapter.heartbeat()
+        frame = await adapter.receive()
+        return adapter, frame
+
+    adapter, frame = asyncio.run(scenario())
+    assert adapter._ws.sent == [{"op": "ping"}]
+    assert frame.stream_type is StreamType.AGG_TRADE
+    assert frame.provider_symbol == "BTCUSDT"
+    payload = orjson.loads(frame.payload)
+    assert payload["item"]["i"] == "heartbeat-data"
