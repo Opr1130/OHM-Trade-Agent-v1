@@ -27,6 +27,25 @@ if [[ -z "$CORE_IMAGE" ]]; then
   exit 69
 fi
 
+# Do not inject the production .env into evidence-only containers. The capture
+# path needs only its enable flag; normalize that one non-secret setting and
+# leave exchange/API credentials outside this process entirely.
+P1_RAW="$(
+  sed -n 's/^[[:space:]]*P1_SHADOW_OUTBOX_ENABLED[[:space:]]*=[[:space:]]*//p' \
+    "$APP_ROOT/.env" | tail -n 1
+)"
+P1_NORMALIZED="$(
+  printf '%s' "$P1_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '"'"'"'[:space:]'
+)"
+case "$P1_NORMALIZED" in
+  true|1|yes|on)
+    P1_SHADOW_OUTBOX_ENABLED=true
+    ;;
+  *)
+    P1_SHADOW_OUTBOX_ENABLED=false
+    ;;
+esac
+
 # Evidence jobs are non-authoritative and may be memory-heavy as ledgers grow.
 # Run them in an isolated, networkless container so a pathological evidence
 # pass is killed before it can starve the core or Freqtrade paper workers.
@@ -41,8 +60,7 @@ exec /usr/bin/docker run --rm \
   --security-opt no-new-privileges:true \
   --tmpfs /tmp:rw,noexec,nosuid,size=32m \
   --tmpfs /var/run:rw,noexec,nosuid,size=16m \
-  --env-file "$APP_ROOT/.env" \
-  -e OPIP_EVENT_STORE_ENABLED=true \
+  -e P1_SHADOW_OUTBOX_ENABLED="$P1_SHADOW_OUTBOX_ENABLED" \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -v "$APP_ROOT/data:/app/data" \
   -v "$APP_ROOT/data/opip/streaming:/app/data/opip/streaming:ro" \
