@@ -37,6 +37,10 @@ class RuntimeTelemetrySnapshot:
     malformed_frames: int
     normalized_observations: int
     processing_errors: int
+    resource_sample_errors: int
+    symbol_limit_rejections: int
+    runtime_failed: bool
+    fatal_error_type: str | None
     last_processing_latency_seconds: float | None
     last_processed_at_utc: str | None
     sequence_gaps: int
@@ -104,6 +108,10 @@ class RuntimeTelemetry:
         self.malformed_frames = 0
         self.normalized_observations = 0
         self.processing_errors = 0
+        self.resource_sample_errors = 0
+        self.symbol_limit_rejections = 0
+        self.runtime_failed = False
+        self.fatal_error_type: str | None = None
         self.last_processing_latency_seconds: float | None = None
         self.last_processed_at_utc: datetime | None = None
         self.sequence_gaps = 0
@@ -143,6 +151,10 @@ class RuntimeTelemetry:
             malformed_frames=self.malformed_frames,
             normalized_observations=self.normalized_observations,
             processing_errors=self.processing_errors,
+            resource_sample_errors=self.resource_sample_errors,
+            symbol_limit_rejections=self.symbol_limit_rejections,
+            runtime_failed=self.runtime_failed,
+            fatal_error_type=self.fatal_error_type,
             last_processing_latency_seconds=self.last_processing_latency_seconds,
             last_processed_at_utc=(
                 self.last_processed_at_utc.isoformat()
