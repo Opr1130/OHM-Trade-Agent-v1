@@ -92,6 +92,7 @@ class StreamingRuntime:
         *,
         config: StreamingRuntimeConfig | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        process_time: Callable[[], float] = time.process_time,
         utc_now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter_source: Callable[[], float] = random.random,
@@ -105,6 +106,7 @@ class StreamingRuntime:
                 raise ValueError("adapter mapping key must match adapter.provider")
 
         self._monotonic = monotonic
+        self._process_time = process_time
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._jitter_source = jitter_source
@@ -494,18 +496,32 @@ class StreamingRuntime:
 
     async def _resource_monitor_loop(self) -> None:
         interval = self.config.resource_sample_interval_seconds
+        last_wall = self._monotonic()
+        last_cpu = self._process_time()
         while not self._stop_event.is_set():
             target = self._monotonic() + interval
             await self._sleep(interval)
-            lag = max(0.0, self._monotonic() - target)
+            wall_now = self._monotonic()
+            cpu_now = self._process_time()
+            lag = max(0.0, wall_now - target)
+            wall_delta = wall_now - last_wall
+            cpu_fraction = (
+                max(0.0, (cpu_now - last_cpu) / wall_delta)
+                if wall_delta > 0
+                else None
+            )
+            last_wall = wall_now
+            last_cpu = cpu_now
             queue_snapshot = self._queue.snapshot()
             assessment = assess_resources(
                 config=self.config.resource_guard,
                 rss_bytes=current_rss_bytes(),
                 loop_lag_seconds=lag,
+                cpu_fraction=cpu_fraction,
                 queue_utilization_pct=queue_snapshot.utilization_pct,
             )
             self._telemetry.rss_bytes = assessment.rss_bytes
+            self._telemetry.cpu_fraction = assessment.cpu_fraction
             self._telemetry.event_loop_lag_seconds = (
                 assessment.loop_lag_seconds
             )
