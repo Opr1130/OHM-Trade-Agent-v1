@@ -479,7 +479,7 @@ def main() -> None:
     early_mover_delivery: dict[str, tuple[str, bool]] = {}
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     if (
-        not bool(getattr(settings, "opip_actionable_only_alerts", True))
+        not bool(getattr(settings, "opip_actionable_only_alerts", False))
         and str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
         and settings.telegram_bot_token
