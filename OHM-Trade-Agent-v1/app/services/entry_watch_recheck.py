@@ -8,7 +8,6 @@ from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import (
     defer_entry_watch,
     due_entry_watch,
-    remove_entry_watch,
 )
 
 
@@ -79,7 +78,10 @@ def recheck_due_entry_watch(
             continue
 
         if plan.valid_now:
-            remove_entry_watch(symbol, direction)
+            # Preserve the watch until the complete qualification + global
+            # capital gate accepts it. If the full scan fails transiently, the
+            # candidate remains eligible for another bounded fast recheck.
+            defer_entry_watch(symbol, direction, now=now, recheck_seconds=120)
             ready.append(symbol)
         else:
             defer_entry_watch(symbol, direction, now=now, recheck_seconds=90)
