@@ -297,18 +297,24 @@ def normalize_paper_outcome(
     paper_only = bool(row.get("paper_only", False))
     authority = bool(row.get("exchange_write_authority", False))
     direction = _direction(row.get("direction"))
+    net_pnl = _optional_float(row.get("net_pnl"))
+    net_pnl_pct = _optional_float(row.get("net_pnl_pct"))
     final = (
         paper_only
         and not authority
         and status == "CLOSED"
         and direction in {"LONG", "SHORT"}
+        and bool(str(row.get("closed_at") or "").strip())
+        and _optional_float(row.get("exit_price")) is not None
+        and net_pnl is not None
+        and net_pnl_pct is not None
+        and bool(str(row.get("outcome") or "").strip())
     )
     quality = (
         OutcomeSourceQuality.FINAL_PAPER
         if final
         else OutcomeSourceQuality.UNUSABLE
     )
-    net_pnl_pct = _optional_float(row.get("net_pnl_pct"))
     returns = (
         {"paper_closed": net_pnl_pct}
         if net_pnl_pct is not None
@@ -345,7 +351,7 @@ def normalize_paper_outcome(
             else None
         ),
         terminal_outcome=str(row.get("outcome") or "") or None,
-        net_pnl=_optional_float(row.get("net_pnl")),
+        net_pnl=net_pnl,
         net_pnl_pct=net_pnl_pct,
     )
 
@@ -417,6 +423,13 @@ def build_learning_linkage_records(
     phase3c = select_latest_phase3c_outcomes(phase3c_outcome_rows)
     paper_latest = select_latest_paper_trades(paper_trade_rows)
     paper_by_episode = _paper_by_episode(paper_latest)
+    canonical_ids_by_episode: dict[str, list[str]] = {}
+    for canonical_snapshot_id, canonical_row in canonical_index.items():
+        canonical_episode_id = str(canonical_row.get("episode_id") or "").strip()
+        if canonical_episode_id:
+            canonical_ids_by_episode.setdefault(canonical_episode_id, []).append(
+                canonical_snapshot_id
+            )
 
     records: list[LearningLinkageRecord] = []
     for snapshot_id in sorted(canonical_index):
@@ -446,7 +459,40 @@ def build_learning_linkage_records(
                 if episode_id is not None
                 else []
             )
-            if len(matching_paper) > 1:
+            episode_snapshot_count = (
+                len(canonical_ids_by_episode.get(episode_id, []))
+                if episode_id is not None
+                else 0
+            )
+            if matching_paper and episode_snapshot_count != 1:
+                reasons.append("AMBIGUOUS_CANONICAL_SNAPSHOT_FOR_PAPER_EPISODE")
+                outcome = NormalizedOutcomeEvidence(
+                    source_quality=OutcomeSourceQuality.UNUSABLE,
+                    source_name="PAPER_TRADE_V1",
+                    canonical_snapshot_id=snapshot_id,
+                    episode_id=episode_id,
+                    direction=None,
+                    outcome_record_id=None,
+                    outcome_revision=None,
+                    paper_trade_id=None,
+                    horizon_returns={},
+                    mfe=None,
+                    mae=None,
+                    time_to_mfe_seconds=None,
+                    time_to_mae_seconds=None,
+                    censored=False,
+                    data_gap=False,
+                    execution_path_ambiguous=False,
+                    fee_model_version=None,
+                    slippage_model_version=None,
+                    terminal_outcome=None,
+                    net_pnl=None,
+                    net_pnl_pct=None,
+                )
+                status = LinkageStatus.AMBIGUOUS_PAPER_LINK
+                primary = False
+                paper_trade_id = None
+            elif len(matching_paper) > 1:
                 reasons.append("AMBIGUOUS_EXACT_PAPER_EPISODE_LINK")
                 outcome = NormalizedOutcomeEvidence(
                     source_quality=OutcomeSourceQuality.UNUSABLE,
