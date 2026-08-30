@@ -221,3 +221,46 @@ def test_cross_venue_liquidation_sync_is_bounded_state():
     assert len(accumulator._buckets) == 1
     bucket = next(iter(accumulator._buckets.values()))
     assert bucket.synchronized_seen is True
+
+
+def test_bybit_connect_and_subscribe_contract(monkeypatch):
+    import asyncio
+    import app.opip.streaming.bybit as module
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+        async def close(self):
+            return None
+
+    fake_ws = FakeWs()
+    captured = {}
+
+    async def fake_connect(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return fake_ws
+
+    monkeypatch.setattr(module, "connect", fake_connect)
+
+    async def scenario():
+        adapter = BybitPublicAdapter(symbols=("BTCUSDT", "ETHUSDT"))
+        await adapter.connect(connection_id="bybit-0", reconnect_epoch=0)
+        await adapter.subscribe()
+        await adapter.close()
+
+    asyncio.run(scenario())
+    assert captured["url"] == "wss://stream.bybit.com/v5/public/linear"
+    request = orjson.loads(fake_ws.sent[0])
+    assert request["op"] == "subscribe"
+    assert set(request["args"]) == {
+        "publicTrade.BTCUSDT",
+        "allLiquidation.BTCUSDT",
+        "publicTrade.ETHUSDT",
+        "allLiquidation.ETHUSDT",
+    }
+    assert captured["kwargs"]["max_queue"] == 16
