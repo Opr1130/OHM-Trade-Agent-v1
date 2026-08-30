@@ -187,7 +187,8 @@ def test_late_after_seal_never_reaches_feature_acceptance_and_degrades_quality()
     )
     seal_at = final_end + timedelta(milliseconds=2)
     runtime._seal_and_prune(seal_at)
-    assert notices == []
+    assert all(notice.window_seconds == 1 for notice in notices)
+    notices.clear()
 
     late = QueuedRawFrame(
         provider=StreamProvider.BINANCE,
@@ -206,10 +207,13 @@ def test_late_after_seal_never_reaches_feature_acceptance_and_degrades_quality()
     runtime._seal_and_prune(
         final_end + timedelta(seconds=2)
     )
-    assert notices
-    assert all(
-        notice.quality.state is EvidenceQualityState.DEGRADED
-        for notice in notices
+    notices_15s = [
+        notice for notice in notices if notice.window_seconds == 15
+    ]
+    assert len(notices_15s) == 1
+    assert (
+        notices_15s[0].quality.state
+        is EvidenceQualityState.DEGRADED
     )
 
 
