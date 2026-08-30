@@ -32,6 +32,7 @@ class RuntimeTelemetrySnapshot:
     raw_frames_received: int
     raw_frames_enqueued: int
     raw_frames_dropped_newest: int
+    raw_frames_dropped_shutdown: int
     frames_processed: int
     malformed_frames: int
     normalized_observations: int
@@ -97,6 +98,7 @@ class RuntimeTelemetry:
         self.raw_frames_received = 0
         self.raw_frames_enqueued = 0
         self.raw_frames_dropped_newest = 0
+        self.raw_frames_dropped_shutdown = 0
         self.frames_processed = 0
         self.malformed_frames = 0
         self.normalized_observations = 0
@@ -134,6 +136,7 @@ class RuntimeTelemetry:
             raw_frames_received=self.raw_frames_received,
             raw_frames_enqueued=self.raw_frames_enqueued,
             raw_frames_dropped_newest=self.raw_frames_dropped_newest,
+            raw_frames_dropped_shutdown=self.raw_frames_dropped_shutdown,
             frames_processed=self.frames_processed,
             malformed_frames=self.malformed_frames,
             normalized_observations=self.normalized_observations,
