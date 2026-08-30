@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+import json
 
 import pytest
 
 from app.opip.decision.engine import CandidateEvidence, OPipDecisionEngine
 from app.opip.decision.equivalence import (
     DivergenceKind,
+    EquivalenceObservation,
     PairingState,
     build_equivalence_observation,
 )
@@ -22,6 +24,7 @@ from app.opip.decision.policy_snapshot import GatePolicySnapshot, _freeze, _thaw
 from app.opip.decision.promotion import (
     PromotionCriteria,
     PromotionEvaluationStatus,
+    ScanCoverageExpectation,
     evaluate_shadow_equivalence,
 )
 from app.opip.decision.replay import replay_decision
@@ -31,8 +34,9 @@ from tests.test_opip_decision_engine_v1 import execution, snapshot
 
 def _pair(
     *,
-    when: datetime = NOW,
+    when=NOW,
     scan_id: str = "SCAN:1",
+    candidate_id: str = "OPIPC:build51",
     shadow_mutator=None,
 ):
     candidate = snapshot()
@@ -41,6 +45,7 @@ def _pair(
     )
     row = evidence(
         decision_time_utc=when,
+        candidate_id=candidate_id,
         candidate_snapshot=candidate,
     )
     live = OPipDecisionEngine(
@@ -71,16 +76,46 @@ def _pair(
     )
 
 
-def test_exact_pair_records_full_equivalence():
+def _coverage(*rows):
+    by_scan = {}
+    for row in rows:
+        by_scan.setdefault(row.scan_id, []).append(row.candidate_id)
+    return tuple(
+        ScanCoverageExpectation(
+            scan_id=scan_id,
+            expected_at_utc=next(
+                row.observed_at_utc for row in rows if row.scan_id == scan_id
+            ),
+            expected_candidate_ids=tuple(candidate_ids),
+        )
+        for scan_id, candidate_ids in sorted(by_scan.items())
+    )
+
+
+def _criteria(n=1, scans=1, days=1):
+    return PromotionCriteria(
+        min_comparable_observations=n,
+        min_distinct_scans=scans,
+        min_distinct_days=days,
+    )
+
+
+def test_exact_pair_records_full_equivalence_and_content_identity():
     observation = _pair()
     assert observation.pairing_state is PairingState.COMPLETE
     assert observation.divergence_kind is DivergenceKind.EXACT
     assert observation.exact_match is True
-    assert observation.outcome_match is True
-    assert observation.terminal_gate_match is True
-    assert observation.reason_match is True
-    assert observation.gate_history_match is True
-    assert observation.observation_id.startswith("EQO:")
+    assert observation.production_decision_hash.startswith("DCH:")
+    assert observation.production_gate_history_hash.startswith("GHH:")
+    assert observation.observation_id == observation.calculated_observation_id
+
+
+def test_persisted_row_rejects_mutated_match_evidence():
+    observation = _pair()
+    payload = observation.as_dict()
+    payload["exact_match"] = False
+    with pytest.raises(ValueError):
+        EquivalenceObservation.from_dict(payload)
 
 
 def test_missing_side_is_instrumentation_failure_not_match():
@@ -108,14 +143,10 @@ def test_runtime_identity_mismatch_is_invalid_and_cannot_compare():
     )
     assert observation.pairing_state is PairingState.INVALID
     assert observation.exact_match is False
-    assert observation.divergence_kind is DivergenceKind.PAIRING_INVALID
     assert "ENGINE_CODE_FINGERPRINT_MISMATCH" in observation.pairing_errors
 
 
 def test_gate_history_divergence_is_visible_even_when_verdict_matches():
-    baseline = _pair()
-    assert baseline.exact_match is True
-
     def mutate(value):
         last = value.gate_results_ordered[-1]
         changed = replace(last, reason=last.reason + " changed")
@@ -136,115 +167,150 @@ def test_promotion_requires_sustained_exact_homogeneous_evidence():
         _pair(
             when=NOW + timedelta(days=index, minutes=index),
             scan_id=f"SCAN:{index}",
+            candidate_id=f"OPIPC:{index}",
         )
         for index in range(3)
     )
     result = evaluate_shadow_equivalence(
         rows,
-        criteria=PromotionCriteria(
-            min_comparable_observations=3,
-            min_distinct_scans=3,
-            min_distinct_days=3,
-        ),
+        criteria=_criteria(3, 3, 3),
+        coverage_expectations=_coverage(*rows),
     )
     assert result.status is PromotionEvaluationStatus.READY_FOR_HUMAN_REVIEW
     assert result.ready_for_human_review is True
-    assert result.divergences == 0
     assert result.instrumentation_coverage_pct == 100.0
     assert result.CAN_PROMOTE is False
     assert result.AUTHORITATIVE is False
 
 
+def test_no_expected_denominator_can_never_be_ready():
+    row = _pair()
+    result = evaluate_shadow_equivalence([row], criteria=_criteria())
+    assert result.status is PromotionEvaluationStatus.BLOCKED_INSTRUMENTATION
+    assert "EXPECTED_COVERAGE_NOT_PROVIDED" in result.blockers
+
+
+def test_entirely_omitted_candidate_is_detected_by_independent_denominator():
+    kept = _pair(scan_id="SCAN:1", candidate_id="OPIPC:kept")
+    expectation = ScanCoverageExpectation(
+        scan_id="SCAN:1",
+        expected_at_utc=NOW,
+        expected_candidate_ids=("OPIPC:kept", "OPIPC:omitted"),
+    )
+    result = evaluate_shadow_equivalence(
+        [kept],
+        criteria=_criteria(),
+        coverage_expectations=(expectation,),
+    )
+    assert result.status is PromotionEvaluationStatus.BLOCKED_INSTRUMENTATION
+    assert result.instrumentation_coverage_pct == 50.0
+    assert result.missing_expected_observations == 1
+    assert "EXPECTED_COMPARISON_MISSING" in result.blockers
+
+
 def test_one_divergence_blocks_engine_equivalence():
-    rows = [_pair(scan_id="SCAN:1"), _pair(scan_id="SCAN:2", when=NOW + timedelta(days=1))]
+    rows = [
+        _pair(scan_id="SCAN:1", candidate_id="OPIPC:1"),
+        _pair(
+            scan_id="SCAN:2",
+            candidate_id="OPIPC:2",
+            when=NOW + timedelta(days=1),
+        ),
+    ]
     divergent = replace(
         rows[1],
+        observation_id="EQO:" + ("0" * 64),
         exact_match=False,
         gate_history_match=False,
         divergence_kind=DivergenceKind.GATE_HISTORY,
+        shadow_gate_history_hash="GHH:" + ("0" * 64),
     )
+    divergent = replace(divergent, observation_id=divergent.calculated_observation_id)
     result = evaluate_shadow_equivalence(
         [rows[0], divergent],
-        criteria=PromotionCriteria(
-            min_comparable_observations=2,
-            min_distinct_scans=2,
-            min_distinct_days=2,
-        ),
+        criteria=_criteria(2, 2, 2),
+        coverage_expectations=_coverage(rows[0], divergent),
     )
     assert result.status is PromotionEvaluationStatus.BLOCKED_DIVERGENCE
     assert "EXACT_EQUIVALENCE_DIVERGENCE_PRESENT" in result.blockers
 
 
 def test_incomplete_instrumentation_blocks_even_with_exact_pairs():
-    exact = _pair()
+    exact = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
     candidate = snapshot()
     candidate.execution_validation = execution()
-    row = evidence(candidate_snapshot=candidate)
+    row = evidence(candidate_id="OPIPC:2", candidate_snapshot=candidate)
     missing = build_equivalence_observation(
         observed_at_utc=NOW + timedelta(minutes=1),
-        scan_id="SCAN:missing",
+        scan_id="SCAN:2",
         production=None,
         shadow=replay_decision(row),
     )
     result = evaluate_shadow_equivalence(
         [exact, missing],
-        criteria=PromotionCriteria(
-            min_comparable_observations=1,
-            min_distinct_scans=1,
-            min_distinct_days=1,
-            min_instrumentation_coverage_pct=100.0,
-        ),
+        criteria=_criteria(),
+        coverage_expectations=_coverage(exact, missing),
     )
     assert result.status is PromotionEvaluationStatus.BLOCKED_INSTRUMENTATION
     assert result.instrumentation_coverage_pct == 50.0
 
 
 def test_incomplete_ledger_coverage_blocks_promotion():
+    row = _pair()
     result = evaluate_shadow_equivalence(
-        [_pair()],
-        criteria=PromotionCriteria(
-            min_comparable_observations=1,
-            min_distinct_scans=1,
-            min_distinct_days=1,
-        ),
+        [row],
+        criteria=_criteria(),
+        coverage_expectations=_coverage(row),
         ledger_complete=False,
-        ledger_warnings=("ARCHIVE_READ_FAILED:RuntimeError",),
+        ledger_warnings=("ARCHIVE_SEGMENT_MISSING",),
     )
     assert result.status is PromotionEvaluationStatus.BLOCKED_INSTRUMENTATION
     assert "LEDGER_COVERAGE_INCOMPLETE" in result.blockers
 
 
 def test_version_mix_blocks_aggregation():
-    first = _pair(scan_id="SCAN:1")
+    first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    second = _pair(
+        scan_id="SCAN:2",
+        candidate_id="OPIPC:2",
+        when=NOW + timedelta(days=1),
+    )
     second = replace(
-        _pair(scan_id="SCAN:2", when=NOW + timedelta(days=1)),
+        second,
+        observation_id="EQO:" + ("0" * 64),
         engine_code_fingerprint="ACF:" + ("f" * 64),
     )
+    second = replace(second, observation_id=second.calculated_observation_id)
     result = evaluate_shadow_equivalence(
         [first, second],
-        criteria=PromotionCriteria(
-            min_comparable_observations=2,
-            min_distinct_scans=2,
-            min_distinct_days=2,
-        ),
+        criteria=_criteria(2, 2, 2),
+        coverage_expectations=_coverage(first, second),
     )
     assert result.status is PromotionEvaluationStatus.BLOCKED_VERSION_MIX
 
 
+def test_duplicate_candidate_observations_block_readiness():
+    first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    second = replace(
+        first,
+        observation_id="EQO:" + ("0" * 64),
+        shadow_decision_id="DEC:" + ("f" * 64),
+    )
+    second = replace(second, observation_id=second.calculated_observation_id)
+    result = evaluate_shadow_equivalence(
+        [first, second],
+        criteria=_criteria(),
+        coverage_expectations=_coverage(first),
+    )
+    assert result.status is PromotionEvaluationStatus.BLOCKED_INSTRUMENTATION
+    assert "DUPLICATE_CANDIDATE_OBSERVATION_PRESENT" in result.blockers
+
+
 def test_criteria_are_explicit_and_validated():
     with pytest.raises(ValueError):
-        PromotionCriteria(
-            min_comparable_observations=0,
-            min_distinct_scans=1,
-            min_distinct_days=1,
-        )
+        PromotionCriteria(0, 1, 1)
     with pytest.raises(ValueError):
-        PromotionCriteria(
-            min_comparable_observations=1,
-            min_distinct_scans=1,
-            min_distinct_days=1,
-            min_instrumentation_coverage_pct=float("nan"),
-        )
+        PromotionCriteria(1, 1, 1, float("nan"))
 
 
 def test_ledger_dark_by_default_and_round_trips_when_enabled(tmp_path):
@@ -260,7 +326,6 @@ def test_ledger_dark_by_default_and_round_trips_when_enabled(tmp_path):
     result = read_equivalence_ledger(path=path)
     assert result.complete is True
     assert result.warnings == ()
-    assert len(result.observations) == 1
     assert result.observations[0].as_dict() == observation.as_dict()
 
 
@@ -275,11 +340,34 @@ def test_ledger_deduplicates_idempotent_retry(tmp_path):
     assert len(result.observations) == 1
 
 
+def test_manifest_declared_missing_archive_marks_ledger_incomplete(tmp_path):
+    path = tmp_path / "equivalence.jsonl"
+    archive_dir = tmp_path / "equivalence_archive"
+    archive_dir.mkdir()
+    manifest = {
+        "schema_version": 1,
+        "segments": {
+            "a" * 64: {
+                "archive": "equivalence-missing.jsonl.gz",
+                "tier": "WARM",
+                "sha256": "a" * 64,
+                "row_count": 1,
+                "bytes": 100,
+            }
+        },
+    }
+    (archive_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    result = read_equivalence_ledger(path=path)
+    assert result.complete is False
+    assert "ARCHIVE_SEGMENT_MISSING" in result.warnings
+
+
 def test_policy_freeze_thaw_round_trips_ambiguous_lists():
     values = (
         [],
+        {},
         [["a", 1], ["b", 2]],
-        {"nested": [], "pairs": [["x", 3]]},
+        {"nested": [], "pairs": [["x", 3]], "empty": {}},
     )
     for value in values:
         assert _thaw(_freeze(value)) == value

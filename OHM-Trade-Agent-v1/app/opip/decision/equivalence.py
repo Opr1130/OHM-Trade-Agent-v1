@@ -36,17 +36,27 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _sha(prefix: str, value: Any) -> str:
+    return prefix + hashlib.sha256(
+        canonical_serialize(value).encode("utf-8")
+    ).hexdigest()
+
+
 def _gate_history(decision: AdmissionDecisionV2) -> tuple[dict[str, Any], ...]:
     return tuple(item.as_dict() for item in decision.gate_results_ordered)
 
 
+def _decision_hash(decision: AdmissionDecisionV2 | None) -> str | None:
+    return None if decision is None else _sha("DCH:", decision.as_dict())
+
+
+def _gate_history_hash(decision: AdmissionDecisionV2 | None) -> str | None:
+    return None if decision is None else _sha("GHH:", _gate_history(decision))
+
+
 @dataclass(frozen=True)
 class EquivalenceObservation:
-    """One immutable production-reference vs shadow comparison.
-
-    Missing or mismatched sides are evidence too. They are recorded as
-    instrumentation failures and can never count as equivalence.
-    """
+    """One immutable production-reference vs shadow comparison."""
 
     observation_id: str
     observed_at_utc: datetime
@@ -54,6 +64,10 @@ class EquivalenceObservation:
     candidate_id: str
     production_decision_id: str | None
     shadow_decision_id: str | None
+    production_decision_hash: str | None
+    shadow_decision_hash: str | None
+    production_gate_history_hash: str | None
+    shadow_gate_history_hash: str | None
     evidence_hash: str | None
     gate_policy_fingerprint: str | None
     engine_code_fingerprint: str | None
@@ -73,6 +87,8 @@ class EquivalenceObservation:
     shadow_terminal_gate: str | None
     production_reason_code: str | None
     shadow_reason_code: str | None
+    production_reason_class: str | None
+    shadow_reason_class: str | None
     schema_version: int = EQUIVALENCE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -86,32 +102,108 @@ class EquivalenceObservation:
         )
         if self.schema_version != EQUIVALENCE_SCHEMA_VERSION:
             raise ValueError("unsupported equivalence observation schema")
-        if not self.observation_id.startswith("EQO:"):
-            raise ValueError("observation_id must use EQO: identity")
         if not self.scan_id or not self.candidate_id:
             raise ValueError("scan_id and candidate_id are required")
-        if self.pairing_state is PairingState.COMPLETE and self.pairing_errors:
-            raise ValueError("complete pairing cannot carry pairing errors")
-        if self.exact_match and self.pairing_state is not PairingState.COMPLETE:
-            raise ValueError("only complete pairings can be exact")
-        if self.exact_match and self.divergence_kind is not DivergenceKind.EXACT:
-            raise ValueError("exact match must use EXACT divergence kind")
-        if not self.exact_match and self.divergence_kind is DivergenceKind.EXACT:
-            raise ValueError("non-exact observation cannot use EXACT divergence kind")
+
+        if self.pairing_state is PairingState.COMPLETE:
+            if self.pairing_errors:
+                raise ValueError("complete pairing cannot carry pairing errors")
+            required = (
+                self.production_decision_id,
+                self.shadow_decision_id,
+                self.production_decision_hash,
+                self.shadow_decision_hash,
+                self.production_gate_history_hash,
+                self.shadow_gate_history_hash,
+                self.evidence_hash,
+                self.gate_policy_fingerprint,
+                self.engine_code_fingerprint,
+                self.pair,
+                self.direction,
+            )
+            if any(value is None or str(value) == "" for value in required):
+                raise ValueError("complete pairing is missing immutable comparison evidence")
+            expected_outcome = self.production_outcome == self.shadow_outcome
+            expected_gate = self.production_terminal_gate == self.shadow_terminal_gate
+            expected_reason = (
+                self.production_reason_code == self.shadow_reason_code
+                and self.production_reason_class == self.shadow_reason_class
+            )
+            expected_history = (
+                self.production_gate_history_hash == self.shadow_gate_history_hash
+            )
+            expected_exact = (
+                expected_outcome
+                and expected_gate
+                and expected_reason
+                and expected_history
+            )
+            actual = (
+                self.outcome_match,
+                self.terminal_gate_match,
+                self.reason_match,
+                self.gate_history_match,
+                self.exact_match,
+            )
+            expected = (
+                expected_outcome,
+                expected_gate,
+                expected_reason,
+                expected_history,
+                expected_exact,
+            )
+            if actual != expected:
+                raise ValueError("equivalence match flags are inconsistent with evidence")
+            if not expected_outcome:
+                expected_kind = DivergenceKind.OUTCOME
+            elif not expected_gate:
+                expected_kind = DivergenceKind.TERMINAL_GATE
+            elif not expected_reason:
+                expected_kind = DivergenceKind.REASON
+            elif not expected_history:
+                expected_kind = DivergenceKind.GATE_HISTORY
+            else:
+                expected_kind = DivergenceKind.EXACT
+            if self.divergence_kind is not expected_kind:
+                raise ValueError("divergence kind is inconsistent with comparison evidence")
+        else:
+            if any(
+                (
+                    self.outcome_match,
+                    self.terminal_gate_match,
+                    self.reason_match,
+                    self.gate_history_match,
+                    self.exact_match,
+                )
+            ):
+                raise ValueError("non-comparable pairing cannot carry match flags")
+            expected_kind = (
+                DivergenceKind.INSTRUMENTATION_INCOMPLETE
+                if self.pairing_state is PairingState.INCOMPLETE
+                else DivergenceKind.PAIRING_INVALID
+            )
+            if self.divergence_kind is not expected_kind:
+                raise ValueError("non-comparable pairing has invalid divergence kind")
+
+        if self.observation_id != self.calculated_observation_id:
+            raise ValueError("equivalence observation content hash mismatch")
 
     @property
     def instrumentation_complete(self) -> bool:
         return self.pairing_state is PairingState.COMPLETE
 
-    def as_dict(self) -> dict[str, Any]:
+    def identity_payload(self) -> dict[str, Any]:
+        """Content identity excluding wall-clock observation time."""
         return {
             "schema_version": self.schema_version,
-            "observation_id": self.observation_id,
-            "observed_at_utc": self.observed_at_utc.isoformat(),
             "scan_id": self.scan_id,
             "candidate_id": self.candidate_id,
             "production_decision_id": self.production_decision_id,
             "shadow_decision_id": self.shadow_decision_id,
+            "production_decision_hash": self.production_decision_hash,
+            "shadow_decision_hash": self.shadow_decision_hash,
+            "production_gate_history_hash": self.production_gate_history_hash,
+            "shadow_gate_history_hash": self.shadow_gate_history_hash,
             "evidence_hash": self.evidence_hash,
             "gate_policy_fingerprint": self.gate_policy_fingerprint,
             "engine_code_fingerprint": self.engine_code_fingerprint,
@@ -119,7 +211,6 @@ class EquivalenceObservation:
             "direction": self.direction,
             "pairing_state": self.pairing_state.value,
             "pairing_errors": list(self.pairing_errors),
-            "instrumentation_complete": self.instrumentation_complete,
             "outcome_match": self.outcome_match,
             "terminal_gate_match": self.terminal_gate_match,
             "reason_match": self.reason_match,
@@ -132,6 +223,20 @@ class EquivalenceObservation:
             "shadow_terminal_gate": self.shadow_terminal_gate,
             "production_reason_code": self.production_reason_code,
             "shadow_reason_code": self.shadow_reason_code,
+            "production_reason_class": self.production_reason_class,
+            "shadow_reason_class": self.shadow_reason_class,
+        }
+
+    @property
+    def calculated_observation_id(self) -> str:
+        return _sha("EQO:", self.identity_payload())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            **self.identity_payload(),
+            "observation_id": self.observation_id,
+            "observed_at_utc": self.observed_at_utc.isoformat(),
+            "instrumentation_complete": self.instrumentation_complete,
         }
 
     @classmethod
@@ -146,6 +251,10 @@ class EquivalenceObservation:
             candidate_id=str(payload["candidate_id"]),
             production_decision_id=payload.get("production_decision_id"),
             shadow_decision_id=payload.get("shadow_decision_id"),
+            production_decision_hash=payload.get("production_decision_hash"),
+            shadow_decision_hash=payload.get("shadow_decision_hash"),
+            production_gate_history_hash=payload.get("production_gate_history_hash"),
+            shadow_gate_history_hash=payload.get("shadow_gate_history_hash"),
             evidence_hash=payload.get("evidence_hash"),
             gate_policy_fingerprint=payload.get("gate_policy_fingerprint"),
             engine_code_fingerprint=payload.get("engine_code_fingerprint"),
@@ -165,6 +274,8 @@ class EquivalenceObservation:
             shadow_terminal_gate=payload.get("shadow_terminal_gate"),
             production_reason_code=payload.get("production_reason_code"),
             shadow_reason_code=payload.get("shadow_reason_code"),
+            production_reason_class=payload.get("production_reason_class"),
+            shadow_reason_class=payload.get("shadow_reason_class"),
             schema_version=int(payload.get("schema_version", -1)),
         )
 
@@ -175,24 +286,8 @@ def _decision_gate(decision: AdmissionDecisionV2 | None) -> str | None:
     return decision.first_terminal_gate.value
 
 
-def _observation_id(
-    *,
-    scan_id: str,
-    candidate_id: str,
-    production_decision_id: str | None,
-    shadow_decision_id: str | None,
-    evidence_hash: str | None,
-) -> str:
-    payload = {
-        "scan_id": scan_id,
-        "candidate_id": candidate_id,
-        "production_decision_id": production_decision_id,
-        "shadow_decision_id": shadow_decision_id,
-        "evidence_hash": evidence_hash,
-    }
-    return "EQO:" + hashlib.sha256(
-        canonical_serialize(payload).encode("utf-8")
-    ).hexdigest()
+def _reason_class(decision: AdmissionDecisionV2 | None) -> str | None:
+    return None if decision is None else decision.terminal_reason_class.value
 
 
 def build_equivalence_observation(
@@ -203,12 +298,7 @@ def build_equivalence_observation(
     shadow: AdmissionDecisionV2 | None,
     candidate_id: str | None = None,
 ) -> EquivalenceObservation:
-    """Build one fail-closed equivalence observation.
-
-    The two sides must represent the same sealed candidate/evidence/runtime.
-    Any missing side is INCOMPLETE; any identity/runtime mismatch is INVALID.
-    Neither state is eligible to count as a comparable match.
-    """
+    """Build one fail-closed equivalence observation."""
     if production is None and shadow is None:
         raise ValueError("at least one decision side is required")
 
@@ -223,7 +313,6 @@ def build_equivalence_observation(
         errors.append("PRODUCTION_REFERENCE_MISSING")
     if shadow is None:
         errors.append("SHADOW_DECISION_MISSING")
-
     if production is not None and production.decision_role is not DecisionRole.PRODUCTION_REFERENCE:
         errors.append("PRODUCTION_ROLE_INVALID")
     if shadow is not None and shadow.decision_role is not DecisionRole.SHADOW_ENGINE:
@@ -252,13 +341,15 @@ def build_equivalence_observation(
                 errors.append(code)
 
     if production is None or shadow is None:
-        pairing_state = PairingState.INCOMPLETE
+        state = PairingState.INCOMPLETE
     elif errors:
-        pairing_state = PairingState.INVALID
+        state = PairingState.INVALID
     else:
-        pairing_state = PairingState.COMPLETE
+        state = PairingState.COMPLETE
 
-    comparable = pairing_state is PairingState.COMPLETE
+    comparable = state is PairingState.COMPLETE
+    production_history_hash = _gate_history_hash(production)
+    shadow_history_hash = _gate_history_hash(shadow)
     outcome_match = bool(
         comparable and production is not None and shadow is not None
         and production.decision == shadow.decision
@@ -272,17 +363,17 @@ def build_equivalence_observation(
         and production.terminal_reason_class == shadow.terminal_reason_class
     )
     gate_history_match = bool(
-        comparable and production is not None and shadow is not None
-        and canonical_serialize(_gate_history(production))
-        == canonical_serialize(_gate_history(shadow))
+        comparable
+        and production_history_hash is not None
+        and production_history_hash == shadow_history_hash
     )
     exact = bool(
         outcome_match and terminal_gate_match and reason_match and gate_history_match
     )
 
-    if pairing_state is PairingState.INCOMPLETE:
+    if state is PairingState.INCOMPLETE:
         kind = DivergenceKind.INSTRUMENTATION_INCOMPLETE
-    elif pairing_state is PairingState.INVALID:
+    elif state is PairingState.INVALID:
         kind = DivergenceKind.PAIRING_INVALID
     elif not outcome_match:
         kind = DivergenceKind.OUTCOME
@@ -313,16 +404,8 @@ def build_equivalence_observation(
     pair = production.pair if production is not None else shadow.pair
     direction = production.direction if production is not None else shadow.direction
 
-    return EquivalenceObservation(
-        observation_id=_observation_id(
-            scan_id=str(scan_id),
-            candidate_id=resolved_candidate,
-            production_decision_id=(
-                production.decision_id if production is not None else None
-            ),
-            shadow_decision_id=shadow.decision_id if shadow is not None else None,
-            evidence_hash=evidence_hash,
-        ),
+    values = dict(
+        observation_id="EQO:" + ("0" * 64),
         observed_at_utc=observed_at_utc,
         scan_id=str(scan_id),
         candidate_id=resolved_candidate,
@@ -330,12 +413,16 @@ def build_equivalence_observation(
             production.decision_id if production is not None else None
         ),
         shadow_decision_id=shadow.decision_id if shadow is not None else None,
+        production_decision_hash=_decision_hash(production),
+        shadow_decision_hash=_decision_hash(shadow),
+        production_gate_history_hash=production_history_hash,
+        shadow_gate_history_hash=shadow_history_hash,
         evidence_hash=evidence_hash,
         gate_policy_fingerprint=policy,
         engine_code_fingerprint=code_fingerprint,
         pair=pair,
         direction=direction,
-        pairing_state=pairing_state,
+        pairing_state=state,
         pairing_errors=tuple(errors),
         outcome_match=outcome_match,
         terminal_gate_match=terminal_gate_match,
@@ -353,4 +440,24 @@ def build_equivalence_observation(
             production.terminal_reason_code if production is not None else None
         ),
         shadow_reason_code=shadow.terminal_reason_code if shadow is not None else None,
+        production_reason_class=_reason_class(production),
+        shadow_reason_class=_reason_class(shadow),
     )
+    # Build once with a placeholder only to calculate the content identity
+    # without permitting a caller-supplied observation ID.
+    payload = {
+        key: value
+        for key, value in values.items()
+        if key not in {"observation_id", "observed_at_utc"}
+    }
+    payload["schema_version"] = EQUIVALENCE_SCHEMA_VERSION
+    values["observation_id"] = _sha(
+        "EQO:",
+        {
+            **payload,
+            "pairing_state": state.value,
+            "pairing_errors": list(tuple(sorted(errors))),
+            "divergence_kind": kind.value,
+        },
+    )
+    return EquivalenceObservation(**values)

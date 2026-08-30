@@ -1,7 +1,9 @@
 """Sustained shadow-equivalence evaluation for O'Pip BUILD 5.2A."""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import math
 from typing import Iterable
@@ -18,13 +20,34 @@ class PromotionEvaluationStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class PromotionCriteria:
-    """Governance inputs for an equivalence evaluation.
+class ScanCoverageExpectation:
+    """Independent expected denominator for one canonical scan."""
 
-    BUILD 5.2A deliberately does not choose production promotion thresholds.
-    A caller must supply the minimum observation/scans/days it wants to demand.
-    Exact engine equivalence itself is non-negotiable: zero divergences.
-    """
+    scan_id: str
+    expected_at_utc: datetime
+    expected_candidate_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not str(self.scan_id or ""):
+            raise ValueError("scan_id is required")
+        if self.expected_at_utc.tzinfo is None or self.expected_at_utc.utcoffset() is None:
+            raise ValueError("expected_at_utc must be timezone-aware")
+        object.__setattr__(
+            self,
+            "expected_at_utc",
+            self.expected_at_utc.astimezone(timezone.utc),
+        )
+        normalized = tuple(
+            sorted({str(item) for item in self.expected_candidate_ids if str(item)})
+        )
+        if not normalized:
+            raise ValueError("expected_candidate_ids must not be empty")
+        object.__setattr__(self, "expected_candidate_ids", normalized)
+
+
+@dataclass(frozen=True)
+class PromotionCriteria:
+    """Explicit governance inputs; BUILD 5.2A chooses no production threshold."""
 
     min_comparable_observations: int
     min_distinct_scans: int
@@ -47,6 +70,11 @@ class PromotionCriteria:
 class PromotionEvaluation:
     status: PromotionEvaluationStatus
     evaluated_observations: int
+    expected_observations: int
+    covered_expected_observations: int
+    missing_expected_observations: int
+    unexpected_observations: int
+    duplicate_candidate_observations: int
     comparable_observations: int
     instrumentation_complete_observations: int
     instrumentation_coverage_pct: float
@@ -72,6 +100,11 @@ class PromotionEvaluation:
         return {
             "status": self.status.value,
             "evaluated_observations": self.evaluated_observations,
+            "expected_observations": self.expected_observations,
+            "covered_expected_observations": self.covered_expected_observations,
+            "missing_expected_observations": self.missing_expected_observations,
+            "unexpected_observations": self.unexpected_observations,
+            "duplicate_candidate_observations": self.duplicate_candidate_observations,
             "comparable_observations": self.comparable_observations,
             "instrumentation_complete_observations": (
                 self.instrumentation_complete_observations
@@ -114,29 +147,68 @@ def _dedupe(
     )
 
 
+def _expectations(
+    values: Iterable[ScanCoverageExpectation] | None,
+) -> tuple[ScanCoverageExpectation, ...]:
+    if values is None:
+        return ()
+    by_scan: dict[str, ScanCoverageExpectation] = {}
+    for item in values:
+        prior = by_scan.get(item.scan_id)
+        if prior is not None and prior != item:
+            raise ValueError("conflicting coverage expectation for scan")
+        by_scan[item.scan_id] = item
+    return tuple(sorted(by_scan.values(), key=lambda item: item.scan_id))
+
+
 def evaluate_shadow_equivalence(
     observations: Iterable[EquivalenceObservation],
     *,
     criteria: PromotionCriteria,
+    coverage_expectations: Iterable[ScanCoverageExpectation] | None = None,
     ledger_complete: bool = True,
     ledger_warnings: tuple[str, ...] = (),
 ) -> PromotionEvaluation:
     """Evaluate evidence readiness; never perform or authorize promotion."""
     rows = _dedupe(observations)
-    total = len(rows)
-    complete = tuple(
-        row for row in rows if row.pairing_state is PairingState.COMPLETE
+    expectations = _expectations(coverage_expectations)
+    expected_keys = {
+        (expectation.scan_id, candidate_id)
+        for expectation in expectations
+        for candidate_id in expectation.expected_candidate_ids
+    }
+    rows_by_key: dict[tuple[str, str], list[EquivalenceObservation]] = {}
+    for row in rows:
+        rows_by_key.setdefault((row.scan_id, row.candidate_id), []).append(row)
+
+    counts = Counter(
+        key for key, matching in rows_by_key.items() for _ in matching
     )
-    exact = tuple(row for row in complete if row.exact_match)
-    divergent = tuple(row for row in complete if not row.exact_match)
-    coverage = round(100.0 * len(complete) / total, 6) if total else 0.0
-    scans = {row.scan_id for row in complete}
-    days = {row.observed_at_utc.date().isoformat() for row in complete}
+    duplicate_keys = {key for key, count in counts.items() if count > 1}
+    observed_keys = set(rows_by_key)
+    missing_keys = expected_keys - observed_keys
+    unexpected_keys = observed_keys - expected_keys if expectations else observed_keys
+
+    complete_expected: list[EquivalenceObservation] = []
+    for key in sorted(expected_keys):
+        matching = rows_by_key.get(key, [])
+        if len(matching) == 1 and matching[0].pairing_state is PairingState.COMPLETE:
+            complete_expected.append(matching[0])
+
+    total_expected = len(expected_keys)
+    covered = len(complete_expected)
+    coverage = (
+        round(100.0 * covered / total_expected, 6) if total_expected else 0.0
+    )
+    exact = tuple(row for row in complete_expected if row.exact_match)
+    divergent = tuple(row for row in complete_expected if not row.exact_match)
+    scans = {row.scan_id for row in complete_expected}
+    days = {row.observed_at_utc.date().isoformat() for row in complete_expected}
     policies = tuple(
         sorted(
             {
                 str(row.gate_policy_fingerprint)
-                for row in complete
+                for row in complete_expected
                 if row.gate_policy_fingerprint
             }
         )
@@ -145,7 +217,7 @@ def evaluate_shadow_equivalence(
         sorted(
             {
                 str(row.engine_code_fingerprint)
-                for row in complete
+                for row in complete_expected
                 if row.engine_code_fingerprint
             }
         )
@@ -154,6 +226,14 @@ def evaluate_shadow_equivalence(
     instrumentation_blockers: list[str] = []
     if not ledger_complete:
         instrumentation_blockers.append("LEDGER_COVERAGE_INCOMPLETE")
+    if not expectations:
+        instrumentation_blockers.append("EXPECTED_COVERAGE_NOT_PROVIDED")
+    if missing_keys:
+        instrumentation_blockers.append("EXPECTED_COMPARISON_MISSING")
+    if unexpected_keys:
+        instrumentation_blockers.append("UNEXPECTED_COMPARISON_PRESENT")
+    if duplicate_keys:
+        instrumentation_blockers.append("DUPLICATE_CANDIDATE_OBSERVATION_PRESENT")
     if coverage < criteria.min_instrumentation_coverage_pct:
         instrumentation_blockers.append("INSTRUMENTATION_COVERAGE_BELOW_MINIMUM")
     if any(row.pairing_state is PairingState.INVALID for row in rows):
@@ -162,13 +242,13 @@ def evaluate_shadow_equivalence(
         instrumentation_blockers.append("MISSING_DECISION_SIDE_PRESENT")
 
     version_blockers: list[str] = []
-    if len(policies) != 1 and complete:
+    if len(policies) != 1 and complete_expected:
         version_blockers.append("MIXED_OR_MISSING_POLICY_FINGERPRINT")
-    if len(code_fingerprints) != 1 and complete:
+    if len(code_fingerprints) != 1 and complete_expected:
         version_blockers.append("MIXED_OR_MISSING_ENGINE_CODE_FINGERPRINT")
 
     evidence_blockers: list[str] = []
-    if len(complete) < criteria.min_comparable_observations:
+    if len(complete_expected) < criteria.min_comparable_observations:
         evidence_blockers.append("INSUFFICIENT_COMPARABLE_OBSERVATIONS")
     if len(scans) < criteria.min_distinct_scans:
         evidence_blockers.append("INSUFFICIENT_DISTINCT_SCANS")
@@ -199,9 +279,14 @@ def evaluate_shadow_equivalence(
 
     return PromotionEvaluation(
         status=status,
-        evaluated_observations=total,
-        comparable_observations=len(complete),
-        instrumentation_complete_observations=len(complete),
+        evaluated_observations=len(rows),
+        expected_observations=total_expected,
+        covered_expected_observations=covered,
+        missing_expected_observations=len(missing_keys),
+        unexpected_observations=len(unexpected_keys),
+        duplicate_candidate_observations=len(duplicate_keys),
+        comparable_observations=len(complete_expected),
+        instrumentation_complete_observations=len(complete_expected),
         instrumentation_coverage_pct=coverage,
         exact_matches=len(exact),
         divergences=len(divergent),

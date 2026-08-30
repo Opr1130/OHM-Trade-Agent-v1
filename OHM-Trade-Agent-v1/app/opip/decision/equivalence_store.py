@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -85,6 +86,79 @@ def append_equivalence_observations(
     return len(rows)
 
 
+def _manifest_paths(
+    archive: BoundedJsonlArchive,
+) -> tuple[tuple[Path, ...], bool, tuple[str, ...]]:
+    """Reconcile archive files against the durable manifest.
+
+    A manifest-declared segment that disappears must surface as incomplete
+    coverage rather than silently reducing the historical denominator.
+    """
+    actual = {
+        path.resolve()
+        for path in archive.archive_dir.rglob(archive.archive_glob)
+    } if archive.archive_dir.exists() else set()
+    if not archive.manifest_file.exists():
+        if not actual:
+            return (), True, ()
+        return tuple(sorted(actual)), False, ("ARCHIVE_MANIFEST_UNAVAILABLE",)
+
+    warnings: list[str] = []
+    complete = True
+    try:
+        payload = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
+        segments = payload.get("segments") if isinstance(payload, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        segments = None
+    if not isinstance(segments, dict):
+        return tuple(sorted(actual)), False, ("ARCHIVE_MANIFEST_INVALID",)
+
+    expected_existing: set[Path] = set()
+    root = archive.archive_dir.resolve()
+    for manifest_key, row in segments.items():
+        if not isinstance(row, dict):
+            complete = False
+            warnings.append("ARCHIVE_MANIFEST_ROW_INVALID")
+            continue
+        rel = str(row.get("archive") or "").strip()
+        expected_sha = str(row.get("sha256") or manifest_key).strip()
+        if not rel or not expected_sha:
+            complete = False
+            warnings.append("ARCHIVE_MANIFEST_ROW_INVALID")
+            continue
+        candidate = (archive.archive_dir / rel).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            complete = False
+            warnings.append("ARCHIVE_MANIFEST_PATH_INVALID")
+            continue
+        if not candidate.exists():
+            complete = False
+            warnings.append("ARCHIVE_SEGMENT_MISSING")
+            continue
+        expected_existing.add(candidate)
+        try:
+            verification = archive.verify_archive_file(
+                candidate,
+                tier=str(row.get("tier") or "WARM"),
+            )
+        except Exception:
+            complete = False
+            warnings.append("ARCHIVE_SEGMENT_VERIFICATION_FAILED")
+            continue
+        if verification.sha256 != expected_sha:
+            complete = False
+            warnings.append("ARCHIVE_MANIFEST_CHECKSUM_MISMATCH")
+
+    unmanifested = actual - expected_existing
+    if unmanifested:
+        complete = False
+        warnings.append("ARCHIVE_UNMANIFESTED_SEGMENT")
+    paths = tuple(sorted(expected_existing | unmanifested))
+    return paths, complete, tuple(dict.fromkeys(warnings))
+
+
 def read_equivalence_ledger(
     *,
     path: Path | None = None,
@@ -93,14 +167,9 @@ def read_equivalence_ledger(
     target = path or EQUIVALENCE_LEDGER_FILE
     archive = _archive(target)
     observations: list[EquivalenceObservation] = []
-    warnings: list[str] = []
-    complete = True
+    archive_paths, complete, manifest_warnings = _manifest_paths(archive)
+    warnings = list(manifest_warnings)
 
-    archive_paths = (
-        tuple(sorted(archive.archive_dir.rglob(archive.archive_glob)))
-        if archive.archive_dir.exists()
-        else ()
-    )
     if archive_paths:
         try:
             observations.extend(
