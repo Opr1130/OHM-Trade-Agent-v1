@@ -372,12 +372,12 @@ def classify_learning_cohort(
     suppressed = bool(canonical_row.get("suppressed", False))
     counterfactual = bool(canonical_row.get("counterfactual_eligible", False))
 
-    if status == "QUALIFIED" and not suppressed:
+    if status in {"QUALIFIED", "SCORED_ELIGIBLE"} and not suppressed:
         return LearningCohort.QUALIFIED_PAPER
     if (
         counterfactual
         or suppressed
-        or status in {"REJECTED", "BLOCKED", "NOT_QUALIFIED", "DISQUALIFIED"}
+        or status in {"REJECTED", "BLOCKED", "NOT_QUALIFIED", "DISQUALIFIED", "SCORED_SUPPRESSED"}
     ):
         return LearningCohort.COUNTERFACTUAL_REJECTED
     return LearningCohort.OBSERVATION_ONLY
