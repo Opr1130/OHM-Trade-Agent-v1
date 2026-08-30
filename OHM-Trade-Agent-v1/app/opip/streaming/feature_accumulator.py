@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import math
 from typing import Any
 
 from app.opip.events.contract import MappingStatus
@@ -33,6 +34,8 @@ from app.opip.streaming.windows import WindowBounds
 
 
 FEATURE_WINDOW_SECONDS = 15
+_EXPECTED_VENUES = {"BINANCE", "BYBIT"}
+_MISSING_VENUE = "MISSING_VENUE"
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,8 @@ class CrossVenueFeatureAccumulator:
         self.dropped_buckets = 0
         self.dropped_ready_snapshots = 0
         self.invalid_identity_observations = 0
+        self.invalid_payload_observations = 0
+        self.missing_venue_windows = 0
         self.trade_observations_by_provider: dict[str, int] = {}
         self.liquidation_observations_by_provider: dict[str, int] = {}
         self.seal_notices_15s_by_provider: dict[str, int] = {}
@@ -106,6 +111,24 @@ class CrossVenueFeatureAccumulator:
         self.pair_emissions = 0
         self.latest_trade_timestamp_by_provider: dict[str, datetime] = {}
         self.latest_seal_start_by_provider: dict[str, datetime] = {}
+
+    def _payload_numbers(self, payload: dict[str, Any]) -> tuple[float, float] | None:
+        """Return validated positive quantity/notional or reject the observation."""
+        try:
+            quantity = float(payload["base_quantity"])
+            notional = float(payload["notional_usd"])
+        except (KeyError, TypeError, ValueError):
+            self.invalid_payload_observations += 1
+            return None
+        if (
+            not math.isfinite(quantity)
+            or not math.isfinite(notional)
+            or quantity <= 0
+            or notional <= 0
+        ):
+            self.invalid_payload_observations += 1
+            return None
+        return quantity, notional
 
     def record(self, normalized: NormalizedStreamObservation) -> None:
         env = normalized.envelope
@@ -115,6 +138,10 @@ class CrossVenueFeatureAccumulator:
         ):
             self.invalid_identity_observations += 1
             return
+        values = self._payload_numbers(dict(env.payload))
+        if values is None:
+            return
+        base_quantity, notional_usd = values
         bounds = WindowBounds.for_timestamp(
             asset=env.canonical_asset_id,
             venue="CROSS_VENUE",
@@ -149,8 +176,8 @@ class CrossVenueFeatureAccumulator:
                 identity_status=env.identity_status,
                 venue=env.provider.value,
                 side=normalize_trade_side(payload.get("aggressor_side")),
-                base_quantity=float(payload["base_quantity"]),
-                notional_usd=float(payload["notional_usd"]),
+                base_quantity=base_quantity,
+                notional_usd=notional_usd,
                 provider_timestamp_utc=env.provider_timestamp_utc,
             )
             state = bucket.venue_cvd.get(env.provider.value)
@@ -170,8 +197,8 @@ class CrossVenueFeatureAccumulator:
                 identity_status=env.identity_status,
                 venue=env.provider.value,
                 side=side,
-                base_quantity=float(payload["base_quantity"]),
-                notional_usd=float(payload["notional_usd"]),
+                base_quantity=base_quantity,
+                notional_usd=notional_usd,
                 provider_timestamp_utc=env.provider_timestamp_utc,
                 ingest_timestamp_utc=env.ingest_timestamp_utc,
             )
@@ -203,18 +230,54 @@ class CrossVenueFeatureAccumulator:
             notice.start_utc,
             self.latest_seal_start_by_provider.get(provider, notice.start_utc),
         )
+        # A later finalized window proves all seal notices for earlier windows
+        # have already had a chance to arrive in prior runtime prune cycles.
+        # Expire older sparse windows here, not on live observations, so late
+        # evidence inside the retention interval is never cut off prematurely.
+        self._expire_before(notice.start_utc)
         key = (notice.canonical_asset_id, notice.start_utc)
         bucket = self._buckets.get(key)
         if bucket is None:
             self.seal_bucket_misses += 1
             return
         bucket.trade_quality[notice.provider] = notice.quality
-        if bucket.emitted:
-            return
-        expected = {"BINANCE", "BYBIT"}
-        if not expected.issubset(bucket.trade_quality):
-            return
+        if _EXPECTED_VENUES.issubset(bucket.trade_quality):
+            self._emit_and_remove(key, fill_missing=False)
 
+    def _expire_before(self, cutoff_utc: datetime) -> None:
+        """Emit older sparse buckets as incomplete instead of capacity loss."""
+        expired = [
+            key
+            for key, bucket in self._buckets.items()
+            if bucket.bounds.end_utc <= cutoff_utc
+        ]
+        for key in sorted(expired, key=lambda item: item[1]):
+            self._emit_and_remove(key, fill_missing=True)
+
+    def _emit_and_remove(
+        self,
+        key: tuple[str, datetime],
+        *,
+        fill_missing: bool,
+    ) -> None:
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            return
+        missing = _EXPECTED_VENUES - set(bucket.trade_quality)
+        if missing and not fill_missing:
+            return
+        if missing:
+            self.missing_venue_windows += 1
+            for venue in sorted(missing):
+                bucket.trade_quality[venue] = EvidenceQuality(
+                    state=EvidenceQualityState.INCOMPLETE,
+                    degradations=frozenset({_MISSING_VENUE}),
+                )
+                bucket.venue_cvd.setdefault(venue, empty_venue_cvd(venue))
+        self._emit_bucket(bucket)
+        self._buckets.pop(key, None)
+
+    def _emit_bucket(self, bucket: _FeatureBucket) -> None:
         cvd = combine_cross_venue(
             canonical_asset_id=bucket.asset,
             venue_states=bucket.venue_cvd,
@@ -251,9 +314,6 @@ class CrossVenueFeatureAccumulator:
                 ),
                 liquidation_sync_state=sync_state.value,
                 liquidation_venues=liq_venues,
-                # Neither Binance forceOrder nor Bybit allLiquidation carries
-                # a continuity sequence. Synchronization is useful observed
-                # evidence, but cannot independently confirm a decision.
                 liquidation_evidence_quality=(
                     EvidenceQualityState.DEGRADED.value
                     if liquidation.total_notional_usd > 0
@@ -269,10 +329,6 @@ class CrossVenueFeatureAccumulator:
         )
         bucket.emitted = True
         self.pair_emissions += 1
-        # Once both provider qualities have finalized, the immutable snapshot
-        # in _ready owns the completed evidence. Keeping the emitted bucket
-        # would turn normal bounded retention into a false evidence-drop signal.
-        self._buckets.pop(key, None)
 
     def diagnostics(self) -> dict[str, Any]:
         missing_provider_counts = {"BINANCE": 0, "BYBIT": 0, "BOTH": 0}
@@ -282,14 +338,14 @@ class CrossVenueFeatureAccumulator:
                 continue
             providers = set(bucket.venue_cvd)
             quality_providers = set(bucket.trade_quality)
-            if {"BINANCE", "BYBIT"}.issubset(providers):
+            if _EXPECTED_VENUES.issubset(providers):
                 unsealed_pairable += 1
-            missing = {"BINANCE", "BYBIT"} - quality_providers
+            missing = _EXPECTED_VENUES - quality_providers
             if missing == {"BINANCE"}:
                 missing_provider_counts["BINANCE"] += 1
             elif missing == {"BYBIT"}:
                 missing_provider_counts["BYBIT"] += 1
-            elif missing == {"BINANCE", "BYBIT"}:
+            elif missing == _EXPECTED_VENUES:
                 missing_provider_counts["BOTH"] += 1
         return {
             "trade_observations_by_provider": dict(
@@ -315,6 +371,8 @@ class CrossVenueFeatureAccumulator:
             "seal_bucket_misses": self.seal_bucket_misses,
             "unsealed_pairable_buckets": unsealed_pairable,
             "missing_seal_provider_counts": missing_provider_counts,
+            "missing_venue_windows": self.missing_venue_windows,
+            "invalid_payload_observations": self.invalid_payload_observations,
         }
 
     def drain_ready(self) -> tuple[StreamingFeatureSnapshot, ...]:
