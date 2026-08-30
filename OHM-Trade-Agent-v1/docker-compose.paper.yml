@@ -67,7 +67,8 @@ services:
         condition: service_completed_successfully
     # USD and USDT are intentionally isolated. A worker OOM/restart cannot
     # recycle its sibling, while paper activation still requires both healthy.
-    mem_limit: 448m
+    mem_limit: 384m
+    memswap_limit: 384m
     cpus: "0.20"
     pids_limit: 128
     oom_score_adj: 500
@@ -122,7 +123,8 @@ services:
     depends_on:
       ohm-freqtrade-paper-init:
         condition: service_completed_successfully
-    mem_limit: 448m
+    mem_limit: 384m
+    memswap_limit: 384m
     cpus: "0.20"
     pids_limit: 128
     oom_score_adj: 500
