@@ -196,12 +196,14 @@ def test_resource_guard_is_measurement_only():
         config=config,
         rss_bytes=101,
         loop_lag_seconds=0.2,
+        cpu_fraction=0.5,
         queue_utilization_pct=90,
     )
     assert result.degraded is True
     assert set(result.reasons) == {
         "MEMORY_SOFT_LIMIT_EXCEEDED",
         "EVENT_LOOP_LAG_SOFT_LIMIT_EXCEEDED",
+        "CPU_SOFT_LIMIT_EXCEEDED",
         "QUEUE_UTILIZATION_SOFT_LIMIT_EXCEEDED",
     }
 
