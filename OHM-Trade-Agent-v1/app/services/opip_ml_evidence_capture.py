@@ -31,6 +31,7 @@ DEFAULT_ML_SNAPSHOT_DIR = Path("/app/data/opip_ml_feature_snapshots_v1")
 DEFAULT_ML_CHECKPOINT_FILE = Path("/app/data/opip_ml_capture_checkpoint.json")
 DEFAULT_ML_DEAD_LETTER_FILE = Path("/app/data/opip_ml_capture_dead_letter.jsonl")
 DEFAULT_ML_HEALTH_FILE = Path("/app/data/opip_ml_capture_health.json")
+DEFAULT_ML_CAPTURE_LOCK_FILE = Path("/var/run/opip-ml-capture.lock")
 ML_CAPTURE_SCHEMA_VERSION = 1
 ML_FEATURE_SCHEMA_VERSION = "canonical-market-v1"
 ML_FEATURE_CALC_VERSION = "canonical-episode-ml-v1"
@@ -329,7 +330,7 @@ def _write_snapshot_chunk_atomic(
     return True, destination
 
 
-def capture_ml_production_evidence(
+def _capture_ml_production_evidence_locked(
     *,
     evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
     snapshot_dir: Path = DEFAULT_ML_SNAPSHOT_DIR,
@@ -543,3 +544,39 @@ def capture_ml_production_evidence(
     )
     save_json_atomic(health_path, summary.as_dict())
     return summary
+
+def capture_ml_production_evidence(
+    *,
+    evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
+    snapshot_dir: Path = DEFAULT_ML_SNAPSHOT_DIR,
+    checkpoint_path: Path = DEFAULT_ML_CHECKPOINT_FILE,
+    dead_letter_path: Path = DEFAULT_ML_DEAD_LETTER_FILE,
+    health_path: Path = DEFAULT_ML_HEALTH_FILE,
+    batch_limit: int = 250,
+    enabled: bool | None = None,
+    capture_lock_path: Path | None = None,
+) -> MLCaptureSummary:
+    """Serialize one complete ML evidence capture pass.
+
+    Production uses the same lock pathname as the host cron/deploy wrapper.
+    Tests and isolated replay paths use a sibling lock next to their custom
+    checkpoint so they never contend with production state.
+    """
+    lock_path = capture_lock_path
+    if lock_path is None:
+        lock_path = (
+            DEFAULT_ML_CAPTURE_LOCK_FILE
+            if checkpoint_path == DEFAULT_ML_CHECKPOINT_FILE
+            else checkpoint_path.parent / ".opip-ml-capture.lock"
+        )
+    with registry_lock(lock_path):
+        return _capture_ml_production_evidence_locked(
+            evidence_path=evidence_path,
+            snapshot_dir=snapshot_dir,
+            checkpoint_path=checkpoint_path,
+            dead_letter_path=dead_letter_path,
+            health_path=health_path,
+            batch_limit=batch_limit,
+            enabled=enabled,
+        )
+
