@@ -12,16 +12,22 @@ from app.services.trade_monitor import TradeMonitorResult
 
 STATE_FILE = Path("/app/data/trade_monitor_state.json")
 
-# Active-position monitoring is a safety workflow, not a one-shot state-change
-# notifier. Re-emit the current state on a bounded heartbeat so the operator
-# continues to receive protection even when the action remains unchanged.
-HEARTBEAT_SECONDS = {
-    "HOLD": 30 * 60,
-    "WARNING": 10 * 60,
-    "TAKE_PROFIT": 5 * 60,
-    "EXIT_NOW": 2 * 60,
+# Existing holdings are monitored continuously, but routine states should not
+# create periodic noise. Re-alert only when the state changes or the position
+# materially changes. Actionable terminal/profit states may repeat on a bounded
+# cadence until the holding disappears from Kraken.
+ACTION_REPEAT_SECONDS = {
+    "TAKE_PROFIT": 10 * 60,
+    "EXIT_NOW": 5 * 60,
 }
-DEFAULT_HEARTBEAT_SECONDS = 15 * 60
+MATERIAL_PRICE_CHANGE_PCT = {
+    "HOLD": 3.0,
+    "WARNING": 2.0,
+}
+MATERIAL_PNL_CHANGE_POINTS = {
+    "HOLD": 3.0,
+    "WARNING": 2.0,
+}
 
 
 def _load_state() -> dict:
@@ -57,17 +63,56 @@ def _previous_updated_at(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _heartbeat_seconds(action: str) -> int:
-    return int(HEARTBEAT_SECONDS.get(str(action).upper(), DEFAULT_HEARTBEAT_SECONDS))
+def _previous_float(value, key: str) -> float | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get(key)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
-def _same_action_heartbeat_due(value, action: str, *, now: datetime) -> bool:
-    if _previous_action(value) != action:
+def _reason_signature(result: TradeMonitorResult) -> str:
+    return "|".join(sorted(str(reason).strip() for reason in (result.reasons or []) if str(reason).strip()))
+
+
+def _material_change(previous, result: TradeMonitorResult) -> bool:
+    action = str(result.action).upper()
+    if _previous_action(previous) != action:
         return True
-    updated_at = _previous_updated_at(value)
+
+    current_price = float(result.current_price)
+    current_pnl = float(result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct)
+    previous_price = _previous_float(previous, "price")
+    previous_pnl = _previous_float(previous, "pnl_pct")
+    previous_reason = str(previous.get("reason_signature") or "") if isinstance(previous, dict) else ""
+
+    if previous_reason and previous_reason != _reason_signature(result):
+        return True
+
+    price_threshold = MATERIAL_PRICE_CHANGE_PCT.get(action)
+    if price_threshold is not None and previous_price and previous_price > 0:
+        move_pct = abs(current_price / previous_price - 1.0) * 100.0
+        if move_pct >= price_threshold:
+            return True
+
+    pnl_threshold = MATERIAL_PNL_CHANGE_POINTS.get(action)
+    if pnl_threshold is not None and previous_pnl is not None:
+        if abs(current_pnl - previous_pnl) >= pnl_threshold:
+            return True
+
+    return False
+
+
+def _action_repeat_due(previous, action: str, *, now: datetime) -> bool:
+    repeat_seconds = ACTION_REPEAT_SECONDS.get(str(action).upper())
+    if repeat_seconds is None:
+        return False
+    updated_at = _previous_updated_at(previous)
     if updated_at is None:
         return True
-    return (now - updated_at).total_seconds() >= _heartbeat_seconds(action)
+    return (now - updated_at).total_seconds() >= repeat_seconds
 
 
 def _stop_downside_pct(trade: ActiveTrade, current_price: float) -> float:
@@ -111,7 +156,6 @@ def send_monitor_update(
 
     identity = f"ACTIVE_TRADE:{trade.trade_id or trade.symbol}"
     now = datetime.now(timezone.utc)
-    heartbeat_seconds = _heartbeat_seconds(result.action)
     try:
         state = _load_state()
     except (OSError, TimeoutError, RegistryIOError):
@@ -127,29 +171,44 @@ def send_monitor_update(
         return False
 
     previous = state.get(trade.symbol)
-    if not _same_action_heartbeat_due(previous, result.action, now=now):
+    material = _material_change(previous, result)
+    repeat_due = _action_repeat_due(previous, result.action, now=now)
+
+    if not material and not repeat_due:
         record_telegram_suppression(
             identity=identity,
             alert_family="ACTIVE_TRADE",
             event_type=result.action,
             fingerprint=f"{trade.direction}:{result.action}",
-            reason="SAME_ACTION_HEARTBEAT_NOT_DUE",
+            reason="NO_MATERIAL_CHANGE",
             symbol=trade.symbol,
             trade_id=trade.trade_id,
         )
         return False
 
-    # Bucket the fingerprint by the action heartbeat. This preserves global
-    # deduplication while allowing a healthy active position to keep producing
-    # bounded reminders instead of being suppressed forever.
-    heartbeat_bucket = int(now.timestamp()) // max(1, heartbeat_seconds)
-    fingerprint = f"{trade.direction}:{result.action}:{heartbeat_bucket}"
+    current_price = float(result.current_price)
+    current_pnl = float(result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct)
+    reason_sig = _reason_signature(result)
+
+    if repeat_due and not material:
+        repeat_seconds = ACTION_REPEAT_SECONDS[str(result.action).upper()]
+        bucket = int(now.timestamp()) // max(1, repeat_seconds)
+        fingerprint = f"{trade.direction}:{result.action}:REPEAT:{bucket}"
+        cooldown_seconds = repeat_seconds
+    else:
+        # Include rounded material state so the global policy permits meaningful
+        # same-action updates while still deduplicating identical observations.
+        fingerprint = (
+            f"{trade.direction}:{result.action}:"
+            f"{round(current_price, 8)}:{round(current_pnl, 2)}:{reason_sig}"
+        )
+        cooldown_seconds = 0
 
     if not should_emit(
         identity=identity,
         event_type=result.action,
         fingerprint=fingerprint,
-        cooldown_seconds=heartbeat_seconds,
+        cooldown_seconds=cooldown_seconds,
         now=now,
     ):
         record_telegram_suppression(
@@ -175,13 +234,13 @@ def send_monitor_update(
         trade_id=trade.trade_id,
     )
     if delivery.delivered:
-        pnl_pct = result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct
         state[trade.symbol] = {
             "action": result.action,
             "message_id": delivery.message_id,
             "updated_at": now.isoformat(),
-            "price": float(result.current_price),
-            "pnl_pct": float(pnl_pct),
+            "price": current_price,
+            "pnl_pct": current_pnl,
+            "reason_signature": reason_sig,
         }
         try:
             _save_state(state)
