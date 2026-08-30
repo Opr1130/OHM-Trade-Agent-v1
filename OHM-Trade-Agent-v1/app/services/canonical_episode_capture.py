@@ -95,6 +95,7 @@ def _ml_feature_seed(
     """
 
     numeric_fields = {
+        "volume_24h": "volume_24h",
         "ema20": "ema20",
         "ema50": "ema50",
         "ema200": "ema200",
@@ -169,6 +170,28 @@ def _ml_feature_seed(
             output_name: _finite(getattr(observation, attribute_name, None))
             for output_name, attribute_name in numeric_fields.items()
         }
+    )
+    # Normalize source-compatible aliases without changing feature semantics.
+    # LIVE_FULL_MARKET exposes raw ticker-cohort names while the opportunity
+    # scanner exposes richer canonical names. Prefer the richer field when
+    # present and fall back only to an equivalent raw measurement.
+    notional_24h = _finite(getattr(observation, "notional_24h_usd_approx", None))
+    feature_values["recent_24h_high"] = _first_finite(
+        feature_values.get("recent_24h_high"),
+        getattr(observation, "high_24h", None),
+    )
+    feature_values["recent_24h_low"] = _first_finite(
+        feature_values.get("recent_24h_low"),
+        getattr(observation, "low_24h", None),
+    )
+    feature_values["primary_24h_liquidity_usd"] = _first_finite(
+        feature_values.get("primary_24h_liquidity_usd"),
+        notional_24h,
+    )
+    feature_values["combined_24h_liquidity_usd"] = _first_finite(
+        feature_values.get("combined_24h_liquidity_usd"),
+        notional_24h,
+        feature_values.get("primary_24h_liquidity_usd"),
     )
     for name in (
         "trend",
