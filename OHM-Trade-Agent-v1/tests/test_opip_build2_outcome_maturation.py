@@ -293,3 +293,145 @@ def test_bounded_outcomes_revisit_partial_only_at_next_milestone(tmp_path):
         now=BASE + timedelta(minutes=31),
     )
     assert len(third) == 1
+
+
+def test_bounded_outcomes_normalize_naive_snapshot_timestamp_to_utc(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshot = {
+        **_snapshot(),
+        "decision_at_utc": BASE.replace(tzinfo=None).isoformat(),
+    }
+    snapshots.write_text(json.dumps(snapshot) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=24), 11.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=24, minutes=1),
+    )
+    assert len(rows) == 1
+    assert rows[0]["snapshot_id"] == "S1"
+    assert rows[0]["reference_at"].endswith("+00:00")
+
+
+def test_bounded_outcomes_retire_terminal_incomplete_snapshot(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    first = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=26),
+    )
+    assert len(first) == 1
+    assert first[0]["window_complete"] is False
+
+    second = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=27),
+    )
+    assert second == []
+
+
+def test_bounded_snapshot_checkpoint_rejects_rewritten_ledger(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(minutes=1),
+    )
+
+    replacement = {
+        **_snapshot("S-REPLACED", "E-REPLACED"),
+        "padding": "x" * 512,
+    }
+    snapshots.write_text(
+        json.dumps(replacement) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="SNAPSHOT_LEDGER_DIVERGED"):
+        build_outcomes_bounded(
+            snapshot_path=snapshots,
+            observation_path=observations,
+            output_path=outcomes,
+            state_path=state,
+            now=BASE + timedelta(minutes=2),
+        )
+
+
+def test_bounded_output_checkpoint_rejects_rewritten_ledger(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    first = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(minutes=1),
+    )
+    assert len(first) == 1
+
+    original = json.loads(outcomes.read_text(encoding="utf-8").strip())
+    replacement = {
+        **original,
+        "outcome_record_id": "REWRITTEN-" + str(original["outcome_record_id"]),
+        "padding": "x" * 512,
+    }
+    outcomes.write_text(
+        json.dumps(replacement, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="OUTCOME_LEDGER_DIVERGED"):
+        build_outcomes_bounded(
+            snapshot_path=snapshots,
+            observation_path=observations,
+            output_path=outcomes,
+            state_path=state,
+            now=BASE + timedelta(minutes=2),
+        )
