@@ -103,7 +103,7 @@ These dependencies prepare the provider adapters planned for later builds.
 BUILD 4.2:
 
 - does not alter the unified cycle
-- does not add a production compose service
+- does not add a production Compose service
 - does not consume or influence the Decision Engine
 - does not consume or influence Sequence 3 protection policy
 - does not send outbound trading actions
