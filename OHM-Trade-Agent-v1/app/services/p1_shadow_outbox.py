@@ -183,6 +183,10 @@ class _OutboxCheckpoint:
     anchor_start: int = 0
     anchor_size: int = 0
     anchor_sha256: str | None = None
+    source_size: int = 0
+    source_tail_start: int = 0
+    source_tail_size: int = 0
+    source_tail_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -248,7 +252,33 @@ def _load_checkpoint_state(path: Path, source: Path) -> _OutboxCheckpoint:
             anchor_start = int(payload.get("anchor_start", 0))
             anchor_size = int(payload.get("anchor_size", 0))
             anchor_sha256 = str(payload.get("anchor_sha256") or "") or None
-            if min(byte_offset, anchor_start, anchor_size) < 0:
+
+            # Early schema-2 development checkpoints did not yet preserve the
+            # prior source generation tail. Upgrade them in-memory once; every
+            # subsequent advancement persists the full continuity contract.
+            if "source_size" in payload:
+                source_size = int(payload.get("source_size", 0))
+                source_tail_start = int(payload.get("source_tail_start", 0))
+                source_tail_size = int(payload.get("source_tail_size", 0))
+                source_tail_sha256 = (
+                    str(payload.get("source_tail_sha256") or "") or None
+                )
+            else:
+                source_size = source.stat().st_size if source.exists() else 0
+                (
+                    source_tail_start,
+                    source_tail_size,
+                    source_tail_sha256,
+                ) = _checkpoint_anchor(source, source_size)
+
+            if min(
+                byte_offset,
+                anchor_start,
+                anchor_size,
+                source_size,
+                source_tail_start,
+                source_tail_size,
+            ) < 0:
                 raise ValueError("negative checkpoint component")
             return _OutboxCheckpoint(
                 next_line=next_line,
@@ -256,6 +286,10 @@ def _load_checkpoint_state(path: Path, source: Path) -> _OutboxCheckpoint:
                 anchor_start=anchor_start,
                 anchor_size=anchor_size,
                 anchor_sha256=anchor_sha256,
+                source_size=source_size,
+                source_tail_start=source_tail_start,
+                source_tail_size=source_tail_size,
+                source_tail_sha256=source_tail_sha256,
             )
 
         # Legacy checkpoints stored only a line index. Resolve that index once
@@ -264,12 +298,22 @@ def _load_checkpoint_state(path: Path, source: Path) -> _OutboxCheckpoint:
         anchor_start, anchor_size, anchor_sha256 = _checkpoint_anchor(
             source, byte_offset
         )
+        source_size = source.stat().st_size if source.exists() else 0
+        (
+            source_tail_start,
+            source_tail_size,
+            source_tail_sha256,
+        ) = _checkpoint_anchor(source, source_size)
         return _OutboxCheckpoint(
             next_line=next_line,
             byte_offset=byte_offset,
             anchor_start=anchor_start,
             anchor_size=anchor_size,
             anchor_sha256=anchor_sha256,
+            source_size=source_size,
+            source_tail_start=source_tail_start,
+            source_tail_size=source_tail_size,
+            source_tail_sha256=source_tail_sha256,
         )
     except _CheckpointInvariantError:
         raise
@@ -286,25 +330,54 @@ def _verify_checkpoint_continuity(source: Path, checkpoint: _OutboxCheckpoint) -
     size = source.stat().st_size
     if checkpoint.byte_offset > size:
         raise _CheckpointInvariantError("CHECKPOINT_AHEAD_OF_OUTBOX")
+    if checkpoint.source_size > size:
+        raise _CheckpointInvariantError("CHECKPOINT_SOURCE_DIVERGED")
 
-    if not checkpoint.anchor_sha256:
-        return
-
-    if (
-        checkpoint.anchor_start < 0
-        or checkpoint.anchor_size < 0
-        or checkpoint.anchor_start + checkpoint.anchor_size != checkpoint.byte_offset
-    ):
+    if checkpoint.byte_offset > 0 and not checkpoint.anchor_sha256:
+        raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE")
+    if checkpoint.source_size > 0 and not checkpoint.source_tail_sha256:
         raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE")
 
-    with source.open("rb") as handle:
-        handle.seek(checkpoint.anchor_start)
-        payload = handle.read(checkpoint.anchor_size)
-    if (
-        len(payload) != checkpoint.anchor_size
-        or hashlib.sha256(payload).hexdigest() != checkpoint.anchor_sha256
-    ):
-        raise _CheckpointInvariantError("CHECKPOINT_SOURCE_DIVERGED")
+    if checkpoint.anchor_sha256:
+        if (
+            checkpoint.anchor_start < 0
+            or checkpoint.anchor_size < 0
+            or checkpoint.anchor_start + checkpoint.anchor_size
+            != checkpoint.byte_offset
+        ):
+            raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE")
+
+        with source.open("rb") as handle:
+            handle.seek(checkpoint.anchor_start)
+            payload = handle.read(checkpoint.anchor_size)
+        if (
+            len(payload) != checkpoint.anchor_size
+            or hashlib.sha256(payload).hexdigest() != checkpoint.anchor_sha256
+        ):
+            raise _CheckpointInvariantError("CHECKPOINT_SOURCE_DIVERGED")
+
+    # The processed-prefix anchor prevents replaying changed history before the
+    # cursor. The prior-generation tail anchor additionally proves that every
+    # byte that existed after the cursor on the previous sync is still present.
+    # This catches truncate/rotate-and-regrow cases that a cursor-only anchor
+    # cannot distinguish from a legitimate append-only replacement.
+    if checkpoint.source_tail_sha256:
+        if (
+            checkpoint.source_tail_start < 0
+            or checkpoint.source_tail_size < 0
+            or checkpoint.source_tail_start + checkpoint.source_tail_size
+            != checkpoint.source_size
+        ):
+            raise _CheckpointInvariantError("CHECKPOINT_UNREADABLE")
+        with source.open("rb") as handle:
+            handle.seek(checkpoint.source_tail_start)
+            payload = handle.read(checkpoint.source_tail_size)
+        if (
+            len(payload) != checkpoint.source_tail_size
+            or hashlib.sha256(payload).hexdigest()
+            != checkpoint.source_tail_sha256
+        ):
+            raise _CheckpointInvariantError("CHECKPOINT_SOURCE_DIVERGED")
 
 
 def _save_checkpoint_state(
@@ -314,7 +387,15 @@ def _save_checkpoint_state(
     next_line: int,
     byte_offset: int,
 ) -> None:
-    anchor_start, anchor_size, anchor_sha256 = _checkpoint_anchor(source, byte_offset)
+    anchor_start, anchor_size, anchor_sha256 = _checkpoint_anchor(
+        source, byte_offset
+    )
+    source_size = source.stat().st_size if source.exists() else 0
+    (
+        source_tail_start,
+        source_tail_size,
+        source_tail_sha256,
+    ) = _checkpoint_anchor(source, source_size)
     save_json_atomic(
         path,
         {
@@ -324,6 +405,10 @@ def _save_checkpoint_state(
             "anchor_start": anchor_start,
             "anchor_size": anchor_size,
             "anchor_sha256": anchor_sha256,
+            "source_size": source_size,
+            "source_tail_start": source_tail_start,
+            "source_tail_size": source_tail_size,
+            "source_tail_sha256": source_tail_sha256,
         },
     )
 
