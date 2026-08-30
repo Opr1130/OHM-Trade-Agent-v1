@@ -25,6 +25,7 @@ from app.opip.streaming.contract import (
     SequenceStatus,
     StreamProvider,
     StreamTransportState,
+    StreamType,
 )
 from app.opip.streaming.quality import assess_window_quality
 from app.opip.streaming.queueing import DropNewestQueue
@@ -32,6 +33,11 @@ from app.opip.streaming.resources import (
     ResourceGuardConfig,
     assess_resources,
     current_rss_bytes,
+)
+from app.opip.streaming.sinks import (
+    ObservationSink,
+    SealedWindowNotice,
+    SealedWindowSink,
 )
 from app.opip.streaming.telemetry import RuntimeTelemetry, RuntimeTelemetrySnapshot
 from app.opip.streaming.windows import WindowAccumulator, WindowBounds, empty_window
@@ -100,6 +106,8 @@ class StreamingRuntime:
         utc_now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         jitter_source: Callable[[], float] = random.random,
+        observation_sink: ObservationSink | None = None,
+        sealed_window_sink: SealedWindowSink | None = None,
     ) -> None:
         self.config = config or StreamingRuntimeConfig()
         self._adapters = dict(adapters)
@@ -114,6 +122,8 @@ class StreamingRuntime:
         self._utc_now = utc_now or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep
         self._jitter_source = jitter_source
+        self._observation_sink = observation_sink
+        self._sealed_window_sink = sealed_window_sink
         self._queue = DropNewestQueue(maxsize=self.config.queue_maxsize)
         self._telemetry = RuntimeTelemetry(tuple(self._adapters))
         self._stop_event = asyncio.Event()
@@ -381,6 +391,11 @@ class StreamingRuntime:
                 self._telemetry.normalized_observations += 1
                 self._record_sequence(normalized)
                 self._record_windows(normalized)
+                if self._observation_sink is not None:
+                    try:
+                        self._observation_sink(normalized)
+                    except Exception:
+                        self._telemetry.observation_sink_errors += 1
                 self._telemetry.frames_processed += 1
                 self._telemetry.last_processed_at_utc = (
                     normalized.envelope.ingest_timestamp_utc
@@ -483,6 +498,23 @@ class StreamingRuntime:
                 self._windows[key] = current
                 self._telemetry.windows_sealed += 1
                 quality = assess_window_quality(current)
+                if self._sealed_window_sink is not None:
+                    try:
+                        self._sealed_window_sink(
+                            SealedWindowNotice(
+                                provider=key[0],
+                                stream_type=StreamType(key[1]),
+                                canonical_asset_id=(
+                                    key[2] if current.bounds.asset == key[2] else None
+                                ),
+                                window_seconds=key[3],
+                                start_utc=current.bounds.start_utc,
+                                end_utc=current.bounds.end_utc,
+                                quality=quality,
+                            )
+                        )
+                    except Exception:
+                        self._telemetry.window_sink_errors += 1
                 if quality.state is EvidenceQualityState.DEGRADED:
                     self._telemetry.degraded_windows += 1
                 elif quality.state in {
