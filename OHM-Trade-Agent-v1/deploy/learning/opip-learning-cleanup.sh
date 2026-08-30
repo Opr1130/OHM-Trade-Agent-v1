@@ -17,7 +17,7 @@ if (( ${#ids[@]} > 0 )); then
   docker rm -f "${ids[@]}" >/dev/null 2>&1 || true
 fi
 
-remaining="$(docker ps -q --filter "label=$LABEL" | wc -l)"
+remaining="$(docker ps -aq --filter "label=$LABEL" | wc -l)"
 if [[ "$remaining" != "0" ]]; then
   echo "O'Pip cleanup could not reap all $JOB containers" >&2
   exit 1
