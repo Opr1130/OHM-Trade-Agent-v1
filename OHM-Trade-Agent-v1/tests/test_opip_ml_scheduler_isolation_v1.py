@@ -11,7 +11,8 @@ def test_ml_evidence_cron_is_independent_from_unified_cycle_lock():
     )
     assert "app.jobs.run_opip_ml_capture" in cron
     assert "app.jobs.build_phase3c_forward_outcomes" in cron
-    assert "/var/run/opip-ml-capture.lock" in cron
+    assert "/var/run/opip-ml-capture-trigger.lock" in cron
+    assert "flock -n /var/run/opip-ml-capture-trigger.lock" not in cron
     assert "/var/run/opip-ml-outcomes.lock" in cron
     executable = "\n".join(
         line for line in cron.splitlines()
@@ -79,8 +80,8 @@ def test_deploy_probes_ml_capture_without_making_it_authoritative():
         encoding="utf-8"
     )
     assert "python -m app.jobs.run_opip_ml_capture" in source
-    assert "flock -n /var/run/opip-ml-capture.lock" in source
-    assert "if flock -n /var/run/opip-ml-capture.lock" in source
+    assert "flock -n /var/run/opip-ml-capture-trigger.lock" in source
+    assert "if flock -n /var/run/opip-ml-capture-trigger.lock" in source
     assert "production unaffected" in source
 
 
@@ -102,3 +103,24 @@ def test_scheduler_validator_ignores_comment_only_unified_lock_mentions():
         "grep -v -E '^[[:space:]]*#' \"$ML_EVIDENCE_DST\" | "
         "grep -q '/var/run/ohm-unified-cycle.lock'"
     ) in source
+
+
+def test_capture_trigger_lock_is_distinct_from_python_state_lock():
+    cron = (ROOT / "deploy" / "cron.d" / "opip-ml-evidence").read_text(
+        encoding="utf-8"
+    )
+    deploy = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
+        encoding="utf-8"
+    )
+    service = (
+        ROOT / "app" / "services" / "opip_ml_evidence_capture.py"
+    ).read_text(encoding="utf-8")
+
+    trigger = "/var/run/opip-ml-capture-trigger.lock"
+    state = "/var/run/opip-ml-capture.lock"
+
+    assert f"flock -n {trigger}" in cron
+    assert f"flock -n {trigger}" in deploy
+    assert f'DEFAULT_ML_CAPTURE_LOCK_FILE = Path("{state}")' in service
+    assert f"flock -n {state}" not in cron
+    assert f"flock -n {state}" not in deploy
