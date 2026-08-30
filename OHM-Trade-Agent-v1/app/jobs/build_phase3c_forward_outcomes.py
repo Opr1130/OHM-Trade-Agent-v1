@@ -49,8 +49,25 @@ def _repair_truncated_jsonl_tail(path: Path) -> bool:
                 break
             cursor = start
 
-        truncate_at = last_newline + 1 if last_newline >= 0 else 0
-        handle.truncate(truncate_at)
+        tail_start = last_newline + 1 if last_newline >= 0 else 0
+        handle.seek(tail_start)
+        tail = handle.read()
+
+        # A complete JSON object may have reached disk before the writer was
+        # killed while emitting only the trailing newline. Preserve that valid
+        # record and normalize its terminator; discard only an unparsable tail.
+        try:
+            parsed = json.loads(tail.decode("utf-8"))
+            valid_complete_record = isinstance(parsed, dict)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            valid_complete_record = False
+
+        if valid_complete_record:
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
+        else:
+            handle.truncate(tail_start)
+
         handle.flush()
         os.fsync(handle.fileno())
     return True
