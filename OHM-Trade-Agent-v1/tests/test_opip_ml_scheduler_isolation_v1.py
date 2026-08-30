@@ -88,7 +88,9 @@ def test_production_export_is_copy_only_and_locked():
     subprocess.run(["bash", "-n", str(runner)], check=True)
     assert "p1_shadow_outbox.jsonl" in source
     assert "full_market_observations.jsonl" in source
-    assert "flock -s" in source
+    assert "flock -x 8" in source
+    assert "sha256sum" in source
+    assert "schema_version=2" in source
     assert "mv -f" in source
     assert "python" not in source
     assert "docker" not in source
@@ -163,6 +165,7 @@ def test_learning_sync_and_cleanup_shell_validate():
         LEARNING / "opip-learning-cleanup.sh",
         LEARNING / "bootstrap-opip-learning-worker.sh",
         ROOT / "deploy" / "remote" / "configure-opip-learning-reader.sh",
+        ROOT / "deploy" / "remote" / "opip-learning-read-export.sh",
     ):
         subprocess.run(["bash", "-n", str(script)], check=True)
 
@@ -204,3 +207,51 @@ def test_deploy_stops_paper_before_target_build():
     assert section.index("stop_paper_stack") < section.index(
         "docker compose build ohm-trade-agent"
     )
+
+
+
+def test_learning_reader_key_is_forced_read_only_and_source_bound():
+    configure = (
+        ROOT / "deploy" / "remote" / "configure-opip-learning-reader.sh"
+    ).read_text(encoding="utf-8")
+    reader = (
+        ROOT / "deploy" / "remote" / "opip-learning-read-export.sh"
+    ).read_text(encoding="utf-8")
+    sync = (LEARNING / "opip-learning-sync.sh").read_text(encoding="utf-8")
+
+    assert 'from="%s",restrict,command="%s" %s' in configure
+    assert 'SOURCE_CIDR="${2:-}"' in configure
+    assert 'EXPECTED_COMMAND="opip-export-v1"' in reader
+    assert 'SSH_ORIGINAL_COMMAND' in reader
+    assert "command rejected" in reader
+    assert "tar -C" in reader
+    assert "flock -s 8" in reader
+    assert "opip-export-v1 >" in sync
+    assert "rsync" not in sync
+
+
+def test_learning_sync_validates_manifest_before_promotion():
+    sync = (LEARNING / "opip-learning-sync.sh").read_text(encoding="utf-8")
+    assert 'schema="$(manifest_value schema_version)"' in sync
+    assert '[[ "$schema" == "2" ]]' in sync
+    assert "sha256sum" in sync
+    assert "size mismatch" in sync
+    assert "checksum mismatch" in sync
+    validation = sync.index('validate_artifact "p1_shadow_outbox.jsonl"')
+    promotion = sync.index("for name in p1_shadow_outbox.jsonl")
+    assert validation < promotion
+
+
+def test_learning_bootstrap_keeps_timers_disabled_until_validation():
+    bootstrap = (LEARNING / "bootstrap-opip-learning-worker.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "systemctl enable opip-learning-sync.timer" not in bootstrap
+    assert "systemctl enable opip-learning-capture.timer" not in bootstrap
+    assert "systemctl enable opip-learning-outcomes.timer" not in bootstrap
+    assert "systemctl enable --now opip-learning-sync.timer" in bootstrap
+
+
+def test_learning_cleanup_checks_all_container_states():
+    cleanup = (LEARNING / "opip-learning-cleanup.sh").read_text(encoding="utf-8")
+    assert 'docker ps -aq --filter "label=$LABEL"' in cleanup
