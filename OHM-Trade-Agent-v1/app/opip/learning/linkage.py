@@ -65,6 +65,7 @@ class NormalizedOutcomeEvidence:
     net_pnl_pct: float | None
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         row = asdict(self)
         row["source_quality"] = self.source_quality.value
         row["horizon_returns"] = dict(self.horizon_returns)
@@ -88,6 +89,7 @@ class LearningLinkageRecord:
     trade_authority_changed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         row = asdict(self)
         row["cohort"] = self.cohort.value
         row["linkage_status"] = self.linkage_status.value
@@ -113,6 +115,7 @@ def _strict_bool(value: Any) -> bool | None:
 
 
 def _direction(value: Any) -> str | None:
+    """Return direction."""
     text = str(value or "").strip().upper()
     return text if text in {"LONG", "SHORT"} else None
 
@@ -163,6 +166,7 @@ def _latest_revision_by_key(
 def select_latest_phase3c_outcomes(
     rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
+    """Return select latest phase3c outcomes."""
     return _latest_revision_by_key(
         rows,
         key_field="snapshot_id",
@@ -174,6 +178,7 @@ def select_latest_phase3c_outcomes(
 def select_latest_paper_trades(
     rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
+    """Return select latest paper trades."""
     return _latest_revision_by_key(
         rows,
         key_field="paper_trade_id",
@@ -188,6 +193,7 @@ def _index_unique(
     key_field: str,
     identity_field: str,
 ) -> dict[str, Mapping[str, Any]]:
+    """Return index unique."""
     indexed: dict[str, Mapping[str, Any]] = {}
     identities: dict[str, str] = {}
     for row in rows:
@@ -208,6 +214,7 @@ def _index_unique(
 def index_ml_feature_snapshots(
     rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
+    """Return index ml feature snapshots."""
     return _index_unique(
         rows,
         key_field="canonical_snapshot_id",
@@ -218,6 +225,7 @@ def index_ml_feature_snapshots(
 def normalize_phase3c_outcome(
     row: Mapping[str, Any] | None,
 ) -> NormalizedOutcomeEvidence:
+    """Return normalize phase3c outcome."""
     if row is None:
         return NormalizedOutcomeEvidence(
             source_quality=OutcomeSourceQuality.MISSING,
@@ -298,6 +306,7 @@ def normalize_phase3c_outcome(
 def normalize_paper_outcome(
     row: Mapping[str, Any] | None,
 ) -> NormalizedOutcomeEvidence:
+    """Return normalize paper outcome."""
     if row is None:
         return normalize_phase3c_outcome(None)
 
@@ -369,6 +378,7 @@ def classify_learning_cohort(
     *,
     has_exact_feature_snapshot: bool,
 ) -> LearningCohort:
+    """Return classify learning cohort."""
     if not has_exact_feature_snapshot:
         return LearningCohort.INELIGIBLE_UNLINKED
 
@@ -394,6 +404,7 @@ def classify_learning_cohort(
 def _paper_by_episode(
     latest_trades: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, list[Mapping[str, Any]]]:
+    """Return paper by episode."""
     by_episode: dict[str, list[Mapping[str, Any]]] = {}
     for row in latest_trades.values():
         episode_id = str(row.get("episode_id") or "").strip()
@@ -591,6 +602,7 @@ def build_learning_linkage_records(
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Return read jsonl."""
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
@@ -606,6 +618,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def read_ml_snapshot_chunks(snapshot_dir: Path) -> list[dict[str, Any]]:
+    """Return read ml snapshot chunks."""
     rows: list[dict[str, Any]] = []
     if not snapshot_dir.exists():
         return rows
