@@ -41,6 +41,10 @@ class _HeartbeatTimeout(ConnectionError):
     pass
 
 
+class _SymbolLimitExceeded(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class StreamingRuntimeConfig:
     queue_maxsize: int = 5000
@@ -127,7 +131,7 @@ class StreamingRuntime:
 
     @property
     def running(self) -> bool:
-        return self._running
+        return self._running and self._fatal_exception is None
 
     @property
     def fatal_exception(self) -> BaseException | None:
@@ -222,6 +226,8 @@ class StreamingRuntime:
             return
         if error is not None and self._fatal_exception is None:
             self._fatal_exception = error
+            self._telemetry.runtime_failed = True
+            self._telemetry.fatal_error_type = type(error).__name__
             self._stop_event.set()
             self._accepting = False
 
@@ -270,9 +276,9 @@ class StreamingRuntime:
                         self._enqueue_if_current(queued)
                 except asyncio.CancelledError:
                     raise
-                except (ConnectionError, OSError, EOFError, asyncio.TimeoutError):
-                    telemetry.connection_errors += 1
                 except Exception:
+                    # Adapter faults are isolated to this provider session.
+                    # The supervisor records the failure and reconnects.
                     telemetry.connection_errors += 1
                 finally:
                     try:
@@ -380,6 +386,8 @@ class StreamingRuntime:
                     normalized.envelope.ingest_timestamp_utc
                 )
                 self._seal_and_prune(self._require_runtime_utc())
+            except _SymbolLimitExceeded:
+                self._telemetry.symbol_limit_rejections += 1
             except (ValueError, TypeError):
                 self._telemetry.processing_errors += 1
             finally:
@@ -428,7 +436,7 @@ class StreamingRuntime:
         asset = envelope.canonical_asset_id or envelope.provider_symbol
         if asset not in self._active_symbols:
             if len(self._active_symbols) >= self.config.max_symbols:
-                raise ValueError("streaming max_symbols bound exceeded")
+                raise _SymbolLimitExceeded("streaming max_symbols bound exceeded")
             self._active_symbols.add(asset)
 
         for seconds in self.config.window_seconds:
@@ -501,32 +509,51 @@ class StreamingRuntime:
         while not self._stop_event.is_set():
             target = self._monotonic() + interval
             await self._sleep(interval)
-            wall_now = self._monotonic()
-            cpu_now = self._process_time()
-            lag = max(0.0, wall_now - target)
-            wall_delta = wall_now - last_wall
-            cpu_fraction = (
-                max(0.0, (cpu_now - last_cpu) / wall_delta)
-                if wall_delta > 0
-                else None
-            )
-            last_wall = wall_now
-            last_cpu = cpu_now
-            queue_snapshot = self._queue.snapshot()
-            assessment = assess_resources(
-                config=self.config.resource_guard,
-                rss_bytes=current_rss_bytes(),
-                loop_lag_seconds=lag,
-                cpu_fraction=cpu_fraction,
-                queue_utilization_pct=queue_snapshot.utilization_pct,
-            )
-            self._telemetry.rss_bytes = assessment.rss_bytes
-            self._telemetry.cpu_fraction = assessment.cpu_fraction
-            self._telemetry.event_loop_lag_seconds = (
-                assessment.loop_lag_seconds
-            )
-            self._telemetry.resource_degraded = assessment.degraded
-            self._telemetry.resource_reasons = assessment.reasons
+            try:
+                last_wall, last_cpu = self._sample_resources_once(
+                    target=target,
+                    last_wall=last_wall,
+                    last_cpu=last_cpu,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Resource telemetry is advisory. Sampling failures must be
+                # visible but must never disable market-data ingestion.
+                self._telemetry.resource_sample_errors += 1
+                last_wall = self._monotonic()
+                last_cpu = self._process_time()
+
+    def _sample_resources_once(
+        self,
+        *,
+        target: float,
+        last_wall: float,
+        last_cpu: float,
+    ) -> tuple[float, float]:
+        wall_now = self._monotonic()
+        cpu_now = self._process_time()
+        lag = max(0.0, wall_now - target)
+        wall_delta = wall_now - last_wall
+        cpu_fraction = (
+            max(0.0, (cpu_now - last_cpu) / wall_delta)
+            if wall_delta > 0
+            else None
+        )
+        queue_snapshot = self._queue.snapshot()
+        assessment = assess_resources(
+            config=self.config.resource_guard,
+            rss_bytes=current_rss_bytes(),
+            loop_lag_seconds=lag,
+            cpu_fraction=cpu_fraction,
+            queue_utilization_pct=queue_snapshot.utilization_pct,
+        )
+        self._telemetry.rss_bytes = assessment.rss_bytes
+        self._telemetry.cpu_fraction = assessment.cpu_fraction
+        self._telemetry.event_loop_lag_seconds = assessment.loop_lag_seconds
+        self._telemetry.resource_degraded = assessment.degraded
+        self._telemetry.resource_reasons = assessment.reasons
+        return wall_now, cpu_now
 
     def _require_runtime_utc(self) -> datetime:
         value = self._utc_now()
