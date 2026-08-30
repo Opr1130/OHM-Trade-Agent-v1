@@ -567,7 +567,9 @@ def capture_ml_production_evidence(
 ) -> MLCaptureSummary:
     """Serialize one complete ML evidence capture pass.
 
-    Production uses the same lock pathname as the host cron/deploy wrapper.
+    Production serializes capture state with its internal pass lock. Host
+    cron/deploy invocations use a distinct nonblocking trigger lock so they can
+    skip overlapping launches without recursively acquiring this same flock.
     Tests and isolated replay paths use a sibling lock next to their custom
     checkpoint so they never contend with production state.
     """
