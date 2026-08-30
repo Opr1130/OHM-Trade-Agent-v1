@@ -128,13 +128,16 @@ def _raw_metrics(ranked: RankedOpportunity) -> dict[str, Any]:
         1.0,
         _finite(getattr(economic, "leverage", 1.0), 1.0),
     )
-    required_notional = max(
-        0.0,
-        _finite(
-            getattr(economic, "position_notional", 0.0),
-            capital * leverage,
-        ),
+    raw_position_notional = getattr(economic, "position_notional", None)
+    required_notional = (
+        _finite(raw_position_notional, capital * leverage)
+        if raw_position_notional is not None
+        else capital * leverage
     )
+    if required_notional <= 0 and capital > 0:
+        required_notional = capital * leverage
+    required_notional = max(0.0, required_notional)
+
     net_profit = max(
         0.0,
         _finite(getattr(economic, "target_2_net_profit", 0.0)),
@@ -321,6 +324,10 @@ def rank_capital_efficiency(
         key=lambda item: (
             not item[1].capacity_eligible,
             -item[1].total_score,
+            # Capacity-ineligible/unknown rows are never deployable. Preserve
+            # their authoritative upstream quality order rather than letting a
+            # secondary velocity metric reorder two zero-score rows.
+            item[0].rank if not item[1].capacity_eligible else 0,
             -item[1].capital_deployability_score,
             -item[1].net_return_velocity_pct_per_hour,
             -item[1].risk_efficiency_ratio,
