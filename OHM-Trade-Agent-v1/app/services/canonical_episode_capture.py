@@ -95,7 +95,6 @@ def _ml_feature_seed(
     """
 
     numeric_fields = {
-        "completed_close": "last_price",
         "ema20": "ema20",
         "ema50": "ema50",
         "ema200": "ema200",
@@ -151,7 +150,20 @@ def _ml_feature_seed(
         "ticker_ask": "ticker_ask",
         "cross_pair_price_divergence_pct": "cross_pair_price_divergence_pct",
     }
-    feature_values: dict[str, Any] = {"reference_price": reference_price}
+    source = str(scan_source or "LIVE_FULL_MARKET").upper()
+    feature_values: dict[str, Any] = {
+        "reference_price": reference_price,
+        # reference_price is the source-correct contemporaneous ticker price.
+        "ticker_last": reference_price,
+        # Only the native opportunity scanner's last_price is documented as a
+        # completed-candle close. Full-market observations use last_price for
+        # the ticker and must never be relabeled as a candle close.
+        "completed_close": (
+            _finite(getattr(observation, "last_price", None))
+            if source == "LIVE_OPPORTUNITY_SCAN"
+            else None
+        ),
+    }
     feature_values.update(
         {
             output_name: _finite(getattr(observation, attribute_name, None))
