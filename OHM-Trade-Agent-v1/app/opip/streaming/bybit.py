@@ -28,6 +28,7 @@ from app.opip.streaming.sequencing import (
 
 
 DEFAULT_BYBIT_PUBLIC_LINEAR_URL = "wss://stream.bybit.com/v5/public/linear"
+DEFAULT_BYBIT_PENDING_MAXSIZE = 5000
 
 
 def _utc_from_ms(value: Any, *, field: str) -> datetime:
@@ -84,6 +85,7 @@ class BybitPublicAdapter:
         *,
         url: str = DEFAULT_BYBIT_PUBLIC_LINEAR_URL,
         symbols: tuple[str, ...] | None = None,
+        pending_maxsize: int = DEFAULT_BYBIT_PENDING_MAXSIZE,
     ) -> None:
         if not str(url or "").startswith("wss://"):
             raise ValueError("Bybit public stream URL must use wss://")
@@ -93,8 +95,12 @@ class BybitPublicAdapter:
         )
         if not self.symbols or len(self.symbols) > 5:
             raise ValueError("Bybit adapter requires 1..5 symbols")
+        if int(pending_maxsize) < 1:
+            raise ValueError("pending_maxsize must be positive")
+        self._pending_maxsize = int(pending_maxsize)
         self._ws = None
         self._pending: deque[RawProviderFrame] = deque()
+        self._discarded_frame_count = 0
         self._trade_trackers: dict[str, NonDecreasingSequenceTracker] = {
             symbol: NonDecreasingSequenceTracker() for symbol in self.symbols
         }
@@ -103,8 +109,26 @@ class BybitPublicAdapter:
         }
         self._deduper = _BoundedEventDeduper()
 
+    @property
+    def discarded_frame_count(self) -> int:
+        """Cumulative frames discarded before reaching the runtime queue."""
+        return self._discarded_frame_count
+
+    def _discard_pending(self) -> None:
+        """Account for every buffered frame before clearing a connection epoch."""
+        if self._pending:
+            self._discarded_frame_count += len(self._pending)
+            self._pending.clear()
+
+    def _append_pending(self, frame: RawProviderFrame) -> None:
+        """Append without silent eviction; overflow fails the provider session."""
+        if len(self._pending) >= self._pending_maxsize:
+            self._discarded_frame_count += 1
+            raise BufferError("Bybit heartbeat pending buffer is full")
+        self._pending.append(frame)
+
     async def connect(self, *, connection_id: str, reconnect_epoch: int) -> None:
-        self._pending.clear()
+        self._discard_pending()
         self._ws = await connect(
             self.url,
             open_timeout=10,
@@ -150,7 +174,7 @@ class BybitPublicAdapter:
                     continue
                 if self._deduper.seen(f"trade:{symbol}:{event_id}"):
                     continue
-                self._pending.append(
+                self._append_pending(
                     RawProviderFrame(
                         stream_type=StreamType.AGG_TRADE,
                         provider_symbol=symbol,
@@ -172,7 +196,7 @@ class BybitPublicAdapter:
                 )
                 if self._deduper.seen(f"liq:{event_id}"):
                     continue
-                self._pending.append(
+                self._append_pending(
                     RawProviderFrame(
                         stream_type=StreamType.LIQUIDATION,
                         provider_symbol=symbol,
@@ -215,7 +239,7 @@ class BybitPublicAdapter:
 
     async def close(self) -> None:
         ws, self._ws = self._ws, None
-        self._pending.clear()
+        self._discard_pending()
         if ws is not None:
             await ws.close()
 
