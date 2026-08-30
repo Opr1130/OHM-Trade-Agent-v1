@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).
     opip_trade_quality_v2_enabled: bool = True
+    # Wave 9 cross-sectional opportunity ranking + scarce-capital gate.
+    # Real Settings default on; legacy harnesses missing the field stay on the
+    # historical ranking path so old extension seams remain stable.
+    opip_global_capital_ranking_enabled: bool = True
     # Optional second boundary for group chats. When set, Telegram commands
     # and lifecycle callback buttons are accepted only from this Telegram user
     # inside the already-configured chat.
