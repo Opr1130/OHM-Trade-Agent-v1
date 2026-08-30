@@ -42,5 +42,6 @@ def test_deploy_probes_ml_capture_without_making_it_authoritative():
         encoding="utf-8"
     )
     assert "python -m app.jobs.run_opip_ml_capture" in source
-    assert "if docker compose exec -T ohm-trade-agent" in source
+    assert "flock -n /var/run/opip-ml-capture.lock" in source
+    assert "if flock -n /var/run/opip-ml-capture.lock" in source
     assert "production unaffected" in source
