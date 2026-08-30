@@ -136,7 +136,7 @@ if bash "$STREAM_RECONCILE"; then
   echo "O'Pip stream worker reconciliation: healthy"
 else
   stream_rc=$?
-  echo "O'Pip stream worker reconciliation: degraded (rc=$stream_rc); production core unaffected" >&2
+  echo "O'Pip stream worker reconciliation: degraded (rc=$stream_rc); shadow evidence unavailable or incomplete; production core unaffected" >&2
 fi
 
 trap - ERR
