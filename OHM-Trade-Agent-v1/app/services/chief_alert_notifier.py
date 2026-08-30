@@ -30,6 +30,7 @@ from app.services.qualified_alert_outbox import queue_qualified_alert
 from app.services.qualified_trade_tracking import register_reconciliation_intent
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_delivery import (
+    accepted_delivery_message_id,
     record_telegram_not_eligible,
     record_telegram_suppression,
     send_tracked_telegram,
@@ -387,6 +388,21 @@ def send_trade_plan(
                 pass
             # Tracking failure is operational/transport state, not rejection.
             return False
+
+    accepted_message_id = accepted_delivery_message_id(
+        identity=identity,
+        event_type=action,
+        fingerprint=key,
+    )
+    if accepted_message_id is not None:
+        try:
+            with registry_lock(STATE_LOCK_FILE):
+                state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
+                state[plan.symbol] = key
+                save_json_atomic(STATE_FILE, state)
+        except (OSError, TimeoutError, RegistryIOError):
+            pass
+        return True
 
     reservation = reserve_emit(
         identity=f"{direction}:{plan.symbol}",
