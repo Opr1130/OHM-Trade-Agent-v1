@@ -50,6 +50,9 @@ class StreamingFeatureSnapshot:
     liquidation_unknown_notional_usd: float
     liquidation_sync_state: str
     liquidation_venues: tuple[str, ...]
+    liquidation_evidence_quality: str
+    liquidation_degradations: tuple[str, ...]
+    liquidation_confirmable: bool
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +69,9 @@ class StreamingFeatureSnapshot:
             "liquidation_unknown_notional_usd": self.liquidation_unknown_notional_usd,
             "liquidation_sync_state": self.liquidation_sync_state,
             "liquidation_venues": list(self.liquidation_venues),
+            "liquidation_evidence_quality": self.liquidation_evidence_quality,
+            "liquidation_degradations": list(self.liquidation_degradations),
+            "liquidation_confirmable": self.liquidation_confirmable,
         }
 
 
@@ -215,6 +221,20 @@ class CrossVenueFeatureAccumulator:
                 ),
                 liquidation_sync_state=sync_state.value,
                 liquidation_venues=liq_venues,
+                # Neither Binance forceOrder nor Bybit allLiquidation carries
+                # a continuity sequence. Synchronization is useful observed
+                # evidence, but cannot independently confirm a decision.
+                liquidation_evidence_quality=(
+                    EvidenceQualityState.DEGRADED.value
+                    if liquidation.total_notional_usd > 0
+                    else EvidenceQualityState.INCOMPLETE.value
+                ),
+                liquidation_degradations=(
+                    ("UNKNOWN_SEQUENCE",)
+                    if liquidation.total_notional_usd > 0
+                    else ("EMPTY_WINDOW",)
+                ),
+                liquidation_confirmable=False,
             )
         )
         bucket.emitted = True
