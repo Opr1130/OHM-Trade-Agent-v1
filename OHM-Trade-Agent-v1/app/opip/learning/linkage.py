@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import Enum
 import gzip
+import math
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -96,12 +97,19 @@ class LearningLinkageRecord:
 
 
 def _optional_float(value: Any) -> float | None:
+    """Parse one finite numeric evidence value or return None."""
     if value is None or value == "":
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _strict_bool(value: Any) -> bool | None:
+    """Accept only actual JSON/Python booleans; never coerce strings or ints."""
+    return value if isinstance(value, bool) else None
 
 
 def _direction(value: Any) -> str | None:
@@ -294,14 +302,14 @@ def normalize_paper_outcome(
         return normalize_phase3c_outcome(None)
 
     status = str(row.get("status") or "").upper()
-    paper_only = bool(row.get("paper_only", False))
-    authority = bool(row.get("exchange_write_authority", False))
+    paper_only = _strict_bool(row.get("paper_only"))
+    authority = _strict_bool(row.get("exchange_write_authority"))
     direction = _direction(row.get("direction"))
     net_pnl = _optional_float(row.get("net_pnl"))
     net_pnl_pct = _optional_float(row.get("net_pnl_pct"))
     final = (
-        paper_only
-        and not authority
+        paper_only is True
+        and authority is False
         and status == "CLOSED"
         and direction in {"LONG", "SHORT"}
         and bool(str(row.get("closed_at") or "").strip())
