@@ -172,7 +172,8 @@ jobs:
           assert "ports:" not in paper
           assert "./data/paper_trading:/freqtrade/control:ro" in paper
           assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper
-          assert paper.count("mem_limit: 448m") == 2
+          assert paper.count("mem_limit: 384m") == 2
+          assert paper.count("memswap_limit: 384m") == 2
           assert "mem_limit: 768m" not in paper
           assert paper.count('cpus: "0.20"') == 2
           assert "ohm-freqtrade-paper-usdt:" in paper
