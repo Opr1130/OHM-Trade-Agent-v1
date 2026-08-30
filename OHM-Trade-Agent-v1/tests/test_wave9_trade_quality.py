@@ -106,7 +106,9 @@ def test_feature_snapshot_is_immutable_and_point_in_time():
     sealed = feature_snapshot()
     mapping = sealed.ml_feature_mapping()
     assert sealed.snapshot_id.startswith("MLSNAP:")
-    assert mapping["technical_score_input"] == 90.0
+    assert "technical_score_input" not in mapping
+    assert mapping["rsi"] == 55.0
+    assert mapping["macd_histogram"] == 0.5
     assert mapping["execution_availability"] == "VALID"
     assert mapping["catalyst_availability"] == "UNRESOLVED"
     assert sealed.max_visible_at_utc == sealed.decision_at_utc
