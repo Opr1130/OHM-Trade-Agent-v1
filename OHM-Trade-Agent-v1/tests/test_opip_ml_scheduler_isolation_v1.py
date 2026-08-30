@@ -82,3 +82,23 @@ def test_deploy_probes_ml_capture_without_making_it_authoritative():
     assert "flock -n /var/run/opip-ml-capture.lock" in source
     assert "if flock -n /var/run/opip-ml-capture.lock" in source
     assert "production unaffected" in source
+
+
+def test_scheduler_validator_ignores_comment_only_unified_lock_mentions():
+    source = (
+        ROOT / "deploy" / "remote" / "reconcile-scheduler.sh"
+    ).read_text(encoding="utf-8")
+    cron = (ROOT / "deploy" / "cron.d" / "opip-ml-evidence").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/var/run/ohm-unified-cycle.lock" in cron
+    executable = "\n".join(
+        line for line in cron.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "/var/run/ohm-unified-cycle.lock" not in executable
+    assert (
+        "grep -v -E '^[[:space:]]*#' \"$ML_EVIDENCE_DST\" | "
+        "grep -q '/var/run/ohm-unified-cycle.lock'"
+    ) in source
