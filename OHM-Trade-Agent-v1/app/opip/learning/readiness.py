@@ -413,6 +413,12 @@ def build_ml_data_readiness_report(
         row.cohort is LearningCohort.OBSERVATION_ONLY for row in linkages
     )
     usable = sum(row.primary_supervised_eligible for row in linkages)
+    training_direction: Counter[str] = Counter(
+        str(row.normalized_outcome.direction)
+        for row in linkages
+        if row.primary_supervised_eligible
+        and row.normalized_outcome.direction in {"LONG", "SHORT"}
+    )
 
     exclusions: Counter[str] = Counter()
     censored = ambiguous = data_gap = mfe_available = mae_available = 0
@@ -450,12 +456,9 @@ def build_ml_data_readiness_report(
     if missing_rate > active_policy.maximum_missing_feature_rate:
         blockers.append("FEATURE_MISSINGNESS_ABOVE_POLICY")
         structural = True
-    trainable_direction_count = direction.get("LONG", 0) + direction.get("SHORT", 0)
-    if feature_bearing > 0 and trainable_direction_count == 0:
-        blockers.append("NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS")
-        structural = True
-    if exclusions.get("ML_DIRECTION_NOT_TRAINABLE", 0):
-        blockers.append("ML_DIRECTION_LINKAGE_NOT_TRAINABLE")
+    trainable_direction_count = sum(training_direction.values())
+    if feature_bearing > 0 and final_truth > 0 and trainable_direction_count == 0:
+        blockers.append("NO_TRAINABLE_DIRECTION_LINKAGE")
         structural = True
     if exclusions.get("DIRECTION_LINK_MISMATCH", 0):
         blockers.append("DIRECTION_LINK_MISMATCH_PRESENT")
@@ -470,10 +473,10 @@ def build_ml_data_readiness_report(
     if usable < active_policy.minimum_primary_supervised_rows:
         blockers.append("INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT")
     if active_policy.require_long_and_short:
-        if direction.get("LONG", 0) == 0:
-            blockers.append("LONG_FEATURE_COVERAGE_MISSING")
-        if direction.get("SHORT", 0) == 0:
-            blockers.append("SHORT_FEATURE_COVERAGE_MISSING")
+        if training_direction.get("LONG", 0) == 0:
+            blockers.append("LONG_TRAINING_DIRECTION_MISSING")
+        if training_direction.get("SHORT", 0) == 0:
+            blockers.append("SHORT_TRAINING_DIRECTION_MISSING")
 
     if structural:
         state = MLReadinessState.NOT_READY
