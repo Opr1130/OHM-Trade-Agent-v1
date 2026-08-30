@@ -219,7 +219,7 @@ def test_production_compose_stream_worker_is_isolated():
     assert "opip-stream-worker:" in compose
     assert 'container_name: opip-stream-worker' in compose
     assert 'mem_limit: 256m' in compose
-    assert 'cpus: "0.40"' in compose
+    assert 'cpus: "0.35"' in compose
     assert './data:/app/data:ro' in compose
     assert './data/opip/streaming:/app/data/opip/streaming:rw' in compose
     assert './data/opip/streaming:/app/data/opip/streaming:ro' in compose
