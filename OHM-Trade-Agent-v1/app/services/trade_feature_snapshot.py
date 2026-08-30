@@ -56,7 +56,6 @@ def _feature_values(snapshot: MarketSnapshot) -> dict[str, Any]:
         "realized_range_24h_pct": _finite(snapshot.realized_range_24h_pct),
         "average_hourly_range_24h_pct": _finite(snapshot.average_hourly_range_24h_pct),
         "bollinger_bandwidth_percentile": _finite(snapshot.bollinger_bandwidth_percentile),
-        "technical_score_input": _finite(snapshot.technical_score),
         "trend": str(snapshot.trend or "UNKNOWN"),
         "combined_24h_liquidity_usd": _finite(snapshot.combined_24h_liquidity_usd),
         "liquidity_rank": int(snapshot.liquidity_rank or 0),
