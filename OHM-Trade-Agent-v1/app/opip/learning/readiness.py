@@ -306,6 +306,7 @@ def build_ml_data_readiness_report(
     phase3c_outcome_rows: Iterable[Mapping[str, Any]] = (),
     paper_trade_rows: Iterable[Mapping[str, Any]] = (),
     capture_health: Mapping[str, Any] | None = None,
+    capture_dead_letter_rows: Iterable[Mapping[str, Any]] = (),
     policy: MLReadinessPolicy | None = None,
 ) -> MLDataReadinessReport:
     """Build the fail-closed readiness gate from immutable O'Pip evidence."""
@@ -314,6 +315,7 @@ def build_ml_data_readiness_report(
     ml_all = list(ml_snapshot_rows)
     phase_all = list(phase3c_outcome_rows)
     paper_all = list(paper_trade_rows)
+    dead_letters = list(capture_dead_letter_rows)
 
     canonical_safe, canonical_malformed = _structurally_valid_canonical(canonical_all)
     (
@@ -334,7 +336,24 @@ def build_ml_data_readiness_report(
         + _duplicates(ml_all, "ml_snapshot_id")
     )
     health = capture_health or {}
-    pit_violations = derived_pit + int(health.get("temporal_violations", 0) or 0)
+    dead_letter_pit = sum(
+        1
+        for row in dead_letters
+        if str(row.get("error_type") or "") == "TemporalIntegrityError"
+    )
+    dead_letter_malformed = sum(
+        1
+        for row in dead_letters
+        if str(row.get("reason") or "") in {
+            "MALFORMED_EVIDENCE_ROW",
+            "ML_SNAPSHOT_BUILD_FAILED",
+        }
+    )
+    pit_violations = (
+        derived_pit
+        + int(health.get("temporal_violations", 0) or 0)
+        + dead_letter_pit
+    )
     phase_malformed = sum(
         1
         for row in phase_all
@@ -352,6 +371,7 @@ def build_ml_data_readiness_report(
         + feature_malformed
         + phase_malformed
         + paper_malformed
+        + dead_letter_malformed
         + int(health.get("malformed", 0) or 0)
     )
 
