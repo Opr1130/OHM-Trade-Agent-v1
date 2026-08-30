@@ -12,7 +12,11 @@ def test_ml_evidence_cron_is_independent_from_unified_cycle_lock():
     assert "app.jobs.build_phase3c_forward_outcomes" in cron
     assert "/var/run/opip-ml-capture.lock" in cron
     assert "/var/run/opip-ml-outcomes.lock" in cron
-    assert "/var/run/ohm-unified-cycle.lock" not in cron
+    executable = "\n".join(
+        line for line in cron.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "/var/run/ohm-unified-cycle.lock" not in executable
     assert "* * * * * root" in cron
     assert "*/10 * * * * root" in cron
 
