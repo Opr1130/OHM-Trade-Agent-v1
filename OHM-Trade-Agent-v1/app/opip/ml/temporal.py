@@ -24,7 +24,13 @@ def require_utc(value: datetime, *, field_name: str) -> datetime:
 
 @dataclass(frozen=True)
 class AvailabilityStamp:
-    """Availability provenance for one feature or source value.\n\n    source_at_utc may be None when the provider does not expose a trustworthy\n    source-event timestamp. Never fabricate it from local receipt time.\n    ingested_at_utc and visible_at_utc remain mandatory, and visibility is the\n    point-in-time eligibility boundary.\n    """
+    """Availability provenance for one feature or source value.
+
+    source_at_utc may be None when the provider does not expose a trustworthy
+    source-event timestamp. Never fabricate it from local receipt time.
+    ingested_at_utc and visible_at_utc remain mandatory, and visibility is the
+    point-in-time eligibility boundary.
+    """
 
     source_at_utc: datetime | None
     ingested_at_utc: datetime
@@ -32,7 +38,13 @@ class AvailabilityStamp:
     source_version: str = "v1"
 
     def __post_init__(self) -> None:
-        source = (\n            require_utc(self.source_at_utc, field_name="source_at_utc")\n            if self.source_at_utc is not None\n            else None\n        )\n        ingested = require_utc(self.ingested_at_utc, field_name="ingested_at_utc")\n        visible = require_utc(self.visible_at_utc, field_name="visible_at_utc")
+        source = (
+            require_utc(self.source_at_utc, field_name="source_at_utc")
+            if self.source_at_utc is not None
+            else None
+        )
+        ingested = require_utc(self.ingested_at_utc, field_name="ingested_at_utc")
+        visible = require_utc(self.visible_at_utc, field_name="visible_at_utc")
         if visible < ingested:
             raise TemporalIntegrityError(
                 "visible_at_utc cannot precede ingested_at_utc"
