@@ -139,6 +139,33 @@ def test_canonical_seed_preserves_source_specific_price_semantics():
     assert full_market_features["completed_close"] is None
 
 
+def test_full_market_seed_preserves_raw_volume_liquidity_and_range_aliases():
+    observation = _observation()
+    observation.primary_24h_liquidity_usd = None
+    observation.combined_24h_liquidity_usd = None
+    observation.recent_24h_high = None
+    observation.recent_24h_low = None
+    observation.notional_24h_usd_approx = 2_750_000.0
+    observation.high_24h = 111.0
+    observation.low_24h = 89.0
+
+    row = build_canonical_episode_snapshots(
+        [observation],
+        candidates=(),
+        decision_at=NOW,
+        signal_quality_enabled=False,
+        scan_source="LIVE_FULL_MARKET",
+    )[0]
+    features = row["ml_feature_seed"]["feature_values"]
+
+    assert features["volume_24h"] == pytest.approx(1000.0)
+    assert features["primary_24h_liquidity_usd"] == pytest.approx(2_750_000.0)
+    assert features["combined_24h_liquidity_usd"] == pytest.approx(2_750_000.0)
+    assert features["recent_24h_high"] == pytest.approx(111.0)
+    assert features["recent_24h_low"] == pytest.approx(89.0)
+    assert features["completed_close"] is None
+
+
 def test_canonical_seed_captures_raw_features_without_deterministic_outputs():
     row = _canonical_row()
     seed = row["ml_feature_seed"]
