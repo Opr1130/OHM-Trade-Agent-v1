@@ -43,7 +43,6 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
-        default=str,
     )
 
 
@@ -186,6 +185,8 @@ def transition_learning(
     if target not in _ALLOWED_TRANSITIONS[record.stage]:
         raise ValueError(f"invalid learning transition {record.stage.value} -> {target.value}")
     updated = _utc(updated_at_utc, field_name="updated_at_utc")
+    if updated < record.updated_at_utc:
+        raise ValueError("learning lifecycle time cannot move backward")
     combined_evidence = record.evidence_ids
     if evidence_ids is not None:
         combined_evidence = tuple(
