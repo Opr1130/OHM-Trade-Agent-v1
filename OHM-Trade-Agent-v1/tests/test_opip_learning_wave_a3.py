@@ -7,6 +7,7 @@ from app.opip.learning.paper_readiness import (
     PaperReadinessState,
     assess_paper_learning_readiness,
 )
+from app.jobs.run_opip_ml_data_readiness import _paper_rows
 from app.opip.learning.readiness import (
     MLReadinessPolicy,
     MLReadinessState,
@@ -257,3 +258,16 @@ def test_support_shortfall_collects_more_data_not_structural_failure():
     )
     assert report.readiness_state is MLReadinessState.COLLECT_MORE_DATA
     assert "INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT" in report.blockers
+
+
+def test_readiness_paper_source_corruption_is_counted_without_mutation(tmp_path):
+    """Verify the readiness reader never quarantines or rewrites paper state."""
+    path = tmp_path / "state.json"
+    original = '{"lifecycles": {"broken": NaN}}'
+    path.write_text(original, encoding="utf-8")
+    rows, malformed = _paper_rows(path)
+    assert rows == []
+    assert malformed == 1
+    assert path.exists()
+    assert path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.iterdir()) == [path]
