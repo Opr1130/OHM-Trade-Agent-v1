@@ -28,21 +28,11 @@ from app.opip.streaming.features import (
     normalize_trade_side,
 )
 from app.opip.streaming.quality import EvidenceQuality
+from app.opip.streaming.sinks import SealedWindowNotice
 from app.opip.streaming.windows import WindowBounds
 
 
 FEATURE_WINDOW_SECONDS = 15
-
-
-@dataclass(frozen=True)
-class SealedWindowNotice:
-    provider: str
-    stream_type: StreamType
-    canonical_asset_id: str | None
-    window_seconds: int
-    start_utc: datetime
-    end_utc: datetime
-    quality: EvidenceQuality
 
 
 @dataclass(frozen=True)
