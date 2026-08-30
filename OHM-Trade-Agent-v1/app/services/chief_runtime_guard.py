@@ -51,10 +51,15 @@ def _candidate_fingerprint_view(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_chief_fingerprint(request_payload: dict[str, Any]) -> str:
+def build_chief_fingerprint(
+    request_payload: dict[str, Any],
+    *,
+    route_key: str | None = None,
+) -> str:
     compact = {
         "candidate_count": request_payload.get("candidate_count"),
         "market_regime": request_payload.get("market_regime_context"),
+        "ai_route_key": route_key,
         "candidates": [
             _candidate_fingerprint_view(item)
             for item in (request_payload.get("candidates") or [])

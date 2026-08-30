@@ -29,6 +29,26 @@ def _review_key(candidate: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def _market_intelligence_with_ai_route(
+    snapshot: Any,
+    review: dict[str, Any],
+) -> dict[str, Any] | None:
+    route = review.get("opip_ai_route")
+    existing = getattr(snapshot, "_wave8_market_intelligence", None)
+    payload = dict(existing) if isinstance(existing, dict) else {}
+    if isinstance(route, dict):
+        payload["ai_route"] = {
+            "provider": route.get("provider"),
+            "model": route.get("model"),
+            "route_tier": route.get("route_tier"),
+            "route_reason": route.get("route_reason"),
+            "reasoning_effort": route.get("reasoning_effort"),
+            "advisory_only": True,
+            "funded_trade_authority_changed": False,
+        }
+    return payload or None
+
+
 def _qualified_ai_alert(candidate: dict[str, Any]) -> bool:
     decision = str(candidate.get("decision") or "").lower()
     risk_level = str(candidate.get("risk_level") or "").lower()
@@ -151,6 +171,7 @@ def capture_chief_review_decisions(
             market_regime=_regime_name(market_regime_context),
             reason=detail,
             source="chief_ai_review",
+            market_intelligence=_market_intelligence_with_ai_route(snapshot, review),
         ):
             captured += 1
 
@@ -165,6 +186,7 @@ def capture_chief_review_decisions(
                 market_regime=_regime_name(market_regime_context),
                 reason="Candidate was compared by Chief but omitted from the maximum-three top_candidates result",
                 source="chief_ai_review",
+                market_intelligence=_market_intelligence_with_ai_route(snapshot, review),
             ):
                 captured += 1
                 not_selected += 1

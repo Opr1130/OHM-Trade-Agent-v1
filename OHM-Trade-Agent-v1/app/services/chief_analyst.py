@@ -30,6 +30,10 @@ from app.services.economic_quality_gate import (
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
+from app.services.opip_ai_router import (
+    invoke_chief_review,
+    plan_chief_route,
+)
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import (
     MIN_QUALIFYING_SCORE,
@@ -191,7 +195,12 @@ def _new_stage_evidence() -> dict:
         "invocation_status": CHIEF_SKIPPED_NO_ELIGIBLE,
         "failure_type": None,
         "invoked_at": None,
+        "provider": None,
         "model": None,
+        "route_tier": None,
+        "route_reason": None,
+        "reasoning_effort": None,
+        "router_attempts": [],
         "prompt_version": SYSTEM_PROMPT_VERSION,
         "eligible_candidate_count": 0,
         "returned_candidate_count": 0,
@@ -421,6 +430,66 @@ def _request_payload(payload: list[dict], *, market_regime_context: object | Non
     }
 
 
+def _planned_route_cache_key(route_plan) -> str:
+    if route_plan.targets:
+        return route_plan.targets[0].cache_key
+    return route_plan.cache_key
+
+
+def _actual_route_cache_key(routed) -> str:
+    effort = routed.reasoning_effort or "none"
+    return f"{routed.provider}:{routed.model}:{effort}"
+
+
+def _attach_ai_route_context(
+    candidates: list[MarketSnapshot],
+    route: object,
+) -> None:
+    """Attach advisory route metadata for downstream outcome attribution."""
+    if not isinstance(route, dict):
+        return
+    route_context = {
+        "provider": route.get("provider"),
+        "model": route.get("model"),
+        "route_tier": route.get("route_tier"),
+        "route_reason": route.get("route_reason"),
+        "reasoning_effort": route.get("reasoning_effort"),
+        "advisory_only": True,
+        "funded_trade_authority_changed": False,
+    }
+    for candidate in candidates:
+        try:
+            existing = getattr(candidate, "_wave8_market_intelligence", None)
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged["ai_route"] = dict(route_context)
+            setattr(candidate, "_wave8_market_intelligence", merged)
+        except Exception:
+            # Attribution is measurement-only and may never block Chief review.
+            continue
+
+
+def _apply_cached_route_stage(
+    stage_evidence: dict[str, object],
+    cached: dict[str, object],
+) -> None:
+    route = cached.get("opip_ai_route")
+    if not isinstance(route, dict):
+        return
+    for key in (
+        "provider",
+        "model",
+        "route_tier",
+        "route_reason",
+        "reasoning_effort",
+    ):
+        stage_evidence[key] = route.get(key)
+    attempts = route.get("attempts")
+    if isinstance(attempts, list):
+        stage_evidence["router_attempts"] = [
+            dict(item) for item in attempts if isinstance(item, dict)
+        ]
+
+
 def review_candidates(
     candidates: list[MarketSnapshot],
     model: str,
@@ -569,7 +638,22 @@ def review_candidates(
         market_regime_context=market_regime_context,
         coingecko_global_context=coingecko_global_context,
     )
-    fingerprint = build_chief_fingerprint(request_payload)
+    route_plan = plan_chief_route(
+        request_payload,
+        default_model=model,
+        openai_api_key=api_key,
+    )
+    stage_evidence["route_tier"] = route_plan.route_tier
+    stage_evidence["route_reason"] = route_plan.route_reason
+    if route_plan.targets:
+        stage_evidence["provider"] = route_plan.targets[0].provider
+        stage_evidence["model"] = route_plan.targets[0].model
+        stage_evidence["reasoning_effort"] = route_plan.targets[0].reasoning_effort
+
+    fingerprint = build_chief_fingerprint(
+        request_payload,
+        route_key=_planned_route_cache_key(route_plan),
+    )
     cached = get_cached_review(fingerprint)
     if cached is not None:
         cached["chief_api_skipped"] = True
@@ -579,44 +663,85 @@ def review_candidates(
         stage_evidence["returned_candidate_count"] = len(
             cached.get("top_candidates") or []
         )
+        _apply_cached_route_stage(stage_evidence, cached)
+        _attach_ai_route_context(
+            chief_eligible_candidates,
+            cached.get("opip_ai_route"),
+        )
         cached["opip_stage_evidence"] = stage_evidence
         return cached
 
     blocked = budget_block_reason()
     if blocked:
-        _trace_chief_failure(
-            chief_eligible_candidates,
-            reason_code="CHIEF_BUDGET_LIMIT",
-            detail=blocked,
+        alternate_plan = route_plan.without_provider(
+            "openai",
+            reason_suffix="openai_budget_blocked",
         )
-        stage_evidence["invocation_status"] = CHIEF_BUDGET_BLOCKED
-        stage_evidence["failure_type"] = "CHIEF_BUDGET_LIMIT"
-        return _no_trade_review(
-            f"Chief API skipped: {blocked}.",
-            failure_code="CHIEF_BUDGET_LIMIT",
-            eligible_candidates=len(payload),
-            stage_evidence=stage_evidence,
-        )
+        if alternate_plan.targets:
+            route_plan = alternate_plan
+            stage_evidence["provider"] = route_plan.targets[0].provider
+            stage_evidence["model"] = route_plan.targets[0].model
+            stage_evidence["reasoning_effort"] = route_plan.targets[0].reasoning_effort
+            stage_evidence["route_reason"] = route_plan.route_reason
+            fingerprint = build_chief_fingerprint(
+                request_payload,
+                route_key=_planned_route_cache_key(route_plan),
+            )
+            cached = get_cached_review(fingerprint)
+            if cached is not None:
+                cached["chief_api_skipped"] = True
+                cached["chief_cache_reused"] = True
+                cached["chief_eligible_candidates"] = len(payload)
+                stage_evidence["invocation_status"] = CHIEF_CACHE_REUSED
+                stage_evidence["returned_candidate_count"] = len(
+                    cached.get("top_candidates") or []
+                )
+                _apply_cached_route_stage(stage_evidence, cached)
+                _attach_ai_route_context(
+                    chief_eligible_candidates,
+                    cached.get("opip_ai_route"),
+                )
+                cached["opip_stage_evidence"] = stage_evidence
+                return cached
+        else:
+            _trace_chief_failure(
+                chief_eligible_candidates,
+                reason_code="CHIEF_BUDGET_LIMIT",
+                detail=blocked,
+            )
+            stage_evidence["invocation_status"] = CHIEF_BUDGET_BLOCKED
+            stage_evidence["failure_type"] = "CHIEF_BUDGET_LIMIT"
+            return _no_trade_review(
+                f"Chief API skipped: {blocked}.",
+                failure_code="CHIEF_BUDGET_LIMIT",
+                eligible_candidates=len(payload),
+                stage_evidence=stage_evidence,
+            )
 
     try:
-        effort = _reasoning_effort()
         max_output_tokens = _max_output_tokens()
-        client = OpenAI(api_key=api_key)
-        response = client.responses.create(
-            model=model,
-            reasoning={"effort": effort},
+        routed = invoke_chief_review(
+            route_plan,
+            system_prompt=SYSTEM_PROMPT,
+            request_payload=request_payload,
             max_output_tokens=max_output_tokens,
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(request_payload)},
-            ],
+            client_factory=OpenAI,
         )
 
-        usage = getattr(response, "usage", None)
-        if usage is not None:
+        stage_evidence["provider"] = routed.provider
+        stage_evidence["model"] = routed.model
+        stage_evidence["route_tier"] = routed.route_tier
+        stage_evidence["route_reason"] = routed.route_reason
+        stage_evidence["reasoning_effort"] = routed.reasoning_effort
+        stage_evidence["router_attempts"] = [
+            dict(item) for item in routed.attempts
+        ]
+
+        usage = routed.usage
+        if usage is not None and routed.provider == "openai":
             record = append_usage_record(
-                model=model,
-                reasoning_effort=effort,
+                model=routed.model,
+                reasoning_effort=routed.reasoning_effort or "none",
                 candidate_count=len(payload),
                 usage=usage,
             )
@@ -627,10 +752,25 @@ def review_candidates(
                 f"Output={record['output_tokens']} Reasoning={record['reasoning_tokens']} "
                 f"Total={record['total_tokens']}"
             )
+        elif usage is not None:
+            print(
+                "OPIP AI USAGE "
+                f"Provider={routed.provider} Model={routed.model} "
+                f"Candidates={len(payload)}"
+            )
 
-        review = json.loads(response.output_text)
+        review = json.loads(routed.output_text)
         if not isinstance(review, dict):
             raise ValueError("Chief response JSON was not an object")
+        review["opip_ai_route"] = routed.route_evidence()
+        _attach_ai_route_context(
+            chief_eligible_candidates,
+            review["opip_ai_route"],
+        )
+        fingerprint = build_chief_fingerprint(
+            request_payload,
+            route_key=_actual_route_cache_key(routed),
+        )
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         _trace_chief_failure(
