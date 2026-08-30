@@ -38,6 +38,7 @@ def _pair(
     scan_id: str = "SCAN:1",
     candidate_id: str = "OPIPC:build51",
     shadow_mutator=None,
+    both_mutator=None,
 ):
     candidate = snapshot()
     candidate.execution_validation = execution(
@@ -68,6 +69,8 @@ def _pair(
     shadow = replay_decision(row, decision_role=DecisionRole.SHADOW_ENGINE)
     if shadow_mutator is not None:
         shadow = shadow_mutator(shadow)
+    if both_mutator is not None:
+        production, shadow = both_mutator(production, shadow)
     return build_equivalence_observation(
         observed_at_utc=when,
         scan_id=scan_id,
@@ -217,15 +220,20 @@ def test_one_divergence_blocks_engine_equivalence():
             when=NOW + timedelta(days=1),
         ),
     ]
-    divergent = replace(
-        rows[1],
-        observation_id="EQO:" + ("0" * 64),
-        exact_match=False,
-        gate_history_match=False,
-        divergence_kind=DivergenceKind.GATE_HISTORY,
-        shadow_gate_history_hash="GHH:" + ("0" * 64),
+    def mutate_gate(value):
+        last = value.gate_results_ordered[-1]
+        changed = replace(last, reason=last.reason + " divergent")
+        return replace(
+            value,
+            gate_results_ordered=(*value.gate_results_ordered[:-1], changed),
+        )
+
+    divergent = _pair(
+        scan_id="SCAN:2",
+        candidate_id="OPIPC:2",
+        when=NOW + timedelta(days=1),
+        shadow_mutator=mutate_gate,
     )
-    divergent = replace(divergent, observation_id=divergent.calculated_observation_id)
     result = evaluate_shadow_equivalence(
         [rows[0], divergent],
         criteria=_criteria(2, 2, 2),
@@ -270,17 +278,19 @@ def test_incomplete_ledger_coverage_blocks_promotion():
 
 def test_version_mix_blocks_aggregation():
     first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
+    def alternate_code(production, shadow):
+        fingerprint = "ACF:" + ("f" * 64)
+        return (
+            replace(production, engine_code_fingerprint=fingerprint),
+            replace(shadow, engine_code_fingerprint=fingerprint),
+        )
+
     second = _pair(
         scan_id="SCAN:2",
         candidate_id="OPIPC:2",
         when=NOW + timedelta(days=1),
+        both_mutator=alternate_code,
     )
-    second = replace(
-        second,
-        observation_id="EQO:" + ("0" * 64),
-        engine_code_fingerprint="ACF:" + ("f" * 64),
-    )
-    second = replace(second, observation_id=second.calculated_observation_id)
     result = evaluate_shadow_equivalence(
         [first, second],
         criteria=_criteria(2, 2, 2),
@@ -291,12 +301,19 @@ def test_version_mix_blocks_aggregation():
 
 def test_duplicate_candidate_observations_block_readiness():
     first = _pair(scan_id="SCAN:1", candidate_id="OPIPC:1")
-    second = replace(
-        first,
-        observation_id="EQO:" + ("0" * 64),
-        shadow_decision_id="DEC:" + ("f" * 64),
+    def mutate_gate(value):
+        last = value.gate_results_ordered[-1]
+        changed = replace(last, reason=last.reason + " duplicate-key")
+        return replace(
+            value,
+            gate_results_ordered=(*value.gate_results_ordered[:-1], changed),
+        )
+
+    second = _pair(
+        scan_id="SCAN:1",
+        candidate_id="OPIPC:1",
+        shadow_mutator=mutate_gate,
     )
-    second = replace(second, observation_id=second.calculated_observation_id)
     result = evaluate_shadow_equivalence(
         [first, second],
         criteria=_criteria(),
