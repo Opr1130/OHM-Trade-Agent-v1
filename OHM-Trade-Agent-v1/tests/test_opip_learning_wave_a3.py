@@ -154,17 +154,18 @@ def test_zero_feature_bearing_snapshots_fail_closed():
     assert "NO_FEATURE_BEARING_SNAPSHOTS" in report.blockers
 
 
-def test_direction_none_binds_to_exact_final_paper_but_stays_support_gated():
-    """Verify production direction NONE can bind only through exact final paper evidence."""
+def test_direction_none_is_structural_not_ready():
+    """Verify direction NONE cannot satisfy supervised training support."""
     report = build_ml_data_readiness_report(
         canonical_rows=[_canonical("S:1", "E:1")],
         ml_snapshot_rows=[_ml("S:1", "E:1", direction="NONE")],
         paper_trade_rows=[_paper("P:1", "E:1", direction="LONG")],
         policy=MLReadinessPolicy(minimum_primary_supervised_rows=2),
     )
-    assert report.readiness_state is MLReadinessState.COLLECT_MORE_DATA
-    assert "INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT" in report.blockers
-    assert report.primary_supervised_usable_rows == 1
+    assert report.readiness_state is MLReadinessState.NOT_READY
+    assert "NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS" in report.blockers
+    assert "ML_DIRECTION_LINKAGE_NOT_TRAINABLE" in report.blockers
+    assert report.primary_supervised_usable_rows == 0
     assert report.direction_coverage.get("NONE") == 1
 
 
@@ -180,6 +181,50 @@ def test_feature_visibility_after_decision_is_pit_violation():
     assert report.pit_violations == 1
     assert report.readiness_state is MLReadinessState.NOT_READY
     assert "PIT_VIOLATIONS_PRESENT" in report.blockers
+
+
+def test_empty_feature_vector_cannot_count_as_supervised_support():
+    """Verify linked final outcomes with empty vectors cannot satisfy support."""
+    canonical = [_canonical("S:1", "E:1"), _canonical("S:2", "E:2")]
+    empty = _ml("S:1", "E:1")
+    empty["feature_snapshot"]["features"] = []
+    report = build_ml_data_readiness_report(
+        canonical_rows=canonical,
+        ml_snapshot_rows=[
+            empty,
+            _ml("S:2", "E:2", ml_id="ML:S:2"),
+        ],
+        paper_trade_rows=[
+            _paper("P:1", "E:1"),
+            _paper("P:2", "E:2"),
+        ],
+        policy=MLReadinessPolicy(
+            minimum_primary_supervised_rows=2,
+            minimum_exact_linkage_rate=1.0,
+        ),
+    )
+    assert report.feature_bearing_snapshots == 1
+    assert report.primary_supervised_usable_rows == 1
+    assert report.readiness_state is MLReadinessState.COLLECT_MORE_DATA
+    assert "INSUFFICIENT_PRIMARY_SUPERVISED_SUPPORT" in report.blockers
+
+
+def test_malformed_outcome_revisions_are_counted_not_raised():
+    """Verify invalid Phase 3C and paper revisions fail closed into malformed metrics."""
+    phase = _phase("S:1", "E:1")
+    phase["outcome_revision"] = 0
+    paper = _paper("P:1", "E:1")
+    paper["revision"] = "bad"
+    report = build_ml_data_readiness_report(
+        canonical_rows=[_canonical("S:1", "E:1")],
+        ml_snapshot_rows=[_ml("S:1", "E:1")],
+        phase3c_outcome_rows=[phase],
+        paper_trade_rows=[paper],
+        policy=MLReadinessPolicy(minimum_primary_supervised_rows=2),
+    )
+    assert report.malformed_records >= 2
+    assert report.readiness_state is MLReadinessState.NOT_READY
+    assert "MALFORMED_EVIDENCE_PRESENT" in report.blockers
 
 
 def test_duplicate_identities_block_readiness():
