@@ -445,3 +445,58 @@ def send_trade_plan(
             reason="ATOMIC_NOTIFICATION_POLICY",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
+        )
+        return False
+
+    delivery = send_tracked_telegram(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        message=message,
+        identity=identity,
+        alert_family="QUALIFIED_OPPORTUNITY",
+        event_type=action,
+        fingerprint=key,
+        symbol=plan.symbol,
+        journey_id=candidate.get("journey_id"),
+        signal_id=candidate.get("signal_id"),
+        trade_id=trade_id,
+    )
+    if delivery.delivered:
+        try:
+            with registry_lock(STATE_LOCK_FILE):
+                state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
+                state[plan.symbol] = key
+                save_json_atomic(STATE_FILE, state)
+        except (OSError, TimeoutError, RegistryIOError):
+            pass
+        confirm_emit(
+            identity=f"{direction}:{plan.symbol}",
+            event_type="OPPORTUNITY",
+            fingerprint=key,
+            reservation_token=reservation,
+        )
+        return True
+
+    release_emit(
+        identity=f"{direction}:{plan.symbol}",
+        event_type="OPPORTUNITY",
+        reservation_token=reservation,
+    )
+    if trade_id:
+        try:
+            queue_qualified_alert(
+                trade_id=trade_id,
+                message=message,
+                candidate=candidate,
+                plan=plan,
+                action=action,
+                direction=direction,
+                identity=identity,
+                fingerprint=key,
+                reason="DELIVERY_PENDING",
+            )
+        except Exception:
+            pass
+    return False
