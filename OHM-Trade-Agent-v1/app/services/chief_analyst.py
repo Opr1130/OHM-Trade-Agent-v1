@@ -31,7 +31,6 @@ from app.services.economic_quality_gate import (
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
 from app.services.opip_ai_router import (
-    AIProviderUnavailable,
     invoke_chief_review,
     plan_chief_route,
 )
