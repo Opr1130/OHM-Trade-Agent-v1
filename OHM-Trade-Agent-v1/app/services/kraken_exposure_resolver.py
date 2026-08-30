@@ -195,8 +195,19 @@ class KrakenExposureResolver:
                     coverage_complete=False,
                     reason="Kraken direct snapshot unavailable; managed verification fallback used",
                 )
+            exposures = tuple(
+                ResolvedExposure(
+                    status="UNKNOWN",
+                    symbol=trade.symbol,
+                    direction=(trade.direction or "LONG").upper(),
+                    observed_quantity=None,
+                    reason="Kraken private credentials are not configured",
+                    trade=trade,
+                )
+                for trade in local_trades
+            )
             return ExposureResolution(
-                exposures=tuple(),
+                exposures=exposures,
                 coverage_complete=False,
                 reason=registry_reason or "Kraken private credentials are not configured",
             )
@@ -216,8 +227,19 @@ class KrakenExposureResolver:
                     coverage_complete=False,
                     reason=f"Kraken direct snapshot unavailable; managed verification fallback used: {exc}",
                 )
+            exposures = tuple(
+                ResolvedExposure(
+                    status="DEGRADED",
+                    symbol=trade.symbol,
+                    direction=(trade.direction or "LONG").upper(),
+                    observed_quantity=None,
+                    reason=f"Kraken account state unavailable: {exc}",
+                    trade=trade,
+                )
+                for trade in local_trades
+            )
             return ExposureResolution(
-                exposures=tuple(),
+                exposures=exposures,
                 coverage_complete=False,
                 reason=registry_reason or f"Kraken account state unavailable: {exc}",
             )
