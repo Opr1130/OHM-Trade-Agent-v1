@@ -158,7 +158,8 @@ def test_background_launch_lock_is_distinct_from_capture_state_lock():
 
     assert launch != state
     assert f"flock -n {launch}" in cron
-    assert launch in deploy\n    assert "flock -w 120 8" in deploy
+    assert launch in deploy
+    assert "flock -w 120 8" in deploy
     assert f'DEFAULT_ML_CAPTURE_LOCK_FILE = Path("{state}")' in service
     assert f"flock -n {state}" not in cron
     assert f"flock -n {state}" not in deploy
