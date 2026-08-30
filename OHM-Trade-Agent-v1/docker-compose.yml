@@ -74,11 +74,14 @@ services:
     build: .
     container_name: opip-stream-worker
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       OPIP_STREAMING_ENABLED: "true"
       OPIP_STREAMING_SYMBOLS: "BTCUSDT,ETHUSDT,SOLUSDT"
+      OPIP_STREAMING_BINANCE_URL: "wss://fstream.binance.com/public/stream"
+      OPIP_STREAMING_BYBIT_URL: "wss://stream.bybit.com/v5/public/linear"
+      OPIP_STREAMING_QUEUE_MAXSIZE: "5000"
+      OPIP_STREAMING_RETENTION_HOURS: "72"
+      OPIP_STREAMING_HEALTH_INTERVAL_SECONDS: "5"
       PYTHONDONTWRITEBYTECODE: "1"
     command:
       - python
