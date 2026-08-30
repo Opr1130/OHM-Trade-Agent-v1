@@ -141,6 +141,23 @@ def test_feature_paper_direction_mismatch_cannot_train():
     assert "DIRECTION_LINK_MISMATCH" in row.exclusion_reasons
 
 
+def test_scored_eligible_counterfactual_never_enters_primary_cohort():
+    """Verify counterfactual eligibility overrides scored-eligible status."""
+    row = build_learning_linkage_records(
+        canonical_rows=[
+            _canonical(
+                status="SCORED_ELIGIBLE",
+                counterfactual=True,
+            )
+        ],
+        ml_snapshot_rows=[_ml(direction="LONG")],
+        paper_trade_rows=[_paper(direction="LONG")],
+    )[0]
+    assert row.cohort is LearningCohort.COUNTERFACTUAL_REJECTED
+    assert row.primary_supervised_eligible is False
+    assert "COUNTERFACTUAL_RESEARCH_ONLY" in row.exclusion_reasons
+
+
 def test_production_scored_suppressed_is_counterfactual_research_only():
     """Verify production scored suppressed is counterfactual research only."""
     row = build_learning_linkage_records(
@@ -221,6 +238,14 @@ def test_latest_phase3c_revision_is_selected_by_explicit_revision():
     )
     assert latest["SNAP:1"]["outcome_revision"] == 3
     assert latest["SNAP:1"]["outcome_record_id"] == "OUT:3"
+
+
+def test_phase3c_revision_without_immutable_record_id_fails_closed():
+    """Verify a revision without outcome_record_id is never selected by order."""
+    row = _phase(revision=2)
+    row["outcome_record_id"] = ""
+    with pytest.raises(ValueError, match="outcome_record_id is required"):
+        select_latest_phase3c_outcomes([row])
 
 
 def test_conflicting_same_revision_phase3c_records_fail_closed():
