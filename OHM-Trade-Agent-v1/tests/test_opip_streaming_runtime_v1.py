@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pytest
@@ -214,6 +214,7 @@ def test_runtime_processes_fake_frames_without_external_network():
         runtime = StreamingRuntime(
             {StreamProvider.BINANCE: adapter},
             config=_runtime_config(),
+            utc_now=lambda: NOW + timedelta(milliseconds=10),
         )
         await runtime.start()
         for _ in range(100):
