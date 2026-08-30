@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from app.opip.ml.contracts import (
+    FeatureSnapshot,
+    FeatureValue,
     ModelHealth,
     ModelLifecycle,
     ModelRegistryRecord,
@@ -103,6 +105,34 @@ def test_deterministic_outputs_are_audit_only_not_ml_features():
 
 def test_snapshot_hash_is_reproducible():
     assert _snapshot().snapshot_id == _snapshot().snapshot_id
+
+
+def test_snapshot_builder_populates_optional_defaults_before_hashing():
+    snapshot = FeatureSnapshot.build(
+        episode_id="EP:defaults",
+        candidate_id=None,
+        decision_at_utc=NOW,
+        canonical_asset_id="bitcoin",
+        venue="KRAKEN",
+        pair="BTCUSD",
+        direction="LONG",
+        lane="PAPER",
+        regime=None,
+        feature_schema_version="v1",
+        feature_calc_version="calc",
+        feature_dag_hash="dag",
+        serialization_version=1,
+        features=(
+            FeatureValue(
+                name="volume",
+                value=1.0,
+                availability=_stamp(),
+            ),
+        ),
+    )
+    assert dict(snapshot.source_versions) == {}
+    assert snapshot.audit_deterministic_score is None
+    assert snapshot.snapshot_id.startswith("MLSNAP:")
 
 
 def test_snapshot_nested_evidence_is_immutable_after_hashing():
