@@ -355,11 +355,12 @@ def _invoke_target(
     system_prompt: str,
     request_payload: dict[str, Any],
     max_output_tokens: int,
+    client_factory=OpenAI,
 ) -> tuple[str, Any]:
     kwargs: dict[str, Any] = {"api_key": target.api_key}
     if target.base_url:
         kwargs["base_url"] = target.base_url
-    client = OpenAI(**kwargs)
+    client = client_factory(**kwargs)
 
     request: dict[str, Any] = {
         "model": target.model,
@@ -385,6 +386,7 @@ def invoke_chief_review(
     system_prompt: str,
     request_payload: dict[str, Any],
     max_output_tokens: int,
+    client_factory=OpenAI,
 ) -> RouterResponse:
     if not plan.targets:
         raise AIProviderUnavailable("no configured O'Pip AI provider is available")
@@ -400,6 +402,7 @@ def invoke_chief_review(
                 system_prompt=system_prompt,
                 request_payload=request_payload,
                 max_output_tokens=max_output_tokens,
+                client_factory=client_factory,
             )
         except Exception as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
