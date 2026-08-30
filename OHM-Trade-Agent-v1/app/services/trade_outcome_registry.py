@@ -10,7 +10,7 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 OUTCOME_FILE = Path("/app/data/trade_outcomes.json")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def registry_lock_file() -> Path:
@@ -105,6 +105,28 @@ def record_recommendation(
             "target_attainability_score": candidate.get("target_attainability_score"),
             "profit_rank": candidate.get("profit_rank"),
             "profit_rank_score": candidate.get("profit_rank_score"),
+            "opportunity_rank": candidate.get("opportunity_rank"),
+            "capital_efficiency_score": candidate.get("capital_efficiency_score"),
+            "hold_proxy_hours": candidate.get("hold_proxy_hours"),
+            "net_return_velocity_proxy_pct_per_hour": candidate.get(
+                "net_return_velocity_proxy_pct_per_hour"
+            ),
+            "risk_efficiency_ratio": candidate.get("risk_efficiency_ratio"),
+            "feature_snapshot_id": candidate.get("feature_snapshot_id"),
+            "trade_quality_evidence_id": candidate.get("trade_quality_evidence_id"),
+            "continuation_score": candidate.get("continuation_score"),
+            "continuation_decision": candidate.get("continuation_decision"),
+            "continuation_evidence_quality": candidate.get(
+                "continuation_evidence_quality"
+            ),
+            "entry_quality_score": candidate.get("entry_quality_score"),
+            "entry_quality_decision": candidate.get("entry_quality_decision"),
+            "exhaustion_state": candidate.get("exhaustion_state"),
+            "trade_quality_actionable": candidate.get("trade_quality_actionable"),
+            "quality_score_is_probability": False,
+            "outcome_event_definition": (
+                "TARGET_1_BEFORE_STOP_WITHIN_HORIZON"
+            ),
             "planned_entry_low": plan.entry_low,
             "planned_entry_high": plan.entry_high,
             "planned_chase_limit": plan.chase_limit,
@@ -355,6 +377,10 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
 
     confidence_bins: dict[str, dict[str, int]] = {}
     rank_bins: dict[str, dict[str, int]] = {}
+    opportunity_rank_bins: dict[str, dict[str, int]] = {}
+    continuation_bins: dict[str, dict[str, int]] = {}
+    entry_quality_bins: dict[str, dict[str, int]] = {}
+    capital_efficiency_bins: dict[str, dict[str, int]] = {}
     direction_bins: dict[str, dict[str, int]] = {}
     for item in resolved_entered:
         confidence = item.get("chief_confidence")
@@ -369,6 +395,32 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
             bucket = rank_bins.setdefault(str(rank), {"count": 0, "t2_observed": 0})
             bucket["count"] += 1
             bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+        opportunity_rank = item.get("opportunity_rank")
+        if isinstance(opportunity_rank, int):
+            bucket = opportunity_rank_bins.setdefault(
+                str(opportunity_rank),
+                {"count": 0, "t1_observed": 0, "t2_observed": 0},
+            )
+            bucket["count"] += 1
+            bucket["t1_observed"] += int(bool(item.get("target_1_observed")))
+            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+
+        for source_field, buckets in (
+            ("continuation_score", continuation_bins),
+            ("entry_quality_score", entry_quality_bins),
+            ("capital_efficiency_score", capital_efficiency_bins),
+        ):
+            value = item.get(source_field)
+            if isinstance(value, (int, float)):
+                low = int(float(value) // 10) * 10
+                label = f"{low:02d}-{min(low + 9, 100):02d}"
+                bucket = buckets.setdefault(
+                    label,
+                    {"count": 0, "t1_observed": 0, "t2_observed": 0},
+                )
+                bucket["count"] += 1
+                bucket["t1_observed"] += int(bool(item.get("target_1_observed")))
+                bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
         direction = str(item.get("direction") or "LONG").upper()
         bucket = direction_bins.setdefault(direction, {"count": 0, "t2_observed": 0})
         bucket["count"] += 1
@@ -380,5 +432,10 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
         "confidence_is_probability": False,
         "confidence_bins": confidence_bins,
         "profit_rank_bins": rank_bins,
+        "opportunity_rank_bins": opportunity_rank_bins,
+        "continuation_score_bins": continuation_bins,
+        "entry_quality_score_bins": entry_quality_bins,
+        "capital_efficiency_score_bins": capital_efficiency_bins,
+        "outcome_event_definition": "TARGET_1_BEFORE_STOP_WITHIN_HORIZON",
         "direction_bins": direction_bins,
     }
