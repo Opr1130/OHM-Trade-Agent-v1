@@ -302,6 +302,56 @@ def test_live_and_replay_match_when_candidate_reaches_ai_stage():
     ]
 
 
+def test_live_and_replay_match_on_qualified_ai_path():
+    candidate = snapshot()
+    candidate.execution_validation = execution(
+        estimated_visible_round_trip_market_drag_pct=0.1
+    )
+    ai_stage = AIStageEvidence(
+        invocation_status=AI_SUCCEEDED,
+        eligible_candidates_before_ai=1,
+        candidates_returned_by_ai=1,
+        confidences=[95],
+    )
+    ai_item = {
+        "decision": "alert",
+        "risk_level": "low",
+        "direction": "LONG",
+        "confidence": 95,
+        "rank": 1,
+    }
+    row = evidence(
+        candidate_snapshot=candidate,
+        ai_evidence=ai_stage,
+        ai_item=ai_item,
+    )
+    live = OPipDecisionEngine(
+        account_equity=row.account_equity,
+        decision_at=NOW,
+        ai_stage=ai_stage,
+    ).evaluate(
+        CandidateEvidence(
+            snapshot=candidate,
+            episode_id=row.episode_id,
+            signal_id=row.signal_id,
+            asset_display_name=row.asset_display_name,
+            pair=row.pair,
+            ai_item=ai_item,
+            market_intelligence=row.market_intelligence,
+        )
+    )
+    replayed = replay_decision(row)
+
+    assert live.decision.value == "QUALIFIED"
+    assert replayed.is_admitted is True
+    assert replayed.decision == live.decision
+    assert replayed.first_terminal_gate == live.first_terminal_gate
+    assert replayed.terminal_reason_code == live.terminal_reason_code.value
+    assert [item.as_dict() for item in replayed.gate_results_ordered] == [
+        item.as_dict() for item in live.gate_results
+    ]
+
+
 def test_replay_is_byte_stable():
     first = replay_decision(evidence())
     second = replay_decision(evidence())

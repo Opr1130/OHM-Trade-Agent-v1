@@ -60,6 +60,13 @@ def app_code_fingerprint() -> str:
     Any Python source change anywhere under the application tree changes this
     fingerprint. Exact historical replay should refuse an uncertain checkout
     rather than certify compatibility from a manually maintained label.
+
+    The value is cached for the process lifetime intentionally. Python normally
+    executes modules already loaded into memory; an on-disk source edit does
+    not change that running bytecode. A fresh replay process recomputes the
+    fingerprint and therefore rejects a different checkout. Code that
+    deliberately reloads modules must clear this cache as part of that explicit
+    non-standard lifecycle.
     """
     app_root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256()
