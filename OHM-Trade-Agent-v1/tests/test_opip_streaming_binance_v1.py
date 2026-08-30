@@ -130,3 +130,46 @@ def test_invalid_numeric_evidence_fails_closed():
     }
     with pytest.raises(ValueError):
         adapter.normalize(_queued(StreamType.AGG_TRADE, payload))
+
+
+def test_binance_connect_and_subscribe_contract(monkeypatch):
+    import asyncio
+    import app.opip.streaming.binance as module
+
+    class FakeWs:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(payload)
+
+        async def close(self):
+            return None
+
+    fake_ws = FakeWs()
+    captured = {}
+
+    async def fake_connect(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return fake_ws
+
+    monkeypatch.setattr(module, "connect", fake_connect)
+
+    async def scenario():
+        adapter = BinancePublicAdapter(symbols=("BTCUSDT", "ETHUSDT"))
+        await adapter.connect(connection_id="binance-0", reconnect_epoch=0)
+        await adapter.subscribe()
+        await adapter.close()
+
+    asyncio.run(scenario())
+    assert captured["url"] == "wss://fstream.binance.com/public/stream"
+    request = orjson.loads(fake_ws.sent[0])
+    assert request["method"] == "SUBSCRIBE"
+    assert set(request["params"]) == {
+        "btcusdt@aggTrade",
+        "btcusdt@forceOrder",
+        "ethusdt@aggTrade",
+        "ethusdt@forceOrder",
+    }
+    assert captured["kwargs"]["max_queue"] == 16
