@@ -99,10 +99,11 @@ bash "$SCHEDULER_RECONCILE"
 # and whether the worker can read/write its local stores. A probe failure must
 # never roll back otherwise healthy deterministic trading protection.
 echo "O'Pip ML evidence capture smoke probe"
-if docker compose exec -T ohm-trade-agent python -m app.jobs.run_opip_ml_capture; then
+if flock -n /var/run/opip-ml-capture.lock -c \
+  'cd /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1 && /usr/bin/docker compose exec -T ohm-trade-agent python -m app.jobs.run_opip_ml_capture'; then
   echo "O'Pip ML evidence capture smoke probe: completed"
 else
-  echo "O'Pip ML evidence capture smoke probe: degraded; production unaffected" >&2
+  echo "O'Pip ML evidence capture smoke probe: skipped/degraded; capture lock busy or probe failed; production unaffected" >&2
 fi
 
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
