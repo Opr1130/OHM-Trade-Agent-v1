@@ -74,6 +74,15 @@ def test_scheduler_reconcile_installs_and_validates_ml_evidence_cron():
     assert "app.jobs.build_phase3c_forward_outcomes" in source
 
 
+def test_scheduler_reconcile_checks_only_executable_cron_for_forbidden_lock():
+    """Documentation comments must not trigger the production lock safety gate."""
+    source = (
+        ROOT / "deploy" / "remote" / "reconcile-scheduler.sh"
+    ).read_text(encoding="utf-8")
+    assert "grep -v -E '^[[:space:]]*#' \"$ML_EVIDENCE_DST\"" in source
+    assert "grep -q '/var/run/ohm-unified-cycle.lock'" in source
+
+
 def test_deploy_probes_ml_capture_without_making_it_authoritative():
     source = (ROOT / "deploy" / "remote" / "ohm-deploy").read_text(
         encoding="utf-8"
