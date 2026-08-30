@@ -276,6 +276,7 @@ class SupervisedLabelRecord:
     direction: str
     label_calc_version: str
     label_available_at_utc: datetime
+    label_computed_at_utc: datetime
     horizon_end_utc: datetime
     tp1_before_sl: bool | None
     tp2_before_sl: bool | None
@@ -297,11 +298,18 @@ class SupervisedLabelRecord:
         available = require_utc(
             self.label_available_at_utc, field_name="label_available_at_utc"
         )
+        computed = require_utc(
+            self.label_computed_at_utc, field_name="label_computed_at_utc"
+        )
         horizon = require_utc(self.horizon_end_utc, field_name="horizon_end_utc")
         if available < horizon:
             raise ValueError("label cannot be available before its horizon is resolved")
+        if computed < available:
+            raise ValueError("label cannot be computed before its inputs are available")
         if self.direction not in {"LONG", "SHORT"}:
             raise ValueError("label direction must be LONG or SHORT")
+        if not self.label_calc_version:
+            raise ValueError("label_calc_version is required")
         if not self.fee_model_version or not self.slippage_model_version:
             raise ValueError("fee and slippage model versions are required")
         for name in (
@@ -314,8 +322,38 @@ class SupervisedLabelRecord:
             _optional_finite(getattr(self, name), field_name=name)
         frozen_returns = _freeze_jsonish(dict(self.net_returns_bps))
         object.__setattr__(self, "label_available_at_utc", available)
+        object.__setattr__(self, "label_computed_at_utc", computed)
         object.__setattr__(self, "horizon_end_utc", horizon)
         object.__setattr__(self, "net_returns_bps", frozen_returns)
+        expected = stable_hash("MLLBL", self.hash_payload())
+        if self.label_id != expected:
+            raise ValueError("label_id does not match canonical label payload")
+
+    def hash_payload(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "candidate_id": self.candidate_id,
+            "direction": self.direction,
+            "label_calc_version": self.label_calc_version,
+            "label_available_at_utc": self.label_available_at_utc,
+            "label_computed_at_utc": self.label_computed_at_utc,
+            "horizon_end_utc": self.horizon_end_utc,
+            "tp1_before_sl": self.tp1_before_sl,
+            "tp2_before_sl": self.tp2_before_sl,
+            "sl_before_tp1": self.sl_before_tp1,
+            "net_returns_bps": self.net_returns_bps,
+            "mfe_bps": self.mfe_bps,
+            "mae_bps": self.mae_bps,
+            "time_to_tp1_seconds": self.time_to_tp1_seconds,
+            "time_to_tp2_seconds": self.time_to_tp2_seconds,
+            "time_to_sl_seconds": self.time_to_sl_seconds,
+            "censored": self.censored,
+            "data_gap": self.data_gap,
+            "execution_path_ambiguous": self.execution_path_ambiguous,
+            "fee_model_version": self.fee_model_version,
+            "slippage_model_version": self.slippage_model_version,
+            "schema_version": self.schema_version,
+        }
 
 
 @dataclass(frozen=True)
