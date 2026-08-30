@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.opip.protection.exposure_resolver import (
+from app.services.kraken_exposure_resolver import (
     ExposureResolution,
     KrakenExposureResolver,
     ResolvedExposure,
