@@ -29,7 +29,11 @@ jobs:
       - run: python -m pytest -q
       - run: python -m compileall -q app
       - name: Validate production Compose
-        run: docker compose config -q
+        run: |
+          test ! -e .env
+          : > .env
+          trap 'rm -f .env' EXIT
+          docker compose config -q
       - name: Validate deployment shell
         run: |
           bash -n deploy/remote/ohm-deploy
