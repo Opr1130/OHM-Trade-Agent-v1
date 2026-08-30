@@ -159,10 +159,6 @@ def send_monitor_update(
     if trade.status != "active":
         return False
 
-    # HEALTHY/HOLD is monitored continuously but is intentionally silent.
-    if result.action == "HOLD":
-        return False
-
     now = datetime.now(timezone.utc)
     identity = f"ACTIVE_TRADE:{trade.trade_id or trade.symbol}"
     reason_signature = _reason_signature(result)
@@ -175,6 +171,30 @@ def send_monitor_update(
         # Protection actions fail open into NotificationPolicy for critical
         # classes; do not let a local monitor-state file silence EXIT/TP.
         state = {}
+
+    # HEALTHY/HOLD is user-silent, but record the recovery internally. Without
+    # this transition a later return to the same WARNING fingerprint could be
+    # mistaken for one uninterrupted warning and be suppressed.
+    if result.action == "HOLD":
+        previous = state.get(trade.symbol)
+        if isinstance(previous, dict) and _previous_action(previous) not in {None, "HOLD"}:
+            state[trade.symbol] = {
+                "action": "HOLD",
+                "message_id": previous.get("message_id"),
+                "updated_at": now.isoformat(),
+                "price": float(result.current_price),
+                "pnl_pct": float(
+                    result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct
+                ),
+                "reason_signature": reason_signature,
+                "risk_progress": risk_progress,
+                "mfe_giveback_r": mfe_giveback_r,
+            }
+            try:
+                _save_state(state)
+            except (OSError, TimeoutError, RegistryIOError):
+                pass
+        return False
 
     previous = state.get(trade.symbol)
     if not isinstance(previous, dict):
