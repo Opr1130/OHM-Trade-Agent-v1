@@ -158,7 +158,7 @@ jobs:
           if [[ "$RC" -eq 0 ]] \
              && grep -q 'OHM deployment succeeded' deploy.log \
              && grep -q '"status":"ok"' deploy.log \
-             && grep -q 'OPIP stream worker reconciliation: OK' deploy.log; then
+             && grep -q 'OHM scheduler reconciliation: OK' deploy.log; then
             RESULT="SUCCESS"
             HEALTH="OK"
             ROLLBACK="NO"
