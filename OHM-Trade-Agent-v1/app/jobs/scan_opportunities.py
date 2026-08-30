@@ -1232,6 +1232,12 @@ def main():
         alert["economic_qualified"] = True
         alert["economic_target_2_move_pct"] = economic.target_2_move_pct
         alert["economic_validation_net_t2"] = economic.target_2_net_profit
+        alert["economic_validation_capital"] = economic.recommended_capital
+        alert["economic_position_notional"] = getattr(
+            economic,
+            "position_notional",
+            economic.recommended_capital,
+        )
         qualified_opportunities.append(
             QualifiedOpportunity(
                 alert=alert,
@@ -1262,33 +1268,83 @@ def main():
 
     if bool(getattr(settings, "opip_global_capital_ranking_enabled", False)):
         capital_ranked = rank_capital_efficiency(ranked_opportunities)
-        print("===== O'PIP GLOBAL CAPITAL EFFICIENCY =====")
+        print("===== O\'PIP GLOBAL CAPITAL EFFICIENCY =====")
         global_ranked_opportunities: list[RankedOpportunity] = []
+        global_rank = 0
         for item in capital_ranked:
             original = item.ranked_opportunity
             alert = original.opportunity.alert
             result = item.capital_efficiency
             alert["profit_rank"] = item.original_rank
-            alert["opportunity_rank"] = item.rank
             alert["capital_efficiency_score"] = result.total_score
             alert["hold_proxy_hours"] = result.hold_proxy_hours
             alert["net_return_velocity_proxy_pct_per_hour"] = (
                 result.net_return_velocity_pct_per_hour
             )
             alert["risk_efficiency_ratio"] = result.risk_efficiency_ratio
+            alert["capital_deployability_score"] = (
+                result.capital_deployability_score
+            )
+            alert["liquidity_capacity_status"] = result.capacity_status
+            alert["liquidity_capacity_ceiling_usd"] = (
+                result.liquidity_capacity_ceiling_usd
+            )
+            alert["liquidity_capacity_utilization_pct"] = (
+                result.capacity_utilization_pct
+            )
+            alert["liquidity_capacity_scalable_fraction"] = (
+                result.capacity_scalable_fraction
+            )
+
+            if not result.capacity_eligible:
+                ceiling_label = (
+                    f"${result.liquidity_capacity_ceiling_usd:.2f}"
+                    if result.liquidity_capacity_ceiling_usd is not None
+                    else "UNKNOWN"
+                )
+                reason = (
+                    f"liquidity capacity {result.capacity_status}; "
+                    f"required_notional=${result.required_notional_usd:.2f}; "
+                    f"ceiling={ceiling_label}"
+                )
+                print(
+                    f"CAPACITY REJECT "
+                    f"{original.opportunity.snapshot.trade_direction} "
+                    f"{result.symbol}: {reason}"
+                )
+                capture_snapshot_decision(
+                    original.opportunity.snapshot,
+                    decision="CAPACITY_REJECT",
+                    market_regime=market_regime.regime,
+                    reason=reason,
+                    source="wave9_liquidity_capacity_gate",
+                    profit_rank_score=original.profit_ranking.total_score,
+                )
+                continue
+
+            global_rank += 1
+            alert["opportunity_rank"] = global_rank
+            ceiling_label = (
+                f"${result.liquidity_capacity_ceiling_usd:.2f}"
+                if result.liquidity_capacity_ceiling_usd is not None
+                else "N/A"
+            )
             print(
-                f"GLOBAL RANK {item.rank} "
+                f"GLOBAL RANK {global_rank} "
                 f"{original.opportunity.snapshot.trade_direction} "
                 f"{result.symbol}: "
                 f"CapitalEfficiency={result.total_score:.2f} "
                 f"ProfitRank={item.original_rank} "
+                f"Deployability={result.capital_deployability_score:.2f}/15 "
+                f"Capacity={result.capacity_status} "
+                f"CapacityCeiling={ceiling_label} "
                 f"HoldProxy={result.hold_proxy_hours:.2f}h "
                 f"NetReturnVelocity={result.net_return_velocity_pct_per_hour:.4f}%/h "
                 f"RiskEfficiency={result.risk_efficiency_ratio:.4f}"
             )
             global_ranked_opportunities.append(
                 RankedOpportunity(
-                    rank=item.rank,
+                    rank=global_rank,
                     opportunity=original.opportunity,
                     profit_ranking=original.profit_ranking,
                 )
