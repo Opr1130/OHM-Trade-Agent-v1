@@ -44,11 +44,13 @@ def main() -> int:
     try:
         received = int(health.get("raw_frames_received") or 0)
         drop_pct = float(health.get("raw_drop_pct") or 0.0)
+        provider_buffer_dropped = int(health.get("provider_buffer_dropped") or 0)
         store_errors = int(health.get("store_errors") or 0)
         observation_sink_errors = int(
             health.get("observation_sink_errors") or 0
         )
         window_sink_errors = int(health.get("window_sink_errors") or 0)
+        invalid_payloads = int(health.get("invalid_payload_observations") or 0)
         bucket_drops = int(health.get("feature_buckets_dropped") or 0)
         snapshot_drops = int(health.get("feature_snapshots_dropped") or 0)
         features_persisted = int(health.get("features_persisted") or 0)
@@ -60,9 +62,11 @@ def main() -> int:
     if any(
         value != 0
         for value in (
+            provider_buffer_dropped,
             store_errors,
             observation_sink_errors,
             window_sink_errors,
+            invalid_payloads,
             bucket_drops,
             snapshot_drops,
         )
