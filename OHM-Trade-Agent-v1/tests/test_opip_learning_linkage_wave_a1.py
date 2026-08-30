@@ -205,6 +205,35 @@ def test_duplicate_canonical_snapshot_identity_fails_closed():
         )
 
 
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity", "1e309"])
+def test_nonfinite_final_paper_values_are_unusable(bad_value):
+    row = _paper()
+    row["net_pnl"] = bad_value
+    row["net_pnl_pct"] = bad_value
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
+
+    linkage = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
+        ml_snapshot_rows=[_ml()],
+        paper_trade_rows=[row],
+    )[0]
+    assert linkage.primary_supervised_eligible is False
+
+
+@pytest.mark.parametrize("bad_flag", ["false", "true", 0, 1, None])
+def test_malformed_paper_authority_flags_are_unusable(bad_flag):
+    row = _paper()
+    row["paper_only"] = bad_flag
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
+
+    row = _paper()
+    row["exchange_write_authority"] = bad_flag
+    normalized = normalize_paper_outcome(row)
+    assert normalized.source_quality is OutcomeSourceQuality.UNUSABLE
+
+
 def test_nonclosed_or_authoritative_paper_record_is_unusable():
     open_row = normalize_paper_outcome(_paper(status="OPEN"))
     assert open_row.source_quality is OutcomeSourceQuality.UNUSABLE
