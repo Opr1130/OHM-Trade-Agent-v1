@@ -103,6 +103,35 @@ wait_paper_health() {
   return 1
 }
 
+validate_target_resource_budget() {
+  local available_kb
+  available_kb="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 384 * 1024 )); then
+    echo "insufficient host memory headroom after paper startup: available_kb=$available_kb" >&2
+    return 1
+  fi
+
+  # Verify the intended hard cgroup ceilings landed on the running target,
+  # rather than trusting only the YAML checked into this SHA.
+  local spec name expected_mem expected_swap actual
+  while IFS='|' read -r name expected_mem expected_swap; do
+    actual="$(docker inspect --format='{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}' "$name" 2>/dev/null || true)"
+    if [[ "$actual" != "$expected_mem|$expected_swap" ]]; then
+      echo "resource limit mismatch: container=$name expected=$expected_mem|$expected_swap actual=$actual" >&2
+      return 1
+    fi
+  done <<'LIMITS'
+ohm-trade-agent|402653184|402653184
+ohm-dashboard-edge|67108864|67108864
+opip-stream-worker|201326592|201326592
+ohm-freqtrade-paper|402653184|402653184
+ohm-freqtrade-paper-usdt|402653184|402653184
+LIMITS
+
+  echo "O'Pip resource budget validation: PASS available_kb=$available_kb"
+}
+
+
 snapshot_scheduler_state() {
   SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
   for name in ohm-unified-cycle opip-ml-evidence ohm-movement-discovery; do
@@ -234,6 +263,7 @@ bash "$SCHEDULER_RECONCILE"
 # has been recreated and both authoritative dry-run workers are healthy.
 start_paper_stack
 wait_paper_health
+validate_target_resource_budget
 
 # Evidence capture is intentionally non-authoritative. The deploy still owns
 # the shared background lock here, so cron cannot overlap this bounded probe.
