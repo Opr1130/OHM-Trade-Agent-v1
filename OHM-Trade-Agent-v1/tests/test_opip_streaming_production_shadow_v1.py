@@ -236,3 +236,97 @@ def test_far_future_provider_timestamp_fails_closed():
     )
     with pytest.raises(ValueError):
         runtime._record_windows(future_normalized, now_utc=RUNTIME_NOW)
+
+
+def test_activation_check_requires_live_cross_venue_feature(tmp_path, monkeypatch):
+    import app.opip.streaming.activation_check as module
+
+    health = tmp_path / "health.json"
+    latest = tmp_path / "latest_features.json"
+    monkeypatch.setattr(module, "HEALTH_FILE", health)
+    monkeypatch.setattr(module, "LATEST_FEATURES_FILE", latest)
+
+    save_json_atomic(
+        health,
+        {
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "runtime_failed": False,
+            "provider_states": {
+                "BINANCE": "CONNECTED",
+                "BYBIT": "CONNECTED",
+            },
+            "raw_frames_received": 100,
+            "raw_drop_pct": 0.0,
+            "store_errors": 0,
+            "observation_sink_errors": 0,
+            "window_sink_errors": 0,
+            "feature_buckets_dropped": 0,
+            "feature_snapshots_dropped": 0,
+            "features_persisted": 1,
+        },
+    )
+    save_json_atomic(
+        latest,
+        {
+            "assets": {
+                "bitcoin": {
+                    "liquidation_confirmable": False,
+                }
+            }
+        },
+    )
+    assert module.main() == 0
+
+    save_json_atomic(
+        health,
+        {
+            **load_json(health),
+            "provider_states": {
+                "BINANCE": "CONNECTED",
+                "BYBIT": "BACKOFF",
+            },
+        },
+    )
+    assert module.main() == 1
+
+
+def test_activation_check_blocks_high_drop_or_confirming_liquidation(
+    tmp_path, monkeypatch
+):
+    import app.opip.streaming.activation_check as module
+
+    health = tmp_path / "health.json"
+    latest = tmp_path / "latest_features.json"
+    monkeypatch.setattr(module, "HEALTH_FILE", health)
+    monkeypatch.setattr(module, "LATEST_FEATURES_FILE", latest)
+
+    base = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "runtime_failed": False,
+        "provider_states": {
+            "BINANCE": "CONNECTED",
+            "BYBIT": "CONNECTED",
+        },
+        "raw_frames_received": 100,
+        "raw_drop_pct": 1.01,
+        "store_errors": 0,
+        "observation_sink_errors": 0,
+        "window_sink_errors": 0,
+        "feature_buckets_dropped": 0,
+        "feature_snapshots_dropped": 0,
+        "features_persisted": 1,
+    }
+    save_json_atomic(health, base)
+    save_json_atomic(
+        latest,
+        {"assets": {"bitcoin": {"liquidation_confirmable": False}}},
+    )
+    assert module.main() == 1
+
+    base["raw_drop_pct"] = 0.0
+    save_json_atomic(health, base)
+    save_json_atomic(
+        latest,
+        {"assets": {"bitcoin": {"liquidation_confirmable": True}}},
+    )
+    assert module.main() == 1
