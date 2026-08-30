@@ -11,7 +11,7 @@ from typing import Iterable
 from app.opip.storage.bounded_jsonl import encode_row
 from app.opip.streaming.feature_accumulator import StreamingFeatureSnapshot
 from app.opip.streaming.telemetry import RuntimeTelemetrySnapshot
-from app.services.registry_io import save_json_atomic
+from app.services.registry_io import RegistryIOError, load_json, save_json_atomic
 
 
 STREAMING_DATA_DIR = Path("/app/data/opip/streaming")
@@ -64,11 +64,16 @@ class StreamingShadowStore:
             except Exception:
                 raise
 
-        latest_by_asset: dict[str, dict] = {}
-        if LATEST_FEATURES_FILE.parent == self.base_dir:
-            latest_path = LATEST_FEATURES_FILE
-        else:
-            latest_path = self.base_dir / "latest_features.json"
+        latest_path = (
+            LATEST_FEATURES_FILE
+            if LATEST_FEATURES_FILE.parent == self.base_dir
+            else self.base_dir / "latest_features.json"
+        )
+        try:
+            existing = load_json(latest_path)
+        except (OSError, TimeoutError, RegistryIOError):
+            existing = {}
+        latest_by_asset = dict(existing.get("assets") or {})
         for row in sorted(items, key=lambda item: item.window_end_utc):
             latest_by_asset[row.canonical_asset_id] = row.as_dict()
         save_json_atomic(
