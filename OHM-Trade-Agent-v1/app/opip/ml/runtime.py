@@ -1,7 +1,8 @@
-"""Provider-neutral shadow model adapter contract.
+"""Provider-neutral shadow evidence adapter contract.
 
-No concrete XGBoost/LightGBM dependency is imported in foundation v1. Model
-families plug into this interface later after datasets and validation are ready.
+Foundation v1 deliberately defines only an interface. Concrete model-library
+dependencies arrive in a later build after point-in-time data, labels, dataset
+construction, and validation gates are proven.
 """
 from __future__ import annotations
 
