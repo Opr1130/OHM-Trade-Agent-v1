@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from openai import OpenAI
 
@@ -321,9 +322,7 @@ def _append_router_usage(
     error_type: str | None = None,
 ) -> None:
     record = {
-        "timestamp_utc": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc
-        ).isoformat(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "provider": target.provider,
         "model": target.model,
         "route_tier": route_tier,
