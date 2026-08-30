@@ -40,6 +40,7 @@ class ZeroTradeDiagnostic:
     trade_authority_changed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         row = asdict(self)
         row["degraded_providers"] = list(self.degraded_providers)
         row["operational_issues"] = list(self.operational_issues)
@@ -47,10 +48,12 @@ class ZeroTradeDiagnostic:
 
 
 def _status(row: Mapping[str, Any]) -> str:
+    """Return status."""
     return str(row.get("decision_status") or row.get("decision") or "").strip().upper()
 
 
 def _rank_key(row: Mapping[str, Any]) -> tuple[float, float, str]:
+    """Return rank key."""
     rank_raw = row.get("candidate_rank")
     try:
         rank = float(rank_raw)
@@ -69,6 +72,7 @@ def _rank_key(row: Mapping[str, Any]) -> tuple[float, float, str]:
 def _nearest_miss(
     candidates: Iterable[Mapping[str, Any]],
 ) -> tuple[str | None, str | None, float | None]:
+    """Return nearest miss."""
     best: tuple[float, str, str] | None = None
     for candidate in candidates:
         candidate_id = str(
@@ -105,6 +109,7 @@ def build_zero_trade_diagnostic(
     provider_health: Mapping[str, Any] | None = None,
     linkage_health: Mapping[str, Any] | None = None,
 ) -> ZeroTradeDiagnostic:
+    """Return build zero trade diagnostic."""
     rows = tuple(candidates)
     qualified = [row for row in rows if _status(row) == "QUALIFIED"]
     rejected_states = {"REJECTED", "BLOCKED", "NOT_QUALIFIED", "DISQUALIFIED"}
