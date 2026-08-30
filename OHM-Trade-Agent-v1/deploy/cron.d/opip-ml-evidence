@@ -1,9 +1,8 @@
-# O'Pip ML evidence jobs — independent from the real-risk unified cycle.
-# Heavy evidence jobs share one background lane and run in a bounded container.
-# They never consume /var/run/ohm-unified-cycle.lock or core-process memory.
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-* * * * * root sleep 25; flock -n /var/run/opip-background.lock -c '/bin/bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/run-opip-background-job.sh app.jobs.run_opip_ml_capture >> /var/log/opip-ml-capture.log 2>&1'
-
-2,12,22,32,42,52 * * * * root sleep 20; flock -n /var/run/opip-background.lock -c '/bin/bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/run-opip-background-job.sh app.jobs.build_phase3c_forward_outcomes >> /var/log/opip-ml-outcomes.log 2>&1'
+# O'Pip ML evidence scheduler — DECOMMISSIONED ON PRODUCTION.
+#
+# Learning/evidence computation is intentionally off-host. The production
+# scheduler reconciliation removes /etc/cron.d/opip-ml-evidence and installs
+# only the lightweight evidence-export schedule used by the separate learning
+# droplet.
+#
+# No executable cron entries belong in this file.
