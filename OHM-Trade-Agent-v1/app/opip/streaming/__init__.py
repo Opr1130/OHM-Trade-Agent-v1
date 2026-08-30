@@ -1,9 +1,8 @@
-"""O'Pip Sequence 4 — Real-Time Market Intelligence (BUILD 4.1).
+"""O'Pip Sequence 4 — Real-Time Market Intelligence.
 
-This package contains deterministic contracts and pure feature math only.
-BUILD 4.1 has no network access, no persistent worker, and no exchange
-execution authority. It is not consumed by the Sequence 3 Risk Shield, the
-O'Pip Decision Engine, or any outbound messaging integration. It exists so
-BUILD 4.2 can add a live worker against a stable contract layer without
-changing these types materially.
+BUILD 4.1 provides deterministic streaming contracts and feature math.
+BUILD 4.2 adds an isolated, provider-neutral asyncio runtime foundation with
+bounded ingress, lifecycle supervision, liveness, telemetry and resource
+guards. No live venue adapter, scheduler integration, production service
+activation, or decision authority is added by BUILD 4.2.
 """
