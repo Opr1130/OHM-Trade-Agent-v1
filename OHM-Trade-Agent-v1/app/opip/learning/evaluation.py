@@ -22,6 +22,7 @@ class MetricEstimate:
     support: EvaluationSupport
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         row = asdict(self)
         row["support"] = self.support.value
         return row
@@ -42,6 +43,7 @@ class PairedEvaluationSample:
     direction: str | None = None
 
     def __post_init__(self) -> None:
+        """Return  post init  ."""
         if not str(self.sample_id or "").strip():
             raise ValueError("sample_id is required")
         for name in ("realized_net_return", "mfe", "mae"):
@@ -67,6 +69,7 @@ class ArmEvaluation:
     opportunity_cost: MetricEstimate
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         return {
             "support": self.support,
             "admitted": self.admitted,
@@ -101,6 +104,7 @@ class ChampionChallengerEvaluation:
     trade_authority_changed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
+        """Return as dict."""
         return {
             "support": self.support.value,
             "cohort": self.cohort,
@@ -119,6 +123,7 @@ class ChampionChallengerEvaluation:
 
 
 def _metric(values: Iterable[float], *, minimum_support: int) -> MetricEstimate:
+    """Return metric."""
     clean = [float(value) for value in values if math.isfinite(float(value))]
     n = len(clean)
     if not clean:
@@ -155,6 +160,7 @@ def _rate(
     *,
     minimum_support: int,
 ) -> MetricEstimate:
+    """Return rate."""
     if denominator <= 0:
         return MetricEstimate(
             n=0,
@@ -193,6 +199,7 @@ def _rate(
 
 
 def _tail_losses(values: list[float]) -> list[float]:
+    """Return tail losses."""
     if not values:
         return []
     ordered = sorted(values)
@@ -206,6 +213,7 @@ def _arm(
     admitted_attr: str,
     minimum_support: int,
 ) -> ArmEvaluation:
+    """Return arm."""
     admitted_rows = [row for row in samples if bool(getattr(row, admitted_attr))]
     labelled = [row for row in samples if row.realized_net_return is not None]
     positives = [row for row in labelled if float(row.realized_net_return) > 0.0]
@@ -281,6 +289,7 @@ def _arm(
 
 
 def _delta(a: MetricEstimate, b: MetricEstimate) -> float | None:
+    """Return delta."""
     if a.mean is None or b.mean is None:
         return None
     return b.mean - a.mean
@@ -291,6 +300,7 @@ def evaluate_champion_challenger(
     *,
     minimum_support: int = 30,
 ) -> ChampionChallengerEvaluation:
+    """Return evaluate champion challenger."""
     if minimum_support < 2:
         raise ValueError("minimum_support must be >= 2")
     rows = tuple(samples)
