@@ -261,8 +261,7 @@ def capture_ml_production_evidence(
     if batch_limit < 1:
         raise ValueError("batch_limit must be >= 1")
 
-    p1 = drain_outbox_to_evidence_ledger(batch_limit=batch_limit)
-    lines = _read_complete_lines(evidence_path)
+    p1 = drain_outbox_to_evidence_ledger(\n        evidence_path=evidence_path,\n        batch_limit=batch_limit,\n    )\n    lines = _read_complete_lines(evidence_path)
     start = _load_next_line(checkpoint_path)
     if start > len(lines):
         summary = MLCaptureSummary(
