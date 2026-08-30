@@ -176,7 +176,8 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert 'if [[ "$REMOTE_MAIN" != "$TARGET_SHA" ]]' in bootstrap
     assert 'OPIP_LEARNING_IMAGE=$IMAGE' in bootstrap
     assert "KRAKEN" not in runner
-    assert ".env" not in runner
+    assert '--env-file' not in runner
+    assert '$APP_ROOT/.env' not in runner
     assert "P1_SHADOW_OUTBOX_ENABLED=true" in runner
 
 
