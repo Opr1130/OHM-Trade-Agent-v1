@@ -144,6 +144,7 @@ def resolve_barrier_labels(
             entry_price, float(close), direction
         ) - total_cost_bps
 
+    censored = censored or data_gap
     available = max([horizon] + [bar.observed_at_utc for bar in rows])
     hash_payload = {
         "snapshot_id": snapshot_id,
