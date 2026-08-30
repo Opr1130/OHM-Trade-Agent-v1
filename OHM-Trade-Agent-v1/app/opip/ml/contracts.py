@@ -116,7 +116,7 @@ class FeatureValue:
             "name": self.name,
             "value": _clean(self.value),
             "missing": bool(self.missing),
-            "source_at_utc": self.availability.source_at_utc.isoformat(),
+            "source_at_utc": (\n                self.availability.source_at_utc.isoformat()\n                if self.availability.source_at_utc is not None\n                else None\n            ),
             "ingested_at_utc": self.availability.ingested_at_utc.isoformat(),
             "visible_at_utc": self.availability.visible_at_utc.isoformat(),
             "source_version": self.availability.source_version,
