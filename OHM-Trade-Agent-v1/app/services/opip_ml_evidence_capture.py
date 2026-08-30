@@ -281,6 +281,16 @@ def _chunk_name(
     )
 
 
+def _fsync_directory(path: Path) -> None:
+    """Require the directory entry namespace to be durable before checkpointing."""
+
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_snapshot_chunk_atomic(
     snapshot_dir: Path,
     *,
@@ -303,6 +313,10 @@ def _write_snapshot_chunk_atomic(
     )
     destination = snapshot_dir / name
     if destination.exists():
+        # A crash retry may find the deterministic chunk already published.
+        # Prove the directory entry is durable before permitting checkpoint
+        # progression on that retry.
+        _fsync_directory(snapshot_dir)
         return False, destination
 
     temp = snapshot_dir / f".{name}.{os.getpid()}.tmp"
@@ -314,14 +328,9 @@ def _write_snapshot_chunk_atomic(
         # Atomic rename means a killed process leaves either the old namespace
         # or one complete gzip member, never a truncated published chunk.
         os.replace(temp, destination)
-        try:
-            directory_fd = os.open(snapshot_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
+        # Directory synchronization is part of publication success. Never let
+        # the caller advance its evidence checkpoint if this fails.
+        _fsync_directory(snapshot_dir)
     finally:
         try:
             temp.unlink(missing_ok=True)
