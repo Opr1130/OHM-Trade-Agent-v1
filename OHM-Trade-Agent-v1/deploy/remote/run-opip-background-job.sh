@@ -63,7 +63,7 @@ P1_RAW="$(
 )"
 P1_NORMALIZED="$(
   printf '%s' "$P1_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]"'
-)
+)"
 case "$P1_NORMALIZED" in
   true|1|yes|on)
     P1_SHADOW_OUTBOX_ENABLED=true
