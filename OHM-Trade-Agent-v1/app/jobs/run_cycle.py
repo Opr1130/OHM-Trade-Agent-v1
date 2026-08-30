@@ -198,52 +198,6 @@ def _run_event_intelligence_fail_open(*, settings) -> None:
         )
 
 
-def _run_ml_evidence_capture_fail_open() -> None:
-    """Persist ML evidence only after all real protection workflows have run."""
-    try:
-        from app.services.opip_ml_evidence_capture import (
-            capture_ml_production_evidence,
-        )
-
-        summary = capture_ml_production_evidence()
-    except Exception as exc:
-        print(
-            "O'Pip ML evidence capture unavailable; production unaffected:",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return
-
-    if not summary.enabled:
-        print("O'Pip ML evidence capture: disabled")
-        return
-
-    print("O'Pip ML Evidence Capture — SHADOW")
-    print(
-        "Snapshots:",
-        f"processed={summary.processed}",
-        f"legacy_skipped={summary.legacy_without_seed}",
-        f"temporal_violations={summary.temporal_violations}",
-        f"malformed={summary.malformed}",
-    )
-    print(
-        "P1 drain:",
-        f"processed={summary.p1_drained}",
-        f"duplicates={summary.p1_duplicates}",
-        f"malformed={summary.p1_malformed}",
-        f"stopped={summary.p1_stopped_on_error}",
-    )
-    if summary.outcome_job_ran:
-        print(
-            "Outcome maturation:",
-            f"rows={summary.outcome_rows}",
-            f"mature_24h={summary.mature_24h_rows}",
-            f"partial={summary.partial_outcome_rows}",
-            f"no_data={summary.no_forward_data_rows}",
-        )
-    if summary.error_type:
-        print("ML capture degraded:", summary.error_type)
-
-
 def _run_cycle_once() -> None:
     # Reconcile the exchange first so stale OHM lifecycle state cannot drive
     # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
@@ -376,11 +330,6 @@ def _run_cycle_once() -> None:
     # lifecycle workflow, but unlike broad discovery it runs independently of
     # SEARCH mode/finalist selection on its own bounded cadence.
     _run_event_intelligence_fail_open(settings=get_settings())
-
-    # ML evidence is lower priority than real risk, pending lifecycle, Early
-    # Watch, paper simulation, and external-event capture. It only processes
-    # local durable evidence from prior scans and is fully fail-open.
-    _run_ml_evidence_capture_fail_open()
 
     # Broad discovery is state/capacity/time gated. This is the only branch
     # that can reach the paid Chief analysis path.
