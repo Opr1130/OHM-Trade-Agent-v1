@@ -1,246 +1,198 @@
 # O'Pip Signal Quality v2 — Consolidated Multi-Model Decision
 
-Status: CONSOLIDATED DESIGN DECISION — architecture only; no production behavior change
+Status: FINAL DESIGN DECISION FOR IMPLEMENTATION PLANNING — architecture only; no production behavior change
 
-## 1. Consolidated verdict
+## 1. Final verdict
 
 APPROVE WITH REQUIRED CHANGES.
 
-The multi-model reviews converge on the same core conclusion: the product objective is correct, but v2 should be simplified and hardened before implementation. The target remains high-quality actionable signals, broad silent surveillance, global opportunity comparison, and Kraken-first position protection.
+The final Opus pass confirmed the core v2 thesis and exposed several production defects that change implementation priority. The governing objective remains: monitor broadly, rank globally, alert narrowly, protect existing holdings continuously.
 
-## 2. Key synthesis decisions
+## 2. Authoritative design decisions
 
-### Decision A — One synchronous Trade Quality Assessment, two logical sub-assessments
+### A. One synchronous TradeQualityAssessor, two logical sub-assessments
 
-Keep Continuation and Entry conceptually separate because a move can be likely to continue while the current entry is poor. Do not implement them as independent asynchronous engines or queues.
+Continuation and Entry remain semantically separate because a move can be likely to continue while the current entry is poor. They must not run as independent asynchronous engines.
 
-Use one immutable point-in-time FeatureSnapshot and one synchronous TradeQualityAssessor:
+One immutable point-in-time FeatureSnapshot drives one synchronous pass:
 
 FeatureSnapshot -> ContinuationAssessment -> EntryAssessment -> TradePlanAssessment
 
-Both sub-assessments use the exact same snapshot/version/timestamp. If entry needs fresher evidence, the whole assessment is recomputed from a new snapshot rather than carrying forward stale continuation state.
+If evidence changes, recompute a fresh full snapshot. Never carry a stale continuation assessment into a later entry decision.
 
-### Decision B — No probabilistic EV ranking before calibration
+For continuation=PASS and entry=WAIT, place the candidate in a small bounded fast entry-watch set. Re-evaluate on a fresh full snapshot at roughly 60–120s cadence, with strict TTL and capacity limits.
 
-V2 starts with deterministic, versioned Opportunity Utility. Inputs include:
+### B. Deterministic global ranking before probability calibration
 
-- continuation quality
-- entry quality
-- target quality / net reward-to-risk
-- liquidity / expected slippage
-- volatility-normalized extension/exhaustion
-- evidence quality
-- market regime
-- portfolio concentration
-- opportunity cost
+No probabilistic expected-value ranking before proper out-of-time calibration.
 
-Raw model scores are never treated as probabilities.
+Initial Opportunity Utility is deterministic and versioned. Reward must be expressed in risk-normalized units rather than raw upside percent, and an explicit liquidity-capacity ceiling must prevent thin assets from winning because of theoretical move size.
 
-Only after purged out-of-time calibration may the system compute probability-based expected utility.
+Inputs include continuation quality, entry quality, target/net reward-to-risk, liquidity/slippage, exhaustion, evidence quality, regime, concentration and opportunity cost.
 
-### Decision C — Regime-aware normalization, not ATR-only rules
+### C. Regime-aware normalization, not ATR-only
 
-Replace regime-blind percentage thresholds where they affect signal quality, but do not force every policy threshold into ATR units.
+Use ATR/ATR percentile, realized-volatility percentile, BTC/ETH regime, sector/breadth context, liquidity/depth and asset-relative history. Replace regime-blind thresholds where they affect signal or protection quality. Operational safety thresholds may remain explicit fixed/versioned gates where appropriate.
 
-Use a regime context combining:
+### D. Kraken-first ExposureResolver is the sole authority for exposure existence
 
-- ATR / ATR percentile
-- realized volatility percentile
-- BTC/ETH market regime
-- sector breadth
-- liquidity/depth state
-- asset-specific historical distribution
+Kraken read-only account truth is primary. The resolver must enumerate Kraken balances/open positions first and left-join local lifecycle context.
 
-Safety/operational thresholds such as data freshness, identity validity, maximum spread policy, and evidence availability can remain explicit fixed/versioned gates where appropriate.
+Required states include VERIFIED_MANAGED, VERIFIED_UNMANAGED, ABSENT, UNKNOWN and DEGRADED.
 
-### Decision D — Kraken Exposure Resolver is the sole authority for exposure existence
+Exactly one component owns terminalization after verified absence. Monitoring consumers do not independently close or infer exposure using conflicting rules. Kraken unavailable means UNKNOWN/DEGRADED, never flat.
 
-Kraken read-only account truth is authoritative.
+### E. Position protection suppression is materiality-aware
 
-Create one ExposureResolver output consumed by protection and reconciliation. Local active-trade state may enrich lifecycle context but cannot establish that a real holding exists.
+Delete the earlier statement that a stable DETERIORATING position remains silent.
 
-Only one component owns lifecycle terminalization after verified Kraken absence. Monitoring components consume the resolved exposure state; they do not independently close/skip using conflicting rules.
+Correct rule:
 
-Kraken unavailable => UNKNOWN / MONITORING_DEGRADED, never assumed flat.
+Suppress only when (state unchanged) AND (no monitored deterioration measure crossed a versioned materiality threshold since the last delivered action).
 
-### Decision E — Silent discovery survives; direct watch-alert delivery does not
+Protection must detect slow deterioration through MFE giveback, time-under-water, capital holding time, relative-strength decay, regime change, liquidity degradation and structural deterioration. No fixed-frequency WARNING spam.
 
-Keep useful Early Watch / Broad Watch discovery features as internal candidate evidence.
+### F. Silent discovery remains; informational watch delivery disappears
 
-Remove the direct user-facing Telegram delivery path for EARLY WATCH / READY / DEVELOPING / BROAD WATCH.
+Keep useful Early Watch/Broad Watch/price-movement detectors as internal evidence. Remove direct user-facing EARLY WATCH / READY / DEVELOPING / BROAD WATCH delivery at cutover.
 
-All discovery channels feed the same bounded monitoring queue and compete through the same Trade Quality Assessment and global ranker.
+All detectors feed the same bounded candidate queue and unified assessment/ranker.
 
-### Decision F — One user-facing action gate
+### G. ActionDecision distinguishes rejected from undelivered
 
-Core decision state must not live in Telegram/notifier modules.
+Target flow:
 
-Decision -> ActionDecision -> NotificationPolicy -> Telegram transport.
+Decision -> ActionDecision -> NotificationPolicy -> Telegram transport
 
-NotificationPolicy owns suppression/dedup/reservation. Telegram is a stateless delivery consumer.
+REJECTED/INVALIDATED is a decision outcome.
 
-Use an atomic reserve/send/confirm-or-release pattern so concurrent callers cannot double-send the same action.
+UNDELIVERED is a transport outcome. A qualified signal that fails tracking registration or Telegram delivery must remain live/retryable until invalidated/expired; it must not be terminalized merely because delivery failed.
 
-### Decision G — Event/news/whale/order-flow evidence is contextual, not a direct trade trigger
+Every drop path must produce telemetry.
 
-Positive news/event evidence cannot independently create an actionable trade.
+Notification reservation must be atomic: reserve -> send -> confirm, or reserve -> send failure -> release.
 
-Market confirmation is required through available price/volume/order-flow/liquidity evidence.
+### H. Capital/portfolio gating occurs before ActionDecision
 
-Cross-venue evidence is a strong modifier when available, but absence of cross-venue coverage must not automatically reject a valid Kraken-only opportunity.
+Capital allocation and portfolio veto must be upstream of notification and downstream of global ranking.
 
-Distinguish:
-- NO_RELEVANT_EVENT: neutral
-- EVENT_PROVIDER_UNAVAILABLE: degraded evidence quality
-- SUPPORTIVE_EVENT + MARKET_CONFIRMATION: positive modifier
-- CONTRADICTORY_EVENT / NEGATIVE_EVENT: downgrade or veto depending on severity
+If rank #1 is vetoed, evaluate/promote the next-best eligible candidate rather than leaving capital idle.
 
-### Decision H — Bounded monitoring queue
+One canonical identity must join candidate decision, dedup, delivery and outcome records.
 
-The silent queue must have:
+### I. Events/news/whales/order flow are contextual evidence
 
-- canonical candidate identity
-- dedupe
-- TTL / expiry
-- priority
-- freshness requirements
-- bounded retention
-- idempotent updates
-- re-evaluation on scheduled market refresh and material new evidence
+Positive news/events cannot independently create a trade.
 
-No queue state is user-facing.
+Market confirmation must be directional and temporal, using evidence available after ingest time: price, volume, structure, order flow and liquidity.
 
-### Decision I — Outcome labels are multi-dimensional
+Cross-venue evidence strengthens a setup when available but is not a universal hard gate.
 
-T1-before-stop remains one useful label but is insufficient alone.
+FeatureSnapshot must distinguish NO_RELEVANT_EVENT from EVENT_PROVIDER_UNAVAILABLE, and more generally carry availability/quality flags for every evidence family. Missing data is not zero or neutral.
 
-Persist at minimum:
+Historical replay must use event ingest time, not event timestamp. Revisions supersede going forward only; backtests must see the version actually known at each decision time.
 
-- T1/T2/T3-before-stop
-- MFE
-- MAE
-- realized fee/slippage-adjusted return
-- time-to-entry
-- time-to-target
-- time-under-water
-- MFE giveback
-- capital holding time
-- opportunity rank at decision
-- discovery lead time
+### J. Bounded monitoring queue
 
-Classify outcomes such as EXPLOSIVE_WINNER, EFFICIENT_WINNER, SLOW_WINNER, FAILED_CONTINUATION, STOPPED_LOSER, EXPIRED_NO_ENTRY.
+The silent queue requires canonical identity, dedupe, TTL, priority, freshness, bounded retention, idempotent updates and explicit re-evaluation triggers. Alert-era cooldowns must not be reused as queue-retention logic.
 
-Probability language remains forbidden until point-in-time leakage controls and out-of-time calibration pass.
+### K. Multi-dimensional outcome labels
 
-## 3. P0 — blocking architecture changes
+T1-before-stop is useful but insufficient. Persist T1/T2/T3-before-stop, MFE, MAE, realized fee/slippage-adjusted return, time-to-entry, time-to-target, time-under-water, MFE giveback, capital holding time, opportunity rank and discovery lead time.
 
-1. Implement one synchronous TradeQualityAssessor over one immutable FeatureSnapshot; keep ContinuationAssessment and EntryAssessment logically separate but not independently scheduled.
-2. Replace probability/EV-based pre-calibration ranking with deterministic Opportunity Utility normalized for volatility, liquidity, exhaustion and evidence quality.
-3. Introduce canonical regime context and remove regime-blind fixed percentage thresholds from continuation/entry/protection decisions where inappropriate.
-4. Establish Kraken-first ExposureResolver as the only authority for exposure existence and assign exactly one owner for terminalization on verified absence.
-5. Remove direct Early Watch/Broad Watch/READY Telegram delivery; retain their detectors as silent discovery inputs.
-6. Centralize user-facing alert eligibility through ActionDecision + NotificationPolicy; Telegram cannot own lifecycle state. Make notification reservation atomic.
-7. Enforce market confirmation for positive event/news promotion and explicitly distinguish missing evidence from neutral evidence.
-8. Define multi-dimensional outcome labels and prohibit probability rendering until calibrated out-of-time.
+Outcome classes may include EXPLOSIVE_WINNER, EFFICIENT_WINNER, SLOW_WINNER, FAILED_CONTINUATION, STOPPED_LOSER and EXPIRED_NO_ENTRY.
 
-## 4. P1 — required before broad production cutover
+No probability language is allowed until point-in-time leakage controls, purged walk-forward validation and calibration pass. Label K/S/H parameters must be frozen by cohort before outcomes are generated.
 
-1. Broaden discovery incrementally across leaderboard/rank velocity, pre-breakout compression, relative-volume anomaly, pullback continuation, order-flow/whale and event-driven channels.
-2. Implement bounded/deduped silent monitoring queue with TTL, priority, freshness and idempotent updates.
-3. Add global deterministic ranking across all actionable candidates, including liquidity capacity, concentration, correlation proxy and opportunity cost.
-4. Add existing-position deterioration intelligence: MFE giveback, relative-strength decay, regime change, liquidity degradation, thesis deterioration and capital-time cost.
-5. Wire Event Intelligence into the canonical feature snapshot; keep event sources point-in-time and revision-aware.
-6. Build calibration/outcome store with model/feature/strategy versioning and purged walk-forward validation.
-7. Add scheduler/candidate-state idempotency and race tests across discovery and qualification.
-8. Make degraded protection state observable when Kraken or Telegram dependencies are unavailable.
+## 3. P0 blockers
 
-## 5. P2 — defer until evidence justifies complexity
+1. Kraken-first ExposureResolver and exactly one verified-absence terminalizer.
+2. Materiality-aware deterioration protection; same state alone cannot suppress worsening risk.
+3. ActionDecision must separate REJECTED from UNDELIVERED; transient tracking/Telegram failure cannot destroy a qualified opportunity.
+4. Capital/portfolio gate moves upstream of ActionDecision with next-best promotion.
+5. One synchronous same-snapshot TradeQualityAssessor; no stale continuation carry-forward.
+6. Deterministic pre-calibration global ranking with risk-normalized reward and liquidity-capacity ceiling.
+7. Regime-aware normalization where signal/protection thresholds are currently crude.
+8. Evidence-family availability/quality flags; missing evidence is never treated as neutral/zero.
+9. Positive event/news promotion requires market confirmation using point-in-time evidence.
+10. Remove uncalibrated probability/confidence percentage rendering and enforce structurally.
 
-1. Historical analogue scoring. Keep raw episode data now; activate analogue influence only after calibration labels and leakage controls are mature.
-2. Full probabilistic expected-value ranking.
-3. Full covariance/portfolio optimizer. Start with deterministic correlation/concentration penalties.
-4. Advanced multi-model/ML continuation probability. First prove deterministic signal-quality lift in shadow.
-5. Broad module cleanup unrelated to measurable signal quality or operational resilience.
+## 4. P1 before broad cutover
 
-## 6. Review recommendations explicitly modified or rejected
+1. Bounded silent candidate queue with TTL/priority/freshness/idempotency.
+2. Discovery initially uses rank velocity and volume/participation anomaly; add other channels only after measured benefit.
+3. Fast bounded entry-watch reevaluation for continuation=PASS, entry=WAIT.
+4. Existing-position degraded-history fallback so assets with insufficient candles still receive price-vs-stop/target protection.
+5. Remove monotonic max-merge behavior from price_movement_radar when reused; scores must be allowed to decay.
+6. Make protection thresholds regime-aware, including relative-strength and volume deterioration.
+7. Establish explicit alert priority so protection warnings do not accidentally consume the same noncritical budget as new trade actions.
+8. Atomic notification reservation and materiality-bucketed fingerprints.
+9. Event revisions/version validity and purged walk-forward embargo >= maximum outcome horizon.
 
-### Do not fully merge continuation and entry semantics
+## 5. P2 defer
 
-Rejected as a semantic merge. Accepted as a runtime simplification.
+- historical analogue scoring
+- probabilistic EV
+- full covariance optimizer
+- advanced ML continuation probability
+- broad module cleanup not tied to measurable outcomes
+- premature calibration/probability module
+- separate thesis subsystem until complexity earns it
 
-A candidate may have strong continuation but no valid current entry. The system must preserve that distinction. The fix for stale state is same-snapshot synchronous evaluation, not deleting the distinction.
+## 6. Revised implementation waves
 
-### Do not make ATR the sole normalization mechanism
+### Wave 0 — Production audit
 
-ATR is necessary but insufficient. Regime-relative logic uses ATR plus realized volatility, liquidity, market/sector regime and asset distribution.
+Verify live KRAKEN_RECONCILIATION_ENABLED and KRAKEN_RECONCILIATION_MODE. Count pending setups terminalized as tracking_failed/send_failed. Enumerate Kraken balances/open positions and diff against the active registry. Verify actual deployed SHA and feature-flag inventory.
 
-### Do not require cross-venue evidence as a universal hard gate
+### Wave 1 — Position Protection
 
-Cross-venue confirmation improves confidence when available. Requiring it universally would reduce recall on Kraken-only or poorly covered assets.
+Kraken-primary ExposureResolver; VERIFIED_UNMANAGED holdings; one terminalizer; MFE giveback, time-under-water and relative-strength decay; materiality-aware suppression; insufficient-history fallback. Dual-run against current active monitor.
 
-### Do not perform a big-bang scanner rewrite
+### Wave 2 — Action/Alert Plumbing
 
-Discovery channels are migrated incrementally into the silent queue and shadow-ranked before alert cutover.
+ActionDecision; rejected-vs-undelivered; retryable delivery; atomic NotificationPolicy; canonical identity; move capital/portfolio gate upstream; next-best promotion.
 
-### Do not undertake cleanup for cleanliness alone
+### Wave 3 — Silent Queue + FeatureSnapshot
 
-State/scheduler/module consolidation is performed only where it prevents duplicate alerts, stale state, missed candidates, unprotected holdings, calibration errors or materially worse capital allocation.
+Bounded queue, canonical immutable point-in-time FeatureSnapshot, per-family availability/quality flags. Start discovery channels with rank velocity and volume/participation anomaly only. No Telegram.
 
-## 7. Revised target path
+### Wave 4 — TradeQualityAssessor + Entry Watch
 
-Kraken eligible universe
-  -> multiple lightweight discovery detectors
-  -> bounded silent candidate queue
-  -> canonical point-in-time FeatureSnapshot
-  -> synchronous TradeQualityAssessor
-       -> ContinuationAssessment
-       -> EntryAssessment
-       -> TradePlanAssessment
-  -> deterministic Global Opportunity Ranker
-  -> portfolio/capital utility gate
-  -> ActionDecision
-  -> NotificationPolicy
-  -> NEW TRADE SIGNAL
+Continuation + Entry over one snapshot; bounded 60–120s fresh-snapshot reevaluation for PASS+WAIT candidates.
 
-Existing holdings:
+### Wave 5 — Deterministic Global Ranker
 
-Kraken account truth
-  -> ExposureResolver
-  -> lifecycle context attachment
-  -> PositionQualityAssessment
-  -> HEALTHY / DETERIORATING / RECOVERING / PROFIT_PROTECT / EXIT_REVIEW / INVALIDATED / UNKNOWN
-  -> ActionDecision only when attention/action is justified
-  -> NotificationPolicy
-  -> EXISTING TRADE ACTION
+Risk-normalized Opportunity Utility plus liquidity-capacity ceiling, concentration/correlation proxy and opportunity cost. Shadow only; measure selection regret.
 
-Both flows -> canonical outcome path -> learning/calibration.
+### Wave 6 — Alert Cutover
 
-## 8. Production acceptance gates
+Only NEW TRADE SIGNAL and EXISTING TRADE ACTION remain user-facing. Direct informational watch transport is disabled.
 
-No production alert cutover until:
+### Wave 7 — Calibration
 
-- no informational watch alert can reach Telegram
-- every NEW TRADE SIGNAL came through the unified ranker and contains entry/stop/targets/do-not-chase
-- Kraken-first resolver accounts for every verified holding or explicitly reports UNKNOWN/degraded
-- stable local state cannot create an exposure that Kraken does not confirm
-- no uncalibrated probability language can render
-- high-volatility/low-liquidity synthetic candidates do not dominate ranking purely due to expected move
-- future major movers can be discovered by at least one non-leaderboard channel in replay tests
+Purged out-of-time calibration and probability activation only after evidence gates pass.
+
+## 7. Production acceptance gates
+
+No V2 alert cutover until all are true:
+
+- every verified Kraken holding is protected or explicitly UNKNOWN/DEGRADED
+- a Kraken holding absent from the local registry is discovered
+- slow deterioration and MFE giveback can trigger review without a sharp shock
+- informational watch alerts cannot reach Telegram
+- transient Telegram failure does not terminalize a qualified signal
+- portfolio veto of rank #1 permits evaluation/promotion of rank #2
+- one canonical identity joins decision, delivery and outcome
+- continuation and entry use the same point-in-time snapshot
+- high-ATR/thin-book candidates cannot dominate ranking purely because of raw expected upside
 - positive news alone cannot promote a candidate
-- existing-position slow deterioration and MFE giveback can trigger review without requiring a sharp price shock
-- shadow V2 materially improves actionable precision without unacceptable major-mover recall loss
-- rollback returns to the prior production decision path without corrupting candidate/position state
+- missing provider evidence is distinguishable from measured neutral evidence
+- no uncalibrated probability/confidence percentage can render
+- new listings with insufficient indicator history still receive minimum protection
+- shadow V2 improves actionable precision without unacceptable major-mover recall loss
+- rollback does not strand candidate/position lifecycle state
 
-## 9. Implementation principle
+## 8. Implementation principle
 
-Do not optimize for architectural elegance. Every change must improve at least one of:
-
-- signal precision
-- major-mover recall
-- entry timing
-- capital efficiency
-- existing-position protection
-- calibration integrity
-- operational resilience
-
-If a proposed refactor does not move one of these, defer it.
+Do not optimize for architectural elegance. Every change must measurably improve at least one of: signal precision, major-mover recall, entry timing, capital efficiency, existing-position protection, calibration integrity or operational resilience. Otherwise defer it.
