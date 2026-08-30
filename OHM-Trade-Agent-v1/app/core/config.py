@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # evidence remains internal and Telegram is reserved for actionable new
     # trades plus material existing-position actions.
     opip_actionable_only_alerts: bool = True
+    # Wave 9 continuation/entry quality gate. Default-on for real Settings;
+    # legacy test/extension SimpleNamespace callers without this field retain
+    # their historical pipeline behavior through getattr(..., False).
+    opip_trade_quality_v2_enabled: bool = True
     # Optional second boundary for group chats. When set, Telegram commands
     # and lifecycle callback buttons are accepted only from this Telegram user
     # inside the already-configured chat.
