@@ -266,7 +266,7 @@ def test_runner_surfaces_unmanaged_even_without_local_active_trade(monkeypatch):
     monkeypatch.setattr(
         active_trade_monitor_runner,
         "KrakenExposureResolver",
-        lambda: SimpleNamespace(
+        lambda **kwargs: SimpleNamespace(
             resolve=lambda: ExposureResolution(
                 exposures=(
                     ResolvedExposure(
