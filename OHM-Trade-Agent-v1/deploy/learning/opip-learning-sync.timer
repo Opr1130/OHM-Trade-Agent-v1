@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync O'Pip production evidence every two minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/2:20
+AccuracySec=10s
+Persistent=true
+RandomizedDelaySec=5s
+Unit=opip-learning-sync.service
+
+[Install]
+WantedBy=timers.target
