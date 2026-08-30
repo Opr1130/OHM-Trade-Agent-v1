@@ -59,6 +59,7 @@ def _health_payload(
         item.provider: item.transport_state
         for item in runtime_snapshot.providers
     }
+    publication = accumulator.diagnostics()
     degraded = (
         runtime_snapshot.resource_degraded
         or runtime_snapshot.runtime_failed
@@ -78,10 +79,19 @@ def _health_payload(
         "provider_states": provider_states,
         "queue": asdict(runtime_snapshot.queue),
         "raw_frames_received": received,
+        "raw_frames_enqueued": runtime_snapshot.raw_frames_enqueued,
         "raw_frames_dropped_newest": dropped,
         "raw_drop_pct": drop_pct,
+        "frames_processed": runtime_snapshot.frames_processed,
+        "normalized_observations": runtime_snapshot.normalized_observations,
+        "malformed_frames": runtime_snapshot.malformed_frames,
+        "processing_errors": runtime_snapshot.processing_errors,
         "sequence_gaps": runtime_snapshot.sequence_gaps,
         "sequence_out_of_order": runtime_snapshot.sequence_out_of_order,
+        "windows_opened": runtime_snapshot.windows_opened,
+        "windows_sealed": runtime_snapshot.windows_sealed,
+        "active_window_count": runtime_snapshot.active_window_count,
+        "active_symbol_count": runtime_snapshot.active_symbol_count,
         "late_frames": runtime_snapshot.late_frames,
         "degraded_windows": runtime_snapshot.degraded_windows,
         "incomplete_windows": runtime_snapshot.incomplete_windows,
@@ -95,6 +105,7 @@ def _health_payload(
         "feature_buckets_dropped": accumulator.dropped_buckets,
         "feature_snapshots_dropped": accumulator.dropped_ready_snapshots,
         "invalid_identity_observations": accumulator.invalid_identity_observations,
+        "publication": publication,
         "features_persisted": int(features_persisted),
         "last_feature_snapshot_utc": last_feature_snapshot_utc,
         "store_errors": int(store_errors),
@@ -155,6 +166,7 @@ async def run_worker() -> int:
     store_errors = 0
     consecutive_store_errors = 0
     last_feature_snapshot_utc: str | None = None
+    pending_feature_rows = ()
     last_prune = time.monotonic()
 
     await runtime.start()
@@ -186,13 +198,16 @@ async def run_worker() -> int:
                 return 1
 
             snapshot = runtime.snapshot()
-            rows = accumulator.drain_ready()
+            if not pending_feature_rows:
+                pending_feature_rows = accumulator.drain_ready()
             try:
-                if rows:
-                    features_persisted += store.append_features(rows)
+                if pending_feature_rows:
+                    persisted = store.append_features(pending_feature_rows)
+                    features_persisted += persisted
                     last_feature_snapshot_utc = max(
-                        row.window_end_utc for row in rows
+                        row.window_end_utc for row in pending_feature_rows
                     ).isoformat()
+                    pending_feature_rows = ()
                 store.write_telemetry(snapshot)
                 now_monotonic = time.monotonic()
                 if now_monotonic - last_prune >= _PRUNE_INTERVAL_SECONDS:
@@ -221,7 +236,7 @@ async def run_worker() -> int:
 
     final_snapshot = runtime.snapshot()
     try:
-        remaining = accumulator.drain_ready()
+        remaining = pending_feature_rows + accumulator.drain_ready()
         if remaining:
             features_persisted += store.append_features(remaining)
         store.write_telemetry(final_snapshot)

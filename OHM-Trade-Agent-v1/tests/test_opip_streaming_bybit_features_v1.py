@@ -179,6 +179,18 @@ def test_cross_venue_accumulator_emits_only_after_both_trade_windows_seal():
     assert rows[0].evidence_quality == EvidenceQualityState.COMPLETE.value
     assert rows[0].cvd_signed_notional_usd == pytest.approx(12000.0)
     assert rows[0].venue_agreement == "ALIGNED_POSITIVE"
+    diagnostics = accumulator.diagnostics()
+    assert diagnostics["trade_observations_by_provider"] == {
+        "BINANCE": 1,
+        "BYBIT": 1,
+    }
+    assert diagnostics["seal_notices_15s_by_provider"] == {
+        "BINANCE": 1,
+        "BYBIT": 1,
+    }
+    assert diagnostics["pair_emissions"] == 1
+    assert diagnostics["active_feature_buckets"] == 0
+    assert accumulator.dropped_buckets == 0
 
 
 def test_cross_venue_liquidation_sync_is_bounded_state():
