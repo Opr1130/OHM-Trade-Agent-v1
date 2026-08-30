@@ -110,12 +110,39 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         quote_note = "Quote: USDT (USDT availability required; no automatic USD conversion)\n"
 
     ranking_note = ""
+    if candidate.get("opportunity_rank") is not None:
+        ranking_note += f"Global Opportunity Rank: #{candidate['opportunity_rank']}\n"
+    if candidate.get("capital_efficiency_score") is not None:
+        ranking_note += (
+            f"Capital Efficiency Score: "
+            f"{float(candidate['capital_efficiency_score']):.2f}/100\n"
+        )
     if candidate.get("profit_rank") is not None:
-        ranking_note += f"Opportunity Rank: #{candidate['profit_rank']}\n"
+        ranking_note += f"Quality Rank: #{candidate['profit_rank']}\n"
     if candidate.get("profit_rank_score") is not None:
-        ranking_note += f"Profit Rank Score: {float(candidate['profit_rank_score']):.2f}/100\n"
+        ranking_note += (
+            f"Base Quality Score: "
+            f"{float(candidate['profit_rank_score']):.2f}/100\n"
+        )
+    if candidate.get("hold_proxy_hours") is not None:
+        ranking_note += (
+            f"Hold Proxy: ~{float(candidate['hold_proxy_hours']):.1f}h "
+            "(deterministic, not forecast probability)\n"
+        )
 
     intelligence_note = ""
+    if candidate.get("continuation_score") is not None:
+        intelligence_note += (
+            f"Continuation: {int(candidate['continuation_score'])}/100 "
+            f"({candidate.get('continuation_decision', 'UNKNOWN')})\n"
+        )
+    if candidate.get("entry_quality_score") is not None:
+        intelligence_note += (
+            f"Entry Quality: {int(candidate['entry_quality_score'])}/100 "
+            f"({candidate.get('entry_quality_decision', 'UNKNOWN')})\n"
+        )
+    if candidate.get("exhaustion_state") is not None:
+        intelligence_note += f"Exhaustion: {candidate['exhaustion_state']}\n"
     if candidate.get("recommended_capital") is not None:
         intelligence_note += f"Recommended Capital: ${float(candidate['recommended_capital']):,.2f}\n"
     if candidate.get("recommended_risk_dollars") is not None:
@@ -418,58 +445,3 @@ def send_trade_plan(
             reason="ATOMIC_NOTIFICATION_POLICY",
             symbol=plan.symbol,
             journey_id=candidate.get("journey_id"),
-            signal_id=candidate.get("signal_id"),
-            trade_id=trade_id,
-        )
-        return False
-
-    delivery = send_tracked_telegram(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        message=message,
-        identity=identity,
-        alert_family="QUALIFIED_OPPORTUNITY",
-        event_type=action,
-        fingerprint=key,
-        symbol=plan.symbol,
-        journey_id=candidate.get("journey_id"),
-        signal_id=candidate.get("signal_id"),
-        trade_id=trade_id,
-    )
-    if delivery.delivered:
-        try:
-            with registry_lock(STATE_LOCK_FILE):
-                state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
-                state[plan.symbol] = key
-                save_json_atomic(STATE_FILE, state)
-        except (OSError, TimeoutError, RegistryIOError):
-            pass
-        confirm_emit(
-            identity=f"{direction}:{plan.symbol}",
-            event_type="OPPORTUNITY",
-            fingerprint=key,
-            reservation_token=reservation,
-        )
-        return True
-
-    release_emit(
-        identity=f"{direction}:{plan.symbol}",
-        event_type="OPPORTUNITY",
-        reservation_token=reservation,
-    )
-    if trade_id:
-        try:
-            queue_qualified_alert(
-                trade_id=trade_id,
-                message=message,
-                candidate=candidate,
-                plan=plan,
-                action=action,
-                direction=direction,
-                identity=identity,
-                fingerprint=key,
-                reason="DELIVERY_PENDING",
-            )
-        except Exception:
-            pass
-    return False
