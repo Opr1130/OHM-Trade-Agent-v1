@@ -123,12 +123,18 @@ def test_background_runner_is_resource_bounded_and_networkless():
         text=True,
     )
     assert "--network none" in source
-    assert "--memory 512m" in source
-    assert "--memory-swap 512m" in source
-    assert "--cpus 0.25" in source
+    assert 'MEMORY_LIMIT="192m"' in source
+    assert 'MEMORY_LIMIT="256m"' in source
+    assert "--memory \"$MEMORY_LIMIT\"" in source
+    assert "--memory-swap \"$MEMORY_LIMIT\"" in source
+    assert "--cpus 0.20" in source
+    assert "MIN_AVAILABLE_KB" in source
+    assert "/proc/meminfo" in source
+    assert "/usr/bin/timeout" in source
     assert "--pids-limit 128" in source
     assert "--oom-score-adj 800" in source
     assert "--read-only" in source
+    assert "--cap-drop ALL" in source
     assert "app.jobs.run_opip_ml_capture|app.jobs.build_phase3c_forward_outcomes" in source
     assert "docker inspect --format '{{.Image}}'" in source
     assert 'P1_SHADOW_OUTBOX_ENABLED="$P1_SHADOW_OUTBOX_ENABLED"' in source
