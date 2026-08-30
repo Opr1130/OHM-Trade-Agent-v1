@@ -5,11 +5,9 @@ TARGET_SHA="${1:-}"
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 LOCK_FILE="/var/lock/ohm-deploy.lock"
-BACKGROUND_LOCK_FILE="/var/run/opip-background.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
-BACKGROUND_RUNNER="$APP_ROOT/deploy/remote/run-opip-background-job.sh"
 PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
 SCHEDULER_SNAPSHOT=""
 
@@ -22,14 +20,6 @@ install -d -m 0755 "$STATE_DIR"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "another deployment is already running" >&2
-  exit 75
-fi
-
-# Serialize deploy/startup against non-authoritative background containers.
-# Holding this lock also makes cron triggers skip rather than pile up.
-exec 8>"$BACKGROUND_LOCK_FILE"
-if ! flock -w 120 8; then
-  echo "background evidence lane did not quiesce for deployment" >&2
   exit 75
 fi
 
@@ -134,7 +124,7 @@ LIMITS
 
 snapshot_scheduler_state() {
   SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
-  for name in ohm-unified-cycle opip-ml-evidence ohm-movement-discovery; do
+  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
     if [[ -e "/etc/cron.d/$name" ]]; then
       cp -a "/etc/cron.d/$name" "$SCHEDULER_SNAPSHOT/$name"
     fi
@@ -148,7 +138,7 @@ snapshot_scheduler_state() {
 
 restore_scheduler_state() {
   [[ -n "$SCHEDULER_SNAPSHOT" && -d "$SCHEDULER_SNAPSHOT" ]] || return 0
-  for name in ohm-unified-cycle opip-ml-evidence ohm-movement-discovery; do
+  for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
     if [[ -e "$SCHEDULER_SNAPSHOT/$name" ]]; then
       cp -a "$SCHEDULER_SNAPSHOT/$name" "/etc/cron.d/$name"
     else
@@ -212,7 +202,6 @@ rollback() {
     echo "rollback core health check failed" >&2
     restore_scheduler_state
     cleanup_snapshot
-    flock -u 8 || true
     exit "$rc"
   fi
 
@@ -224,13 +213,11 @@ rollback() {
   if ! start_paper_stack || ! wait_paper_health; then
     echo "rollback paper topology validation failed" >&2
     cleanup_snapshot
-    flock -u 8 || true
     exit "$rc"
   fi
 
   printf '%s\n' "$PREVIOUS_SHA" > "$LAST_GOOD_FILE"
   cleanup_snapshot
-  flock -u 8 || true
   echo "rollback health and paper checks passed" >&2
   exit "$rc"
 }
@@ -265,18 +252,10 @@ start_paper_stack
 wait_paper_health
 validate_target_resource_budget
 
-# Evidence capture is intentionally non-authoritative. The deploy still owns
-# the shared background lock here, so cron cannot overlap this bounded probe.
-echo "O'Pip ML evidence capture smoke probe"
-if "/bin/bash" "$BACKGROUND_RUNNER" app.jobs.run_opip_ml_capture; then
-  echo "O'Pip ML evidence capture smoke probe: completed or safely skipped by memory guard"
-else
-  echo "O'Pip ML evidence capture smoke probe: degraded; bounded probe failed; production unaffected" >&2
-fi
-
+# Learning computation is remote-only. Production performs only the lightweight
+# evidence export installed by reconcile-scheduler.sh.
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
 cleanup_snapshot
-flock -u 8
 trap - ERR
 
 echo "O'Pip deployment succeeded"
