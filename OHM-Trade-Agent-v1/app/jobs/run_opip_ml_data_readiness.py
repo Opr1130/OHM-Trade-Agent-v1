@@ -94,9 +94,17 @@ def _paper_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
     payload, malformed = _json_object(path)
     if malformed:
         return [], malformed
-    rows = payload.get("lifecycles", payload)
-    if not isinstance(rows, dict):
-        return [], 1
+    if "lifecycles" in payload:
+        rows = payload.get("lifecycles")
+        if not isinstance(rows, dict):
+            return [], 1
+    else:
+        # Historical direct-map state is accepted only when the top-level object
+        # is actually a lifecycle map. A metadata wrapper without lifecycles is
+        # malformed rather than being miscounted as several bad trade rows.
+        if any(key in payload for key in ("schema_version", "paper_only")):
+            return [], 1
+        rows = payload
     malformed_rows = sum(1 for row in rows.values() if not isinstance(row, dict))
     return (
         [dict(row) for row in rows.values() if isinstance(row, dict)],
