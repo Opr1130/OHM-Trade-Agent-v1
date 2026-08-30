@@ -97,9 +97,9 @@ def test_provisional_phase3c_never_becomes_primary_supervised_truth():
     assert "OUTCOME_PROVISIONAL_NOT_SUPERVISED_TRUTH" in row.exclusion_reasons
 
 
-def test_closed_exact_paper_outcome_can_qualify_primary_cohort():
+def test_production_scored_eligible_maps_to_primary_paper_cohort():
     row = build_learning_linkage_records(
-        canonical_rows=[_canonical()],
+        canonical_rows=[_canonical(status="SCORED_ELIGIBLE")],
         ml_snapshot_rows=[_ml()],
         phase3c_outcome_rows=[_phase()],
         paper_trade_rows=[_paper()],
@@ -109,6 +109,16 @@ def test_closed_exact_paper_outcome_can_qualify_primary_cohort():
     assert row.normalized_outcome.source_quality is OutcomeSourceQuality.FINAL_PAPER
     assert row.paper_trade_id == "PT:1"
     assert row.primary_supervised_eligible is True
+
+
+def test_production_scored_suppressed_is_counterfactual_research_only():
+    row = build_learning_linkage_records(
+        canonical_rows=[_canonical(status="SCORED_SUPPRESSED", suppressed=True)],
+        ml_snapshot_rows=[_ml()],
+        paper_trade_rows=[_paper()],
+    )[0]
+    assert row.cohort is LearningCohort.COUNTERFACTUAL_REJECTED
+    assert row.primary_supervised_eligible is False
 
 
 def test_counterfactual_rejected_is_research_only_even_with_final_paper_row():
