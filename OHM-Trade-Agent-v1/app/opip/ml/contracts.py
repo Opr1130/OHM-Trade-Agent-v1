@@ -22,6 +22,7 @@ LABEL_SCHEMA_VERSION = 1
 DATASET_MANIFEST_SCHEMA_VERSION = 1
 MODEL_EVIDENCE_SCHEMA_VERSION = 1
 MODEL_REGISTRY_SCHEMA_VERSION = 1
+DRIFT_HEALTH_SCHEMA_VERSION = 1
 
 
 def _freeze_jsonish(value: Any) -> Any:
@@ -536,6 +537,7 @@ class DriftHealthRecord:
     schema_incompatibility_count: int
     operational_failure_rate: float | None
     health: ModelHealth
+    schema_version: int = DRIFT_HEALTH_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -548,6 +550,8 @@ class DriftHealthRecord:
                 field_name,
                 require_utc(getattr(self, field_name), field_name=field_name),
             )
+        if self.rolling_window_end_utc < self.rolling_window_start_utc:
+            raise ValueError("rolling window end cannot precede its start")
         if self.sample_count < 0:
             raise ValueError("sample_count cannot be negative")
         if self.schema_incompatibility_count < 0:
