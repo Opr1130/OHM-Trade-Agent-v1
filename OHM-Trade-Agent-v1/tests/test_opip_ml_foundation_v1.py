@@ -165,7 +165,7 @@ def test_direction_aware_short_return_is_positive_when_price_falls():
     assert label.net_returns_bps["1h"] == pytest.approx(490.0)
 
 
-def test_dataset_manifest_excludes_censored_labels_and_future_labels():
+def test_dataset_manifest_excludes_ambiguous_labels_with_specific_reason():
     snapshot = _snapshot()
     ambiguous = resolve_barrier_labels(
         snapshot_id=snapshot.snapshot_id,
@@ -207,7 +207,39 @@ def test_dataset_manifest_excludes_censored_labels_and_future_labels():
         random_seed=7,
     )
     assert manifest.included_snapshot_ids == ()
-    assert manifest.excluded_snapshot_ids[snapshot.snapshot_id] == "LABEL_CENSORED"
+    assert (
+        manifest.excluded_snapshot_ids[snapshot.snapshot_id]
+        == "EXECUTION_PATH_AMBIGUOUS"
+    )
+
+
+def test_missing_fixed_horizon_close_marks_label_censored():
+    snapshot = _snapshot()
+    label = resolve_barrier_labels(
+        snapshot_id=snapshot.snapshot_id,
+        candidate_id=snapshot.candidate_id,
+        decision_at_utc=NOW,
+        direction="LONG",
+        entry_price=100.0,
+        tp1_price=105.0,
+        tp2_price=110.0,
+        sl_price=95.0,
+        bars=[
+            PriceBar(
+                observed_at_utc=NOW + timedelta(minutes=1),
+                high=101.0,
+                low=99.0,
+                close=100.0,
+            )
+        ],
+        horizon_end_utc=NOW + timedelta(hours=1),
+        fixed_horizon_closes={"1h": None},
+        label_calc_version="labels-v1",
+        fee_model_version="fees-v1",
+        slippage_model_version="slip-v1",
+    )
+    assert label.data_gap is True
+    assert label.censored is True
 
 
 def test_purged_split_removes_training_label_overlap():
