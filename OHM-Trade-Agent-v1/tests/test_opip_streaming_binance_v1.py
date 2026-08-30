@@ -139,9 +139,13 @@ def test_binance_connect_and_subscribe_contract(monkeypatch):
     class FakeWs:
         def __init__(self):
             self.sent = []
+            self.messages = [orjson.dumps({"result": None, "id": 1})]
 
         async def send(self, payload):
             self.sent.append(payload)
+
+        async def recv(self):
+            return self.messages.pop(0)
 
         async def close(self):
             return None
@@ -166,6 +170,8 @@ def test_binance_connect_and_subscribe_contract(monkeypatch):
     assert captured["url"] == "wss://fstream.binance.com/public/stream"
     request = orjson.loads(fake_ws.sent[0])
     assert request["method"] == "SUBSCRIBE"
+    assert request["id"] == 1
+    assert isinstance(request["id"], int)
     assert set(request["params"]) == {
         "btcusdt@aggTrade",
         "btcusdt@forceOrder",
@@ -188,3 +194,98 @@ def test_binance_reconnect_epoch_is_explicit_boundary():
     assert first.sequence.status is SequenceStatus.FIRST
     assert next_epoch.sequence.status is SequenceStatus.RESET_NEW_EPOCH
     assert next_epoch.sequence.epoch_changed is True
+
+
+def test_binance_subscription_rejection_fails_closed(monkeypatch):
+    import asyncio
+    import app.opip.streaming.binance as module
+
+    class FakeWs:
+        async def send(self, payload):
+            self.request = orjson.loads(payload)
+
+        async def recv(self):
+            return orjson.dumps(
+                {
+                    "error": {
+                        "code": 2,
+                        "msg": "Invalid request: request ID must be an unsigned integer",
+                    },
+                    "id": 1,
+                }
+            )
+
+        async def close(self):
+            return None
+
+    fake_ws = FakeWs()
+
+    async def fake_connect(url, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(module, "connect", fake_connect)
+
+    async def scenario():
+        adapter = BinancePublicAdapter(symbols=("BTCUSDT",))
+        await adapter.connect(connection_id="binance-0", reconnect_epoch=0)
+        with pytest.raises(ConnectionError):
+            await adapter.subscribe()
+        await adapter.close()
+
+    asyncio.run(scenario())
+    assert fake_ws.request["id"] == 1
+
+
+def test_binance_subscription_buffers_market_data_before_ack(monkeypatch):
+    import asyncio
+    import app.opip.streaming.binance as module
+
+    market = {
+        "stream": "btcusdt@aggTrade",
+        "data": {
+            "e": "aggTrade",
+            "E": 1788048000100,
+            "a": 101,
+            "s": "BTCUSDT",
+            "p": "60000",
+            "q": "0.1",
+            "T": 1788048000000,
+            "m": False,
+        },
+    }
+
+    class FakeWs:
+        def __init__(self):
+            self.messages = [
+                orjson.dumps(market),
+                orjson.dumps({"result": None, "id": 1}),
+            ]
+
+        async def send(self, payload):
+            self.request = orjson.loads(payload)
+
+        async def recv(self):
+            return self.messages.pop(0)
+
+        async def close(self):
+            return None
+
+    fake_ws = FakeWs()
+
+    async def fake_connect(url, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(module, "connect", fake_connect)
+
+    async def scenario():
+        adapter = BinancePublicAdapter(symbols=("BTCUSDT",))
+        await adapter.connect(connection_id="binance-0", reconnect_epoch=0)
+        await adapter.subscribe()
+        frame = await adapter.receive()
+        await adapter.close()
+        return frame
+
+    frame = asyncio.run(scenario())
+    assert frame.stream_type is StreamType.AGG_TRADE
+    assert frame.provider_symbol == "BTCUSDT"
+    assert orjson.loads(frame.payload)["a"] == 101
