@@ -430,6 +430,16 @@ def build_ml_data_readiness_report(
     if missing_rate > active_policy.maximum_missing_feature_rate:
         blockers.append("FEATURE_MISSINGNESS_ABOVE_POLICY")
         structural = True
+    trainable_direction_count = direction.get("LONG", 0) + direction.get("SHORT", 0)
+    if feature_bearing > 0 and trainable_direction_count == 0:
+        blockers.append("NO_TRAINABLE_DIRECTION_FEATURE_SNAPSHOTS")
+        structural = True
+    if exclusions.get("ML_DIRECTION_NOT_TRAINABLE", 0):
+        blockers.append("ML_DIRECTION_LINKAGE_NOT_TRAINABLE")
+        structural = True
+    if exclusions.get("DIRECTION_LINK_MISMATCH", 0):
+        blockers.append("DIRECTION_LINK_MISMATCH_PRESENT")
+        structural = True
     if final_truth == 0:
         blockers.append("NO_FINAL_SUPERVISED_TRUTH")
         structural = True
