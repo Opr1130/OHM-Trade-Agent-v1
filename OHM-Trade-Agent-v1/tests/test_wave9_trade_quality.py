@@ -151,7 +151,26 @@ def test_low_liquidity_vetoes_continuation():
     thin = snapshot(liquidity=50_000.0)
     assessment = assess_trade_quality(feature_snapshot(thin), plan())
     assert assessment.continuation.decision == "FAIL"
-    assert "LIQUIDITY_BELOW_100K" in assessment.continuation.vetoes
+    assert "LIQUIDITY_BELOW_CONFIGURED_MINIMUM" in assessment.continuation.vetoes
+
+
+def test_missing_liquidity_cannot_become_actionable():
+    unverified = snapshot(liquidity=None)
+    assessment = assess_trade_quality(feature_snapshot(unverified), plan())
+    assert assessment.continuation.decision == "FAIL"
+    assert "LIQUIDITY_UNAVAILABLE" in assessment.continuation.vetoes
+    assert assessment.actionable is False
+
+
+def test_runtime_liquidity_floor_is_honored():
+    market = snapshot(liquidity=150_000.0)
+    assessment = assess_trade_quality(
+        feature_snapshot(market),
+        plan(),
+        min_liquidity_usd=200_000.0,
+    )
+    assert assessment.continuation.decision == "FAIL"
+    assert "LIQUIDITY_BELOW_CONFIGURED_MINIMUM" in assessment.continuation.vetoes
 
 
 def test_entry_assessment_requires_same_snapshot():
