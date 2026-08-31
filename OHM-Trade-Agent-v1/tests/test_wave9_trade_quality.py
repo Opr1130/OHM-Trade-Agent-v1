@@ -173,6 +173,30 @@ def test_runtime_liquidity_floor_is_honored():
     assert "LIQUIDITY_BELOW_CONFIGURED_MINIMUM" in assessment.continuation.vetoes
 
 
+def test_execution_unavailable_cannot_be_actionable():
+    market = snapshot()
+    market.execution_validation = None
+    assessment = assess_trade_quality(feature_snapshot(market), plan())
+    assert assessment.continuation.decision == "FAIL"
+    assert "EXECUTION_UNAVAILABLE" in assessment.continuation.vetoes
+    assert assessment.actionable is False
+
+
+def test_execution_drag_must_be_available():
+    market = snapshot()
+    market.execution_validation = type(
+        "Execution",
+        (),
+        {
+            "status": "VALID",
+            "estimated_visible_round_trip_market_drag_pct": None,
+        },
+    )()
+    assessment = assess_trade_quality(feature_snapshot(market), plan())
+    assert assessment.continuation.decision == "FAIL"
+    assert "EXECUTION_DRAG_UNAVAILABLE" in assessment.continuation.vetoes
+
+
 def test_entry_assessment_requires_same_snapshot():
     first = feature_snapshot()
     second = build_trade_feature_snapshot(
