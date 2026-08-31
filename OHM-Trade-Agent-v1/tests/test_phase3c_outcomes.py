@@ -86,3 +86,23 @@ def test_forward_labels_map_phase2_major_move_episode_separately():
     assert row["move_episode_id"].startswith("MOVE:")
     assert row["within_major_move_episode"] is True
     assert row["outcome_source"].startswith("PROVISIONAL_EVENT_SAMPLED")
+
+
+def test_forward_labels_reject_nonfinite_reference_prices_without_blocking_valid_rows():
+    bad_nan = snapshot("BAD-NAN", 0)
+    bad_nan["reference_price"] = float("nan")
+    bad_inf = snapshot("BAD-INF", 1)
+    bad_inf["reference_price"] = float("inf")
+    good = snapshot("GOOD", 2)
+    observations = [
+        observation(0, 10.0),
+        observation(15, 10.2),
+        observation(30, 10.3),
+        observation(60, 10.4),
+        observation(240, 10.5),
+        observation(24 * 60, 10.6),
+    ]
+
+    labels = build_forward_outcome_labels([bad_nan, bad_inf, good], observations)
+
+    assert [row["snapshot_id"] for row in labels] == ["GOOD"]

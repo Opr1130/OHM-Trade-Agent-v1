@@ -4,6 +4,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from app.jobs.build_phase3c_forward_outcomes import (
+    _canonical_label_payload,
     build_outcomes,
     build_outcomes_bounded,
 )
@@ -435,3 +436,26 @@ def test_bounded_output_checkpoint_rejects_rewritten_ledger(tmp_path):
             state_path=state,
             now=BASE + timedelta(minutes=2),
         )
+
+
+def test_canonical_label_payload_marks_nonfinite_values_unusable_and_json_safe():
+    payload = _canonical_label_payload(
+        {
+            "snapshot_id": "S-BAD",
+            "outcome_source": "PROVISIONAL_EVENT_SAMPLED_FULL_MARKET_OBSERVATIONS",
+            "horizon_returns_pct": {"5m": float("nan"), "15m": 1.5},
+            "mfe_pct": float("inf"),
+            "window_complete": True,
+            "maturation_status": "MATURE_24H",
+        }
+    )
+
+    assert payload["horizon_returns_pct"]["5m"] is None
+    assert payload["horizon_returns_pct"]["15m"] == 1.5
+    assert payload["mfe_pct"] is None
+    assert payload["data_gap"] is True
+    assert payload["window_complete"] is False
+    assert payload["maturation_status"] == "UNUSABLE_NONFINITE"
+    assert payload["data_quality_nonfinite_count"] == 2
+    assert "NONFINITE_VALUE" in payload["data_quality_flags"]
+    json.dumps(payload, allow_nan=False)

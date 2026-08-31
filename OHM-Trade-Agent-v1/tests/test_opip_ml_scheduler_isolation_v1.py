@@ -298,3 +298,23 @@ def test_learning_outcomes_use_bounded_queue_and_filtered_observations():
     assert "symbols=symbols" in source
     assert "start_at=min(decision_times)" in source
     assert "end_at=max(decision_times)" in source
+
+
+def test_learning_reader_rejects_injected_or_non_host_source_inputs():
+    script = ROOT / "deploy" / "remote" / "configure-opip-learning-reader.sh"
+    cases = (
+        ("ssh-ed25519 AAAAvalid opip-learning-worker\nssh-ed25519 AAAAevil attacker", "10.116.0.4/32"),
+        ("ssh-ed25519 AAAAvalid opip-learning-worker", "10.116.0.4/32\n10.0.0.0/8"),
+        ("ssh-ed25519 AAAAvalid opip-learning-worker", "10.116.0.4/24"),
+        ("ssh-ed25519 AAAAvalid opip-learning-worker", "999.116.0.4/32"),
+    )
+
+    for public_key, source_cidr in cases:
+        result = subprocess.run(
+            ["bash", str(script), public_key, source_cidr],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 64
+        assert "learning-private-ip/32" in result.stderr

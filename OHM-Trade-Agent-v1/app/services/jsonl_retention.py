@@ -38,7 +38,7 @@ def compact_jsonl_recent(
                 if not line.strip():
                     continue
                 recent.append(line if line.endswith("\n") else line + "\n")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         logger.warning("Could not read JSONL ledger %s for retention: %s", path, exc)
         return False
 

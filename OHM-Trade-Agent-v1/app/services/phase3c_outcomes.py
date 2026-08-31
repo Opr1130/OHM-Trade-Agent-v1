@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
+import math
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.services.signal_quality_phase2 import (
@@ -170,7 +171,13 @@ def build_forward_outcome_labels(
             reference_price = float(snapshot.get("reference_price"))
         except (TypeError, ValueError):
             reference_price = 0.0
-        if not snapshot_id or not symbol or at is None or reference_price <= 0:
+        if (
+            not snapshot_id
+            or not symbol
+            or at is None
+            or not math.isfinite(reference_price)
+            or reference_price <= 0
+        ):
             continue
 
         timeline = timelines.get(symbol)

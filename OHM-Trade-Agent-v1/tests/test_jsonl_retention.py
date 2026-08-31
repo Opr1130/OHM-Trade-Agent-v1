@@ -24,3 +24,14 @@ def test_compact_jsonl_recent_is_noop_below_size_cap(tmp_path):
 
     assert compacted is False
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_compact_jsonl_recent_preserves_original_on_invalid_utf8(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    original = b'{"n": 1}\n{"n": "\x80"}\n{"n": 3}\n'
+    path.write_bytes(original)
+
+    compacted = compact_jsonl_recent(path, max_bytes=1, keep_lines=1)
+
+    assert compacted is False
+    assert path.read_bytes() == original

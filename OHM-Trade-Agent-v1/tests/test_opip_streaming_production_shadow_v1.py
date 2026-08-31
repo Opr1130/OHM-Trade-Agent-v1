@@ -383,3 +383,38 @@ def test_drop_after_seal_degrades_retained_window_and_next_window():
     ]
     assert len(notices_15s) == 1
     assert notices_15s[0].quality.state is EvidenceQualityState.INCOMPLETE
+
+
+def test_healthcheck_scales_staleness_with_configured_heartbeat_interval(
+    tmp_path,
+    monkeypatch,
+):
+    import app.opip.streaming.healthcheck as module
+
+    path = tmp_path / "health.json"
+    monkeypatch.setattr(module, "HEALTH_FILE", path)
+    monkeypatch.setenv("OPIP_STREAMING_HEALTH_INTERVAL_SECONDS", "30")
+
+    save_json_atomic(
+        path,
+        {
+            "status": "RUNNING",
+            "updated_at_utc": (
+                datetime.now(timezone.utc) - timedelta(seconds=25)
+            ).isoformat(),
+            "runtime_failed": False,
+        },
+    )
+    assert module.main() == 0
+
+    save_json_atomic(
+        path,
+        {
+            "status": "RUNNING",
+            "updated_at_utc": (
+                datetime.now(timezone.utc) - timedelta(seconds=121)
+            ).isoformat(),
+            "runtime_failed": False,
+        },
+    )
+    assert module.main() == 1
