@@ -40,6 +40,10 @@ services:
           /freqtrade/user_data_usdt \
           /freqtrade/user_data_usdt/strategies
         chmod 0755 /freqtrade/bridge /freqtrade/control
+        if [ ! -s /freqtrade/control/control.json ]; then
+          printf '%s\n' '{"schema_version":1,"enabled":false,"updated_at":null,"updated_by":"SYSTEM_BOOTSTRAP","paper_only":true,"kraken_execution_authority":false}' \
+            > /freqtrade/control/control.json
+        fi
         for REQUIRED in \
           /freqtrade/bridge/pairlist_usd.json \
           /freqtrade/bridge/pairlist_usdt.json \
