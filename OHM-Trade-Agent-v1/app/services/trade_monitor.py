@@ -54,6 +54,30 @@ def _require_finite_trade_geometry(trade: ActiveTrade) -> None:
         raise ValueError(f"{trade.symbol}: active trade stop/target geometry is invalid for {direction}")
 
 
+def _price_ladder_action(
+    trade: ActiveTrade,
+    *,
+    direction: str,
+    current_price: float,
+) -> tuple[str, str | None]:
+    if direction == "SHORT":
+        if current_price >= trade.stop_price:
+            return "EXIT_NOW", "Short stop price breached"
+        if current_price <= trade.target_2:
+            return "TAKE_PROFIT", "Short Target 2 reached"
+        if current_price <= trade.target_1:
+            return "TAKE_PROFIT", "Short Target 1 reached"
+        return "HOLD", None
+
+    if current_price <= trade.stop_price:
+        return "EXIT_NOW", "Stop price breached"
+    if current_price >= trade.target_2:
+        return "TAKE_PROFIT", "Target 2 reached"
+    if current_price >= trade.target_1:
+        return "TAKE_PROFIT", "Target 1 reached"
+    return "HOLD", None
+
+
 def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     _require_finite_trade_geometry(trade)
     client = KrakenClient()
@@ -81,27 +105,13 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
         reasons: list[str] = [
             f"Limited OHLC history ({len(candles)} candles); technical deterioration checks unavailable"
         ]
-        action = "HOLD"
-        if direction == "SHORT":
-            if current_price >= trade.stop_price:
-                action = "EXIT_NOW"
-                reasons.insert(0, "Short stop price breached")
-            elif current_price <= trade.target_2:
-                action = "TAKE_PROFIT"
-                reasons.insert(0, "Short Target 2 reached")
-            elif current_price <= trade.target_1:
-                action = "TAKE_PROFIT"
-                reasons.insert(0, "Short Target 1 reached")
-        else:
-            if current_price <= trade.stop_price:
-                action = "EXIT_NOW"
-                reasons.insert(0, "Stop price breached")
-            elif current_price >= trade.target_2:
-                action = "TAKE_PROFIT"
-                reasons.insert(0, "Target 2 reached")
-            elif current_price >= trade.target_1:
-                action = "TAKE_PROFIT"
-                reasons.insert(0, "Target 1 reached")
+        action, ladder_reason = _price_ladder_action(
+            trade,
+            direction=direction,
+            current_price=current_price,
+        )
+        if ladder_reason:
+            reasons.insert(0, ladder_reason)
 
         pnl = None
         if trade.capital is not None and trade.capital > 0:
@@ -143,19 +153,15 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
     unrealized_pct = -raw_move if direction == "SHORT" else raw_move
     reasons: list[str] = []
-    action = "HOLD"
+    action, ladder_reason = _price_ladder_action(
+        trade,
+        direction=direction,
+        current_price=current_price,
+    )
+    if ladder_reason:
+        reasons.append(ladder_reason)
 
     if direction == "SHORT":
-        if current_price >= trade.stop_price:
-            action = "EXIT_NOW"
-            reasons.append("Short stop price breached")
-        elif current_price <= trade.target_2:
-            action = "TAKE_PROFIT"
-            reasons.append("Short Target 2 reached")
-        elif current_price <= trade.target_1:
-            action = "TAKE_PROFIT"
-            reasons.append("Short Target 1 reached")
-
         weak_signals: list[str] = []
         if current_price > ema20_value:
             weak_signals.append("Price reclaimed EMA20 against short")
@@ -175,16 +181,6 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             if action in {"HOLD", "WARNING"}:
                 action = "EXIT_NOW"
     else:
-        if current_price <= trade.stop_price:
-            action = "EXIT_NOW"
-            reasons.append("Stop price breached")
-        elif current_price >= trade.target_2:
-            action = "TAKE_PROFIT"
-            reasons.append("Target 2 reached")
-        elif current_price >= trade.target_1:
-            action = "TAKE_PROFIT"
-            reasons.append("Target 1 reached")
-
         weak_signals = []
         if current_price < ema20_value:
             weak_signals.append("Price lost EMA20")
