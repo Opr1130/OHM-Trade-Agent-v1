@@ -9,7 +9,7 @@ READER_STATE_FILE="$READER_STATE_ROOT/last_sync_request.env"
 MANIFEST="$EXPORT_ROOT/manifest.env"
 EXPORT_CRON="/etc/cron.d/opip-learning-export"
 MAX_EXPORT_AGE_SECONDS=300
-MAX_SYNC_AGE_SECONDS=300
+MAX_SYNC_AGE_SECONDS=720
 MAX_CAPTURE_AGE_SECONDS=900
 MAX_OUTCOMES_AGE_SECONDS=1800
 MAX_FUTURE_SKEW_SECONDS=120
@@ -85,7 +85,9 @@ fi
 
 if [[ -s "$READER_STATE_FILE" ]]; then
   sync_seen="$(env_value "$READER_STATE_FILE" observed_at_utc)"
-  sync_age="$(age_seconds "$sync_seen" || true)"
+  request_age="$(age_seconds "$sync_seen" || true)"
+  successful_sync_at="$(env_value "$READER_STATE_FILE" last_successful_sync_at_utc)"
+  sync_age="$(age_seconds "$successful_sync_at" || true)"
   protocol="$(env_value "$READER_STATE_FILE" protocol)"
   worker_sha="$(env_value "$READER_STATE_FILE" worker_deployed_sha)"
   capture_at="$(env_value "$READER_STATE_FILE" capture_finished_at_utc)"
@@ -94,8 +96,10 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   outcomes_rc="$(env_value "$READER_STATE_FILE" outcomes_exit_code)"
   capture_age="$(age_seconds "$capture_at" || true)"
   outcomes_age="$(age_seconds "$outcomes_at" || true)"
-  echo "worker_sync_observed_at_utc=${sync_seen:-UNKNOWN}"
-  echo "worker_sync_age_seconds=${sync_age:-UNKNOWN}"
+  echo "worker_sync_request_observed_at_utc=${sync_seen:-UNKNOWN}"
+  echo "worker_sync_request_age_seconds=${request_age:-UNKNOWN}"
+  echo "worker_last_successful_sync_at_utc=${successful_sync_at:-UNKNOWN}"
+  echo "worker_successful_sync_age_seconds=${sync_age:-UNKNOWN}"
   echo "worker_status_protocol=${protocol:-UNKNOWN}"
   echo "worker_deployed_sha=${worker_sha:-UNKNOWN}"
   echo "capture_finished_at_utc=${capture_at:-UNKNOWN}"
@@ -105,10 +109,16 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   echo "outcomes_age_seconds=${outcomes_age:-UNKNOWN}"
   echo "outcomes_exit_code=${outcomes_rc:-UNKNOWN}"
   if [[ ! "$sync_age" =~ ^[0-9]+$ ]] || (( sync_age > MAX_SYNC_AGE_SECONDS )); then
+    echo "worker_evidence_sync_status=STALE_OR_UNVERIFIED"
     degrade
+  else
+    echo "worker_evidence_sync_status=OK"
   fi
   if [[ "$protocol" != "2" ]]; then
     echo "worker_compute_status=UNVERIFIED_LEGACY_SYNC_PROTOCOL"
+    degrade
+  elif [[ "$worker_sha" != "$current_sha" ]]; then
+    echo "worker_compute_status=RELEASE_DRIFT"
     degrade
   elif [[ "$capture_rc" != "0" || "$outcomes_rc" != "0" ]]; then
     echo "worker_compute_status=FAILED_OR_INCOMPLETE"
