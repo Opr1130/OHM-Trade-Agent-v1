@@ -126,7 +126,13 @@ else
 fi
 
 if docker inspect ohm-trade-agent >/dev/null 2>&1; then
-  analytics="$(
+  core_running="$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)"
+  if [[ "$core_running" != "true" ]]; then
+    echo "production_validation_data=CORE_CONTAINER_STOPPED"
+    status="FAIL"
+    analytics=""
+  else
+    analytics="$(
     docker exec ohm-trade-agent python -c '
 import json
 from app.services.dashboard_read_model import build_dashboard_read_model
@@ -158,10 +164,11 @@ out = {
 }
 print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 ' 2>/dev/null || true
-  )"
-  if [[ -n "$analytics" ]]; then
+    )"
+  fi
+  if [[ "$core_running" == "true" && -n "$analytics" ]]; then
     echo "production_validation_data=$analytics"
-  else
+  elif [[ "$core_running" == "true" ]]; then
     echo "production_validation_data=UNAVAILABLE"
     degrade
   fi
