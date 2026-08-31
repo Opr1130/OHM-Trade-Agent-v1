@@ -162,7 +162,7 @@ def _retry_one(
         if str(row.get("trade_id") or "") != trade_id:
             raise ValueError("qualified alert outbox trade_id mismatch")
     except Exception:
-        _release(trade_id, lease_token)
+        _remove(trade_id, token=lease_token)
         return "MALFORMED"
 
     lifecycle = get_pending_setup_record(trade_id)
