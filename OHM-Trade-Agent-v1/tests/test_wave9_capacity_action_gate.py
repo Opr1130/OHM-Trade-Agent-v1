@@ -132,6 +132,18 @@ def test_capacity_above_allocation_does_not_change_recommendation(monkeypatch):
         "evaluate_trade_decision",
         lambda **kwargs: _intelligence(300.0),
     )
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_portfolio_risk",
+        lambda **kwargs: PortfolioRiskDecision(
+            allowed=True,
+            reason="portfolio risk limits satisfied",
+            open_positions=0,
+            gross_exposure=0.0,
+            proposed_exposure=kwargs["proposed_capital"],
+            proposed_total_exposure=kwargs["proposed_capital"],
+        ),
+    )
     candidate = {
         "economic_qualified": True,
         "direction": "LONG",
