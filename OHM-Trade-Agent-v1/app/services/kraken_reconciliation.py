@@ -72,7 +72,10 @@ def _canonical_pair(pair: str) -> str:
 
 def _base_asset(symbol: str) -> str | None:
     value = _canonical_pair(symbol)
-    for quote in ("USDT", "USD", "EUR", "GBP", "CAD", "AUD", "BTC", "ETH"):
+    for quote in (
+        "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
+        "JPY", "CHF", "BTC", "ETH",
+    ):
         if value.endswith(quote) and len(value) > len(quote):
             return value[: -len(quote)]
     return None
