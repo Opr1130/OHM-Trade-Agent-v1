@@ -29,6 +29,10 @@ def test_scheduler_reconciliation_removes_only_legacy_ohm_scheduler_paths():
     assert 'ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"' in script
     assert 'rm -f "$ML_EVIDENCE_DST"' in script
     assert 'LEARNING_EXPORT_DST="/etc/cron.d/opip-learning-export"' in script
+    assert 'DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"' in script
+    assert 'SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"' in script
+    assert 'LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"' in script
+    assert 'LEARNING_READER_STATE="/var/lib/opip-learning-reader"' in script
 
 
 def test_remote_bootstrap_and_future_deploy_reconcile_scheduler():
@@ -46,6 +50,9 @@ def test_scheduler_shell_scripts_have_valid_bash_syntax():
         "deploy/remote/reconcile-scheduler.sh",
         "deploy/remote/bootstrap-remote-ops.sh",
         "deploy/remote/ohm-deploy",
+        "deploy/remote/ohm-deploy-ssh",
+        "deploy/remote/diagnose-opip-learning.sh",
+        "deploy/remote/opip-learning-read-export.sh",
     ):
         subprocess.run(
             ["bash", "-n", str(ROOT / relative)],
@@ -53,3 +60,21 @@ def test_scheduler_shell_scripts_have_valid_bash_syntax():
             capture_output=True,
             text=True,
         )
+
+
+def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
+    gateway = (ROOT / "deploy/remote/ohm-deploy-ssh").read_text(encoding="utf-8")
+    deploy = (ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    diagnostics = (ROOT / "deploy/remote/diagnose-opip-learning.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"diagnose-learning"' in gateway
+    assert "sudo /usr/local/sbin/ohm-deploy diagnose-learning" in gateway
+    assert 'if [[ "$TARGET_SHA" == "diagnose-learning" ]]' in deploy
+    assert "build_dashboard_read_model" in diagnostics
+    assert "production_validation_data=" in diagnostics
+    assert "worker_compute_status=" in diagnostics
+    assert "docker exec ohm-trade-agent" in diagnostics
+    assert "docker rm" not in diagnostics
+    assert "docker stop" not in diagnostics
