@@ -354,6 +354,35 @@ def test_legacy_active_trade_gets_deterministic_legacy_key(monkeypatch, tmp_path
     assert record["trade_id"] == ""
 
 
+def test_calibration_excludes_resolved_records_without_forecast_horizon(
+    monkeypatch,
+    tmp_path,
+):
+    isolate(monkeypatch, tmp_path)
+    outcomes.OUTCOME_FILE.write_text(
+        """{
+  "legacy:BTCUSD:test": {
+    "record_key": "legacy:BTCUSD:test",
+    "trade_id": "",
+    "symbol": "BTCUSD",
+    "direction": "LONG",
+    "entered_trade": true,
+    "terminal_status": "closed",
+    "entered_at": "2026-08-09T20:00:00+00:00",
+    "target_2_first_observed_at": "2026-08-09T21:00:00+00:00",
+    "chief_confidence": 80,
+    "opportunity_rank": 1
+  }
+}""",
+        encoding="utf-8",
+    )
+
+    summary = outcomes.calibration_summary(min_resolved_entered=1)
+
+    assert summary["status"] == "INSUFFICIENT_DATA"
+    assert summary["resolved_entered_trades"] == 0
+
+
 def test_calibration_refuses_small_samples(monkeypatch, tmp_path):
     isolate(monkeypatch, tmp_path)
     summary = outcomes.calibration_summary(min_resolved_entered=30)
