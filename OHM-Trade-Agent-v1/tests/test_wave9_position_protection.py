@@ -8,6 +8,7 @@ from app.services.kraken_exposure_resolver import (
     ResolvedExposure,
 )
 from app.services.position_materiality import refine_protection_action
+from app.services.kraken_position_verification import verify_trade_against_snapshot
 from app.services import active_trade_monitor_runner, trade_monitor, trade_monitor_notifier
 from app.services.active_trade_registry import ActiveTrade
 from app.services.trade_monitor import TradeMonitorResult
@@ -318,6 +319,145 @@ def test_unmanaged_notification_failure_does_not_stop_later_managed_protection(m
     assert checked == ["SOLUSD"]
     assert summary.checked == 1
     assert any("unmanaged-holding notification failed" in item for item in summary.failures)
+
+
+def test_pair_without_ticker_price_marks_exposure_coverage_incomplete():
+    resolver = KrakenExposureResolver(
+        private_client=FakePrivate(balances={"SOL": 2.0}),
+        public_client=FakePublic(
+            pairs={
+                "SOLUSD": {
+                    "status": "online",
+                    "altname": "SOLUSD",
+                    "base": "SOL",
+                    "quote": "ZUSD",
+                }
+            },
+            prices={},
+        ),
+        trade_loader=lambda: [],
+    )
+
+    resolved = resolver.resolve()
+
+    assert resolved.coverage_complete is False
+    assert "pricing unavailable" in resolved.reason.lower()
+    exposure = resolved.exposures[0]
+    assert exposure.status == "VERIFIED_UNMANAGED"
+    assert exposure.notional_usd is None
+
+
+def test_malformed_open_position_degrades_coverage():
+    resolver = KrakenExposureResolver(
+        private_client=FakePrivate(
+            balances={},
+            positions={"BROKEN": "not-a-position-row"},
+        ),
+        public_client=FakePublic(),
+        trade_loader=lambda: [],
+    )
+
+    resolved = resolver.resolve()
+
+    assert resolved.coverage_complete is False
+    assert "malformed open position row" in resolved.reason
+
+
+def test_leveraged_long_does_not_fallback_to_unrelated_spot_balance():
+    margin_trade = ActiveTrade(
+        symbol="SOLUSD",
+        entry_price=100.0,
+        stop_price=95.0,
+        target_1=110.0,
+        target_2=120.0,
+        risk_level="medium",
+        direction="LONG",
+        trade_id="T-MARGIN-LONG",
+        capital=100.0,
+        margin_leverage=2.0,
+    )
+
+    verification = verify_trade_against_snapshot(
+        margin_trade,
+        balances={"SOL": 5.0},
+        positions={},
+    )
+
+    assert verification.status == "ABSENT"
+    assert "leveraged long" in verification.reason
+
+
+def test_degraded_alert_failure_does_not_stop_managed_protection(monkeypatch):
+    settings = SimpleNamespace(
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+    )
+    managed_trade = trade()
+    resolution = ExposureResolution(
+        exposures=(
+            ResolvedExposure(
+                status="VERIFIED_MANAGED",
+                symbol="SOLUSD",
+                direction="LONG",
+                observed_quantity=1.0,
+                reason="managed",
+                trade=managed_trade,
+            ),
+        ),
+        coverage_complete=False,
+        reason="pricing coverage incomplete",
+    )
+    monkeypatch.setattr(active_trade_monitor_runner, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "KrakenExposureResolver",
+        lambda **kwargs: SimpleNamespace(resolve=lambda: resolution),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "_notify_monitor_degraded",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("telegram broke")),
+    )
+    checked = []
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "monitor_trade",
+        lambda trade: checked.append(trade.symbol) or result(action="HOLD"),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "update_active_observation",
+        lambda trade, current_price: {"mfe_pct": 0.0},
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "refine_protection_action",
+        lambda trade, monitor_result, observation: monitor_result,
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "send_monitor_update",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "detect_emergency_move",
+        lambda trade: SimpleNamespace(triggered=False),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "send_emergency_alert",
+        lambda **kwargs: False,
+    )
+
+    summary = active_trade_monitor_runner.run_active_trade_monitor()
+
+    assert checked == ["SOLUSD"]
+    assert summary.checked == 1
+    assert any(
+        "degraded-monitor notification failed" in failure
+        for failure in summary.failures
+    )
 
 
 def test_mfe_giveback_promotes_hold_to_warning():
