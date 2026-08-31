@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any
 
 from app.services.active_trade_registry import get_active_trades
+from app.services.capital_efficiency_ranking import MIN_EXECUTABLE_NOTIONAL_USD
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.economic_quality_gate import MIN_NET_PROFIT
 from app.services.portfolio_risk import evaluate_portfolio_risk
@@ -33,11 +35,12 @@ def apply_action_gate(
     resulting decision; it does not decide portfolio eligibility itself.
     """
     if candidate.get("economic_qualified") is not True:
+        reason = "economic qualification is required for an actionable trade"
         candidate["action_gate_evaluated"] = True
-        candidate["action_gate_allowed"] = True
-        candidate["portfolio_risk_allowed"] = True
-        candidate["portfolio_risk_reason"] = "economic allocation not required"
-        return ActionGateDecision(True, "economic allocation not required")
+        candidate["action_gate_allowed"] = False
+        candidate["portfolio_risk_allowed"] = False
+        candidate["portfolio_risk_reason"] = reason
+        return ActionGateDecision(False, reason)
 
     trades = list(active_trades) if active_trades is not None else get_active_trades()
     try:
@@ -61,15 +64,26 @@ def apply_action_gate(
         )
 
     capacity_reason: str | None = None
-    ceiling = candidate.get("liquidity_capacity_ceiling_usd")
-    if isinstance(ceiling, (int, float)) and float(ceiling) > 0:
-        direction = str(
-            candidate.get("direction") or plan.direction or "LONG"
-        ).upper()
+    direction = str(
+        candidate.get("direction") or plan.direction or "LONG"
+    ).upper()
+    try:
         leverage = float(
             candidate.get("margin_leverage")
             or (2.0 if direction == "SHORT" else 1.0)
         )
+    except (TypeError, ValueError):
+        leverage = math.nan
+    if direction not in {"LONG", "SHORT"} or not math.isfinite(leverage) or leverage <= 0:
+        capacity_reason = "invalid direction or leverage at action gate"
+
+    ceiling = candidate.get("liquidity_capacity_ceiling_usd")
+    if (
+        capacity_reason is None
+        and isinstance(ceiling, (int, float))
+        and math.isfinite(float(ceiling))
+        and float(ceiling) > 0
+    ):
         max_capital_by_capacity = float(ceiling) / leverage
         original_capital = float(
             intelligence.allocation.recommended_capital
@@ -144,6 +158,24 @@ def apply_action_gate(
                     )
         else:
             candidate["liquidity_capacity_capped"] = False
+    final_notional = (
+        float(intelligence.allocation.recommended_capital) * leverage
+        if math.isfinite(leverage) and leverage > 0
+        else 0.0
+    )
+    candidate["recommended_position_notional"] = round(final_notional, 2)
+    if (
+        capacity_reason is None
+        and (
+            not math.isfinite(final_notional)
+            or final_notional < MIN_EXECUTABLE_NOTIONAL_USD
+        )
+    ):
+        capacity_reason = (
+            f"recommended position notional USD {final_notional:.2f} is below "
+            f"minimum executable notional USD {MIN_EXECUTABLE_NOTIONAL_USD:.2f}"
+        )
+
     candidate["recommended_capital"] = intelligence.allocation.recommended_capital
     candidate["recommended_risk_dollars"] = intelligence.allocation.risk_dollars
     candidate["projected_net_edge_pct"] = intelligence.projected_net_edge_pct
