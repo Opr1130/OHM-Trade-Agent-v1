@@ -407,3 +407,90 @@ def test_rewritten_ledger_rebuilds_disk_dedup_index(tmp_path):
         for line in ledger.read_text(encoding="utf-8").splitlines()
     ]
     assert len(rows) == 2
+
+def test_ledger_index_catchup_is_bounded_and_resumes_before_new_append(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    ledger = tmp_path / "ledger.jsonl"
+    checkpoint = tmp_path / "checkpoint.json"
+
+    ledger_rows = [
+        {"snapshot_id": f"LEDGER-{index}", "payload": "x" * 64}
+        for index in range(5)
+    ]
+    ledger.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows),
+        encoding="utf-8",
+    )
+    original_size = ledger.stat().st_size
+    outbox.write_text(
+        json.dumps({"snapshot_id": "LEDGER-4"}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    first = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+        ledger_index_max_rows=2,
+        ledger_index_max_bytes=1_000_000,
+    )
+    assert first.index_catchup_in_progress is True
+    assert first.index_rows_scanned == 2
+    assert first.index_reconciled_from_offset == 0
+    assert 0 < first.index_reconciled_to_offset < original_size
+    assert first.index_ledger_size == original_size
+    assert first.processed == 0
+    assert first.duplicates == 0
+    assert not checkpoint.exists()
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 5
+
+    second = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+        ledger_index_max_rows=2,
+        ledger_index_max_bytes=1_000_000,
+    )
+    assert second.index_catchup_in_progress is True
+    assert second.index_rows_scanned == 2
+    assert second.index_reconciled_from_offset == first.index_reconciled_to_offset
+    assert second.index_reconciled_to_offset > first.index_reconciled_to_offset
+    assert not checkpoint.exists()
+
+    third = drain_outbox_to_evidence_ledger(
+        outbox_path=outbox,
+        evidence_path=ledger,
+        checkpoint_path=checkpoint,
+        batch_limit=1,
+        ledger_index_max_rows=2,
+        ledger_index_max_bytes=1_000_000,
+    )
+    assert third.index_catchup_in_progress is False
+    assert third.index_rows_scanned == 1
+    assert third.index_reconciled_to_offset == original_size
+    assert third.duplicates == 1
+    assert third.processed == 0
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["next_line"] == 1
+    assert len(ledger.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_ledger_index_catchup_rejects_invalid_budgets(tmp_path):
+    outbox = tmp_path / "outbox.jsonl"
+    outbox.write_text('{"snapshot_id":"S1"}\n', encoding="utf-8")
+
+    for rows, byte_budget in ((0, 1024), (1, 0)):
+        try:
+            drain_outbox_to_evidence_ledger(
+                outbox_path=outbox,
+                evidence_path=tmp_path / "ledger.jsonl",
+                checkpoint_path=tmp_path / "checkpoint.json",
+                ledger_index_max_rows=rows,
+                ledger_index_max_bytes=byte_budget,
+            )
+        except ValueError as exc:
+            assert "ledger index reconcile budgets" in str(exc)
+        else:
+            raise AssertionError("invalid ledger index budget was accepted")
+

@@ -171,10 +171,29 @@ class DrainResult:
     remaining_from_line: int
     stopped_on_error: bool
     error_type: str | None = None
+    index_catchup_in_progress: bool = False
+    index_reconciled_from_offset: int = 0
+    index_reconciled_to_offset: int = 0
+    index_ledger_size: int = 0
+    index_rows_scanned: int = 0
+    index_bytes_scanned: int = 0
 
 
 OUTBOX_CHECKPOINT_SCHEMA_VERSION = 2
 CHECKPOINT_ANCHOR_BYTES = 4096
+LEDGER_INDEX_RECONCILE_MAX_ROWS = 5_000
+LEDGER_INDEX_RECONCILE_MAX_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _LedgerIndexReconcileResult:
+    caught_up: bool
+    start_offset: int
+    end_offset: int
+    ledger_size: int
+    rows_scanned: int
+    bytes_scanned: int
+    rebuilt: bool = False
 
 
 @dataclass(frozen=True)
@@ -570,40 +589,72 @@ def _set_ledger_index_checkpoint(
 def _reconcile_ledger_index(
     connection: sqlite3.Connection,
     ledger: Path,
-) -> None:
-    """Catch the SQLite index up to the append-only ledger in constant memory."""
+    *,
+    max_rows: int = LEDGER_INDEX_RECONCILE_MAX_ROWS,
+    max_bytes: int = LEDGER_INDEX_RECONCILE_MAX_BYTES,
+) -> _LedgerIndexReconcileResult:
+    """Advance the disk-backed dedup index by one strictly bounded pass.
+
+    Large recovery ledgers must never turn one nominally bounded capture job
+    into an unbounded historical scan. Progress is committed after each pass,
+    and callers must not append new evidence until caught_up is true.
+    """
+    if max_rows < 1 or max_bytes < 1:
+        raise ValueError("ledger index reconcile budgets must be >= 1")
+
     indexed_offset = _metadata_int(connection, "indexed_offset", 0)
     if not ledger.exists():
         if indexed_offset:
             connection.execute("DELETE FROM snapshot_ids")
             _set_ledger_index_checkpoint(connection, ledger, 0)
             connection.commit()
-        return
+        return _LedgerIndexReconcileResult(
+            caught_up=True,
+            start_offset=indexed_offset,
+            end_offset=0,
+            ledger_size=0,
+            rows_scanned=0,
+            bytes_scanned=0,
+            rebuilt=bool(indexed_offset),
+        )
 
     size = ledger.stat().st_size
+    rebuilt = False
     if (
         indexed_offset > size
         or not _ledger_index_anchor_matches(connection, ledger, indexed_offset)
     ):
-        # A replaced, truncated, or rewritten ledger invalidates all cached
-        # dedup state. Rebuild from byte zero rather than silently dropping
-        # replacement evidence as "already seen".
+        # A replaced, truncated, or rewritten indexed prefix invalidates all
+        # cached dedup state. Rebuild from byte zero under the same bounded
+        # per-invocation catch-up budget.
         connection.execute("DELETE FROM snapshot_ids")
         indexed_offset = 0
+        rebuilt = True
 
+    start_offset = indexed_offset
     last_complete = indexed_offset
+    rows_scanned = 0
+    bytes_scanned = 0
     partial_raw: bytes | None = None
+    reached_eof = False
+
     with ledger.open("rb") as handle:
         handle.seek(indexed_offset)
-        while True:
+        while rows_scanned < max_rows and bytes_scanned < max_bytes:
+            row_start = handle.tell()
             raw = handle.readline()
             if not raw:
+                reached_eof = True
                 break
             end = handle.tell()
             if not raw.endswith(b"\n"):
                 partial_raw = raw
+                reached_eof = True
                 break
+
             last_complete = end
+            rows_scanned += 1
+            bytes_scanned += end - row_start
             try:
                 row = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -617,7 +668,9 @@ def _reconcile_ledger_index(
                     (snapshot_id,),
                 )
 
-    if partial_raw is not None:
+    # Only repair an incomplete tail when this bounded pass actually reached
+    # physical EOF. A budget boundary is never a truncated-record signal.
+    if reached_eof and partial_raw is not None:
         try:
             row = json.loads(partial_raw.decode("utf-8"))
             valid_complete = isinstance(row, dict)
@@ -637,6 +690,8 @@ def _reconcile_ledger_index(
                 handle.flush()
                 os.fsync(handle.fileno())
                 last_complete = handle.tell()
+            rows_scanned += 1
+            bytes_scanned += len(partial_raw) + 1
         else:
             # A crashed partial append is not a durable evidence record. Remove
             # only that incomplete tail before any later payload is appended.
@@ -647,6 +702,17 @@ def _reconcile_ledger_index(
 
     _set_ledger_index_checkpoint(connection, ledger, last_complete)
     connection.commit()
+
+    final_size = ledger.stat().st_size if ledger.exists() else 0
+    return _LedgerIndexReconcileResult(
+        caught_up=last_complete >= final_size,
+        start_offset=start_offset,
+        end_offset=last_complete,
+        ledger_size=final_size,
+        rows_scanned=rows_scanned,
+        bytes_scanned=bytes_scanned,
+        rebuilt=rebuilt,
+    )
 
 
 def _ledger_has_snapshot(
@@ -714,6 +780,8 @@ def _drain_outbox_locked(
     dead_letter: Path,
     batch_limit: int,
     processor: Callable[[dict[str, Any]], None] | None,
+    ledger_index_max_rows: int,
+    ledger_index_max_bytes: int,
 ) -> DrainResult:
     try:
         state = _load_checkpoint_state(checkpoint, source)
@@ -733,6 +801,7 @@ def _drain_outbox_locked(
 
     connection: sqlite3.Connection | None = None
     ledger_lock = ledger.parent / f".{ledger.name}.lock"
+    index_result: _LedgerIndexReconcileResult | None = None
 
     try:
         if processor is None:
@@ -743,7 +812,31 @@ def _drain_outbox_locked(
 
         with ledger_context:
             if connection is not None:
-                _reconcile_ledger_index(connection, ledger)
+                index_result = _reconcile_ledger_index(
+                    connection,
+                    ledger,
+                    max_rows=ledger_index_max_rows,
+                    max_bytes=ledger_index_max_bytes,
+                )
+                if not index_result.caught_up:
+                    # Dedup correctness requires a complete index for all
+                    # durable ledger history before any new outbox row can be
+                    # admitted. Persist bounded catch-up progress and return
+                    # cleanly; the next invocation resumes from that offset.
+                    return DrainResult(
+                        processed=0,
+                        duplicates=0,
+                        malformed=0,
+                        remaining_from_line=next_line,
+                        stopped_on_error=False,
+                        error_type=None,
+                        index_catchup_in_progress=True,
+                        index_reconciled_from_offset=index_result.start_offset,
+                        index_reconciled_to_offset=index_result.end_offset,
+                        index_ledger_size=index_result.ledger_size,
+                        index_rows_scanned=index_result.rows_scanned,
+                        index_bytes_scanned=index_result.bytes_scanned,
+                    )
 
             for item in batch:
                 try:
@@ -840,6 +933,22 @@ def _drain_outbox_locked(
         remaining_from_line=next_line,
         stopped_on_error=stopped,
         error_type=error_type,
+        index_catchup_in_progress=False,
+        index_reconciled_from_offset=(
+            index_result.start_offset if index_result is not None else 0
+        ),
+        index_reconciled_to_offset=(
+            index_result.end_offset if index_result is not None else 0
+        ),
+        index_ledger_size=(
+            index_result.ledger_size if index_result is not None else 0
+        ),
+        index_rows_scanned=(
+            index_result.rows_scanned if index_result is not None else 0
+        ),
+        index_bytes_scanned=(
+            index_result.bytes_scanned if index_result is not None else 0
+        ),
     )
 
 
@@ -851,6 +960,8 @@ def drain_outbox_to_evidence_ledger(
     dead_letter_path: Path | None = None,
     batch_limit: int = 100,
     processor: Callable[[dict[str, Any]], None] | None = None,
+    ledger_index_max_rows: int = LEDGER_INDEX_RECONCILE_MAX_ROWS,
+    ledger_index_max_bytes: int = LEDGER_INDEX_RECONCILE_MAX_BYTES,
 ) -> DrainResult:
     """Consume a bounded batch using a byte cursor and disk-backed dedup index.
 
@@ -865,6 +976,8 @@ def drain_outbox_to_evidence_ledger(
     dead_letter = dead_letter_path or DEFAULT_DEAD_LETTER_FILE
     if batch_limit < 1:
         raise ValueError("batch_limit must be >= 1")
+    if ledger_index_max_rows < 1 or ledger_index_max_bytes < 1:
+        raise ValueError("ledger index reconcile budgets must be >= 1")
     if not source.exists():
         return DrainResult(0, 0, 0, 0, False)
 
@@ -877,6 +990,8 @@ def drain_outbox_to_evidence_ledger(
             dead_letter=dead_letter,
             batch_limit=batch_limit,
             processor=processor,
+            ledger_index_max_rows=ledger_index_max_rows,
+            ledger_index_max_bytes=ledger_index_max_bytes,
         )
 
 

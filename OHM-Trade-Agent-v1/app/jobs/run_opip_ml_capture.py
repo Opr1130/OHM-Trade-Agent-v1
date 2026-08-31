@@ -27,6 +27,15 @@ def main() -> None:
         f"malformed={summary.p1_malformed}",
         f"stopped={summary.p1_stopped_on_error}",
     )
+    print(
+        "P1 index:",
+        f"catchup={summary.p1_index_catchup_in_progress}",
+        f"from={summary.p1_index_reconciled_from_offset}",
+        f"to={summary.p1_index_reconciled_to_offset}",
+        f"ledger_size={summary.p1_index_ledger_size}",
+        f"rows={summary.p1_index_rows_scanned}",
+        f"bytes={summary.p1_index_bytes_scanned}",
+    )
     if summary.error_type:
         print("Degraded:", summary.error_type)
 
