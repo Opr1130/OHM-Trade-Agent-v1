@@ -82,19 +82,19 @@ def _trade(side: TradeSide, base: float, notional: float, venue="BINANCE") -> Tr
 
 
 def test_positive_cvd_from_buy_pressure():
-    state = accumulate_cvd(empty_venue_cvd("BINANCE"), _trade(TradeSide.BUY_AGGRESSOR, 1.0, 100.0))
+    state = accumulate_cvd(empty_venue_cvd("BINANCE", "bitcoin"), _trade(TradeSide.BUY_AGGRESSOR, 1.0, 100.0))
     assert state.signed_base_volume == 1.0
     assert state.signed_notional_usd == 100.0
 
 
 def test_negative_cvd_from_sell_pressure():
-    state = accumulate_cvd(empty_venue_cvd("BINANCE"), _trade(TradeSide.SELL_AGGRESSOR, 1.0, 100.0))
+    state = accumulate_cvd(empty_venue_cvd("BINANCE", "bitcoin"), _trade(TradeSide.SELL_AGGRESSOR, 1.0, 100.0))
     assert state.signed_base_volume == -1.0
     assert state.signed_notional_usd == -100.0
 
 
 def test_mixed_trades_net_correctly():
-    state = empty_venue_cvd("BINANCE")
+    state = empty_venue_cvd("BINANCE", "bitcoin")
     state = accumulate_cvd(state, _trade(TradeSide.BUY_AGGRESSOR, 2.0, 200.0))
     state = accumulate_cvd(state, _trade(TradeSide.SELL_AGGRESSOR, 0.5, 50.0))
     assert state.signed_base_volume == pytest.approx(1.5)
@@ -103,7 +103,7 @@ def test_mixed_trades_net_correctly():
 
 
 def test_unknown_side_excluded_from_directional_delta_but_tracked():
-    state = empty_venue_cvd("BINANCE")
+    state = empty_venue_cvd("BINANCE", "bitcoin")
     state = accumulate_cvd(state, _trade(TradeSide.BUY_AGGRESSOR, 1.0, 100.0))
     state = accumulate_cvd(state, _trade(TradeSide.UNKNOWN, 5.0, 500.0))
     assert state.signed_base_volume == 1.0
@@ -114,14 +114,14 @@ def test_unknown_side_excluded_from_directional_delta_but_tracked():
 
 
 def test_cvd_uses_deterministic_floating_point_accumulation():
-    state = empty_venue_cvd("BINANCE")
+    state = empty_venue_cvd("BINANCE", "bitcoin")
     for _ in range(3):
         state = accumulate_cvd(state, _trade(TradeSide.BUY_AGGRESSOR, 0.1, 10.0))
     assert state.signed_base_volume == pytest.approx(0.3, abs=1e-9)
 
 
 def test_venue_mismatch_rejected():
-    state = empty_venue_cvd("BINANCE")
+    state = empty_venue_cvd("BINANCE", "bitcoin")
     with pytest.raises(ValueError):
         accumulate_cvd(state, _trade(TradeSide.BUY_AGGRESSOR, 1.0, 100.0, venue="BYBIT"))
 
@@ -205,7 +205,7 @@ def test_matching_unique_identity_combines():
 
 
 def _venue_state(notional: float, base: float = 1.0, venue="BINANCE", gross=None):
-    state = empty_venue_cvd(venue)
+    state = empty_venue_cvd(venue, "bitcoin")
     side = TradeSide.BUY_AGGRESSOR if notional >= 0 else TradeSide.SELL_AGGRESSOR
     return accumulate_cvd(state, _trade(side, base, abs(notional), venue=venue))
 
@@ -286,11 +286,11 @@ def test_cross_venue_normalized_notional_not_raw_volume_sum():
     """Base-volume sums would be misleading across venues with different
     contract conventions; combination must happen on notional terms."""
     binance = accumulate_cvd(
-        empty_venue_cvd("BINANCE"),
+        empty_venue_cvd("BINANCE", "bitcoin"),
         _trade(TradeSide.BUY_AGGRESSOR, 1.0, 60000.0, venue="BINANCE"),
     )
     bybit = accumulate_cvd(
-        empty_venue_cvd("BYBIT"),
+        empty_venue_cvd("BYBIT", "bitcoin"),
         _trade(TradeSide.BUY_AGGRESSOR, 100.0, 60000.0, venue="BYBIT"),
     )
     snapshot = combine_cross_venue(
@@ -304,14 +304,14 @@ def test_cross_venue_normalized_notional_not_raw_volume_sum():
 
 def test_cross_venue_mixed_neutral_when_both_within_neutral_band():
     tiny = accumulate_cvd(
-        empty_venue_cvd("BINANCE"),
+        empty_venue_cvd("BINANCE", "bitcoin"),
         _trade(TradeSide.BUY_AGGRESSOR, 0.001, 1.0, venue="BINANCE"),
     )
     tiny = accumulate_cvd(
         tiny, _trade(TradeSide.SELL_AGGRESSOR, 0.001, 0.99, venue="BINANCE")
     )
     other = accumulate_cvd(
-        empty_venue_cvd("BYBIT"), _trade(TradeSide.BUY_AGGRESSOR, 0.001, 1.0, venue="BYBIT")
+        empty_venue_cvd("BYBIT", "bitcoin"), _trade(TradeSide.BUY_AGGRESSOR, 0.001, 1.0, venue="BYBIT")
     )
     other = accumulate_cvd(
         other, _trade(TradeSide.SELL_AGGRESSOR, 0.001, 0.99, venue="BYBIT")
@@ -437,3 +437,28 @@ def test_degraded_liquidation_evidence_is_caller_filtered_not_silently_included(
     result = assess_liquidation_synchronization(filtered, window_seconds=5)
     assert result.state == LiquidationSyncState.INSUFFICIENT_EVIDENCE
     assert result.participating_venues == ("BINANCE",)
+
+
+def test_cvd_rejects_cross_asset_observation():
+    state = empty_venue_cvd("BINANCE", "bitcoin")
+    observation = TradeObservation(
+        canonical_asset_id="ethereum",
+        identity_status=MappingStatus.UNIQUE,
+        venue="BINANCE",
+        side=TradeSide.BUY_AGGRESSOR,
+        base_quantity=1.0,
+        notional_usd=100.0,
+        provider_timestamp_utc=NOW,
+    )
+    with pytest.raises(ValueError, match="asset"):
+        accumulate_cvd(state, observation)
+
+
+def test_cross_venue_rejects_state_for_different_asset():
+    state = empty_venue_cvd("BINANCE", "ethereum")
+    with pytest.raises(ValueError, match="asset"):
+        combine_cross_venue(
+            canonical_asset_id="bitcoin",
+            venue_states={"BINANCE": state},
+            venue_qualities={"BINANCE": COMPLETE},
+        )
