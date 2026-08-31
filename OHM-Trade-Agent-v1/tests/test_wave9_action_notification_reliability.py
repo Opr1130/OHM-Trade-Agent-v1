@@ -323,11 +323,67 @@ def test_alerts_do_not_render_uncalibrated_confidence_percent():
     assert "Setup Score: 84/100 (not probability)" in pending_message
 
 
-def test_qualified_retry_is_after_active_protection():
-    import inspect
 
-    source = inspect.getsource(run_cycle._run_cycle_once)
-    active = source.index("monitor_active_main()")
-    retry = source.index("_run_qualified_alert_retry_fail_open", active)
-    pending = source.index("monitor_pending_main()", active)
-    assert active < retry < pending
+def test_qualified_retry_is_after_active_protection(monkeypatch):
+    calls = []
+    reconciliation = SimpleNamespace(
+        status="OK",
+        mode="observe",
+        active_checked=0,
+        order_intents_checked=0,
+        open_orders_seen=0,
+        fills_seen=0,
+        would_close=(),
+        closed=(),
+        would_fill=(),
+        filled=(),
+        reason="",
+    )
+    external_review = SimpleNamespace(
+        status="OK",
+        unmatched_orders_seen=0,
+        new_reviews=0,
+        notifications_sent=0,
+        reason="",
+    )
+    operator = SimpleNamespace(
+        override_mode="AUTO",
+        effective_mode="MONITOR",
+        occupied_slots=0,
+        active_trades=0,
+        live_order_intents=0,
+        pending_setups=0,
+        quiet_hours=False,
+        reason="",
+    )
+    monkeypatch.setattr(run_cycle, "reconcile_kraken_account", lambda: reconciliation)
+    monkeypatch.setattr(run_cycle, "review_external_open_orders", lambda: external_review)
+    monkeypatch.setattr(
+        run_cycle,
+        "run_learning_cycle",
+        lambda: {
+            "status": "OK",
+            "paid_ai_calls": 0,
+            "shadow": {},
+            "price_movement": {},
+            "profile_refreshed": False,
+            "profile_status": "OK",
+        },
+    )
+    monkeypatch.setattr(run_cycle, "get_operator_decision", lambda: operator)
+    monkeypatch.setattr(run_cycle, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(run_cycle, "monitor_active_main", lambda: calls.append("active"))
+    monkeypatch.setattr(
+        run_cycle,
+        "_run_qualified_alert_retry_fail_open",
+        lambda **kwargs: calls.append("retry"),
+    )
+    monkeypatch.setattr(run_cycle, "_run_entry_watch_recheck_fail_open", lambda: False)
+    monkeypatch.setattr(run_cycle, "monitor_pending_main", lambda: calls.append("pending"))
+    monkeypatch.setattr(run_cycle, "_run_early_watch_if_due", lambda **kwargs: None)
+    monkeypatch.setattr(run_cycle, "_run_paper_monitor_fail_open", lambda: None)
+    monkeypatch.setattr(run_cycle, "_run_event_intelligence_fail_open", lambda **kwargs: None)
+
+    run_cycle._run_cycle_once()
+
+    assert calls[:3] == ["active", "retry", "pending"]
