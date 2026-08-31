@@ -64,6 +64,12 @@ class MLCaptureSummary:
     p1_duplicates: int = 0
     p1_malformed: int = 0
     p1_stopped_on_error: bool = False
+    p1_index_catchup_in_progress: bool = False
+    p1_index_reconciled_from_offset: int = 0
+    p1_index_reconciled_to_offset: int = 0
+    p1_index_ledger_size: int = 0
+    p1_index_rows_scanned: int = 0
+    p1_index_bytes_scanned: int = 0
     error_type: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -359,6 +365,29 @@ def _write_snapshot_chunk_atomic(
     return True, destination
 
 
+def _p1_index_telemetry(p1: Any) -> dict[str, Any]:
+    return {
+        "p1_index_catchup_in_progress": bool(
+            getattr(p1, "index_catchup_in_progress", False)
+        ),
+        "p1_index_reconciled_from_offset": int(
+            getattr(p1, "index_reconciled_from_offset", 0) or 0
+        ),
+        "p1_index_reconciled_to_offset": int(
+            getattr(p1, "index_reconciled_to_offset", 0) or 0
+        ),
+        "p1_index_ledger_size": int(
+            getattr(p1, "index_ledger_size", 0) or 0
+        ),
+        "p1_index_rows_scanned": int(
+            getattr(p1, "index_rows_scanned", 0) or 0
+        ),
+        "p1_index_bytes_scanned": int(
+            getattr(p1, "index_bytes_scanned", 0) or 0
+        ),
+    }
+
+
 def _capture_ml_production_evidence_locked(
     *,
     evidence_path: Path = DEFAULT_EVIDENCE_LEDGER,
@@ -412,6 +441,7 @@ def _capture_ml_production_evidence_locked(
             p1_duplicates=p1.duplicates,
             p1_malformed=p1.malformed,
             p1_stopped_on_error=p1.stopped_on_error,
+            **_p1_index_telemetry(p1),
             error_type=f"ML_CAPTURE_CURSOR_UNREADABLE:{type(exc).__name__}",
         )
         save_json_atomic(health_path, summary.as_dict())
@@ -524,6 +554,7 @@ def _capture_ml_production_evidence_locked(
                 p1_duplicates=p1.duplicates,
                 p1_malformed=p1.malformed,
                 p1_stopped_on_error=p1.stopped_on_error,
+                **_p1_index_telemetry(p1),
                 error_type=f"ML_SNAPSHOT_CHUNK_WRITE_FAILED:{type(exc).__name__}",
             )
             save_json_atomic(health_path, summary.as_dict())
@@ -569,6 +600,7 @@ def _capture_ml_production_evidence_locked(
         p1_duplicates=p1.duplicates,
         p1_malformed=p1.malformed,
         p1_stopped_on_error=p1.stopped_on_error,
+        **_p1_index_telemetry(p1),
         error_type=p1.error_type if p1.stopped_on_error else None,
     )
     save_json_atomic(health_path, summary.as_dict())
