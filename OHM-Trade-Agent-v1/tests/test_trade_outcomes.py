@@ -240,6 +240,40 @@ def test_stop_first_then_later_target_is_not_counted_as_target_success(monkeypat
     assert summary["opportunity_rank_bins"]["1"]["t2_observed"] == 0
 
 
+def test_pre_entry_target_observation_is_ignored(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    item["forecast_horizon_hours"] = 4.0
+    trade_id = "OHM-BTC-PRE-ENTRY"
+    outcomes.record_recommendation(
+        trade_id=trade_id,
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100,
+        stop_price=90,
+        target_1=110,
+        target_2=120,
+        risk_level="low",
+        opened_at="2026-08-09T20:00:00+00:00",
+        trade_id=trade_id,
+    )
+    outcomes.mark_trade_entered(trade, entry_price_source="manual_actual_fill")
+    record = outcomes.update_active_observation(
+        trade,
+        121,
+        observed_at="2026-08-09T19:59:00+00:00",
+    )
+
+    assert record["target_1_observed"] is False
+    assert record["target_2_observed"] is False
+    assert outcomes._target_before_stop(record, 1) is False
+    assert any("Pre-entry observation ignored" in w for w in record["observation_warnings"])
+
+
 def test_target_after_forecast_horizon_is_not_counted_as_success(monkeypatch, tmp_path):
     isolate(monkeypatch, tmp_path)
     item = candidate()
