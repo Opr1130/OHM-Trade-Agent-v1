@@ -41,6 +41,7 @@ from app.exchanges.kraken_identity import (
 )
 from app.exchanges.kraken_private import KrakenPrivateClient
 from app.services.active_trade_registry import get_active_trades
+from app.services.kraken_credential_audit import PASS as KRAKEN_AUDIT_PASS, audit_kraken_read_only
 from app.services.kraken_reconciliation import reconciliation_enabled, reconciliation_mode
 from app.services.pending_setup_registry import PENDING_FILE
 from app.services.registry_io import load_json, registry_lock
@@ -89,10 +90,13 @@ result['pending_lifecycle'] = {
 client = KrakenPrivateClient()
 result['kraken'] = {'credentials_configured': client.enabled}
 
-if client.enabled:
+audit = audit_kraken_read_only(client)
+result['kraken']['read_only_status'] = audit.status
+result['kraken']['read_only_verified'] = audit.status == KRAKEN_AUDIT_PASS
+result['kraken']['read_only_audit_reason'] = audit.reason
+
+if audit.status == KRAKEN_AUDIT_PASS:
     try:
-        key = client.assert_read_only()
-        result['kraken']['read_only_verified'] = key.is_read_only
         balances = client.get_balance()
         positions = client.get_open_positions()
 
@@ -116,6 +120,10 @@ if client.enabled:
 attention = []
 if not client.enabled:
     attention.append('KRAKEN_CREDENTIALS_UNAVAILABLE')
+elif audit.status != KRAKEN_AUDIT_PASS:
+    # Unknown/unverified permission state must never be reported as PASS.
+    # This also covers a positively-confirmed non-read-only key.
+    attention.append('KRAKEN_KEY_NOT_VERIFIED_READ_ONLY')
 if not result['reconciliation']['enabled']:
     attention.append('KRAKEN_RECONCILIATION_DISABLED')
 if result['reconciliation']['mode'] != 'apply':
@@ -135,6 +143,7 @@ PY
 
 ## Interpretation
 
+- `read_only_status` is one of `PASS`, `FAIL`, or `UNVERIFIED`. Unknown or unverified permission state (missing credentials, API failure, timeout, malformed response, or a response that omits permissions entirely) is never reported as `PASS`; only a positively confirmed read-only key reaches `PASS`, and only then are balances/positions collected.
 - `enabled=false` or `mode!=apply` is a blocking Wave-0 finding because current qualified-alert tracking requires reconciliation apply mode.
 - non-zero Kraken assets absent from the active registry are candidate unmanaged holdings; settlement/stablecoin/dust assets must be classified conservatively before any automatic protection lifecycle is created.
 - `tracking_failed` and `send_failed` counts estimate qualified-opportunity recall loss caused by terminalization on tracking/delivery failure.
