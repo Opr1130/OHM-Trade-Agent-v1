@@ -12,6 +12,7 @@ MAX_EXPORT_AGE_SECONDS=300
 MAX_SYNC_AGE_SECONDS=300
 MAX_CAPTURE_AGE_SECONDS=900
 MAX_OUTCOMES_AGE_SECONDS=1800
+MAX_FUTURE_SKEW_SECONDS=120
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run O'Pip learning diagnostics as root" >&2
@@ -45,7 +46,9 @@ age_seconds() {
   [[ -n "$raw" ]] || return 1
   epoch="$(date -u -d "$raw" +%s 2>/dev/null || true)"
   [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
-  if (( epoch > now_epoch )); then
+  if (( epoch > now_epoch + MAX_FUTURE_SKEW_SECONDS )); then
+    return 1
+  elif (( epoch > now_epoch )); then
     printf '0\n'
   else
     printf '%s\n' "$((now_epoch - epoch))"
