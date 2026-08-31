@@ -11,7 +11,12 @@ from app.exchanges.kraken_identity import (
     split_canonical_pair,
 )
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
-from app.services.active_trade_registry import ActiveTrade, close_trade, get_active_trades
+from app.services.active_trade_registry import (
+    ActiveTrade,
+    close_trade,
+    get_active_trades,
+    update_trade_remaining_quantity,
+)
 from app.services.execution_learning_registry import record_execution_event
 from app.services.order_intent_registry import (
     bind_exchange_order_txid,
@@ -258,6 +263,31 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
         should_close = False
         verified_absent = False
 
+        actual_entry_quantity = trade.entry_quantity
+        if actual_entry_quantity is not None:
+            try:
+                actual_entry_quantity = float(actual_entry_quantity)
+            except (TypeError, ValueError):
+                actual_entry_quantity = None
+        if (
+            actual_entry_quantity is not None
+            and (not math.isfinite(actual_entry_quantity) or actual_entry_quantity <= 0)
+        ):
+            actual_entry_quantity = None
+
+        if actual_entry_quantity is not None:
+            # Treat every observed opposite-side spot fill after entry as a
+            # reduction of OHM-managed quantity. A manual sell may therefore
+            # understate managed exposure, which is conservative because it
+            # leaves more balance visible as unmanaged rather than hiding it.
+            reconciled_remaining = max(0.0, actual_entry_quantity - qty)
+            if mode == "apply":
+                update_trade_remaining_quantity(
+                    trade.symbol,
+                    reconciled_remaining,
+                )
+            expected = actual_entry_quantity
+
         # Spot LONG reconciliation is intentionally conservative: an observed
         # sell after OHM's entry must cover nearly all expected quantity and
         # Kraken must no longer show a meaningful base-asset balance.
@@ -381,6 +411,7 @@ def reconcile_kraken_account(client: KrakenPrivateClient | None = None) -> Recon
                     intent.trade_id,
                     fill_price=vwap,
                     actual_entry_fee=fee,
+                    fill_quantity=qty,
                     entry_price_source="kraken_reconciliation_fill",
                 )
                 filled.append(intent.trade_id)
