@@ -50,7 +50,10 @@ def enqueue_entry_watch(
     normalized_direction = str(direction).upper()
     if normalized_direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
-    key = f"{symbol.upper()}:{normalized_direction}"
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        raise ValueError("symbol must be a non-empty market identifier")
+    key = f"{normalized_symbol}:{normalized_direction}"
     with registry_lock(_lock_file()):
         rows = load_json(ENTRY_WATCH_FILE)
         for existing_key, existing_row in list(rows.items()):
@@ -62,7 +65,7 @@ def enqueue_entry_watch(
         if is_new:
             row = {
                 "schema_version": 1,
-                "symbol": symbol.upper(),
+                "symbol": normalized_symbol,
                 "direction": normalized_direction,
                 "candidate_id": candidate_id,
                 "first_seen_at": current.isoformat(),
@@ -108,8 +111,8 @@ def due_entry_watch(*, now: datetime | None = None) -> list[dict]:
                 rows.pop(key, None)
                 changed = True
                 continue
-            symbol = str(row.get("symbol") or "").upper()
-            direction = str(row.get("direction") or "").upper()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            direction = str(row.get("direction") or "").strip().upper()
             if not symbol or direction not in {"LONG", "SHORT"}:
                 rows.pop(key, None)
                 changed = True
@@ -121,7 +124,9 @@ def due_entry_watch(*, now: datetime | None = None) -> list[dict]:
                 continue
             next_due = _parse(row.get("next_due_at"))
             if next_due is None or next_due <= current:
-                due.append(dict(row))
+                due_row = dict(row)
+                due_row["_watch_key"] = key
+                due.append(due_row)
         if changed:
             save_json_atomic(ENTRY_WATCH_FILE, rows)
 
@@ -162,7 +167,15 @@ def defer_entry_watch(
 
 
 def remove_entry_watch(symbol: str, direction: str) -> bool:
-    key = f"{symbol.upper()}:{direction.upper()}"
+    return remove_entry_watch_key(f"{symbol.upper()}:{direction.upper()}")
+
+
+def remove_entry_watch_key(key: str) -> bool:
+    """Terminalize an entry-watch row by its exact queue key.
+
+    Used to quarantine a malformed row whose symbol/direction fields cannot
+    be trusted to reconstruct the original storage key.
+    """
     with registry_lock(_lock_file()):
         rows = load_json(ENTRY_WATCH_FILE)
         if key not in rows:
