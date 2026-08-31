@@ -222,6 +222,8 @@ def test_learning_reader_key_is_forced_read_only_and_source_bound():
 
     assert 'from="%s",restrict,command="%s" %s' in configure
     assert 'SOURCE_CIDR="${2:-}"' in configure
+    assert 'READER_STATE_ROOT="/var/lib/opip-learning-reader"' in configure
+    assert 'install -d -o "$USER_NAME" -g "$USER_NAME" -m 0750 "$READER_STATE_ROOT"' in configure
     assert 'ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"' in reader
     assert 'if [[ "$ORIGINAL" == "opip-export-v1" ]]' in reader
     assert "opip-export-v2" in reader
