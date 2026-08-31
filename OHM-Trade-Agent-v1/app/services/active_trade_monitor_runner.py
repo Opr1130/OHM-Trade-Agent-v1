@@ -179,7 +179,13 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     for exposure in resolution.exposures:
         if exposure.status == "VERIFIED_UNMANAGED":
             positions_unmanaged += 1
-            _notify_unmanaged_holding(settings=settings, exposure=exposure)
+            try:
+                _notify_unmanaged_holding(settings=settings, exposure=exposure)
+            except Exception as exc:
+                failures.append(
+                    f"{exposure.symbol}: unmanaged-holding notification failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             continue
 
         trade = exposure.trade
