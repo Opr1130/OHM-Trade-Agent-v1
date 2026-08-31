@@ -365,6 +365,14 @@ def get_outcomes() -> list[dict[str, Any]]:
         return list(_load_raw().values())
 
 
+def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
+    target_at = _parse_time(item.get(f"target_{target_number}_first_observed_at"))
+    if target_at is None:
+        return False
+    stop_at = _parse_time(item.get("stop_first_observed_at"))
+    return stop_at is None or target_at <= stop_at
+
+
 def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
     outcomes = get_outcomes()
     resolved_entered = [
@@ -392,12 +400,12 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
             label = f"{low:02d}-{min(low + 9, 100):02d}"
             bucket = confidence_bins.setdefault(label, {"count": 0, "t2_observed": 0})
             bucket["count"] += 1
-            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
         rank = item.get("profit_rank")
         if isinstance(rank, int):
             bucket = rank_bins.setdefault(str(rank), {"count": 0, "t2_observed": 0})
             bucket["count"] += 1
-            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
         opportunity_rank = item.get("opportunity_rank")
         if isinstance(opportunity_rank, int):
             bucket = opportunity_rank_bins.setdefault(
@@ -405,8 +413,8 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
                 {"count": 0, "t1_observed": 0, "t2_observed": 0},
             )
             bucket["count"] += 1
-            bucket["t1_observed"] += int(bool(item.get("target_1_observed")))
-            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+            bucket["t1_observed"] += int(_target_before_stop(item, 1))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
 
         for source_field, buckets in (
             ("continuation_score", continuation_bins),
@@ -422,12 +430,12 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
                     {"count": 0, "t1_observed": 0, "t2_observed": 0},
                 )
                 bucket["count"] += 1
-                bucket["t1_observed"] += int(bool(item.get("target_1_observed")))
-                bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+                bucket["t1_observed"] += int(_target_before_stop(item, 1))
+                bucket["t2_observed"] += int(_target_before_stop(item, 2))
         direction = str(item.get("direction") or "LONG").upper()
         bucket = direction_bins.setdefault(direction, {"count": 0, "t2_observed": 0})
         bucket["count"] += 1
-        bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+        bucket["t2_observed"] += int(_target_before_stop(item, 2))
 
     return {
         "status": "AVAILABLE",
