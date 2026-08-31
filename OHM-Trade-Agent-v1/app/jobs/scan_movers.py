@@ -391,6 +391,16 @@ def _enqueue_wave9_monitoring(full_market, signals, *, observed_at: datetime) ->
     return queued, failures
 
 
+def _watch_telegram_enabled(settings) -> bool:
+    return bool(
+        not bool(getattr(settings, "opip_actionable_only_alerts", False))
+        and str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
+        and settings.telegram_enabled
+        and settings.telegram_bot_token
+        and settings.telegram_chat_id
+    )
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -478,13 +488,7 @@ def main() -> None:
     transition_push_failures = 0
     early_mover_delivery: dict[str, tuple[str, bool]] = {}
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
-    if (
-        not bool(getattr(settings, "opip_actionable_only_alerts", False))
-        and str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
-        and settings.telegram_enabled
-        and settings.telegram_bot_token
-        and settings.telegram_chat_id
-    ):
+    if _watch_telegram_enabled(settings):
         repeat_cooldown = max(
             int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
             21600,
