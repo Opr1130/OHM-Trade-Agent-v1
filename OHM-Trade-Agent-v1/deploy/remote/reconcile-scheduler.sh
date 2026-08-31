@@ -17,6 +17,7 @@ LEARNING_DIAGNOSTICS_SRC="$APP_ROOT/deploy/remote/diagnose-opip-learning.sh"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
+LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"
 LEARNING_READER_STATE="/var/lib/opip-learning-reader"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -129,6 +130,7 @@ install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 install -o root -g root -m 0755 "$DEPLOY_SCRIPT_SRC" "$DEPLOY_SCRIPT_DST"
 install -o root -g root -m 0755 "$SSH_GATEWAY_SRC" "$SSH_GATEWAY_DST"
 install -o root -g root -m 0755 "$LEARNING_READER_SRC" "$LEARNING_READER_DST"
+install -o root -g root -m 0755 "$LEARNING_DIAGNOSTICS_SRC" "$LEARNING_DIAGNOSTICS_DST"
 if id opiplearn >/dev/null 2>&1; then
   install -d -o opiplearn -g opiplearn -m 0750 "$LEARNING_READER_STATE"
 fi
