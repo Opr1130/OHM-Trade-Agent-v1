@@ -49,6 +49,19 @@ def test_private_client_accepts_read_only_permissions(monkeypatch):
     assert info.name == "ohm-read-only"
 
 
+def test_private_client_fails_closed_when_permissions_not_reported(monkeypatch):
+    from app.exchanges.kraken_private import KrakenPermissionUnverifiable
+
+    client = KrakenPrivateClient(api_key="key", api_secret="c2VjcmV0")
+    monkeypatch.setattr(
+        client,
+        "_post",
+        lambda endpoint, params=None: {"apiKeyName": "ohm-no-permissions-field"},
+    )
+    with pytest.raises(KrakenPermissionUnverifiable):
+        client.assert_read_only()
+
+
 def test_private_client_signs_exact_post_body(monkeypatch):
     client = KrakenPrivateClient(api_key="key", api_secret="c2VjcmV0")
     monkeypatch.setattr(client, "_nonce", lambda: 123456789)
