@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.jobs import run_cycle
-from app.services import entry_watch_recheck
+from app.services import entry_watch_queue, entry_watch_recheck
 
 
 def _cycle_decision():
@@ -181,14 +182,16 @@ def test_ready_fast_recheck_only_requests_full_scan(monkeypatch):
     monkeypatch.setattr(
         entry_watch_recheck,
         "defer_entry_watch",
-        lambda *args, **kwargs: deferred.append(args) or True,
+        lambda *args, **kwargs: deferred.append((args, kwargs)) or True,
     )
 
     summary = entry_watch_recheck.recheck_due_entry_watch()
 
     assert summary.full_scan_required is True
     assert summary.ready_symbols == ("SOLUSD",)
-    assert deferred == [("SOLUSD", "LONG")]
+    assert deferred[0][0] == ("SOLUSD", "LONG")
+    assert deferred[0][1]["recheck_seconds"] == 300
+    assert deferred[0][1]["accelerated_scan"] is True
 
 
 def test_not_ready_fast_recheck_defers_without_full_scan(monkeypatch):
@@ -225,3 +228,66 @@ def test_not_ready_fast_recheck_defers_without_full_scan(monkeypatch):
     assert summary.ready_symbols == ()
     assert summary.deferred == 1
     assert deferred
+
+def test_reenqueue_preserves_original_entry_watch_expiry(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        entry_watch_queue,
+        "ENTRY_WATCH_FILE",
+        tmp_path / "entry_watch.json",
+    )
+    start = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    entry_watch_queue.enqueue_entry_watch(
+        symbol="SOLUSD",
+        direction="LONG",
+        candidate_id="C1",
+        continuation_score=80,
+        now=start,
+        ttl_seconds=300,
+    )
+    entry_watch_queue.enqueue_entry_watch(
+        symbol="SOLUSD",
+        direction="LONG",
+        candidate_id="C2",
+        continuation_score=90,
+        now=start + timedelta(seconds=120),
+        ttl_seconds=300,
+    )
+
+    assert entry_watch_queue.due_entry_watch(
+        now=start + timedelta(seconds=301)
+    ) == []
+
+
+def test_accelerated_defer_records_scan_and_longer_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        entry_watch_queue,
+        "ENTRY_WATCH_FILE",
+        tmp_path / "entry_watch.json",
+    )
+    start = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    entry_watch_queue.enqueue_entry_watch(
+        symbol="SOLUSD",
+        direction="LONG",
+        candidate_id="C1",
+        continuation_score=80,
+        now=start,
+        ttl_seconds=900,
+        recheck_seconds=60,
+    )
+    assert entry_watch_queue.defer_entry_watch(
+        "SOLUSD",
+        "LONG",
+        now=start + timedelta(seconds=61),
+        recheck_seconds=300,
+        accelerated_scan=True,
+    )
+    assert entry_watch_queue.due_entry_watch(
+        now=start + timedelta(seconds=300)
+    ) == []
+    due = entry_watch_queue.due_entry_watch(
+        now=start + timedelta(seconds=362)
+    )
+    assert len(due) == 1
+    assert due[0]["last_accelerated_scan_at"] == (
+        start + timedelta(seconds=61)
+    ).isoformat()
