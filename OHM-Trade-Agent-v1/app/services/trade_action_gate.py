@@ -42,6 +42,18 @@ def apply_action_gate(
         candidate["portfolio_risk_reason"] = reason
         return ActionGateDecision(False, reason)
 
+    try:
+        account_capital = float(account_capital)
+    except (TypeError, ValueError):
+        account_capital = math.nan
+    if not math.isfinite(account_capital) or account_capital <= 0:
+        reason = "account capital is unavailable or invalid"
+        candidate["action_gate_evaluated"] = True
+        candidate["action_gate_allowed"] = False
+        candidate["portfolio_risk_allowed"] = False
+        candidate["portfolio_risk_reason"] = reason
+        return ActionGateDecision(False, reason)
+
     trades = list(active_trades) if active_trades is not None else get_active_trades()
     try:
         intelligence = evaluate_trade_decision(
