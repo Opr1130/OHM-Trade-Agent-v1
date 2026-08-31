@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
+from app.core.config import Settings
 from app.opip.ml.contracts import FeatureSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -70,6 +71,8 @@ def _exhaustion(features: dict[str, Any]) -> tuple[str, float]:
 
 def assess_continuation(
     snapshot: FeatureSnapshot,
+    *,
+    min_liquidity_usd: float | None = None,
 ) -> ContinuationAssessment:
     features = snapshot.ml_feature_mapping()
     direction = snapshot.direction
@@ -80,10 +83,16 @@ def assess_continuation(
     liquidity = _number(features, "combined_24h_liquidity_usd")
     execution_status = str(features.get("execution_availability") or "UNAVAILABLE").upper()
     drag = _number(features, "execution_drag_pct")
-    exhaustion_state, extension_atr = _exhaustion(features)
+    exhaustion_state, _ = _exhaustion(features)
+    if min_liquidity_usd is None:
+        min_liquidity_usd = float(
+            Settings.model_fields["signal_quality_min_liquidity_usd"].default
+        )
 
-    if liquidity is not None and liquidity < 100_000:
-        vetoes.append("LIQUIDITY_BELOW_100K")
+    if liquidity is None:
+        vetoes.append("LIQUIDITY_UNAVAILABLE")
+    elif liquidity < float(min_liquidity_usd):
+        vetoes.append("LIQUIDITY_BELOW_CONFIGURED_MINIMUM")
     if execution_status in {"INVALID", "REJECTED"}:
         vetoes.append("EXECUTION_INVALID")
     if drag is not None and drag > 2.0:
@@ -293,8 +302,13 @@ def assess_entry(
 def assess_trade_quality(
     snapshot: FeatureSnapshot,
     plan: EntryExitPlan,
+    *,
+    min_liquidity_usd: float | None = None,
 ) -> TradePlanAssessment:
-    continuation = assess_continuation(snapshot)
+    continuation = assess_continuation(
+        snapshot,
+        min_liquidity_usd=min_liquidity_usd,
+    )
     entry = assess_entry(snapshot, plan, continuation)
     actionable = continuation.decision == "PASS" and entry.decision == "PASS"
     return TradePlanAssessment(
