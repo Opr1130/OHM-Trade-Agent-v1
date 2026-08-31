@@ -16,7 +16,10 @@ from app.services.active_trade_registry import ActiveTrade
 from app.services.kraken_exposure_resolver import KrakenExposureResolver
 from app.services.opportunity_monitor_queue import CandidateObservation
 from app.services.position_materiality import refine_protection_action
-from app.services.qualified_trade_tracking import ReconciliationTrackingDisabled
+from app.services.qualified_trade_tracking import (
+    ReconciliationIdentityMismatch,
+    ReconciliationTrackingDisabled,
+)
 from app.services.trade_monitor import TradeMonitorResult
 
 
@@ -117,6 +120,51 @@ def test_monitor_queue_missing_rs_observation_preserves_full_history(
     )[0]
     assert after["relative_strength_history"] == before_history
     assert len(after["relative_strength_history"]) == 12
+
+
+def test_monitor_queue_recovers_invalid_source_priority_shape(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        opportunity_monitor_queue,
+        "QUEUE_FILE",
+        tmp_path / "queue.json",
+    )
+    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    opportunity_monitor_queue.upsert_candidate(
+        CandidateObservation(
+            symbol="SOLUSD",
+            direction="LONG",
+            source="FULL_MARKET",
+            observed_at=now,
+            priority_score=80.0,
+        )
+    )
+    rows = json.loads(
+        opportunity_monitor_queue.QUEUE_FILE.read_text(encoding="utf-8")
+    )
+    rows["SOLUSD:LONG"]["source_priority_scores"] = ["corrupt"]
+    opportunity_monitor_queue.QUEUE_FILE.write_text(
+        json.dumps(rows),
+        encoding="utf-8",
+    )
+
+    opportunity_monitor_queue.upsert_candidate(
+        CandidateObservation(
+            symbol="SOLUSD",
+            direction="LONG",
+            source="EARLY_MOVER",
+            observed_at=now + timedelta(minutes=1),
+            priority_score=75.0,
+        )
+    )
+
+    row = opportunity_monitor_queue.read_candidates(
+        now=now + timedelta(minutes=1)
+    )[0]
+    assert row["source_priority_scores"] == {"EARLY_MOVER": 75.0}
+    assert row["priority_score"] == 75.0
 
 
 def test_failopen_notification_confirmation_persists_after_storage_recovers(
@@ -292,6 +340,11 @@ def test_malformed_outbox_records_audit_and_terminalizes(monkeypatch):
     )
     monkeypatch.setattr(
         qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
         "terminalize_pending_setup",
         lambda trade_id, status: terminalized.append((trade_id, status)) or True,
     )
@@ -311,6 +364,122 @@ def test_malformed_outbox_records_audit_and_terminalizes(monkeypatch):
     assert terminalized == [("Q-AUDIT-BAD", "delivery_malformed")]
     assert removed == [("Q-AUDIT-BAD", "lease")]
     assert audits[0]["reason"].startswith("OUTBOX_MALFORMED:")
+
+
+def test_malformed_outbox_retains_row_when_lifecycle_retirement_fails(
+    monkeypatch,
+):
+    row = {
+        "trade_id": "Q-BAD-PENDING",
+        "plan": {"not": "an entry plan"},
+    }
+    removed = []
+    released = []
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_claim",
+        lambda trade_id: ("lease", dict(row)),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "record_telegram_not_eligible",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: False,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: released.append((trade_id, token)) or True,
+    )
+
+    status = qualified_alert_outbox._retry_one(
+        "Q-BAD-PENDING",
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert status == "MALFORMED_PENDING"
+    assert removed == []
+    assert released == [("Q-BAD-PENDING", "lease")]
+
+
+def test_reconciliation_identity_mismatch_terminalizes_outbox(monkeypatch):
+    row = {
+        "trade_id": "Q-MISMATCH",
+        "plan": _queued_plan(),
+        "direction": "LONG",
+        "action": "ENTER_NOW",
+        "tracking_candidate": {
+            "economic_qualified": True,
+            "recommended_capital": 100.0,
+        },
+        "identity": "QUALIFIED_OPPORTUNITY:Q-MISMATCH",
+        "fingerprint": "fp",
+        "message": "trade",
+        "leverage": 1.0,
+    }
+    terminalized = []
+    removed = []
+    suppressions = []
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_claim",
+        lambda trade_id: ("lease", dict(row)),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ReconciliationIdentityMismatch("conflict")
+        ),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalized.append(
+            (trade_id, status)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "record_telegram_suppression",
+        lambda **kwargs: suppressions.append(kwargs),
+    )
+
+    status = qualified_alert_outbox._retry_one(
+        "Q-MISMATCH",
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert status == "SUPPRESSED"
+    assert terminalized == [("Q-MISMATCH", "tracking_failed")]
+    assert removed == [("Q-MISMATCH", "lease")]
+    assert suppressions[-1]["reason"] == "TRACKING_IDENTITY_MISMATCH_TERMINAL"
 
 
 def test_non_numeric_outbox_leverage_is_malformed_and_removed(monkeypatch):
