@@ -143,15 +143,90 @@ def test_kraken_unavailable_never_becomes_absent():
 
 def test_kraken_managed_trade_is_verified():
     resolver = KrakenExposureResolver(
-        private_client=FakePrivate(balances={"SOL": 1.0}),
+        private_client=FakePrivate(
+            balances={},
+            positions={
+                "P-LONG": {
+                    "pair": "SOLUSD",
+                    "type": "buy",
+                    "vol": "1.0",
+                    "vol_closed": "0",
+                }
+            },
+        ),
         public_client=FakePublic(),
-        trade_loader=lambda: [trade()],
+        trade_loader=lambda: [
+            ActiveTrade(
+                symbol="SOLUSD",
+                entry_price=100.0,
+                stop_price=95.0,
+                target_1=110.0,
+                target_2=120.0,
+                risk_level="medium",
+                direction="LONG",
+                trade_id="T-LONG-MARGIN",
+                capital=100.0,
+                margin_leverage=2.0,
+            )
+        ],
     )
 
     resolved = resolver.resolve()
 
     assert resolved.exposures[0].status == "VERIFIED_MANAGED"
     assert resolved.exposures[0].trade is not None
+
+
+def test_short_positions_resolve_managed_and_unmanaged():
+    resolver = KrakenExposureResolver(
+        private_client=FakePrivate(
+            balances={},
+            positions={
+                "P-SOL": {
+                    "pair": "SOLUSD",
+                    "type": "sell",
+                    "vol": "1.0",
+                    "vol_closed": "0",
+                },
+                "P-ETH": {
+                    "pair": "ETHUSD",
+                    "type": "sell",
+                    "vol": "2.0",
+                    "vol_closed": "0",
+                },
+            },
+        ),
+        public_client=FakePublic(),
+        trade_loader=lambda: [trade(direction="SHORT")],
+    )
+
+    resolved = resolver.resolve()
+
+    sol = [e for e in resolved.exposures if e.symbol == "SOLUSD"][0]
+    eth = [e for e in resolved.exposures if e.symbol == "ETHUSD"][0]
+    assert sol.status == "VERIFIED_MANAGED"
+    assert sol.observed_quantity == pytest.approx(1.0)
+    assert eth.status == "VERIFIED_UNMANAGED"
+    assert eth.direction == "SHORT"
+    assert eth.observed_quantity == pytest.approx(2.0)
+
+
+def test_unpriced_non_cash_holding_is_never_silently_dropped():
+    resolver = KrakenExposureResolver(
+        private_client=FakePrivate(balances={"ABC": 3.0}),
+        public_client=FakePublic(pairs={}),
+        trade_loader=lambda: [],
+    )
+
+    resolved = resolver.resolve()
+
+    assert resolved.coverage_complete is False
+    assert len(resolved.exposures) == 1
+    exposure = resolved.exposures[0]
+    assert exposure.status == "VERIFIED_UNMANAGED"
+    assert exposure.symbol == "ABC"
+    assert exposure.observed_quantity == pytest.approx(3.0)
+    assert "no USD/USDT pair" in exposure.reason
 
 
 def test_mfe_giveback_promotes_hold_to_warning():
