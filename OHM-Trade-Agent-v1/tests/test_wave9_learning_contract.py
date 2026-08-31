@@ -35,6 +35,11 @@ def _snapshot():
         primary_quote_currency="USD",
         movement_data_status="AVAILABLE",
     )
+    row.market_data_validation = type(
+        "MarketData",
+        (),
+        {"status": "PASS"},
+    )()
     row.execution_validation = type(
         "Execution",
         (),
