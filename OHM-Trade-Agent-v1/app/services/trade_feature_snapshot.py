@@ -110,7 +110,13 @@ def build_trade_feature_snapshot(
         for name in features
     }
     dag = hashlib.sha256(
-        "|".join(sorted(features)).encode("utf-8")
+        "|".join(
+            (
+                FEATURE_SCHEMA_VERSION,
+                FEATURE_CALC_VERSION,
+                *sorted(features),
+            )
+        ).encode("utf-8")
     ).hexdigest()
 
     asset = str(snapshot.underlying_asset or snapshot.symbol).upper()
