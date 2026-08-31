@@ -1123,18 +1123,32 @@ def main():
             alert["_lineage_pair"] = pair
             alert["_lineage_base_asset"] = base_asset
             alert["_lineage_quote_asset"] = quote_asset
-            feature_snapshot = build_trade_feature_snapshot(
-                snapshot,
-                decision_at=decision_at,
-                episode_id=episode_id,
-                candidate_id=candidate_id,
-                regime=market_regime.regime,
-            )
-            trade_quality = assess_trade_quality(
-                feature_snapshot,
-                plan,
-                min_liquidity_usd=float(settings.signal_quality_min_liquidity_usd),
-            )
+            try:
+                feature_snapshot = build_trade_feature_snapshot(
+                    snapshot,
+                    decision_at=decision_at,
+                    episode_id=episode_id,
+                    candidate_id=candidate_id,
+                    regime=market_regime.regime,
+                )
+                trade_quality = assess_trade_quality(
+                    feature_snapshot,
+                    plan,
+                    min_liquidity_usd=float(settings.signal_quality_min_liquidity_usd),
+                )
+            except Exception as exc:
+                print(
+                    f"TRADE QUALITY candidate rejected after evaluator failure "
+                    f"{direction} {snapshot.symbol}: {type(exc).__name__}: {exc}"
+                )
+                capture_snapshot_decision(
+                    snapshot,
+                    decision="TRADE_QUALITY_UNAVAILABLE",
+                    market_regime=market_regime.regime,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    source="wave9_trade_quality_gate",
+                )
+                continue
             alert["feature_snapshot_id"] = feature_snapshot.snapshot_id
             alert["continuation_score"] = trade_quality.continuation.score
             alert["continuation_decision"] = trade_quality.continuation.decision
@@ -1383,23 +1397,24 @@ def main():
             )
         ranked_opportunities = global_ranked_opportunities
 
-        actionable_ranked_opportunities = _apply_ranked_action_gates(
-            ranked_opportunities,
-            settings=settings,
-        )
-        print(
-            "Actionable survivors after capital/portfolio gate:",
-            len(actionable_ranked_opportunities),
-        )
-        ranked_opportunities = actionable_ranked_opportunities
     else:
-        # Compatibility path for legacy test/extension settings only. Real
-        # Settings default the Wave 9 global gate on.
+        # Compatibility path for legacy test/extension settings only. Ranking
+        # may be disabled, but the action gate remains mandatory authority.
         for ranked in ranked_opportunities:
             ranked.opportunity.alert["profit_rank"] = ranked.rank
             ranked.opportunity.alert["profit_rank_score"] = (
                 ranked.profit_ranking.total_score
             )
+
+    actionable_ranked_opportunities = _apply_ranked_action_gates(
+        ranked_opportunities,
+        settings=settings,
+    )
+    print(
+        "Actionable survivors after capital/portfolio gate:",
+        len(actionable_ranked_opportunities),
+    )
+    ranked_opportunities = actionable_ranked_opportunities
 
     lineage_prepared, lineage_failures = _prepare_qualified_lineage(
         ranked_opportunities,
