@@ -20,112 +20,21 @@ class PositionVerification:
         return self.status == "VERIFIED"
 
 
-def verify_trade_against_snapshot(
-    trade: ActiveTrade,
-    *,
-    balances: dict[str, float],
+def _open_position_quantity(
     positions: dict[str, dict[str, Any]],
-) -> PositionVerification:
-    """Verify one local lifecycle against an already-loaded Kraken snapshot.
-
-    This keeps exposure resolution and legacy verification on identical rules
-    while avoiding a second private-account fetch in the Kraken-first resolver.
-    """
-    direction = (trade.direction or "LONG").upper()
-    if direction not in {"LONG", "SHORT"}:
+    *,
+    wanted_pair: str,
+    side: str,
+) -> tuple[float | None, str | None]:
+    remaining, position_error = _open_position_quantity(
+        positions,
+        wanted_pair=wanted_pair,
+        side="sell",
+    )
+    if position_error:
         return PositionVerification(
             status="UNAVAILABLE",
-            reason=f"Unsupported active-trade direction {direction!r}",
-        )
-
-    if direction == "LONG":
-        asset = _base_asset(trade.symbol)
-        quantity = _balance_for_asset(balances, asset)
-        if quantity is None or not math.isfinite(float(quantity)) or quantity < 0:
-            return PositionVerification(
-                status="UNAVAILABLE",
-                reason=f"Kraken balance for {trade.symbol} is unresolved or non-finite",
-            )
-
-        expected = None
-        if trade.capital is not None:
-            try:
-                capital = float(trade.capital)
-                leverage = float(trade.margin_leverage or 1.0)
-                entry = float(trade.entry_price)
-            except (TypeError, ValueError):
-                return PositionVerification(
-                    status="UNAVAILABLE",
-                    reason=f"Active-trade sizing state for {trade.symbol} is malformed",
-                )
-            if not all(math.isfinite(value) for value in (capital, leverage, entry)):
-                return PositionVerification(
-                    status="UNAVAILABLE",
-                    reason=f"Active-trade sizing state for {trade.symbol} is non-finite",
-                )
-            if capital < 0 or leverage <= 0 or entry <= 0:
-                return PositionVerification(
-                    status="UNAVAILABLE",
-                    reason=f"Active-trade sizing state for {trade.symbol} is invalid",
-                )
-            if capital > 0:
-                expected = capital * leverage / entry
-
-        minimum = expected * 0.01 if expected is not None else 0.0
-        if quantity <= minimum:
-            return PositionVerification(
-                status="ABSENT",
-                reason=f"No meaningful {asset} balance exists on Kraken",
-                observed_quantity=quantity,
-            )
-        return PositionVerification(
-            status="VERIFIED",
-            reason=f"Kraken reports a positive {asset} balance",
-            observed_quantity=quantity,
-        )
-
-    wanted_pair = _canonical_pair(trade.symbol)
-    if not wanted_pair:
-        return PositionVerification(
-            status="UNAVAILABLE",
-            reason=f"Could not canonicalize {trade.symbol}",
-        )
-
-    remaining = 0.0
-    matched = False
-    for row in positions.values():
-        if not isinstance(row, dict):
-            continue
-        descr = row.get("descr") if isinstance(row.get("descr"), dict) else {}
-        pair = row.get("pair") or descr.get("pair") or ""
-        side = str(row.get("type") or descr.get("type") or "").lower()
-        if _canonical_pair(str(pair or "")) != wanted_pair or side != "sell":
-            continue
-        matched = True
-        try:
-            volume = float(row.get("vol") or 0)
-            closed = float(row.get("vol_closed") or 0)
-        except (TypeError, ValueError):
-            return PositionVerification(
-                status="UNAVAILABLE",
-                reason=f"Kraken short quantity for {trade.symbol} is malformed",
-            )
-        if not all(math.isfinite(value) for value in (volume, closed)):
-            return PositionVerification(
-                status="UNAVAILABLE",
-                reason=f"Kraken short quantity for {trade.symbol} is non-finite",
-            )
-        if volume < 0 or closed < 0 or closed > volume:
-            return PositionVerification(
-                status="UNAVAILABLE",
-                reason=f"Kraken short quantity for {trade.symbol} is inconsistent",
-            )
-        remaining += volume - closed
-
-    if matched and not math.isfinite(remaining):
-        return PositionVerification(
-            status="UNAVAILABLE",
-            reason=f"Kraken short quantity for {trade.symbol} is non-finite",
+            reason=f"Kraken short quantity for {trade.symbol} is {position_error.lower()}",
         )
     if remaining <= 0:
         return PositionVerification(
@@ -181,4 +90,3 @@ class KrakenPositionVerifier:
             balances=self._balances,
             positions=self._positions,
         )
-
