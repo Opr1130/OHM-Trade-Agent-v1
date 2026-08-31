@@ -76,6 +76,27 @@ def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_T
     return delivery.delivered
 
 
+def _notify_monitor_degraded_safe(
+    *,
+    settings,
+    reason: str,
+    failures: list[str],
+    identity: str = "ACTIVE_TRADE_MONITOR",
+) -> bool:
+    try:
+        return _notify_monitor_degraded(
+            settings=settings,
+            reason=reason,
+            identity=identity,
+        )
+    except Exception as exc:
+        failures.append(
+            f"{identity}: degraded-monitor notification failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+
+
 def _notify_unmanaged_holding(*, settings, exposure: ResolvedExposure) -> bool:
     now = datetime.now(timezone.utc)
     day_bucket = now.strftime("%Y%m%d")
@@ -148,7 +169,12 @@ def run_active_trade_monitor() -> MonitorRunSummary:
         ).resolve()
     except Exception as exc:
         reason = f"Kraken-first exposure resolution failed: {exc}"
-        _notify_monitor_degraded(settings=settings, reason=reason)
+        failures = [reason]
+        _notify_monitor_degraded_safe(
+            settings=settings,
+            reason=reason,
+            failures=failures,
+        )
         return MonitorRunSummary(
             active_trades=0,
             checked=0,
@@ -158,7 +184,7 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             positions_absent=0,
             positions_unavailable=0,
             positions_unmanaged=0,
-            failures=[reason],
+            failures=failures,
         )
 
     managed = [e for e in resolution.exposures if e.trade is not None]
@@ -174,7 +200,11 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     if not resolution.coverage_complete:
         reason = resolution.reason or "Kraken exposure coverage is incomplete"
         failures.append(reason)
-        _notify_monitor_degraded(settings=settings, reason=reason)
+        _notify_monitor_degraded_safe(
+            settings=settings,
+            reason=reason,
+            failures=failures,
+        )
 
     for exposure in resolution.exposures:
         if exposure.status == "VERIFIED_UNMANAGED":
@@ -212,6 +242,8 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             continue
 
         positions_verified += 1
+        monitor_result = None
+        observation = None
         try:
             monitor_result = monitor_trade(trade)
             observation = update_active_observation(
@@ -223,29 +255,55 @@ def run_active_trade_monitor() -> MonitorRunSummary:
                 monitor_result,
                 observation,
             )
-
-            if send_monitor_update(
-                trade=trade,
-                result=monitor_result,
-                bot_token=settings.telegram_bot_token,
-                chat_id=settings.telegram_chat_id,
-                observation=observation,
-            ):
-                monitor_notifications_sent += 1
-
-            emergency_result = detect_emergency_move(trade)
-            if send_emergency_alert(
-                trade=trade,
-                result=emergency_result,
-                bot_token=settings.telegram_bot_token,
-                chat_id=settings.telegram_chat_id,
-            ):
-                emergency_notifications_sent += 1
-
             checked += 1
         except Exception as exc:
-            degraded_symbols.append(f"{trade.symbol}:ERROR")
-            failures.append(f"{trade.symbol}: {exc}")
+            degraded_symbols.append(f"{trade.symbol}:MONITOR_ERROR")
+            failures.append(
+                f"{trade.symbol}: deterministic monitor failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if monitor_result is not None:
+            try:
+                if send_monitor_update(
+                    trade=trade,
+                    result=monitor_result,
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    observation=observation,
+                ):
+                    monitor_notifications_sent += 1
+            except Exception as exc:
+                failures.append(
+                    f"{trade.symbol}: monitor notification failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        # Emergency protection is independent from routine monitor state and
+        # notification transport. A failure in either path must not suppress
+        # the other protection path for the same verified holding.
+        try:
+            emergency_result = detect_emergency_move(trade)
+        except Exception as exc:
+            degraded_symbols.append(f"{trade.symbol}:EMERGENCY_ERROR")
+            failures.append(
+                f"{trade.symbol}: emergency detection failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            try:
+                if send_emergency_alert(
+                    trade=trade,
+                    result=emergency_result,
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                ):
+                    emergency_notifications_sent += 1
+            except Exception as exc:
+                failures.append(
+                    f"{trade.symbol}: emergency notification failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     if degraded_symbols:
         reason = (
