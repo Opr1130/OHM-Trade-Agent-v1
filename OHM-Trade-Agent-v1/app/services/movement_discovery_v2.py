@@ -10,8 +10,13 @@ from app.exchanges.kraken import KrakenClient
 from app.scanner.market_scanner import analyze_symbol
 from app.scanner.models import MarketSnapshot
 from app.scanner.universe import TICKER_BATCH_SIZE, _is_excluded_market, _market_symbols
+from app.services.asset_display_identity import display_market_label
 from app.services.notification_policy import record_emitted, should_emit
-from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_delivery import (
+    record_telegram_not_eligible,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 
 VERSION = "movement-discovery-v2.1"
 WATCH = "WATCH"
@@ -118,6 +123,8 @@ class EarlyMoverSignal:
     actionable: bool
     reasons: tuple[str, ...]
     warnings: tuple[str, ...]
+    reference_price: float = 0.0
+    detection_timeframe: str = "1H"
 
     @property
     def fingerprint(self) -> str:
@@ -331,7 +338,9 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                             continuation, False, entry_quality, recommendation, state, round(one_hour, 4),
                             round(six_hour, 4), round(day, 4), round(volume, 4), round(near_high, 4),
                             round(liquidity, 2), extended, statuses[0], statuses[1],
-                            statuses[2], alert_eligible, False, tuple(reasons), tuple(warnings))
+                            statuses[2], alert_eligible, False, tuple(reasons), tuple(warnings),
+                            reference_price=round(float(snapshot.last_price), 8),
+                            detection_timeframe=str(snapshot.movement_timeframe or "1H"))
 
 
 def scan_early_movers(client: KrakenClient | None = None, *, max_candidates: int = DEFAULT_DEEP_CANDIDATES):
@@ -362,25 +371,54 @@ def append_detection_snapshots(signals: list[EarlyMoverSignal], *, path: str = D
 
 
 def format_early_mover_message(signal: EarlyMoverSignal) -> str:
-    warning = "\n".join(f"⚠️ {item}" for item in signal.warnings)
-    reasons = "\n".join(f"• {item}" for item in signal.reasons[:7])
-    return (f"🚀 OHM EARLY MOVER — {signal.stage}\n\nMarket: {signal.symbol}\nDirection: {signal.direction}\n"
-            f"Expansion continuation confidence: {signal.continuation_confidence}/100 (heuristic, not probability)\n"
-            f"Entry quality: {signal.entry_quality}/100\nEntry recommendation: {signal.entry_recommendation}\n"
-            f"Momentum state: {signal.momentum_state}\n1h: {signal.momentum_1h_pct:+.2f}% | 6h: {signal.momentum_6h_pct:+.2f}% | 24h: {signal.momentum_24h_pct:+.2f}%\n"
-            f"Relative volume: {signal.relative_volume:.2f}x\nApprox 24h liquidity: ${signal.liquidity_24h_usd_approx:,.0f}\n"
-            f"Flow: {signal.flow_confirmation} | Whale: {signal.whale_confirmation} | Social: {signal.social_confirmation}\n\n"
-            f"Evidence:\n{reasons}\n" + (f"\n{warning}\n" if warning else "\n") +
-            "\nAction: MONITOR ONLY — not an entry authorization. Existing OHM execution, economic, target, AI, risk, and human-confirmation gates remain authoritative.")
+    warning = "; ".join(str(item) for item in signal.warnings[:2])
+    reason = "; ".join(str(item) for item in signal.reasons[:3]) or "Early movement conditions detected"
+    caution = f" | Caution: {warning}" if warning else ""
+    return (
+        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"Price: {signal.reference_price:.8g} | TF: {signal.detection_timeframe}\n"
+        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | 24h {signal.momentum_24h_pct:+.2f}%\n"
+        f"Continuation*: {signal.continuation_confidence}/100 | Entry quality*: {signal.entry_quality}/100\n"
+        f"Volume: {signal.relative_volume:.2f}x | Liquidity: ${signal.liquidity_24h_usd_approx:,.0f}/24h\n"
+        f"Why now: {reason}{caution}\n"
+        f"Action: {signal.entry_recommendation.replace('_', ' ')} — EARLY WATCH ONLY; no entry is authorized\n"
+        "*Heuristic scores, not probabilities."
+    )
 
 
 def send_early_mover_update(signal: EarlyMoverSignal, *, bot_token: str, chat_id: str, cooldown_seconds: int = 1800) -> bool:
+    identity = f"EARLY_MOVER:{signal.symbol}"
     if not signal.alert_eligible:
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="EARLY_MOVER",
+            event_type=signal.stage,
+            fingerprint=signal.fingerprint,
+            reason="ALERT_NOT_ELIGIBLE",
+            symbol=signal.symbol,
+        )
         return False
-    if not should_emit(identity=f"EARLY_MOVER:{signal.symbol}", event_type=signal.stage,
+    if not should_emit(identity=identity, event_type=signal.stage,
                        fingerprint=signal.fingerprint, cooldown_seconds=cooldown_seconds):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="EARLY_MOVER",
+            event_type=signal.stage,
+            fingerprint=signal.fingerprint,
+            reason="NOTIFICATION_POLICY",
+            symbol=signal.symbol,
+        )
         return False
-    sent = send_telegram_message(bot_token, chat_id, format_early_mover_message(signal))
-    if sent:
-        record_emitted(identity=f"EARLY_MOVER:{signal.symbol}", event_type=signal.stage, fingerprint=signal.fingerprint)
-    return sent
+    delivery = send_tracked_telegram(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        message=format_early_mover_message(signal),
+        identity=identity,
+        alert_family="EARLY_MOVER",
+        event_type=signal.stage,
+        fingerprint=signal.fingerprint,
+        symbol=signal.symbol,
+    )
+    if delivery.delivered:
+        record_emitted(identity=identity, event_type=signal.stage, fingerprint=signal.fingerprint)
+    return delivery.delivered

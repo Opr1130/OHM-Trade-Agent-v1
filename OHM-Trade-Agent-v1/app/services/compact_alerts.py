@@ -71,18 +71,17 @@ def format_watch_alert(
     downside_pct: float,
     reason: str,
     action: str,
-    title: str = "OHM MARKET WATCH",
+    title: str = "MARKET WATCH",
 ) -> str:
     label = display_market_label(symbol)
     return (
         f"🚀 {title} — {label}\n"
         f"Potential: +{potential_low_pct:.0f}% to +{potential_high_pct:.0f}%\n"
-        f"Confidence*: {confidence_pct:.0f}%\n"
-        f"Risk*: {risk_pct:.0f}%\n"
-        f"Downside if wrong*: up to -{downside_pct:.0f}%\n"
+        f"Confidence score: {confidence_pct:.0f}/100\n"
+        f"Risk score: {risk_pct:.0f}/100\n"
+        f"Downside if wrong: up to -{downside_pct:.0f}%\n"
         f"Reason: {one_line_reason(reason)}\n"
-        f"Action: {action}\n"
-        "*Heuristic scenario scores, not probabilities."
+        f"Action: {action}"
     )
 
 

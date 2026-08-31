@@ -490,8 +490,14 @@ def test_telegram_dual_market_uses_stable_usd_market_identity():
         _actionable_plan("SOLUSD"),
         "Summary",
     )
-    assert "Market: SOLUSD" in message
-    assert "Market: SOLUSDT" not in message
+    # The alert now renders the O'Pip asset display identity alongside the
+    # market ("Market: Solana (SOL) - SOLUSD"), so the bare-symbol assertion
+    # this test originally used no longer matches. The invariant it exists to
+    # protect is unchanged and asserted directly: the stable USD market is the
+    # one quoted, and the USDT market never is.
+    assert "Market: " in message
+    assert "SOLUSD" in message
+    assert "SOLUSDT" not in message
     assert "no automatic USD conversion" not in message
 
 

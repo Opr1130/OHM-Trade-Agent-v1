@@ -19,6 +19,7 @@ from app.services.full_market_observation import (
     process_full_market_observations,
 )
 from app.services.full_market_transition_learning import build_full_market_transition_summary
+from app.services.intelligence_journey import record_watch_observation
 from app.services.movement_discovery_learning_capture import capture_movement_detections
 from app.services.movement_discovery_v2 import scan_early_movers
 from app.services.signal_scoring import (
@@ -27,7 +28,12 @@ from app.services.signal_scoring import (
     main_feed_candidates,
     volume_growth_proxy_label,
 )
-from app.services.telegram_notifier import edit_telegram_message, send_telegram_message_with_id
+from app.services.telegram_delivery import (
+    edit_tracked_telegram,
+    link_delivery_to_journey,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 
 
 def _transition_key(signal) -> str:
@@ -39,6 +45,50 @@ def _transition_key(signal) -> str:
             "EXTENDED" if signal.extended_move else "NOT_EXTENDED",
         )
     )
+
+
+def _deliver_existing_card_update(
+    *,
+    settings,
+    decision,
+    message: str,
+    identity: str,
+    alert_family: str,
+    event_type: str,
+    fingerprint: str,
+    symbol: str,
+) -> tuple[str, int | None]:
+    """Deliver an existing opportunity update without hiding meaningful changes."""
+    if decision.reason == "MEANINGFUL_TRANSITION":
+        delivery = send_tracked_telegram(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            message=message,
+            identity=identity,
+            alert_family=alert_family,
+            event_type=event_type,
+            fingerprint=fingerprint,
+            symbol=symbol,
+            success_status="TRANSITION_PUSHED",
+        )
+        if not delivery.delivered:
+            return "TRANSITION_PUSH_FAILED", None
+        return "TRANSITION_PUSHED", delivery.message_id
+
+    delivery = edit_tracked_telegram(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+        message_id=decision.message_id,
+        message=message,
+        identity=identity,
+        alert_family=alert_family,
+        event_type=event_type,
+        fingerprint=fingerprint,
+        symbol=symbol,
+    )
+    if delivery.delivered:
+        return "EDITED", delivery.message_id
+    return "EDIT_FAILED", None
 
 
 def _maybe_record_decision_telemetry(full_market, settings, *, decision_at) -> None:
@@ -102,13 +152,13 @@ def _compact_card(signal) -> str:
         else "WATCH FOR PULLBACK"
     )
     return (
-        f"🚀 OHM OPPORTUNITY — {display_market_label(signal.symbol)} — {signal.stage}\n"
-        f"Potential: +{low}% to +{high}%\n"
-        f"Confidence*: {signal.continuation_confidence}% | Risk*: {risk}%\n"
-        f"Downside if wrong*: up to -{downside}%\n"
-        f"Reason: {_best_signal_reason(signal)}\n"
-        f"Entry: {signal.entry_recommendation} | Action: {action}\n"
-        "*Heuristic scenario scores, not probabilities."
+        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
+        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | {signal.momentum_state}\n"
+        f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
+        f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
+        f"Why now: {_best_signal_reason(signal)}\n"
+        f"Entry: {signal.entry_recommendation} | Action: {action}"
     )
 
 
@@ -163,7 +213,7 @@ def _signal_quality_transition_key(candidate: SignalQualityCandidate) -> str:
     )
 
 
-def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
+def _signal_quality_card(candidate: SignalQualityCandidate, *, reference_price: float | None = None) -> str:
     """Render a Signal Quality v1 card.
 
     Every score carries a heuristic marker and the action line states plainly
@@ -173,8 +223,9 @@ def _signal_quality_card(candidate: SignalQualityCandidate) -> str:
     pattern = str(candidate.pattern or "UNCLASSIFIED").replace("_", " ").title()
     stage = str(candidate.stage).replace("_", " ")
     return (
-        f"🚀 OHM EARLY WATCH — {display_market_label(candidate.symbol)}\n"
-        f"Stage: {stage}\n"
+        f"🚀 EARLY WATCH — {display_market_label(candidate.symbol)}\n"
+        + (f"Price: {float(reference_price):.8g}\n" if isinstance(reference_price, (int, float)) and float(reference_price) > 0 else "")
+        + f"Stage: {stage}\n"
         f"Pattern: {pattern}\n"
         f"Pattern strength*: {candidate.pattern_strength_score}/100\n"
         f"Tradeability*: {candidate.tradeability_score}/100\n"
@@ -257,7 +308,10 @@ def _broad_watch_feed(
             (
                 candidate.symbol,
                 _signal_quality_transition_key(candidate),
-                _signal_quality_card(candidate),
+                _signal_quality_card(
+                    candidate,
+                    reference_price=(getattr(full_market, "signal_quality_reference_prices", {}) or {}).get(candidate.symbol),
+                ),
             )
             for candidate in eligible
         ]
@@ -341,6 +395,10 @@ def main() -> None:
     broad_created = 0
     broad_edited = 0
     broad_suppressed = 0
+    transition_pushes = 0
+    transition_push_failures = 0
+    early_mover_delivery: dict[str, tuple[str, bool]] = {}
+    broad_watch_delivery: dict[str, tuple[str, bool]] = {}
     if (
         str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
         and settings.telegram_enabled
@@ -364,41 +422,74 @@ def main() -> None:
             )
             if decision.action == "SUPPRESS":
                 suppressed += 1
+                early_mover_delivery[signal.symbol.upper()] = ("SUPPRESSED", False)
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="EARLY_MOVER",
+                    event_type=signal.stage,
+                    fingerprint=transition_key,
+                    reason=decision.reason,
+                    symbol=signal.symbol,
+                    generated_at=decision_at,
+                )
                 print(f"Alert governor suppressed {signal.symbol}: {decision.reason}")
                 continue
 
             message = _compact_card(signal)
             if decision.action == "EDIT" and decision.message_id is not None:
-                if edit_telegram_message(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    decision.message_id,
-                    message,
-                ):
+                delivery_action, delivered_message_id = _deliver_existing_card_update(
+                    settings=settings,
+                    decision=decision,
+                    message=message,
+                    identity=identity,
+                    alert_family="EARLY_MOVER",
+                    event_type=signal.stage,
+                    fingerprint=transition_key,
+                    symbol=signal.symbol,
+                )
+                if delivered_message_id is not None:
                     record_opportunity_alert(
                         identity=identity,
                         transition_key=transition_key,
-                        message_id=decision.message_id,
+                        message_id=delivered_message_id,
                         created_new=False,
                     )
                     edited += 1
+                    if delivery_action == "TRANSITION_PUSHED":
+                        transition_pushes += 1
+                    early_mover_delivery[signal.symbol.upper()] = (delivery_action, True)
                 else:
-                    print(f"Telegram edit failed for {signal.symbol}; existing card retained for retry.")
+                    if delivery_action == "TRANSITION_PUSH_FAILED":
+                        transition_push_failures += 1
+                    early_mover_delivery[signal.symbol.upper()] = (delivery_action, False)
+                    print(
+                        f"Telegram update failed for {signal.symbol}: "
+                        f"{delivery_action}; prior canonical card retained for retry."
+                    )
                 continue
 
-            message_id = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message,
+            delivery = send_tracked_telegram(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id,
+                message=message,
+                identity=identity,
+                alert_family="EARLY_MOVER",
+                event_type=signal.stage,
+                fingerprint=transition_key,
+                symbol=signal.symbol,
+                generated_at=decision_at,
             )
-            if message_id is not None:
+            if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
-                    message_id=message_id,
+                    message_id=delivery.message_id,
                     created_new=True,
                 )
                 created += 1
+                early_mover_delivery[signal.symbol.upper()] = ("CREATED", True)
+            else:
+                early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
 
         broad_feed = _broad_watch_feed(
             full_market,
@@ -416,42 +507,162 @@ def main() -> None:
             )
             if decision.action == "SUPPRESS":
                 broad_suppressed += 1
+                broad_watch_delivery[symbol.upper()] = ("SUPPRESSED", False)
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="BROAD_WATCH",
+                    event_type=transition_key.split(":", 1)[0],
+                    fingerprint=transition_key,
+                    reason=decision.reason,
+                    symbol=symbol,
+                    generated_at=decision_at,
+                )
                 print(f"Broad-watch governor suppressed {symbol}: {decision.reason}")
                 continue
 
             if decision.action == "EDIT" and decision.message_id is not None:
-                if edit_telegram_message(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    decision.message_id,
-                    message,
-                ):
+                delivery_action, delivered_message_id = _deliver_existing_card_update(
+                    settings=settings,
+                    decision=decision,
+                    message=message,
+                    identity=identity,
+                    alert_family="BROAD_WATCH",
+                    event_type=transition_key.split(":", 1)[0],
+                    fingerprint=transition_key,
+                    symbol=symbol,
+                )
+                if delivered_message_id is not None:
                     record_opportunity_alert(
                         identity=identity,
                         transition_key=transition_key,
-                        message_id=decision.message_id,
+                        message_id=delivered_message_id,
                         created_new=False,
                         state_file=FULL_MARKET_ALERT_STATE_FILE,
                     )
                     broad_edited += 1
+                    if delivery_action == "TRANSITION_PUSHED":
+                        transition_pushes += 1
+                    broad_watch_delivery[symbol.upper()] = (delivery_action, True)
                 else:
-                    print(f"Telegram broad-watch edit failed for {symbol}; card retained.")
+                    if delivery_action == "TRANSITION_PUSH_FAILED":
+                        transition_push_failures += 1
+                    broad_watch_delivery[symbol.upper()] = (delivery_action, False)
+                    print(
+                        f"Telegram broad-watch update failed for {symbol}: "
+                        f"{delivery_action}; prior canonical card retained for retry."
+                    )
                 continue
 
-            message_id = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message,
+            delivery = send_tracked_telegram(
+                bot_token=settings.telegram_bot_token,
+                chat_id=settings.telegram_chat_id,
+                message=message,
+                identity=identity,
+                alert_family="BROAD_WATCH",
+                event_type=transition_key.split(":", 1)[0],
+                fingerprint=transition_key,
+                symbol=symbol,
+                generated_at=decision_at,
             )
-            if message_id is not None:
+            if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
-                    message_id=message_id,
+                    message_id=delivery.message_id,
                     created_new=True,
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
                 broad_created += 1
+                broad_watch_delivery[symbol.upper()] = ("CREATED", True)
+            else:
+                broad_watch_delivery[symbol.upper()] = ("CREATE_FAILED", False)
+
+    # Intelligence-journey persistence is deliberately post-alert and
+    # measurement-only. It links early evidence to later qualified signals and
+    # Freqtrade dry-run outcomes without participating in the live decision.
+    try:
+        if full_market is not None and getattr(full_market, "signal_quality_enabled", False):
+            learning_config = SignalQualityConfig.from_settings(settings)
+            learning_candidates = main_feed_candidates(
+                full_market.signal_quality_candidates,
+                config=learning_config,
+            )
+            for candidate in learning_candidates:
+                delivery_action, delivered = broad_watch_delivery.get(
+                    candidate.symbol.upper(),
+                    ("NOT_DELIVERED_OR_EXCLUDED", False),
+                )
+                journey_id = record_watch_observation(
+                    symbol=candidate.symbol,
+                    observed_at=decision_at,
+                    watch_type="EARLY_WATCH",
+                    payload={
+                        "stage": candidate.stage,
+                        "pattern": candidate.pattern,
+                        "tradeability_score": candidate.tradeability_score,
+                        "pattern_strength_score": candidate.pattern_strength_score,
+                        "volume_acceleration_score": candidate.volume_acceleration_score,
+                        "persistence_score": candidate.persistence_score,
+                        "relative_strength_score": candidate.relative_strength_score,
+                        "explosion_potential_score": candidate.explosion_potential_score,
+                        "opportunity_score": candidate.opportunity_score,
+                        "exhaustion_penalty": candidate.exhaustion_penalty,
+                        "exhaustion_band": candidate.exhaustion_band,
+                        "liquidity_24h_usd_approx": candidate.liquidity_24h_usd_approx,
+                        "persistence_scans": candidate.persistence_scans,
+                        "relative_strength_percentile": candidate.relative_strength_percentile,
+                        "reasons": list(candidate.reasons),
+                        "telegram_alert_eligible": True,
+                    },
+                    delivery_action=delivery_action,
+                    delivered=delivered,
+                )
+                link_delivery_to_journey(
+                    identity=f"FULL_MARKET_WATCH:{candidate.symbol}",
+                    alert_family="BROAD_WATCH",
+                    event_type=candidate.stage,
+                    fingerprint=_signal_quality_transition_key(candidate),
+                    journey_id=journey_id,
+                )
+        for signal in signals:
+            if not signal.alert_eligible:
+                continue
+            delivery_action, delivered = early_mover_delivery.get(
+                signal.symbol.upper(),
+                ("NOT_DELIVERED", False),
+            )
+            journey_id = record_watch_observation(
+                symbol=signal.symbol,
+                observed_at=decision_at,
+                watch_type="EARLY_MOVER",
+                payload={
+                    "stage": signal.stage,
+                    "pattern": "MOVEMENT_DISCOVERY",
+                    "discovery_score": signal.discovery_score,
+                    "continuation_confidence": signal.continuation_confidence,
+                    "entry_quality": signal.entry_quality,
+                    "entry_recommendation": signal.entry_recommendation,
+                    "momentum_state": signal.momentum_state,
+                    "momentum_1h_pct": signal.momentum_1h_pct,
+                    "momentum_6h_pct": signal.momentum_6h_pct,
+                    "momentum_24h_pct": signal.momentum_24h_pct,
+                    "relative_volume": signal.relative_volume,
+                    "liquidity_24h_usd_approx": signal.liquidity_24h_usd_approx,
+                    "extended_move": signal.extended_move,
+                    "telegram_alert_eligible": True,
+                },
+                delivery_action=delivery_action,
+                delivered=delivered,
+            )
+            link_delivery_to_journey(
+                identity=f"EARLY_MOVER:{signal.symbol}",
+                alert_family="EARLY_MOVER",
+                event_type=signal.stage,
+                fingerprint=_transition_key(signal),
+                journey_id=journey_id,
+            )
+    except Exception as exc:
+        print("Intelligence journey watch capture: fail-soft", type(exc).__name__)
 
     # External OHLC work is deliberately deferred until every alert-critical
     # operation above has completed. It still uses the immutable decision_at.
@@ -460,7 +671,9 @@ def main() -> None:
     )
 
     print("Early-mover Telegram cards created:", created)
-    print("Early-mover Telegram cards edited:", edited)
+    print("Early-mover Telegram cards edited/transitioned:", edited)
+    print("Meaningful-transition push notifications sent:", transition_pushes)
+    print("Meaningful-transition push notification failures:", transition_push_failures)
     print("Alert-governor opportunity updates suppressed:", suppressed)
     print("Broad-market watch cards created:", broad_created)
     print("Broad-market watch cards edited:", broad_edited)

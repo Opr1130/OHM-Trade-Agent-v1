@@ -3,6 +3,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from app.core.config import get_settings
+from app.opip.decision.observer import build_scan_observer
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
@@ -20,7 +21,11 @@ from app.scanner.reference_market_validation import validate_finalist_references
 from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
-from app.services.canonical_episode_capture import append_canonical_episode_snapshots
+from app.services.canonical_episode_capture import (
+    append_canonical_episode_snapshots,
+    canonical_cohort_id,
+    canonical_episode_id,
+)
 from app.services.chief_alert_notifier import send_trade_plan
 from app.services.chief_analyst import (
     SHORT_MARGIN_COST_RESERVE_PCT,
@@ -55,6 +60,33 @@ logger = logging.getLogger(__name__)
 select_candidates = select_directional_candidates
 
 
+def _opip_scan_context(scan, technical_candidates: int) -> dict:
+    """Return the scan-level counters the O'Pip funnel summary reports.
+
+    ``technical_candidates`` is the size of the directional shortlist as
+    selected, not the number of survivors at the point the summary is written -
+    the funnel's own counters already describe attrition, and reporting the
+    survivor count here would understate how many candidates were considered.
+    """
+    return {
+        "requested": getattr(scan, "requested", None),
+        "analyzed": getattr(scan, "analyzed", None),
+        "skipped": getattr(scan, "skipped", None),
+        "failed": getattr(scan, "failed", None),
+        "technical_candidates": int(technical_candidates),
+    }
+
+
+def _paper_trade_enabled_safe() -> bool:
+    """Report paper-engine state for telemetry without ever raising."""
+    try:
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        return bool(paper_trade_enabled())
+    except Exception:
+        return False
+
+
 def _direction_counts(candidates):
     return (
         sum(c.trade_direction == "LONG" for c in candidates),
@@ -87,6 +119,342 @@ def _capture_native_scan_cohort(scan, *, decision_at):
     return written
 
 
+def _maybe_enroll_paper_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Post-alert paper enrollment; never participates in live decisions."""
+    try:
+        from app.services.paper_trade_control import paper_trade_enabled
+        from app.services.paper_trade_engine import (
+            PaperTradeConfig,
+            enroll_paper_opportunity,
+        )
+
+        if not paper_trade_enabled():
+            return 0, 0
+        config = PaperTradeConfig.from_settings(settings)
+        cohort_id = canonical_cohort_id(
+            scan.snapshots,
+            decision_at=decision_at,
+        )
+    except Exception as exc:
+        print(
+            "Paper Trade enrollment unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, 1
+
+    enrolled = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        try:
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            result = enroll_paper_opportunity(
+                candidate=alert,
+                snapshot=snapshot,
+                plan=plan,
+                episode_id=episode_id,
+                cohort_id=cohort_id,
+                decision_at=decision_at,
+                config=config,
+            )
+            print(
+                f"PAPER {snapshot.symbol}: Status={result.status} "
+                f"Reason={result.reason} "
+                f"Id={result.paper_trade_id or 'N/A'}"
+            )
+            if result.status in {"OPENED", "PENDING"}:
+                enrolled += 1
+        except Exception as exc:
+            failures += 1
+            print(
+                f"PAPER {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return enrolled, failures
+
+
+def _prepare_qualified_lineage(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Create immutable signal/journey identity before any qualified Telegram send."""
+    try:
+        from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
+        from app.services.intelligence_journey import link_qualified_signal
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        paper_enabled = paper_trade_enabled()
+    except Exception as exc:
+        print(
+            "Qualified signal lineage unavailable; alert delivery remains fail-soft:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, len(ranked_opportunities)
+
+    prepared = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(snapshot.trade_direction or "LONG").upper()
+        try:
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            base_asset = str(
+                snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or ("USDT" if str(snapshot.symbol).upper().endswith("USDT") else "USD")
+            ).upper()
+            pair = to_freqtrade_pair(base_asset, quote_asset)
+            signal_id = build_signal_id(
+                episode_id=episode_id,
+                pair=pair,
+                decision_at=decision_at,
+                direction=direction,
+            )
+            journey_id = link_qualified_signal(
+                symbol=snapshot.symbol,
+                signal_id=signal_id,
+                observed_at=decision_at,
+                payload={
+                    "direction": direction,
+                    "profit_rank": ranked.rank,
+                    "profit_rank_score": ranked.profit_ranking.total_score,
+                    "confidence": int(alert.get("confidence") or 0),
+                    "entry_style": plan.entry_style,
+                    "valid_now": bool(plan.valid_now),
+                    "entry_low": plan.entry_low,
+                    "entry_high": plan.entry_high,
+                    "chase_limit": plan.chase_limit,
+                    "stop_price": plan.stop_price,
+                    "target_1": plan.target_1,
+                    "target_2": plan.target_2,
+                    "technical_score": alert.get("technical_score"),
+                    "market_regime": alert.get("market_regime"),
+                    "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
+                    "target_attainability_score": alert.get("target_attainability_score"),
+                    "paper_requested": bool(paper_enabled and direction == "LONG"),
+                    "paper_engine": (
+                        "FREQTRADE_DRY_RUN"
+                        if direction == "LONG"
+                        else "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
+                    ),
+                },
+            )
+            alert["signal_id"] = signal_id
+            alert["journey_id"] = journey_id
+            alert["_lineage_episode_id"] = episode_id
+            alert["_lineage_pair"] = pair
+            alert["_lineage_base_asset"] = base_asset
+            alert["_lineage_quote_asset"] = quote_asset
+            prepared += 1
+        except Exception as exc:
+            failures += 1
+            print(
+                f"QUALIFIED LINEAGE {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return prepared, failures
+
+
+def _publish_freqtrade_paper_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    settings,
+) -> tuple[int, int]:
+    """Publish post-alert qualified LONG intents to authoritative Freqtrade dry-run."""
+    try:
+        from app.services.freqtrade_signal_bridge import (
+            PaperAdmissionRejected,
+            build_signal_id,
+            publish_qualified_long,
+            to_freqtrade_pair,
+        )
+        from app.services.intelligence_journey import (
+            link_qualified_signal,
+            record_paper_admission,
+        )
+        from app.services.paper_trade_control import paper_trade_enabled
+
+        paper_enabled = paper_trade_enabled()
+        cohort_id = canonical_cohort_id(scan.snapshots, decision_at=decision_at)
+    except Exception as exc:
+        print(
+            "Freqtrade paper bridge unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return 0, 1
+
+    published = 0
+    failures = 0
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        snapshot = opportunity.snapshot
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(snapshot.trade_direction or "LONG").upper()
+        if direction != "LONG":
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: skipped "
+                "(v1 authoritative paper engine is spot LONG only)"
+            )
+            continue
+        try:
+            episode_id = str(
+                alert.get("_lineage_episode_id")
+                or canonical_episode_id(
+                    scan.snapshots,
+                    decision_at=decision_at,
+                    symbol=snapshot.symbol,
+                )
+            )
+            base_asset = str(
+                alert.get("_lineage_base_asset")
+                or snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                alert.get("_lineage_quote_asset")
+                or snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or ("USDT" if str(snapshot.symbol).upper().endswith("USDT") else "USD")
+            ).upper()
+            pair = str(alert.get("_lineage_pair") or to_freqtrade_pair(base_asset, quote_asset))
+            signal_id = str(
+                alert.get("signal_id")
+                or build_signal_id(
+                    episode_id=episode_id,
+                    pair=pair,
+                    decision_at=decision_at,
+                    direction=direction,
+                )
+            )
+            journey_id = str(alert.get("journey_id") or "")
+            if not journey_id:
+                journey_id = link_qualified_signal(
+                    symbol=snapshot.symbol,
+                    signal_id=signal_id,
+                    observed_at=decision_at,
+                    payload={
+                        "direction": direction,
+                        "profit_rank": ranked.rank,
+                        "profit_rank_score": ranked.profit_ranking.total_score,
+                        "confidence": int(alert.get("confidence") or 0),
+                        "entry_style": plan.entry_style,
+                        "valid_now": bool(plan.valid_now),
+                        "paper_requested": bool(paper_enabled),
+                        "paper_engine": "FREQTRADE_DRY_RUN",
+                    },
+                )
+                alert["signal_id"] = signal_id
+                alert["journey_id"] = journey_id
+            if not paper_enabled:
+                print(
+                    f"FREQTRADE PAPER {snapshot.symbol}: PAPER_OFF "
+                    f"Signal={signal_id} Journey={journey_id}"
+                )
+                continue
+
+            signal = publish_qualified_long(
+                episode_id=episode_id,
+                cohort_id=cohort_id,
+                journey_id=journey_id,
+                ohm_symbol=snapshot.symbol,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                decision_at=decision_at,
+                valid_now=bool(plan.valid_now),
+                entry_style=plan.entry_style,
+                entry_low=plan.entry_low,
+                entry_high=plan.entry_high,
+                chase_limit=plan.chase_limit,
+                stop_price=plan.stop_price,
+                target_1=plan.target_1,
+                target_2=plan.target_2,
+                stake_amount=float(settings.paper_trade_capital_per_trade),
+                max_hold_hours=int(settings.paper_trade_max_hold_hours),
+                pending_ttl_hours=int(settings.paper_trade_pending_ttl_hours),
+                confidence=int(alert.get("confidence") or 0),
+                profit_rank=ranked.rank,
+                profit_rank_score=float(ranked.profit_ranking.total_score),
+                starting_equity=float(settings.paper_trade_starting_equity),
+                max_positions=int(settings.paper_trade_max_positions),
+            )
+            record_paper_admission(
+                signal_id=signal_id,
+                symbol=snapshot.symbol,
+                observed_at=decision_at,
+                admitted=True,
+                reason="ADMITTED",
+                payload={
+                    "pair": signal["pair"],
+                    "stake_amount": signal["stake_amount"],
+                    "profit_rank": ranked.rank,
+                },
+            )
+            published += 1
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: PUBLISHED "
+                f"Signal={signal['signal_id']} Pair={signal['pair']} "
+                f"Journey={journey_id} Entry={signal['entry_price']}"
+            )
+        except PaperAdmissionRejected as exc:
+            try:
+                record_paper_admission(
+                    signal_id=signal_id,
+                    symbol=snapshot.symbol,
+                    observed_at=decision_at,
+                    admitted=False,
+                    reason=exc.reason,
+                    payload={
+                        "profit_rank": ranked.rank,
+                        "stake_amount": float(settings.paper_trade_capital_per_trade),
+                    },
+                )
+            except Exception:
+                pass
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: NOT_ADMITTED "
+                f"Reason={exc.reason} Signal={signal_id}"
+            )
+        except Exception as exc:
+            failures += 1
+            print(
+                f"FREQTRADE PAPER {snapshot.symbol}: fail-soft "
+                f"{type(exc).__name__}: {exc}"
+            )
+    return published, failures
+
+
 def _target_quality(plan, snapshot):
     if snapshot.trade_direction == "SHORT":
         return evaluate_short_target_attainability(plan, snapshot)
@@ -109,6 +477,48 @@ def _economic_quality(plan, snapshot, account_equity):
         available_capital=account_equity,
         max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
     )
+
+
+def _telegram_delivery_ready(settings) -> bool:
+    return bool(
+        getattr(settings, "telegram_enabled", False)
+        and getattr(settings, "telegram_bot_token", None)
+        and getattr(settings, "telegram_chat_id", None)
+    )
+
+
+def _send_movement_notification(movement, settings) -> tuple[bool, bool]:
+    """Return (sent, failed).
+
+    Policy suppression / non-alert mode is not a delivery failure. Exceptions
+    from the actual notification path are surfaced and counted.
+    """
+    if (
+        str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
+        or not _telegram_delivery_ready(settings)
+    ):
+        return False, False
+    try:
+        sent = send_price_movement_update(
+            movement,
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            cooldown_seconds=int(
+                getattr(
+                    settings,
+                    "price_movement_alert_cooldown_seconds",
+                    21_600,
+                )
+            ),
+        )
+        return bool(sent), False
+    except Exception:
+        logger.exception(
+            "Price movement Telegram delivery failed symbol=%s stage=%s",
+            movement.get("symbol", "UNKNOWN"),
+            movement.get("stage", "UNKNOWN"),
+        )
+        return False, True
 
 
 def _assess_price_movement(snapshot, settings, market_intelligence=None):
@@ -177,6 +587,17 @@ def main():
                 "TradingView v2 evidence merge failed open; continuing with native candidates only"
             )
 
+    # O'Pip qualification funnel: observation only. Every hook below is
+    # fail-soft and one-directional - it records what the production path just
+    # decided and can never change that decision.
+    opip = build_scan_observer(
+        snapshots=scan.snapshots,
+        decision_at=decision_at,
+        account_equity=getattr(settings, "account_equity", None),
+    )
+    opip.register_candidates(candidates)
+    technical_candidate_count = len(candidates)
+
     print("OHM AI Opportunity Scan")
     if scan.universe is not None:
         print("===== OHM UNIVERSE =====")
@@ -225,6 +646,7 @@ def main():
 
     if not candidates:
         print("No technical candidates.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -255,9 +677,11 @@ def main():
                     reason=f"margin status {candidate.margin_validation_status}",
                     source="margin_eligibility_gate",
                 )
+    opip.record_margin(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -282,6 +706,8 @@ def main():
             f"SecondaryVol={candidate.secondary_volume_ratio if candidate.secondary_volume_ratio is not None else 'N/A'} "
             f"Status={candidate.cross_pair_confirmation_status}"
         )
+
+    opip.record_cross_market(candidates)
 
     execution_requested = len(candidates)
     pre_execution_candidates = list(candidates)
@@ -329,10 +755,12 @@ def main():
             f"RecentTradeAge={execution.latest_trade_age_seconds if execution.latest_trade_age_seconds is not None else 'N/A'}s"
         )
     candidates = strict_execution_candidates
+    opip.record_execution(pre_execution_candidates)
     print("Execution validation requested:", execution_requested)
     print("Execution structural/short-quality rejects:", execution_requested - len(candidates))
     if not candidates:
         print("No candidates survived execution quality validation.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -355,6 +783,8 @@ def main():
             f"CoinGecko={reference.coingecko_id or 'N/A'} "
             f"Divergence={reference.price_divergence_pct if reference.price_divergence_pct is not None else 'N/A'}%"
         )
+
+    opip.record_reference(candidates)
 
     coingecko_global = load_coingecko_global_context(
         api_key=getattr(settings, "coingecko_api_key", None)
@@ -391,6 +821,7 @@ def main():
     intelligence = enrich_finalist_market_intelligence(candidates, market_regime)
     candidates = list(intelligence.candidates)
     movement_notifications_sent = 0
+    movement_notification_failures = 0
     enriched_movement_counts: Counter[str] = Counter()
     for candidate in candidates:
         movement = _assess_price_movement(
@@ -401,28 +832,12 @@ def main():
         if movement is None:
             continue
         enriched_movement_counts[str(movement.get("stage") or "UNKNOWN")] += 1
-        if (
-            str(getattr(settings, "price_movement_mode", "shadow")).lower() == "alert"
-            and settings.telegram_enabled
-            and settings.telegram_bot_token
-            and settings.telegram_chat_id
-        ):
-            try:
-                if send_price_movement_update(
-                    movement,
-                    bot_token=settings.telegram_bot_token,
-                    chat_id=settings.telegram_chat_id,
-                    cooldown_seconds=int(
-                        getattr(
-                            settings,
-                            "price_movement_alert_cooldown_seconds",
-                            21_600,
-                        )
-                    ),
-                ):
-                    movement_notifications_sent += 1
-            except Exception:
-                pass
+        movement_sent, movement_failed = _send_movement_notification(
+            movement,
+            settings,
+        )
+        movement_notifications_sent += int(movement_sent)
+        movement_notification_failures += int(movement_failed)
     print("===== OHM EXTERNAL MARKET INTELLIGENCE =====")
     print("Evidence records:", len(intelligence.evidence))
     print("Available assessments:", sum(
@@ -451,6 +866,8 @@ def main():
             f"Sentiment={assessment.sentiment_bias}"
         )
 
+    opip.record_market_intelligence(candidates, intelligence.assessments)
+
     review = review_candidates(
         candidates,
         settings.openai_model,
@@ -459,6 +876,7 @@ def main():
         market_regime_context=intelligence.chief_market_regime_context,
         coingecko_global_context=coingecko_global,
     )
+    opip.record_ai_stage(review)
     alerts = qualified_alerts(review)
     print("AI top candidates:", len(review.get("top_candidates", [])))
     print("Qualified alerts before deterministic quality gates:", len(alerts))
@@ -481,6 +899,7 @@ def main():
         snapshot = snapshot_by_key.get((alert["symbol"], direction))
         if snapshot is None:
             print("Snapshot missing for:", alert["symbol"], direction)
+            opip.record_snapshot_missing(alert["symbol"], direction)
             continue
 
         plan = (
@@ -506,6 +925,7 @@ def main():
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
 
         target_quality = _target_quality(plan, snapshot)
+        opip.record_target_quality(snapshot, target_quality)
         if not target_quality.qualified:
             target_rejected += 1
             rejection_reason = "; ".join(target_quality.rejection_reasons)
@@ -534,6 +954,7 @@ def main():
         )
 
         economic = _economic_quality(plan, snapshot, settings.account_equity)
+        opip.record_economic_quality(snapshot, economic)
         if not economic.qualified:
             economic_rejected += 1
             print(f"ECONOMIC REJECT {direction} {plan.symbol}: {economic.rejection_reason}")
@@ -588,6 +1009,16 @@ def main():
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
 
+    lineage_prepared, lineage_failures = _prepare_qualified_lineage(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    print("Qualified signal lineages prepared before Telegram:", lineage_prepared)
+    print("Qualified signal lineage failures:", lineage_failures)
+    opip.record_qualified(ranked_opportunities)
+
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
         alert = opportunity.alert
@@ -623,8 +1054,35 @@ def main():
     print("Target quality passes:", target_passed)
     print("Target quality rejects:", target_rejected)
     print("Pending setups saved:", pending_saved)
+    print("Telegram delivery configured:", _telegram_delivery_ready(settings))
+    print("Price movement mode:", getattr(settings, "price_movement_mode", "shadow"))
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
+    print("Price movement notification failures:", movement_notification_failures)
+    freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
+        ranked_opportunities,
+        scan=scan,
+        decision_at=decision_at,
+        settings=settings,
+    )
+    print("Authoritative Freqtrade paper signals published:", freqtrade_published)
+    print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
+    print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
+    print("Shadow simulator failures:", shadow_failures)
+    paper_admission_eligible = opip.record_paper_admission_eligibility(
+        ranked_opportunities,
+        paper_enabled=_paper_trade_enabled_safe(),
+    )
+    opip.finalize(
+        scan_context=_opip_scan_context(scan, technical_candidate_count),
+        paper_admission_eligible=paper_admission_eligible,
+    )
     _capture_native_scan_cohort(scan, decision_at=decision_at)
 
 

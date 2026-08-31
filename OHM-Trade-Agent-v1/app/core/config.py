@@ -63,6 +63,20 @@ class Settings(BaseSettings):
     max_daily_loss_pct: float = Field(default=1.0, gt=0, le=5)
     max_open_trades: int = Field(default=2, ge=1, le=10)
 
+    # Paper Trade v1 is a physically separate simulation subsystem. Runtime
+    # activation is NOT controlled here; the operator toggles it through the
+    # dedicated atomic paper-control registry so on/off requires no container
+    # rebuild. These fields are simulation assumptions only.
+    paper_trade_starting_equity: float = Field(default=10_000.0, gt=0)
+    paper_trade_capital_per_trade: float = Field(default=1_000.0, gt=0)
+    paper_trade_max_positions: int = Field(default=3, ge=1, le=20)
+    paper_trade_fee_rate: float = Field(default=0.004, ge=0.0, le=0.02)
+    paper_trade_slippage_bps: float = Field(default=10.0, ge=0.0, le=100.0)
+    paper_trade_tp1_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    paper_trade_pending_ttl_hours: int = Field(default=24, ge=1, le=168)
+    paper_trade_max_hold_hours: int = Field(default=24, ge=1, le=168)
+    paper_trade_candle_interval_minutes: int = Field(default=15)
+
     # Margin Intelligence v1 is advisory/manual only. The configured ceiling
     # mirrors what the account is permitted to use, while validation remains
     # conservatively fixed at 2x until outcome data justifies anything else.
@@ -176,6 +190,22 @@ class Settings(BaseSettings):
     signal_quality_actionable_tradeability: int = Field(default=70, ge=0, le=100)
     signal_quality_actionable_min_persistence_scans: int = Field(default=3, ge=1, le=32)
     signal_quality_actionable_max_exhaustion: int = Field(default=20, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def validate_paper_trade_config(self) -> "Settings":
+        required_cash = self.paper_trade_capital_per_trade * (
+            1.0 + self.paper_trade_fee_rate
+        )
+        if required_cash > self.paper_trade_starting_equity:
+            raise ValueError(
+                "PAPER_TRADE capital plus entry fee cannot exceed "
+                "PAPER_TRADE_STARTING_EQUITY"
+            )
+        if self.paper_trade_candle_interval_minutes not in {
+            1, 5, 15, 30, 60, 240, 1440, 10080, 21600
+        }:
+            raise ValueError("PAPER_TRADE_CANDLE_INTERVAL_MINUTES is not a Kraken OHLC interval")
+        return self
 
     @model_validator(mode="after")
     def validate_signal_quality_bands(self) -> "Settings":

@@ -8,6 +8,15 @@ DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
 DEFAULT_MAX_CAPITAL_FRACTION = 1.0
 PRODUCTION_MAX_CAPITAL_FRACTION = 0.20
 
+# The economic gate's policy numbers, named so that telemetry can report how
+# far a candidate was from the bar without restating the value. These are the
+# keyword defaults below; production never overrides them.
+MIN_TARGET_2_MOVE_PCT = 4.0
+PREFERRED_TARGET_2_MOVE_PCT = 7.0
+MIN_NET_PROFIT = 75.0
+MIN_REWARD_TO_RISK = 2.5
+ESTIMATED_ROUND_TRIP_COST_PCT = 0.60
+
 
 @dataclass
 class EconomicGateResult:
@@ -55,11 +64,11 @@ def evaluate_economic_quality(
     plan: EntryExitPlan,
     available_capital: float,
     *,
-    min_target_2_move_pct: float = 4.0,
-    preferred_target_2_move_pct: float = 7.0,
-    min_net_profit: float = 75.0,
-    min_reward_to_risk: float = 2.5,
-    estimated_round_trip_cost_pct: float = 0.60,
+    min_target_2_move_pct: float = MIN_TARGET_2_MOVE_PCT,
+    preferred_target_2_move_pct: float = PREFERRED_TARGET_2_MOVE_PCT,
+    min_net_profit: float = MIN_NET_PROFIT,
+    min_reward_to_risk: float = MIN_REWARD_TO_RISK,
+    estimated_round_trip_cost_pct: float = ESTIMATED_ROUND_TRIP_COST_PCT,
     max_capital_fraction: float | None = None,
     direction: str | None = None,
     leverage: float = 1.0,

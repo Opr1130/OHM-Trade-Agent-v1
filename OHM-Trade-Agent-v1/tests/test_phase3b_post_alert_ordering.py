@@ -43,7 +43,7 @@ def test_phase3b_shadow_call_occurs_after_telegram_send_sites():
     post_shadow = source.rindex("_maybe_record_phase3b_shadow(")
 
     assert source.index("scan_early_movers()") < post_shadow
-    assert source.rindex("send_telegram_message_with_id(") < post_shadow
+    assert source.rindex("send_tracked_telegram(") < post_shadow
     assert source.rindex("record_opportunity_alert(") < post_shadow
 
 

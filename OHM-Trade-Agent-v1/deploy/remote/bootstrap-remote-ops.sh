@@ -11,6 +11,7 @@ PRIVATE_KEY="$KEY_DIR/github-actions-deploy"
 PUBLIC_KEY="$PRIVATE_KEY.pub"
 DEPLOY_SCRIPT_SRC="$APP_ROOT/deploy/remote/ohm-deploy"
 SSH_GATEWAY_SRC="$APP_ROOT/deploy/remote/ohm-deploy-ssh"
+SCHEDULER_RECONCILE_SRC="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 SUDOERS_FILE="/etc/sudoers.d/ohmdeploy"
@@ -20,7 +21,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in git docker curl flock ssh-keygen install visudo; do
+for cmd in git docker curl flock ssh-keygen install visudo crontab; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
@@ -32,13 +33,14 @@ if [[ ! -d "$REPO_ROOT/.git" ]]; then
   exit 69
 fi
 
-if [[ ! -f "$DEPLOY_SCRIPT_SRC" || ! -f "$SSH_GATEWAY_SRC" ]]; then
-  echo "remote deploy scripts are missing from $APP_ROOT/deploy/remote" >&2
+if [[ ! -f "$DEPLOY_SCRIPT_SRC" || ! -f "$SSH_GATEWAY_SRC" || ! -f "$SCHEDULER_RECONCILE_SRC" ]]; then
+  echo "remote operations scripts are missing from $APP_ROOT/deploy/remote" >&2
   exit 69
 fi
 
 install -o root -g root -m 0755 "$DEPLOY_SCRIPT_SRC" "$DEPLOY_SCRIPT_DST"
 install -o root -g root -m 0755 "$SSH_GATEWAY_SRC" "$SSH_GATEWAY_DST"
+bash "$SCHEDULER_RECONCILE_SRC"
 
 if ! id "$DEPLOY_USER" >/dev/null 2>&1; then
   useradd --create-home --home-dir "$DEPLOY_HOME" --shell /bin/bash "$DEPLOY_USER"

@@ -23,7 +23,11 @@ from app.services.pending_setup_registry import (
 )
 from app.services.price_movement_radar import attach_actionable_plan
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
-from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_delivery import (
+    record_telegram_not_eligible,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
@@ -79,10 +83,10 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     action = _action_type(plan)
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     if action == "ENTER_NOW":
-        headline = f"🔥 OHM CHIEF — {direction} — ENTER NOW"
+        headline = f"🔥 OPPORTUNITY — {direction} — ENTER NOW"
         action_text = "Action: ENTRY CONDITIONS VALID\nUse the approved entry zone and respect the chase boundary."
     elif action == "PLACE_LIMIT":
-        headline = f"🎯 OHM CHIEF — {direction} — PLACE LIMIT"
+        headline = f"🎯 OPPORTUNITY — {direction} — PLACE LIMIT"
         action_text = (
             "Action: SET LIMIT ENTRY\n"
             + (
@@ -92,7 +96,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
             )
         )
     else:
-        raise ValueError("Cannot format non-actionable OHM trade plan")
+        raise ValueError("Cannot format non-actionable trade plan")
 
     quote_note = ""
     if candidate.get("primary_quote_currency") == "USDT" and not candidate.get("secondary_pair"):
@@ -100,7 +104,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
 
     ranking_note = ""
     if candidate.get("profit_rank") is not None:
-        ranking_note += f"OHM Opportunity Rank: #{candidate['profit_rank']}\n"
+        ranking_note += f"Opportunity Rank: #{candidate['profit_rank']}\n"
     if candidate.get("profit_rank_score") is not None:
         ranking_note += f"Profit Rank Score: {float(candidate['profit_rank_score']):.2f}/100\n"
 
@@ -149,7 +153,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
     fill_tracking_note = ""
     if candidate.get("economic_qualified") is True:
         fill_tracking_note = (
-            "Fill Tracking: read-only Kraken reconciliation; OHM sends a monitoring-degraded alert if position verification is unavailable\n"
+            "Fill Tracking: read-only Kraken reconciliation; a monitoring-degraded alert is sent if position verification is unavailable\n"
         )
 
     chase_label = "Do Not Chase Below" if direction == "SHORT" else "Do Not Chase Above"
@@ -300,9 +304,47 @@ def send_trade_plan(
     chat_id: str,
 ) -> bool:
     action = _action_type(plan)
-    if action is None or not should_send_trade_plan(candidate, plan):
+    direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
+    identity = f"QUALIFIED_OPPORTUNITY:{candidate.get('trade_id') or plan.symbol}"
+    initial_fingerprint = _alert_state_key(candidate, plan)
+    if action is None:
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type="NOT_ACTIONABLE",
+            fingerprint=initial_fingerprint,
+            reason="NO_ACTIONABLE_ENTRY_PLAN",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
+        return False
+    if not should_send_trade_plan(candidate, plan):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="DEDUP_OR_NOTIFICATION_POLICY",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
         return False
     if not _apply_intelligence(candidate, plan):
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="PORTFOLIO_OR_ALLOCATION_GUARDRAIL",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
         return False
 
     movement = attach_actionable_plan(
@@ -313,7 +355,6 @@ def send_trade_plan(
     if movement is not None:
         candidate["price_movement"] = movement
 
-    direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
     message = format_trade_plan(candidate=candidate, plan=plan, summary=summary)
 
@@ -360,18 +401,30 @@ def send_trade_plan(
             return False
 
     record_recommendation(trade_id=trade_id, candidate=candidate, plan=plan, action=action)
-    sent = send_telegram_message(bot_token, chat_id, message)
-    if sent:
-        key = _alert_state_key(candidate, plan)
+    key = _alert_state_key(candidate, plan)
+    identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
+    delivery = send_tracked_telegram(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        message=message,
+        identity=identity,
+        alert_family="QUALIFIED_OPPORTUNITY",
+        event_type=action,
+        fingerprint=key,
+        symbol=plan.symbol,
+        journey_id=candidate.get("journey_id"),
+        signal_id=candidate.get("signal_id"),
+        trade_id=trade_id,
+    )
+    if delivery.delivered:
         try:
             with registry_lock(STATE_LOCK_FILE):
                 state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
                 state[plan.symbol] = key
                 save_json_atomic(STATE_FILE, state)
         except (OSError, TimeoutError, RegistryIOError):
-            # The alert was already delivered; report failure through the
-            # normal notification policy state on the next cycle rather than
-            # pretending dedup persistence succeeded.
+            # The delivery ledger is canonical for transport outcome; a failed
+            # convenience dedup write must not erase a successful Telegram send.
             pass
         record_emitted(
             identity=f"{direction}:{plan.symbol}",
@@ -380,4 +433,4 @@ def send_trade_plan(
         )
     elif trade_id:
         terminalize_pending_setup(trade_id, "send_failed")
-    return sent
+    return delivery.delivered

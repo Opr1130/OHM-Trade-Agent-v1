@@ -6,6 +6,7 @@ from app.api.dashboard import router as dashboard_router
 from app.api.routes import router
 from app.core.config import get_settings
 from app.services.legacy_tradingview_guard import evaluate_legacy_tradingview_request
+from app.services.freqtrade_signal_bridge import ensure_bridge_files
 from app.services.telegram_callback_listener import (
     start_telegram_callback_listener,
     stop_telegram_callback_listener,
@@ -47,6 +48,13 @@ app.include_router(dashboard_router)
 
 @app.on_event("startup")
 def startup_event() -> None:
+    try:
+        ensure_bridge_files()
+    except Exception:
+        # The bridge is paper-only and must never prevent the advisory app
+        # from starting. Missing bridge state leaves Freqtrade unable to admit
+        # paper signals and therefore fails safe.
+        pass
     start_telegram_callback_listener()
 
 

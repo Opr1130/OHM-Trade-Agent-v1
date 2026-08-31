@@ -1,0 +1,179 @@
+name: freqtrade-contract
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/freqtrade/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/docker-compose.paper.yml'
+      - 'OHM-Trade-Agent-v1/app/services/freqtrade_**'
+      - 'OHM-Trade-Agent-v1/app/services/paper_trade_control.py'
+      - 'OHM-Trade-Agent-v1/app/services/registry_io.py'
+      - 'OHM-Trade-Agent-v1/app/services/intelligence_**'
+      - 'OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py'
+      - 'OHM-Trade-Agent-v1/app/jobs/run_cycle.py'
+      - '.github/workflows/freqtrade-contract.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'OHM-Trade-Agent-v1/freqtrade/**'
+      - 'OHM-Trade-Agent-v1/docker-compose.yml'
+      - 'OHM-Trade-Agent-v1/docker-compose.paper.yml'
+      - 'OHM-Trade-Agent-v1/app/services/freqtrade_**'
+      - 'OHM-Trade-Agent-v1/app/services/paper_trade_control.py'
+      - 'OHM-Trade-Agent-v1/app/services/registry_io.py'
+      - 'OHM-Trade-Agent-v1/app/services/intelligence_**'
+      - 'OHM-Trade-Agent-v1/app/jobs/scan_opportunities.py'
+      - 'OHM-Trade-Agent-v1/app/jobs/run_cycle.py'
+      - '.github/workflows/freqtrade-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: OHM-Trade-Agent-v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate independent Compose models
+        run: |
+          touch .env
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.paper.yml config -q
+
+      - name: Prepare isolated Freqtrade runtime fixtures
+        run: |
+          mkdir -p             "$RUNNER_TEMP/ohm-ft-bridge"             "$RUNNER_TEMP/ohm-ft-control"             "$RUNNER_TEMP/ohm-ft-user-data/strategies"             "$RUNNER_TEMP/ohm-ft-state"
+          cp freqtrade/user_data/strategies/OHMExternalSignalStrategy.py             "$RUNNER_TEMP/ohm-ft-user-data/strategies/"
+          printf '%s\n' '{"pairs":["SOL/USD"],"refresh_period":10,"stake_currency":"USD"}' > "$RUNNER_TEMP/ohm-ft-bridge/pairlist_usd.json"
+          printf '%s\n' '{"pairs":["SOL/USDT"],"refresh_period":10,"stake_currency":"USDT"}' > "$RUNNER_TEMP/ohm-ft-bridge/pairlist_usdt.json"
+          printf '%s\n' '{"schema_version":1,"signals":[]}' > "$RUNNER_TEMP/ohm-ft-bridge/signals.json"
+          printf '%s\n' '{"schema_version":1,"enabled":false,"updated_by":"CI"}' > "$RUNNER_TEMP/ohm-ft-control/control.json"
+
+      - name: Pull pinned Freqtrade engine
+        run: docker pull freqtradeorg/freqtrade:2026.7
+
+      - name: Load OHM strategy in real Freqtrade for USD and USDT
+        run: |
+          for CONFIG in config.json config_usdt.json; do
+            docker run --rm \
+              -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
+              -v "$PWD/freqtrade/user_data/$CONFIG:/freqtrade/config/$CONFIG:ro" \
+              -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
+              -v "$RUNNER_TEMP/ohm-ft-control:/freqtrade/control:ro" \
+              -v "$RUNNER_TEMP/ohm-ft-state:/freqtrade/state" \
+              freqtradeorg/freqtrade:2026.7 \
+              list-strategies \
+              --config "/freqtrade/config/$CONFIG" \
+              | tee "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"
+            grep -q 'OHMExternalSignalStrategy' "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"
+            if grep -q 'DUPLICATE NAME' "$RUNNER_TEMP/ohm-ft-strategies-$CONFIG.txt"; then
+              echo "Duplicate OHM strategy registration detected" >&2
+              exit 1
+            fi
+          done
+
+      - name: Validate dynamic Kraken pairlists in real Freqtrade
+        run: |
+          docker run --rm \
+            -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
+            -v "$PWD/freqtrade/user_data/config.json:/freqtrade/config/config.json:ro" \
+            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
+            freqtradeorg/freqtrade:2026.7 \
+            test-pairlist --config /freqtrade/config/config.json --print-json \
+            | tee "$RUNNER_TEMP/ohm-ft-pairs-usd.txt"
+          grep -q 'SOL/USD' "$RUNNER_TEMP/ohm-ft-pairs-usd.txt"
+
+          docker run --rm \
+            -v "$RUNNER_TEMP/ohm-ft-user-data:/freqtrade/user_data" \
+            -v "$PWD/freqtrade/user_data/config_usdt.json:/freqtrade/config/config_usdt.json:ro" \
+            -v "$RUNNER_TEMP/ohm-ft-bridge:/freqtrade/user_data/bridge:ro" \
+            freqtradeorg/freqtrade:2026.7 \
+            test-pairlist --config /freqtrade/config/config_usdt.json --print-json \
+            | tee "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
+          grep -q 'SOL/USDT' "$RUNNER_TEMP/ohm-ft-pairs-usdt.txt"
+
+      - name: Boot production paper sidecar and require both worker heartbeats
+        run: |
+          rm -rf data/freqtrade data/freqtrade_bridge data/paper_trading
+          mkdir -p data/freqtrade/user_data data/freqtrade/state data/freqtrade_bridge data/paper_trading
+          cp "$RUNNER_TEMP/ohm-ft-bridge/"*.json data/freqtrade_bridge/
+          cp "$RUNNER_TEMP/ohm-ft-control/control.json" data/paper_trading/control.json
+
+          # Reproduce the restrictive root-created modes seen in production.
+          chmod 0600 data/freqtrade_bridge/*.json data/paper_trading/control.json
+
+          docker compose -f docker-compose.paper.yml up -d ohm-freqtrade-paper
+
+          STATUS=""
+          for _ in $(seq 1 45); do
+            STATUS="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' ohm-freqtrade-paper 2>/dev/null || true)"
+            if [ "$STATUS" = "healthy" ]; then
+              break
+            fi
+            if [ "$(docker inspect --format='{{.State.Restarting}}' ohm-freqtrade-paper 2>/dev/null || true)" = "true" ]; then
+              docker compose -f docker-compose.paper.yml logs --tail=200
+              exit 1
+            fi
+            sleep 2
+          done
+
+          test "$STATUS" = "healthy"
+          test -s data/freqtrade/state/heartbeat_USD
+          test -s data/freqtrade/state/heartbeat_USDT
+          test "$(stat -c '%a' data/freqtrade_bridge/signals.json)" = "644"
+          test "$(stat -c '%a' data/paper_trading/control.json)" = "644"
+
+          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config.json'
+          docker top ohm-freqtrade-paper -eo pid,args             | grep -q -- '--config /freqtrade/config/config_usdt.json'
+
+      - name: Prove dry-run and credential isolation
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          configs = [
+              json.loads(Path("freqtrade/user_data/config.json").read_text()),
+              json.loads(Path("freqtrade/user_data/config_usdt.json").read_text()),
+          ]
+          assert {config["stake_currency"] for config in configs} == {"USD", "USDT"}
+          for config in configs:
+              assert config["dry_run"] is True
+              assert config["trading_mode"] == "spot"
+              assert config["exchange"]["name"] == "kraken"
+              assert not config["exchange"].get("key")
+              assert not config["exchange"].get("secret")
+              assert "api_server" not in config
+              assert "telegram" not in config
+              assert config["pairlists"][0]["processing_mode"] == "append"
+              assert config["custom_price_max_distance_ratio"] == 1.0
+              assert config["exit_pricing"]["price_side"] == "other"
+              assert config["pairlists"][0]["pairlist_url"].startswith("file:///user_data/bridge/")
+
+          production = Path("docker-compose.yml").read_text()
+          paper = Path("docker-compose.paper.yml").read_text()
+          assert "ohm-freqtrade-paper" not in production
+          assert "freqtradeorg/freqtrade" not in production
+          assert "docker-compose.paper.yml" not in production
+          assert paper.startswith("name: ohm-paper\n")
+          assert "ohm-freqtrade-paper-init" in paper
+          assert "network_mode: none" in paper
+          assert "freqtradeorg/freqtrade:2026.7" in paper
+          assert "env_file:" not in paper
+          assert "ports:" not in paper
+          assert "./data/paper_trading:/freqtrade/control:ro" in paper
+          assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper
+          assert "mem_limit: 384m" in paper
+          assert 'cpus: "0.40"' in paper
+          print("Freqtrade paper authority/isolation boundary: PASS")
+          PY
+
+      - name: Cleanup paper sidecar
+        if: always()
+        run: docker compose -f docker-compose.paper.yml down --remove-orphans || true

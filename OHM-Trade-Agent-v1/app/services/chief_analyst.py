@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 
 from openai import OpenAI
 
@@ -19,13 +21,20 @@ from app.services.chief_runtime_guard import (
     store_cached_review,
 )
 from app.services.economic_quality_gate import (
+    DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
+    MIN_NET_PROFIT,
+    MIN_REWARD_TO_RISK,
+    MIN_TARGET_2_MOVE_PCT,
     PRODUCTION_MAX_CAPITAL_FRACTION,
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.openai_usage_telemetry import append_usage_record
 from app.services.short_target_attainability import evaluate_short_target_attainability
-from app.services.target_attainability import evaluate_target_attainability
+from app.services.target_attainability import (
+    MIN_QUALIFYING_SCORE,
+    evaluate_target_attainability,
+)
 
 
 SYSTEM_PROMPT = """You are OHM AI's Chief Investment Analyst and Risk Advisor.
@@ -69,6 +78,15 @@ Maximum 3 top_candidates. Confidence must be 0-100. Be conservative.
 """
 
 _ALLOWED_REASONING_EFFORTS = {"low", "medium", "high"}
+
+# Deterministic identity for the exact system prompt in use. This is not a
+# semantic version: it is a content hash, so it changes if and only if the
+# prompt text changes. O'Pip qualification evidence records it so a future
+# confidence analysis can partition by the prompt that produced the number.
+SYSTEM_PROMPT_VERSION = "CHIEF-PROMPT:" + hashlib.sha256(
+    SYSTEM_PROMPT.encode("utf-8")
+).hexdigest()[:12]
+
 SHORT_VALIDATION_LEVERAGE = 2.0
 SHORT_MARGIN_COST_RESERVE_PCT = 0.28
 SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT = 5.0
@@ -136,13 +154,233 @@ def _quality_by_risk_level(candidate: MarketSnapshot, account_equity: float) -> 
             "economic_rejection": economic.rejection_reason,
             "economic_assumed_capital": economic.recommended_capital,
             "economic_validation_leverage": getattr(economic, "leverage", 1.0),
+            "economic_reward_to_risk_2": float(getattr(plan, "reward_to_risk_2", 0.0)),
+            "economic_target_2_move_pct": getattr(economic, "target_2_move_pct", None),
             "economic_account_risk_at_stop_pct": getattr(economic, "account_risk_at_stop_pct", 0.0),
+            "economic_max_account_risk_at_stop_pct": (
+                SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT
+                if direction == "SHORT"
+                else DEFAULT_MAX_ACCOUNT_RISK_AT_STOP_PCT
+            ),
             "hypothetical_target_2_net_profit_at_assumed_capital": economic.target_2_net_profit,
         }
     return quality_by_risk_level, viable_any
 
 
-def _no_trade_review(reason: str, *, failure_code: str | None = None, eligible_candidates: int = 0) -> dict:
+#: O'Pip Chief invocation states. These are recorded separately because
+#: "no eligible candidate", "budget suppressed", "service failed", "cache
+#: reused" and "the model answered" are materially different events that the
+#: legacy ``AI top candidates = 0`` operator line collapses into one.
+CHIEF_SKIPPED_NO_ELIGIBLE = "SKIPPED_NO_ELIGIBLE_CANDIDATES"
+CHIEF_BUDGET_BLOCKED = "BUDGET_BLOCKED"
+CHIEF_CACHE_REUSED = "CACHE_REUSED"
+CHIEF_FAILED = "FAILED"
+CHIEF_SUCCEEDED = "SUCCEEDED"
+
+
+def _new_stage_evidence() -> dict:
+    """Return the mutable O'Pip stage-evidence accumulator for one review.
+
+    Measurement only: nothing read or written here participates in the review
+    decision. It exists so the qualification funnel can attribute the AI stage
+    exactly instead of inferring it from an empty candidate list.
+    """
+    return {
+        "prefiltered": [],
+        "eligible": [],
+        "invocation_status": CHIEF_SKIPPED_NO_ELIGIBLE,
+        "failure_type": None,
+        "invoked_at": None,
+        "model": None,
+        "prompt_version": SYSTEM_PROMPT_VERSION,
+        "eligible_candidate_count": 0,
+        "returned_candidate_count": 0,
+    }
+
+
+def _economic_binding_constraint(level: dict) -> dict:
+    """Return the numeric policy constraint that actually rejected one plan.
+
+    Economic quality can fail on reward/risk, target move, net profit, or stop
+    exposure. Nearest-miss telemetry must quote the same metric that triggered
+    the rejection rather than assuming net profit was always binding.
+    """
+    rejection = str(level.get("economic_rejection") or "")
+    if rejection.startswith("Reward/risk "):
+        metric = "ECONOMIC_REWARD_TO_RISK"
+        measured = level.get("economic_reward_to_risk_2")
+        threshold = float(MIN_REWARD_TO_RISK)
+        higher_is_better = True
+    elif rejection.startswith("Projected Target 2 move "):
+        metric = "ECONOMIC_TARGET_2_MOVE_PCT"
+        measured = level.get("economic_target_2_move_pct")
+        threshold = float(MIN_TARGET_2_MOVE_PCT)
+        higher_is_better = True
+    elif rejection.startswith("Projected net profit $"):
+        metric = "ECONOMIC_NET_PROFIT_AT_TARGET_2"
+        measured = level.get(
+            "hypothetical_target_2_net_profit_at_assumed_capital"
+        )
+        threshold = float(MIN_NET_PROFIT)
+        higher_is_better = True
+    elif rejection.startswith("stop exposure "):
+        metric = "ECONOMIC_ACCOUNT_RISK_AT_STOP_PCT"
+        measured = level.get("economic_account_risk_at_stop_pct")
+        threshold = level.get("economic_max_account_risk_at_stop_pct")
+        higher_is_better = False
+    else:
+        # Backward-compatible evidence (older captures and unit-test stubs)
+        # may predate the structured rejection string. Only infer net profit
+        # when the stored value itself proves that this named gate failed;
+        # otherwise leave the binding metric unattributed rather than inventing
+        # a threshold.
+        net_profit = level.get(
+            "hypothetical_target_2_net_profit_at_assumed_capital"
+        )
+        try:
+            net_profit_value = float(net_profit)
+        except (TypeError, ValueError):
+            net_profit_value = None
+        if net_profit_value is not None and net_profit_value < float(MIN_NET_PROFIT):
+            metric = "ECONOMIC_NET_PROFIT_AT_TARGET_2"
+            measured = net_profit_value
+            threshold = float(MIN_NET_PROFIT)
+            higher_is_better = True
+        else:
+            return {
+                "metric": "ECONOMIC_REJECTION",
+                "measured": None,
+                "threshold": None,
+                "higher_is_better": True,
+                "distance": None,
+            }
+
+    try:
+        measured_value = float(measured)
+        threshold_value = float(threshold)
+    except (TypeError, ValueError):
+        distance = None
+    else:
+        if threshold_value == 0:
+            distance = None
+        else:
+            gap = (measured_value - threshold_value) / abs(threshold_value)
+            distance = gap if higher_is_better else -gap
+
+    return {
+        "metric": metric,
+        "measured": measured,
+        "threshold": threshold,
+        "higher_is_better": higher_is_better,
+        "distance": distance,
+    }
+
+
+def binding_deterministic_constraint(quality_by_risk_level: dict) -> dict:
+    """Return the constraint that actually stopped a deterministic screen.
+
+    When no risk level clears target quality, the best target score is binding.
+    When target quality clears but economics fails, the metric is derived from
+    the actual economic rejection for that risk level. If multiple target-
+    qualified risk variants fail economics, the closest comparable failing
+    constraint is reported.
+    """
+    levels = list(quality_by_risk_level.values())
+    target_passed = any(
+        bool(level.get("target_quality_qualified")) for level in levels
+    )
+    best_target_score = max(
+        (float(level.get("target_quality_score") or 0.0) for level in levels),
+        default=0.0,
+    )
+    best_net_profit = max(
+        (
+            float(
+                level.get("hypothetical_target_2_net_profit_at_assumed_capital")
+                or 0.0
+            )
+            for level in levels
+        ),
+        default=0.0,
+    )
+
+    if not target_passed:
+        binding = {
+            "metric": "TARGET_QUALITY_SCORE",
+            "measured": best_target_score,
+            "threshold": float(MIN_QUALIFYING_SCORE),
+            "higher_is_better": True,
+        }
+    else:
+        economic_constraints = [
+            _economic_binding_constraint(level)
+            for level in levels
+            if bool(level.get("target_quality_qualified"))
+            and not bool(level.get("economic_qualified"))
+        ]
+        comparable = [
+            item for item in economic_constraints if item.get("distance") is not None
+        ]
+        if comparable:
+            binding = max(comparable, key=lambda item: float(item["distance"]))
+        elif economic_constraints:
+            binding = economic_constraints[0]
+        else:
+            # Defensive fallback: this function is normally called only for a
+            # rejected deterministic screen. Avoid fabricating a threshold.
+            binding = {
+                "metric": "ECONOMIC_REJECTION",
+                "measured": None,
+                "threshold": None,
+                "higher_is_better": True,
+            }
+
+    return {
+        "target_qualified_any": target_passed,
+        "economic_qualified_any": any(
+            bool(level.get("economic_qualified")) for level in levels
+        ),
+        "best_target_quality_score": best_target_score,
+        "best_economic_net_profit": best_net_profit,
+        "binding_metric": binding["metric"],
+        "binding_measured": binding["measured"],
+        "binding_threshold": binding["threshold"],
+        "binding_higher_is_better": bool(binding["higher_is_better"]),
+    }
+
+def _prefilter_evidence(candidate: MarketSnapshot, quality_by_risk_level: dict) -> dict:
+    """Summarise why the deterministic prefilter dropped one finalist.
+
+    This is the stage that most often ends a scan, and today it is invisible:
+    the candidate simply never appears in the Chief payload.
+    """
+    reasons: list[str] = []
+    for risk_level, level in quality_by_risk_level.items():
+        parts: list[str] = []
+        rejections = level.get("target_quality_rejections") or []
+        if rejections:
+            parts.append("target=" + "; ".join(str(item) for item in rejections))
+        economic_rejection = level.get("economic_rejection")
+        if economic_rejection:
+            parts.append("economic=" + str(economic_rejection))
+        if parts:
+            reasons.append(f"{risk_level}: " + " | ".join(parts))
+    return {
+        "symbol": candidate.symbol,
+        "direction": candidate.trade_direction.upper(),
+        **binding_deterministic_constraint(quality_by_risk_level),
+        "reason": "; ".join(reasons)
+        or "no risk level clears both the target and economic gates",
+    }
+
+
+def _no_trade_review(
+    reason: str,
+    *,
+    failure_code: str | None = None,
+    eligible_candidates: int = 0,
+    stage_evidence: dict | None = None,
+) -> dict:
     review = {
         "market_view": "",
         "recommended_action": "no_trade",
@@ -153,6 +391,8 @@ def _no_trade_review(reason: str, *, failure_code: str | None = None, eligible_c
     }
     if failure_code:
         review["chief_failure_code"] = failure_code
+    if stage_evidence is not None:
+        review["opip_stage_evidence"] = stage_evidence
     return review
 
 
@@ -189,6 +429,8 @@ def review_candidates(
     market_regime_context: object | None = None,
     coingecko_global_context: object | None = None,
 ) -> dict:
+    stage_evidence = _new_stage_evidence()
+    stage_evidence["model"] = model
     payload = []
     unique_candidates: list[MarketSnapshot] = []
     seen: set[tuple[str, str]] = set()
@@ -211,6 +453,9 @@ def review_candidates(
                     candidate,
                     quality_by_risk_level=quality_by_risk_level,
                     market_regime_context=market_regime_context,
+                )
+                stage_evidence["prefiltered"].append(
+                    _prefilter_evidence(candidate, quality_by_risk_level)
                 )
                 continue
 
@@ -308,10 +553,15 @@ def review_candidates(
         candidate_context["price_movement_intelligence"] = candidate.price_movement_signal
         payload.append(candidate_context)
         chief_eligible_candidates.append(candidate)
+        stage_evidence["eligible"].append(
+            {"symbol": candidate.symbol, "direction": direction}
+        )
 
+    stage_evidence["eligible_candidate_count"] = len(payload)
     if account_equity is not None and not payload:
         return _no_trade_review(
-            "Chief API skipped: no LONG/SHORT finalist can pass both deterministic target and economic gates under low or medium risk."
+            "Chief API skipped: no LONG/SHORT finalist can pass both deterministic target and economic gates under low or medium risk.",
+            stage_evidence=stage_evidence,
         )
 
     request_payload = _request_payload(
@@ -325,6 +575,11 @@ def review_candidates(
         cached["chief_api_skipped"] = True
         cached["chief_cache_reused"] = True
         cached["chief_eligible_candidates"] = len(payload)
+        stage_evidence["invocation_status"] = CHIEF_CACHE_REUSED
+        stage_evidence["returned_candidate_count"] = len(
+            cached.get("top_candidates") or []
+        )
+        cached["opip_stage_evidence"] = stage_evidence
         return cached
 
     blocked = budget_block_reason()
@@ -334,10 +589,13 @@ def review_candidates(
             reason_code="CHIEF_BUDGET_LIMIT",
             detail=blocked,
         )
+        stage_evidence["invocation_status"] = CHIEF_BUDGET_BLOCKED
+        stage_evidence["failure_type"] = "CHIEF_BUDGET_LIMIT"
         return _no_trade_review(
             f"Chief API skipped: {blocked}.",
             failure_code="CHIEF_BUDGET_LIMIT",
             eligible_candidates=len(payload),
+            stage_evidence=stage_evidence,
         )
 
     try:
@@ -381,15 +639,25 @@ def review_candidates(
             detail=detail,
         )
         print(f"CHIEF SUPPRESSED Reason=CHIEF_UNAVAILABLE Error={type(exc).__name__}")
+        stage_evidence["invocation_status"] = CHIEF_FAILED
+        stage_evidence["failure_type"] = type(exc).__name__
+        stage_evidence["invoked_at"] = datetime.now(timezone.utc).isoformat()
         return _no_trade_review(
             f"Chief unavailable; fail-closed: {type(exc).__name__}.",
             failure_code="CHIEF_UNAVAILABLE",
             eligible_candidates=len(payload),
+            stage_evidence=stage_evidence,
         )
 
     review["chief_api_skipped"] = False
     review["chief_cache_reused"] = False
     review["chief_eligible_candidates"] = len(payload)
+    stage_evidence["invocation_status"] = CHIEF_SUCCEEDED
+    stage_evidence["invoked_at"] = datetime.now(timezone.utc).isoformat()
+    stage_evidence["returned_candidate_count"] = len(
+        review.get("top_candidates") or []
+    )
+    review["opip_stage_evidence"] = stage_evidence
     store_cached_review(fingerprint, review)
     try:
         review["learning_capture"] = capture_chief_review_decisions(

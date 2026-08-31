@@ -13,8 +13,15 @@ from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import get_active_trades
 from app.services.asset_display_identity import display_asset_text, display_market_label
+from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
+from app.services.paper_trade_control import (
+    PaperTradeActivationError,
+    get_paper_trade_control,
+    set_paper_trade_enabled,
+)
+from app.services.paper_trade_registry import account_summary
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_market_insights import (
     MarketInsight,
@@ -29,6 +36,7 @@ from app.services.telegram_notifier import (
     send_telegram_message,
     send_telegram_message_with_id,
 )
+from app.services.telegram_delivery import send_tracked_telegram
 
 
 WATCH_FILE = Path("/app/data/telegram_market_watches.json")
@@ -54,9 +62,11 @@ _HELP = (
     "/orders — review current Kraken open orders\n"
     "/positions — review Kraken spot balances/margin positions\n"
     "/market — BTC-led market regime read\n"
+    "/paper status|on|off — isolated Paper Trade v1 control\n"
     "/help — show commands\n\n"
     "Examples: /CAP, /BTC, /ETH, /scan VVV\n\n"
-    "Read-only/advisory: Telegram commands never place, cancel, modify, or confirm Kraken orders."
+    "Read-only/advisory: Telegram commands never place, cancel, modify, or confirm Kraken orders. "
+    "Paper control changes simulation state only."
 )
 
 
@@ -233,8 +243,8 @@ def _is_material_watch_change(row: dict[str, Any], insight: MarketInsight) -> bo
 
 def _format_watchlist(watches: dict[str, dict[str, Any]]) -> str:
     if not watches:
-        return "👁 OHM WATCHLIST\nNo coins are being watched. Use /watch COIN."
-    lines = [f"👁 OHM WATCHLIST — {len(watches)}/{MAX_WATCHES}"]
+        return "👁 WATCHLIST\nNo coins are being watched. Use /watch COIN."
+    lines = [f"👁 WATCHLIST — {len(watches)}/{MAX_WATCHES}"]
     for symbol, row in sorted(watches.items()):
         lines.append(
             f"{symbol}: {row.get('state', 'UNKNOWN')} | {row.get('action', 'UNKNOWN')} | {_fmt_price(_finite(row.get('last_price')))}"
@@ -331,9 +341,9 @@ def orders_report() -> str:
         intents = get_live_order_intents()
         return format_orders_report(open_orders, intents, KrakenClient(timeout_seconds=5.0))
     except KrakenPrivateAPIError:
-        return "⚠️ OHM ORDERS — Kraken private account data is temporarily unavailable. No order was changed."
+        return "⚠️ ORDERS — Kraken private account data is temporarily unavailable. No order was changed."
     except RegistryIOError:
-        return "⚠️ OHM ORDERS — local lifecycle state is unavailable, so order attribution is unsafe. No order was changed."
+        return "⚠️ ORDERS — local lifecycle state is unavailable, so order attribution is unsafe. No order was changed."
 
 
 def _aggregate_balances(raw: dict[str, float]) -> tuple[dict[str, float], bool]:
@@ -357,7 +367,7 @@ def positions_report() -> str:
         balances, invalid = _aggregate_balances(private.get_balance())
         margin_positions = private.get_open_positions()
     except KrakenPrivateAPIError:
-        return "⚠️ OHM POSITIONS — Kraken private account data is temporarily unavailable."
+        return "⚠️ POSITIONS — Kraken private account data is temporarily unavailable."
 
     public = KrakenClient(timeout_seconds=5.0)
     try:
@@ -412,7 +422,7 @@ def market_report() -> str:
     try:
         insight = analyze_market("BTC")
     except (MarketResolutionError, MarketInsightUnavailable) as exc:
-        return f"⚠️ OHM MARKET — BTC regime data unavailable: {str(exc)[:160]}"
+        return f"⚠️ MARKET — BTC regime data unavailable: {str(exc)[:160]}"
     if insight.momentum_24h_pct <= -3.0 or insight.momentum_1h_pct <= -2.0 or insight.state == "REVERSAL_RISK":
         regime = "RISK_OFF / DEFENSIVE"
     elif insight.momentum_24h_pct >= 3.0 and insight.momentum_1h_pct > -0.5 and insight.trend == "BULLISH":
@@ -440,16 +450,16 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
     try:
         insight = analyze_market(symbol_query)
     except (MarketResolutionError, MarketInsightUnavailable) as exc:
-        _send(settings, f"⚠️ OHM WATCH — {str(exc)[:220]}")
+        _send(settings, f"⚠️ WATCH — {str(exc)[:220]}")
         return
     try:
         watches = get_watches()
     except RegistryIOError:
-        _send(settings, "⚠️ OHM WATCH — watch registry is unavailable; no watch was added.")
+        _send(settings, "⚠️ WATCH — watch registry is unavailable; no watch was added.")
         return
     existing = watches.get(insight.symbol)
     if existing is None and len(watches) >= MAX_WATCHES:
-        _send(settings, f"⚠️ OHM WATCH — limit reached ({MAX_WATCHES}). Use /unwatch COIN first.")
+        _send(settings, f"⚠️ WATCH — limit reached ({MAX_WATCHES}). Use /unwatch COIN first.")
         return
 
     text = format_market_insight(insight, watch=True)
@@ -474,7 +484,7 @@ def _handle_watch(settings: Any, symbol_query: str) -> None:
     try:
         _put_watch(insight.symbol, _watch_row(insight, message_id))
     except (RegistryIOError, OSError, TimeoutError):
-        _send(settings, "⚠️ OHM WATCH — card sent, but watch persistence failed; automatic refresh is not active.")
+        _send(settings, "⚠️ WATCH — card sent, but watch persistence failed; automatic refresh is not active.")
         return
     if existing is not None:
         _send(settings, f"👁 {insight.symbol} watch refreshed. The existing watch card will update on material changes.")
@@ -485,12 +495,78 @@ def _handle_unwatch(settings: Any, symbol_query: str) -> None:
         symbol = _canonical_watch_symbol(symbol_query)
         removed = _delete_watch(symbol)
     except TelegramCommandError as exc:
-        _send(settings, f"⚠️ OHM UNWATCH — {exc}")
+        _send(settings, f"⚠️ UNWATCH — {exc}")
         return
     except (RegistryIOError, OSError, TimeoutError):
-        _send(settings, "⚠️ OHM UNWATCH — watch registry is unavailable; no change was made.")
+        _send(settings, "⚠️ UNWATCH — watch registry is unavailable; no change was made.")
         return
     _send(settings, f"👁 {symbol} removed from watchlist." if removed else f"👁 {symbol} was not on the watchlist.")
+
+
+def _paper_status_text(settings: Any) -> str:
+    control = get_paper_trade_control()
+    authoritative = freqtrade_dry_run_status()
+    shadow = account_summary(float(settings.paper_trade_starting_equity))
+    open_pairs = ", ".join(authoritative.get("open_pairs") or []) or "None"
+    pnl_by_currency = authoritative.get("realized_pnl_by_currency") or {}
+    usd_pnl = float(pnl_by_currency.get("USD") or 0.0)
+    usdt_pnl = float(pnl_by_currency.get("USDT") or 0.0)
+    return (
+        "🧪 OHM PAPER TRADE\n"
+        f"Mode: {'ON' if control.enabled else 'OFF'}\n"
+        "Authoritative engine: FREQTRADE DRY-RUN\n"
+        f"Freqtrade status: {authoritative.get('status', 'UNKNOWN')}\n"
+        f"Freqtrade open/closed: {authoritative.get('open_trades', 0)}/"
+        f"{authoritative.get('closed_trades', 0)}\n"
+        f"Freqtrade realized P/L: ${usd_pnl:,.2f} USD | {usdt_pnl:,.2f} USDT\n"
+        f"Freqtrade open pairs: {open_pairs}\n"
+        "Shadow/control engine: OHM INTERNAL SIMULATOR\n"
+        f"Shadow open/closed: {shadow.open_positions}/{shadow.closed_trades}\n"
+        f"Shadow realized net P/L: ${shadow.realized_net_pnl:,.2f}\n"
+        "Policy: SPOT LONG ONLY\n"
+        "Kraken exchange writes: NONE"
+    )
+
+
+def _handle_paper(settings: Any, args: tuple[str, ...]) -> None:
+    if len(args) > 1:
+        raise TelegramCommandError("Usage: /paper status|on|off")
+    action = str(args[0] if args else "status").strip().casefold()
+    if action == "status":
+        _send(settings, _paper_status_text(settings))
+        return
+    if action not in {"on", "off"}:
+        raise TelegramCommandError("Usage: /paper status|on|off")
+
+    try:
+        state = set_paper_trade_enabled(
+            action == "on",
+            updated_by="TELEGRAM_AUTHORIZED_OPERATOR",
+        )
+    except PaperTradeActivationError as exc:
+        raise TelegramCommandError(
+            f"Paper activation refused: {exc}"
+        ) from exc
+    if action == "on":
+        prefix = (
+            "✅ PAPER TRADE — ON\n"
+            "Authoritative engine: FREQTRADE DRY-RUN\n"
+            "New qualified LONG opportunities may enter Freqtrade forward testing.\n"
+            "OHM internal simulator remains shadow/control only.\n"
+        )
+    else:
+        prefix = (
+            "⛔ PAPER TRADE — OFF\n"
+            "No new paper exposure will be admitted. Pending entries cancel on "
+            "the next monitor pass; already-open paper positions continue to a "
+            "terminal outcome.\n"
+        )
+    _send(
+        settings,
+        prefix
+        + f"Updated: {state.updated_at}\n"
+        + "Kraken execution authority: NONE",
+    )
 
 
 def process_command_message(update: dict[str, Any], settings: Any | None = None) -> bool:
@@ -520,13 +596,13 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             try:
                 _send(settings, format_market_insight(analyze_market(symbol)))
             except (MarketResolutionError, MarketInsightUnavailable) as exc:
-                _send(settings, f"⚠️ OHM SCAN — {str(exc)[:220]}")
+                _send(settings, f"⚠️ SCAN — {str(exc)[:220]}")
         elif command == "why":
             symbol = _require_symbol(args, "why")
             try:
                 _send(settings, format_market_insight(analyze_market(symbol), verbose=True))
             except (MarketResolutionError, MarketInsightUnavailable) as exc:
-                _send(settings, f"⚠️ OHM WHY — {str(exc)[:220]}")
+                _send(settings, f"⚠️ WHY — {str(exc)[:220]}")
         elif command == "watch":
             _handle_watch(settings, _require_symbol(args, "watch"))
         elif command == "unwatch":
@@ -537,7 +613,7 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             try:
                 _send(settings, _format_watchlist(get_watches()))
             except RegistryIOError:
-                _send(settings, "⚠️ OHM WATCHLIST — watch registry is unavailable.")
+                _send(settings, "⚠️ WATCHLIST — watch registry is unavailable.")
         elif command == "orders":
             if args:
                 raise TelegramCommandError("Usage: /orders")
@@ -550,12 +626,14 @@ def process_command_message(update: dict[str, Any], settings: Any | None = None)
             if args:
                 raise TelegramCommandError("Usage: /market")
             _send(settings, market_report())
+        elif command == "paper":
+            _handle_paper(settings, args)
         else:
             _send(settings, f"Unknown command /{command}. Use /help.")
     except TelegramCommandError as exc:
         _send(settings, f"⚠️ {exc}")
     except Exception as exc:
-        _send(settings, f"⚠️ OHM command failed safely ({type(exc).__name__}). No Kraken order was changed.")
+        _send(settings, f"⚠️ command failed safely ({type(exc).__name__}). No Kraken order was changed.")
     return True
 
 
@@ -567,7 +645,7 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
     except RegistryIOError:
         _send(
             settings,
-            "⚠️ OHM WATCH DEGRADED — watch registry is unavailable or corrupt. Existing Telegram cards may be stale.",
+            "⚠️ WATCH DEGRADED — watch registry is unavailable or corrupt. Existing Telegram cards may be stale.",
         )
         return 0
     changed = 0
@@ -595,7 +673,7 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
             except Exception:
                 pass
             if failures == 3:
-                _send(settings, f"⚠️ OHM WATCH DEGRADED — {symbol}: three consecutive market-data refresh failures. Existing card retained.")
+                _send(settings, f"⚠️ WATCH DEGRADED — {symbol}: three consecutive market-data refresh failures. Existing card retained.")
             continue
 
         material = _is_material_watch_change(row, insight)
@@ -608,24 +686,23 @@ def refresh_market_watches(settings: Any | None = None, *, force: bool = False) 
                 pass
             continue
 
-        message_id = _safe_message_id(row.get("message_id"))
-        delivered = False
-        if message_id > 0:
-            delivered = edit_telegram_message(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                message_id,
-                format_market_insight(insight, watch=True),
-            )
-        if not delivered:
-            replacement = send_telegram_message_with_id(
-                settings.telegram_bot_token,
-                settings.telegram_chat_id,
-                format_market_insight(insight, watch=True),
-            )
-            if replacement is not None:
-                message_id = replacement
-                delivered = True
+        # A material watch transition must create a fresh Telegram message so
+        # the mobile client generates a new push. The old card remains historical.
+        fingerprint = f"{row.get('state')}:{row.get('action')}:{row.get('risk')}->{insight.state}:{insight.action}:{insight.risk}:{insight.current_price:.8g}"
+        delivery = send_tracked_telegram(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            message=format_market_insight(insight, watch=True),
+            identity=f"COMMAND_WATCH:{symbol}",
+            alert_family="COMMAND_WATCH",
+            event_type="MATERIAL_TRANSITION",
+            fingerprint=fingerprint,
+            symbol=insight.symbol,
+            pair=insight.pair,
+            success_status="TRANSITION_PUSHED",
+        )
+        message_id = delivery.message_id or 0
+        delivered = delivery.delivered
 
         if delivered and message_id > 0:
             changed += 1

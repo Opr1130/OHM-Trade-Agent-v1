@@ -45,8 +45,8 @@ def test_external_orders_send_once_and_remain_unmanaged(monkeypatch, tmp_path):
     messages = []
     monkeypatch.setattr(
         review,
-        "send_telegram_message",
-        lambda bot, chat, message: messages.append(message) or True,
+        "send_tracked_telegram",
+        lambda **kwargs: messages.append(kwargs["message"]) or SimpleNamespace(delivered=True, message_id=81),
     )
 
     first = review.review_external_open_orders(FakePrivateClient(), FakePublicClient())
@@ -78,7 +78,11 @@ def test_ohm_linked_order_is_not_reviewed_as_external(monkeypatch, tmp_path):
         ),
     )
     sent = []
-    monkeypatch.setattr(review, "send_telegram_message", lambda *args, **kwargs: sent.append(1) or True)
+    monkeypatch.setattr(
+        review,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(1) or SimpleNamespace(delivered=True, message_id=82),
+    )
 
     result = review.review_external_open_orders(FakePrivateClient(), FakePublicClient())
 

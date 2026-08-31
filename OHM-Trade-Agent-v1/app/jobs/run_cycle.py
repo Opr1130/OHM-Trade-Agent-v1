@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import get_settings
 from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
+from app.jobs.scan_movers import main as scan_movers_main
 from app.jobs.scan_opportunities import main as scan_main
 from app.services.active_trade_monitor_runner import _notify_monitor_degraded
 from app.services.external_order_review import ExternalOrderReviewSummary, review_external_open_orders
@@ -12,10 +14,94 @@ from app.services.kraken_reconciliation import ReconciliationSummary, reconcile_
 from app.services.learning_scheduler import run_learning_cycle
 from app.services.operations_analytics import run_scan_with_telemetry
 from app.services.operator_control import get_operator_decision, mark_search_started, search_due
-from app.services.registry_io import registry_lock
+from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
+EARLY_WATCH_STATE_FILE = Path("/app/data/early_watch_scheduler_state.json")
+EARLY_WATCH_LOCK_FILE = EARLY_WATCH_STATE_FILE.parent / ".early_watch_scheduler.lock"
+
+
+def _parse_scheduler_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
+    """Run Early Watch on its configured cadence after real risk protection.
+
+    Crypto markets are continuous. Quiet hours suppress lower-priority pending
+    and broad/paid discovery, but must not create an overnight blind spot in
+    the selective Early Watch Telegram channel.
+    """
+    if quiet_hours:
+        print("OHM Early Watch remains active during quiet hours.")
+
+    now = datetime.now(timezone.utc)
+    interval_seconds = max(
+        30,
+        int(getattr(settings, "signal_quality_scan_interval_seconds", 600)),
+    )
+    try:
+        with registry_lock(EARLY_WATCH_LOCK_FILE):
+            state = load_json(EARLY_WATCH_STATE_FILE)
+            last = _parse_scheduler_time(state.get("last_started_at"))
+            if last is not None and (now - last).total_seconds() < interval_seconds:
+                print("OHM Early Watch skipped: cadence not due.")
+                return
+            state["last_started_at"] = now.isoformat()
+            state["interval_seconds"] = interval_seconds
+            save_json_atomic(EARLY_WATCH_STATE_FILE, state)
+    except Exception as exc:
+        print(
+            "OHM Early Watch scheduler unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+
+    try:
+        scan_movers_main()
+    except Exception as exc:
+        print(
+            "OHM Early Watch failed open; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _run_paper_monitor_fail_open() -> None:
+    """Run paper simulation only after live protection has completed."""
+    try:
+        from app.services.paper_trade_engine import PaperTradeConfig
+        from app.services.paper_trade_monitor import run_paper_trade_monitor
+
+        settings = get_settings()
+        summary = run_paper_trade_monitor(PaperTradeConfig.from_settings(settings))
+    except Exception as exc:
+        print(
+            "OHM Paper Trade v1 unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+
+    print("OHM Paper Trade v1")
+    print("Control enabled:", summary.control_enabled)
+    print("Tracked:", summary.tracked)
+    print("Checked:", summary.checked)
+    print("Opened:", summary.opened)
+    print("TP1 hits:", summary.tp1_hits)
+    print("Closed:", summary.closed)
+    print("Cancelled:", summary.cancelled)
+    print("Unresolved:", summary.unresolved)
+    print("Failures:", len(summary.failures))
+    for failure in summary.failures[:3]:
+        print("PAPER FAILURE:", failure)
 
 
 def _run_cycle_once() -> None:
@@ -133,6 +219,18 @@ def _run_cycle_once() -> None:
         print("Pending setup monitor skipped during quiet hours.")
     else:
         monitor_pending_main()
+
+    # Early Watch runs 24/7 after real active/pending protection and on its own
+    # cadence. Alert governance/dedup controls noise during quiet hours. Its
+    # failure cannot suppress the production opportunity scanner.
+    _run_early_watch_if_due(
+        settings=get_settings(),
+        quiet_hours=decision.quiet_hours,
+    )
+
+    # Shadow paper simulation is lower priority than every real lifecycle
+    # workflow. Authoritative Freqtrade runs in a separate Compose stack.
+    _run_paper_monitor_fail_open()
 
     # Broad discovery is state/capacity/time gated. This is the only branch
     # that can reach the paid Chief analysis path.

@@ -1,11 +1,36 @@
 services:
+  ohm-dashboard-edge:
+    image: nginx:1.27-alpine
+    container_name: ohm-dashboard-edge
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./deploy/nginx/dashboard-sidecar.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    entrypoint:
+      - nginx
+      - -g
+      - daemon off;
+
   ohm-trade-agent:
     build: .
     container_name: ohm-trade-agent
     restart: unless-stopped
+    depends_on:
+      ohm-dashboard-edge:
+        condition: service_started
     env_file:
       - .env
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/app/data
+      - ./data/freqtrade/state:/app/freqtrade_paper:ro

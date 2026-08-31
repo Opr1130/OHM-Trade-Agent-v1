@@ -12,7 +12,10 @@ from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 from app.services.asset_display_identity import display_market_label
-from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_delivery import (
+    record_telegram_not_eligible,
+    send_tracked_telegram,
+)
 
 
 REVIEW_FILE = Path("/app/data/external_order_reviews.json")
@@ -178,11 +181,28 @@ def review_external_open_orders(
                 opened_at=_order_opened_at(row),
             )
             delivered = False
+            identity = f"EXTERNAL_ORDER:{order_id}"
+            fingerprint = f"{pair}:{side}:{limit_price}:{volume}"
             if telegram_ready:
-                delivered = send_telegram_message(
-                    settings.telegram_bot_token,
-                    settings.telegram_chat_id,
-                    message,
+                delivery = send_tracked_telegram(
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    message=message,
+                    identity=identity,
+                    alert_family="EXTERNAL_ORDER_REVIEW",
+                    event_type="UNMANAGED_ORDER",
+                    fingerprint=fingerprint,
+                    symbol=pair,
+                )
+                delivered = delivery.delivered
+            else:
+                record_telegram_not_eligible(
+                    identity=identity,
+                    alert_family="EXTERNAL_ORDER_REVIEW",
+                    event_type="UNMANAGED_ORDER",
+                    fingerprint=fingerprint,
+                    reason="TELEGRAM_NOT_CONFIGURED",
+                    symbol=pair,
                 )
             if delivered:
                 sent += 1

@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from app.services.explosion_learning import observe_due_explosion_outcomes
+from app.services.freqtrade_result_ingest import ingest_freqtrade_dry_run
+from app.services.intelligence_learning_profile import build_intelligence_learning_profile
 from app.services.movement_discovery_outcomes import observe_due_movement_discovery_outcomes
 from app.services.profitability_learning import build_profitability_profile
 from app.services.price_movement_learning import observe_due_price_movements
@@ -67,6 +69,23 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
             "reason": f"Wave 5 explosion outcome observation failed open: {type(exc).__name__}: {exc}",
         }
 
+    try:
+        freqtrade = ingest_freqtrade_dry_run()
+    except Exception as exc:
+        freqtrade = {
+            "status": "UNAVAILABLE",
+            "outcomes_added": 0,
+            "reason": f"Freqtrade dry-run ingest failed open: {type(exc).__name__}: {exc}",
+        }
+    try:
+        intelligence_profile = build_intelligence_learning_profile(persist=True)
+    except Exception as exc:
+        intelligence_profile = {
+            "population": "FREQTRADE_DRY_RUN_V1",
+            "status": "UNAVAILABLE",
+            "reason": f"intelligence journey profile failed open: {type(exc).__name__}: {exc}",
+        }
+
     profile_refreshed = False
     profile_status = "NOT_DUE"
     with registry_lock(LOCK_FILE):
@@ -88,6 +107,8 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
         "price_movement": movement,
         "movement_discovery_v2_1": discovery,
         "wave5_explosion_learning": explosion,
+        "freqtrade_dry_run": freqtrade,
+        "intelligence_journey_profile": intelligence_profile,
         "profile_refreshed": profile_refreshed,
         "profile_status": profile_status,
     }

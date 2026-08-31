@@ -105,6 +105,36 @@ def canonical_cohort_id(
     return _hash("COHORT", identity, length=24)
 
 
+def canonical_episode_id(
+    observations: Iterable[Any],
+    *,
+    decision_at: datetime,
+    symbol: str,
+) -> str:
+    """Return the deterministic episode id used by canonical persistence.
+
+    This is pure identity construction: no disk or network I/O. Paper Trade v1
+    uses it to link a simulated lifecycle to the exact episode that the
+    post-alert canonical producer will persist later in the same scan.
+    """
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        raise ValueError("symbol is required")
+    rows = list(observations)
+    observed = {
+        str(getattr(row, "symbol", "") or "").strip().upper()
+        for row in rows
+    }
+    if normalized not in observed:
+        raise ValueError(f"{normalized} is not present in the canonical cohort")
+    cohort_id = canonical_cohort_id(rows, decision_at=decision_at)
+    return _hash(
+        "EP",
+        f"{SCHEMA_VERSION}|{cohort_id}|{normalized}",
+        length=24,
+    )
+
+
 def _candidate_by_symbol(
     candidates: Sequence[Any],
 ) -> dict[str, tuple[int, Any]]:

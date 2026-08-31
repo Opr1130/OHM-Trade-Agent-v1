@@ -12,7 +12,11 @@ from app.services.compact_alerts import (
 )
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.price_movement_radar import EXPIRED, READY, WATCH
-from app.services.telegram_notifier import send_telegram_message
+from app.services.telegram_delivery import (
+    record_telegram_not_eligible,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 
 
 NON_ACTIONABLE_STAGES = {WATCH, READY, EXPIRED}
@@ -49,7 +53,7 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
     symbol = str(signal.get("symbol") or "UNKNOWN").upper()
     if stage == EXPIRED:
         return (
-            f"⚪ OHM WATCH EXPIRED — {display_market_label(symbol)}\n"
+            f"⚪ WATCH EXPIRED — {display_market_label(symbol)}\n"
             "Reason: Setup expired without directional confirmation\n"
             "Action: NO TRADE"
         )
@@ -68,12 +72,22 @@ def format_price_movement_message(signal: dict[str, Any]) -> str:
         downside_pct=downside_scenario_pct(risk),
         reason=reason,
         action=action,
-        title="OHM MOVEMENT WATCH",
+        title="MOVEMENT WATCH",
     )
     if fallback:
         plain = f"Potential: +{low:.0f}% to +{high:.0f}%"
         disclosed = plain + " (heuristic fallback; not market-derived)"
         message = message.replace(plain, disclosed, 1)
+    price = signal.get("current_price") or signal.get("reference_price")
+    timeframe = signal.get("detection_timeframe") or signal.get("timeframe")
+    context: list[str] = []
+    if isinstance(price, (int, float)) and float(price) > 0:
+        context.append(f"Price: {float(price):.8g}")
+    if timeframe:
+        context.append(f"TF: {timeframe}")
+    if context:
+        lines = message.splitlines()
+        message = "\n".join([lines[0], " | ".join(context), *lines[1:]])
     return message
 
 
@@ -85,26 +99,48 @@ def send_price_movement_update(
     cooldown_seconds: int = 6 * 60 * 60,
 ) -> bool:
     stage = str(signal.get("stage") or "").upper()
-    if stage not in NON_ACTIONABLE_STAGES:
-        return False
     symbol = str(signal.get("symbol") or "UNKNOWN").upper()
+    identity = f"PRICE_MOVEMENT:{symbol}"
     fingerprint = str(signal.get("fingerprint") or f"{stage}:{signal.get('readiness_score', 0)}")
+    if stage not in NON_ACTIONABLE_STAGES:
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="PRICE_MOVEMENT",
+            event_type=stage or "UNKNOWN",
+            fingerprint=fingerprint,
+            reason="UNSUPPORTED_STAGE",
+            symbol=symbol,
+        )
+        return False
     if not should_emit(
-        identity=f"PRICE_MOVEMENT:{symbol}",
+        identity=identity,
         event_type=stage,
         fingerprint=fingerprint,
         cooldown_seconds=cooldown_seconds,
     ):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="PRICE_MOVEMENT",
+            event_type=stage,
+            fingerprint=fingerprint,
+            reason="NOTIFICATION_POLICY",
+            symbol=symbol,
+        )
         return False
-    sent = send_telegram_message(
-        bot_token,
-        chat_id,
-        format_price_movement_message(signal),
+    delivery = send_tracked_telegram(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        message=format_price_movement_message(signal),
+        identity=identity,
+        alert_family="PRICE_MOVEMENT",
+        event_type=stage,
+        fingerprint=fingerprint,
+        symbol=symbol,
     )
-    if sent:
+    if delivery.delivered:
         record_emitted(
-            identity=f"PRICE_MOVEMENT:{symbol}",
+            identity=identity,
             event_type=stage,
             fingerprint=fingerprint,
         )
-    return sent
+    return delivery.delivered
