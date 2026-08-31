@@ -25,7 +25,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep awk mktemp cp rm id; do
+for cmd in install crontab grep awk mktemp cp mv rm id; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
@@ -85,6 +85,16 @@ else
   : > "$tmpdir/root.before"
 fi
 
+install_executable_atomically() {
+  local source="$1"
+  local target="$2"
+  local tmp
+  tmp="$(mktemp "${target}.install.XXXXXX")"
+  rm -f "$tmp"
+  install -o root -g root -m 0755 "$source" "$tmp"
+  mv -f "$tmp" "$target"
+}
+
 rollback() {
   rc=$?
   trap - ERR
@@ -127,10 +137,10 @@ install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 # Refresh forced-command remote operations from the exact deployed SHA. This
 # keeps the production deploy gateway and read-only learning observability in
 # lockstep with the checked-out release without relaxing SSH authority.
-install -o root -g root -m 0755 "$DEPLOY_SCRIPT_SRC" "$DEPLOY_SCRIPT_DST"
-install -o root -g root -m 0755 "$SSH_GATEWAY_SRC" "$SSH_GATEWAY_DST"
-install -o root -g root -m 0755 "$LEARNING_READER_SRC" "$LEARNING_READER_DST"
-install -o root -g root -m 0755 "$LEARNING_DIAGNOSTICS_SRC" "$LEARNING_DIAGNOSTICS_DST"
+install_executable_atomically "$DEPLOY_SCRIPT_SRC" "$DEPLOY_SCRIPT_DST"
+install_executable_atomically "$SSH_GATEWAY_SRC" "$SSH_GATEWAY_DST"
+install_executable_atomically "$LEARNING_READER_SRC" "$LEARNING_READER_DST"
+install_executable_atomically "$LEARNING_DIAGNOSTICS_SRC" "$LEARNING_DIAGNOSTICS_DST"
 if id opiplearn >/dev/null 2>&1; then
   install -d -o opiplearn -g opiplearn -m 0750 "$LEARNING_READER_STATE"
 fi
