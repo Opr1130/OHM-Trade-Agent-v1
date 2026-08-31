@@ -124,13 +124,14 @@ def test_liquidation_observation_rejects_nonfinite_values(field, bad):
 
 def test_venue_cvd_state_rejects_nan_poisoning():
     with pytest.raises(ValueError):
-        VenueCvdState(venue="BINANCE", signed_notional_usd=float("nan"))
+        VenueCvdState(venue="BINANCE", canonical_asset_id="bitcoin", signed_notional_usd=float("nan"))
 
 
 def test_cross_venue_missing_quality_fails_closed_without_keyerror():
     states = {
         "BINANCE": VenueCvdState(
             venue="BINANCE",
+            canonical_asset_id="bitcoin",
             signed_base_volume=1.0,
             signed_notional_usd=100.0,
             gross_notional_usd=100.0,
@@ -138,6 +139,7 @@ def test_cross_venue_missing_quality_fails_closed_without_keyerror():
         ),
         "BYBIT": VenueCvdState(
             venue="BYBIT",
+            canonical_asset_id="bitcoin",
             signed_base_volume=1.0,
             signed_notional_usd=100.0,
             gross_notional_usd=100.0,
@@ -158,6 +160,7 @@ def test_cross_venue_extra_quality_fails_closed_without_keyerror():
     states = {
         "BINANCE": VenueCvdState(
             venue="BINANCE",
+            canonical_asset_id="bitcoin",
             signed_base_volume=1.0,
             signed_notional_usd=100.0,
             gross_notional_usd=100.0,
