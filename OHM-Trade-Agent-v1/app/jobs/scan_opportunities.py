@@ -1428,18 +1428,6 @@ def main():
             profit_rank_score=ranked.profit_ranking.total_score,
         )
 
-        # This candidate has now survived the complete qualification, global
-        # rank, and capital/portfolio path. Delivery reliability is owned by
-        # the qualified-alert outbox, so the fast entry-watch queue no longer
-        # has authority to force repeated full scans for this setup.
-        try:
-            remove_entry_watch(opportunity.snapshot.symbol, direction)
-        except Exception as exc:
-            print(
-                f"ENTRY WATCH cleanup failed open {direction} "
-                f"{opportunity.snapshot.symbol}: {type(exc).__name__}: {exc}"
-            )
-
         if send_trade_plan(
             candidate=alert,
             plan=plan,
