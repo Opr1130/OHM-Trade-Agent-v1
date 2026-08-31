@@ -88,6 +88,36 @@ def test_malformed_response_is_not_pass(monkeypatch):
     assert audit.status == UNVERIFIED
 
 
+def test_permissions_string_is_unverified(monkeypatch):
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_post",
+        lambda endpoint, params=None: {
+            "apiKeyName": "ohm-malformed-string",
+            "permissions": "query-funds",
+        },
+    )
+    audit = audit_kraken_read_only(client)
+    assert audit.status == UNVERIFIED
+    assert audit.is_positively_read_only is False
+
+
+def test_permissions_mixed_type_list_is_unverified(monkeypatch):
+    client = _client()
+    monkeypatch.setattr(
+        client,
+        "_post",
+        lambda endpoint, params=None: {
+            "apiKeyName": "ohm-malformed-list",
+            "permissions": ["query-funds", 123],
+        },
+    )
+    audit = audit_kraken_read_only(client)
+    assert audit.status == UNVERIFIED
+    assert audit.is_positively_read_only is False
+
+
 def test_timeout_unavailable_is_not_pass(monkeypatch):
     client = _client()
 
