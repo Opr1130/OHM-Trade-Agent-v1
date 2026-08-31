@@ -81,6 +81,9 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "CAPTURE_STALE" in diagnostics
     assert "OUTCOMES_STALE" in diagnostics
     assert "docker exec ohm-trade-agent" in diagnostics
+    assert "{{.State.Running}}" in diagnostics
+    assert "CORE_CONTAINER_STOPPED" in diagnostics
+    assert 'status="FAIL"' in diagnostics
     assert "docker rm" not in diagnostics
     assert "docker stop" not in diagnostics
 
