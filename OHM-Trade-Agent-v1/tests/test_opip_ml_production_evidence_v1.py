@@ -487,3 +487,26 @@ def test_ml_capture_service_has_no_exchange_order_or_position_imports():
             continue
         for name in names:
             assert not any(fragment in name for fragment in forbidden), name
+
+def test_capture_health_exposes_p1_index_catchup_progress():
+    p1 = SimpleNamespace(
+        index_catchup_in_progress=True,
+        index_reconciled_from_offset=100,
+        index_reconciled_to_offset=200,
+        index_ledger_size=500,
+        index_rows_scanned=25,
+        index_bytes_scanned=100,
+    )
+    telemetry = capture_module._p1_index_telemetry(p1)
+    summary = capture_module.MLCaptureSummary(enabled=True, **telemetry)
+    payload = summary.as_dict()
+
+    assert payload["p1_index_catchup_in_progress"] is True
+    assert payload["p1_index_reconciled_from_offset"] == 100
+    assert payload["p1_index_reconciled_to_offset"] == 200
+    assert payload["p1_index_ledger_size"] == 500
+    assert payload["p1_index_rows_scanned"] == 25
+    assert payload["p1_index_bytes_scanned"] == 100
+    assert payload["measurement_only"] is True
+    assert payload["affects_live_decisions"] is False
+
