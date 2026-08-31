@@ -401,16 +401,21 @@ def get_outcomes() -> list[dict[str, Any]]:
         return list(_load_raw().values())
 
 
-def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
-    target_at = _parse_time(item.get(f"target_{target_number}_first_observed_at"))
-    entered_at = _parse_time(item.get("entered_at"))
-    if target_at is None or entered_at is None:
-        return False
+def _valid_forecast_horizon_hours(item: dict[str, Any]) -> float | None:
     try:
         horizon_hours = float(item.get("forecast_horizon_hours"))
     except (TypeError, ValueError):
-        return False
+        return None
     if not math.isfinite(horizon_hours) or horizon_hours <= 0:
+        return None
+    return horizon_hours
+
+
+def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
+    target_at = _parse_time(item.get(f"target_{target_number}_first_observed_at"))
+    entered_at = _parse_time(item.get("entered_at"))
+    horizon_hours = _valid_forecast_horizon_hours(item)
+    if target_at is None or entered_at is None or horizon_hours is None:
         return False
     horizon_end = entered_at + timedelta(hours=horizon_hours)
     if target_at < entered_at or target_at > horizon_end:
@@ -422,7 +427,13 @@ def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
 def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
     outcomes = get_outcomes()
     resolved_entered = [
-        item for item in outcomes if item.get("entered_trade") and item.get("terminal_status")
+        item
+        for item in outcomes
+        if (
+            item.get("entered_trade")
+            and item.get("terminal_status")
+            and _valid_forecast_horizon_hours(item) is not None
+        )
     ]
     if len(resolved_entered) < min_resolved_entered:
         return {
