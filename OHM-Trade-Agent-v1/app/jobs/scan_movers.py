@@ -1,7 +1,11 @@
 from datetime import datetime, timezone
 
 from app.core.config import get_settings
-from app.services.alert_governor import evaluate_opportunity_alert, record_opportunity_alert
+from app.services.alert_governor import (
+    evaluate_opportunity_alert,
+    record_opportunity_alert,
+    release_opportunity_alert_reservation,
+)
 from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import (
     downside_scenario_pct,
@@ -552,27 +556,38 @@ def main() -> None:
                     )
                 continue
 
-            delivery = send_tracked_telegram(
-                bot_token=settings.telegram_bot_token,
-                chat_id=settings.telegram_chat_id,
-                message=message,
-                identity=identity,
-                alert_family="EARLY_MOVER",
-                event_type=signal.stage,
-                fingerprint=transition_key,
-                symbol=signal.symbol,
-                generated_at=decision_at,
-            )
+            try:
+                delivery = send_tracked_telegram(
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    message=message,
+                    identity=identity,
+                    alert_family="EARLY_MOVER",
+                    event_type=signal.stage,
+                    fingerprint=transition_key,
+                    symbol=signal.symbol,
+                    generated_at=decision_at,
+                )
+            except Exception as exc:
+                release_opportunity_alert_reservation(decision.reservation_token)
+                early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
+                print(
+                    f"Telegram create failed for {signal.symbol}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
             if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
                     message_id=delivery.message_id,
                     created_new=True,
+                    reservation_token=decision.reservation_token,
                 )
                 created += 1
                 early_mover_delivery[signal.symbol.upper()] = ("CREATED", True)
             else:
+                release_opportunity_alert_reservation(decision.reservation_token)
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
 
         broad_feed = _broad_watch_feed(
@@ -637,28 +652,45 @@ def main() -> None:
                     )
                 continue
 
-            delivery = send_tracked_telegram(
-                bot_token=settings.telegram_bot_token,
-                chat_id=settings.telegram_chat_id,
-                message=message,
-                identity=identity,
-                alert_family="BROAD_WATCH",
-                event_type=transition_key.split(":", 1)[0],
-                fingerprint=transition_key,
-                symbol=symbol,
-                generated_at=decision_at,
-            )
+            try:
+                delivery = send_tracked_telegram(
+                    bot_token=settings.telegram_bot_token,
+                    chat_id=settings.telegram_chat_id,
+                    message=message,
+                    identity=identity,
+                    alert_family="BROAD_WATCH",
+                    event_type=transition_key.split(":", 1)[0],
+                    fingerprint=transition_key,
+                    symbol=symbol,
+                    generated_at=decision_at,
+                )
+            except Exception as exc:
+                release_opportunity_alert_reservation(
+                    decision.reservation_token,
+                    state_file=FULL_MARKET_ALERT_STATE_FILE,
+                )
+                broad_watch_delivery[symbol.upper()] = ("CREATE_FAILED", False)
+                print(
+                    f"Telegram broad-watch create failed for {symbol}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
             if delivery.delivered and delivery.message_id is not None:
                 record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
                     message_id=delivery.message_id,
                     created_new=True,
+                    reservation_token=decision.reservation_token,
                     state_file=FULL_MARKET_ALERT_STATE_FILE,
                 )
                 broad_created += 1
                 broad_watch_delivery[symbol.upper()] = ("CREATED", True)
             else:
+                release_opportunity_alert_reservation(
+                    decision.reservation_token,
+                    state_file=FULL_MARKET_ALERT_STATE_FILE,
+                )
                 broad_watch_delivery[symbol.upper()] = ("CREATE_FAILED", False)
 
     # Intelligence-journey persistence is deliberately post-alert and
