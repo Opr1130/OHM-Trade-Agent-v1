@@ -71,35 +71,28 @@ def _managed_spot_quantity(
     trade: ActiveTrade,
     observed_quantity: float | None,
 ) -> float | None:
-    """Return the verified lifecycle quantity that may suppress spot exposure.
+    """Return only a lifecycle quantity proved by persisted reconciliation state."""
+    try:
+        observed = (
+            float(observed_quantity)
+            if observed_quantity is not None
+            else math.nan
+        )
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed) or observed < 0:
+        return None
 
-    Legacy lifecycles without explicit capital retain their historical behavior
-    and use the verified observed quantity. When sizing exists, only that
-    lifecycle's expected quantity is treated as managed so residual account
-    balance remains visible as unmanaged exposure.
-    """
+    raw_remaining = trade.remaining_quantity
+    if raw_remaining is None:
+        return None
     try:
-        observed = float(observed_quantity) if observed_quantity is not None else math.nan
-        leverage = float(trade.margin_leverage or 1.0)
-        entry = float(trade.entry_price)
+        remaining = float(raw_remaining)
     except (TypeError, ValueError):
         return None
-    if not all(math.isfinite(value) for value in (observed, leverage, entry)):
+    if not math.isfinite(remaining) or remaining < 0:
         return None
-    if observed < 0 or leverage <= 0 or entry <= 0:
-        return None
-    if trade.capital is None:
-        return observed
-    try:
-        capital = float(trade.capital)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(capital) or capital < 0:
-        return None
-    expected = capital * leverage / entry
-    if not math.isfinite(expected) or expected < 0:
-        return None
-    return min(observed, expected)
+    return min(observed, remaining)
 
 
 def _position_identity(row: dict[str, Any]) -> tuple[str, str] | None:
