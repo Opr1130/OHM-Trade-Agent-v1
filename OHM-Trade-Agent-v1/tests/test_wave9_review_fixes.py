@@ -304,6 +304,11 @@ def test_malformed_qualified_outbox_row_is_removed(monkeypatch):
     )
     monkeypatch.setattr(
         qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: None,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
         "_remove",
         lambda trade_id, token=None: removed.append((trade_id, token)) or True,
     )
@@ -496,6 +501,11 @@ def test_non_numeric_outbox_leverage_is_malformed_and_removed(monkeypatch):
         qualified_alert_outbox,
         "_claim",
         lambda trade_id: ("lease", dict(row)),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: None,
     )
     monkeypatch.setattr(
         qualified_alert_outbox,
