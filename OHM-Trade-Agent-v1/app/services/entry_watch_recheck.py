@@ -33,9 +33,10 @@ def recheck_due_entry_watch(
     """Cheap fast recheck that can only request a fresh full qualification scan.
 
     It emits no external message and grants no trade authority. A candidate that
-    becomes entry-valid is removed from the fast queue and causes the unified
-    cycle to rerun the complete opportunity pipeline, including intelligence,
-    target/economic gates, global ranking and capital allocation.
+    becomes entry-valid remains in the bounded fast queue while requesting the
+    complete opportunity pipeline. The accelerated request receives a longer
+    cooldown and the original watch expiry is preserved, so downstream ranking
+    or capital vetoes cannot create an indefinite fast-rescan loop.
     """
     due = due_entry_watch(now=now)[: max(1, int(max_items))]
     checked = 0
@@ -82,9 +83,15 @@ def recheck_due_entry_watch(
 
         if plan.valid_now:
             # Preserve the watch until the complete qualification + global
-            # capital gate accepts it. If the full scan fails transiently, the
-            # candidate remains eligible for another bounded fast recheck.
-            defer_entry_watch(symbol, direction, now=now, recheck_seconds=120)
+            # capital gate accepts it, but prevent a downstream veto from
+            # triggering another accelerated full scan every two minutes.
+            defer_entry_watch(
+                symbol,
+                direction,
+                now=now,
+                recheck_seconds=300,
+                accelerated_scan=True,
+            )
             ready.append(symbol)
         else:
             defer_entry_watch(symbol, direction, now=now, recheck_seconds=90)
