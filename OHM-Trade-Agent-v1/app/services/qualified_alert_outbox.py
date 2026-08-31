@@ -13,7 +13,10 @@ from app.services.notification_policy import (
     release_emit,
     reserve_emit,
 )
-from app.services.pending_setup_registry import get_pending_setup_record
+from app.services.pending_setup_registry import (
+    get_pending_setup_record,
+    terminalize_pending_setup,
+)
 from app.services.qualified_trade_tracking import (
     ReconciliationTrackingDisabled,
     register_reconciliation_intent,
@@ -206,6 +209,7 @@ def _retry_one(
                 trade_id=trade_id,
             )
         except ReconciliationTrackingDisabled:
+            terminalize_pending_setup(trade_id, "tracking_disabled")
             _remove(trade_id, token=lease_token)
             record_telegram_suppression(
                 identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
