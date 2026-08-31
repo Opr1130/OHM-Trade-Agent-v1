@@ -69,6 +69,71 @@ def _exhaustion(features: dict[str, Any]) -> tuple[str, float]:
     return "LOW", extension
 
 
+def _entry_plan_geometry_valid(
+    snapshot: FeatureSnapshot,
+    plan: EntryExitPlan,
+) -> tuple[bool, str]:
+    snapshot_direction = str(snapshot.direction or "").upper()
+    plan_direction = str(plan.direction or "").upper()
+    if snapshot_direction not in {"LONG", "SHORT"}:
+        return False, "INVALID_SNAPSHOT_DIRECTION"
+    if plan_direction != snapshot_direction:
+        return False, "DIRECTION_MISMATCH"
+
+    values = (
+        plan.entry_low,
+        plan.entry_high,
+        plan.chase_limit,
+        plan.stop_price,
+        plan.target_1,
+        plan.target_2,
+        plan.reward_to_risk_1,
+        plan.reward_to_risk_2,
+    )
+    try:
+        numeric = tuple(float(value) for value in values)
+    except (TypeError, ValueError):
+        return False, "INVALID_RISK_REWARD_GEOMETRY"
+    if not all(math.isfinite(value) for value in numeric):
+        return False, "INVALID_RISK_REWARD_GEOMETRY"
+
+    (
+        entry_low,
+        entry_high,
+        chase_limit,
+        stop_price,
+        target_1,
+        target_2,
+        rr1,
+        rr2,
+    ) = numeric
+    if (
+        min(entry_low, entry_high, chase_limit, stop_price, target_1, target_2)
+        <= 0
+        or entry_low > entry_high
+        or rr1 < 1.2
+        or rr2 < 2.0
+    ):
+        return False, "INVALID_RISK_REWARD_GEOMETRY"
+
+    entry_reference = (entry_low + entry_high) / 2.0
+    if snapshot_direction == "LONG":
+        valid = (
+            stop_price < entry_reference < target_1 < target_2
+            and chase_limit >= entry_high
+        )
+    else:
+        valid = (
+            0 < target_2 < target_1 < entry_reference < stop_price
+            and 0 < chase_limit <= entry_low
+        )
+    return (
+        (True, "")
+        if valid
+        else (False, "INVALID_DIRECTIONAL_GEOMETRY")
+    )
+
+
 def assess_continuation(
     snapshot: FeatureSnapshot,
     *,
@@ -81,6 +146,9 @@ def assess_continuation(
     vetoes: list[str] = []
 
     liquidity = _number(features, "combined_24h_liquidity_usd")
+    market_data_status = str(
+        features.get("market_data_availability") or "UNAVAILABLE"
+    ).upper()
     execution_status = str(features.get("execution_availability") or "UNAVAILABLE").upper()
     drag = _number(features, "execution_drag_pct")
     exhaustion_state, _ = _exhaustion(features)
@@ -89,6 +157,8 @@ def assess_continuation(
             Settings.model_fields["signal_quality_min_liquidity_usd"].default
         )
 
+    if market_data_status not in {"PASS", "WARN"}:
+        vetoes.append("MARKET_DATA_UNAVAILABLE_OR_INVALID")
     if liquidity is None:
         vetoes.append("LIQUIDITY_UNAVAILABLE")
     elif liquidity < float(min_liquidity_usd):
@@ -188,6 +258,7 @@ def assess_continuation(
         str(features.get(name) or "UNAVAILABLE").upper()
         in {"UNAVAILABLE", "UNRESOLVED", "UNKNOWN"}
         for name in (
+            "market_data_availability",
             "execution_availability",
             "reference_availability",
             "news_availability",
@@ -243,21 +314,16 @@ def assess_entry(
             exhaustion_risk=exhaustion_state,
         )
 
-    geometry = (
-        plan.entry_low > 0
-        and plan.entry_high >= plan.entry_low
-        and plan.stop_price > 0
-        and plan.target_1 > 0
-        and plan.target_2 > 0
-        and plan.reward_to_risk_1 >= 1.2
-        and plan.reward_to_risk_2 >= 2.0
+    geometry, geometry_reason = _entry_plan_geometry_valid(
+        snapshot,
+        plan,
     )
     if not geometry:
         return EntryAssessment(
             snapshot_id=snapshot.snapshot_id,
             decision="VETO",
-            quality_score=int(round(score)),
-            reasons=("INVALID_RISK_REWARD_GEOMETRY",),
+            quality_score=round(score),
+            reasons=(geometry_reason,),
             exhaustion_risk=exhaustion_state,
         )
 
