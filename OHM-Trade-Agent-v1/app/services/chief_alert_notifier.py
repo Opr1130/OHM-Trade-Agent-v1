@@ -22,11 +22,13 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
+    get_pending_setup_record,
     terminalize_pending_setup,
 )
 from app.services.price_movement_radar import attach_actionable_plan
 from app.services.qualified_alert_outbox import queue_qualified_alert
 from app.services.qualified_trade_tracking import (
+    ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
     register_reconciliation_intent,
 )
@@ -407,6 +409,64 @@ def send_trade_plan(
                 event_type=action,
                 fingerprint=key,
                 reason="RECONCILIATION_NOT_APPLY_TERMINAL",
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return False
+        except ReconciliationIdentityMismatch as exc:
+            transitioned = False
+            lifecycle_after_status = "waiting"
+            try:
+                transitioned = terminalize_pending_setup(
+                    trade_id,
+                    "tracking_failed",
+                )
+                lifecycle_after = get_pending_setup_record(trade_id)
+                lifecycle_after_status = str(
+                    (lifecycle_after or {}).get("status") or ""
+                )
+            except Exception as transition_exc:
+                print(
+                    "O'Pip reconciliation-mismatch terminalization failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(transition_exc).__name__}: {transition_exc}",
+                )
+
+            if not transitioned and lifecycle_after_status == "waiting":
+                try:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason=(
+                            "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
+                            f"{type(exc).__name__}"
+                        ),
+                    )
+                except Exception as queue_exc:
+                    print(
+                        "O'Pip terminalization-pending queueing failed:",
+                        f"trade_id={trade_id}",
+                        f"{type(queue_exc).__name__}: {queue_exc}",
+                    )
+
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                reason=(
+                    "TRACKING_IDENTITY_MISMATCH_TERMINAL"
+                    if transitioned or lifecycle_after_status != "waiting"
+                    else "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING"
+                ),
                 symbol=plan.symbol,
                 journey_id=candidate.get("journey_id"),
                 signal_id=candidate.get("signal_id"),
