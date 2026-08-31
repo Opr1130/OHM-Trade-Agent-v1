@@ -135,8 +135,23 @@ def test_retry_outbox_uses_actionable_policy_class(monkeypatch):
         "send_tracked_telegram",
         lambda **kwargs: type("Delivery", (), {"delivered": False})(),
     )
-    monkeypatch.setattr(qualified_alert_outbox, "release_emit", lambda **kwargs: True)
-    monkeypatch.setattr(qualified_alert_outbox, "_release", lambda *args, **kwargs: True)
+    released = {"emit": 0, "lease": 0}
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "release_emit",
+        lambda **kwargs: released.__setitem__(
+            "emit",
+            released["emit"] + 1,
+        ) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_release",
+        lambda *args, **kwargs: released.__setitem__(
+            "lease",
+            released["lease"] + 1,
+        ) or True,
+    )
 
     assert (
         qualified_alert_outbox._retry_one(
