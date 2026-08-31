@@ -109,6 +109,27 @@ def record_emitted(
         )
 
 
+def is_confirmed_emission(
+    *,
+    identity: str,
+    event_type: str,
+    fingerprint: str,
+) -> bool:
+    event_type = event_type.upper()
+    key = f"{identity}:{event_type}"
+    try:
+        with registry_lock(LOCK_FILE):
+            state = load_json(STATE_FILE)
+            previous = state.get(key, {})
+            return bool(
+                isinstance(previous, dict)
+                and previous.get("fingerprint") == fingerprint
+                and previous.get("sent_at")
+            )
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+
+
 def reserve_emit(
     *,
     identity: str,
