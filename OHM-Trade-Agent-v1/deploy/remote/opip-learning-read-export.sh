@@ -17,10 +17,11 @@ done
 write_reader_state() {
   local protocol="$1"
   local worker_sha="$2"
-  local capture_at="$3"
-  local capture_rc="$4"
-  local outcomes_at="$5"
-  local outcomes_rc="$6"
+  local sync_success_at="$3"
+  local capture_at="$4"
+  local capture_rc="$5"
+  local outcomes_at="$6"
+  local outcomes_rc="$7"
 
   [[ -d "$READER_STATE_ROOT" && -w "$READER_STATE_ROOT" ]] || return 0
   local tmp="$READER_STATE_ROOT/.last_sync_request.env.tmp.$$"
@@ -29,6 +30,7 @@ write_reader_state() {
     printf 'observed_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'protocol=%s\n' "$protocol"
     printf 'worker_deployed_sha=%s\n' "$worker_sha"
+    printf 'last_successful_sync_at_utc=%s\n' "$sync_success_at"
     printf 'capture_finished_at_utc=%s\n' "$capture_at"
     printf 'capture_exit_code=%s\n' "$capture_rc"
     printf 'outcomes_finished_at_utc=%s\n' "$outcomes_at"
@@ -43,13 +45,18 @@ validate_status_value() {
 }
 
 if [[ "$ORIGINAL" == "opip-export-v1" ]]; then
-  write_reader_state "1" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN"
-elif [[ "$ORIGINAL" =~ ^opip-export-v2[[:space:]]+sha=([0-9a-f]{40})[[:space:]]+capture_at=([^[:space:]]+)[[:space:]]+capture_rc=([^[:space:]]+)[[:space:]]+outcomes_at=([^[:space:]]+)[[:space:]]+outcomes_rc=([^[:space:]]+)$ ]]; then
+  write_reader_state "1" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN"
+elif [[ "$ORIGINAL" =~ ^opip-export-v2[[:space:]]+sha=([0-9a-f]{40})[[:space:]]+sync_success_at=([^[:space:]]+)[[:space:]]+capture_at=([^[:space:]]+)[[:space:]]+capture_rc=([^[:space:]]+)[[:space:]]+outcomes_at=([^[:space:]]+)[[:space:]]+outcomes_rc=([^[:space:]]+)$ ]]; then
   worker_sha="${BASH_REMATCH[1]}"
-  capture_at="${BASH_REMATCH[2]}"
-  capture_rc="${BASH_REMATCH[3]}"
-  outcomes_at="${BASH_REMATCH[4]}"
-  outcomes_rc="${BASH_REMATCH[5]}"
+  sync_success_at="${BASH_REMATCH[2]}"
+  capture_at="${BASH_REMATCH[3]}"
+  capture_rc="${BASH_REMATCH[4]}"
+  outcomes_at="${BASH_REMATCH[5]}"
+  outcomes_rc="${BASH_REMATCH[6]}"
+  validate_status_value "$sync_success_at" || {
+    echo "O'Pip learning reader: invalid sync-success timestamp" >&2
+    exit 126
+  }
   validate_status_value "$capture_at" || {
     echo "O'Pip learning reader: invalid capture timestamp" >&2
     exit 126
@@ -66,7 +73,7 @@ elif [[ "$ORIGINAL" =~ ^opip-export-v2[[:space:]]+sha=([0-9a-f]{40})[[:space:]]+
     echo "O'Pip learning reader: invalid outcomes rc" >&2
     exit 126
   }
-  write_reader_state "2" "$worker_sha" "$capture_at" "$capture_rc" "$outcomes_at" "$outcomes_rc"
+  write_reader_state "2" "$worker_sha" "$sync_success_at" "$capture_at" "$capture_rc" "$outcomes_at" "$outcomes_rc"
 else
   echo "O'Pip learning reader: command rejected" >&2
   exit 126
