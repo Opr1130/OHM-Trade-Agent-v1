@@ -9,6 +9,7 @@ from app.services.entry_watch_queue import (
     defer_entry_watch,
     due_entry_watch,
     remove_entry_watch,
+    remove_entry_watch_key,
 )
 
 
@@ -45,13 +46,22 @@ def recheck_due_entry_watch(
     failures: list[str] = []
 
     for row in due:
-        symbol = str(row.get("symbol") or "").upper()
-        direction = str(row.get("direction") or "LONG").upper()
+        watch_key = row.get("_watch_key")
+        raw_symbol = str(row.get("symbol") or "")
+        raw_direction = str(row.get("direction") or "LONG")
+        symbol = raw_symbol.strip().upper()
+        direction = raw_direction.strip().upper()
         risk_level = str(row.get("risk_level") or "low").lower()
         if not symbol or direction not in {"LONG", "SHORT"}:
             failures.append(f"{symbol or 'UNKNOWN'}: malformed entry-watch row")
-            if symbol:
-                remove_entry_watch(symbol, direction)
+            # A structurally invalid row is terminal: quarantine it so it can
+            # never survive to consume a future recheck slot, even when it
+            # has no usable symbol. Prefer the queue's own key (exact match);
+            # fall back to reconstructing the key the row was most likely
+            # stored under.
+            removed = bool(watch_key) and remove_entry_watch_key(str(watch_key))
+            if not removed:
+                remove_entry_watch(raw_symbol.upper(), raw_direction.upper())
             continue
 
         try:
