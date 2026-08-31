@@ -88,6 +88,14 @@ def _notify_unmanaged_holding(*, settings, exposure: ResolvedExposure) -> bool:
         cooldown_seconds=24 * 60 * 60,
         now=now,
     ):
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="ACTIVE_TRADE",
+            event_type="UNMANAGED_HOLDING",
+            fingerprint=fingerprint,
+            reason="NOTIFICATION_POLICY",
+            generated_at=now,
+        )
         return False
 
     quantity = (
