@@ -54,14 +54,26 @@ def test_legacy_movement_alert_path_remains_opt_in(monkeypatch):
     assert len(calls) == 1
 
 
-def test_scan_movers_source_has_actionable_only_guard():
-    import inspect
+def test_scan_movers_actionable_only_blocks_watch_transport():
+    settings = SimpleNamespace(
+        opip_actionable_only_alerts=True,
+        price_movement_mode="alert",
+        telegram_enabled=True,
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+    )
+    assert scan_movers._watch_telegram_enabled(settings) is False
 
-    source = inspect.getsource(scan_movers.main)
-    guard = 'opip_actionable_only_alerts'
-    telegram_send = 'send_tracked_telegram('
-    assert guard in source
-    assert telegram_send in source
+
+def test_scan_movers_legacy_watch_transport_is_explicit_opt_in():
+    settings = SimpleNamespace(
+        opip_actionable_only_alerts=False,
+        price_movement_mode="alert",
+        telegram_enabled=True,
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+    )
+    assert scan_movers._watch_telegram_enabled(settings) is True
 
 
 def test_settings_default_actionable_only():
