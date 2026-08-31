@@ -10,6 +10,7 @@ from app.scanner.models import MarketSnapshot
 from app.services import (
     active_trade_registry,
     chief_alert_notifier,
+    notification_policy,
     order_intent_registry,
     pending_setup_notifier,
     pending_setup_registry,
@@ -54,6 +55,16 @@ def registry_files(tmp_path, monkeypatch):
         chief_alert_notifier,
         "STATE_FILE",
         tmp_path / "alert_state.json",
+    )
+    monkeypatch.setattr(
+        notification_policy,
+        "STATE_FILE",
+        tmp_path / "notification_policy.json",
+    )
+    monkeypatch.setattr(
+        notification_policy,
+        "LOCK_FILE",
+        tmp_path / ".notification_policy.lock",
     )
     monkeypatch.setattr(
         pending_setup_notifier,
