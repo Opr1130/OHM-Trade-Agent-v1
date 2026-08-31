@@ -93,9 +93,11 @@ def assess_continuation(
         vetoes.append("LIQUIDITY_UNAVAILABLE")
     elif liquidity < float(min_liquidity_usd):
         vetoes.append("LIQUIDITY_BELOW_CONFIGURED_MINIMUM")
-    if execution_status in {"INVALID", "REJECTED"}:
-        vetoes.append("EXECUTION_INVALID")
-    if drag is not None and drag > 2.0:
+    if execution_status not in {"VALID", "WARN"}:
+        vetoes.append("EXECUTION_UNAVAILABLE")
+    elif drag is None:
+        vetoes.append("EXECUTION_DRAG_UNAVAILABLE")
+    elif drag > 2.0:
         vetoes.append("EXECUTION_DRAG_EXCESSIVE")
     if exhaustion_state == "HIGH":
         vetoes.append("SEVERE_EXTENSION")
