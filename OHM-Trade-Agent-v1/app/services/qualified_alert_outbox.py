@@ -154,6 +154,42 @@ def _remove(trade_id: str, *, token: str | None = None) -> bool:
         return True
 
 
+def _record_malformed_outbox(
+    *,
+    trade_id: str,
+    row: dict | None,
+    reason: str,
+) -> None:
+    payload = row if isinstance(row, dict) else {}
+    try:
+        record_telegram_not_eligible(
+            identity=str(
+                payload.get("identity")
+                or f"QUALIFIED_OPPORTUNITY:{trade_id}"
+            ),
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=str(payload.get("action") or "ACTION"),
+            fingerprint=str(payload.get("fingerprint") or ""),
+            reason=reason,
+            symbol=str(
+                payload.get("symbol")
+                or (payload.get("plan") or {}).get("symbol")
+                if isinstance(payload.get("plan"), dict)
+                else ""
+            ),
+            journey_id=payload.get("journey_id"),
+            signal_id=payload.get("signal_id"),
+            trade_id=trade_id,
+        )
+    except Exception:
+        # Audit transport/storage must not keep a corrupt outbox row alive.
+        pass
+    try:
+        terminalize_pending_setup(trade_id, "delivery_malformed")
+    except Exception:
+        pass
+
+
 def _retry_one(
     trade_id: str,
     *,
@@ -182,7 +218,12 @@ def _retry_one(
         )
         if not math.isfinite(leverage) or leverage <= 0:
             raise ValueError("qualified alert outbox leverage is invalid")
-    except Exception:
+    except Exception as exc:
+        _record_malformed_outbox(
+            trade_id=trade_id,
+            row=row,
+            reason=f"OUTBOX_MALFORMED:{type(exc).__name__}",
+        )
         _remove(trade_id, token=lease_token)
         return "MALFORMED"
 
@@ -325,6 +366,11 @@ def retry_qualified_alerts(
     pending = 0
     for trade_id, row in list(rows.items()):
         if not isinstance(row, dict):
+            _record_malformed_outbox(
+                trade_id=str(trade_id),
+                row=None,
+                reason="OUTBOX_MALFORMED:NON_DICT_ROW",
+            )
             try:
                 with registry_lock(_lock_file()):
                     current = load_json(OUTBOX_FILE)
