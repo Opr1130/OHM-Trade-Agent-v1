@@ -257,6 +257,7 @@ class KrakenExposureResolver:
             direction = (trade.direction or "LONG").upper()
             pair = canonicalize_pair(trade.symbol)
             if direction == "LONG":
+                managed_position_keys.add((pair, "LONG"))
                 for quote in (
                     "USDT", "USD", "EUR", "GBP", "CAD", "AUD",
                     "JPY", "CHF", "BTC", "ETH",
