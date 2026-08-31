@@ -111,6 +111,15 @@ def record_trade_quality_evidence(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with registry_lock(_lock_file(path)):
+        if path.exists():
+            with path.open("r", encoding="utf-8") as existing:
+                for line in existing:
+                    try:
+                        prior = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if prior.get("evidence_id") == evidence_id:
+                        return evidence_id
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
