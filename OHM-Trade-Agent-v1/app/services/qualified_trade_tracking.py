@@ -14,6 +14,10 @@ from app.services.order_intent_registry import (
 )
 
 
+class ReconciliationTrackingDisabled(RuntimeError):
+    """Qualified trade tracking is intentionally unavailable by configuration."""
+
+
 def reconciliation_limit_price(
     plan: EntryExitPlan,
     *,
@@ -50,7 +54,9 @@ def register_reconciliation_intent(
         else str(reconciliation_mode_value).lower()
     )
     if not enabled or mode != "apply":
-        raise RuntimeError("Kraken reconciliation apply mode is required")
+        raise ReconciliationTrackingDisabled(
+            "Kraken reconciliation must be enabled in apply mode"
+        )
 
     capital = candidate.get("recommended_capital")
     if not isinstance(capital, (int, float)) or float(capital) <= 0:
