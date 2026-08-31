@@ -47,7 +47,10 @@ def enqueue_entry_watch(
     recheck_seconds: int = DEFAULT_RECHECK_SECONDS,
 ) -> None:
     current = _utc(now)
-    key = f"{symbol.upper()}:{direction.upper()}"
+    normalized_direction = str(direction).upper()
+    if normalized_direction not in {"LONG", "SHORT"}:
+        raise ValueError("direction must be LONG or SHORT")
+    key = f"{symbol.upper()}:{normalized_direction}"
     with registry_lock(_lock_file()):
         rows = load_json(ENTRY_WATCH_FILE)
         row = rows.get(key)
@@ -55,7 +58,7 @@ def enqueue_entry_watch(
             row = {
                 "schema_version": 1,
                 "symbol": symbol.upper(),
-                "direction": direction.upper(),
+                "direction": normalized_direction,
                 "candidate_id": candidate_id,
                 "first_seen_at": current.isoformat(),
             }
