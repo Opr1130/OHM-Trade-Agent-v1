@@ -278,6 +278,23 @@ def update_active_observation(
                 "terminal_status": None,
             }
         item = data[key]
+        if item.get("terminal_status"):
+            return item
+
+        observation_dt = _parse_time(observed_at)
+        entered_dt = _parse_time(item.get("entered_at") or trade.opened_at)
+        if (
+            observation_dt is not None
+            and entered_dt is not None
+            and observation_dt < entered_dt
+        ):
+            warnings = item.setdefault("observation_warnings", [])
+            warning = "Pre-entry observation ignored for outcome labels"
+            if warning not in warnings:
+                warnings.append(warning)
+            _save_raw(data)
+            return item
+
         direction = str(item.get("direction") or trade.direction or "LONG").upper()
         item["direction"] = direction
         item["entered_trade"] = True
@@ -396,10 +413,10 @@ def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
     if not math.isfinite(horizon_hours) or horizon_hours <= 0:
         return False
     horizon_end = entered_at + timedelta(hours=horizon_hours)
-    if target_at > horizon_end:
+    if target_at < entered_at or target_at > horizon_end:
         return False
     stop_at = _parse_time(item.get("stop_first_observed_at"))
-    return stop_at is None or target_at <= stop_at
+    return stop_at is None or target_at < stop_at
 
 
 def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
