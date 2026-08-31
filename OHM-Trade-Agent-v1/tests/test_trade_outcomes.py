@@ -352,11 +352,11 @@ def test_legacy_active_trade_gets_deterministic_legacy_key(monkeypatch, tmp_path
     record = outcomes.update_active_observation(trade, 101)
     assert record["record_key"].startswith("legacy:BTCUSD:")
     assert record["trade_id"] == ""
-    assert record["forecast_horizon_hours"] == outcomes.DEFAULT_FORECAST_HORIZON_HOURS
-    assert record["forecast_horizon_version"] == outcomes.FORECAST_HORIZON_VERSION
+    assert "forecast_horizon_hours" not in record
+    assert "forecast_horizon_version" not in record
 
 
-def test_mark_entered_legacy_record_gets_current_forecast_contract(monkeypatch, tmp_path):
+def test_mark_entered_late_legacy_record_stays_out_of_calibration(monkeypatch, tmp_path):
     isolate(monkeypatch, tmp_path)
     trade = ActiveTrade(
         symbol="BTCUSD", entry_price=100, stop_price=90, target_1=110,
@@ -369,8 +369,8 @@ def test_mark_entered_legacy_record_gets_current_forecast_contract(monkeypatch, 
         entry_price_source="legacy_registry",
     )
 
-    assert record["forecast_horizon_hours"] == outcomes.DEFAULT_FORECAST_HORIZON_HOURS
-    assert record["forecast_horizon_version"] == outcomes.FORECAST_HORIZON_VERSION
+    assert "forecast_horizon_hours" not in record
+    assert "forecast_horizon_version" not in record
 
 
 def test_calibration_excludes_resolved_records_without_forecast_horizon(
