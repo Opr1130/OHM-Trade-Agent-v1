@@ -108,7 +108,7 @@ def test_managed_long_margin_position_is_not_duplicated_as_unmanaged():
             return SimpleNamespace(is_read_only=True)
 
         def get_balance(self):
-            return {"SOL": 1.0}
+            return {}
 
         def get_open_positions(self):
             return {
