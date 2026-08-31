@@ -113,6 +113,14 @@ def verify_trade_against_snapshot(
                     reason=f"Kraken reports an open long position for {trade.symbol}",
                     observed_quantity=quantity,
                 )
+            return PositionVerification(
+                status="ABSENT",
+                reason=(
+                    f"No open Kraken leveraged long position exists for "
+                    f"{trade.symbol}"
+                ),
+                observed_quantity=quantity,
+            )
 
         asset = _base_asset(trade.symbol)
         quantity = _balance_for_asset(balances, asset)
