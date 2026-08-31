@@ -364,13 +364,17 @@ def _run_cycle_once() -> None:
     print("Quiet hours:", decision.quiet_hours)
     print("Reason:", decision.reason)
 
-    if decision.effective_mode == "MAINTENANCE":
-        print("Maintenance mode: all trading workflows skipped.")
-        return
-
-    # Active positions always receive deterministic protection outside
-    # MAINTENANCE, including overnight quiet hours.
+    # Active positions always receive deterministic protection, including
+    # MAINTENANCE and overnight quiet hours. Maintenance disables discovery and
+    # lifecycle expansion; it must not blind O'Pip to risk on verified holdings.
     monitor_active_main()
+
+    if decision.effective_mode == "MAINTENANCE":
+        print(
+            "Maintenance mode: discovery/tracking workflows skipped; "
+            "verified-position protection completed."
+        )
+        return
 
     # Recover previously qualified but operationally undelivered actions only
     # after existing positions have received their protection pass.
