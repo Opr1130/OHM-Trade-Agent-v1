@@ -162,3 +162,5 @@ def test_retry_outbox_uses_actionable_policy_class(monkeypatch):
         == "SEND_FAILED"
     )
     assert captured["event_type"] == "ACTIONABLE_TRADE"
+    assert released["emit"] == 1
+    assert released["lease"] == 1
