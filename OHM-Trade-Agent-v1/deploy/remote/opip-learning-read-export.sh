@@ -7,6 +7,13 @@ READER_STATE_ROOT="/var/lib/opip-learning-reader"
 READER_STATE_FILE="$READER_STATE_ROOT/last_sync_request.env"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
+for cmd in date mv flock tar; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "O'Pip learning reader: missing $cmd" >&2
+    exit 69
+  }
+done
+
 write_reader_state() {
   local protocol="$1"
   local worker_sha="$2"
@@ -64,13 +71,6 @@ else
   echo "O'Pip learning reader: command rejected" >&2
   exit 126
 fi
-
-for cmd in flock tar; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "O'Pip learning reader: missing $cmd" >&2
-    exit 69
-  }
-done
 
 for name in p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; do
   if [[ ! -r "$EXPORT_ROOT/$name" ]]; then
