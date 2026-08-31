@@ -92,7 +92,7 @@ def test_recommendation_persists_wave8_market_intelligence(monkeypatch, tmp_path
         action="ENTER_NOW",
     )
 
-    assert record["schema_version"] == 3
+    assert record["schema_version"] == 4
     assert record["market_intelligence"] == evidence
 
 
@@ -238,6 +238,42 @@ def test_stop_first_then_later_target_is_not_counted_as_target_success(monkeypat
 
     assert summary["opportunity_rank_bins"]["1"]["t1_observed"] == 0
     assert summary["opportunity_rank_bins"]["1"]["t2_observed"] == 0
+
+
+def test_target_after_forecast_horizon_is_not_counted_as_success(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    item["opportunity_rank"] = 1
+    item["forecast_horizon_hours"] = 2.0
+    trade_id = "OHM-BTC-HORIZON"
+    recommendation = outcomes.record_recommendation(
+        trade_id=trade_id,
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+    assert recommendation["forecast_horizon_hours"] == 2.0
+    assert recommendation["forecast_horizon_version"] == outcomes.FORECAST_HORIZON_VERSION
+
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100,
+        stop_price=90,
+        target_1=110,
+        target_2=120,
+        risk_level="low",
+        opened_at="2026-08-09T20:00:00+00:00",
+        trade_id=trade_id,
+    )
+    outcomes.mark_trade_entered(trade, entry_price_source="manual_actual_fill")
+    record = outcomes.update_active_observation(
+        trade,
+        121,
+        observed_at="2026-08-09T23:00:01+00:00",
+    )
+    assert record["target_1_observed"] is True
+    assert outcomes._target_before_stop(record, 1) is False
+    assert outcomes._target_before_stop(record, 2) is False
 
 
 def test_skipped_setup_is_not_counted_as_losing_entered_trade(monkeypatch, tmp_path):
