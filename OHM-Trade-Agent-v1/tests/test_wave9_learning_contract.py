@@ -115,6 +115,35 @@ def test_quality_evidence_is_point_in_time_and_non_probabilistic(tmp_path):
     assert row["trade_authority_changed"] is False
 
 
+def test_quality_evidence_recording_is_idempotent(tmp_path):
+    decision_at = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    feature_snapshot = build_trade_feature_snapshot(
+        _snapshot(),
+        decision_at=decision_at,
+        episode_id="W9EP:IDEMPOTENT",
+        candidate_id="IDEMPOTENT",
+        regime="NEUTRAL",
+    )
+    assessment = assess_trade_quality(feature_snapshot, _plan())
+    path = tmp_path / "quality.jsonl"
+    kwargs = dict(
+        feature_snapshot=feature_snapshot,
+        assessment=assessment,
+        plan=_plan(),
+        candidate={"direction": "LONG", "confidence": 84, "decision": "alert"},
+        decision_at=decision_at,
+        market_regime="NEUTRAL",
+        path=path,
+    )
+
+    first = record_trade_quality_evidence(**kwargs)
+    second = record_trade_quality_evidence(**kwargs)
+
+    assert first == second
+    rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    assert len(rows) == 1
+
+
 def test_recommendation_links_wave9_quality_to_outcome_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         trade_outcome_registry,
