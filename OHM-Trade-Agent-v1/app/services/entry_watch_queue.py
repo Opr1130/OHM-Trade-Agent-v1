@@ -58,13 +58,17 @@ def enqueue_entry_watch(
             if expires is None or expires <= current:
                 rows.pop(existing_key, None)
         row = rows.get(key)
-        if not isinstance(row, dict):
+        is_new = not isinstance(row, dict)
+        if is_new:
             row = {
                 "schema_version": 1,
                 "symbol": symbol.upper(),
                 "direction": normalized_direction,
                 "candidate_id": candidate_id,
                 "first_seen_at": current.isoformat(),
+                "expires_at": (
+                    current + timedelta(seconds=max(300, int(ttl_seconds)))
+                ).isoformat(),
             }
         row["candidate_id"] = candidate_id
         row["continuation_score"] = int(continuation_score)
@@ -76,9 +80,6 @@ def enqueue_entry_watch(
         row["updated_at"] = current.isoformat()
         row["next_due_at"] = (
             current + timedelta(seconds=max(60, min(120, int(recheck_seconds))))
-        ).isoformat()
-        row["expires_at"] = (
-            current + timedelta(seconds=max(300, int(ttl_seconds)))
         ).isoformat()
         rows[key] = row
 
@@ -139,6 +140,7 @@ def defer_entry_watch(
     *,
     now: datetime | None = None,
     recheck_seconds: int = DEFAULT_RECHECK_SECONDS,
+    accelerated_scan: bool = False,
 ) -> bool:
     current = _utc(now)
     key = f"{symbol.upper()}:{direction.upper()}"
@@ -149,9 +151,11 @@ def defer_entry_watch(
             return False
         updated = dict(row)
         updated["next_due_at"] = (
-            current + timedelta(seconds=max(60, min(120, int(recheck_seconds))))
+            current + timedelta(seconds=max(60, min(900, int(recheck_seconds))))
         ).isoformat()
         updated["updated_at"] = current.isoformat()
+        if accelerated_scan:
+            updated["last_accelerated_scan_at"] = current.isoformat()
         rows[key] = updated
         save_json_atomic(ENTRY_WATCH_FILE, rows)
         return True
