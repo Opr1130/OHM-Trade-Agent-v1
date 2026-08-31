@@ -206,9 +206,14 @@ def _install_scan(monkeypatch, tmp_path, snapshots, *, openai=None):
         scan_opportunities, "_capture_native_scan_cohort", lambda scan, **kwargs: 0
     )
     monkeypatch.setattr(scan_opportunities, "_paper_trade_enabled_safe", lambda: False)
-    # Active-trade registry storage is an I/O boundary. Keep the real action
-    # gate deterministic logic while supplying an empty portfolio fixture.
-    monkeypatch.setattr(scan_opportunities, "get_active_trades", lambda: [])
+    # The action gate has dedicated integration coverage. This funnel suite
+    # isolates later qualification telemetry from portfolio-registry I/O while
+    # R1.2 separately verifies that the gate is invoked even when ranking is off.
+    monkeypatch.setattr(
+        scan_opportunities,
+        "_apply_ranked_action_gates",
+        lambda ranked, **kwargs: list(ranked),
+    )
 
     # Keep the real Chief review, but isolate its transport and its writers.
     monkeypatch.setattr(chief_analyst, "OpenAI", openai or _FakeOpenAI(_chief_payload([])))
