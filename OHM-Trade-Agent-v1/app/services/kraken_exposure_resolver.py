@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.exchanges.kraken import KrakenClient
-from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
+from app.exchanges.kraken_identity import (
+    canonicalize_asset,
+    canonicalize_pair,
+    split_canonical_pair,
+)
 from app.exchanges.kraken_private import KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade, get_active_trades
 from app.services.kraken_position_verification import verify_trade_against_snapshot
@@ -15,7 +19,7 @@ from app.services.kraken_position_verification import verify_trade_against_snaps
 CASH_LIKE_ASSETS = {
     "USD", "USDT", "USDC", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF"
 }
-PREFERRED_QUOTES = ("USD", "USDT")
+PREFERRED_QUOTES = ("USD", "USDT", "USDC")
 
 
 @dataclass(frozen=True)
@@ -270,15 +274,13 @@ class KrakenExposureResolver:
                     elif leverage > 1.0:
                         managed_position_keys.add((pair, "LONG"))
                     else:
-                        for quote in (
-                            "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
-                            "JPY", "CHF", "BTC", "ETH",
-                        ):
-                            if pair.endswith(quote) and len(pair) > len(quote):
-                                managed_spot_assets.add(
-                                    canonicalize_asset(pair[: -len(quote)])
-                                )
-                                break
+                        identity = split_canonical_pair(pair)
+                        if identity is None:
+                            managed_resolution_gaps.append(
+                                f"{trade.symbol}: unresolved managed spot pair identity"
+                            )
+                        else:
+                            managed_spot_assets.add(identity[0])
                 elif direction == "SHORT":
                     managed_position_keys.add((pair, direction))
                 else:
@@ -365,7 +367,7 @@ class KrakenExposureResolver:
                         direction="LONG",
                         observed_quantity=quantity,
                         reason=(
-                            "Kraken reports a non-zero balance with no USD/USDT pair; "
+                            "Kraken reports a non-zero balance with no USD/stable-quote pair; "
                             "USD notional is unavailable"
                         ),
                     )
@@ -429,7 +431,7 @@ class KrakenExposureResolver:
         ]
         if unpriced_assets:
             reasons.append(
-                "USD/USDT pricing unavailable for held assets: "
+                "USD/stable-quote pricing unavailable for held assets: "
                 + ",".join(sorted(set(unpriced_assets)))
             )
         if account_state_gaps:
