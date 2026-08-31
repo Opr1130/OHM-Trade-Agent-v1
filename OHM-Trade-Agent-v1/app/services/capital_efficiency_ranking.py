@@ -64,25 +64,26 @@ def _capacity_metrics(
         _finite(getattr(snapshot, "combined_24h_liquidity_usd", 0.0)),
     )
     execution = getattr(snapshot, "execution_validation", None)
-    bid_depth = max(
-        0.0,
-        _finite(getattr(execution, "bid_depth_050_usd", 0.0)),
+    bid_depth = _finite(
+        getattr(execution, "bid_depth_050_usd", None),
+        -1.0,
     )
-    ask_depth = max(
-        0.0,
-        _finite(getattr(execution, "ask_depth_050_usd", 0.0)),
+    ask_depth = _finite(
+        getattr(execution, "ask_depth_050_usd", None),
+        -1.0,
     )
+    if bid_depth < 0 or ask_depth < 0:
+        return False, "UNKNOWN", None, None, 0.0
 
     limits: list[float] = []
     if liquidity_24h > 0:
         limits.append(
             liquidity_24h * MAX_POSITION_TO_24H_LIQUIDITY_FRACTION
         )
-    if bid_depth > 0 and ask_depth > 0:
-        limits.append(
-            min(bid_depth, ask_depth)
-            * MAX_POSITION_TO_HALF_PERCENT_DEPTH_FRACTION
-        )
+    limits.append(
+        min(bid_depth, ask_depth)
+        * MAX_POSITION_TO_HALF_PERCENT_DEPTH_FRACTION
+    )
 
     if not limits:
         return False, "UNKNOWN", None, None, 0.0
