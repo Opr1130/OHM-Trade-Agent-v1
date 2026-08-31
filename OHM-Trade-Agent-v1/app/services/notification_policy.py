@@ -199,9 +199,8 @@ def confirm_emit(
             if not isinstance(previous, dict):
                 previous = {}
             token = str(previous.get("reservation_token") or "")
-            if reservation_token.startswith("FAILOPEN-"):
-                return False
-            if token != reservation_token:
+            fail_open = reservation_token.startswith("FAILOPEN-")
+            if not fail_open and token != reservation_token:
                 return False
             state[key] = {
                 "fingerprint": fingerprint,
