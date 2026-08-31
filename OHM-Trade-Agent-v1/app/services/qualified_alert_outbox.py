@@ -9,11 +9,15 @@ from uuid import uuid4
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.notification_policy import (
     confirm_emit,
+    is_confirmed_emission,
     release_emit,
     reserve_emit,
 )
 from app.services.pending_setup_registry import get_pending_setup_record
-from app.services.qualified_trade_tracking import register_reconciliation_intent
+from app.services.qualified_trade_tracking import (
+    ReconciliationTrackingDisabled,
+    register_reconciliation_intent,
+)
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_delivery import (
     accepted_delivery_message_id,
@@ -201,6 +205,20 @@ def _retry_one(
                 leverage=leverage,
                 trade_id=trade_id,
             )
+        except ReconciliationTrackingDisabled:
+            _remove(trade_id, token=lease_token)
+            record_telegram_suppression(
+                identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action or "ACTION",
+                fingerprint=str(row.get("fingerprint") or ""),
+                reason="RECONCILIATION_NOT_APPLY_TERMINAL",
+                symbol=plan.symbol,
+                journey_id=row.get("journey_id"),
+                signal_id=row.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return "SUPPRESSED"
         except Exception as exc:
             _release(trade_id, lease_token)
             record_telegram_suppression(
@@ -236,6 +254,13 @@ def _retry_one(
         fingerprint=fingerprint,
     )
     if reservation is None:
+        if is_confirmed_emission(
+            identity=policy_identity,
+            event_type="ACTIONABLE_TRADE",
+            fingerprint=fingerprint,
+        ):
+            _remove(trade_id, token=lease_token)
+            return "DELIVERED"
         _release(trade_id, lease_token)
         return "POLICY_PENDING"
 
