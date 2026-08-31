@@ -139,6 +139,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="## Gemini Independent Review
-
-REVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate." >/dev/null || true
+          body=$'## Gemini Independent Review\\n\\nREVIEW_WORKFLOW_FAILED. Inspect the Gemini PR Review Actions run before relying on this review gate.'
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null || true
