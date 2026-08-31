@@ -310,7 +310,11 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             f"{len(degraded_symbols)} verified/expected holding(s) not fully protected: "
             + ", ".join(degraded_symbols[:8])
         )
-        _notify_monitor_degraded(settings=settings, reason=reason)
+        _notify_monitor_degraded_safe(
+            settings=settings,
+            reason=reason,
+            failures=failures,
+        )
 
     return MonitorRunSummary(
         active_trades=len(managed),
