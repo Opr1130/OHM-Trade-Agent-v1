@@ -129,12 +129,13 @@ def upsert_candidate(observation: CandidateObservation) -> QueueSummary:
         row["last_seen_at"] = observed_iso
         row["expires_at"] = (now + timedelta(seconds=ttl)).isoformat()
 
+        source = str(observation.source)
         sources = {
             str(item)
             for item in (row.get("sources") or [])
             if str(item).strip()
         }
-        sources.add(str(observation.source))
+        sources.add(source)
         row["sources"] = sorted(sources)
 
         price = _finite_optional(observation.price)
@@ -151,10 +152,15 @@ def upsert_candidate(observation: CandidateObservation) -> QueueSummary:
             row["volume_acceleration_score"] = volume
         if liquidity is not None:
             row["liquidity_usd"] = liquidity
-        row["priority_score"] = max(
-            float(row.get("priority_score") or 0.0),
-            max(0.0, min(100.0, priority)),
-        )
+
+        source_priorities = {
+            str(name): float(value)
+            for name, value in (row.get("source_priority_scores") or {}).items()
+            if _finite_optional(value) is not None
+        }
+        source_priorities[source] = max(0.0, min(100.0, priority))
+        row["source_priority_scores"] = source_priorities
+        row["priority_score"] = max(source_priorities.values(), default=0.0)
 
         rs_history = list(row.get("relative_strength_history") or [])
         volume_history = list(row.get("volume_acceleration_history") or [])
