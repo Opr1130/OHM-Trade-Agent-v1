@@ -175,6 +175,38 @@ def test_unknown_or_too_small_capacity_cannot_win_global_rank():
     assert thin_result.total_score == 0.0
 
 
+def test_missing_book_depth_is_unknown_and_ineligible():
+    row = ranked(
+        "NODEPTHUSD",
+        liquidity_24h=5_000_000.0,
+        bid_depth_050=None,
+        ask_depth_050=None,
+    )
+
+    result = rank_capital_efficiency([row])[0].capital_efficiency
+
+    assert result.capacity_eligible is False
+    assert result.capacity_status == "UNKNOWN"
+    assert result.liquidity_capacity_ceiling_usd is None
+    assert result.total_score == 0.0
+
+
+def test_observed_zero_book_depth_is_non_executable():
+    row = ranked(
+        "ZERODEPTHUSD",
+        liquidity_24h=5_000_000.0,
+        bid_depth_050=0.0,
+        ask_depth_050=0.0,
+    )
+
+    result = rank_capital_efficiency([row])[0].capital_efficiency
+
+    assert result.capacity_eligible is False
+    assert result.capacity_status == "BELOW_MINIMUM_EXECUTABLE_CAPACITY"
+    assert result.liquidity_capacity_ceiling_usd == 0.0
+    assert result.total_score == 0.0
+
+
 def test_score_is_bounded_and_rank_is_deterministic():
     rows = [
         ranked("BBBUSD", original_rank=2),
