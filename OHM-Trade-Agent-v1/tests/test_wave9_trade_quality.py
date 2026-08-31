@@ -48,6 +48,11 @@ def snapshot(
         primary_quote_currency="USD",
         movement_data_status="AVAILABLE",
     )
+    row.market_data_validation = type(
+        "MarketData",
+        (),
+        {"status": "PASS"},
+    )()
     row.execution_validation = type(
         "Execution",
         (),
@@ -195,6 +200,59 @@ def test_execution_drag_must_be_available():
     assessment = assess_trade_quality(feature_snapshot(market), plan())
     assert assessment.continuation.decision == "FAIL"
     assert "EXECUTION_DRAG_UNAVAILABLE" in assessment.continuation.vetoes
+
+
+def test_market_data_unavailable_cannot_be_actionable():
+    market = snapshot()
+    market.market_data_validation = None
+    assessment = assess_trade_quality(feature_snapshot(market), plan())
+    assert assessment.continuation.decision == "FAIL"
+    assert "MARKET_DATA_UNAVAILABLE_OR_INVALID" in assessment.continuation.vetoes
+    assert assessment.actionable is False
+
+
+def test_market_data_reject_cannot_be_actionable():
+    market = snapshot()
+    market.market_data_validation = type(
+        "MarketData",
+        (),
+        {"status": "REJECT"},
+    )()
+    assessment = assess_trade_quality(feature_snapshot(market), plan())
+    assert assessment.continuation.decision == "FAIL"
+    assert "MARKET_DATA_UNAVAILABLE_OR_INVALID" in assessment.continuation.vetoes
+
+
+def test_entry_direction_must_match_feature_snapshot():
+    assessment = assess_trade_quality(
+        feature_snapshot(),
+        EntryExitPlan(
+            symbol="SOLUSD",
+            valid_now=True,
+            entry_style="test",
+            entry_low=99.0,
+            entry_high=100.0,
+            chase_limit=98.0,
+            stop_price=105.0,
+            target_1=95.0,
+            target_2=90.0,
+            reward_to_risk_1=2.0,
+            reward_to_risk_2=3.0,
+            risk_level="low",
+            reason="opposite",
+            direction="SHORT",
+        ),
+    )
+    assert assessment.entry.decision == "VETO"
+    assert "DIRECTION_MISMATCH" in assessment.entry.reasons
+
+
+def test_long_entry_geometry_must_order_stop_and_targets():
+    bad = plan()
+    bad.stop_price = 101.0
+    assessment = assess_trade_quality(feature_snapshot(), bad)
+    assert assessment.entry.decision == "VETO"
+    assert "INVALID_DIRECTIONAL_GEOMETRY" in assessment.entry.reasons
 
 
 def test_entry_assessment_requires_same_snapshot():
