@@ -257,16 +257,22 @@ class KrakenExposureResolver:
             direction = (trade.direction or "LONG").upper()
             pair = canonicalize_pair(trade.symbol)
             if direction == "LONG":
-                managed_position_keys.add((pair, "LONG"))
-                for quote in (
-                    "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
-                    "JPY", "CHF", "BTC", "ETH",
-                ):
-                    if pair.endswith(quote) and len(pair) > len(quote):
-                        managed_spot_assets.add(
-                            canonicalize_asset(pair[: -len(quote)])
-                        )
-                        break
+                try:
+                    leverage = float(trade.margin_leverage or 1.0)
+                except (TypeError, ValueError):
+                    leverage = math.nan
+                if math.isfinite(leverage) and leverage > 1.0:
+                    managed_position_keys.add((pair, "LONG"))
+                else:
+                    for quote in (
+                        "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
+                        "JPY", "CHF", "BTC", "ETH",
+                    ):
+                        if pair.endswith(quote) and len(pair) > len(quote):
+                            managed_spot_assets.add(
+                                canonicalize_asset(pair[: -len(quote)])
+                            )
+                            break
             else:
                 managed_position_keys.add((pair, direction))
 
@@ -287,17 +293,29 @@ class KrakenExposureResolver:
             )
 
         canonical_balances: dict[str, float] = {}
+        account_state_gaps: list[str] = []
         for raw_asset, raw_quantity in balances.items():
             asset = canonicalize_asset(raw_asset)
+            if not asset:
+                account_state_gaps.append(
+                    f"unrecognized balance asset {raw_asset!r}"
+                )
+                continue
             try:
                 quantity = float(raw_quantity)
             except (TypeError, ValueError):
+                account_state_gaps.append(
+                    f"malformed balance quantity for {asset}"
+                )
+                continue
+            if not math.isfinite(quantity) or quantity < 0:
+                account_state_gaps.append(
+                    f"invalid balance quantity for {asset}"
+                )
                 continue
             if (
-                not asset
-                or asset in CASH_LIKE_ASSETS
-                or not math.isfinite(quantity)
-                or quantity <= 0
+                asset in CASH_LIKE_ASSETS
+                or quantity == 0
                 or asset in managed_spot_assets
             ):
                 continue
@@ -340,7 +358,9 @@ class KrakenExposureResolver:
                 )
                 continue
             notional = notionals.get(asset)
-            if notional is not None and notional < minimum_notional:
+            if notional is None:
+                unpriced_assets.append(asset)
+            elif notional < minimum_notional:
                 continue
             exposures.append(
                 ResolvedExposure(
@@ -357,15 +377,26 @@ class KrakenExposureResolver:
                 )
             )
 
-        for row in positions.values():
+        for position_id, row in positions.items():
             if not isinstance(row, dict):
+                account_state_gaps.append(
+                    f"malformed open position row {position_id}"
+                )
                 continue
             identity = _position_identity(row)
             if identity is None:
+                account_state_gaps.append(
+                    f"unresolved open position identity {position_id}"
+                )
                 continue
             pair, direction = identity
             remaining = _remaining_open_position_quantity(row)
-            if remaining is None or remaining <= 0:
+            if remaining is None:
+                account_state_gaps.append(
+                    f"invalid open position quantity {position_id}"
+                )
+                continue
+            if remaining <= 0:
                 continue
             if (pair, direction) in managed_position_keys:
                 continue
@@ -385,7 +416,12 @@ class KrakenExposureResolver:
         if unpriced_assets:
             reasons.append(
                 "USD/USDT pricing unavailable for held assets: "
-                + ",".join(sorted(unpriced_assets))
+                + ",".join(sorted(set(unpriced_assets)))
+            )
+        if account_state_gaps:
+            reasons.append(
+                "Kraken account state contains unresolved records: "
+                + "; ".join(account_state_gaps[:8])
             )
         return ExposureResolution(
             exposures=tuple(exposures),
@@ -393,6 +429,7 @@ class KrakenExposureResolver:
                 registry_available
                 and pair_catalog_available
                 and not unpriced_assets
+                and not account_state_gaps
             ),
             reason="; ".join(reasons),
         )
