@@ -94,7 +94,7 @@ def _identity(symbol: str, direction: str) -> str:
 
 def _history_append(history: list[dict[str, Any]], *, at: str, value: float | None) -> list[dict[str, Any]]:
     if value is None:
-        return history[-11:]
+        return history[-12:]
     if history and history[-1].get("at") == at and history[-1].get("value") == value:
         return history[-12:]
     history.append({"at": at, "value": value})
