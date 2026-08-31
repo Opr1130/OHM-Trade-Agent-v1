@@ -4,9 +4,17 @@ set -Eeuo pipefail
 TARGET_SHA="${1:-}"
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
+DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
+SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
+LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
+LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"
 
 if [[ "$TARGET_SHA" == "diagnose-learning" ]]; then
-  exec "$APP_ROOT/deploy/remote/diagnose-opip-learning.sh"
+  [[ -x "$LEARNING_DIAGNOSTICS_DST" ]] || {
+    echo "learning diagnostics helper is not installed" >&2
+    exit 69
+  }
+  exec "$LEARNING_DIAGNOSTICS_DST"
 fi
 LOCK_FILE="/var/lock/ohm-deploy.lock"
 STATE_DIR="/var/lib/ohm-deploy"
@@ -133,6 +141,20 @@ snapshot_scheduler_state() {
       cp -a "/etc/cron.d/$name" "$SCHEDULER_SNAPSHOT/$name"
     fi
   done
+
+  local spec source snapshot_name
+  while IFS='|' read -r source snapshot_name; do
+    if [[ -e "$source" ]]; then
+      cp -a "$source" "$SCHEDULER_SNAPSHOT/$snapshot_name"
+      : > "$SCHEDULER_SNAPSHOT/$snapshot_name.present"
+    fi
+  done <<OPS
+$DEPLOY_SCRIPT_DST|remote-op-ohm-deploy
+$SSH_GATEWAY_DST|remote-op-ohm-deploy-ssh
+$LEARNING_READER_DST|remote-op-learning-reader
+$LEARNING_DIAGNOSTICS_DST|remote-op-learning-diagnostics
+OPS
+
   if crontab -l > "$SCHEDULER_SNAPSHOT/root.crontab" 2>/dev/null; then
     : > "$SCHEDULER_SNAPSHOT/root.crontab.present"
   else
@@ -149,6 +171,21 @@ restore_scheduler_state() {
       rm -f "/etc/cron.d/$name"
     fi
   done
+
+  local spec target snapshot_name
+  while IFS='|' read -r target snapshot_name; do
+    if [[ -e "$SCHEDULER_SNAPSHOT/$snapshot_name.present" ]]; then
+      cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"
+    else
+      rm -f "$target"
+    fi
+  done <<OPS
+$DEPLOY_SCRIPT_DST|remote-op-ohm-deploy
+$SSH_GATEWAY_DST|remote-op-ohm-deploy-ssh
+$LEARNING_READER_DST|remote-op-learning-reader
+$LEARNING_DIAGNOSTICS_DST|remote-op-learning-diagnostics
+OPS
+
   if [[ -e "$SCHEDULER_SNAPSHOT/root.crontab.present" ]]; then
     crontab "$SCHEDULER_SNAPSHOT/root.crontab"
   else
