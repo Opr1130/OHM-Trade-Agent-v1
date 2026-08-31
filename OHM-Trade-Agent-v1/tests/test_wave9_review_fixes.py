@@ -73,6 +73,52 @@ def test_monitor_queue_preserves_stronger_cross_source_evidence(tmp_path, monkey
     assert row["volume_acceleration_score"] == 80.0
 
 
+def test_monitor_queue_missing_rs_observation_preserves_full_history(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        opportunity_monitor_queue,
+        "QUEUE_FILE",
+        tmp_path / "queue.json",
+    )
+    start = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    for offset in range(12):
+        opportunity_monitor_queue.upsert_candidate(
+            CandidateObservation(
+                symbol="SOLUSD",
+                direction="LONG",
+                source="FULL_MARKET",
+                observed_at=start + timedelta(minutes=offset),
+                relative_strength_percentile=70.0 + offset,
+                priority_score=80.0,
+            )
+        )
+
+    before = opportunity_monitor_queue.read_candidates(
+        now=start + timedelta(minutes=11)
+    )[0]
+    before_history = list(before["relative_strength_history"])
+    assert len(before_history) == 12
+
+    opportunity_monitor_queue.upsert_candidate(
+        CandidateObservation(
+            symbol="SOLUSD",
+            direction="LONG",
+            source="EARLY_MOVER",
+            observed_at=start + timedelta(minutes=12),
+            relative_strength_percentile=None,
+            priority_score=75.0,
+        )
+    )
+
+    after = opportunity_monitor_queue.read_candidates(
+        now=start + timedelta(minutes=12)
+    )[0]
+    assert after["relative_strength_history"] == before_history
+    assert len(after["relative_strength_history"]) == 12
+
+
 def test_failopen_notification_confirmation_persists_after_storage_recovers(
     tmp_path,
     monkeypatch,
