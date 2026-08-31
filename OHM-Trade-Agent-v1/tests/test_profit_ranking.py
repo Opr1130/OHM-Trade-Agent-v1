@@ -379,6 +379,9 @@ def _configure_pipeline(monkeypatch, specifications):
         coinmarketcal_api_key=None,
         telegram_bot_token="token",
         telegram_chat_id="chat",
+        opip_global_capital_ranking_enabled=False,
+        opip_trade_quality_v2_enabled=False,
+        signal_quality_min_liquidity_usd=100_000.0,
     )
     monkeypatch.setattr(scan_opportunities, "get_settings", lambda: settings)
     monkeypatch.setattr(
@@ -520,6 +523,12 @@ def _configure_pipeline(monkeypatch, specifications):
 
     monkeypatch.setattr(scan_opportunities, "rank_profit_opportunities", rank_all)
 
+    def action_gate(items, *, settings):
+        events.append("action_gate")
+        return list(items)
+
+    monkeypatch.setattr(scan_opportunities, "_apply_ranked_action_gates", action_gate)
+
     def send(**kwargs):
         events.append(f"send:{kwargs['plan'].symbol}")
         sent.append(kwargs["candidate"].copy())
@@ -547,6 +556,7 @@ def test_pipeline_ranks_only_gate_survivors_before_dispatch_and_sends_all(monkey
     assert set(ranked_symbols) == {"FIRSTUSD", "SECONDUSD", "THIRDUSD"}
     first_send_index = next(i for i, value in enumerate(events) if value.startswith("send:"))
     assert events.index("rank:3") < first_send_index
+    assert events.index("action_gate") < first_send_index
     assert events.index("target:THIRDUSD") < first_send_index
     assert events.index("economic:SECONDUSD") < first_send_index
     assert [item["symbol"] for item in sent] == ["FIRSTUSD", "SECONDUSD", "THIRDUSD"]
@@ -603,3 +613,72 @@ def test_telegram_dedup_key_is_unchanged_by_rank_alone():
     assert chief_alert_notifier._alert_state_key(first, _plan()) == (
         chief_alert_notifier._alert_state_key(second, _plan())
     )
+
+
+def test_ranking_disabled_still_applies_action_gate(monkeypatch):
+    events, _, sent = _configure_pipeline(
+        monkeypatch,
+        [{"symbol": "GATEDUSD", "move": 7.0}],
+    )
+
+    scan_opportunities.main()
+
+    assert "action_gate" in events
+    assert [item["symbol"] for item in sent] == ["GATEDUSD"]
+
+
+def test_trade_quality_exception_rejects_only_failing_candidate(monkeypatch):
+    events, _, sent = _configure_pipeline(
+        monkeypatch,
+        [
+            {"symbol": "BROKENUSD", "move": 8.0},
+            {"symbol": "HEALTHYUSD", "move": 7.0},
+        ],
+    )
+    settings = scan_opportunities.get_settings()
+    settings.opip_trade_quality_v2_enabled = True
+
+    monkeypatch.setattr(
+        scan_opportunities,
+        "canonical_episode_id",
+        lambda *args, symbol, **kwargs: f"E-{symbol}",
+    )
+    monkeypatch.setattr(
+        scan_opportunities,
+        "build_signal_id",
+        lambda **kwargs: f"S-{kwargs['pair']}",
+    )
+
+    def build(snapshot, **kwargs):
+        if snapshot.symbol == "BROKENUSD":
+            raise ValueError("poisoned feature input")
+        return SimpleNamespace(snapshot_id="FS-HEALTHY")
+
+    monkeypatch.setattr(scan_opportunities, "build_trade_feature_snapshot", build)
+    monkeypatch.setattr(
+        scan_opportunities,
+        "assess_trade_quality",
+        lambda *args, **kwargs: SimpleNamespace(
+            continuation=SimpleNamespace(
+                score=90,
+                decision="PASS",
+                evidence_quality="COMPLETE",
+            ),
+            entry=SimpleNamespace(
+                quality_score=85,
+                decision="PASS",
+                exhaustion_risk="LOW",
+            ),
+            actionable=True,
+        ),
+    )
+    monkeypatch.setattr(
+        scan_opportunities,
+        "record_trade_quality_evidence",
+        lambda **kwargs: "W9Q-TEST",
+    )
+
+    scan_opportunities.main()
+
+    assert [item["symbol"] for item in sent] == ["HEALTHYUSD"]
+    assert events.count("chief") == 1
