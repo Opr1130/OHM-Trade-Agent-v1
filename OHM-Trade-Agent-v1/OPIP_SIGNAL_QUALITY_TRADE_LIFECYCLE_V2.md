@@ -186,7 +186,7 @@ Later, after calibration, the engine may expose P(continuation event within hori
 
 Candidate training label:
 
-CONTINUATION_SUCCESS = MFE >= K * ATR before MAE <= -S * ATR within H minutes.
+CONTINUATION_SUCCESS = `MFE >= K * ATR before MAE <= -S * ATR within H` minutes.
 
 K, S, and H must be strategy-versioned and validated historically.
 
