@@ -75,6 +75,8 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert 'if [[ "$TARGET_SHA" == "diagnose-learning" ]]' in deploy
     assert "build_dashboard_read_model" in diagnostics
     assert "production_validation_data=" in diagnostics
+    assert "/var/lib/ohm-deploy/last-good-sha" in diagnostics
+    assert 'safe.directory="$REPO_ROOT"' in diagnostics
     assert "worker_compute_status=" in diagnostics
     assert "worker_evidence_sync_status=" in diagnostics
     assert "last_successful_sync_at_utc" in diagnostics
