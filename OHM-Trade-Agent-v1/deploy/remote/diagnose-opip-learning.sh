@@ -58,7 +58,10 @@ age_seconds() {
 echo "OPIP_LEARNING_DIAGNOSTICS"
 echo "checked_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-current_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+current_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
+if [[ ! "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  current_sha="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+fi
 echo "production_sha=${current_sha:-UNKNOWN}"
 
 if [[ -s "$EXPORT_CRON" ]]; then
