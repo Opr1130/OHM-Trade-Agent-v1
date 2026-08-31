@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone
 
 from app.scanner.models import MarketSnapshot
-from app.services import trade_outcome_registry
+from app.services import trade_outcome_registry, trade_quality_evidence_registry
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.trade_feature_snapshot import build_trade_feature_snapshot
 from app.services.trade_quality_assessor import assess_trade_quality
@@ -142,11 +142,25 @@ def test_quality_evidence_recording_is_idempotent(tmp_path):
     )
 
     first = record_trade_quality_evidence(**kwargs)
+    index_path = trade_quality_evidence_registry._index_file(path)
+    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert first in index_payload["evidence_ids"]
+    assert index_payload["source_size_bytes"] == path.stat().st_size
+
     second = record_trade_quality_evidence(**kwargs)
 
     assert first == second
     rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
     assert len(rows) == 1
+
+    # A stale sidecar must rebuild from canonical JSONL rather than duplicate.
+    index_payload["source_size_bytes"] = 0
+    index_path.write_text(json.dumps(index_payload), encoding="utf-8")
+    third = record_trade_quality_evidence(**kwargs)
+    assert third == first
+    assert len(
+        [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    ) == 1
 
 
 def test_recommendation_links_wave9_quality_to_outcome_registry(tmp_path, monkeypatch):
