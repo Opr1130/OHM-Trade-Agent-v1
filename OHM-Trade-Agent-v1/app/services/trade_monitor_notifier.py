@@ -84,9 +84,7 @@ def _mfe_giveback_r(
         return 0.0
     try:
         mfe_pct = float(observation.get("mfe_pct") or 0.0)
-        current_pct = float(
-            result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct
-        )
+        current_pct = float(result.unrealized_pct)
         entry = float(trade.entry_price)
         stop = float(trade.stop_price)
     except (TypeError, ValueError):
