@@ -78,6 +78,8 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "worker_compute_status=" in diagnostics
     assert "MAX_CAPTURE_AGE_SECONDS=900" in diagnostics
     assert "MAX_OUTCOMES_AGE_SECONDS=1800" in diagnostics
+    assert "MAX_FUTURE_SKEW_SECONDS=120" in diagnostics
+    assert "epoch > now_epoch + MAX_FUTURE_SKEW_SECONDS" in diagnostics
     assert "CAPTURE_STALE" in diagnostics
     assert "OUTCOMES_STALE" in diagnostics
     assert "docker exec ohm-trade-agent" in diagnostics
