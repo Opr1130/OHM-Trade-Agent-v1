@@ -257,15 +257,15 @@ def test_rank_one_veto_does_not_block_rank_two(monkeypatch):
     assert second.opportunity.alert["profit_rank"] == 2
 
 
-def test_pre_evaluated_action_does_not_recompute_inside_notifier(tmp_path, monkeypatch):
+def test_notifier_consumes_pre_evaluated_action_gate(tmp_path, monkeypatch):
     _patch_pending(tmp_path, monkeypatch)
     monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
+    monkeypatch.setattr(chief_alert_notifier, "record_recommendation", lambda **kwargs: None)
     monkeypatch.setattr(
         chief_alert_notifier,
-        "_apply_intelligence",
-        lambda *args: (_ for _ in ()).throw(AssertionError("must not run")),
+        "_register_reconciliation_intent",
+        lambda **kwargs: None,
     )
-    monkeypatch.setattr(chief_alert_notifier, "record_recommendation", lambda **kwargs: None)
     monkeypatch.setattr(chief_alert_notifier, "reserve_emit", lambda **kwargs: "reserve")
     monkeypatch.setattr(chief_alert_notifier, "confirm_emit", lambda **kwargs: True)
     monkeypatch.setattr(
@@ -276,9 +276,10 @@ def test_pre_evaluated_action_does_not_recompute_inside_notifier(tmp_path, monke
     candidate = {
         "confidence": 80,
         "decision": "alert",
-        "economic_qualified": False,
+        "economic_qualified": True,
         "action_gate_evaluated": True,
         "action_gate_allowed": True,
+        "recommended_capital": 200.0,
     }
 
     assert chief_alert_notifier.send_trade_plan(
@@ -288,6 +289,31 @@ def test_pre_evaluated_action_does_not_recompute_inside_notifier(tmp_path, monke
         "token",
         "chat",
     )
+
+
+def test_notifier_rejects_missing_action_gate_decision(tmp_path, monkeypatch):
+    _patch_pending(tmp_path, monkeypatch)
+    audits = []
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "record_telegram_not_eligible",
+        lambda **kwargs: audits.append(kwargs),
+    )
+    candidate = {
+        "confidence": 80,
+        "decision": "alert",
+        "economic_qualified": True,
+    }
+
+    assert not chief_alert_notifier.send_trade_plan(
+        candidate,
+        plan(),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert audits[-1]["reason"] == "ACTION_GATE_NOT_EVALUATED"
 
 
 def test_alerts_do_not_render_uncalibrated_confidence_percent():
