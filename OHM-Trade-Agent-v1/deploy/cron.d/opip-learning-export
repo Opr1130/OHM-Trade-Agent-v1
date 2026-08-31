@@ -1,0 +1,6 @@
+# O'Pip production -> learning-plane evidence export.
+# This is copy-only I/O: no ML, no Phase 3C compute, no exchange calls.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/2 * * * * root sleep 40; flock -n /var/run/opip-learning-export-trigger.lock -c '/bin/bash /opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1/deploy/remote/export-opip-learning-evidence.sh >> /var/log/opip-learning-export.log 2>&1'

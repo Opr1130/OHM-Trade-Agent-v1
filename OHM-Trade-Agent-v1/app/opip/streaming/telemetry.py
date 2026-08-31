@@ -37,6 +37,8 @@ class RuntimeTelemetrySnapshot:
     malformed_frames: int
     normalized_observations: int
     processing_errors: int
+    observation_sink_errors: int
+    window_sink_errors: int
     resource_sample_errors: int
     symbol_limit_rejections: int
     runtime_failed: bool
@@ -108,6 +110,8 @@ class RuntimeTelemetry:
         self.malformed_frames = 0
         self.normalized_observations = 0
         self.processing_errors = 0
+        self.observation_sink_errors = 0
+        self.window_sink_errors = 0
         self.resource_sample_errors = 0
         self.symbol_limit_rejections = 0
         self.runtime_failed = False
@@ -151,6 +155,8 @@ class RuntimeTelemetry:
             malformed_frames=self.malformed_frames,
             normalized_observations=self.normalized_observations,
             processing_errors=self.processing_errors,
+            observation_sink_errors=self.observation_sink_errors,
+            window_sink_errors=self.window_sink_errors,
             resource_sample_errors=self.resource_sample_errors,
             symbol_limit_rejections=self.symbol_limit_rejections,
             runtime_failed=self.runtime_failed,

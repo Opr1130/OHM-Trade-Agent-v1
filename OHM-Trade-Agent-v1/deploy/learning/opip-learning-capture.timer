@@ -1,0 +1,12 @@
+[Unit]
+Description=Run O'Pip ML evidence capture every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:50
+AccuracySec=10s
+Persistent=true
+RandomizedDelaySec=5s
+Unit=opip-learning-capture.service
+
+[Install]
+WantedBy=timers.target

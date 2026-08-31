@@ -23,7 +23,7 @@ def _use_temp_cycle_lock(cycle, monkeypatch, tmp_path):
     monkeypatch.setattr(cycle, "CYCLE_LOCK_FILE", tmp_path / ".unified_cycle.lock")
 
 
-def test_maintenance_cycle_runs_nothing(monkeypatch, tmp_path):
+def test_maintenance_cycle_runs_only_active_protection(monkeypatch, tmp_path):
     import app.jobs.run_cycle as cycle
 
     _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
@@ -33,7 +33,7 @@ def test_maintenance_cycle_runs_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(cycle, "monitor_pending_main", lambda: calls.append("pending"))
     monkeypatch.setattr(cycle, "scan_main", lambda: calls.append("scan"))
     cycle.main()
-    assert calls == []
+    assert calls == ["active"]
 
 
 def test_quiet_hours_keep_risk_and_selective_early_watch_active(monkeypatch, tmp_path):

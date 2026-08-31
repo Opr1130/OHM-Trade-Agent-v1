@@ -40,11 +40,24 @@ class KrakenPermissionError(KrakenPrivateAPIError):
     """Raised when the configured key has permissions OHM must not use."""
 
 
+class KrakenPermissionUnverifiable(KrakenPrivateAPIError):
+    """Raised when the API response does not report key permissions at all.
+
+    This is distinct from a positively-confirmed empty permission set: it
+    means read-only status could not be determined, not that it was checked
+    and found safe.
+    """
+
+
 @dataclass(frozen=True)
 class KrakenKeyInfo:
     name: str
     permissions: frozenset[str]
     last_used: str | None = None
+    # False when the API response omitted the permissions field entirely, so
+    # an empty `permissions` frozenset here is never confused with a
+    # positively-confirmed empty permission set.
+    permissions_reported: bool = True
 
     @property
     def is_read_only(self) -> bool:
@@ -125,15 +138,39 @@ class KrakenPrivateClient:
 
     def get_api_key_info(self) -> KrakenKeyInfo:
         result = self._post("GetApiKeyInfo") or {}
-        permissions = frozenset(str(value) for value in result.get("permissions", []))
+        if not isinstance(result, dict):
+            return KrakenKeyInfo(
+                name="",
+                permissions=frozenset(),
+                permissions_reported=False,
+            )
+
+        raw_permissions = result.get("permissions")
+        permissions_valid = isinstance(raw_permissions, list) and all(
+            isinstance(value, str) for value in raw_permissions
+        )
+        permissions_reported = "permissions" in result and permissions_valid
+        permissions = (
+            frozenset(raw_permissions)
+            if permissions_valid
+            else frozenset()
+        )
         return KrakenKeyInfo(
             name=str(result.get("apiKeyName") or ""),
             permissions=permissions,
             last_used=result.get("lastUsed"),
+            permissions_reported=permissions_reported,
         )
 
     def assert_read_only(self) -> KrakenKeyInfo:
         info = self.get_api_key_info()
+        if not info.permissions_reported:
+            # Unknown/unverified permission state must never be represented
+            # as read-only-safe. Fail closed rather than defaulting an
+            # unreported permission set to "no dangerous permissions".
+            raise KrakenPermissionUnverifiable(
+                "Kraken API response did not report key permissions"
+            )
         dangerous = sorted(info.permissions & DANGEROUS_PERMISSIONS)
         if dangerous:
             raise KrakenPermissionError(

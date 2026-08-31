@@ -80,18 +80,20 @@ class Phase3CRow:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Parse JSONL incrementally without materializing the source text twice."""
     if not path.exists():
         return []
     rows: list[dict[str, Any]] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        if not raw.strip():
-            continue
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                rows.append(value)
     return rows
 
 

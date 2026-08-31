@@ -190,11 +190,18 @@ class WindowAccumulator:
         )
 
     def record_dropped_frame(self) -> "WindowAccumulator":
-        """Account for a raw frame the caller chose to drop (e.g. under
-        queue-overflow backpressure) without folding it into the aggregate."""
-        if self.sealed:
-            raise ValueError("cannot record into a sealed window")
-        return replace(self, dropped_frame_count=self.dropped_frame_count + 1)
+        """Account for one dropped raw frame without folding its payload."""
+        return self.record_dropped_frames(1)
+
+    def record_dropped_frames(self, count: int) -> "WindowAccumulator":
+        """Account for one or more dropped frames in O(1) bounded state."""
+        amount = int(count)
+        if amount <= 0:
+            raise ValueError("dropped frame count must be positive")
+        # Like late_frame_count, drop counters are post-seal quality metadata.
+        # Updating them during the retention interval never changes the sealed
+        # aggregate values; it only prevents false COMPLETE classification.
+        return replace(self, dropped_frame_count=self.dropped_frame_count + amount)
 
     def record_late_frame(self) -> "WindowAccumulator":
         """Account for a late frame without mutating the sealed aggregate

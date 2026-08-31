@@ -51,7 +51,7 @@ PROFILES: dict[str, ExecutionProfile] = {
         provider="anthropic",
         model="sonnet",
         max_turns=20,
-        max_budget_usd=3.50,
+        max_budget_usd=3.00,
     ),
 }
 

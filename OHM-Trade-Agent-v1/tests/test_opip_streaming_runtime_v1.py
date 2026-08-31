@@ -258,8 +258,13 @@ def test_runtime_telemetry_snapshot_is_immutable():
 
 
 def test_heartbeat_timeout_causes_supervised_reconnect():
+    class NoHeartbeatAckAdapter(FakeAdapter):
+        async def heartbeat(self):
+            self.heartbeat_calls += 1
+            await asyncio.Event().wait()
+
     async def scenario():
-        adapter = FakeAdapter([])
+        adapter = NoHeartbeatAckAdapter([])
         runtime = StreamingRuntime(
             {StreamProvider.BINANCE: adapter},
             config=_runtime_config(
@@ -279,6 +284,29 @@ def test_heartbeat_timeout_causes_supervised_reconnect():
     assert provider.heartbeat_timeouts >= 1
     assert provider.connect_attempts >= 2
     assert provider.reconnects >= 1
+
+
+def test_successful_heartbeat_keeps_quiet_connection_alive():
+    async def scenario():
+        adapter = FakeAdapter([])
+        runtime = StreamingRuntime(
+            {StreamProvider.BINANCE: adapter},
+            config=_runtime_config(
+                heartbeat_interval_seconds=0.003,
+                heartbeat_timeout_seconds=0.003,
+            ),
+        )
+        await runtime.start()
+        await asyncio.sleep(0.02)
+        snapshot = runtime.snapshot()
+        await runtime.stop()
+        return adapter, snapshot
+
+    adapter, snapshot = asyncio.run(scenario())
+    provider = snapshot.providers[0]
+    assert adapter.heartbeat_calls >= 2
+    assert provider.heartbeat_timeouts == 0
+    assert provider.connect_attempts == 1
 
 
 def test_owned_task_failure_is_observable_and_running_turns_false():

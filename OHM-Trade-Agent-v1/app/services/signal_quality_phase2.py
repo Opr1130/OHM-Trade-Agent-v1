@@ -392,11 +392,33 @@ class IngestionResult:
         return {row.symbol for row in self.observations}
 
 
-def read_observations(path: Path | None = None) -> IngestionResult:
-    """Parse FULL_MARKET_OBSERVATION rows, rejecting malformed ones safely."""
+def read_observations(
+    path: Path | None = None,
+    *,
+    symbols: set[str] | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> IngestionResult:
+    """Parse observations incrementally, optionally retaining a bounded slice.
+
+    Filtering happens before ObservationSnapshot construction so offline
+    learning jobs can scan a large append-only history while keeping only the
+    symbols and time window needed for the current maturation batch. Filtered
+    rows are not reclassified as rejected input.
+    """
     target = path or DEFAULT_OBSERVATION_FILE
     if not target.exists():
         return IngestionResult(observations=[], total_lines=0, rejected_lines=0)
+
+    allowed_symbols = (
+        {str(symbol).upper() for symbol in symbols if str(symbol).strip()}
+        if symbols is not None
+        else None
+    )
+    start_utc = _as_utc(start_at) if start_at is not None else None
+    end_utc = _as_utc(end_at) if end_at is not None else None
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise ValueError("start_at must be <= end_at")
 
     rows: list[ReplayObservation] = []
     total = 0
@@ -414,18 +436,39 @@ def read_observations(path: Path | None = None) -> IngestionResult:
             if not isinstance(raw, dict) or raw.get("record_type") != "FULL_MARKET_OBSERVATION":
                 rejected += 1
                 continue
+
             observed_at = _as_utc(raw.get("observed_at"))
             symbol = str(raw.get("symbol") or "").upper()
+            if observed_at is None or not symbol:
+                rejected += 1
+                continue
+            if allowed_symbols is not None and symbol not in allowed_symbols:
+                continue
+            if start_utc is not None and observed_at < start_utc:
+                continue
+            if end_utc is not None and observed_at > end_utc:
+                continue
+
             snapshot = snapshot_from_mapping(raw, observed_at=observed_at)
-            if observed_at is None or not symbol or snapshot is None:
+            if snapshot is None:
                 rejected += 1
                 continue
             if not math.isfinite(snapshot.last_price) or snapshot.last_price <= 0:
                 rejected += 1
                 continue
-            rows.append(ReplayObservation(observed_at=observed_at, symbol=symbol, snapshot=snapshot))
+            rows.append(
+                ReplayObservation(
+                    observed_at=observed_at,
+                    symbol=symbol,
+                    snapshot=snapshot,
+                )
+            )
     rows.sort(key=lambda row: (row.observed_at, row.symbol))
-    return IngestionResult(observations=rows, total_lines=total, rejected_lines=rejected)
+    return IngestionResult(
+        observations=rows,
+        total_lines=total,
+        rejected_lines=rejected,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,8 @@
+# O'Pip ML evidence scheduler — DECOMMISSIONED ON PRODUCTION.
+#
+# Learning/evidence computation is intentionally off-host. The production
+# scheduler reconciliation removes /etc/cron.d/opip-ml-evidence and installs
+# only the lightweight evidence-export schedule used by the separate learning
+# droplet.
+#
+# No executable cron entries belong in this file.

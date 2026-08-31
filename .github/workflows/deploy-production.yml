@@ -155,7 +155,10 @@ jobs:
             "deploy $TARGET_SHA" 2>&1 | tee deploy.log
           RC=${PIPESTATUS[0]}
 
-          if [[ "$RC" -eq 0 ]] && grep -q 'OHM deployment succeeded' deploy.log && grep -q '"status":"ok"' deploy.log; then
+          if [[ "$RC" -eq 0 ]] \
+             && grep -q "O'Pip deployment succeeded" deploy.log \
+             && grep -q '"status":"ok"' deploy.log \
+             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log; then
             RESULT="SUCCESS"
             HEALTH="OK"
             ROLLBACK="NO"
@@ -231,3 +234,95 @@ jobs:
           fi
           echo "Production deploy result: ${RESULT:-FAILED BEFORE SSH}" >&2
           exit 1
+
+  diagnose-learning:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      github.event.comment.body == '/diagnose-learning'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate diagnostics secrets
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$OHM_DEPLOY_HOST"
+          test -n "$OHM_DEPLOY_USER"
+          test -n "$OHM_DEPLOY_SSH_KEY_B64"
+          test -n "$OHM_DEPLOY_KNOWN_HOSTS"
+
+      - name: Decode diagnostics SSH key
+        env:
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
+          OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s' "$OHM_DEPLOY_SSH_KEY_B64" | base64 --decode > ~/.ssh/ohm_deploy
+          chmod 600 ~/.ssh/ohm_deploy
+          ssh-keygen -y -f ~/.ssh/ohm_deploy >/dev/null
+          printf '%s\n' "$OHM_DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run read-only learning diagnostics
+        id: diagnose
+        env:
+          OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
+          OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
+          OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
+        run: |
+          set +e
+          PORT="${OHM_DEPLOY_PORT:-22}"
+          ssh \
+            -i ~/.ssh/ohm_deploy \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=5 \
+            -p "$PORT" \
+            "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
+            "diagnose-learning" 2>&1 | tee diagnostics.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish learning diagnostics
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIAG_RC: ${{ steps.diagnose.outputs.rc }}
+        run: |
+          set -euo pipefail
+          if [[ -s diagnostics.log ]]; then
+            DIAGNOSTICS="$(tail -c 12000 diagnostics.log)"
+          else
+            DIAGNOSTICS="Diagnostics command did not produce output."
+          fi
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          BODY=$(cat <<EOF
+          ## O'Pip Learning Diagnostics
+          - **Remote exit code:** ${DIAG_RC:-N/A}
+          - **Workflow run:** $RUN_URL
+
+          \`\`\`text
+          $DIAGNOSTICS
+          \`\`\`
+          EOF
+          )
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/64/comments" \
+            -f body="$BODY" >/dev/null
+
+      - name: Fail if diagnostics command failed
+        if: steps.diagnose.outputs.rc != '0'
+        run: exit 1
+
