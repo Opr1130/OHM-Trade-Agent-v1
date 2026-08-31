@@ -168,7 +168,13 @@ def test_actionable_setup_is_persisted_without_confirmation_buttons(
 
     monkeypatch.setattr(chief_alert_notifier, "send_tracked_telegram", send)
     assert chief_alert_notifier.send_trade_plan(
-        {"confidence": 90, "decision": "alert"},
+        {
+            "confidence": 90,
+            "decision": "alert",
+            "economic_qualified": True,
+            "action_gate_evaluated": True,
+            "action_gate_allowed": True,
+        },
         _plan(),
         "summary",
         "token",
