@@ -46,6 +46,44 @@ STATE_FILE = Path("/app/data/alert_state.json")
 STATE_LOCK_FILE = STATE_FILE.parent / ".alert_state.lock"
 
 
+def _settle_reservation(
+    *,
+    policy_identity: str,
+    fingerprint: str,
+    reservation_token: str,
+    delivered: bool,
+) -> None:
+    """Close a notification reservation exactly once, whatever happened.
+
+    A delivered message is always confirmed so a later attempt cannot resend
+    it. Every non-delivered outcome releases the reservation immediately so
+    recovery does not have to wait for the lease TTL. Settlement failure is
+    audited but never propagates: the caller has already decided the delivery
+    outcome.
+    """
+    try:
+        if delivered:
+            confirm_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                fingerprint=fingerprint,
+                reservation_token=reservation_token,
+            )
+        else:
+            release_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                reservation_token=reservation_token,
+            )
+    except Exception as exc:
+        print(
+            "O'Pip notification reservation settlement failed:",
+            f"identity={policy_identity}",
+            f"delivered={delivered}",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _pretty_entry_style(value: str) -> str:
     return value.replace("_", " ").title()
 
@@ -402,13 +440,57 @@ def send_trade_plan(
                 trade_id=trade_id,
             )
         except ReconciliationTrackingDisabled:
-            terminalize_pending_setup(trade_id, "tracking_disabled")
+            transitioned = False
+            lifecycle_after_status = "waiting"
+            try:
+                transitioned = terminalize_pending_setup(
+                    trade_id,
+                    "tracking_disabled",
+                )
+                lifecycle_after = get_pending_setup_record(trade_id)
+                lifecycle_after_status = str(
+                    (lifecycle_after or {}).get("status") or ""
+                )
+            except Exception as transition_exc:
+                print(
+                    "O'Pip tracking-disabled terminalization failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(transition_exc).__name__}: {transition_exc}",
+                )
+
+            terminal = bool(transitioned) or lifecycle_after_status != "waiting"
+            if not terminal:
+                # The lifecycle is still waiting, so a durable recovery record
+                # must exist before this decision is dropped.
+                try:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
+                    )
+                except Exception as queue_exc:
+                    print(
+                        "O'Pip terminalization-pending queueing failed:",
+                        f"trade_id={trade_id}",
+                        f"{type(queue_exc).__name__}: {queue_exc}",
+                    )
+
             record_telegram_suppression(
                 identity=identity,
                 alert_family="QUALIFIED_OPPORTUNITY",
                 event_type=action,
                 fingerprint=key,
-                reason="RECONCILIATION_NOT_APPLY_TERMINAL",
+                reason=(
+                    "RECONCILIATION_NOT_APPLY_TERMINAL"
+                    if terminal
+                    else "RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING"
+                ),
                 symbol=plan.symbol,
                 journey_id=candidate.get("journey_id"),
                 signal_id=candidate.get("signal_id"),
@@ -521,8 +603,9 @@ def send_trade_plan(
             pass
         return True
 
+    policy_identity = f"{direction}:{plan.symbol}"
     reservation = reserve_emit(
-        identity=f"{direction}:{plan.symbol}",
+        identity=policy_identity,
         event_type="ACTIONABLE_TRADE",
         fingerprint=key,
     )
@@ -540,68 +623,93 @@ def send_trade_plan(
         )
         return False
 
-    delivery = send_tracked_telegram(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        message=message,
-        identity=identity,
-        alert_family="QUALIFIED_OPPORTUNITY",
-        event_type=action,
-        fingerprint=key,
-        symbol=plan.symbol,
-        journey_id=candidate.get("journey_id"),
-        signal_id=candidate.get("signal_id"),
-        trade_id=trade_id,
-    )
-    if delivery.delivered:
+    delivered = False
+    settled = False
+    delivery_reason = "DELIVERY_PENDING"
+    try:
         try:
-            with registry_lock(STATE_LOCK_FILE):
-                state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
-                state[plan.symbol] = key
-                save_json_atomic(STATE_FILE, state)
-        except (OSError, TimeoutError, RegistryIOError):
-            pass
-        confirm_emit(
-            identity=f"{direction}:{plan.symbol}",
-            event_type="ACTIONABLE_TRADE",
-            fingerprint=key,
-            reservation_token=reservation,
-        )
-        return True
-
-    release_emit(
-        identity=f"{direction}:{plan.symbol}",
-        event_type="ACTIONABLE_TRADE",
-        reservation_token=reservation,
-    )
-    if trade_id:
-        try:
-            queue_qualified_alert(
-                trade_id=trade_id,
+            delivery = send_tracked_telegram(
+                bot_token=bot_token,
+                chat_id=chat_id,
                 message=message,
-                candidate=candidate,
-                plan=plan,
-                action=action,
-                direction=direction,
-                identity=identity,
-                fingerprint=key,
-                reason="DELIVERY_PENDING",
-            )
-        except Exception as queue_exc:
-            print(
-                "O'Pip qualified alert queueing failed:",
-                f"trade_id={trade_id}",
-                f"{type(queue_exc).__name__}: {queue_exc}",
-            )
-            record_telegram_suppression(
                 identity=identity,
                 alert_family="QUALIFIED_OPPORTUNITY",
                 event_type=action,
                 fingerprint=key,
-                reason="DELIVERY_PENDING_UNQUEUEABLE",
                 symbol=plan.symbol,
                 journey_id=candidate.get("journey_id"),
                 signal_id=candidate.get("signal_id"),
                 trade_id=trade_id,
             )
-    return False
+            delivered = bool(getattr(delivery, "delivered", False))
+        except Exception as send_exc:
+            # A raised delivery attempt is not an accepted send. Release the
+            # reservation now so recovery does not wait for the lease TTL.
+            delivery_reason = f"DELIVERY_EXCEPTION:{type(send_exc).__name__}"
+            print(
+                "O'Pip qualified alert delivery raised:",
+                f"trade_id={trade_id}",
+                f"{type(send_exc).__name__}: {send_exc}",
+            )
+
+        # Settle before any audit/telemetry work so a downstream failure can
+        # never strand the reservation.
+        _settle_reservation(
+            policy_identity=policy_identity,
+            fingerprint=key,
+            reservation_token=reservation,
+            delivered=delivered,
+        )
+        settled = True
+
+        if delivered:
+            try:
+                with registry_lock(STATE_LOCK_FILE):
+                    state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
+                    state[plan.symbol] = key
+                    save_json_atomic(STATE_FILE, state)
+            except (OSError, TimeoutError, RegistryIOError):
+                pass
+            return True
+
+        if trade_id:
+            try:
+                queue_qualified_alert(
+                    trade_id=trade_id,
+                    message=message,
+                    candidate=candidate,
+                    plan=plan,
+                    action=action,
+                    direction=direction,
+                    identity=identity,
+                    fingerprint=key,
+                    reason=delivery_reason,
+                )
+            except Exception as queue_exc:
+                print(
+                    "O'Pip qualified alert queueing failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(queue_exc).__name__}: {queue_exc}",
+                )
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action,
+                    fingerprint=key,
+                    reason="DELIVERY_PENDING_UNQUEUEABLE",
+                    symbol=plan.symbol,
+                    journey_id=candidate.get("journey_id"),
+                    signal_id=candidate.get("signal_id"),
+                    trade_id=trade_id,
+                )
+        return False
+    finally:
+        # Last-resort guarantee for any unexpected exception raised between
+        # reservation and settlement (telemetry, audit, registry, or runtime).
+        if not settled:
+            _settle_reservation(
+                policy_identity=policy_identity,
+                fingerprint=key,
+                reservation_token=reservation,
+                delivered=delivered,
+            )
