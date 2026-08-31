@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
-from app.core.config import Settings
+from app.core.config import get_settings
 from app.opip.ml.contracts import FeatureSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
 
@@ -154,7 +154,7 @@ def assess_continuation(
     exhaustion_state, _ = _exhaustion(features)
     if min_liquidity_usd is None:
         min_liquidity_usd = float(
-            Settings.model_fields["signal_quality_min_liquidity_usd"].default
+            get_settings().signal_quality_min_liquidity_usd
         )
 
     if market_data_status not in {"PASS", "WARN"}:
