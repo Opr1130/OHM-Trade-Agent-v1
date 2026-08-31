@@ -66,11 +66,13 @@ status_rc() {
 
 capture_file="$STATE_ROOT/capture.last.env"
 outcomes_file="$STATE_ROOT/outcomes.last.env"
+last_sync_file="$DATA_ROOT/.last_sync"
+last_sync_at="$(status_time "$(state_value "$last_sync_file" last_sync_at_utc)")"
 capture_at="$(status_time "$(state_value "$capture_file" finished_at_utc)")"
 capture_rc="$(status_rc "$(state_value "$capture_file" exit_code)")"
 outcomes_at="$(status_time "$(state_value "$outcomes_file" finished_at_utc)")"
 outcomes_rc="$(status_rc "$(state_value "$outcomes_file" exit_code)")"
-status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc"
+status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA sync_success_at=$last_sync_at capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc"
 
 rm -f "$INCOMING"/* "$ARCHIVE"
 
