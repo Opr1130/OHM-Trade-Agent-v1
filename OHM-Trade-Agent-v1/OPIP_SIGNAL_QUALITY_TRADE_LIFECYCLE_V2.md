@@ -232,7 +232,7 @@ Rank by expected capital utility, not raw momentum.
 
 Conceptual utility:
 
-Opportunity Utility = success likelihood * expected net reward - failure likelihood * expected net loss - fees/slippage - liquidity penalty - exhaustion penalty - portfolio concentration penalty - opportunity-cost penalty.
+`Opportunity Utility = success likelihood * expected net reward - failure likelihood * expected net loss - fees/slippage - liquidity penalty - exhaustion penalty - portfolio concentration penalty - opportunity-cost penalty.`
 
 Before calibrated probabilities exist, use a deterministic versioned score with the same feature families and preserve all raw evidence for later calibration.
 
