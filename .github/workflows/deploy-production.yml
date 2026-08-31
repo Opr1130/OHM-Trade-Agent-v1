@@ -312,9 +312,9 @@ jobs:
           - **Remote exit code:** ${DIAG_RC:-N/A}
           - **Workflow run:** $RUN_URL
 
-          ```text
+          \`\`\`text
           $DIAGNOSTICS
-          ```
+          \`\`\`
           EOF
           )
           gh api \
