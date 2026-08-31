@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.services.confirm_entry import confirm_trade_id
 from app.services.pending_setup_registry import terminalize_pending_setup
 from app.services.telegram_command_center import process_command_message, refresh_market_watches
+from app.services.asset_display_identity import display_market_label
 from app.services.telegram_notifier import send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ def process_callback(update: dict) -> None:
             (
                 "✅ OHM TRADE CONFIRMED\n\n"
                 f"Trade ID: {trade_id}\n"
-                f"Symbol: {trade.symbol}\n"
+                f"Market: {display_market_label(trade.symbol)}\n"
                 "Status: FILLED\n\n"
                 "OHM recorded your confirmation.\n"
                 "Kraken execution is NOT enabled."

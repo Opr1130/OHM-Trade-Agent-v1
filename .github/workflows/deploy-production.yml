@@ -16,7 +16,7 @@ on:
 permissions:
   contents: read
   actions: read
-  issues: read
+  issues: write
 
 concurrency:
   group: ohm-production
@@ -93,41 +93,141 @@ jobs:
         env:
           OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
           OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
-          OHM_DEPLOY_SSH_KEY: ${{ secrets.OHM_DEPLOY_SSH_KEY }}
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
           OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           test -n "$OHM_DEPLOY_HOST"
           test -n "$OHM_DEPLOY_USER"
-          test -n "$OHM_DEPLOY_SSH_KEY"
+          test -n "$OHM_DEPLOY_SSH_KEY_B64"
           test -n "$OHM_DEPLOY_KNOWN_HOSTS"
 
-      - name: Configure SSH
+      - name: Decode and validate SSH key
+        id: ssh_config
         env:
-          OHM_DEPLOY_SSH_KEY: ${{ secrets.OHM_DEPLOY_SSH_KEY }}
+          OHM_DEPLOY_SSH_KEY_B64: ${{ secrets.OHM_DEPLOY_SSH_KEY_B64 }}
           OHM_DEPLOY_KNOWN_HOSTS: ${{ secrets.OHM_DEPLOY_KNOWN_HOSTS }}
         run: |
-          set -euo pipefail
+          set +e
           install -m 700 -d ~/.ssh
-          printf '%s\n' "$OHM_DEPLOY_SSH_KEY" > ~/.ssh/ohm_deploy
-          chmod 600 ~/.ssh/ohm_deploy
+
+          printf '%s' "$OHM_DEPLOY_SSH_KEY_B64" | base64 --decode > ~/.ssh/ohm_deploy 2>/dev/null
+          DECODE_RC=$?
+          chmod 600 ~/.ssh/ohm_deploy 2>/dev/null
+
+          if [[ "$DECODE_RC" -ne 0 ]] || ! ssh-keygen -y -f ~/.ssh/ohm_deploy >/dev/null 2>&1; then
+            rm -f ~/.ssh/ohm_deploy
+            echo "SSH deploy key validation failed." >&2
+            echo "result=SSH KEY INVALID" >> "$GITHUB_OUTPUT"
+            echo "rc=66" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           printf '%s\n' "$OHM_DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+          echo "SSH deploy key decoded and validated successfully."
+          echo "result=READY" >> "$GITHUB_OUTPUT"
+          echo "rc=0" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Deploy exact approved and tested main commit
+        id: production_deploy
+        if: steps.ssh_config.outputs.result == 'READY'
+        continue-on-error: true
         env:
           OHM_DEPLOY_HOST: ${{ secrets.OHM_DEPLOY_HOST }}
           OHM_DEPLOY_USER: ${{ secrets.OHM_DEPLOY_USER }}
           OHM_DEPLOY_PORT: ${{ secrets.OHM_DEPLOY_PORT }}
           TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
-          set -euo pipefail
+          set +e
           PORT="${OHM_DEPLOY_PORT:-22}"
           ssh \
             -i ~/.ssh/ohm_deploy \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
             -p "$PORT" \
             "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
-            "deploy $TARGET_SHA"
+            "deploy $TARGET_SHA" 2>&1 | tee deploy.log
+          RC=${PIPESTATUS[0]}
+
+          if [[ "$RC" -eq 0 ]] && grep -q 'OHM deployment succeeded' deploy.log && grep -q '"status":"ok"' deploy.log; then
+            RESULT="SUCCESS"
+            HEALTH="OK"
+            ROLLBACK="NO"
+          elif grep -q 'rollback health check passed' deploy.log; then
+            RESULT="ROLLED BACK"
+            HEALTH="PREVIOUS RELEASE OK"
+            ROLLBACK="YES"
+          elif grep -qiE 'Permission denied \(publickey\)|Too many authentication failures' deploy.log; then
+            RESULT="SSH AUTH FAILED"
+            HEALTH="NOT CONFIRMED"
+            ROLLBACK="NOT RUN"
+          elif grep -qiE 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|No .* host key is known' deploy.log; then
+            RESULT="HOST KEY FAILED"
+            HEALTH="NOT CONFIRMED"
+            ROLLBACK="NOT RUN"
+          else
+            RESULT="SERVER DEPLOY FAILED"
+            HEALTH="NOT CONFIRMED"
+            ROLLBACK="UNKNOWN OR FAILED"
+          fi
+
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "health=$HEALTH" >> "$GITHUB_OUTPUT"
+          echo "rollback=$ROLLBACK" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish deployment receipt to approval issue
+        if: always() && steps.target.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          SSH_CONFIG_RESULT: ${{ steps.ssh_config.outputs.result }}
+          SSH_CONFIG_RC: ${{ steps.ssh_config.outputs.rc }}
+          DEPLOY_RESULT: ${{ steps.production_deploy.outputs.result }}
+          HEALTH_RESULT: ${{ steps.production_deploy.outputs.health }}
+          ROLLBACK_RESULT: ${{ steps.production_deploy.outputs.rollback }}
+          DEPLOY_RC: ${{ steps.production_deploy.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RESULT="${DEPLOY_RESULT:-${SSH_CONFIG_RESULT:-FAILED BEFORE SSH}}"
+          HEALTH="${HEALTH_RESULT:-NOT CONFIRMED}"
+          if [[ "$RESULT" == "SSH KEY INVALID" || "$RESULT" == "SSH AUTH FAILED" || "$RESULT" == "HOST KEY FAILED" ]]; then
+            ROLLBACK="NOT RUN"
+          else
+            ROLLBACK="${ROLLBACK_RESULT:-NOT RUN}"
+          fi
+          RC="${DEPLOY_RC:-${SSH_CONFIG_RC:-N/A}}"
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          BODY=$(cat <<EOF
+          ## OHM Production Deployment Receipt
+          - **Result:** $RESULT
+          - **SHA:** \`$TARGET_SHA\`
+          - **Health:** $HEALTH
+          - **Rollback:** $ROLLBACK
+          - **Deploy exit code:** $RC
+          - **Workflow run:** $RUN_URL
+          EOF
+          )
+
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/64/comments" \
+            -f body="$BODY" >/dev/null
+
+      - name: Fail workflow if production deploy did not succeed
+        if: always() && steps.production_deploy.outputs.result != 'SUCCESS'
+        run: |
+          RESULT="${{ steps.production_deploy.outputs.result }}"
+          if [[ -z "$RESULT" ]]; then
+            RESULT="${{ steps.ssh_config.outputs.result }}"
+          fi
+          echo "Production deploy result: ${RESULT:-FAILED BEFORE SSH}" >&2
+          exit 1

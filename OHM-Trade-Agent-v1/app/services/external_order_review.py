@@ -11,6 +11,7 @@ from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateCli
 from app.services.kraken_reconciliation import _order_matches_intent
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.asset_display_identity import display_market_label
 from app.services.telegram_notifier import send_telegram_message
 
 
@@ -109,7 +110,7 @@ def _format_review(
 
     return (
         "📌 OHM AI — EXTERNAL KRAKEN ORDER REVIEW\n\n"
-        f"Market: {pair or 'UNKNOWN'}\n"
+        f"Market: {display_market_label(pair or 'UNKNOWN')}\n"
         f"Side: {side or 'UNKNOWN'}\n"
         f"Limit: {limit_text}\n"
         f"Current: {current_text}\n"
