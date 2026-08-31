@@ -223,6 +223,50 @@ def test_malformed_qualified_outbox_row_is_removed(monkeypatch):
     )
     assert removed == [("Q-BAD", "lease")]
 
+def test_malformed_outbox_records_audit_and_terminalizes(monkeypatch):
+    row = {
+        "trade_id": "Q-AUDIT-BAD",
+        "plan": {"not": "an entry plan"},
+        "identity": "QUALIFIED_OPPORTUNITY:Q-AUDIT-BAD",
+        "action": "ENTER_NOW",
+        "fingerprint": "fp",
+    }
+    audits = []
+    terminalized = []
+    removed = []
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_claim",
+        lambda trade_id: ("lease", dict(row)),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "record_telegram_not_eligible",
+        lambda **kwargs: audits.append(kwargs),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalized.append((trade_id, status)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+
+    status = qualified_alert_outbox._retry_one(
+        "Q-AUDIT-BAD",
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert status == "MALFORMED"
+    assert terminalized == [("Q-AUDIT-BAD", "delivery_malformed")]
+    assert removed == [("Q-AUDIT-BAD", "lease")]
+    assert audits[0]["reason"].startswith("OUTBOX_MALFORMED:")
+
+
 def test_non_numeric_outbox_leverage_is_malformed_and_removed(monkeypatch):
     row = {
         "trade_id": "Q-BAD-LEV",
