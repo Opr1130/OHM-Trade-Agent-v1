@@ -76,6 +76,16 @@ def _repair_truncated_jsonl_tail(path: Path) -> bool:
     return True
 
 
+def _contains_nonfinite_json(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_contains_nonfinite_json(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite_json(item) for item in value)
+    return False
+
+
 def _sanitize_nonfinite_json(value: Any) -> tuple[Any, int]:
     """Return JSON-safe evidence while counting every non-finite numeric value."""
     if isinstance(value, float):
@@ -493,7 +503,17 @@ def _reconcile_snapshot_queue(
 
             snapshot_id = str(snapshot.get("snapshot_id", "") or "")
             decision_at = _parse_utc(snapshot.get("decision_at_utc"))
-            if not snapshot_id or decision_at is None:
+            try:
+                reference_price = float(snapshot.get("reference_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                reference_price = 0.0
+            if (
+                not snapshot_id
+                or decision_at is None
+                or not math.isfinite(reference_price)
+                or reference_price <= 0
+                or _contains_nonfinite_json(snapshot)
+            ):
                 continue
 
             normalized_snapshot = {
