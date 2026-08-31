@@ -223,6 +223,37 @@ def test_malformed_qualified_outbox_row_is_removed(monkeypatch):
     )
     assert removed == [("Q-BAD", "lease")]
 
+def test_non_numeric_outbox_leverage_is_malformed_and_removed(monkeypatch):
+    row = {
+        "trade_id": "Q-BAD-LEV",
+        "plan": _queued_plan(),
+        "direction": "LONG",
+        "action": "ENTER_NOW",
+        "tracking_candidate": {"economic_qualified": True},
+        "leverage": "not-a-number",
+    }
+    removed = []
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_claim",
+        lambda trade_id: ("lease", dict(row)),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+
+    status = qualified_alert_outbox._retry_one(
+        "Q-BAD-LEV",
+        bot_token="token",
+        chat_id="chat",
+    )
+
+    assert status == "MALFORMED"
+    assert removed == [("Q-BAD-LEV", "lease")]
+
+
 def test_entry_watch_expired_rows_do_not_evict_fresh_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(entry_watch_queue, "ENTRY_WATCH_FILE", tmp_path / "entry_watch.json")
     monkeypatch.setattr(entry_watch_queue, "MAX_ENTRY_WATCH", 1)
