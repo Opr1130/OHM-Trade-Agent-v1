@@ -168,6 +168,19 @@ def _retry_one(
         plan = EntryExitPlan(**dict(row.get("plan") or {}))
         if str(row.get("trade_id") or "") != trade_id:
             raise ValueError("qualified alert outbox trade_id mismatch")
+        direction = str(
+            row.get("direction") or plan.direction or "LONG"
+        ).upper()
+        if direction not in {"LONG", "SHORT"}:
+            raise ValueError("qualified alert outbox direction is invalid")
+        action = str(row.get("action") or "")
+        candidate = dict(row.get("tracking_candidate") or {})
+        leverage = float(
+            row.get("leverage")
+            or (2.0 if direction == "SHORT" else 1.0)
+        )
+        if not math.isfinite(leverage) or leverage <= 0:
+            raise ValueError("qualified alert outbox leverage is invalid")
     except Exception:
         _remove(trade_id, token=lease_token)
         return "MALFORMED"
@@ -192,11 +205,6 @@ def _retry_one(
             trade_id=trade_id,
         )
         return "SUPERSEDED"
-
-    direction = str(row.get("direction") or plan.direction or "LONG").upper()
-    action = str(row.get("action") or "")
-    candidate = dict(row.get("tracking_candidate") or {})
-    leverage = float(row.get("leverage") or (2.0 if direction == "SHORT" else 1.0))
 
     if candidate.get("economic_qualified") is True:
         try:
@@ -316,7 +324,13 @@ def retry_qualified_alerts(
     pending = 0
     for trade_id, row in list(rows.items()):
         if not isinstance(row, dict):
-            pending += 1
+            try:
+                with registry_lock(_lock_file()):
+                    current = load_json(OUTBOX_FILE)
+                    current.pop(str(trade_id), None)
+                    save_json_atomic(OUTBOX_FILE, current)
+            except (OSError, TimeoutError, RegistryIOError):
+                pending += 1
             continue
         try:
             status = _retry_one(
