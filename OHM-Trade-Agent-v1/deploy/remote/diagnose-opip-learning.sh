@@ -10,6 +10,8 @@ MANIFEST="$EXPORT_ROOT/manifest.env"
 EXPORT_CRON="/etc/cron.d/opip-learning-export"
 MAX_EXPORT_AGE_SECONDS=300
 MAX_SYNC_AGE_SECONDS=300
+MAX_CAPTURE_AGE_SECONDS=900
+MAX_OUTCOMES_AGE_SECONDS=1800
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run O'Pip learning diagnostics as root" >&2
@@ -87,13 +89,17 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   capture_rc="$(env_value "$READER_STATE_FILE" capture_exit_code)"
   outcomes_at="$(env_value "$READER_STATE_FILE" outcomes_finished_at_utc)"
   outcomes_rc="$(env_value "$READER_STATE_FILE" outcomes_exit_code)"
+  capture_age="$(age_seconds "$capture_at" || true)"
+  outcomes_age="$(age_seconds "$outcomes_at" || true)"
   echo "worker_sync_observed_at_utc=${sync_seen:-UNKNOWN}"
   echo "worker_sync_age_seconds=${sync_age:-UNKNOWN}"
   echo "worker_status_protocol=${protocol:-UNKNOWN}"
   echo "worker_deployed_sha=${worker_sha:-UNKNOWN}"
   echo "capture_finished_at_utc=${capture_at:-UNKNOWN}"
+  echo "capture_age_seconds=${capture_age:-UNKNOWN}"
   echo "capture_exit_code=${capture_rc:-UNKNOWN}"
   echo "outcomes_finished_at_utc=${outcomes_at:-UNKNOWN}"
+  echo "outcomes_age_seconds=${outcomes_age:-UNKNOWN}"
   echo "outcomes_exit_code=${outcomes_rc:-UNKNOWN}"
   if [[ ! "$sync_age" =~ ^[0-9]+$ ]] || (( sync_age > MAX_SYNC_AGE_SECONDS )); then
     degrade
@@ -103,6 +109,12 @@ if [[ -s "$READER_STATE_FILE" ]]; then
     degrade
   elif [[ "$capture_rc" != "0" || "$outcomes_rc" != "0" ]]; then
     echo "worker_compute_status=FAILED_OR_INCOMPLETE"
+    degrade
+  elif [[ ! "$capture_age" =~ ^[0-9]+$ || "$capture_age" -gt "$MAX_CAPTURE_AGE_SECONDS" ]]; then
+    echo "worker_compute_status=CAPTURE_STALE"
+    degrade
+  elif [[ ! "$outcomes_age" =~ ^[0-9]+$ || "$outcomes_age" -gt "$MAX_OUTCOMES_AGE_SECONDS" ]]; then
+    echo "worker_compute_status=OUTCOMES_STALE"
     degrade
   else
     echo "worker_compute_status=OK"
