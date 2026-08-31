@@ -76,6 +76,10 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "build_dashboard_read_model" in diagnostics
     assert "production_validation_data=" in diagnostics
     assert "worker_compute_status=" in diagnostics
+    assert "worker_evidence_sync_status=" in diagnostics
+    assert "last_successful_sync_at_utc" in diagnostics
+    assert "RELEASE_DRIFT" in diagnostics
+    assert "MAX_SYNC_AGE_SECONDS=720" in diagnostics
     assert "MAX_CAPTURE_AGE_SECONDS=900" in diagnostics
     assert "MAX_OUTCOMES_AGE_SECONDS=1800" in diagnostics
     assert "MAX_FUTURE_SKEW_SECONDS=120" in diagnostics
