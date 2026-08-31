@@ -173,9 +173,11 @@ def _record_malformed_outbox(
             reason=reason,
             symbol=str(
                 payload.get("symbol")
-                or (payload.get("plan") or {}).get("symbol")
-                if isinstance(payload.get("plan"), dict)
-                else ""
+                or (
+                    payload.get("plan", {}).get("symbol")
+                    if isinstance(payload.get("plan"), dict)
+                    else ""
+                )
             ),
             journey_id=payload.get("journey_id"),
             signal_id=payload.get("signal_id"),
