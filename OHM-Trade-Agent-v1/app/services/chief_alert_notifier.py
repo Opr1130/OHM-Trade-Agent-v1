@@ -27,7 +27,10 @@ from app.services.pending_setup_registry import (
 )
 from app.services.price_movement_radar import attach_actionable_plan
 from app.services.qualified_alert_outbox import queue_qualified_alert
-from app.services.qualified_trade_tracking import register_reconciliation_intent
+from app.services.qualified_trade_tracking import (
+    ReconciliationTrackingDisabled,
+    register_reconciliation_intent,
+)
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_delivery import (
     accepted_delivery_message_id,
@@ -409,6 +412,19 @@ def send_trade_plan(
                 leverage=leverage,
                 trade_id=trade_id,
             )
+        except ReconciliationTrackingDisabled:
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                reason="RECONCILIATION_NOT_APPLY_TERMINAL",
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return False
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             try:
                 queue_qualified_alert(
