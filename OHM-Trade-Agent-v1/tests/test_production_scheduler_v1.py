@@ -32,6 +32,7 @@ def test_scheduler_reconciliation_removes_only_legacy_ohm_scheduler_paths():
     assert 'DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"' in script
     assert 'SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"' in script
     assert 'LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"' in script
+    assert 'LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"' in script
     assert 'LEARNING_READER_STATE="/var/lib/opip-learning-reader"' in script
 
 
@@ -75,6 +76,23 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "build_dashboard_read_model" in diagnostics
     assert "production_validation_data=" in diagnostics
     assert "worker_compute_status=" in diagnostics
+    assert "MAX_CAPTURE_AGE_SECONDS=900" in diagnostics
+    assert "MAX_OUTCOMES_AGE_SECONDS=1800" in diagnostics
+    assert "CAPTURE_STALE" in diagnostics
+    assert "OUTCOMES_STALE" in diagnostics
     assert "docker exec ohm-trade-agent" in diagnostics
     assert "docker rm" not in diagnostics
     assert "docker stop" not in diagnostics
+
+
+def test_deploy_rollback_restores_installed_remote_ops():
+    deploy = (ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
+    assert 'DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"' in deploy
+    assert 'SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"' in deploy
+    assert 'LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"' in deploy
+    assert 'LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"' in deploy
+    assert "remote-op-ohm-deploy" in deploy
+    assert "remote-op-ohm-deploy-ssh" in deploy
+    assert "remote-op-learning-reader" in deploy
+    assert "remote-op-learning-diagnostics" in deploy
+    assert 'cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' in deploy
