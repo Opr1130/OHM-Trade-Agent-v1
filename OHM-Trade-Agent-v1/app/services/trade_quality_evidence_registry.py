@@ -216,20 +216,3 @@ def record_trade_quality_evidence(
             evidence_ids=evidence_ids,
         )
     return evidence_id
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    row,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                    default=str,
-                )
-                + "\n"
-            )
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                pass
-    return evidence_id
