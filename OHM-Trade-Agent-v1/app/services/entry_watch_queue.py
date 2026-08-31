@@ -53,6 +53,10 @@ def enqueue_entry_watch(
     key = f"{symbol.upper()}:{normalized_direction}"
     with registry_lock(_lock_file()):
         rows = load_json(ENTRY_WATCH_FILE)
+        for existing_key, existing_row in list(rows.items()):
+            expires = _parse((existing_row or {}).get("expires_at")) if isinstance(existing_row, dict) else None
+            if expires is None or expires <= current:
+                rows.pop(existing_key, None)
         row = rows.get(key)
         if not isinstance(row, dict):
             row = {
