@@ -182,6 +182,7 @@ def test_cross_venue_snapshot_maps_are_immutable():
         venue_states={
             "BINANCE": VenueCvdState(
                 venue="BINANCE",
+                canonical_asset_id="bitcoin",
                 signed_base_volume=1.0,
                 signed_notional_usd=100.0,
                 gross_notional_usd=100.0,
