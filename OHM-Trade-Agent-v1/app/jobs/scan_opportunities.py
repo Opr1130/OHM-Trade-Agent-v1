@@ -1,6 +1,7 @@
 import logging
 from collections import Counter
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.opip.decision.observer import build_scan_observer
@@ -22,6 +23,8 @@ from app.scanner.reference_market_validation import validate_finalist_references
 from app.scanner.scheduled_catalysts import validate_scheduled_catalysts
 from app.scanner.short_execution_quality import short_execution_is_tradeable
 from app.scanner.universe import DEFAULT_UNIQUE_ASSET_LIMIT
+from app.services.active_trade_registry import get_active_trades
+from app.services.capital_efficiency_ranking import rank_capital_efficiency
 from app.services.canonical_episode_capture import (
     append_canonical_episode_snapshots,
     canonical_cohort_id,
@@ -39,6 +42,8 @@ from app.services.economic_quality_gate import (
     evaluate_economic_quality,
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
+from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
+from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
     get_latest_price_movement,
@@ -46,11 +51,19 @@ from app.services.price_movement_learning import (
 )
 from app.services.price_movement_notifier import send_price_movement_update
 from app.services.price_movement_radar import evaluate_price_movement
-from app.services.profit_ranking import QualifiedOpportunity, rank_profit_opportunities
+from app.services.profit_ranking import (
+    QualifiedOpportunity,
+    RankedOpportunity,
+    rank_profit_opportunities,
+)
 from app.services.recommendation_gate import qualified_alerts
 from app.services.shadow_decision_capture import capture_snapshot_decision
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
+from app.services.trade_action_gate import apply_action_gate
+from app.services.trade_feature_snapshot import build_trade_feature_snapshot
+from app.services.trade_quality_assessor import assess_trade_quality
+from app.services.trade_quality_evidence_registry import record_trade_quality_evidence
 
 
 logger = logging.getLogger(__name__)
@@ -574,7 +587,8 @@ def _send_movement_notification(movement, settings) -> tuple[bool, bool]:
     from the actual notification path are surfaced and counted.
     """
     if (
-        str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
+        bool(getattr(settings, "opip_actionable_only_alerts", False))
+        or str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
         or not _telegram_delivery_ready(settings)
     ):
         return False, False
@@ -630,6 +644,74 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
         # Shadow persistence must never block scanning or an approved alert.
         pass
     return payload
+
+
+
+def _apply_ranked_action_gates(ranked_opportunities, *, settings):
+    """Apply scarce-capital/portfolio eligibility in global rank order.
+
+    Approved candidates are added to a projected exposure list so lower-ranked
+    signals cannot independently allocate the same capital/position slots.
+    A vetoed higher-ranked candidate does not block the next-best candidate.
+    """
+    try:
+        projected_trades = list(get_active_trades())
+    except Exception as exc:
+        print(
+            "ACTION GATE unavailable; no new trade alert authorized:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return []
+
+    eligible = []
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(opportunity.snapshot.trade_direction or "LONG").upper()
+        alert["opportunity_rank"] = ranked.rank
+        alert.setdefault("profit_rank", ranked.rank)
+        alert["profit_rank_score"] = ranked.profit_ranking.total_score
+
+        gate = apply_action_gate(
+            candidate=alert,
+            plan=plan,
+            account_capital=float(settings.account_equity),
+            active_trades=projected_trades,
+        )
+        if not gate.allowed:
+            print(
+                f"ACTION GATE REJECT rank={ranked.rank} {direction} {plan.symbol}: "
+                f"{gate.reason}"
+            )
+            continue
+
+        eligible.append(ranked)
+        try:
+            remove_entry_watch(plan.symbol, direction)
+        except Exception as exc:
+            # Accepted trade remains valid; queue cleanup is operational only.
+            print(
+                f"ENTRY WATCH cleanup failed open {direction} {plan.symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        projected_trades.append(
+            SimpleNamespace(
+                symbol=plan.symbol,
+                status="active",
+                direction=direction,
+                capital=float(alert.get("recommended_capital") or 0.0),
+                margin_leverage=float(
+                    alert.get("margin_leverage")
+                    or (2.0 if direction == "SHORT" else 1.0)
+                ),
+            )
+        )
+        print(
+            f"ACTION GATE PASS rank={ranked.rank} {direction} {plan.symbol}: "
+            f"capital={float(alert.get('recommended_capital') or 0.0):.2f}"
+        )
+    return eligible
 
 
 def main():
@@ -1009,6 +1091,122 @@ def main():
             alert["margin_leverage"] = SHORT_VALIDATION_LEVERAGE
             alert["margin_venue_symbol"] = snapshot.margin_venue_symbol
 
+        if bool(getattr(settings, "opip_trade_quality_v2_enabled", False)):
+            episode_id = canonical_episode_id(
+                scan.snapshots,
+                decision_at=decision_at,
+                symbol=snapshot.symbol,
+            )
+            base_asset = str(
+                snapshot.underlying_asset
+                or alert.get("underlying_asset")
+                or snapshot.symbol
+            )
+            quote_asset = str(
+                snapshot.primary_quote_currency
+                or alert.get("primary_quote_currency")
+                or (
+                    "USDT"
+                    if str(snapshot.symbol).upper().endswith("USDT")
+                    else "USD"
+                )
+            ).upper()
+            pair = to_freqtrade_pair(base_asset, quote_asset)
+            candidate_id = build_signal_id(
+                episode_id=episode_id,
+                pair=pair,
+                decision_at=decision_at,
+                direction=direction,
+            )
+            alert["signal_id"] = candidate_id
+            alert["_lineage_episode_id"] = episode_id
+            alert["_lineage_pair"] = pair
+            alert["_lineage_base_asset"] = base_asset
+            alert["_lineage_quote_asset"] = quote_asset
+            feature_snapshot = build_trade_feature_snapshot(
+                snapshot,
+                decision_at=decision_at,
+                episode_id=episode_id,
+                candidate_id=candidate_id,
+                regime=market_regime.regime,
+            )
+            trade_quality = assess_trade_quality(
+                feature_snapshot,
+                plan,
+                min_liquidity_usd=float(settings.signal_quality_min_liquidity_usd),
+            )
+            alert["feature_snapshot_id"] = feature_snapshot.snapshot_id
+            alert["continuation_score"] = trade_quality.continuation.score
+            alert["continuation_decision"] = trade_quality.continuation.decision
+            alert["continuation_evidence_quality"] = (
+                trade_quality.continuation.evidence_quality
+            )
+            alert["entry_quality_score"] = trade_quality.entry.quality_score
+            alert["entry_quality_decision"] = trade_quality.entry.decision
+            alert["exhaustion_state"] = trade_quality.entry.exhaustion_risk
+            alert["trade_quality_actionable"] = trade_quality.actionable
+            alert["score_is_probability"] = False
+            try:
+                alert["trade_quality_evidence_id"] = record_trade_quality_evidence(
+                    feature_snapshot=feature_snapshot,
+                    assessment=trade_quality,
+                    plan=plan,
+                    candidate=alert,
+                    decision_at=decision_at,
+                    market_regime=market_regime.regime,
+                )
+            except Exception as exc:
+                print(
+                    f"TRADE QUALITY evidence capture failed open "
+                    f"{direction} {snapshot.symbol}: {type(exc).__name__}: {exc}"
+                )
+
+            if (
+                trade_quality.continuation.decision == "PASS"
+                and trade_quality.entry.decision == "WAIT"
+            ):
+                try:
+                    enqueue_entry_watch(
+                        symbol=snapshot.symbol,
+                        direction=direction,
+                        candidate_id=candidate_id,
+                        continuation_score=trade_quality.continuation.score,
+                        now=decision_at,
+                    )
+                except Exception as exc:
+                    print(
+                        f"ENTRY WATCH enqueue failed open {direction} {snapshot.symbol}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            if not trade_quality.actionable:
+                quality_reason = (
+                    f"Continuation={trade_quality.continuation.decision}/"
+                    f"{trade_quality.continuation.score} "
+                    f"Entry={trade_quality.entry.decision}/"
+                    f"{trade_quality.entry.quality_score} "
+                    f"Exhaustion={trade_quality.entry.exhaustion_risk}"
+                )
+                print(
+                    f"TRADE QUALITY MONITOR {direction} {snapshot.symbol}: "
+                    f"{quality_reason}"
+                )
+                capture_snapshot_decision(
+                    snapshot,
+                    decision="TRADE_QUALITY_MONITOR",
+                    market_regime=market_regime.regime,
+                    reason=quality_reason,
+                    source="wave9_trade_quality_gate",
+                )
+                continue
+
+            print(
+                f"TRADE QUALITY PASS {direction} {snapshot.symbol}: "
+                f"Continuation={trade_quality.continuation.score}/100 "
+                f"Entry={trade_quality.entry.quality_score}/100 "
+                f"Snapshot={feature_snapshot.snapshot_id}"
+            )
+
         target_quality = _target_quality(plan, snapshot)
         opip.record_target_quality(snapshot, target_quality)
         if not target_quality.qualified:
@@ -1066,6 +1264,12 @@ def main():
         alert["economic_qualified"] = True
         alert["economic_target_2_move_pct"] = economic.target_2_move_pct
         alert["economic_validation_net_t2"] = economic.target_2_net_profit
+        alert["economic_validation_capital"] = economic.recommended_capital
+        alert["economic_position_notional"] = getattr(
+            economic,
+            "position_notional",
+            economic.recommended_capital,
+        )
         qualified_opportunities.append(
             QualifiedOpportunity(
                 alert=alert,
@@ -1094,6 +1298,109 @@ def main():
             f"ExecutionDrag={f'{drag:.2f}%' if drag is not None else 'N/A'}"
         )
 
+    if bool(getattr(settings, "opip_global_capital_ranking_enabled", False)):
+        capital_ranked = rank_capital_efficiency(ranked_opportunities)
+        print("===== O\'PIP GLOBAL CAPITAL EFFICIENCY =====")
+        global_ranked_opportunities: list[RankedOpportunity] = []
+        global_rank = 0
+        for item in capital_ranked:
+            original = item.ranked_opportunity
+            alert = original.opportunity.alert
+            result = item.capital_efficiency
+            alert["profit_rank"] = item.original_rank
+            alert["capital_efficiency_score"] = result.total_score
+            alert["hold_proxy_hours"] = result.hold_proxy_hours
+            alert["net_return_velocity_proxy_pct_per_hour"] = (
+                result.net_return_velocity_pct_per_hour
+            )
+            alert["risk_efficiency_ratio"] = result.risk_efficiency_ratio
+            alert["capital_deployability_score"] = (
+                result.capital_deployability_score
+            )
+            alert["liquidity_capacity_status"] = result.capacity_status
+            alert["liquidity_capacity_ceiling_usd"] = (
+                result.liquidity_capacity_ceiling_usd
+            )
+            alert["liquidity_capacity_utilization_pct"] = (
+                result.capacity_utilization_pct
+            )
+            alert["liquidity_capacity_scalable_fraction"] = (
+                result.capacity_scalable_fraction
+            )
+
+            if not result.capacity_eligible:
+                ceiling_label = (
+                    f"${result.liquidity_capacity_ceiling_usd:.2f}"
+                    if result.liquidity_capacity_ceiling_usd is not None
+                    else "UNKNOWN"
+                )
+                reason = (
+                    f"liquidity capacity {result.capacity_status}; "
+                    f"required_notional=${result.required_notional_usd:.2f}; "
+                    f"ceiling={ceiling_label}"
+                )
+                print(
+                    f"CAPACITY REJECT "
+                    f"{original.opportunity.snapshot.trade_direction} "
+                    f"{result.symbol}: {reason}"
+                )
+                capture_snapshot_decision(
+                    original.opportunity.snapshot,
+                    decision="CAPACITY_REJECT",
+                    market_regime=market_regime.regime,
+                    reason=reason,
+                    source="wave9_liquidity_capacity_gate",
+                    profit_rank_score=original.profit_ranking.total_score,
+                )
+                continue
+
+            global_rank += 1
+            alert["opportunity_rank"] = global_rank
+            ceiling_label = (
+                f"${result.liquidity_capacity_ceiling_usd:.2f}"
+                if result.liquidity_capacity_ceiling_usd is not None
+                else "N/A"
+            )
+            print(
+                f"GLOBAL RANK {global_rank} "
+                f"{original.opportunity.snapshot.trade_direction} "
+                f"{result.symbol}: "
+                f"CapitalEfficiency={result.total_score:.2f} "
+                f"ProfitRank={item.original_rank} "
+                f"Deployability={result.capital_deployability_score:.2f}/15 "
+                f"Capacity={result.capacity_status} "
+                f"CapacityCeiling={ceiling_label} "
+                f"HoldProxy={result.hold_proxy_hours:.2f}h "
+                f"NetReturnVelocity={result.net_return_velocity_pct_per_hour:.4f}%/h "
+                f"RiskEfficiency={result.risk_efficiency_ratio:.4f}"
+            )
+            global_ranked_opportunities.append(
+                RankedOpportunity(
+                    rank=global_rank,
+                    opportunity=original.opportunity,
+                    profit_ranking=original.profit_ranking,
+                )
+            )
+        ranked_opportunities = global_ranked_opportunities
+
+        actionable_ranked_opportunities = _apply_ranked_action_gates(
+            ranked_opportunities,
+            settings=settings,
+        )
+        print(
+            "Actionable survivors after capital/portfolio gate:",
+            len(actionable_ranked_opportunities),
+        )
+        ranked_opportunities = actionable_ranked_opportunities
+    else:
+        # Compatibility path for legacy test/extension settings only. Real
+        # Settings default the Wave 9 global gate on.
+        for ranked in ranked_opportunities:
+            ranked.opportunity.alert["profit_rank"] = ranked.rank
+            ranked.opportunity.alert["profit_rank_score"] = (
+                ranked.profit_ranking.total_score
+            )
+
     lineage_prepared, lineage_failures = _prepare_qualified_lineage(
         ranked_opportunities,
         scan=scan,
@@ -1109,7 +1416,7 @@ def main():
         alert = opportunity.alert
         plan = opportunity.plan
         direction = opportunity.snapshot.trade_direction
-        alert["profit_rank"] = ranked.rank
+        alert["opportunity_rank"] = ranked.rank
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
         capture_snapshot_decision(

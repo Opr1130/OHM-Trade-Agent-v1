@@ -75,6 +75,72 @@ def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
         )
 
 
+
+def _run_qualified_alert_retry_fail_open(*, settings) -> None:
+    """Retry already-qualified actions after real-position protection.
+
+    This path never rescans or re-qualifies a market. It only recovers
+    operational tracking/Telegram failures for a still-live pending lifecycle.
+    """
+    bot_token = str(getattr(settings, "telegram_bot_token", "") or "")
+    chat_id = str(getattr(settings, "telegram_chat_id", "") or "")
+    if not bool(getattr(settings, "telegram_enabled", True)) or not bot_token or not chat_id:
+        return
+    try:
+        from app.services.qualified_alert_outbox import retry_qualified_alerts
+
+        delivered, pending = retry_qualified_alerts(
+            bot_token=bot_token,
+            chat_id=chat_id,
+        )
+    except Exception as exc:
+        print(
+            "O'Pip qualified alert recovery unavailable; production protection unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+    if delivered or pending:
+        print(
+            "O'Pip qualified alert recovery:",
+            f"delivered={delivered}",
+            f"pending={pending}",
+        )
+
+
+def _run_entry_watch_recheck_fail_open() -> bool:
+    """Recheck hot entry-watch candidates after real-position protection.
+
+    The recheck cannot authorize or alert a trade. It may only request an
+    immediate full opportunity scan, which reruns every qualification,
+    intelligence, ranking, capital and notification gate.
+    """
+    try:
+        from app.services.entry_watch_recheck import recheck_due_entry_watch
+
+        summary = recheck_due_entry_watch()
+    except Exception as exc:
+        print(
+            "O'Pip entry-watch recheck unavailable; normal scan cadence retained:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+    if summary.due or summary.failures:
+        print("O'Pip Entry Watch Recheck")
+        print("Due:", summary.due)
+        print("Checked:", summary.checked)
+        print("Ready:", len(summary.ready_symbols))
+        print("Deferred:", summary.deferred)
+        for failure in summary.failures[:3]:
+            print("ENTRY WATCH FAILURE:", failure)
+    if summary.ready_symbols:
+        print(
+            "Entry-watch candidate(s) became entry-valid; requesting full qualification scan:",
+            ", ".join(summary.ready_symbols),
+        )
+    return summary.full_scan_required
+
+
 def _run_paper_monitor_fail_open() -> None:
     """Run paper simulation only after live protection has completed."""
     try:
@@ -298,13 +364,25 @@ def _run_cycle_once() -> None:
     print("Quiet hours:", decision.quiet_hours)
     print("Reason:", decision.reason)
 
+    # Active positions always receive deterministic protection, including
+    # MAINTENANCE and overnight quiet hours. Maintenance disables discovery and
+    # lifecycle expansion; it must not blind O'Pip to risk on verified holdings.
+    monitor_active_main()
+
     if decision.effective_mode == "MAINTENANCE":
-        print("Maintenance mode: all trading workflows skipped.")
+        print(
+            "Maintenance mode: discovery/tracking workflows skipped; "
+            "verified-position protection completed."
+        )
         return
 
-    # Active positions always receive deterministic protection outside
-    # MAINTENANCE, including overnight quiet hours.
-    monitor_active_main()
+    # Recover previously qualified but operationally undelivered actions only
+    # after existing positions have received their protection pass.
+    _run_qualified_alert_retry_fail_open(settings=get_settings())
+
+    # Fast entry-watch is still non-authoritative: it can only accelerate a
+    # complete SEARCH-mode qualification pass when entry geometry turns valid.
+    entry_watch_ready = _run_entry_watch_recheck_fail_open()
 
     # Pending opportunities are routine discovery/lifecycle noise while the
     # operator is asleep. They resume after 05:00 ET; active risk protection
@@ -336,9 +414,15 @@ def _run_cycle_once() -> None:
     if decision.effective_mode != "SEARCH":
         print("Broad opportunity scan skipped: effective mode is", decision.effective_mode)
         return
-    if not search_due(decision):
+    normal_search_due = search_due(decision)
+    if not normal_search_due and not entry_watch_ready:
         print("Broad opportunity scan skipped: search cadence not due.")
         return
+    if entry_watch_ready and not normal_search_due:
+        print(
+            "Broad opportunity scan accelerated by entry-watch readiness; "
+            "full qualification remains mandatory."
+        )
 
     # Optional candidate evidence is processed only after active-trade and
     # pending-setup protection has completed, and only immediately before a

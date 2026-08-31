@@ -5,7 +5,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from app.exchanges.kraken_identity import balance_quantity_for_asset, canonicalize_pair
+from app.exchanges.kraken_identity import (
+    balance_quantity_for_asset,
+    canonicalize_pair,
+    split_canonical_pair,
+)
 from app.exchanges.kraken_private import KrakenPrivateAPIError, KrakenPrivateClient
 from app.services.active_trade_registry import ActiveTrade, close_trade, get_active_trades
 from app.services.execution_learning_registry import record_execution_event
@@ -71,11 +75,8 @@ def _canonical_pair(pair: str) -> str:
 
 
 def _base_asset(symbol: str) -> str | None:
-    value = _canonical_pair(symbol)
-    for quote in ("USDT", "USD", "EUR", "GBP", "CAD", "AUD", "BTC", "ETH"):
-        if value.endswith(quote) and len(value) > len(quote):
-            return value[: -len(quote)]
-    return None
+    identity = split_canonical_pair(symbol)
+    return identity[0] if identity is not None else None
 
 
 def _matching_fills(

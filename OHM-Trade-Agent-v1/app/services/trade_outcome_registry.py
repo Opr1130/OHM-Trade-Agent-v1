@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,9 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 OUTCOME_FILE = Path("/app/data/trade_outcomes.json")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+FORECAST_HORIZON_VERSION = "capital-efficiency-hold-proxy-v1"
+DEFAULT_FORECAST_HORIZON_HOURS = 24.0
 
 
 def registry_lock_file() -> Path:
@@ -70,6 +73,19 @@ def _find_key(
     return None
 
 
+def _forecast_horizon_hours(candidate: dict[str, Any]) -> float:
+    raw = candidate.get("forecast_horizon_hours")
+    if raw is None:
+        raw = candidate.get("hold_proxy_hours")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_FORECAST_HORIZON_HOURS
+    if not math.isfinite(value) or value <= 0:
+        value = DEFAULT_FORECAST_HORIZON_HOURS
+    return max(1.0, min(DEFAULT_FORECAST_HORIZON_HOURS, value))
+
+
 def record_recommendation(
     *,
     trade_id: str | None,
@@ -86,10 +102,13 @@ def record_recommendation(
         if existing is not None:
             return existing
         direction = (candidate.get("direction") or getattr(plan, "direction", "LONG") or "LONG").upper()
+        forecast_horizon_hours = _forecast_horizon_hours(candidate)
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "trade_id": trade_id or "",
             "record_key": key,
+            "signal_id": candidate.get("signal_id"),
+            "journey_id": candidate.get("journey_id"),
             "symbol": symbol,
             "direction": direction,
             "margin_leverage": float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0)),
@@ -105,6 +124,31 @@ def record_recommendation(
             "target_attainability_score": candidate.get("target_attainability_score"),
             "profit_rank": candidate.get("profit_rank"),
             "profit_rank_score": candidate.get("profit_rank_score"),
+            "opportunity_rank": candidate.get("opportunity_rank"),
+            "capital_efficiency_score": candidate.get("capital_efficiency_score"),
+            "hold_proxy_hours": candidate.get("hold_proxy_hours"),
+            "net_return_velocity_proxy_pct_per_hour": candidate.get(
+                "net_return_velocity_proxy_pct_per_hour"
+            ),
+            "risk_efficiency_ratio": candidate.get("risk_efficiency_ratio"),
+            "feature_snapshot_id": candidate.get("feature_snapshot_id"),
+            "trade_quality_evidence_id": candidate.get("trade_quality_evidence_id"),
+            "continuation_score": candidate.get("continuation_score"),
+            "continuation_decision": candidate.get("continuation_decision"),
+            "continuation_evidence_quality": candidate.get(
+                "continuation_evidence_quality"
+            ),
+            "entry_quality_score": candidate.get("entry_quality_score"),
+            "entry_quality_decision": candidate.get("entry_quality_decision"),
+            "exhaustion_state": candidate.get("exhaustion_state"),
+            "trade_quality_actionable": candidate.get("trade_quality_actionable"),
+            "quality_score_is_probability": False,
+            "wave9_extension_version": 1,
+            "outcome_event_definition": (
+                "TARGET_1_BEFORE_STOP_WITHIN_HORIZON"
+            ),
+            "forecast_horizon_hours": forecast_horizon_hours,
+            "forecast_horizon_version": FORECAST_HORIZON_VERSION,
             "planned_entry_low": plan.entry_low,
             "planned_entry_high": plan.entry_high,
             "planned_chase_limit": plan.chase_limit,
@@ -234,6 +278,23 @@ def update_active_observation(
                 "terminal_status": None,
             }
         item = data[key]
+        if item.get("terminal_status"):
+            return item
+
+        observation_dt = _parse_time(observed_at)
+        entered_dt = _parse_time(item.get("entered_at") or trade.opened_at)
+        if (
+            observation_dt is not None
+            and entered_dt is not None
+            and observation_dt < entered_dt
+        ):
+            warnings = item.setdefault("observation_warnings", [])
+            warning = "Pre-entry observation ignored for outcome labels"
+            if warning not in warnings:
+                warnings.append(warning)
+            _save_raw(data)
+            return item
+
         direction = str(item.get("direction") or trade.direction or "LONG").upper()
         item["direction"] = direction
         item["entered_trade"] = True
@@ -340,10 +401,43 @@ def get_outcomes() -> list[dict[str, Any]]:
         return list(_load_raw().values())
 
 
+def _valid_forecast_horizon_hours(item: dict[str, Any]) -> float | None:
+    try:
+        horizon_hours = float(item.get("forecast_horizon_hours"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(horizon_hours)
+        or horizon_hours < 1.0
+        or horizon_hours > DEFAULT_FORECAST_HORIZON_HOURS
+    ):
+        return None
+    return horizon_hours
+
+
+def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
+    target_at = _parse_time(item.get(f"target_{target_number}_first_observed_at"))
+    entered_at = _parse_time(item.get("entered_at"))
+    horizon_hours = _valid_forecast_horizon_hours(item)
+    if target_at is None or entered_at is None or horizon_hours is None:
+        return False
+    horizon_end = entered_at + timedelta(hours=horizon_hours)
+    if target_at < entered_at or target_at > horizon_end:
+        return False
+    stop_at = _parse_time(item.get("stop_first_observed_at"))
+    return stop_at is None or target_at < stop_at
+
+
 def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
     outcomes = get_outcomes()
     resolved_entered = [
-        item for item in outcomes if item.get("entered_trade") and item.get("terminal_status")
+        item
+        for item in outcomes
+        if (
+            item.get("entered_trade")
+            and item.get("terminal_status")
+            and _valid_forecast_horizon_hours(item) is not None
+        )
     ]
     if len(resolved_entered) < min_resolved_entered:
         return {
@@ -355,6 +449,10 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
 
     confidence_bins: dict[str, dict[str, int]] = {}
     rank_bins: dict[str, dict[str, int]] = {}
+    opportunity_rank_bins: dict[str, dict[str, int]] = {}
+    continuation_bins: dict[str, dict[str, int]] = {}
+    entry_quality_bins: dict[str, dict[str, int]] = {}
+    capital_efficiency_bins: dict[str, dict[str, int]] = {}
     direction_bins: dict[str, dict[str, int]] = {}
     for item in resolved_entered:
         confidence = item.get("chief_confidence")
@@ -363,16 +461,42 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
             label = f"{low:02d}-{min(low + 9, 100):02d}"
             bucket = confidence_bins.setdefault(label, {"count": 0, "t2_observed": 0})
             bucket["count"] += 1
-            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
         rank = item.get("profit_rank")
         if isinstance(rank, int):
             bucket = rank_bins.setdefault(str(rank), {"count": 0, "t2_observed": 0})
             bucket["count"] += 1
-            bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
+        opportunity_rank = item.get("opportunity_rank")
+        if isinstance(opportunity_rank, int):
+            bucket = opportunity_rank_bins.setdefault(
+                str(opportunity_rank),
+                {"count": 0, "t1_observed": 0, "t2_observed": 0},
+            )
+            bucket["count"] += 1
+            bucket["t1_observed"] += int(_target_before_stop(item, 1))
+            bucket["t2_observed"] += int(_target_before_stop(item, 2))
+
+        for source_field, buckets in (
+            ("continuation_score", continuation_bins),
+            ("entry_quality_score", entry_quality_bins),
+            ("capital_efficiency_score", capital_efficiency_bins),
+        ):
+            value = item.get(source_field)
+            if isinstance(value, (int, float)):
+                low = int(float(value) // 10) * 10
+                label = f"{low:02d}-{min(low + 9, 100):02d}"
+                bucket = buckets.setdefault(
+                    label,
+                    {"count": 0, "t1_observed": 0, "t2_observed": 0},
+                )
+                bucket["count"] += 1
+                bucket["t1_observed"] += int(_target_before_stop(item, 1))
+                bucket["t2_observed"] += int(_target_before_stop(item, 2))
         direction = str(item.get("direction") or "LONG").upper()
         bucket = direction_bins.setdefault(direction, {"count": 0, "t2_observed": 0})
         bucket["count"] += 1
-        bucket["t2_observed"] += int(bool(item.get("target_2_observed")))
+        bucket["t2_observed"] += int(_target_before_stop(item, 2))
 
     return {
         "status": "AVAILABLE",
@@ -380,5 +504,10 @@ def calibration_summary(min_resolved_entered: int = 30) -> dict[str, Any]:
         "confidence_is_probability": False,
         "confidence_bins": confidence_bins,
         "profit_rank_bins": rank_bins,
+        "opportunity_rank_bins": opportunity_rank_bins,
+        "continuation_score_bins": continuation_bins,
+        "entry_quality_score_bins": entry_quality_bins,
+        "capital_efficiency_score_bins": capital_efficiency_bins,
+        "outcome_event_definition": "TARGET_1_BEFORE_STOP_WITHIN_HORIZON",
         "direction_bins": direction_bins,
     }

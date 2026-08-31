@@ -89,9 +89,24 @@ def test_early_watch_cadence_runs_once_then_waits(tmp_path, monkeypatch):
     assert calls == [True]
 
 
-def test_early_watch_does_not_create_new_quiet_hour_alert_path(monkeypatch):
+def test_early_watch_does_not_create_new_quiet_hour_alert_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_cycle, "EARLY_WATCH_STATE_FILE", tmp_path / "early_watch_scheduler_state.json")
+    monkeypatch.setattr(run_cycle, "EARLY_WATCH_LOCK_FILE", tmp_path / ".early_watch_scheduler.lock")
     calls = []
     monkeypatch.setattr(run_cycle, "scan_movers_main", lambda: calls.append(True))
+
+    # Quiet hours must not create an overnight blind spot: the first call is
+    # cadence-due and must still run Early Watch.
+    run_cycle._run_early_watch_if_due(
+        settings=SimpleNamespace(signal_quality_scan_interval_seconds=600),
+        quiet_hours=True,
+    )
+    assert calls == [True]
+
+    # A rapid repeat invocation within the cadence window must not create a
+    # second, duplicate scan path. This must hold deterministically on a
+    # fresh checkout, not merely when another test happened to run first.
+    calls.clear()
     run_cycle._run_early_watch_if_due(
         settings=SimpleNamespace(signal_quality_scan_interval_seconds=600),
         quiet_hours=True,

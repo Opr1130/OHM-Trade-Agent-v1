@@ -54,12 +54,36 @@ def _require_finite_trade_geometry(trade: ActiveTrade) -> None:
         raise ValueError(f"{trade.symbol}: active trade stop/target geometry is invalid for {direction}")
 
 
+def _price_ladder_action(
+    trade: ActiveTrade,
+    *,
+    direction: str,
+    current_price: float,
+) -> tuple[str, str | None]:
+    if direction == "SHORT":
+        if current_price >= trade.stop_price:
+            return "EXIT_NOW", "Short stop price breached"
+        if current_price <= trade.target_2:
+            return "TAKE_PROFIT", "Short Target 2 reached"
+        if current_price <= trade.target_1:
+            return "TAKE_PROFIT", "Short Target 1 reached"
+        return "HOLD", None
+
+    if current_price <= trade.stop_price:
+        return "EXIT_NOW", "Stop price breached"
+    if current_price >= trade.target_2:
+        return "TAKE_PROFIT", "Target 2 reached"
+    if current_price >= trade.target_1:
+        return "TAKE_PROFIT", "Target 1 reached"
+    return "HOLD", None
+
+
 def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     _require_finite_trade_geometry(trade)
     client = KrakenClient()
     candles = client.get_ohlc(trade.symbol, interval=60)
-    if len(candles) < 36:
-        raise ValueError(f"{trade.symbol}: insufficient OHLC history for active-trade monitoring")
+    if not candles:
+        raise ValueError(f"{trade.symbol}: no OHLC history for active-trade monitoring")
 
     closes = [float(c.close) for c in candles]
     volumes = [float(c.volume) for c in candles]
@@ -69,6 +93,59 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
         raise ValueError(f"{trade.symbol}: OHLC volume data must be finite and non-negative")
 
     current_price = closes[-1]
+    direction = trade.direction.upper()
+
+    # New listings and recently activated markets may not yet have enough
+    # completed 1H candles for EMA/MACD/RSI. Stop/target geometry is still
+    # protection-critical, so fail soft to price-only protection instead of
+    # dropping the position from monitoring entirely.
+    if len(candles) < 36:
+        raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
+        unrealized_pct = -raw_move if direction == "SHORT" else raw_move
+        reasons: list[str] = [
+            f"Limited OHLC history ({len(candles)} candles); technical deterioration checks unavailable"
+        ]
+        action, ladder_reason = _price_ladder_action(
+            trade,
+            direction=direction,
+            current_price=current_price,
+        )
+        if ladder_reason:
+            reasons.insert(0, ladder_reason)
+
+        pnl = None
+        if trade.capital is not None and trade.capital > 0:
+            if not math.isfinite(float(trade.capital)):
+                raise ValueError(f"{trade.symbol}: capital must be finite")
+            pnl = calculate_fee_aware_pnl(
+                direction=direction,
+                entry_price=trade.entry_price,
+                current_or_exit_price=current_price,
+                capital=trade.capital,
+                leverage=trade.margin_leverage,
+                actual_entry_fee=trade.actual_entry_fee,
+                financing_fee=trade.financing_fee,
+            )
+            if pnl.gross_pnl > 0 and pnl.net_pnl <= 0:
+                reasons.append(
+                    "Gross price move is positive but estimated net P/L remains "
+                    "negative after trading costs"
+                )
+
+        return TradeMonitorResult(
+            symbol=trade.symbol,
+            action=action,
+            current_price=round(current_price, 8),
+            unrealized_pct=round(unrealized_pct, 2),
+            reasons=reasons,
+            gross_pnl=(pnl.gross_pnl if pnl else None),
+            estimated_total_costs=(pnl.total_costs if pnl else None),
+            net_pnl=(pnl.net_pnl if pnl else None),
+            net_pnl_pct=(pnl.net_pnl_pct_on_capital if pnl else None),
+            break_even_move_pct=(pnl.break_even_move_pct if pnl else None),
+            fee_source=(pnl.fee_source if pnl else None),
+        )
+
     # Current price is live monitoring evidence; technical corroboration is
     # intentionally based on completed bars so a partial 1H candle cannot
     # repaint EMA/MACD/RSI state while the monitor is running.
@@ -78,24 +155,18 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
     rsi_value = rsi(completed_closes, 14)
     macd_line, macd_signal, _ = macd(completed_closes)
     vol_ratio = volume_ratio(completed_volumes, 20)
-    direction = trade.direction.upper()
-
     raw_move = (current_price - trade.entry_price) / trade.entry_price * 100
     unrealized_pct = -raw_move if direction == "SHORT" else raw_move
     reasons: list[str] = []
-    action = "HOLD"
+    action, ladder_reason = _price_ladder_action(
+        trade,
+        direction=direction,
+        current_price=current_price,
+    )
+    if ladder_reason:
+        reasons.append(ladder_reason)
 
     if direction == "SHORT":
-        if current_price >= trade.stop_price:
-            action = "EXIT_NOW"
-            reasons.append("Short stop price breached")
-        elif current_price <= trade.target_2:
-            action = "TAKE_PROFIT"
-            reasons.append("Short Target 2 reached")
-        elif current_price <= trade.target_1:
-            action = "TAKE_PROFIT"
-            reasons.append("Short Target 1 reached")
-
         weak_signals: list[str] = []
         if current_price > ema20_value:
             weak_signals.append("Price reclaimed EMA20 against short")
@@ -115,16 +186,6 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
             if action in {"HOLD", "WARNING"}:
                 action = "EXIT_NOW"
     else:
-        if current_price <= trade.stop_price:
-            action = "EXIT_NOW"
-            reasons.append("Stop price breached")
-        elif current_price >= trade.target_2:
-            action = "TAKE_PROFIT"
-            reasons.append("Target 2 reached")
-        elif current_price >= trade.target_1:
-            action = "TAKE_PROFIT"
-            reasons.append("Target 1 reached")
-
         weak_signals = []
         if current_price < ema20_value:
             weak_signals.append("Price lost EMA20")

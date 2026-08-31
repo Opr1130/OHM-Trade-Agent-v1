@@ -129,7 +129,8 @@ def get_pending_setup_record(trade_id: str) -> dict | None:
 def terminalize_pending_setup(trade_id: str, status: str) -> bool:
     if status not in {
         "skipped", "invalidated", "too_extended", "send_failed",
-        "portfolio_risk_rejected", "tracking_failed", "expired",
+        "portfolio_risk_rejected", "tracking_failed", "tracking_disabled",
+        "delivery_malformed", "expired",
     }:
         raise ValueError(f"Unsupported terminal status: {status}")
     try:
@@ -194,7 +195,13 @@ def terminalize_pending_setup(trade_id: str, status: str) -> bool:
             reason_code=status.upper(),
             details={"trade_id": trade_id},
         )
-        if status in {"tracking_failed", "send_failed", "portfolio_risk_rejected"}:
+        if status in {
+            "tracking_failed",
+            "tracking_disabled",
+            "delivery_malformed",
+            "send_failed",
+            "portfolio_risk_rejected",
+        }:
             print(
                 f"ALERT SUPPRESSED Symbol={traced_symbol or 'UNKNOWN'} "
                 f"Reason={status.upper()} TradeId={trade_id}"

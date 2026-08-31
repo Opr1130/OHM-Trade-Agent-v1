@@ -1,15 +1,18 @@
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
 from app.services.asset_display_identity import display_asset_text, display_market_label
-from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
     reconciliation_enabled,
     reconciliation_mode,
 )
-from app.services.notification_policy import record_emitted, should_emit
+from app.services.notification_policy import (
+    confirm_emit,
+    release_emit,
+    reserve_emit,
+    should_emit,
+)
 from app.services.order_intent_registry import (
     OrderIntent,
     get_order_intent,
@@ -19,21 +22,66 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
+    get_pending_setup_record,
     terminalize_pending_setup,
 )
 from app.services.price_movement_radar import attach_actionable_plan
+from app.services.qualified_alert_outbox import queue_qualified_alert
+from app.services.qualified_trade_tracking import (
+    ReconciliationIdentityMismatch,
+    ReconciliationTrackingDisabled,
+    register_reconciliation_intent,
+)
 from app.services.registry_io import RegistryIOError, load_json, registry_lock, save_json_atomic
 from app.services.telegram_delivery import (
+    accepted_delivery_message_id,
     record_telegram_not_eligible,
     record_telegram_suppression,
     send_tracked_telegram,
 )
-from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
 
 STATE_FILE = Path("/app/data/alert_state.json")
 STATE_LOCK_FILE = STATE_FILE.parent / ".alert_state.lock"
+
+
+def _settle_reservation(
+    *,
+    policy_identity: str,
+    fingerprint: str,
+    reservation_token: str,
+    delivered: bool,
+) -> None:
+    """Close a notification reservation exactly once, whatever happened.
+
+    A delivered message is always confirmed so a later attempt cannot resend
+    it. Every non-delivered outcome releases the reservation immediately so
+    recovery does not have to wait for the lease TTL. Settlement failure is
+    audited but never propagates: the caller has already decided the delivery
+    outcome.
+    """
+    try:
+        if delivered:
+            confirm_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                fingerprint=fingerprint,
+                reservation_token=reservation_token,
+            )
+        else:
+            release_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                reservation_token=reservation_token,
+            )
+    except Exception as exc:
+        print(
+            "O'Pip notification reservation settlement failed:",
+            f"identity={policy_identity}",
+            f"delivered={delivered}",
+            f"{type(exc).__name__}: {exc}",
+        )
 
 
 def _pretty_entry_style(value: str) -> str:
@@ -103,12 +151,48 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         quote_note = "Quote: USDT (USDT availability required; no automatic USD conversion)\n"
 
     ranking_note = ""
+    if candidate.get("opportunity_rank") is not None:
+        ranking_note += f"Global Opportunity Rank: #{candidate['opportunity_rank']}\n"
+    if candidate.get("capital_efficiency_score") is not None:
+        ranking_note += (
+            f"Capital Efficiency Score: "
+            f"{float(candidate['capital_efficiency_score']):.2f}/100\n"
+        )
     if candidate.get("profit_rank") is not None:
-        ranking_note += f"Opportunity Rank: #{candidate['profit_rank']}\n"
+        if candidate.get("opportunity_rank") is None:
+            ranking_note += f"Opportunity Rank: #{candidate['profit_rank']}\n"
+        else:
+            ranking_note += f"Quality Rank: #{candidate['profit_rank']}\n"
     if candidate.get("profit_rank_score") is not None:
-        ranking_note += f"Profit Rank Score: {float(candidate['profit_rank_score']):.2f}/100\n"
+        if candidate.get("opportunity_rank") is None:
+            ranking_note += (
+                f"Profit Rank Score: "
+                f"{float(candidate['profit_rank_score']):.2f}/100\n"
+            )
+        else:
+            ranking_note += (
+                f"Base Quality Score: "
+                f"{float(candidate['profit_rank_score']):.2f}/100\n"
+            )
+    if candidate.get("hold_proxy_hours") is not None:
+        ranking_note += (
+            f"Hold Proxy: ~{float(candidate['hold_proxy_hours']):.1f}h "
+            "(deterministic, not forecast probability)\n"
+        )
 
     intelligence_note = ""
+    if candidate.get("continuation_score") is not None:
+        intelligence_note += (
+            f"Continuation: {int(candidate['continuation_score'])}/100 "
+            f"({candidate.get('continuation_decision', 'UNKNOWN')})\n"
+        )
+    if candidate.get("entry_quality_score") is not None:
+        intelligence_note += (
+            f"Entry Quality: {int(candidate['entry_quality_score'])}/100 "
+            f"({candidate.get('entry_quality_decision', 'UNKNOWN')})\n"
+        )
+    if candidate.get("exhaustion_state") is not None:
+        intelligence_note += f"Exhaustion: {candidate['exhaustion_state']}\n"
     if candidate.get("recommended_capital") is not None:
         intelligence_note += f"Recommended Capital: ${float(candidate['recommended_capital']):,.2f}\n"
     if candidate.get("recommended_risk_dollars") is not None:
@@ -176,7 +260,7 @@ def format_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan, summary: s
         f"Direction: {direction}\n"
         f"{quote_note}{margin_note}{ranking_note}{intelligence_note}{movement_note}{fill_tracking_note}"
         f"Risk: {plan.risk_level.upper()}\n"
-        f"AI Confidence: {candidate.get('confidence', 0)}%\n"
+        f"Setup Score: {int(candidate.get('confidence', 0))}/100 (not probability)\n"
         f"Technical Decision: {str(candidate.get('decision', '')).upper()}\n\n"
         f"📍 ENTRY PLAN\nEntry Zone: {plan.entry_low} - {plan.entry_high}\n"
         f"{chase_label}: {plan.chase_limit}\nStop: {plan.stop_price}\n\n"
@@ -196,27 +280,18 @@ def should_send_trade_plan(candidate: dict[str, Any], plan: EntryExitPlan) -> bo
     try:
         state = _load_state()
     except (OSError, TimeoutError, RegistryIOError):
-        # Opportunity notifications fail closed when dedup state is unhealthy.
-        return False
+        # This file is only a convenience dedup cache. Qualified actionable
+        # trades must not disappear because it is unreadable; the atomic
+        # notification policy and delivery ledger remain authoritative.
+        state = {}
     if state.get(plan.symbol) == current_key:
         return False
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     return should_emit(
         identity=f"{direction}:{plan.symbol}",
-        event_type="OPPORTUNITY",
+        event_type="ACTIONABLE_TRADE",
         fingerprint=current_key,
     )
-
-
-def _reconciliation_limit_price(
-    plan: EntryExitPlan,
-    *,
-    action: str,
-    direction: str,
-) -> float:
-    if action == "PLACE_LIMIT":
-        return plan.entry_high if direction == "SHORT" else plan.entry_low
-    return plan.entry_low if direction == "SHORT" else plan.entry_high
 
 
 def _register_reconciliation_intent(
@@ -228,72 +303,17 @@ def _register_reconciliation_intent(
     leverage: float,
     trade_id: str,
 ) -> None:
-    """Create the exchange-observation identity for a production alert."""
-    if candidate.get("economic_qualified") is not True:
-        return
-    if not reconciliation_enabled() or reconciliation_mode() != "apply":
-        raise RuntimeError("Kraken reconciliation apply mode is required")
-
-    capital = candidate.get("recommended_capital")
-    if not isinstance(capital, (int, float)) or float(capital) <= 0:
-        raise ValueError("recommended capital is required for Kraken fill tracking")
-
-    limit_price = _reconciliation_limit_price(
-        plan,
-        action=action,
-        direction=direction,
-    )
-    existing = get_order_intent(trade_id)
-    if existing is not None:
-        same_identity = (
-            existing.status == "LIMIT_PLACED"
-            and existing.symbol == plan.symbol.upper()
-            and existing.direction == direction
-            and existing.source == "ohm_actionable_signal"
-            and abs(existing.limit_price - limit_price) <= 1e-9
-            and abs(existing.capital - float(capital)) <= 1e-9
-        )
-        if same_identity:
-            return
-        raise ValueError(f"reconciliation intent {trade_id} does not match this alert")
-
-    register_order_intent(
-        OrderIntent(
-            symbol=plan.symbol,
-            direction=direction,
-            limit_price=limit_price,
-            capital=float(capital),
-            stop_price=plan.stop_price,
-            target_1=plan.target_1,
-            target_2=plan.target_2,
-            margin_leverage=leverage,
-            risk_level=plan.risk_level,
-            entry_action=action,
-            source="ohm_actionable_signal",
-            trade_id=trade_id,
-        )
-    )
-
-
-def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
-    if candidate.get("economic_qualified") is not True:
-        return True
-
-    settings = get_settings()
-    intelligence = evaluate_trade_decision(
+    """Compatibility wrapper around the canonical tracking boundary."""
+    register_reconciliation_intent(
         candidate=candidate,
         plan=plan,
-        account_capital=settings.account_equity,
-        active_trades=get_active_trades(),
+        action=action,
+        direction=direction,
+        leverage=leverage,
+        trade_id=trade_id,
+        reconciliation_is_enabled=reconciliation_enabled(),
+        reconciliation_mode_value=reconciliation_mode(),
     )
-    candidate["recommended_capital"] = intelligence.allocation.recommended_capital
-    candidate["recommended_risk_dollars"] = intelligence.allocation.risk_dollars
-    candidate["projected_net_edge_pct"] = intelligence.projected_net_edge_pct
-    candidate["calibration_status"] = intelligence.calibration_status
-    candidate["calibration_multiplier"] = intelligence.calibration_multiplier
-    candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
-    candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
-    return intelligence.allowed
 
 
 def send_trade_plan(
@@ -333,7 +353,21 @@ def send_trade_plan(
             trade_id=candidate.get("trade_id"),
         )
         return False
-    if not _apply_intelligence(candidate, plan):
+    if candidate.get("action_gate_evaluated") is not True:
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="ACTION_GATE_NOT_EVALUATED",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
+        return False
+    action_allowed = candidate.get("action_gate_allowed") is True
+    if not action_allowed:
         record_telegram_not_eligible(
             identity=identity,
             alert_family="QUALIFIED_OPPORTUNITY",
@@ -384,6 +418,15 @@ def send_trade_plan(
     if trade_id:
         candidate["trade_id"] = trade_id
 
+    record_recommendation(
+        trade_id=trade_id,
+        candidate=candidate,
+        plan=plan,
+        action=action,
+    )
+    key = _alert_state_key(candidate, plan)
+    identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
+
     if candidate.get("economic_qualified") is True:
         if not trade_id:
             return False
@@ -396,41 +439,277 @@ def send_trade_plan(
                 leverage=leverage,
                 trade_id=trade_id,
             )
-        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
-            terminalize_pending_setup(trade_id, "tracking_failed")
+        except ReconciliationTrackingDisabled:
+            transitioned = False
+            lifecycle_after_status = "waiting"
+            try:
+                transitioned = terminalize_pending_setup(
+                    trade_id,
+                    "tracking_disabled",
+                )
+                lifecycle_after = get_pending_setup_record(trade_id)
+                lifecycle_after_status = str(
+                    (lifecycle_after or {}).get("status") or ""
+                )
+            except Exception as transition_exc:
+                print(
+                    "O'Pip tracking-disabled terminalization failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(transition_exc).__name__}: {transition_exc}",
+                )
+
+            terminal = bool(transitioned) or lifecycle_after_status != "waiting"
+            if not terminal:
+                # The lifecycle is still waiting, so a durable recovery record
+                # must exist before this decision is dropped.
+                try:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
+                    )
+                except Exception as queue_exc:
+                    print(
+                        "O'Pip terminalization-pending queueing failed:",
+                        f"trade_id={trade_id}",
+                        f"{type(queue_exc).__name__}: {queue_exc}",
+                    )
+
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                reason=(
+                    "RECONCILIATION_NOT_APPLY_TERMINAL"
+                    if terminal
+                    else "RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING"
+                ),
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return False
+        except ReconciliationIdentityMismatch as exc:
+            transitioned = False
+            lifecycle_after_status = "waiting"
+            try:
+                transitioned = terminalize_pending_setup(
+                    trade_id,
+                    "tracking_failed",
+                )
+                lifecycle_after = get_pending_setup_record(trade_id)
+                lifecycle_after_status = str(
+                    (lifecycle_after or {}).get("status") or ""
+                )
+            except Exception as transition_exc:
+                print(
+                    "O'Pip reconciliation-mismatch terminalization failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(transition_exc).__name__}: {transition_exc}",
+                )
+
+            if not transitioned and lifecycle_after_status == "waiting":
+                try:
+                    queue_qualified_alert(
+                        trade_id=trade_id,
+                        message=message,
+                        candidate=candidate,
+                        plan=plan,
+                        action=action,
+                        direction=direction,
+                        identity=identity,
+                        fingerprint=key,
+                        reason=(
+                            "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
+                            f"{type(exc).__name__}"
+                        ),
+                    )
+                except Exception as queue_exc:
+                    print(
+                        "O'Pip terminalization-pending queueing failed:",
+                        f"trade_id={trade_id}",
+                        f"{type(queue_exc).__name__}: {queue_exc}",
+                    )
+
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                reason=(
+                    "TRACKING_IDENTITY_MISMATCH_TERMINAL"
+                    if transitioned or lifecycle_after_status != "waiting"
+                    else "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING"
+                ),
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return False
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            try:
+                queue_qualified_alert(
+                    trade_id=trade_id,
+                    message=message,
+                    candidate=candidate,
+                    plan=plan,
+                    action=action,
+                    direction=direction,
+                    identity=identity,
+                    fingerprint=key,
+                    reason=f"TRACKING_PENDING:{type(exc).__name__}",
+                )
+            except Exception as queue_exc:
+                print(
+                    "O'Pip qualified alert queueing failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(queue_exc).__name__}: {queue_exc}",
+                )
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action,
+                    fingerprint=key,
+                    reason="TRACKING_PENDING_UNQUEUEABLE",
+                    symbol=plan.symbol,
+                    journey_id=candidate.get("journey_id"),
+                    signal_id=candidate.get("signal_id"),
+                    trade_id=trade_id,
+                )
+            # Tracking failure is operational/transport state, not rejection.
             return False
 
-    record_recommendation(trade_id=trade_id, candidate=candidate, plan=plan, action=action)
-    key = _alert_state_key(candidate, plan)
-    identity = f"QUALIFIED_OPPORTUNITY:{trade_id or plan.symbol}"
-    delivery = send_tracked_telegram(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        message=message,
+    accepted_message_id = accepted_delivery_message_id(
         identity=identity,
-        alert_family="QUALIFIED_OPPORTUNITY",
         event_type=action,
         fingerprint=key,
-        symbol=plan.symbol,
-        journey_id=candidate.get("journey_id"),
-        signal_id=candidate.get("signal_id"),
-        trade_id=trade_id,
     )
-    if delivery.delivered:
+    if accepted_message_id is not None:
         try:
             with registry_lock(STATE_LOCK_FILE):
                 state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
                 state[plan.symbol] = key
                 save_json_atomic(STATE_FILE, state)
         except (OSError, TimeoutError, RegistryIOError):
-            # The delivery ledger is canonical for transport outcome; a failed
-            # convenience dedup write must not erase a successful Telegram send.
             pass
-        record_emitted(
-            identity=f"{direction}:{plan.symbol}",
-            event_type="OPPORTUNITY",
+        return True
+
+    policy_identity = f"{direction}:{plan.symbol}"
+    reservation = reserve_emit(
+        identity=policy_identity,
+        event_type="ACTIONABLE_TRADE",
+        fingerprint=key,
+    )
+    if reservation is None:
+        record_telegram_suppression(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
             fingerprint=key,
+            reason="ATOMIC_NOTIFICATION_POLICY",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=trade_id,
         )
-    elif trade_id:
-        terminalize_pending_setup(trade_id, "send_failed")
-    return delivery.delivered
+        return False
+
+    delivered = False
+    settled = False
+    delivery_reason = "DELIVERY_PENDING"
+    try:
+        try:
+            delivery = send_tracked_telegram(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                message=message,
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
+            delivered = bool(getattr(delivery, "delivered", False))
+        except Exception as send_exc:
+            # A raised delivery attempt is not an accepted send. Release the
+            # reservation now so recovery does not wait for the lease TTL.
+            delivery_reason = f"DELIVERY_EXCEPTION:{type(send_exc).__name__}"
+            print(
+                "O'Pip qualified alert delivery raised:",
+                f"trade_id={trade_id}",
+                f"{type(send_exc).__name__}: {send_exc}",
+            )
+
+        # Settle before any audit/telemetry work so a downstream failure can
+        # never strand the reservation.
+        _settle_reservation(
+            policy_identity=policy_identity,
+            fingerprint=key,
+            reservation_token=reservation,
+            delivered=delivered,
+        )
+        settled = True
+
+        if delivered:
+            try:
+                with registry_lock(STATE_LOCK_FILE):
+                    state = {str(k): str(v) for k, v in load_json(STATE_FILE).items()}
+                    state[plan.symbol] = key
+                    save_json_atomic(STATE_FILE, state)
+            except (OSError, TimeoutError, RegistryIOError):
+                pass
+            return True
+
+        if trade_id:
+            try:
+                queue_qualified_alert(
+                    trade_id=trade_id,
+                    message=message,
+                    candidate=candidate,
+                    plan=plan,
+                    action=action,
+                    direction=direction,
+                    identity=identity,
+                    fingerprint=key,
+                    reason=delivery_reason,
+                )
+            except Exception as queue_exc:
+                print(
+                    "O'Pip qualified alert queueing failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(queue_exc).__name__}: {queue_exc}",
+                )
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action,
+                    fingerprint=key,
+                    reason="DELIVERY_PENDING_UNQUEUEABLE",
+                    symbol=plan.symbol,
+                    journey_id=candidate.get("journey_id"),
+                    signal_id=candidate.get("signal_id"),
+                    trade_id=trade_id,
+                )
+        return False
+    finally:
+        # Last-resort guarantee for any unexpected exception raised between
+        # reservation and settlement (telemetry, audit, registry, or runtime).
+        if not settled:
+            _settle_reservation(
+                policy_identity=policy_identity,
+                fingerprint=key,
+                reservation_token=reservation,
+                delivered=delivered,
+            )

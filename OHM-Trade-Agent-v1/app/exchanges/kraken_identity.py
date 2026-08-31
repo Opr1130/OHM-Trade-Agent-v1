@@ -54,6 +54,8 @@ _ASSET_ALIASES: dict[str, str] = {
     "CHF": "CHF",
     "ZUSDT": "USDT",
     "USDT": "USDT",
+    "ZUSDC": "USDC",
+    "USDC": "USDC",
 }
 
 # Pair parsing tries the longest suffix first, but legacy Z-prefixed quote
@@ -65,6 +67,8 @@ _QUOTE_ALIASES: tuple[tuple[str, str], ...] = tuple(
         {
             "ZUSDT": "USDT",
             "USDT": "USDT",
+            "ZUSDC": "USDC",
+            "USDC": "USDC",
             "ZUSD": "USD",
             "USD": "USD",
             "ZEUR": "EUR",
@@ -140,6 +144,32 @@ def canonicalize_pair(pair: str | None) -> str:
         if base:
             return f"{base}{canonical_quote}"
     return value
+
+
+CANONICAL_QUOTE_ASSETS: tuple[str, ...] = (
+    "USDT",
+    "USDC",
+    "USD",
+    "EUR",
+    "GBP",
+    "CAD",
+    "AUD",
+    "JPY",
+    "CHF",
+    "BTC",
+    "ETH",
+)
+
+
+def split_canonical_pair(pair: str | None) -> tuple[str, str] | None:
+    """Return canonical (base, quote) without duplicating quote lists."""
+    value = canonicalize_pair(pair)
+    for quote in CANONICAL_QUOTE_ASSETS:
+        if value.endswith(quote) and len(value) > len(quote):
+            base = canonicalize_asset(value[: -len(quote)])
+            if base:
+                return base, quote
+    return None
 
 
 def balance_quantity_for_asset(balances: dict[str, float], asset: str | None) -> float | None:

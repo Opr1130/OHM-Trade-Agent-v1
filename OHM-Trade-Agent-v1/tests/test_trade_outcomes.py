@@ -92,7 +92,7 @@ def test_recommendation_persists_wave8_market_intelligence(monkeypatch, tmp_path
         action="ENTER_NOW",
     )
 
-    assert record["schema_version"] == 3
+    assert record["schema_version"] == 4
     assert record["market_intelligence"] == evidence
 
 
@@ -194,6 +194,122 @@ def test_stop_first_hit_time_is_stable(monkeypatch, tmp_path):
     assert record["stop_first_observed_at"] == "2026-08-09T21:00:00+00:00"
 
 
+def test_stop_first_then_later_target_is_not_counted_as_target_success(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    item["opportunity_rank"] = 1
+    trade_id = "OHM-BTC-STOP-FIRST"
+    outcomes.record_recommendation(
+        trade_id=trade_id,
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100,
+        stop_price=90,
+        target_1=110,
+        target_2=120,
+        risk_level="low",
+        opened_at="2026-08-09T20:00:00+00:00",
+        trade_id=trade_id,
+    )
+    outcomes.mark_trade_entered(trade, entry_price_source="manual_actual_fill")
+    outcomes.update_active_observation(
+        trade, 89, observed_at="2026-08-09T21:00:00+00:00"
+    )
+    record = outcomes.update_active_observation(
+        trade, 121, observed_at="2026-08-09T22:00:00+00:00"
+    )
+    assert record["target_1_observed"] is True
+    assert record["target_2_observed"] is True
+    assert outcomes._target_before_stop(record, 1) is False
+    assert outcomes._target_before_stop(record, 2) is False
+    outcomes.terminalize_active_outcome(
+        trade_id=trade_id,
+        symbol="BTCUSD",
+        status="closed",
+        reason="test",
+        final_price=121,
+    )
+
+    summary = outcomes.calibration_summary(min_resolved_entered=1)
+
+    assert summary["opportunity_rank_bins"]["1"]["t1_observed"] == 0
+    assert summary["opportunity_rank_bins"]["1"]["t2_observed"] == 0
+
+
+def test_pre_entry_target_observation_is_ignored(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    item["forecast_horizon_hours"] = 4.0
+    trade_id = "OHM-BTC-PRE-ENTRY"
+    outcomes.record_recommendation(
+        trade_id=trade_id,
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100,
+        stop_price=90,
+        target_1=110,
+        target_2=120,
+        risk_level="low",
+        opened_at="2026-08-09T20:00:00+00:00",
+        trade_id=trade_id,
+    )
+    outcomes.mark_trade_entered(trade, entry_price_source="manual_actual_fill")
+    record = outcomes.update_active_observation(
+        trade,
+        121,
+        observed_at="2026-08-09T19:59:00+00:00",
+    )
+
+    assert record["target_1_observed"] is False
+    assert record["target_2_observed"] is False
+    assert outcomes._target_before_stop(record, 1) is False
+    assert any("Pre-entry observation ignored" in w for w in record["observation_warnings"])
+
+
+def test_target_after_forecast_horizon_is_not_counted_as_success(monkeypatch, tmp_path):
+    isolate(monkeypatch, tmp_path)
+    item = candidate()
+    item["opportunity_rank"] = 1
+    item["forecast_horizon_hours"] = 2.0
+    trade_id = "OHM-BTC-HORIZON"
+    recommendation = outcomes.record_recommendation(
+        trade_id=trade_id,
+        candidate=item,
+        plan=plan(),
+        action="ENTER_NOW",
+    )
+    assert recommendation["forecast_horizon_hours"] == 2.0
+    assert recommendation["forecast_horizon_version"] == outcomes.FORECAST_HORIZON_VERSION
+
+    trade = ActiveTrade(
+        symbol="BTCUSD",
+        entry_price=100,
+        stop_price=90,
+        target_1=110,
+        target_2=120,
+        risk_level="low",
+        opened_at="2026-08-09T20:00:00+00:00",
+        trade_id=trade_id,
+    )
+    outcomes.mark_trade_entered(trade, entry_price_source="manual_actual_fill")
+    record = outcomes.update_active_observation(
+        trade,
+        121,
+        observed_at="2026-08-09T23:00:01+00:00",
+    )
+    assert record["target_1_observed"] is True
+    assert outcomes._target_before_stop(record, 1) is False
+    assert outcomes._target_before_stop(record, 2) is False
+
+
 def test_skipped_setup_is_not_counted_as_losing_entered_trade(monkeypatch, tmp_path):
     isolate(monkeypatch, tmp_path)
     outcomes.record_recommendation(
@@ -236,6 +352,35 @@ def test_legacy_active_trade_gets_deterministic_legacy_key(monkeypatch, tmp_path
     record = outcomes.update_active_observation(trade, 101)
     assert record["record_key"].startswith("legacy:BTCUSD:")
     assert record["trade_id"] == ""
+
+
+def test_calibration_excludes_resolved_records_without_forecast_horizon(
+    monkeypatch,
+    tmp_path,
+):
+    isolate(monkeypatch, tmp_path)
+    outcomes.OUTCOME_FILE.write_text(
+        """{
+  "legacy:BTCUSD:test": {
+    "record_key": "legacy:BTCUSD:test",
+    "trade_id": "",
+    "symbol": "BTCUSD",
+    "direction": "LONG",
+    "entered_trade": true,
+    "terminal_status": "closed",
+    "entered_at": "2026-08-09T20:00:00+00:00",
+    "target_2_first_observed_at": "2026-08-09T21:00:00+00:00",
+    "chief_confidence": 80,
+    "opportunity_rank": 1
+  }
+}""",
+        encoding="utf-8",
+    )
+
+    summary = outcomes.calibration_summary(min_resolved_entered=1)
+
+    assert summary["status"] == "INSUFFICIENT_DATA"
+    assert summary["resolved_entered_trades"] == 0
 
 
 def test_calibration_refuses_small_samples(monkeypatch, tmp_path):
