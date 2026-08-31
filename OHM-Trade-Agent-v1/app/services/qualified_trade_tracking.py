@@ -18,6 +18,10 @@ class ReconciliationTrackingDisabled(RuntimeError):
     """Qualified trade tracking is intentionally unavailable by configuration."""
 
 
+class ReconciliationIdentityMismatch(ValueError):
+    """Existing reconciliation state conflicts with this qualified alert."""
+
+
 def reconciliation_limit_price(
     plan: EntryExitPlan,
     *,
@@ -79,7 +83,7 @@ def register_reconciliation_intent(
         )
         if same_identity:
             return
-        raise ValueError(
+        raise ReconciliationIdentityMismatch(
             f"reconciliation intent {trade_id} does not match this alert"
         )
 
