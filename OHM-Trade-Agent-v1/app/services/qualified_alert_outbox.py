@@ -155,6 +155,67 @@ def _remove(trade_id: str, *, token: str | None = None) -> bool:
         return True
 
 
+def _settle_reservation(
+    *,
+    policy_identity: str,
+    fingerprint: str,
+    reservation_token: str,
+    delivered: bool,
+) -> None:
+    """Close a notification reservation exactly once, whatever happened.
+
+    Mirrors chief_alert_notifier: a delivered message is always confirmed so a
+    retry cannot resend it, and every other outcome releases immediately so the
+    next drain does not have to wait for the lease TTL.
+    """
+    try:
+        if delivered:
+            confirm_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                fingerprint=fingerprint,
+                reservation_token=reservation_token,
+            )
+        else:
+            release_emit(
+                identity=policy_identity,
+                event_type="ACTIONABLE_TRADE",
+                reservation_token=reservation_token,
+            )
+    except Exception as exc:
+        print(
+            "O'Pip notification reservation settlement failed:",
+            f"identity={policy_identity}",
+            f"delivered={delivered}",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _terminalization_confirmed(trade_id: str, status: str) -> bool:
+    """Report whether the waiting lifecycle is durably non-waiting.
+
+    The durable recovery record may only be destroyed once this returns True.
+    A missing record or an already-terminal status counts as confirmed; a
+    failed or unverifiable transition keeps the recovery record retryable.
+    """
+    try:
+        lifecycle = get_pending_setup_record(trade_id)
+        if lifecycle is None or str((lifecycle or {}).get("status") or "") != "waiting":
+            return True
+        if terminalize_pending_setup(trade_id, status):
+            return True
+        refreshed = get_pending_setup_record(trade_id)
+        return str((refreshed or {}).get("status") or "") != "waiting"
+    except Exception as exc:
+        print(
+            "O'Pip outbox lifecycle terminalization failed:",
+            f"trade_id={trade_id}",
+            f"status={status}",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+
 def _record_malformed_outbox(
     *,
     trade_id: str,
@@ -197,22 +258,7 @@ def _record_malformed_outbox(
             f"{type(exc).__name__}: {exc}",
         )
 
-    try:
-        lifecycle = get_pending_setup_record(trade_id)
-        lifecycle_status = str((lifecycle or {}).get("status") or "")
-        if lifecycle is None or lifecycle_status != "waiting":
-            return True
-        if terminalize_pending_setup(trade_id, "delivery_malformed"):
-            return True
-        refreshed = get_pending_setup_record(trade_id)
-        return str((refreshed or {}).get("status") or "") != "waiting"
-    except Exception as exc:
-        print(
-            "O'Pip malformed-outbox lifecycle transition failed:",
-            f"trade_id={trade_id}",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return False
+    return _terminalization_confirmed(trade_id, "delivery_malformed")
 
 
 def _retry_one(
@@ -287,7 +333,25 @@ def _retry_one(
                 trade_id=trade_id,
             )
         except ReconciliationTrackingDisabled:
-            terminalize_pending_setup(trade_id, "tracking_disabled")
+            # Never destroy the durable recovery record before the intended
+            # terminal lifecycle transition is confirmed.
+            if not _terminalization_confirmed(trade_id, "tracking_disabled"):
+                _release(trade_id, lease_token)
+                record_telegram_suppression(
+                    identity=str(
+                        row.get("identity")
+                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
+                    ),
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action or "ACTION",
+                    fingerprint=str(row.get("fingerprint") or ""),
+                    reason="RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING",
+                    symbol=plan.symbol,
+                    journey_id=row.get("journey_id"),
+                    signal_id=row.get("signal_id"),
+                    trade_id=trade_id,
+                )
+                return "TRACKING_PENDING"
             _remove(trade_id, token=lease_token)
             record_telegram_suppression(
                 identity=str(row.get("identity") or f"QUALIFIED_OPPORTUNITY:{trade_id}"),
@@ -402,36 +466,55 @@ def _retry_one(
         _release(trade_id, lease_token)
         return "POLICY_PENDING"
 
-    delivery = send_tracked_telegram(
-        bot_token=bot_token,
-        chat_id=chat_id,
-        message=str(row.get("message") or ""),
-        identity=identity,
-        alert_family="QUALIFIED_OPPORTUNITY",
-        event_type=event_type,
-        fingerprint=fingerprint,
-        symbol=plan.symbol,
-        journey_id=row.get("journey_id"),
-        signal_id=row.get("signal_id"),
-        trade_id=trade_id,
-    )
-    if not delivery.delivered:
-        release_emit(
-            identity=policy_identity,
-            event_type="ACTIONABLE_TRADE",
-            reservation_token=reservation,
-        )
-        _release(trade_id, lease_token)
-        return "SEND_FAILED"
+    delivered = False
+    settled = False
+    try:
+        try:
+            delivery = send_tracked_telegram(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                message=str(row.get("message") or ""),
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=event_type,
+                fingerprint=fingerprint,
+                symbol=plan.symbol,
+                journey_id=row.get("journey_id"),
+                signal_id=row.get("signal_id"),
+                trade_id=trade_id,
+            )
+            delivered = bool(getattr(delivery, "delivered", False))
+        except Exception as send_exc:
+            print(
+                "O'Pip qualified alert retry delivery raised:",
+                f"trade_id={trade_id}",
+                f"{type(send_exc).__name__}: {send_exc}",
+            )
 
-    confirm_emit(
-        identity=policy_identity,
-        event_type="ACTIONABLE_TRADE",
-        fingerprint=fingerprint,
-        reservation_token=reservation,
-    )
-    _remove(trade_id, token=lease_token)
-    return "DELIVERED"
+        _settle_reservation(
+            policy_identity=policy_identity,
+            fingerprint=fingerprint,
+            reservation_token=reservation,
+            delivered=delivered,
+        )
+        settled = True
+
+        if not delivered:
+            # The durable recovery record stays; only the lease is released so
+            # the next drain can retry without waiting for the lease TTL.
+            _release(trade_id, lease_token)
+            return "SEND_FAILED"
+
+        _remove(trade_id, token=lease_token)
+        return "DELIVERED"
+    finally:
+        if not settled:
+            _settle_reservation(
+                policy_identity=policy_identity,
+                fingerprint=fingerprint,
+                reservation_token=reservation,
+                delivered=delivered,
+            )
 
 
 def retry_qualified_alerts(
