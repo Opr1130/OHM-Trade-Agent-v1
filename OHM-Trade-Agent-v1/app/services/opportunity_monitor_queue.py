@@ -153,9 +153,15 @@ def upsert_candidate(observation: CandidateObservation) -> QueueSummary:
         if liquidity is not None:
             row["liquidity_usd"] = liquidity
 
+        persisted_source_priorities = row.get("source_priority_scores")
+        source_priority_mapping = (
+            persisted_source_priorities
+            if isinstance(persisted_source_priorities, dict)
+            else {}
+        )
         source_priorities = {
             str(name): float(value)
-            for name, value in (row.get("source_priority_scores") or {}).items()
+            for name, value in source_priority_mapping.items()
             if _finite_optional(value) is not None
         }
         source_priorities[source] = max(0.0, min(100.0, priority))
