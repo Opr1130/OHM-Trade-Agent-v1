@@ -1,9 +1,7 @@
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
 from app.services.asset_display_identity import display_asset_text, display_market_label
-from app.services.active_trade_registry import get_active_trades
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.kraken_reconciliation import (
     reconciliation_enabled,
@@ -39,7 +37,6 @@ from app.services.telegram_delivery import (
     record_telegram_suppression,
     send_tracked_telegram,
 )
-from app.services.trade_decision_intelligence import evaluate_trade_decision
 from app.services.trade_outcome_registry import record_recommendation
 
 
@@ -278,26 +275,6 @@ def _register_reconciliation_intent(
         reconciliation_mode_value=reconciliation_mode(),
     )
 
-def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
-    if candidate.get("economic_qualified") is not True:
-        return False
-
-    settings = get_settings()
-    intelligence = evaluate_trade_decision(
-        candidate=candidate,
-        plan=plan,
-        account_capital=settings.account_equity,
-        active_trades=get_active_trades(),
-    )
-    candidate["recommended_capital"] = intelligence.allocation.recommended_capital
-    candidate["recommended_risk_dollars"] = intelligence.allocation.risk_dollars
-    candidate["projected_net_edge_pct"] = intelligence.projected_net_edge_pct
-    candidate["calibration_status"] = intelligence.calibration_status
-    candidate["calibration_multiplier"] = intelligence.calibration_multiplier
-    candidate["portfolio_risk_allowed"] = intelligence.portfolio_risk.allowed
-    candidate["portfolio_risk_reason"] = intelligence.portfolio_risk.reason
-    return intelligence.allowed
-
 
 def send_trade_plan(
     candidate: dict[str, Any],
@@ -336,11 +313,20 @@ def send_trade_plan(
             trade_id=candidate.get("trade_id"),
         )
         return False
-    if candidate.get("action_gate_evaluated") is True:
-        action_allowed = candidate.get("action_gate_allowed") is True
-    else:
-        # Direct-call compatibility only. Production evaluates this upstream.
-        action_allowed = _apply_intelligence(candidate, plan)
+    if candidate.get("action_gate_evaluated") is not True:
+        record_telegram_not_eligible(
+            identity=identity,
+            alert_family="QUALIFIED_OPPORTUNITY",
+            event_type=action,
+            fingerprint=initial_fingerprint,
+            reason="ACTION_GATE_NOT_EVALUATED",
+            symbol=plan.symbol,
+            journey_id=candidate.get("journey_id"),
+            signal_id=candidate.get("signal_id"),
+            trade_id=candidate.get("trade_id"),
+        )
+        return False
+    action_allowed = candidate.get("action_gate_allowed") is True
     if not action_allowed:
         record_telegram_not_eligible(
             identity=identity,
