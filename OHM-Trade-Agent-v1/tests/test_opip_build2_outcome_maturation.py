@@ -459,3 +459,43 @@ def test_canonical_label_payload_marks_nonfinite_values_unusable_and_json_safe()
     assert payload["data_quality_nonfinite_count"] == 2
     assert "NONFINITE_VALUE" in payload["data_quality_flags"]
     json.dumps(payload, allow_nan=False)
+
+
+def test_bounded_queue_skips_nonfinite_snapshot_before_strict_serialization(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    poisoned = {
+        **_snapshot("BAD", "E-BAD"),
+        "reference_price": float("nan"),
+    }
+    valid = {
+        **_snapshot("GOOD", "E-GOOD"),
+        "decision_at_utc": (BASE + timedelta(minutes=1)).isoformat(),
+    }
+    snapshots.write_text(
+        json.dumps(poisoned) + "\n" + json.dumps(valid) + "\n",
+        encoding="utf-8",
+    )
+    observations.write_text(
+        json.dumps(_observation(BASE + timedelta(minutes=1), 10.0)) + "\n"
+        + json.dumps(
+            _observation(BASE + timedelta(hours=24, minutes=1), 11.0)
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        max_snapshots=10,
+        now=BASE + timedelta(hours=25),
+    )
+
+    assert [row["snapshot_id"] for row in rows] == ["GOOD"]
+    persisted = outcomes.read_text(encoding="utf-8")
+    assert '"snapshot_id":"BAD"' not in persisted.replace(" ", "")
