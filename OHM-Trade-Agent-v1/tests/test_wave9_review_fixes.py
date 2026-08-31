@@ -554,6 +554,143 @@ def test_entry_watch_expired_rows_do_not_evict_fresh_candidate(tmp_path, monkeyp
     assert rows[0]["symbol"] == "SOLUSD"
 
 
+def _persist_entry_watch_rows(rows: dict, tmp_path, monkeypatch):
+    monkeypatch.setattr(entry_watch_queue, "ENTRY_WATCH_FILE", tmp_path / "entry_watch.json")
+    entry_watch_queue.ENTRY_WATCH_FILE.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def _watch_row(*, symbol, direction="LONG", now, continuation_score=50):
+    return {
+        "schema_version": 1,
+        "symbol": symbol,
+        "direction": direction,
+        "candidate_id": "C1",
+        "continuation_score": continuation_score,
+        "updated_at": now.isoformat(),
+        "next_due_at": (now - timedelta(seconds=1)).isoformat(),
+        "expires_at": (now + timedelta(minutes=30)).isoformat(),
+    }
+
+
+def test_persisted_empty_symbol_row_is_terminalized_and_never_reappears(tmp_path, monkeypatch):
+    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    _persist_entry_watch_rows(
+        {":LONG": _watch_row(symbol="", now=now)},
+        tmp_path,
+        monkeypatch,
+    )
+
+    due = entry_watch_queue.due_entry_watch(now=now)
+    assert due == []
+    remaining = json.loads(entry_watch_queue.ENTRY_WATCH_FILE.read_text(encoding="utf-8"))
+    assert remaining == {}
+
+    # Never reappears on a later scan either -- the record is gone, not
+    # merely skipped for one cycle.
+    assert entry_watch_queue.due_entry_watch(now=now + timedelta(minutes=5)) == []
+
+
+def test_persisted_whitespace_only_symbol_row_is_terminalized(tmp_path, monkeypatch):
+    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    _persist_entry_watch_rows(
+        {"   :LONG": _watch_row(symbol="   ", now=now)},
+        tmp_path,
+        monkeypatch,
+    )
+
+    due = entry_watch_queue.due_entry_watch(now=now)
+    assert due == []
+    remaining = json.loads(entry_watch_queue.ENTRY_WATCH_FILE.read_text(encoding="utf-8"))
+    assert remaining == {}
+    assert entry_watch_queue.due_entry_watch(now=now + timedelta(minutes=5)) == []
+
+
+def test_malformed_invalid_persisted_row_is_removed(tmp_path, monkeypatch):
+    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    _persist_entry_watch_rows(
+        {
+            "GARBAGE:LONG": "not-a-dict",
+            "NOENTRY:LONG": {"schema_version": 1, "direction": "LONG"},
+        },
+        tmp_path,
+        monkeypatch,
+    )
+
+    due = entry_watch_queue.due_entry_watch(now=now)
+    assert due == []
+    remaining = json.loads(entry_watch_queue.ENTRY_WATCH_FILE.read_text(encoding="utf-8"))
+    assert remaining == {}
+
+
+def test_valid_rows_continue_processing_alongside_malformed_rows(tmp_path, monkeypatch):
+    now = datetime(2026, 8, 30, 20, 0, tzinfo=timezone.utc)
+    _persist_entry_watch_rows(
+        {
+            ":LONG": _watch_row(symbol="", now=now),
+            "SOLUSD:LONG": _watch_row(symbol="SOLUSD", now=now, continuation_score=80),
+        },
+        tmp_path,
+        monkeypatch,
+    )
+
+    due = entry_watch_queue.due_entry_watch(now=now)
+    assert [row["symbol"] for row in due] == ["SOLUSD"]
+    remaining = json.loads(entry_watch_queue.ENTRY_WATCH_FILE.read_text(encoding="utf-8"))
+    assert list(remaining.keys()) == ["SOLUSD:LONG"]
+
+
+def test_recheck_quarantines_malformed_row_without_usable_symbol(monkeypatch):
+    removed_keys = []
+    monkeypatch.setattr(
+        entry_watch_recheck,
+        "due_entry_watch",
+        lambda **kwargs: [
+            {
+                "symbol": "   ",
+                "direction": "LONG",
+                "risk_level": "low",
+                "_watch_key": "   :LONG",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        entry_watch_recheck,
+        "remove_entry_watch_key",
+        lambda key: removed_keys.append(key) or True,
+    )
+    monkeypatch.setattr(
+        entry_watch_recheck,
+        "remove_entry_watch",
+        lambda symbol, direction: (_ for _ in ()).throw(
+            AssertionError("should not reconstruct a key when the queue key is known")
+        ),
+    )
+
+    summary = entry_watch_recheck.recheck_due_entry_watch()
+
+    assert summary.checked == 0
+    assert removed_keys == ["   :LONG"]
+
+
+def test_recheck_falls_back_to_reconstructed_key_without_watch_key(monkeypatch):
+    removed = []
+    monkeypatch.setattr(
+        entry_watch_recheck,
+        "due_entry_watch",
+        lambda **kwargs: [{"symbol": "", "direction": "LONG", "risk_level": "low"}],
+    )
+    monkeypatch.setattr(
+        entry_watch_recheck,
+        "remove_entry_watch",
+        lambda symbol, direction: removed.append((symbol, direction)) or True,
+    )
+
+    summary = entry_watch_recheck.recheck_due_entry_watch()
+
+    assert summary.checked == 0
+    assert removed == [("", "LONG")]
+
+
 def _queued_plan():
     return {
         "symbol": "SOLUSD",
@@ -677,6 +814,151 @@ def test_outbox_terminally_suppresses_disabled_reconciliation(monkeypatch):
     assert terminalized == [("Q-DISABLED", "tracking_disabled")]
     assert removed == [("Q-DISABLED", "lease")]
     assert suppressions[0]["reason"] == "RECONCILIATION_NOT_APPLY_TERMINAL"
+
+
+# --- Finding 3: outbox recovery record durability -----------------------
+
+
+def _tracking_disabled_row(trade_id="Q-DUR"):
+    return {
+        "trade_id": trade_id,
+        "plan": _queued_plan(),
+        "direction": "LONG",
+        "action": "ENTER_NOW",
+        "tracking_candidate": {
+            "economic_qualified": True,
+            "recommended_capital": 100.0,
+        },
+        "identity": f"QUALIFIED_OPPORTUNITY:{trade_id}",
+        "policy_identity": "LONG:SOLUSD",
+        "fingerprint": "fp",
+        "message": "trade",
+        "leverage": 1.0,
+    }
+
+
+def test_outbox_retains_row_when_terminalization_fails(monkeypatch):
+    row = _tracking_disabled_row()
+    removed = []
+    released = []
+    monkeypatch.setattr(qualified_alert_outbox, "_claim", lambda trade_id: ("lease", dict(row)))
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(ReconciliationTrackingDisabled("disabled")),
+    )
+    # Terminalization fails outright, and a refreshed lookup still shows
+    # "waiting" -- the recovery record must not be destroyed.
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: False,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_release",
+        lambda trade_id, token: released.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox, "record_telegram_suppression", lambda **kwargs: None
+    )
+
+    status = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
+
+    assert status == "TRACKING_PENDING"
+    assert removed == []
+    assert released == [("Q-DUR", "lease")]
+
+
+def test_outbox_removes_row_once_retry_confirms_terminalization(monkeypatch):
+    row = _tracking_disabled_row()
+    removed = []
+    calls = {"n": 0}
+
+    def _terminalize(trade_id, status):
+        # First attempt fails, second (retry) attempt succeeds.
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    monkeypatch.setattr(qualified_alert_outbox, "_claim", lambda trade_id: ("lease", dict(row)))
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(ReconciliationTrackingDisabled("disabled")),
+    )
+    monkeypatch.setattr(qualified_alert_outbox, "terminalize_pending_setup", _terminalize)
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(qualified_alert_outbox, "_release", lambda trade_id, token: True)
+    monkeypatch.setattr(
+        qualified_alert_outbox, "record_telegram_suppression", lambda **kwargs: None
+    )
+
+    first = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
+    assert first == "TRACKING_PENDING"
+    assert removed == []
+
+    second = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
+    assert second == "SUPPRESSED"
+    assert removed == [("Q-DUR", "lease")]
+
+
+def test_outbox_terminalization_retry_is_idempotent(monkeypatch):
+    row = _tracking_disabled_row()
+    removed = []
+    terminalize_calls = []
+
+    monkeypatch.setattr(qualified_alert_outbox, "_claim", lambda trade_id: ("lease", dict(row)))
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(ReconciliationTrackingDisabled("disabled")),
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalize_calls.append((trade_id, status)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "_remove",
+        lambda trade_id, token=None: removed.append((trade_id, token)) or True,
+    )
+    monkeypatch.setattr(
+        qualified_alert_outbox, "record_telegram_suppression", lambda **kwargs: None
+    )
+
+    for _ in range(3):
+        status = qualified_alert_outbox._retry_one("Q-DUR", bot_token="token", chat_id="chat")
+        assert status == "SUPPRESSED"
+
+    # Every repeated drain terminalizes/removes without creating duplicate
+    # lifecycle transitions or notifications beyond one per retry.
+    assert terminalize_calls == [("Q-DUR", "tracking_disabled")] * 3
+    assert removed == [("Q-DUR", "lease")] * 3
 
 
 def test_monitor_state_load_failure_never_overwrites_other_symbol_state(monkeypatch):
