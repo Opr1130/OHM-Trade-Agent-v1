@@ -325,6 +325,11 @@ def retry_qualified_alerts(
             continue
         if status == "DELIVERED":
             delivered += 1
-        elif status not in {"SUPERSEDED", "BUSY_OR_MISSING"}:
+        elif status not in {
+            "SUPERSEDED",
+            "SUPPRESSED",
+            "MALFORMED",
+            "BUSY_OR_MISSING",
+        }:
             pending += 1
     return delivered, pending
