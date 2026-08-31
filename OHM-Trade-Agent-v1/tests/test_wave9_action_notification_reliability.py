@@ -12,7 +12,10 @@ from app.services import (
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.pending_setup_registry import PendingSetup
 from app.services.trade_action_gate import ActionGateDecision
-from app.services.qualified_trade_tracking import ReconciliationIdentityMismatch
+from app.services.qualified_trade_tracking import (
+    ReconciliationIdentityMismatch,
+    ReconciliationTrackingDisabled,
+)
 
 
 def plan(symbol="SOLUSD"):
@@ -306,6 +309,16 @@ def test_rank_one_veto_does_not_block_rank_two(monkeypatch):
         profit_ranking=SimpleNamespace(total_score=90.0),
     )
     monkeypatch.setattr(scan_opportunities, "get_active_trades", lambda: [])
+    entry_watch_cleanup_calls = []
+    # Finding 5: this test must never touch the real/default entry-watch
+    # registry file. Isolate remove_entry_watch entirely (no tmp_path
+    # indirection needed since the call itself must not reach shared state)
+    # while still proving the gate-approved path invokes cleanup.
+    monkeypatch.setattr(
+        scan_opportunities,
+        "remove_entry_watch",
+        lambda *args: entry_watch_cleanup_calls.append(args),
+    )
 
     def gate(*, candidate, plan, account_capital, active_trades):
         if plan.symbol == "AAAUSD":
@@ -325,6 +338,7 @@ def test_rank_one_veto_does_not_block_rank_two(monkeypatch):
 
     assert [item.rank for item in eligible] == [2]
     assert second.opportunity.alert["profit_rank"] == 2
+    assert entry_watch_cleanup_calls == [("BBBUSD", "LONG")]
 
 
 def test_notifier_consumes_pre_evaluated_action_gate(tmp_path, monkeypatch):
@@ -483,3 +497,216 @@ def test_qualified_retry_is_after_active_protection(monkeypatch):
     run_cycle._run_cycle_once()
 
     assert calls[:3] == ["active", "retry", "pending"]
+
+
+# --- Finding 1: notification reservation must never remain stranded ---------
+
+
+def _reservation_test_setup(tmp_path, monkeypatch):
+    """Wire send_trade_plan up to a real, tmp-isolated notification_policy.
+
+    economic_qualified is False so the flow reaches the atomic reservation
+    directly, and only the network-facing pieces are mocked.
+    """
+    _patch_pending(tmp_path, monkeypatch)
+    monkeypatch.setattr(notification_policy, "STATE_FILE", tmp_path / "notification.json")
+    monkeypatch.setattr(notification_policy, "LOCK_FILE", tmp_path / ".notification.lock")
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
+    monkeypatch.setattr(chief_alert_notifier, "record_recommendation", lambda **kwargs: None)
+    monkeypatch.setattr(chief_alert_notifier, "accepted_delivery_message_id", lambda **kwargs: None)
+
+
+def _reservation_candidate():
+    return {
+        "confidence": 88,
+        "decision": "alert",
+        "economic_qualified": False,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "recommended_capital": 200.0,
+    }
+
+
+def test_reservation_confirmed_and_no_double_send_on_successful_delivery(tmp_path, monkeypatch):
+    _reservation_test_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
+    )
+
+    assert chief_alert_notifier.send_trade_plan(
+        _reservation_candidate(), plan(), "summary", "token", "chat"
+    )
+
+    # Confirmed emission means a same-fingerprint retry must not resend.
+    assert notification_policy.is_confirmed_emission(
+        identity="LONG:SOLUSD",
+        event_type="ACTIONABLE_TRADE",
+        fingerprint=chief_alert_notifier._alert_state_key(_reservation_candidate(), plan()),
+    )
+    assert (
+        notification_policy.reserve_emit(
+            identity="LONG:SOLUSD",
+            event_type="ACTIONABLE_TRADE",
+            fingerprint=chief_alert_notifier._alert_state_key(_reservation_candidate(), plan()),
+        )
+        is None
+    )
+
+
+def test_reservation_released_on_suppressed_delivery(tmp_path, monkeypatch):
+    _reservation_test_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=False, message_id=None),
+    )
+
+    assert not chief_alert_notifier.send_trade_plan(
+        _reservation_candidate(), plan(), "summary", "token", "chat"
+    )
+
+    # A suppressed (not delivered, no exception) send must release immediately
+    # -- a fresh reservation attempt must not wait for the lease TTL.
+    fingerprint = chief_alert_notifier._alert_state_key(_reservation_candidate(), plan())
+    assert notification_policy.reserve_emit(
+        identity="LONG:SOLUSD",
+        event_type="ACTIONABLE_TRADE",
+        fingerprint=fingerprint,
+    )
+
+
+def test_reservation_released_when_delivery_raises(tmp_path, monkeypatch):
+    _reservation_test_setup(tmp_path, monkeypatch)
+
+    def _raise(**kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(chief_alert_notifier, "send_tracked_telegram", _raise)
+
+    assert not chief_alert_notifier.send_trade_plan(
+        _reservation_candidate(), plan(), "summary", "token", "chat"
+    )
+
+    # A provider exception must not strand the reservation for the 120s
+    # lease TTL -- retry must be immediately possible.
+    fingerprint = chief_alert_notifier._alert_state_key(_reservation_candidate(), plan())
+    assert notification_policy.reserve_emit(
+        identity="LONG:SOLUSD",
+        event_type="ACTIONABLE_TRADE",
+        fingerprint=fingerprint,
+    )
+
+
+def test_reservation_released_on_unexpected_exception_in_downstream_audit(tmp_path, monkeypatch):
+    _reservation_test_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=False, message_id=None),
+    )
+
+    def _raise_queue(**kwargs):
+        raise MemoryError("unexpected runtime failure")
+
+    monkeypatch.setattr(chief_alert_notifier, "queue_qualified_alert", _raise_queue)
+
+    candidate = _reservation_candidate()
+    candidate["trade_id"] = "Q-UNEXPECTED"
+    # An unrelated, unexpected exception raised deep in the audit/queueing
+    # path must not propagate out of send_trade_plan and must not prevent
+    # the reservation from having already been released.
+    assert not chief_alert_notifier.send_trade_plan(
+        candidate, plan(), "summary", "token", "chat"
+    )
+
+    fingerprint = chief_alert_notifier._alert_state_key(candidate, plan())
+    assert notification_policy.reserve_emit(
+        identity="LONG:SOLUSD",
+        event_type="ACTIONABLE_TRADE",
+        fingerprint=fingerprint,
+    )
+
+
+def test_settle_reservation_never_raises_when_policy_calls_fail(monkeypatch):
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "confirm_emit",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "release_emit",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+
+    # Settlement must never raise, whether confirming a delivered message or
+    # releasing a non-delivered one -- an unexpected exception here must not
+    # crash the caller or leave the reservation lifecycle undefined.
+    chief_alert_notifier._settle_reservation(
+        policy_identity="LONG:SOLUSD",
+        fingerprint="fp",
+        reservation_token="token",
+        delivered=True,
+    )
+    chief_alert_notifier._settle_reservation(
+        policy_identity="LONG:SOLUSD",
+        fingerprint="fp",
+        reservation_token="token",
+        delivered=False,
+    )
+
+
+def test_send_trade_plan_retains_recovery_record_when_terminalization_unconfirmed(
+    tmp_path, monkeypatch
+):
+    """Finding 3 (notifier side): never destroy the recovery path before the
+    intended terminal lifecycle transition is confirmed successful."""
+    _patch_pending(tmp_path, monkeypatch)
+    queued = []
+    suppressions = []
+    monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
+    monkeypatch.setattr(chief_alert_notifier, "record_recommendation", lambda **kwargs: None)
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(ReconciliationTrackingDisabled("disabled")),
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "terminalize_pending_setup",
+        lambda trade_id, status: False,
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "waiting"},
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "queue_qualified_alert",
+        lambda **kwargs: queued.append(kwargs),
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "record_telegram_suppression",
+        lambda **kwargs: suppressions.append(kwargs),
+    )
+
+    candidate = {
+        "confidence": 88,
+        "decision": "alert",
+        "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "recommended_capital": 200.0,
+    }
+
+    assert not chief_alert_notifier.send_trade_plan(
+        candidate, plan(), "summary", "token", "chat"
+    )
+    # Terminalization was never confirmed, so the durable recovery record
+    # must be queued rather than silently dropped.
+    assert len(queued) == 1
+    assert suppressions[-1]["reason"] == "RECONCILIATION_NOT_APPLY_TERMINALIZATION_PENDING"
