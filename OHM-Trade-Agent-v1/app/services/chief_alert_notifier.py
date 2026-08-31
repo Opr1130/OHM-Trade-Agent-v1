@@ -280,7 +280,7 @@ def _register_reconciliation_intent(
 
 def _apply_intelligence(candidate: dict[str, Any], plan: EntryExitPlan) -> bool:
     if candidate.get("economic_qualified") is not True:
-        return True
+        return False
 
     settings = get_settings()
     intelligence = evaluate_trade_decision(
