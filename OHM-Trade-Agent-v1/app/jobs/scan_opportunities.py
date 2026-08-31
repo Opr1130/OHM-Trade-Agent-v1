@@ -43,6 +43,7 @@ from app.services.economic_quality_gate import (
 )
 from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import enqueue_entry_watch, remove_entry_watch
+from app.services.freqtrade_signal_bridge import build_signal_id, to_freqtrade_pair
 from app.services.market_intelligence_integration import enrich_finalist_market_intelligence
 from app.services.price_movement_learning import (
     get_latest_price_movement,
