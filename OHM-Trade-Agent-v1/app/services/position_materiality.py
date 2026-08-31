@@ -63,9 +63,7 @@ def refine_protection_action(
         return result
     try:
         mfe_pct = float(observation.get("mfe_pct") or 0.0)
-        current_pct = float(
-            result.net_pnl_pct if result.net_pnl_pct is not None else result.unrealized_pct
-        )
+        current_pct = float(result.unrealized_pct)
     except (TypeError, ValueError):
         return result
 
