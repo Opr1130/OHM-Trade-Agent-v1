@@ -138,8 +138,23 @@ class KrakenPrivateClient:
 
     def get_api_key_info(self) -> KrakenKeyInfo:
         result = self._post("GetApiKeyInfo") or {}
-        permissions_reported = "permissions" in result
-        permissions = frozenset(str(value) for value in result.get("permissions", []))
+        if not isinstance(result, dict):
+            return KrakenKeyInfo(
+                name="",
+                permissions=frozenset(),
+                permissions_reported=False,
+            )
+
+        raw_permissions = result.get("permissions")
+        permissions_valid = isinstance(raw_permissions, list) and all(
+            isinstance(value, str) for value in raw_permissions
+        )
+        permissions_reported = "permissions" in result and permissions_valid
+        permissions = (
+            frozenset(raw_permissions)
+            if permissions_valid
+            else frozenset()
+        )
         return KrakenKeyInfo(
             name=str(result.get("apiKeyName") or ""),
             permissions=permissions,
