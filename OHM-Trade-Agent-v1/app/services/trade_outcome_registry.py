@@ -406,7 +406,11 @@ def _valid_forecast_horizon_hours(item: dict[str, Any]) -> float | None:
         horizon_hours = float(item.get("forecast_horizon_hours"))
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(horizon_hours) or horizon_hours <= 0:
+    if (
+        not math.isfinite(horizon_hours)
+        or horizon_hours < 1.0
+        or horizon_hours > DEFAULT_FORECAST_HORIZON_HOURS
+    ):
         return None
     return horizon_hours
 
