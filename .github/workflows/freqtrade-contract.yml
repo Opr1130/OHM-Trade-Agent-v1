@@ -169,7 +169,7 @@ jobs:
           assert "ports:" not in paper
           assert "./data/paper_trading:/freqtrade/control:ro" in paper
           assert "./data/freqtrade_bridge:/freqtrade/user_data/bridge:ro" in paper
-          assert "mem_limit: 384m" in paper
+          assert "mem_limit: 768m" in paper
           assert 'cpus: "0.40"' in paper
           print("Freqtrade paper authority/isolation boundary: PASS")
           PY

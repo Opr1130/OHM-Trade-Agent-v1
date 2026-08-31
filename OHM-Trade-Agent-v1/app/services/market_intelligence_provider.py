@@ -25,6 +25,9 @@ class ProviderResult:
     ok: bool
     bundle: MarketIntelligenceBundle | None = None
     error: str | None = None
+    error_kind: str | None = None
+    rate_limited: bool = False
+    retry_after_seconds: int | None = None
 
 
 def collect_market_intelligence(
@@ -41,6 +44,16 @@ def collect_market_intelligence(
                     provider=provider.name,
                     ok=False,
                     error=f"{type(exc).__name__}: {exc}",
+                    error_kind=type(exc).__name__,
+                    rate_limited=bool(
+                        getattr(exc, "retry_after_seconds", None) is not None
+                        or "RateLimit" in type(exc).__name__
+                    ),
+                    retry_after_seconds=getattr(
+                        exc,
+                        "retry_after_seconds",
+                        None,
+                    ),
                 )
             )
             continue

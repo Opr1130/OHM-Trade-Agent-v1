@@ -24,6 +24,9 @@ class CoinGeckoGlobalContext:
     updated_at: int | None = None
     age_seconds: float | None = None
     warnings: tuple[str, ...] = ()
+    provider_error_kind: str | None = None
+    rate_limited: bool = False
+    retry_after_seconds: int | None = None
 
 
 def _number(value: Any) -> float | None:
@@ -35,11 +38,18 @@ def _number(value: Any) -> float | None:
 def unavailable_global_context(
     api_mode: str,
     warning: str,
+    *,
+    provider_error_kind: str | None = None,
+    rate_limited: bool = False,
+    retry_after_seconds: int | None = None,
 ) -> CoinGeckoGlobalContext:
     return CoinGeckoGlobalContext(
         status=UNAVAILABLE,
         api_mode=api_mode,
         warnings=(warning,),
+        provider_error_kind=provider_error_kind,
+        rate_limited=rate_limited,
+        retry_after_seconds=retry_after_seconds,
     )
 
 
@@ -94,8 +104,12 @@ def load_coingecko_global_context(
     client = client or CoinGeckoClient(api_key=api_key)
     try:
         data = client.get_global_market()
-    except CoinGeckoAPIError:
+    except CoinGeckoAPIError as exc:
         return unavailable_global_context(
-            client.api_mode, "CoinGecko global request unavailable"
+            client.api_mode,
+            "CoinGecko global request unavailable",
+            provider_error_kind=type(exc).__name__,
+            rate_limited=bool(getattr(exc, "rate_limited", False)),
+            retry_after_seconds=getattr(exc, "retry_after_seconds", None),
         )
     return parse_global_market_context(data, client.api_mode, now)

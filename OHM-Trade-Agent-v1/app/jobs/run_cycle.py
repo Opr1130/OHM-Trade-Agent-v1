@@ -104,6 +104,100 @@ def _run_paper_monitor_fail_open() -> None:
         print("PAPER FAILURE:", failure)
 
 
+def _run_event_intelligence_fail_open(*, settings) -> None:
+    """Run O'Pip external-event capture after every real protection workflow.
+
+    Sequence 2 is evidence-only. It has its own bounded cadence, does not
+    participate in qualification/ranking, and cannot block the unified cycle.
+    """
+    if not bool(getattr(settings, "opip_event_store_enabled", False)):
+        return
+
+    try:
+        from app.opip.events.observer import capture_external_event_intelligence
+
+        result = capture_external_event_intelligence(
+            settings=settings,
+            capture_started_at=datetime.now(timezone.utc),
+        )
+    except Exception as exc:
+        print(
+            "O'Pip Event Intelligence unavailable; production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return
+
+    if not result.enabled:
+        return
+    if not result.ran:
+        print("O'Pip Event Intelligence skipped: cadence not due.")
+        return
+
+    telemetry = result.telemetry
+    print("O'Pip Event Intelligence — SHADOW")
+    print(
+        "Events:",
+        f"received={telemetry.get('events_received', 0)}",
+        f"normalized={telemetry.get('events_normalized', 0)}",
+        f"persisted={telemetry.get('events_persisted', 0)}",
+        f"duplicates={telemetry.get('duplicates', 0)}",
+        f"revisions={telemetry.get('revisions', 0)}",
+    )
+    print(
+        "Identity:",
+        f"unique={telemetry.get('mapping_unique', 0)}",
+        f"ambiguous={telemetry.get('mapping_ambiguous', 0)}",
+        f"unknown={telemetry.get('mapping_unknown', 0)}",
+    )
+    print(
+        "Sources:",
+        f"cryptopanic_requests={telemetry.get('cryptopanic_requests', 0)}",
+        f"coinmarketcal_requests={telemetry.get('coinmarketcal_requests', 0)}",
+        f"coinmarketcal_mapping_requests={telemetry.get('coinmarketcal_mapping_requests', 0)}",
+    )
+    print(
+        "Failures:",
+        f"provider={telemetry.get('provider_errors', 0)}",
+        f"normalization={telemetry.get('normalization_errors', 0)}",
+        f"storage={telemetry.get('storage_errors', 0)}",
+    )
+    try:
+        from app.opip.events.provider_health import ProviderHealthStore
+        from app.opip.events.storage import EventStore
+
+        now = datetime.now(timezone.utc)
+        health_rows = ProviderHealthStore().read_all(as_of=now)
+        print("Provider health:")
+        for item in health_rows:
+            print(
+                f"  {item.provider}={item.state.value}",
+                f"configured={item.configured}",
+                f"failures={item.consecutive_failures}",
+                f"freshness_age={item.freshness_age_seconds if item.freshness_age_seconds is not None else 'N/A'}s",
+                f"last_success={item.last_success_at_utc.isoformat() if item.last_success_at_utc else 'N/A'}",
+                f"reason={item.reason or 'none'}",
+            )
+
+        stats = EventStore().storage_stats()
+        print(
+            "Event storage:",
+            f"hot_bytes={stats.hot_bytes}",
+            f"hot_lines={stats.hot_lines}",
+            f"warm_bytes={stats.warm_archive_bytes}",
+            f"warm_segments={stats.warm_archive_segments}",
+            f"cold_bytes={stats.cold_archive_bytes}",
+            f"cold_segments={stats.cold_archive_segments}",
+            f"dead_letter_bytes={stats.dead_letter_bytes}",
+            f"manifest_segments={stats.manifest_segments}",
+        )
+    except Exception as exc:
+        print(
+            "O'Pip provider-health/storage telemetry unavailable; "
+            "production unaffected:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
 def _run_cycle_once() -> None:
     # Reconcile the exchange first so stale OHM lifecycle state cannot drive
     # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
@@ -231,6 +325,11 @@ def _run_cycle_once() -> None:
     # Shadow paper simulation is lower priority than every real lifecycle
     # workflow. Authoritative Freqtrade runs in a separate Compose stack.
     _run_paper_monitor_fail_open()
+
+    # Sequence 2 event evidence is also lower priority than every real
+    # lifecycle workflow, but unlike broad discovery it runs independently of
+    # SEARCH mode/finalist selection on its own bounded cadence.
+    _run_event_intelligence_fail_open(settings=get_settings())
 
     # Broad discovery is state/capacity/time gated. This is the only branch
     # that can reach the paid Chief analysis path.

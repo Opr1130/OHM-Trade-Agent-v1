@@ -57,6 +57,9 @@ class ReferenceValidationSummary:
     unavailable: int
     ambiguous: int
     api_mode: str
+    provider_error_kind: str | None = None
+    rate_limited: bool = False
+    retry_after_seconds: int | None = None
 
 
 def _symbol(value: str) -> str:
@@ -226,10 +229,16 @@ def validate_finalist_references(
     api_mode = client.api_mode
     requested = candidates[:8]
     symbols = [_candidate_symbol(item) for item in requested]
+    provider_error_kind = None
+    rate_limited = False
+    retry_after_seconds = None
     try:
         rows = client.get_markets_by_symbols(symbols)
-    except CoinGeckoAPIError:
+    except CoinGeckoAPIError as exc:
         rows = []
+        provider_error_kind = type(exc).__name__
+        rate_limited = bool(getattr(exc, "rate_limited", False))
+        retry_after_seconds = getattr(exc, "retry_after_seconds", None)
         for candidate in requested:
             candidate.independent_market_reference = _unavailable(api_mode, "CoinGecko batch request unavailable")
     else:
@@ -251,4 +260,7 @@ def validate_finalist_references(
         unavailable=sum(bool(item and not item.available) for item in references),
         ambiguous=sum(bool(item and item.mapping_status == AMBIGUOUS) for item in references),
         api_mode=api_mode,
+        provider_error_kind=provider_error_kind,
+        rate_limited=rate_limited,
+        retry_after_seconds=retry_after_seconds,
     )

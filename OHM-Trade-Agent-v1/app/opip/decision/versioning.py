@@ -14,8 +14,10 @@ detectable in the evidence even if nobody remembers to bump a label.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 
@@ -49,6 +51,35 @@ def gate_policy_fingerprint() -> str:
         allow_nan=False,
     )
     return "GPF:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+@lru_cache(maxsize=1)
+def app_code_fingerprint() -> str:
+    """Return a conservative SHA-256 fingerprint of the shipped app source.
+
+    Any Python source change anywhere under the application tree changes this
+    fingerprint. Exact historical replay should refuse an uncertain checkout
+    rather than certify compatibility from a manually maintained label.
+
+    The value is cached for the process lifetime intentionally. Python normally
+    executes modules already loaded into memory; an on-disk source edit does
+    not change that running bytecode. A fresh replay process recomputes the
+    fingerprint and therefore rejects a different checkout. Code that
+    deliberately reloads modules must clear this cache as part of that explicit
+    non-standard lifecycle.
+    """
+    app_root = Path(__file__).resolve().parents[2]
+    digest = hashlib.sha256()
+    for path in sorted(
+        app_root.rglob("*.py"),
+        key=lambda item: item.relative_to(app_root).as_posix(),
+    ):
+        relative = path.relative_to(app_root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return "ACF:" + digest.hexdigest()
 
 
 def version_stamp() -> dict[str, Any]:
