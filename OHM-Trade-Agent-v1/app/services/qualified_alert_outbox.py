@@ -19,6 +19,7 @@ from app.services.pending_setup_registry import (
     terminalize_pending_setup,
 )
 from app.services.qualified_trade_tracking import (
+    ReconciliationIdentityMismatch,
     ReconciliationTrackingDisabled,
     register_reconciliation_intent,
 )
@@ -159,7 +160,13 @@ def _record_malformed_outbox(
     trade_id: str,
     row: dict | None,
     reason: str,
-) -> None:
+) -> bool:
+    """Audit malformed delivery state and retire its waiting lifecycle.
+
+    The outbox row is safe to delete only after the pending lifecycle is known
+    to be non-waiting. Audit failure is observable but does not block the
+    lifecycle transition; lifecycle/registry failure keeps the row retryable.
+    """
     payload = row if isinstance(row, dict) else {}
     try:
         record_telegram_not_eligible(
@@ -183,13 +190,29 @@ def _record_malformed_outbox(
             signal_id=payload.get("signal_id"),
             trade_id=trade_id,
         )
-    except Exception:
-        # Audit transport/storage must not keep a corrupt outbox row alive.
-        pass
+    except Exception as exc:
+        print(
+            "O'Pip malformed-outbox audit failed:",
+            f"trade_id={trade_id}",
+            f"{type(exc).__name__}: {exc}",
+        )
+
     try:
-        terminalize_pending_setup(trade_id, "delivery_malformed")
-    except Exception:
-        pass
+        lifecycle = get_pending_setup_record(trade_id)
+        lifecycle_status = str((lifecycle or {}).get("status") or "")
+        if lifecycle is None or lifecycle_status != "waiting":
+            return True
+        if terminalize_pending_setup(trade_id, "delivery_malformed"):
+            return True
+        refreshed = get_pending_setup_record(trade_id)
+        return str((refreshed or {}).get("status") or "") != "waiting"
+    except Exception as exc:
+        print(
+            "O'Pip malformed-outbox lifecycle transition failed:",
+            f"trade_id={trade_id}",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
 
 
 def _retry_one(
@@ -221,13 +244,16 @@ def _retry_one(
         if not math.isfinite(leverage) or leverage <= 0:
             raise ValueError("qualified alert outbox leverage is invalid")
     except Exception as exc:
-        _record_malformed_outbox(
+        retired = _record_malformed_outbox(
             trade_id=trade_id,
             row=row,
             reason=f"OUTBOX_MALFORMED:{type(exc).__name__}",
         )
-        _remove(trade_id, token=lease_token)
-        return "MALFORMED"
+        if retired:
+            _remove(trade_id, token=lease_token)
+            return "MALFORMED"
+        _release(trade_id, lease_token)
+        return "MALFORMED_PENDING"
 
     lifecycle = get_pending_setup_record(trade_id)
     lifecycle_status = str((lifecycle or {}).get("status") or "")
@@ -275,6 +301,62 @@ def _retry_one(
                 trade_id=trade_id,
             )
             return "SUPPRESSED"
+        except ReconciliationIdentityMismatch as exc:
+            try:
+                transitioned = terminalize_pending_setup(
+                    trade_id,
+                    "tracking_failed",
+                )
+                lifecycle_after = get_pending_setup_record(trade_id)
+                lifecycle_after_status = str(
+                    (lifecycle_after or {}).get("status") or ""
+                )
+            except Exception as transition_exc:
+                transitioned = False
+                lifecycle_after_status = "waiting"
+                print(
+                    "O'Pip reconciliation-mismatch terminalization failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(transition_exc).__name__}: {transition_exc}",
+                )
+
+            if transitioned or lifecycle_after_status != "waiting":
+                _remove(trade_id, token=lease_token)
+                record_telegram_suppression(
+                    identity=str(
+                        row.get("identity")
+                        or f"QUALIFIED_OPPORTUNITY:{trade_id}"
+                    ),
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action or "ACTION",
+                    fingerprint=str(row.get("fingerprint") or ""),
+                    reason="TRACKING_IDENTITY_MISMATCH_TERMINAL",
+                    symbol=plan.symbol,
+                    journey_id=row.get("journey_id"),
+                    signal_id=row.get("signal_id"),
+                    trade_id=trade_id,
+                )
+                return "SUPPRESSED"
+
+            _release(trade_id, lease_token)
+            record_telegram_suppression(
+                identity=str(
+                    row.get("identity")
+                    or f"QUALIFIED_OPPORTUNITY:{trade_id}"
+                ),
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action or "ACTION",
+                fingerprint=str(row.get("fingerprint") or ""),
+                reason=(
+                    "TRACKING_IDENTITY_MISMATCH_TERMINALIZATION_PENDING:"
+                    f"{type(exc).__name__}"
+                ),
+                symbol=plan.symbol,
+                journey_id=row.get("journey_id"),
+                signal_id=row.get("signal_id"),
+                trade_id=trade_id,
+            )
+            return "TRACKING_PENDING"
         except Exception as exc:
             _release(trade_id, lease_token)
             record_telegram_suppression(
@@ -368,11 +450,14 @@ def retry_qualified_alerts(
     pending = 0
     for trade_id, row in list(rows.items()):
         if not isinstance(row, dict):
-            _record_malformed_outbox(
+            retired = _record_malformed_outbox(
                 trade_id=str(trade_id),
                 row=None,
                 reason="OUTBOX_MALFORMED:NON_DICT_ROW",
             )
+            if not retired:
+                pending += 1
+                continue
             try:
                 with registry_lock(_lock_file()):
                     current = load_json(OUTBOX_FILE)
