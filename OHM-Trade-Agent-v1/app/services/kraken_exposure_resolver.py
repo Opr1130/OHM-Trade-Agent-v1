@@ -259,7 +259,7 @@ class KrakenExposureResolver:
             if direction == "LONG":
                 managed_position_keys.add((pair, "LONG"))
                 for quote in (
-                    "USDT", "USD", "EUR", "GBP", "CAD", "AUD",
+                    "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
                     "JPY", "CHF", "BTC", "ETH",
                 ):
                     if pair.endswith(quote) and len(pair) > len(quote):
