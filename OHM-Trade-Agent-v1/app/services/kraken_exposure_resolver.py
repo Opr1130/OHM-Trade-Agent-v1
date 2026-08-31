@@ -321,9 +321,23 @@ class KrakenExposureResolver:
             notionals = {}
 
         minimum_notional = _minimum_unmanaged_notional_usd()
+        unpriced_assets: list[str] = []
         for asset, quantity in sorted(canonical_balances.items()):
             pair = pairs_by_asset.get(asset)
             if not pair:
+                unpriced_assets.append(asset)
+                exposures.append(
+                    ResolvedExposure(
+                        status="VERIFIED_UNMANAGED",
+                        symbol=asset,
+                        direction="LONG",
+                        observed_quantity=quantity,
+                        reason=(
+                            "Kraken reports a non-zero balance with no USD/USDT pair; "
+                            "USD notional is unavailable"
+                        ),
+                    )
+                )
                 continue
             notional = notionals.get(asset)
             if notional is not None and notional < minimum_notional:
@@ -368,8 +382,17 @@ class KrakenExposureResolver:
         reasons = [
             reason for reason in (registry_reason, pair_catalog_reason) if reason
         ]
+        if unpriced_assets:
+            reasons.append(
+                "USD/USDT pricing unavailable for held assets: "
+                + ",".join(sorted(unpriced_assets))
+            )
         return ExposureResolution(
             exposures=tuple(exposures),
-            coverage_complete=registry_available and pair_catalog_available,
+            coverage_complete=(
+                registry_available
+                and pair_catalog_available
+                and not unpriced_assets
+            ),
             reason="; ".join(reasons),
         )
