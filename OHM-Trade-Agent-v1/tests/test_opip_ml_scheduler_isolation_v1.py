@@ -280,6 +280,9 @@ def test_learning_capture_uses_bounded_outbox_cursor_and_disk_dedup():
     assert "CHECKPOINT_SOURCE_DIVERGED" in source
     assert "sqlite3.connect" in source
     assert "snapshot_ids" in source
+    assert "LEDGER_INDEX_RECONCILE_MAX_ROWS" in source
+    assert "LEDGER_INDEX_RECONCILE_MAX_BYTES" in source
+    assert "index_catchup_in_progress" in source
     assert "_read_complete_outbox_lines" not in source
     assert "_ledger_snapshot_ids" not in source
 
