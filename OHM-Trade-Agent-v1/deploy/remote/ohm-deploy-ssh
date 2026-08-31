@@ -5,9 +5,12 @@ ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
 if [[ "$ORIGINAL" =~ ^deploy[[:space:]]+([0-9a-f]{40})$ ]]; then
   TARGET_SHA="${BASH_REMATCH[1]}"
-else
-  echo "refusing command" >&2
-  exit 64
+  exec sudo /usr/local/sbin/ohm-deploy "$TARGET_SHA"
 fi
 
-exec sudo /usr/local/sbin/ohm-deploy "$TARGET_SHA"
+if [[ "$ORIGINAL" == "diagnose-learning" ]]; then
+  exec sudo /usr/local/sbin/ohm-deploy diagnose-learning
+fi
+
+echo "refusing command" >&2
+exit 64
