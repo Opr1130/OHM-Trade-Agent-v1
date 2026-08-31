@@ -165,10 +165,12 @@ def send_monitor_update(
 
     try:
         state = _load_state()
+        state_loaded = True
     except (OSError, TimeoutError, RegistryIOError):
         # Protection actions fail open into NotificationPolicy for critical
         # classes; do not let a local monitor-state file silence EXIT/TP.
         state = {}
+        state_loaded = False
 
     # HEALTHY/HOLD is user-silent, but record the recovery internally. Without
     # this transition a later return to the same WARNING fingerprint could be
@@ -188,10 +190,11 @@ def send_monitor_update(
                 "risk_progress": risk_progress,
                 "mfe_giveback_r": mfe_giveback_r,
             }
-            try:
-                _save_state(state)
-            except (OSError, TimeoutError, RegistryIOError):
-                pass
+            if state_loaded:
+                try:
+                    _save_state(state)
+                except (OSError, TimeoutError, RegistryIOError):
+                    pass
         return False
 
     previous = state.get(trade.symbol)
@@ -292,10 +295,11 @@ def send_monitor_update(
             "risk_progress": risk_progress,
             "mfe_giveback_r": mfe_giveback_r,
         }
-        try:
-            _save_state(state)
-        except (OSError, TimeoutError, RegistryIOError):
-            pass
+        if state_loaded:
+            try:
+                _save_state(state)
+            except (OSError, TimeoutError, RegistryIOError):
+                pass
         record_emitted(
             identity=identity,
             event_type=policy_event_type,
