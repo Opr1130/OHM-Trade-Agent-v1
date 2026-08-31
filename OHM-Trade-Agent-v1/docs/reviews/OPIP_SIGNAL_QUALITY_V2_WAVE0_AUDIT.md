@@ -34,21 +34,20 @@ docker compose exec -T ohm-trade-agent python - <<'PY'
 import json
 from collections import Counter
 
-from app.exchanges.kraken_identity import canonicalize_asset, canonicalize_pair
+from app.exchanges.kraken_identity import (
+    canonicalize_asset,
+    canonicalize_pair,
+    split_canonical_pair,
+)
 from app.exchanges.kraken_private import KrakenPrivateClient
 from app.services.active_trade_registry import get_active_trades
 from app.services.kraken_reconciliation import reconciliation_enabled, reconciliation_mode
 from app.services.pending_setup_registry import PENDING_FILE
 from app.services.registry_io import load_json, registry_lock
 
-QUOTES = ('USDT','USD','EUR','GBP','CAD','AUD','JPY','CHF','BTC','ETH')
-
 def base_asset(symbol):
-    pair = canonicalize_pair(symbol)
-    for quote in QUOTES:
-        if pair.endswith(quote) and len(pair) > len(quote):
-            return pair[:-len(quote)]
-    return None
+    identity = split_canonical_pair(symbol)
+    return identity[0] if identity else None
 
 result = {
     'reconciliation': {
