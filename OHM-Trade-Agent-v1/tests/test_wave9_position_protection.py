@@ -227,7 +227,7 @@ def test_unpriced_non_cash_holding_is_never_silently_dropped():
     assert exposure.status == "VERIFIED_UNMANAGED"
     assert exposure.symbol == "ABC"
     assert exposure.observed_quantity == pytest.approx(3.0)
-    assert "no USD/USDT pair" in exposure.reason
+    assert "no USD/stable-quote pair" in exposure.reason
 
 
 def test_managed_usdc_pair_does_not_duplicate_as_unmanaged():
