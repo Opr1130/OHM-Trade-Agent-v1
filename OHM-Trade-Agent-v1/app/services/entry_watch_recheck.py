@@ -8,6 +8,7 @@ from app.services.entry_exit_advisor import build_entry_exit_plan
 from app.services.entry_watch_queue import (
     defer_entry_watch,
     due_entry_watch,
+    remove_entry_watch,
 )
 
 
@@ -48,6 +49,8 @@ def recheck_due_entry_watch(
         risk_level = str(row.get("risk_level") or "low").lower()
         if not symbol or direction not in {"LONG", "SHORT"}:
             failures.append(f"{symbol or 'UNKNOWN'}: malformed entry-watch row")
+            if symbol:
+                remove_entry_watch(symbol, direction)
             continue
 
         try:
