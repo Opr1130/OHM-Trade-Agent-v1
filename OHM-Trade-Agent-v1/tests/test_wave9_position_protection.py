@@ -229,6 +229,97 @@ def test_unpriced_non_cash_holding_is_never_silently_dropped():
     assert "no USD/USDT pair" in exposure.reason
 
 
+def test_managed_usdc_pair_does_not_duplicate_as_unmanaged():
+    resolver = KrakenExposureResolver(
+        private_client=FakePrivate(balances={"SOL": 2.0}),
+        public_client=FakePublic(),
+        trade_loader=lambda: [trade(symbol="SOLUSDC")],
+    )
+
+    resolved = resolver.resolve()
+
+    managed = [e for e in resolved.exposures if e.status == "VERIFIED_MANAGED"]
+    unmanaged = [e for e in resolved.exposures if e.status == "VERIFIED_UNMANAGED"]
+    assert len(managed) == 1
+    assert unmanaged == []
+
+
+def test_unmanaged_notification_failure_does_not_stop_later_managed_protection(monkeypatch):
+    settings = SimpleNamespace(
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+    )
+    managed_trade = trade()
+    resolution = ExposureResolution(
+        exposures=(
+            ResolvedExposure(
+                status="VERIFIED_UNMANAGED",
+                symbol="ABC",
+                direction="LONG",
+                observed_quantity=1.0,
+                reason="unmanaged",
+            ),
+            ResolvedExposure(
+                status="VERIFIED_MANAGED",
+                symbol="SOLUSD",
+                direction="LONG",
+                observed_quantity=1.0,
+                reason="managed",
+                trade=managed_trade,
+            ),
+        ),
+        coverage_complete=True,
+    )
+    monkeypatch.setattr(active_trade_monitor_runner, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "KrakenExposureResolver",
+        lambda **kwargs: SimpleNamespace(resolve=lambda: resolution),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "_notify_unmanaged_holding",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("telegram broke")),
+    )
+    checked = []
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "monitor_trade",
+        lambda trade: checked.append(trade.symbol) or result(action="HOLD"),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "update_active_observation",
+        lambda trade, current_price: {"mfe_pct": 0.0},
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "refine_protection_action",
+        lambda trade, monitor_result, observation: monitor_result,
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "send_monitor_update",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "detect_emergency_move",
+        lambda trade: SimpleNamespace(triggered=False),
+    )
+    monkeypatch.setattr(
+        active_trade_monitor_runner,
+        "send_emergency_alert",
+        lambda **kwargs: False,
+    )
+
+    summary = active_trade_monitor_runner.run_active_trade_monitor()
+
+    assert checked == ["SOLUSD"]
+    assert summary.checked == 1
+    assert any("unmanaged-holding notification failed" in item for item in summary.failures)
+
+
 def test_mfe_giveback_promotes_hold_to_warning():
     t = trade()
     base = result(action="HOLD", price=104.0, pnl=4.0)
