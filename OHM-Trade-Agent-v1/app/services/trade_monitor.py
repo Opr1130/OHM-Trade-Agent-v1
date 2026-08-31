@@ -126,6 +126,11 @@ def monitor_trade(trade: ActiveTrade) -> TradeMonitorResult:
                 actual_entry_fee=trade.actual_entry_fee,
                 financing_fee=trade.financing_fee,
             )
+            if pnl.gross_pnl > 0 and pnl.net_pnl <= 0:
+                reasons.append(
+                    "Gross price move is positive but estimated net P/L remains "
+                    "negative after trading costs"
+                )
 
         return TradeMonitorResult(
             symbol=trade.symbol,
