@@ -12,6 +12,7 @@ from app.services import (
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.pending_setup_registry import PendingSetup
 from app.services.trade_action_gate import ActionGateDecision
+from app.services.qualified_trade_tracking import ReconciliationIdentityMismatch
 
 
 def plan(symbol="SOLUSD"):
@@ -131,6 +132,75 @@ def test_tracking_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, 
         rows = qualified_alert_outbox.load_json(qualified_alert_outbox.OUTBOX_FILE)
     assert waiting[0].trade_id in rows
     assert rows[waiting[0].trade_id]["reason"].startswith("TRACKING_PENDING:")
+
+
+def test_reconciliation_identity_mismatch_is_terminal_not_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_pending(tmp_path, monkeypatch)
+    queued = []
+    terminalized = []
+    suppressions = []
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "should_send_trade_plan",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "record_recommendation",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ReconciliationIdentityMismatch("conflict")
+        ),
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalized.append(
+            (trade_id, status)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "get_pending_setup_record",
+        lambda trade_id: {"status": "tracking_failed"},
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "queue_qualified_alert",
+        lambda **kwargs: queued.append(kwargs),
+    )
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "record_telegram_suppression",
+        lambda **kwargs: suppressions.append(kwargs),
+    )
+
+    candidate = {
+        "confidence": 88,
+        "decision": "alert",
+        "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "recommended_capital": 200.0,
+    }
+
+    assert not chief_alert_notifier.send_trade_plan(
+        candidate,
+        plan(),
+        "summary",
+        "token",
+        "chat",
+    )
+    assert terminalized == [(candidate["trade_id"], "tracking_failed")]
+    assert queued == []
+    assert suppressions[-1]["reason"] == "TRACKING_IDENTITY_MISMATCH_TERMINAL"
 
 
 def test_telegram_failure_keeps_qualified_setup_live_and_queues_retry(tmp_path, monkeypatch):
