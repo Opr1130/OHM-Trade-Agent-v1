@@ -181,7 +181,7 @@ def assess_continuation(
     if exhaustion_state == "MODERATE":
         score -= 10.0
 
-    score_int = int(round(max(0.0, min(100.0, score))))
+    score_int = round(max(0.0, min(100.0, score)))
     unavailable_families = sum(
         str(features.get(name) or "UNAVAILABLE").upper()
         in {"UNAVAILABLE", "UNRESOLVED", "UNKNOWN"}
@@ -236,7 +236,7 @@ def assess_entry(
         return EntryAssessment(
             snapshot_id=snapshot.snapshot_id,
             decision="VETO",
-            quality_score=int(round(score)),
+            quality_score=round(score),
             reasons=("CONTINUATION_FAILED",),
             exhaustion_risk=exhaustion_state,
         )
