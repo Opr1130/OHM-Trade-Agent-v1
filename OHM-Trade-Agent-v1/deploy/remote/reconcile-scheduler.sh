@@ -24,7 +24,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install crontab grep awk mktemp cp rm; do
+for cmd in install crontab grep awk mktemp cp rm id; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required command: $cmd" >&2
     exit 69
