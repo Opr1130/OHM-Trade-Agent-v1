@@ -10,11 +10,73 @@ from typing import Any
 
 from app.opip.ml.contracts import FeatureSnapshot
 from app.services.entry_exit_advisor import EntryExitPlan
-from app.services.registry_io import registry_lock
+from app.services.registry_io import registry_lock, save_json_atomic
 from app.services.trade_quality_assessor import TradePlanAssessment
 
 
 EVIDENCE_FILE = Path("/app/data/opip_trade_quality_evidence_v1.jsonl")
+EVIDENCE_INDEX_SCHEMA_VERSION = 1
+
+
+def _index_file(path: Path) -> Path:
+    return path.with_name(f"{path.name}.ids.json")
+
+
+def _scan_evidence_ids(path: Path) -> set[str]:
+    evidence_ids: set[str] = set()
+    if not path.exists():
+        return evidence_ids
+    with path.open("r", encoding="utf-8") as existing:
+        for line in existing:
+            try:
+                prior = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            evidence_id = prior.get("evidence_id") if isinstance(prior, dict) else None
+            if isinstance(evidence_id, str) and evidence_id:
+                evidence_ids.add(evidence_id)
+    return evidence_ids
+
+
+def _load_evidence_index(
+    *,
+    index_path: Path,
+    source_size_bytes: int,
+) -> set[str] | None:
+    if not index_path.exists():
+        return None
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != EVIDENCE_INDEX_SCHEMA_VERSION:
+        return None
+    if payload.get("source_size_bytes") != source_size_bytes:
+        return None
+    raw_ids = payload.get("evidence_ids")
+    if not isinstance(raw_ids, list) or not all(
+        isinstance(item, str) and item for item in raw_ids
+    ):
+        return None
+    return set(raw_ids)
+
+
+def _save_evidence_index(
+    *,
+    index_path: Path,
+    source_size_bytes: int,
+    evidence_ids: set[str],
+) -> None:
+    save_json_atomic(
+        index_path,
+        {
+            "schema_version": EVIDENCE_INDEX_SCHEMA_VERSION,
+            "source_size_bytes": source_size_bytes,
+            "evidence_ids": sorted(evidence_ids),
+        },
+    )
 
 
 def _lock_file(path: Path) -> Path:
@@ -111,15 +173,49 @@ def record_trade_quality_evidence(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with registry_lock(_lock_file(path)):
-        if path.exists():
-            with path.open("r", encoding="utf-8") as existing:
-                for line in existing:
-                    try:
-                        prior = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if prior.get("evidence_id") == evidence_id:
-                        return evidence_id
+        index_path = _index_file(path)
+        source_size = path.stat().st_size if path.exists() else 0
+        evidence_ids = _load_evidence_index(
+            index_path=index_path,
+            source_size_bytes=source_size,
+        )
+        index_rebuilt = evidence_ids is None
+        if evidence_ids is None:
+            evidence_ids = _scan_evidence_ids(path)
+
+        if evidence_id in evidence_ids:
+            if index_rebuilt:
+                _save_evidence_index(
+                    index_path=index_path,
+                    source_size_bytes=source_size,
+                    evidence_ids=evidence_ids,
+                )
+            return evidence_id
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    row,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                    default=str,
+                )
+                + "\n"
+            )
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+
+        evidence_ids.add(evidence_id)
+        _save_evidence_index(
+            index_path=index_path,
+            source_size_bytes=path.stat().st_size,
+            evidence_ids=evidence_ids,
+        )
+    return evidence_id
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
