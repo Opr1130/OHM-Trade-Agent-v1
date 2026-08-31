@@ -24,6 +24,7 @@ from app.services.pending_setup_registry import (
     PendingSetup,
     add_pending_setup,
     get_pending_setup_by_trade_id,
+    terminalize_pending_setup,
 )
 from app.services.price_movement_radar import attach_actionable_plan
 from app.services.qualified_alert_outbox import queue_qualified_alert
@@ -413,6 +414,7 @@ def send_trade_plan(
                 trade_id=trade_id,
             )
         except ReconciliationTrackingDisabled:
+            terminalize_pending_setup(trade_id, "tracking_disabled")
             record_telegram_suppression(
                 identity=identity,
                 alert_family="QUALIFIED_OPPORTUNITY",
