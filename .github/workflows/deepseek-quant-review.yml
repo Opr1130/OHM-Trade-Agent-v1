@@ -174,5 +174,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          body=$'## DeepSeek Quantitative Review\\n\\nREVIEW_WORKFLOW_FAILED. Inspect the DeepSeek Quantitative PR Review Actions run before relying on this review gate.'
+          body=. Inspect the DeepSeek Quantitative PR Review Actions run before relying on this review gate.'
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null || true
+## DeepSeek Quantitative Review\n\nREVIEW_WORKFLOW_FAILED. Inspect the DeepSeek Quantitative PR Review Actions run before relying on this review gate.'
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null || true
