@@ -115,6 +115,8 @@ if client.enabled:
         result['kraken']['audit_error'] = f'{type(exc).__name__}: {exc}'
 
 attention = []
+if not client.enabled:
+    attention.append('KRAKEN_CREDENTIALS_UNAVAILABLE')
 if not result['reconciliation']['enabled']:
     attention.append('KRAKEN_RECONCILIATION_DISABLED')
 if result['reconciliation']['mode'] != 'apply':
