@@ -350,6 +350,12 @@ def test_outbox_terminally_suppresses_disabled_reconciliation(monkeypatch):
             ReconciliationTrackingDisabled("disabled")
         ),
     )
+    terminalized = []
+    monkeypatch.setattr(
+        qualified_alert_outbox,
+        "terminalize_pending_setup",
+        lambda trade_id, status: terminalized.append((trade_id, status)) or True,
+    )
     monkeypatch.setattr(
         qualified_alert_outbox,
         "_remove",
@@ -368,6 +374,7 @@ def test_outbox_terminally_suppresses_disabled_reconciliation(monkeypatch):
     )
 
     assert status == "SUPPRESSED"
+    assert terminalized == [("Q-DISABLED", "tracking_disabled")]
     assert removed == [("Q-DISABLED", "lease")]
     assert suppressions[0]["reason"] == "RECONCILIATION_NOT_APPLY_TERMINAL"
 
