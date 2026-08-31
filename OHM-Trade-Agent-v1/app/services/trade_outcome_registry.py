@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,9 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
 OUTCOME_FILE = Path("/app/data/trade_outcomes.json")
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+FORECAST_HORIZON_VERSION = "capital-efficiency-hold-proxy-v1"
+DEFAULT_FORECAST_HORIZON_HOURS = 24.0
 
 
 def registry_lock_file() -> Path:
@@ -70,6 +73,19 @@ def _find_key(
     return None
 
 
+def _forecast_horizon_hours(candidate: dict[str, Any]) -> float:
+    raw = candidate.get("forecast_horizon_hours")
+    if raw is None:
+        raw = candidate.get("hold_proxy_hours")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_FORECAST_HORIZON_HOURS
+    if not math.isfinite(value) or value <= 0:
+        value = DEFAULT_FORECAST_HORIZON_HOURS
+    return max(1.0, min(DEFAULT_FORECAST_HORIZON_HOURS, value))
+
+
 def record_recommendation(
     *,
     trade_id: str | None,
@@ -86,6 +102,7 @@ def record_recommendation(
         if existing is not None:
             return existing
         direction = (candidate.get("direction") or getattr(plan, "direction", "LONG") or "LONG").upper()
+        forecast_horizon_hours = _forecast_horizon_hours(candidate)
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "trade_id": trade_id or "",
@@ -130,6 +147,8 @@ def record_recommendation(
             "outcome_event_definition": (
                 "TARGET_1_BEFORE_STOP_WITHIN_HORIZON"
             ),
+            "forecast_horizon_hours": forecast_horizon_hours,
+            "forecast_horizon_version": FORECAST_HORIZON_VERSION,
             "planned_entry_low": plan.entry_low,
             "planned_entry_high": plan.entry_high,
             "planned_chase_limit": plan.chase_limit,
@@ -367,7 +386,17 @@ def get_outcomes() -> list[dict[str, Any]]:
 
 def _target_before_stop(item: dict[str, Any], target_number: int) -> bool:
     target_at = _parse_time(item.get(f"target_{target_number}_first_observed_at"))
-    if target_at is None:
+    entered_at = _parse_time(item.get("entered_at"))
+    if target_at is None or entered_at is None:
+        return False
+    try:
+        horizon_hours = float(item.get("forecast_horizon_hours"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(horizon_hours) or horizon_hours <= 0:
+        return False
+    horizon_end = entered_at + timedelta(hours=horizon_hours)
+    if target_at > horizon_end:
         return False
     stop_at = _parse_time(item.get("stop_first_observed_at"))
     return stop_at is None or target_at <= stop_at
