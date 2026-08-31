@@ -10,6 +10,14 @@ ML_EVIDENCE_DST="/etc/cron.d/opip-ml-evidence"
 LEGACY_MOVEMENT="/etc/cron.d/ohm-movement-discovery"
 STREAM_RECONCILE="$APP_ROOT/deploy/remote/reconcile-stream-worker.sh"
 LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
+DEPLOY_SCRIPT_SRC="$APP_ROOT/deploy/remote/ohm-deploy"
+SSH_GATEWAY_SRC="$APP_ROOT/deploy/remote/ohm-deploy-ssh"
+LEARNING_READER_SRC="$APP_ROOT/deploy/remote/opip-learning-read-export.sh"
+LEARNING_DIAGNOSTICS_SRC="$APP_ROOT/deploy/remote/diagnose-opip-learning.sh"
+DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
+SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
+LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
+LEARNING_READER_STATE="/var/lib/opip-learning-reader"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run this scheduler reconciliation with sudo" >&2
@@ -23,7 +31,15 @@ for cmd in install crontab grep awk mktemp cp rm; do
   }
 done
 
-for required in "$CANONICAL_SRC" "$LEARNING_EXPORT_SRC" "$STREAM_RECONCILE" "$LEARNING_EXPORTER"; do
+for required in \
+  "$CANONICAL_SRC" \
+  "$LEARNING_EXPORT_SRC" \
+  "$STREAM_RECONCILE" \
+  "$LEARNING_EXPORTER" \
+  "$DEPLOY_SCRIPT_SRC" \
+  "$SSH_GATEWAY_SRC" \
+  "$LEARNING_READER_SRC" \
+  "$LEARNING_DIAGNOSTICS_SRC"; do
   if [[ ! -s "$required" ]]; then
     echo "required production scheduler artifact missing: $required" >&2
     exit 69
@@ -107,6 +123,16 @@ trap rollback ERR
 install -o root -g root -m 0644 "$CANONICAL_SRC" "$CANONICAL_DST"
 install -o root -g root -m 0644 "$LEARNING_EXPORT_SRC" "$LEARNING_EXPORT_DST"
 
+# Refresh forced-command remote operations from the exact deployed SHA. This
+# keeps the production deploy gateway and read-only learning observability in
+# lockstep with the checked-out release without relaxing SSH authority.
+install -o root -g root -m 0755 "$DEPLOY_SCRIPT_SRC" "$DEPLOY_SCRIPT_DST"
+install -o root -g root -m 0755 "$SSH_GATEWAY_SRC" "$SSH_GATEWAY_DST"
+install -o root -g root -m 0755 "$LEARNING_READER_SRC" "$LEARNING_READER_DST"
+if id opiplearn >/dev/null 2>&1; then
+  install -d -o opiplearn -g opiplearn -m 0750 "$LEARNING_READER_STATE"
+fi
+
 # Learning compute is no longer permitted on the production droplet.
 rm -f "$ML_EVIDENCE_DST"
 rm -f "$LEGACY_MOVEMENT"
@@ -150,3 +176,4 @@ echo "learning_compute=REMOTE_ONLY"
 echo "local_ml_evidence_cron=ABSENT"
 echo "learning_export=$LEARNING_EXPORT_DST"
 echo "learning_export_cadence=2 minutes + 40s offset"
+echo "learning_reader_observability=ENABLED"
