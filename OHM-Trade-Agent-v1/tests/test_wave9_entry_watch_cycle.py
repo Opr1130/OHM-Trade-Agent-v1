@@ -128,12 +128,25 @@ def test_not_ready_does_not_bypass_normal_scan_cadence(monkeypatch):
     assert calls == []
 
 
-def test_fast_recheck_is_after_active_protection_and_before_pending_monitor():
-    source = inspect.getsource(run_cycle._run_cycle_once)
-    active = source.index("monitor_active_main()")
-    recheck = source.index("_run_entry_watch_recheck_fail_open()", active)
-    pending = source.index("monitor_pending_main()", active)
-    assert active < recheck < pending
+def test_fast_recheck_is_after_active_protection_and_before_pending_monitor(monkeypatch):
+    _patch_cycle(monkeypatch, entry_ready=False, search_due=False)
+    calls = []
+    monkeypatch.setattr(run_cycle, "monitor_active_main", lambda: calls.append("active"))
+    monkeypatch.setattr(
+        run_cycle,
+        "_run_qualified_alert_retry_fail_open",
+        lambda **kwargs: calls.append("retry"),
+    )
+    monkeypatch.setattr(
+        run_cycle,
+        "_run_entry_watch_recheck_fail_open",
+        lambda: calls.append("recheck") or False,
+    )
+    monkeypatch.setattr(run_cycle, "monitor_pending_main", lambda: calls.append("pending"))
+
+    run_cycle._run_cycle_once()
+
+    assert calls[:4] == ["active", "retry", "recheck", "pending"]
 
 
 def test_fast_recheck_has_no_telegram_or_notifier_authority():
