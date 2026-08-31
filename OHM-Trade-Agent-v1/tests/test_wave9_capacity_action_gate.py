@@ -201,3 +201,20 @@ def test_post_cap_minimum_notional_rejects_without_validation_inputs(monkeypatch
     assert candidate["recommended_capital"] == 50.0
     assert candidate["recommended_position_notional"] == 50.0
     assert "minimum executable notional" in decision.reason
+
+def test_action_gate_rejects_invalid_account_capital():
+    candidate = {
+        "economic_qualified": True,
+        "direction": "LONG",
+    }
+
+    decision = trade_action_gate.apply_action_gate(
+        candidate=candidate,
+        plan=_plan(),
+        account_capital=0.0,
+        active_trades=[],
+    )
+
+    assert decision.allowed is False
+    assert candidate["action_gate_allowed"] is False
+    assert "account capital" in decision.reason
