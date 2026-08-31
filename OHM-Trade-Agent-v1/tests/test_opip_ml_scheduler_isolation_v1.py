@@ -231,7 +231,11 @@ def test_learning_reader_key_is_forced_read_only_and_source_bound():
     assert "tar -C" in reader
     assert "flock -s 8" in reader
     assert "last_sync_request.env" in reader
+    assert "last_successful_sync_at_utc" in reader
+    assert "sync_success_at=" in reader
     assert "opip-export-v2 sha=" in sync
+    assert "sync_success_at=" in sync
+    assert "last_sync_at_utc" in sync
     assert "capture_at=" in sync
     assert "outcomes_at=" in sync
     assert "rsync" not in sync
