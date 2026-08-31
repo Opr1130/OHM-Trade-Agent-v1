@@ -422,8 +422,23 @@ def send_trade_plan(
                     fingerprint=key,
                     reason=f"TRACKING_PENDING:{type(exc).__name__}",
                 )
-            except Exception:
-                pass
+            except Exception as queue_exc:
+                print(
+                    "O'Pip qualified alert queueing failed:",
+                    f"trade_id={trade_id}",
+                    f"{type(queue_exc).__name__}: {queue_exc}",
+                )
+                record_telegram_suppression(
+                    identity=identity,
+                    alert_family="QUALIFIED_OPPORTUNITY",
+                    event_type=action,
+                    fingerprint=key,
+                    reason="TRACKING_PENDING_UNQUEUEABLE",
+                    symbol=plan.symbol,
+                    journey_id=candidate.get("journey_id"),
+                    signal_id=candidate.get("signal_id"),
+                    trade_id=trade_id,
+                )
             # Tracking failure is operational/transport state, not rejection.
             return False
 
@@ -508,6 +523,21 @@ def send_trade_plan(
                 fingerprint=key,
                 reason="DELIVERY_PENDING",
             )
-        except Exception:
-            pass
+        except Exception as queue_exc:
+            print(
+                "O'Pip qualified alert queueing failed:",
+                f"trade_id={trade_id}",
+                f"{type(queue_exc).__name__}: {queue_exc}",
+            )
+            record_telegram_suppression(
+                identity=identity,
+                alert_family="QUALIFIED_OPPORTUNITY",
+                event_type=action,
+                fingerprint=key,
+                reason="DELIVERY_PENDING_UNQUEUEABLE",
+                symbol=plan.symbol,
+                journey_id=candidate.get("journey_id"),
+                signal_id=candidate.get("signal_id"),
+                trade_id=trade_id,
+            )
     return False
