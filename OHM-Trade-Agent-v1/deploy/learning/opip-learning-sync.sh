@@ -4,6 +4,7 @@ set -Eeuo pipefail
 ENV_FILE="/etc/opip-learning.env"
 LOCK_FILE="/var/lock/opip-learning-plane.lock"
 DATA_ROOT="/var/lib/opip-learning/data"
+STATE_ROOT="/var/lib/opip-learning/state"
 INCOMING="$DATA_ROOT/.incoming"
 ARCHIVE="$DATA_ROOT/.export.tar"
 
@@ -16,7 +17,13 @@ source "$ENV_FILE"
 
 : "${OPIP_PRODUCTION_HOST:?OPIP_PRODUCTION_HOST is required}"
 : "${OPIP_PRODUCTION_USER:?OPIP_PRODUCTION_USER is required}"
+: "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 : "${OPIP_LEARNING_SSH_KEY:=/root/.ssh/opip-learning}"
+
+[[ "$OPIP_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "invalid OPIP_DEPLOYED_SHA" >&2
+  exit 78
+}
 
 for cmd in ssh tar install flock mv date sha256sum stat awk rm; do
   command -v "$cmd" >/dev/null 2>&1 || {
@@ -33,9 +40,47 @@ if ! flock -n 9; then
   exit 0
 fi
 
+state_value() {
+  local file="$1"
+  local key="$2"
+  awk -F= -v k="$key" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true
+}
+
+status_time() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    printf '%s\n' "$raw"
+  else
+    printf 'NONE\n'
+  fi
+}
+
+status_rc() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$raw"
+  else
+    printf 'NONE\n'
+  fi
+}
+
+capture_file="$STATE_ROOT/capture.last.env"
+outcomes_file="$STATE_ROOT/outcomes.last.env"
+capture_at="$(status_time "$(state_value "$capture_file" finished_at_utc)")"
+capture_rc="$(status_rc "$(state_value "$capture_file" exit_code)")"
+outcomes_at="$(status_time "$(state_value "$outcomes_file" finished_at_utc)")"
+outcomes_rc="$(status_rc "$(state_value "$outcomes_file" exit_code)")"
+status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc"
+
 rm -f "$INCOMING"/* "$ARCHIVE"
 
-ssh   -i "$OPIP_LEARNING_SSH_KEY"   -o BatchMode=yes   -o StrictHostKeyChecking=yes   -o ConnectTimeout=10   "$OPIP_PRODUCTION_USER@$OPIP_PRODUCTION_HOST"   opip-export-v1 > "$ARCHIVE"
+ssh \
+  -i "$OPIP_LEARNING_SSH_KEY" \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=yes \
+  -o ConnectTimeout=10 \
+  "$OPIP_PRODUCTION_USER@$OPIP_PRODUCTION_HOST" \
+  "$status_command" > "$ARCHIVE"
 
 tar -xf "$ARCHIVE" -C "$INCOMING"
 
@@ -92,6 +137,7 @@ for name in p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; 
 done
 rm -f "$ARCHIVE"
 
-printf 'last_sync_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"   > "$DATA_ROOT/.last_sync"
+printf 'last_sync_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$DATA_ROOT/.last_sync"
 
 echo "O'Pip learning evidence sync: OK"
