@@ -143,11 +143,18 @@ def upsert_candidate(observation: CandidateObservation) -> QueueSummary:
         liquidity = _finite_optional(observation.liquidity_usd)
         priority = _finite_optional(observation.priority_score) or 0.0
 
-        row["latest_price"] = price
-        row["relative_strength_percentile"] = rs
-        row["volume_acceleration_score"] = volume
-        row["liquidity_usd"] = liquidity
-        row["priority_score"] = max(0.0, min(100.0, priority))
+        if price is not None:
+            row["latest_price"] = price
+        if rs is not None:
+            row["relative_strength_percentile"] = rs
+        if volume is not None:
+            row["volume_acceleration_score"] = volume
+        if liquidity is not None:
+            row["liquidity_usd"] = liquidity
+        row["priority_score"] = max(
+            float(row.get("priority_score") or 0.0),
+            max(0.0, min(100.0, priority)),
+        )
 
         rs_history = list(row.get("relative_strength_history") or [])
         volume_history = list(row.get("volume_acceleration_history") or [])
