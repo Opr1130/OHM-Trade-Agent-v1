@@ -103,6 +103,12 @@ def due_entry_watch(*, now: datetime | None = None) -> list[dict]:
                 rows.pop(key, None)
                 changed = True
                 continue
+            symbol = str(row.get("symbol") or "").upper()
+            direction = str(row.get("direction") or "").upper()
+            if not symbol or direction not in {"LONG", "SHORT"}:
+                rows.pop(key, None)
+                changed = True
+                continue
             expires = _parse(row.get("expires_at"))
             if expires is None or expires <= current:
                 rows.pop(key, None)
