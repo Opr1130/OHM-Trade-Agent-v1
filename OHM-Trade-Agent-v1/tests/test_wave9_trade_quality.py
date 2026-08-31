@@ -4,7 +4,7 @@ import pytest
 
 from app.opip.ml.temporal import TemporalIntegrityError
 from app.scanner.models import MarketSnapshot
-from app.services import entry_watch_queue
+from app.services import entry_watch_queue, trade_quality_assessor
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.trade_feature_snapshot import build_trade_feature_snapshot
 from app.services.trade_quality_assessor import (
@@ -174,6 +174,24 @@ def test_runtime_liquidity_floor_is_honored():
         plan(),
         min_liquidity_usd=200_000.0,
     )
+    assert assessment.continuation.decision == "FAIL"
+    assert "LIQUIDITY_BELOW_CONFIGURED_MINIMUM" in assessment.continuation.vetoes
+
+
+def test_default_liquidity_floor_uses_resolved_settings(monkeypatch):
+    monkeypatch.setattr(
+        trade_quality_assessor,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {"signal_quality_min_liquidity_usd": 200_000.0},
+        )(),
+    )
+    market = snapshot(liquidity=150_000.0)
+
+    assessment = assess_trade_quality(feature_snapshot(market), plan())
+
     assert assessment.continuation.decision == "FAIL"
     assert "LIQUIDITY_BELOW_CONFIGURED_MINIMUM" in assessment.continuation.vetoes
 
