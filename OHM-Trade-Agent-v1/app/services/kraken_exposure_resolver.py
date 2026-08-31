@@ -247,6 +247,7 @@ class KrakenExposureResolver:
         exposures: list[ResolvedExposure] = []
         managed_spot_assets: set[str] = set()
         managed_position_keys: set[tuple[str, str]] = set()
+        managed_resolution_gaps: list[str] = []
 
         for trade in local_trades:
             verification = verify_trade_against_snapshot(
@@ -256,25 +257,38 @@ class KrakenExposureResolver:
             )
             direction = (trade.direction or "LONG").upper()
             pair = canonicalize_pair(trade.symbol)
-            if direction == "LONG":
-                try:
-                    leverage = float(trade.margin_leverage or 1.0)
-                except (TypeError, ValueError):
-                    leverage = math.nan
-                if math.isfinite(leverage) and leverage > 1.0:
-                    managed_position_keys.add((pair, "LONG"))
+            if verification.status == "VERIFIED":
+                if direction == "LONG":
+                    try:
+                        leverage = float(trade.margin_leverage or 1.0)
+                    except (TypeError, ValueError):
+                        leverage = math.nan
+                    if not math.isfinite(leverage) or leverage <= 0:
+                        managed_resolution_gaps.append(
+                            f"{trade.symbol}: invalid lifecycle leverage"
+                        )
+                    elif leverage > 1.0:
+                        managed_position_keys.add((pair, "LONG"))
+                    else:
+                        for quote in (
+                            "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
+                            "JPY", "CHF", "BTC", "ETH",
+                        ):
+                            if pair.endswith(quote) and len(pair) > len(quote):
+                                managed_spot_assets.add(
+                                    canonicalize_asset(pair[: -len(quote)])
+                                )
+                                break
+                elif direction == "SHORT":
+                    managed_position_keys.add((pair, direction))
                 else:
-                    for quote in (
-                        "USDT", "USDC", "USD", "EUR", "GBP", "CAD", "AUD",
-                        "JPY", "CHF", "BTC", "ETH",
-                    ):
-                        if pair.endswith(quote) and len(pair) > len(quote):
-                            managed_spot_assets.add(
-                                canonicalize_asset(pair[: -len(quote)])
-                            )
-                            break
-            else:
-                managed_position_keys.add((pair, direction))
+                    managed_resolution_gaps.append(
+                        f"{trade.symbol}: unsupported lifecycle direction {direction}"
+                    )
+            elif verification.status == "UNAVAILABLE":
+                managed_resolution_gaps.append(
+                    f"{trade.symbol}: {verification.reason}"
+                )
 
             status = {
                 "VERIFIED": "VERIFIED_MANAGED",
@@ -423,6 +437,11 @@ class KrakenExposureResolver:
                 "Kraken account state contains unresolved records: "
                 + "; ".join(account_state_gaps[:8])
             )
+        if managed_resolution_gaps:
+            reasons.append(
+                "Managed lifecycle verification incomplete: "
+                + "; ".join(managed_resolution_gaps[:8])
+            )
         return ExposureResolution(
             exposures=tuple(exposures),
             coverage_complete=(
@@ -430,6 +449,7 @@ class KrakenExposureResolver:
                 and pair_catalog_available
                 and not unpriced_assets
                 and not account_state_gaps
+                and not managed_resolution_gaps
             ),
             reason="; ".join(reasons),
         )
