@@ -1129,7 +1129,11 @@ def main():
                 candidate_id=candidate_id,
                 regime=market_regime.regime,
             )
-            trade_quality = assess_trade_quality(feature_snapshot, plan)
+            trade_quality = assess_trade_quality(
+                feature_snapshot,
+                plan,
+                min_liquidity_usd=float(settings.signal_quality_min_liquidity_usd),
+            )
             alert["feature_snapshot_id"] = feature_snapshot.snapshot_id
             alert["continuation_score"] = trade_quality.continuation.score
             alert["continuation_decision"] = trade_quality.continuation.decision
