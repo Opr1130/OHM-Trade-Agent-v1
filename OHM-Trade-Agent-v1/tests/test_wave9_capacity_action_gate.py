@@ -150,3 +150,54 @@ def test_capacity_above_allocation_does_not_change_recommendation(monkeypatch):
     assert decision.allowed is True
     assert candidate["recommended_capital"] == 300.0
     assert candidate["liquidity_capacity_capped"] is False
+
+def test_action_gate_rejects_missing_economic_qualification():
+    candidate = {"direction": "LONG"}
+
+    decision = trade_action_gate.apply_action_gate(
+        candidate=candidate,
+        plan=_plan(),
+        account_capital=2_000.0,
+        active_trades=[],
+    )
+
+    assert decision.allowed is False
+    assert candidate["action_gate_allowed"] is False
+    assert "economic qualification is required" in decision.reason
+
+
+def test_post_cap_minimum_notional_rejects_without_validation_inputs(monkeypatch):
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_trade_decision",
+        lambda **kwargs: _intelligence(400.0),
+    )
+    monkeypatch.setattr(
+        trade_action_gate,
+        "evaluate_portfolio_risk",
+        lambda **kwargs: PortfolioRiskDecision(
+            allowed=True,
+            reason="portfolio risk limits satisfied",
+            open_positions=0,
+            gross_exposure=0.0,
+            proposed_exposure=kwargs["proposed_capital"],
+            proposed_total_exposure=kwargs["proposed_capital"],
+        ),
+    )
+    candidate = {
+        "economic_qualified": True,
+        "direction": "LONG",
+        "liquidity_capacity_ceiling_usd": 50.0,
+    }
+
+    decision = trade_action_gate.apply_action_gate(
+        candidate=candidate,
+        plan=_plan(),
+        account_capital=2_000.0,
+        active_trades=[],
+    )
+
+    assert decision.allowed is False
+    assert candidate["recommended_capital"] == 50.0
+    assert candidate["recommended_position_notional"] == 50.0
+    assert "minimum executable notional" in decision.reason
