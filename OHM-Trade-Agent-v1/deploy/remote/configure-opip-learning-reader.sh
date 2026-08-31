@@ -8,6 +8,7 @@ USER_NAME="opiplearn"
 HOME_DIR="/home/$USER_NAME"
 AUTHORIZED_KEYS="$HOME_DIR/.ssh/authorized_keys"
 EXPORT_ROOT="/var/lib/opip-learning-export"
+READER_STATE_ROOT="/var/lib/opip-learning-reader"
 FORCED_COMMAND="/usr/local/sbin/opip-learning-read-export"
 
 if [[ -z "$PUBLIC_KEY" || "$PUBLIC_KEY" != ssh-ed25519\ * || -z "$SOURCE_CIDR" ]]; then
@@ -27,6 +28,7 @@ passwd -l "$USER_NAME" >/dev/null 2>&1 || true
 install -o root -g root -m 0755   "$APP_ROOT/deploy/remote/opip-learning-read-export.sh"   "$FORCED_COMMAND"
 
 install -d -o root -g "$USER_NAME" -m 0750 "$EXPORT_ROOT"
+install -d -o "$USER_NAME" -g "$USER_NAME" -m 0750 "$READER_STATE_ROOT"
 for name in .publish.lock p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; do
   if [[ -e "$EXPORT_ROOT/$name" ]]; then
     chown root:"$USER_NAME" "$EXPORT_ROOT/$name"
@@ -49,5 +51,6 @@ echo "O'Pip production evidence reader configured."
 echo "user=$USER_NAME"
 echo "source=$SOURCE_CIDR"
 echo "forced_command=$FORCED_COMMAND"
+echo "reader_state_root=$READER_STATE_ROOT"
 echo "sudo_authority=NONE"
 echo "interactive_shell_authority=NONE_FOR_THIS_KEY"
