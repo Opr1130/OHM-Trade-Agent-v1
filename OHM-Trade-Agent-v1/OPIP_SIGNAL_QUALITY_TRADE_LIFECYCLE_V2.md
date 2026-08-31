@@ -332,7 +332,7 @@ Alert when state or thesis changes materially, stop/structure risk escalates, pr
 
 Repeated urgent alerts are allowed only for unresolved actionable conditions such as INVALIDATED/EXIT_REVIEW, using bounded retry semantics.
 
-A stable HEALTHY or stable DETERIORATING position remains silent.
+Suppress an alert only when the state is unchanged and no monitored deterioration measure has crossed a versioned materiality threshold since the last delivered action. An unchanged DETERIORATING state must still alert when risk worsens materially.
 
 ## 13. Events and news integration
 
