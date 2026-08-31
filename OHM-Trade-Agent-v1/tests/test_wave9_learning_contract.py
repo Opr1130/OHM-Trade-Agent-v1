@@ -210,6 +210,7 @@ def test_calibration_summary_reports_wave9_quality_bins(monkeypatch):
             {
                 "entered_trade": True,
                 "terminal_status": "closed",
+                "forecast_horizon_hours": 4.0,
                 "target_1_observed": index % 2 == 0,
                 "target_2_observed": index % 3 == 0,
                 "chief_confidence": 84,
