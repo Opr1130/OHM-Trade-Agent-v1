@@ -203,10 +203,12 @@ def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
     candidate = {
         "confidence": 90,
         "decision": "alert",
+        "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": False,
         "price_movement": movement,
     }
     monkeypatch.setattr(chief_alert_notifier, "should_send_trade_plan", lambda *args: True)
-    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", lambda *args: False)
 
     assert not chief_alert_notifier.send_trade_plan(
         candidate,
@@ -218,7 +220,13 @@ def test_movement_plan_becomes_actionable_only_after_final_intelligence_gate(
     assert candidate["price_movement"]["actionable"] is False
     assert "entry" not in candidate["price_movement"]
 
-    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", lambda *args: True)
+    candidate["action_gate_allowed"] = True
+    candidate["recommended_capital"] = 250.0
+    monkeypatch.setattr(
+        chief_alert_notifier,
+        "_register_reconciliation_intent",
+        lambda **kwargs: None,
+    )
     monkeypatch.setattr(
         chief_alert_notifier,
         "send_tracked_telegram",
@@ -242,11 +250,6 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
 ):
     sent = {}
 
-    def allow_intelligence(candidate, plan):
-        candidate["recommended_capital"] = 250.0
-        return True
-
-    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", allow_intelligence)
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_enabled", lambda: True)
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
     monkeypatch.setattr(
@@ -258,6 +261,9 @@ def test_production_alert_registers_buttonless_kraken_reconciliation_intent(
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "recommended_capital": 250.0,
         "signal_id": "SIG-BTC-1",
         "journey_id": "JOURNEY-BTC-1",
     }
@@ -290,11 +296,6 @@ def test_place_limit_reuses_pending_trade_id_for_reconciliation(
     setup = pending_setup_registry.add_pending_setup(_setup())
     plan = replace(_plan(), valid_now=False, entry_style="wait_for_pullback")
 
-    def allow_intelligence(candidate, plan):
-        candidate["recommended_capital"] = 200.0
-        return True
-
-    monkeypatch.setattr(chief_alert_notifier, "_apply_intelligence", allow_intelligence)
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_enabled", lambda: True)
     monkeypatch.setattr(chief_alert_notifier, "reconciliation_mode", lambda: "apply")
     monkeypatch.setattr(
@@ -306,6 +307,9 @@ def test_place_limit_reuses_pending_trade_id_for_reconciliation(
         "confidence": 90,
         "decision": "alert",
         "economic_qualified": True,
+        "action_gate_evaluated": True,
+        "action_gate_allowed": True,
+        "recommended_capital": 200.0,
         "trade_id": setup.trade_id,
     }
 
