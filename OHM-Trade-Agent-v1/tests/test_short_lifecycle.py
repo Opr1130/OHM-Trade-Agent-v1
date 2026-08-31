@@ -120,6 +120,7 @@ def test_short_outcome_mfe_mae_and_hits_are_direction_aware(registries):
         trade_id="OHM-BTC-2",
         direction="SHORT",
         margin_leverage=2.0,
+        opened_at="2025-12-31T23:00:00+00:00",
     )
     mark_trade_entered(trade, entry_price_source="manual_actual_fill")
     r1 = update_active_observation(trade, 94.0, observed_at="2026-01-01T00:00:00+00:00")
