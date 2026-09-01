@@ -20,6 +20,7 @@ from app.opip.data_platform.read_model import (
 )
 from app.opip.data_platform.shipper import (
     Checkpoint,
+    _validated_revision,
     checkpoint_is_continuous,
     iter_lines,
     observed_at,
@@ -60,6 +61,14 @@ def test_source_event_ids_are_canonical_and_stream_scoped():
     right = {"value": 1, "observed_at": "2026-09-01T00:00:00Z"}
     assert source_event_id("a", left) == source_event_id("a", right)
     assert source_event_id("a", left) != source_event_id("b", right)
+
+
+def test_projection_revisions_default_only_when_missing_and_must_be_positive():
+    assert _validated_revision({}) == 1
+    assert _validated_revision({"revision": "2"}) == 2
+    for value in (0, -1, "0"):
+        with pytest.raises(ValueError, match="revision must be positive"):
+            _validated_revision({"revision": value})
 
 
 def test_jsonl_reader_retries_torn_tail_and_validates_continuity(tmp_path):
@@ -293,6 +302,9 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "backup_epoch > now_epoch" in bootstrap
     assert "restore_epoch > now_epoch" in bootstrap
     assert "rollback_epoch > now_epoch" in bootstrap
+    assert bootstrap.index(
+        ': "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before validating rollback evidence}"'
+    ) < bootstrap.index('rollback_epoch="$(date -u -d "$OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC"')
     assert "a checksummed PostgreSQL dump is required before promotion" in bootstrap
     maintenance = (
         ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"

@@ -65,6 +65,14 @@ def source_event_id(stream_name: str, row: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def _validated_revision(row: Mapping[str, Any]) -> int:
+    value = row.get("revision")
+    revision = 1 if value is None else int(value)
+    if revision <= 0:
+        raise ValueError("revision must be positive")
+    return revision
+
+
 def _parse_time(value: Any) -> datetime | None:
     if not value:
         return None
@@ -371,7 +379,7 @@ class DatabaseWriter:
             if not paper_trade_id:
                 raise ValueError("paper event has no paper_trade_id")
             state = str(row.get("status") or "UNKNOWN").upper()
-            revision = int(row.get("revision") or 1)
+            revision = _validated_revision(row)
             cursor.execute(
                 """
                 INSERT INTO paper.trade(
@@ -442,7 +450,7 @@ class DatabaseWriter:
         strategy_version = str(row.get("strategy_version") or "UNKNOWN")
         config_version = str(row.get("gate_policy_version") or "UNKNOWN")
         model_version = row.get("intelligence_version")
-        revision = int(row.get("revision") or 1)
+        revision = _validated_revision(row)
         cursor.execute(
             """
             INSERT INTO lifecycle.episode(

@@ -194,6 +194,12 @@ elif [[ "$STAGE" == "backfill" ]]; then
     exit 69
   fi
   : "${OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC:?record the empty-stage rollback verification before backfill}"
+  : "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before validating rollback evidence}"
+  restore_epoch="${restore_epoch:-$(date -u -d "$OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" +%s 2>/dev/null || true)}"
+  if [[ ! "$restore_epoch" =~ ^[0-9]+$ ]] || (( restore_epoch > now_epoch )); then
+    echo "restore drill evidence is invalid or future-dated" >&2
+    exit 69
+  fi
   rollback_epoch="$(date -u -d "$OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
   if [[ ! "$rollback_epoch" =~ ^[0-9]+$ ]] \
     || (( rollback_epoch > now_epoch || rollback_epoch < restore_epoch )); then
