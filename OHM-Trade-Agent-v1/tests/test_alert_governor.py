@@ -309,12 +309,14 @@ def test_concurrent_create_reservations_cannot_exceed_hard_cap(tmp_path):
         thread.join()
 
     created = [decision for decision in decisions if decision.action == "CREATE"]
+    rejected = [decision for decision in decisions if decision.action != "CREATE"]
     assert len(created) == 3
     assert all(decision.reservation_token for decision in created)
-    assert sum(
+    assert all(decision.action == "SUPPRESS" for decision in rejected)
+    assert any(
         decision.reason == "NEW_CARD_EMERGENCY_CAP"
-        for decision in decisions
-    ) == workers - 3
+        for decision in rejected
+    )
 
 
 def test_failed_delivery_release_returns_reserved_capacity(tmp_path):
@@ -382,3 +384,40 @@ def test_commit_consumes_reservation_and_records_one_card(tmp_path):
     assert payload["new_card_reservations"] == {}
     assert len(payload["new_card_history"]) == 1
     assert payload["identities"]["EARLY_MOVER:COMMITUSD"]["message_id"] == 9001
+
+
+def test_expired_reservation_still_records_delivered_card(tmp_path):
+    state = tmp_path / "governor.json"
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    transition = "READY:BREAKOUT_ENTRY_POSSIBLE:ACCELERATING:NOT_EXTENDED"
+    decision = evaluate_opportunity_alert(
+        identity="EARLY_MOVER:EXPIREDUSD",
+        transition_key=transition,
+        now=now,
+        state_file=state,
+    )
+    assert decision.reservation_token
+
+    # Delivery can finish after the five-minute reservation TTL. The Telegram
+    # message exists, so persistence must not discard its canonical identity.
+    record_opportunity_alert(
+        identity="EARLY_MOVER:EXPIREDUSD",
+        transition_key=transition,
+        message_id=9002,
+        created_new=True,
+        reservation_token=decision.reservation_token,
+        now=now + timedelta(minutes=6),
+        state_file=state,
+    )
+
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert payload["identities"]["EARLY_MOVER:EXPIREDUSD"]["message_id"] == 9002
+    assert len(payload["new_card_history"]) == 1
+    follow_up = evaluate_opportunity_alert(
+        identity="EARLY_MOVER:EXPIREDUSD",
+        transition_key=transition,
+        now=now + timedelta(minutes=7),
+        state_file=state,
+    )
+    assert follow_up.action == "SUPPRESS"
+    assert follow_up.reason == "SAME_STATE_COOLDOWN"
