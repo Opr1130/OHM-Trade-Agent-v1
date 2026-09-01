@@ -1,4 +1,6 @@
 from dataclasses import replace
+import logging
+from typing import Callable
 
 from app.scanner.candidates import MIN_TECHNICAL_SCORE, MAX_CANDIDATES
 from app.scanner.models import MarketSnapshot
@@ -8,11 +10,48 @@ from app.scanner.short_technical_scorer import score_short_snapshot
 MAX_PER_DIRECTION = 5
 
 
+logger = logging.getLogger(__name__)
+
+
+EvaluationCallback = Callable[[MarketSnapshot, int, int, str | None], None]
+
+
+def _emit_evaluation_fail_soft(
+    callback: EvaluationCallback | None,
+    snapshot: MarketSnapshot,
+    long_score: int,
+    short_score: int,
+    advanced_direction: str | None,
+    scan_id: str | None,
+) -> None:
+    if callback is None:
+        return
+    try:
+        # A copy prevents an observational callback from mutating the object
+        # that production later ranks or qualifies.
+        callback(
+            replace(snapshot),
+            int(long_score),
+            int(short_score),
+            advanced_direction,
+        )
+    except Exception as exc:
+        logger.warning(
+            "O'Pip screening callback failed open scanner_type=BROAD_SEARCH "
+            "scan_id=%s raw=%s operation=record_screening_evaluation error=%s",
+            scan_id or "UNKNOWN",
+            getattr(snapshot, "symbol", "UNKNOWN"),
+            type(exc).__name__,
+        )
+
+
 def select_directional_candidates(
     snapshots: list[MarketSnapshot],
     *,
     min_score: int = MIN_TECHNICAL_SCORE,
     limit: int = MAX_CANDIDATES,
+    on_evaluated: EvaluationCallback | None = None,
+    scan_id: str | None = None,
 ) -> list[MarketSnapshot]:
     """Return a maximum-eight mixed LONG/SHORT shortlist.
 
@@ -39,6 +78,14 @@ def select_directional_candidates(
                 )
             )
         if not options:
+            _emit_evaluation_fail_soft(
+                on_evaluated,
+                snapshot,
+                long_score,
+                short_score,
+                None,
+                scan_id,
+            )
             continue
 
         chosen = max(
@@ -47,6 +94,14 @@ def select_directional_candidates(
                 item.technical_score,
                 item.trade_direction == "LONG",
             ),
+        )
+        _emit_evaluation_fail_soft(
+            on_evaluated,
+            snapshot,
+            long_score,
+            short_score,
+            chosen.trade_direction,
+            scan_id,
         )
         previous = best_by_asset.get(asset)
         if previous is None or chosen.technical_score > previous.technical_score:

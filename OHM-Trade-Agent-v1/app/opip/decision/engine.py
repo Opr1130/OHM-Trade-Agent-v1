@@ -377,6 +377,19 @@ class OPipDecisionEngine:
 
             results.append(
                 GateResult.build(
+                    GateName.CAPITAL_PORTFOLIO_GATE,
+                    GateStatus.SKIPPED,
+                    ReasonCode.CAPITAL_GATE_NOT_APPLICABLE_TO_SHADOW_ENGINE,
+                    reason=(
+                        "shadow engine has no capital allocation authority; "
+                        "production verdict is captured by the live observer"
+                    ),
+                    evaluated_at=self.decision_at,
+                )
+            )
+
+            results.append(
+                GateResult.build(
                     GateName.FINAL_QUALIFICATION,
                     GateStatus.PASS,
                     ReasonCode.QUALIFIED,

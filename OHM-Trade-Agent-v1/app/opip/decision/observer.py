@@ -558,6 +558,52 @@ class OPipScanObserver:
         except Exception as exc:
             self._degrade("record_economic_quality", exc)
 
+    def record_action_gate(
+        self,
+        ranked: Any,
+        *,
+        allowed: bool | None,
+        reason: str,
+    ) -> None:
+        """Capture the production capital/portfolio authority verbatim.
+
+        ``None`` means the authority could not be evaluated and is operational,
+        never a policy rejection.  This hook remains fail-soft like every other
+        observer method and cannot change the gate's production verdict.
+        """
+        try:
+            snapshot = ranked.opportunity.snapshot
+            if allowed is None:
+                status = GateStatus.ERROR
+                code = ReasonCode.GATE_EVALUATION_ERROR
+            elif allowed:
+                status = GateStatus.PASS
+                code = ReasonCode.GATE_PASSED
+            else:
+                status = GateStatus.FAIL
+                code = ReasonCode.NO_CAPITAL
+            result = GateResult.build(
+                GateName.CAPITAL_PORTFOLIO_GATE,
+                status,
+                code,
+                reason=reason,
+                evaluated_at=self.decision_at,
+                metadata={"profit_rank": getattr(ranked, "rank", None)},
+            )
+            self._record(snapshot, result)
+            if result.is_terminal:
+                if allowed is None:
+                    self.funnel.record_legacy_outcome(
+                        getattr(snapshot, "symbol", ""),
+                        getattr(snapshot, "trade_direction", "LONG"),
+                        decision=LEGACY_OPERATIONAL_FAILURE,
+                        terminal_reason=reason,
+                    )
+                else:
+                    self._reject(snapshot, reason)
+        except Exception as exc:
+            self._degrade("record_action_gate", exc)
+
     def record_qualified(self, ranked_opportunities: Iterable[Any]) -> None:
         """Record the candidates production actually qualified."""
         try:
@@ -791,6 +837,15 @@ class NullScanObserver:
         return None
 
     def record_economic_quality(self, snapshot: Any, result: Any) -> None:
+        return None
+
+    def record_action_gate(
+        self,
+        ranked: Any,
+        *,
+        allowed: bool | None,
+        reason: str,
+    ) -> None:
         return None
 
     def record_qualified(self, ranked_opportunities: Iterable[Any]) -> None:

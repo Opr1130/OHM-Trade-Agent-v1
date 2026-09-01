@@ -266,6 +266,19 @@ class BoundedJsonlArchive:
             handle.flush()
             os.fsync(handle.fileno())
 
+    def append_encoded_many_locked(self, rows: Iterable[bytes]) -> int:
+        """Append a batch durably with one open/flush/fsync cycle."""
+        pending = list(rows)
+        if not pending:
+            return 0
+        self.data_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.data_file.open("ab") as handle:
+            for encoded in pending:
+                handle.write(encoded if encoded.endswith(b"\n") else encoded + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return len(pending)
+
     def verify_archive_file(self, archive: Path, *, tier: str) -> ArchiveVerification:
         checksum = archive.with_suffix(archive.suffix + ".sha256")
         if not checksum.exists():
@@ -532,9 +545,9 @@ class BoundedJsonlArchive:
                 )
                 shutil.copy2(archive, temp_archive)
                 shutil.copy2(source_checksum, temp_checksum)
-                with temp_archive.open("rb") as handle:
+                with temp_archive.open("r+b") as handle:
                     os.fsync(handle.fileno())
-                with temp_checksum.open("rb") as handle:
+                with temp_checksum.open("r+b") as handle:
                     os.fsync(handle.fileno())
 
                 copied = self.verify_archive_file(temp_archive, tier="COLD")
@@ -587,6 +600,50 @@ class BoundedJsonlArchive:
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         content_digest = hashlib.sha256(b"".join(archive_lines)).hexdigest()[:12]
+
+        # A process can die after publishing and manifesting an archive but
+        # before replacing HOT.  On restart the same HOT prefix must reuse the
+        # verified segment; otherwise every retry creates another immutable
+        # copy and archive replay double-counts the evidence.
+        for existing in sorted(
+            self.archive_dir.glob(
+                f"{self.archive_prefix}-*-{content_digest}.jsonl.gz"
+            )
+        ):
+            try:
+                verification = self.verify_archive_file(existing, tier="WARM")
+                with gzip.open(existing, "rb") as handle:
+                    existing_lines = [
+                        line for line in handle if line.strip()
+                    ]
+            except Exception:
+                logger.exception(
+                    "Ignoring unusable O'Pip retry archive candidate: %s",
+                    existing,
+                )
+                continue
+            if existing_lines != [
+                line if line.endswith(b"\n") else line + b"\n"
+                for line in archive_lines
+            ]:
+                continue
+
+            # From this point the existing segment is authoritative.  Any
+            # manifest/HOT failure must propagate; falling through would mint
+            # a duplicate segment for the same evidence on every retry.
+            self.update_manifest_locked(verification)
+            write_atomic_lines(self.data_file, hot_lines)
+            try:
+                self.tier_warm_archives_locked(
+                    now=datetime.now(timezone.utc),
+                    cold_after_days=cold_after_days,
+                )
+            except Exception:
+                logger.exception(
+                    "O'Pip WARM-to-COLD archive maintenance failed open"
+                )
+            return existing
+
         archive = self.archive_dir / (
             f"{self.archive_prefix}-{stamp}-{content_digest}.jsonl.gz"
         )
@@ -600,7 +657,7 @@ class BoundedJsonlArchive:
                     handle.write(line if line.endswith(b"\n") else line + b"\n")
 
             # Make compressed bytes durable before verification/finalization.
-            with archive_tmp.open("rb") as handle:
+            with archive_tmp.open("r+b") as handle:
                 os.fsync(handle.fileno())
 
             digest = self._sha256_file(archive_tmp)
@@ -618,7 +675,7 @@ class BoundedJsonlArchive:
                 )
 
             checksum_tmp.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
-            with checksum_tmp.open("rb") as handle:
+            with checksum_tmp.open("r+b") as handle:
                 os.fsync(handle.fileno())
 
             os.replace(archive_tmp, archive)
@@ -649,6 +706,7 @@ class BoundedJsonlArchive:
     def iter_archive_rows(self) -> Iterator[Any]:
         if not self.archive_dir.exists():
             return
+        seen_checksums: set[str] = set()
         for archive in sorted(self.archive_dir.rglob(self.archive_glob)):
             checksum = archive.with_suffix(archive.suffix + ".sha256")
             if not checksum.exists():
@@ -662,6 +720,13 @@ class BoundedJsonlArchive:
                         archive,
                     )
                     continue
+                if expected in seen_checksums:
+                    logger.warning(
+                        "Skipping duplicate O'Pip archive content: %s",
+                        archive,
+                    )
+                    continue
+                seen_checksums.add(expected)
                 with gzip.open(archive, "rb") as handle:
                     for line in handle:
                         if line.strip():
