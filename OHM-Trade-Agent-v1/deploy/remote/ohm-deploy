@@ -134,6 +134,16 @@ LIMITS
 }
 
 
+replace_file_atomically() {
+  local source="$1"
+  local target="$2"
+  local tmp
+  tmp="$(mktemp "${target}.restore.XXXXXX")"
+  rm -f "$tmp"
+  cp -a "$source" "$tmp"
+  mv -f "$tmp" "$target"
+}
+
 snapshot_scheduler_state() {
   SCHEDULER_SNAPSHOT="$(mktemp -d "$STATE_DIR/scheduler-before.XXXXXX")"
   for name in ohm-unified-cycle opip-learning-export opip-ml-evidence ohm-movement-discovery; do
@@ -175,7 +185,7 @@ restore_scheduler_state() {
   local spec target snapshot_name
   while IFS='|' read -r target snapshot_name; do
     if [[ -e "$SCHEDULER_SNAPSHOT/$snapshot_name.present" ]]; then
-      cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"
+      replace_file_atomically "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"
     else
       rm -f "$target"
     fi

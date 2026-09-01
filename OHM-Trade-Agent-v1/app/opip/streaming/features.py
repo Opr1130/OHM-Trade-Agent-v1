@@ -106,6 +106,7 @@ class TradeObservation:
 @dataclass(frozen=True)
 class VenueCvdState:
     venue: str
+    canonical_asset_id: str
     signed_base_volume: float = 0.0
     signed_notional_usd: float = 0.0
     gross_notional_usd: float = 0.0
@@ -117,6 +118,8 @@ class VenueCvdState:
     def __post_init__(self) -> None:
         if not str(self.venue or "").strip():
             raise ValueError("venue is required")
+        if not str(self.canonical_asset_id or "").strip():
+            raise ValueError("canonical_asset_id is required")
         for name in (
             "signed_base_volume",
             "signed_notional_usd",
@@ -139,8 +142,11 @@ class VenueCvdState:
         return self.trade_count > 0
 
 
-def empty_venue_cvd(venue: str) -> VenueCvdState:
-    return VenueCvdState(venue=venue)
+def empty_venue_cvd(venue: str, canonical_asset_id: str) -> VenueCvdState:
+    return VenueCvdState(
+        venue=venue,
+        canonical_asset_id=canonical_asset_id,
+    )
 
 
 def accumulate_cvd(existing: VenueCvdState, observation: TradeObservation) -> VenueCvdState:
@@ -149,6 +155,8 @@ def accumulate_cvd(existing: VenueCvdState, observation: TradeObservation) -> Ve
     BUY_AGGRESSOR adds, SELL_AGGRESSOR subtracts. UNKNOWN is excluded from the
     directional delta but tracked explicitly rather than silently discarded.
     """
+    if observation.canonical_asset_id != existing.canonical_asset_id:
+        raise ValueError("observation asset does not match accumulator asset")
     if observation.venue != existing.venue:
         raise ValueError("observation venue does not match accumulator venue")
 
@@ -280,6 +288,10 @@ def combine_cross_venue(
         if state.venue != venue:
             raise ValueError(
                 f"venue_states key {venue!r} does not match state.venue {state.venue!r}"
+            )
+        if state.canonical_asset_id != canonical_asset_id:
+            raise ValueError(
+                f"venue state {venue!r} asset does not match canonical_asset_id"
             )
 
     combined_notional = sum(state.signed_notional_usd for state in venue_states.values())

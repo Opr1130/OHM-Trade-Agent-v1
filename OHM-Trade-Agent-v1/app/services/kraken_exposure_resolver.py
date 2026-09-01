@@ -67,6 +67,34 @@ def _remaining_open_position_quantity(row: dict[str, Any]) -> float | None:
     return volume - closed
 
 
+def _managed_spot_quantity(
+    trade: ActiveTrade,
+    observed_quantity: float | None,
+) -> float | None:
+    """Return only a lifecycle quantity proved by persisted reconciliation state."""
+    try:
+        observed = (
+            float(observed_quantity)
+            if observed_quantity is not None
+            else math.nan
+        )
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed) or observed < 0:
+        return None
+
+    raw_remaining = trade.remaining_quantity
+    if raw_remaining is None:
+        return None
+    try:
+        remaining = float(raw_remaining)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(remaining) or remaining < 0:
+        return None
+    return min(observed, remaining)
+
+
 def _position_identity(row: dict[str, Any]) -> tuple[str, str] | None:
     descr = row.get("descr") if isinstance(row.get("descr"), dict) else {}
     pair = canonicalize_pair(str(row.get("pair") or descr.get("pair") or ""))
@@ -249,7 +277,7 @@ class KrakenExposureResolver:
             )
 
         exposures: list[ResolvedExposure] = []
-        managed_spot_assets: set[str] = set()
+        managed_spot_quantities: dict[str, float] = {}
         managed_position_keys: set[tuple[str, str]] = set()
         managed_resolution_gaps: list[str] = []
 
@@ -263,8 +291,13 @@ class KrakenExposureResolver:
             pair = canonicalize_pair(trade.symbol)
             if verification.status == "VERIFIED":
                 if direction == "LONG":
+                    raw_leverage = trade.margin_leverage
                     try:
-                        leverage = float(trade.margin_leverage or 1.0)
+                        leverage = (
+                            1.0
+                            if raw_leverage is None
+                            else float(raw_leverage)
+                        )
                     except (TypeError, ValueError):
                         leverage = math.nan
                     if not math.isfinite(leverage) or leverage <= 0:
@@ -280,7 +313,20 @@ class KrakenExposureResolver:
                                 f"{trade.symbol}: unresolved managed spot pair identity"
                             )
                         else:
-                            managed_spot_assets.add(identity[0])
+                            managed_quantity = _managed_spot_quantity(
+                                trade,
+                                verification.observed_quantity,
+                            )
+                            if managed_quantity is None:
+                                managed_resolution_gaps.append(
+                                    f"{trade.symbol}: unresolved managed spot quantity"
+                                )
+                            else:
+                                asset = identity[0]
+                                managed_spot_quantities[asset] = (
+                                    managed_spot_quantities.get(asset, 0.0)
+                                    + managed_quantity
+                                )
                 elif direction == "SHORT":
                     managed_position_keys.add((pair, direction))
                 else:
@@ -329,15 +375,25 @@ class KrakenExposureResolver:
                     f"invalid balance quantity for {asset}"
                 )
                 continue
-            if (
-                asset in CASH_LIKE_ASSETS
-                or quantity == 0
-                or asset in managed_spot_assets
-            ):
+            if asset in CASH_LIKE_ASSETS or quantity == 0:
                 continue
             canonical_balances[asset] = (
                 canonical_balances.get(asset, 0.0) + quantity
             )
+
+        for asset, managed_quantity in sorted(managed_spot_quantities.items()):
+            balance_quantity = canonical_balances.get(asset)
+            if balance_quantity is None:
+                continue
+            if managed_quantity > balance_quantity + 1e-12:
+                managed_resolution_gaps.append(
+                    f"{asset}: managed lifecycle quantity exceeds Kraken balance"
+                )
+            residual = max(0.0, balance_quantity - managed_quantity)
+            if residual <= 1e-12:
+                canonical_balances.pop(asset, None)
+            else:
+                canonical_balances[asset] = residual
 
         pair_catalog_available = True
         pair_catalog_reason = ""

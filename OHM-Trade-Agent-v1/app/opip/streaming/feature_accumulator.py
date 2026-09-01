@@ -182,7 +182,10 @@ class CrossVenueFeatureAccumulator:
             )
             state = bucket.venue_cvd.get(env.provider.value)
             if state is None:
-                state = empty_venue_cvd(env.provider.value)
+                state = empty_venue_cvd(
+                    env.provider.value,
+                    env.canonical_asset_id,
+                )
             bucket.venue_cvd[env.provider.value] = accumulate_cvd(state, observation)
         elif env.stream_type is StreamType.LIQUIDATION:
             provider = env.provider.value
@@ -273,7 +276,10 @@ class CrossVenueFeatureAccumulator:
                     state=EvidenceQualityState.INCOMPLETE,
                     degradations=frozenset({_MISSING_VENUE}),
                 )
-                bucket.venue_cvd.setdefault(venue, empty_venue_cvd(venue))
+                bucket.venue_cvd.setdefault(
+                    venue,
+                    empty_venue_cvd(venue, bucket.asset),
+                )
         self._emit_bucket(bucket)
         self._buckets.pop(key, None)
 

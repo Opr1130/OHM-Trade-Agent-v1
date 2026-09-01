@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +23,8 @@ class ActiveTrade:
     direction: str = "LONG"
     margin_leverage: float = 1.0
     capital: float | None = None
+    entry_quantity: float | None = None
+    remaining_quantity: float | None = None
     actual_entry_fee: float | None = None
     actual_exit_fee: float | None = None
     financing_fee: float = 0.0
@@ -48,6 +51,8 @@ def _from_item(item: dict) -> ActiveTrade:
     normalized.setdefault("direction", "LONG")
     normalized.setdefault("margin_leverage", 1.0)
     normalized.setdefault("capital", None)
+    normalized.setdefault("entry_quantity", None)
+    normalized.setdefault("remaining_quantity", None)
     normalized.setdefault("actual_entry_fee", None)
     normalized.setdefault("actual_exit_fee", None)
     normalized.setdefault("financing_fee", 0.0)
@@ -89,6 +94,27 @@ def get_active_trades() -> list[ActiveTrade]:
     with registry_lock(registry_lock_file()):
         data = _load_raw()
     return [_from_item(item) for item in data.values() if item.get("status") == "active"]
+
+
+def update_trade_remaining_quantity(
+    symbol: str,
+    remaining_quantity: float,
+) -> ActiveTrade:
+    """Persist read-only reconciliation's conservative remaining lifecycle quantity."""
+    remaining = float(remaining_quantity)
+    if not math.isfinite(remaining) or remaining < 0:
+        raise ValueError("remaining_quantity must be finite and non-negative")
+    symbol = symbol.upper()
+    with registry_lock(registry_lock_file()):
+        data = _load_raw()
+        if symbol not in data:
+            raise KeyError(symbol)
+        item = data[symbol]
+        if item.get("status") != "active":
+            raise ValueError(f"trade {symbol} is not active")
+        item["remaining_quantity"] = remaining
+        _save_raw(data)
+        return _from_item(item)
 
 
 def close_trade(

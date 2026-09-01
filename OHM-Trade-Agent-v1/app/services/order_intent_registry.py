@@ -35,6 +35,7 @@ class OrderIntent:
     filled_at: str | None = None
     cancelled_at: str | None = None
     actual_entry_fee: float | None = None
+    fill_quantity: float | None = None
     exchange_order_txid: str | None = None
 
 
@@ -63,6 +64,7 @@ def _normalize(item: dict) -> OrderIntent:
     normalized.setdefault("filled_at", None)
     normalized.setdefault("cancelled_at", None)
     normalized.setdefault("actual_entry_fee", None)
+    normalized.setdefault("fill_quantity", None)
     normalized.setdefault("exchange_order_txid", None)
     normalized.pop("fill_price", None)
     return OrderIntent(**normalized)
@@ -194,6 +196,14 @@ def _trade_from_filled_row(row: dict) -> ActiveTrade:
     capital = float(row.get("capital") or 0.0)
     if capital <= 0:
         raise ValueError("filled intent is missing valid capital")
+    raw_fill_quantity = row.get("fill_quantity")
+    fill_quantity = (
+        float(raw_fill_quantity)
+        if raw_fill_quantity is not None
+        else None
+    )
+    if fill_quantity is not None and fill_quantity <= 0:
+        raise ValueError("filled intent has invalid fill_quantity")
     return ActiveTrade(
         symbol=str(row.get("symbol") or "").upper(),
         entry_price=fill_price,
@@ -205,6 +215,8 @@ def _trade_from_filled_row(row: dict) -> ActiveTrade:
         direction=str(row.get("direction") or "LONG").upper(),
         margin_leverage=float(row.get("margin_leverage") or 1.0),
         capital=capital,
+        entry_quantity=fill_quantity,
+        remaining_quantity=fill_quantity,
         actual_entry_fee=row.get("actual_entry_fee"),
         opened_at=str(row.get("filled_at") or row.get("updated_at") or ""),
     )
@@ -264,12 +276,15 @@ def mark_order_filled(
     *,
     fill_price: float,
     actual_entry_fee: float | None = None,
+    fill_quantity: float | None = None,
     entry_price_source: str = "manual_limit_fill",
 ) -> ActiveTrade:
     if fill_price <= 0:
         raise ValueError("fill_price must be positive")
     if actual_entry_fee is not None and actual_entry_fee < 0:
         raise ValueError("actual_entry_fee cannot be negative")
+    if fill_quantity is not None and fill_quantity <= 0:
+        raise ValueError("fill_quantity must be positive")
     with registry_lock(LOCK_FILE):
         data = _load()
         if trade_id not in data:
@@ -283,6 +298,7 @@ def mark_order_filled(
         row["filled_at"] = _now()
         row["updated_at"] = row["filled_at"]
         row["fill_price"] = fill_price
+        row["fill_quantity"] = fill_quantity
         row["actual_entry_fee"] = actual_entry_fee
         _save(data)
         persisted = dict(row)

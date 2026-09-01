@@ -106,4 +106,5 @@ def test_deploy_rollback_restores_installed_remote_ops():
     assert "remote-op-ohm-deploy-ssh" in deploy
     assert "remote-op-learning-reader" in deploy
     assert "remote-op-learning-diagnostics" in deploy
-    assert 'cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' in deploy
+    assert 'replace_file_atomically "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' in deploy
+    assert 'cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' not in deploy
