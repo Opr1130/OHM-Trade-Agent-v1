@@ -36,7 +36,13 @@ class FakePublic:
         return {"SOLUSD": {"last": 100.0}}
 
 
-def managed_trade(*, capital, entry_quantity=None, remaining_quantity=None):
+def managed_trade(
+    *,
+    capital,
+    entry_quantity=None,
+    remaining_quantity=None,
+    margin_leverage=1.0,
+):
     return ActiveTrade(
         symbol="SOLUSD",
         entry_price=100.0,
@@ -46,7 +52,7 @@ def managed_trade(*, capital, entry_quantity=None, remaining_quantity=None):
         risk_level="medium",
         direction="LONG",
         trade_id=f"T-{capital}",
-        margin_leverage=1.0,
+        margin_leverage=margin_leverage,
         capital=capital,
         entry_quantity=entry_quantity,
         remaining_quantity=remaining_quantity,
@@ -154,3 +160,24 @@ def test_partial_exit_uses_reconciled_remaining_quantity(monkeypatch):
     unmanaged = [row for row in resolved.exposures if row.status == "VERIFIED_UNMANAGED"]
     assert len(unmanaged) == 1
     assert unmanaged[0].observed_quantity == pytest.approx(0.2)
+
+
+def test_explicit_zero_leverage_does_not_hide_spot_balance(monkeypatch):
+    monkeypatch.setenv("OPIP_PROTECTION_MIN_UNMANAGED_NOTIONAL_USD", "1")
+    trade = managed_trade(
+        capital=100.0,
+        entry_quantity=1.0,
+        remaining_quantity=1.0,
+        margin_leverage=0.0,
+    )
+    resolved = KrakenExposureResolver(
+        private_client=FakePrivate(balances={"SOL": 1.0}),
+        public_client=FakePublic(),
+        trade_loader=lambda: [trade],
+    ).resolve()
+
+    unmanaged = [row for row in resolved.exposures if row.status == "VERIFIED_UNMANAGED"]
+    assert len(unmanaged) == 1
+    assert unmanaged[0].observed_quantity == pytest.approx(1.0)
+    assert resolved.coverage_complete is False
+    assert "invalid lifecycle leverage" in resolved.reason
