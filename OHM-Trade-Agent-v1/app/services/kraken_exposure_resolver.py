@@ -291,8 +291,13 @@ class KrakenExposureResolver:
             pair = canonicalize_pair(trade.symbol)
             if verification.status == "VERIFIED":
                 if direction == "LONG":
+                    raw_leverage = trade.margin_leverage
                     try:
-                        leverage = float(trade.margin_leverage or 1.0)
+                        leverage = (
+                            1.0
+                            if raw_leverage is None
+                            else float(raw_leverage)
+                        )
                     except (TypeError, ValueError):
                         leverage = math.nan
                     if not math.isfinite(leverage) or leverage <= 0:
