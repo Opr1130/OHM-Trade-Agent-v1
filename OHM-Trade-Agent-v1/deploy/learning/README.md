@@ -15,22 +15,34 @@ Production MUST NOT schedule:
 - `app.jobs.run_opip_ml_capture`
 - `app.jobs.build_phase3c_forward_outcomes`
 
-Production exports only:
+Production exports only copy-only, non-authoritative JSONL evidence:
 
 - `p1_shadow_outbox.jsonl`
 - `full_market_observations.jsonl`
+- `p1_evidence_ledger.jsonl`
+- `intelligence_learning/events.jsonl`
+- `opip/qualification/{screening_evaluations,funnel_events,scan_summaries}.jsonl`
+- the three corresponding checksummed `*_archive/` trees
+- `paper_trading/events.jsonl`
+- `telegram_delivery_events.jsonl`
+- `decision_telemetry.jsonl`
+- `opip_trade_quality_evidence_v1.jsonl`
+- `candidate_trace.jsonl`
 - `manifest.env`
 
 The export path is `/var/lib/opip-learning-export`. The learning SSH key is bound to a forced read-only export command and the learning droplet's private source address; it cannot open an interactive shell or execute arbitrary commands with that key.
 
 ## Learning worker contract
 
-Recommended initial host:
+Learning-only minimum host:
 
 - DigitalOcean Basic / Regular
 - 1 vCPU
 - 1 GiB RAM
 - same region and VPC as production
+
+The PostgreSQL analytics stage reuses this isolated host only after it is
+resized to at least 2 GiB. PostgreSQL must never be installed on production.
 
 The worker has no Kraken private credentials, no Telegram authority, no paper
 control write path, and no live qualification/ranking/execution authority.

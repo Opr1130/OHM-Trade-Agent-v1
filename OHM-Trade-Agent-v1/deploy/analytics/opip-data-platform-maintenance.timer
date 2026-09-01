@@ -1,0 +1,11 @@
+[Unit]
+Description=Run O'Pip data-platform maintenance hourly
+
+[Timer]
+OnCalendar=*-*-* *:17:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+Unit=opip-data-platform-maintenance.service
+
+[Install]
+WantedBy=timers.target

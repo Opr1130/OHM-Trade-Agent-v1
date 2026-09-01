@@ -79,7 +79,23 @@ else
   exit 126
 fi
 
-for name in p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; do
+for name in \
+  p1_shadow_outbox.jsonl \
+  full_market_observations.jsonl \
+  p1_evidence_ledger.jsonl \
+  intelligence_learning/events.jsonl \
+  opip/qualification/screening_evaluations.jsonl \
+  opip/qualification/funnel_events.jsonl \
+  opip/qualification/scan_summaries.jsonl \
+  paper_trading/events.jsonl \
+  telegram_delivery_events.jsonl \
+  decision_telemetry.jsonl \
+  opip_trade_quality_evidence_v1.jsonl \
+  candidate_trace.jsonl \
+  opip/qualification/screening_evaluations_archive \
+  opip/qualification/funnel_events_archive \
+  opip/qualification/scan_summaries_archive \
+  manifest.env; do
   if [[ ! -r "$EXPORT_ROOT/$name" ]]; then
     echo "O'Pip learning reader: export unavailable: $name" >&2
     exit 66
@@ -95,4 +111,17 @@ flock -s 8
 exec tar -C "$EXPORT_ROOT" -cf - \
   p1_shadow_outbox.jsonl \
   full_market_observations.jsonl \
+  p1_evidence_ledger.jsonl \
+  intelligence_learning/events.jsonl \
+  opip/qualification/screening_evaluations.jsonl \
+  opip/qualification/funnel_events.jsonl \
+  opip/qualification/scan_summaries.jsonl \
+  paper_trading/events.jsonl \
+  telegram_delivery_events.jsonl \
+  decision_telemetry.jsonl \
+  opip_trade_quality_evidence_v1.jsonl \
+  candidate_trace.jsonl \
+  opip/qualification/screening_evaluations_archive \
+  opip/qualification/funnel_events_archive \
+  opip/qualification/scan_summaries_archive \
   manifest.env

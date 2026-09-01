@@ -1,0 +1,13 @@
+[Unit]
+Description=O'Pip data-platform reconciliation and read-model refresh
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/opip-data-platform.env
+ExecStart=/usr/local/sbin/opip-data-platform-maintenance
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true

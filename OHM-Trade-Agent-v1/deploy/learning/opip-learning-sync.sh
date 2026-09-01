@@ -25,7 +25,7 @@ source "$ENV_FILE"
   exit 78
 }
 
-for cmd in ssh tar install flock mv date sha256sum stat awk rm; do
+for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning sync command: $cmd" >&2
     exit 69
@@ -74,7 +74,8 @@ outcomes_at="$(status_time "$(state_value "$outcomes_file" finished_at_utc)")"
 outcomes_rc="$(status_rc "$(state_value "$outcomes_file" exit_code)")"
 status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA sync_success_at=$last_sync_at capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc"
 
-rm -f "$INCOMING"/* "$ARCHIVE"
+rm -rf "$INCOMING"/*
+rm -f "$ARCHIVE"
 
 ssh \
   -i "$OPIP_LEARNING_SSH_KEY" \
@@ -98,7 +99,7 @@ manifest_value() {
 }
 
 schema="$(manifest_value schema_version)"
-[[ "$schema" == "2" ]] || {
+[[ "$schema" == "3" ]] || {
   echo "O'Pip learning sync: unsupported manifest schema=$schema" >&2
   exit 65
 }
@@ -131,12 +132,81 @@ validate_artifact() {
   }
 }
 
+tree_bytes() {
+  find "$1" -type f -printf '%s\n' | awk '{total += $1} END {printf "%d\n", total}'
+}
+
+tree_sha256() {
+  (
+    cd "$1"
+    find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+  ) | sha256sum | awk '{print $1}'
+}
+
+validate_archive() {
+  local name="$1"
+  local key="$2"
+  local path="$INCOMING/$name"
+  local expected_bytes expected_sha actual_bytes actual_sha
+  [[ -d "$path" ]] || {
+    echo "O'Pip learning sync: missing archive directory=$name" >&2
+    return 1
+  }
+  expected_bytes="$(manifest_value "${key}_bytes")"
+  expected_sha="$(manifest_value "${key}_sha256")"
+  actual_bytes="$(tree_bytes "$path")"
+  actual_sha="$(tree_sha256 "$path")"
+  [[ "$expected_bytes" =~ ^[0-9]+$ && "$actual_bytes" == "$expected_bytes" ]] || {
+    echo "O'Pip learning sync: archive size mismatch for $name" >&2
+    return 1
+  }
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ && "$actual_sha" == "$expected_sha" ]] || {
+    echo "O'Pip learning sync: archive checksum mismatch for $name" >&2
+    return 1
+  }
+}
+
 validate_artifact "p1_shadow_outbox.jsonl" "p1_shadow_outbox_jsonl"
 validate_artifact "full_market_observations.jsonl" "full_market_observations_jsonl"
+validate_artifact "p1_evidence_ledger.jsonl" "p1_evidence_ledger_jsonl"
+validate_artifact "intelligence_learning/events.jsonl" "intelligence_learning_events_jsonl"
+validate_artifact "opip/qualification/screening_evaluations.jsonl" "opip_qualification_screening_evaluations_jsonl"
+validate_artifact "opip/qualification/funnel_events.jsonl" "opip_qualification_funnel_events_jsonl"
+validate_artifact "opip/qualification/scan_summaries.jsonl" "opip_qualification_scan_summaries_jsonl"
+validate_artifact "paper_trading/events.jsonl" "paper_trading_events_jsonl"
+validate_artifact "telegram_delivery_events.jsonl" "telegram_delivery_events_jsonl"
+validate_artifact "decision_telemetry.jsonl" "decision_telemetry_jsonl"
+validate_artifact "opip_trade_quality_evidence_v1.jsonl" "opip_trade_quality_evidence_v1_jsonl"
+validate_artifact "candidate_trace.jsonl" "candidate_trace_jsonl"
+validate_archive "opip/qualification/screening_evaluations_archive" "opip_qualification_screening_archive"
+validate_archive "opip/qualification/funnel_events_archive" "opip_qualification_funnel_archive"
+validate_archive "opip/qualification/scan_summaries_archive" "opip_qualification_summaries_archive"
 
-for name in p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; do
+for name in \
+  p1_shadow_outbox.jsonl \
+  full_market_observations.jsonl \
+  p1_evidence_ledger.jsonl \
+  intelligence_learning/events.jsonl \
+  opip/qualification/screening_evaluations.jsonl \
+  opip/qualification/funnel_events.jsonl \
+  opip/qualification/scan_summaries.jsonl \
+  paper_trading/events.jsonl \
+  telegram_delivery_events.jsonl \
+  decision_telemetry.jsonl \
+  opip_trade_quality_evidence_v1.jsonl \
+  candidate_trace.jsonl; do
+  install -d -o root -g root -m 0755 "$(dirname "$DATA_ROOT/$name")"
   mv -f -- "$INCOMING/$name" "$DATA_ROOT/$name"
 done
+for name in \
+  opip/qualification/screening_evaluations_archive \
+  opip/qualification/funnel_events_archive \
+  opip/qualification/scan_summaries_archive; do
+  install -d -o root -g root -m 0755 "$(dirname "$DATA_ROOT/$name")"
+  rm -rf -- "$DATA_ROOT/$name"
+  mv -f -- "$INCOMING/$name" "$DATA_ROOT/$name"
+done
+mv -f -- "$INCOMING/manifest.env" "$DATA_ROOT/manifest.env"
 rm -f "$ARCHIVE"
 
 printf 'last_sync_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -18,6 +18,7 @@ from app.services.profitability_learning import build_profitability_profile
 from app.services.shadow_learning import get_shadow_records
 from app.services.trade_outcome_registry import get_outcomes
 from app.services.telegram_delivery import build_delivery_summary
+from app.opip.data_platform.read_model import read_historical_snapshot
 
 
 MAX_EVENTS = 20000
@@ -360,6 +361,19 @@ def _paper_status() -> dict[str, Any]:
     }
 
 
+def _historical_trend_for_scope(
+    rows: list[dict[str, Any]],
+    scope: str,
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    if scope != "today":
+        return rows
+    current_day = today or datetime.now(timezone.utc).date()
+    day_text = current_day.isoformat()
+    return [row for row in rows if str(row.get("date")) == day_text]
+
+
 def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     if scope not in {"today", "all"}:
         raise ValueError("scope must be today or all")
@@ -407,6 +421,11 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     calibration = profitability.get("trade_calibration") or {}
     sample_count = int(paper.get("count") or 0)
     evidence_state = "INSUFFICIENT_DATA" if sample_count < 30 else "MEASURED"
+    historical = read_historical_snapshot()
+    historical_trend = _historical_trend_for_scope(
+        historical.get("intelligence_daily") or [],
+        scope,
+    )
 
     return {
         "schema_version": 2,
@@ -436,13 +455,15 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
                 "status": "AWAITING_VERSIONED_CHANGE_COHORTS",
                 "message": "Strategy-change before/after attribution is not credited until versioned change cohorts exist.",
             },
-            "trend": _daily_intelligence_series(events),
+            "trend": historical_trend or _daily_intelligence_series(events),
+            "trend_source": "POSTGRESQL" if historical_trend else "FILE_WAL_FALLBACK",
             "stage_pattern_performance": intelligence.get("early_stage_pattern_performance") or {},
         },
         "failure_eradication": _failure_snapshot(outcomes, profitability),
         "paper_engine": _paper_status(),
         "telegram_delivery": build_delivery_summary(scope=scope),
         "recent_events": _recent_events(events),
+        "data_platform": historical,
         "guardrails": {
             "dashboard_can_change_rankings": False,
             "dashboard_can_change_alerts": False,

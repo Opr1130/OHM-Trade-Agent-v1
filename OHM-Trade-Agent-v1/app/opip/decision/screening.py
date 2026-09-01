@@ -14,6 +14,7 @@ import math
 from typing import Any, Mapping
 
 from app.opip.identity import ResolvedInstrumentIdentity
+from app.opip.decision.versioning import STRATEGY_VERSION
 
 
 class ScannerType(str, Enum):
@@ -57,6 +58,7 @@ class ScreeningEvaluation:
     advanced_direction: str | None = None
     reason: str | None = None
     metadata: Mapping[str, Any] | None = None
+    strategy_version: str = STRATEGY_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "observed_at", _utc(self.observed_at))
@@ -74,6 +76,8 @@ class ScreeningEvaluation:
         if self.outcome is not ScreeningOutcome.ADVANCED and direction is not None:
             raise ValueError("only ADVANCED evaluations may select a direction")
         object.__setattr__(self, "advanced_direction", direction)
+        if not str(self.strategy_version or "").strip():
+            raise ValueError("strategy_version is required")
 
     @property
     def identity_tuple(self) -> tuple[str, str, str, str]:
@@ -86,7 +90,7 @@ class ScreeningEvaluation:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "observed_at": self.observed_at.isoformat(),
             "scan_id": self.scan_id,
             "scanner_type": self.scanner_type.value,
@@ -98,6 +102,7 @@ class ScreeningEvaluation:
             "advanced_direction": self.advanced_direction,
             "reason": self.reason,
             "metadata": dict(self.metadata) if self.metadata is not None else None,
+            "strategy_version": self.strategy_version,
         }
 
     @classmethod
@@ -125,4 +130,5 @@ class ScreeningEvaluation:
                 else None
             ),
             metadata=(dict(metadata) if isinstance(metadata, Mapping) else None),
+            strategy_version=str(payload.get("strategy_version") or STRATEGY_VERSION),
         )

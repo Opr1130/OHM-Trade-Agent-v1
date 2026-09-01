@@ -90,7 +90,7 @@ def test_production_export_is_copy_only_and_locked():
     assert "full_market_observations.jsonl" in source
     assert "flock -x 8" in source
     assert "sha256sum" in source
-    assert "schema_version=2" in source
+    assert "schema_version=3" in source
     assert "mv -f" in source
     assert "python" not in source
     assert "docker" not in source
@@ -244,12 +244,12 @@ def test_learning_reader_key_is_forced_read_only_and_source_bound():
 def test_learning_sync_validates_manifest_before_promotion():
     sync = (LEARNING / "opip-learning-sync.sh").read_text(encoding="utf-8")
     assert 'schema="$(manifest_value schema_version)"' in sync
-    assert '[[ "$schema" == "2" ]]' in sync
+    assert '[[ "$schema" == "3" ]]' in sync
     assert "sha256sum" in sync
     assert "size mismatch" in sync
     assert "checksum mismatch" in sync
     validation = sync.index('validate_artifact "p1_shadow_outbox.jsonl"')
-    promotion = sync.index("for name in p1_shadow_outbox.jsonl")
+    promotion = sync.index("for name in \\")
     assert validation < promotion
 
 

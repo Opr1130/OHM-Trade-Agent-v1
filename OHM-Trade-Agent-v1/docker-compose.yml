@@ -44,6 +44,9 @@ services:
       # Evidence collection only; the event store is not consumed by
       # qualification, ranking, alerts, paper admission, or exchange actions.
       OPIP_EVENT_STORE_ENABLED: "true"
+      # Stage 0 emission is the durable WAL for the analytics-plane shipper.
+      # It remains evidence-only and cannot alter ranking or execution.
+      OPIP_FUNNEL_TELEMETRY_ENABLED: "true"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
