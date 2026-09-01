@@ -1,0 +1,11 @@
+[Unit]
+Description=Create nightly O'Pip PostgreSQL dump
+
+[Timer]
+OnCalendar=*-*-* 02:43:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+Unit=opip-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

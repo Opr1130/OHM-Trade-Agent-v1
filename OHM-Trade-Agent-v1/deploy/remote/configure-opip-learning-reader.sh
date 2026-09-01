@@ -29,10 +29,33 @@ install -o root -g root -m 0755   "$APP_ROOT/deploy/remote/opip-learning-read-ex
 
 install -d -o root -g "$USER_NAME" -m 0750 "$EXPORT_ROOT"
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 0750 "$READER_STATE_ROOT"
-for name in .publish.lock p1_shadow_outbox.jsonl full_market_observations.jsonl manifest.env; do
+for name in \
+  .publish.lock \
+  p1_shadow_outbox.jsonl \
+  full_market_observations.jsonl \
+  p1_evidence_ledger.jsonl \
+  intelligence_learning/events.jsonl \
+  opip/qualification/screening_evaluations.jsonl \
+  opip/qualification/funnel_events.jsonl \
+  opip/qualification/scan_summaries.jsonl \
+  paper_trading/events.jsonl \
+  telegram_delivery_events.jsonl \
+  decision_telemetry.jsonl \
+  opip_trade_quality_evidence_v1.jsonl \
+  candidate_trace.jsonl \
+  opip/qualification/screening_evaluations_archive \
+  opip/qualification/funnel_events_archive \
+  opip/qualification/scan_summaries_archive \
+  manifest.env; do
   if [[ -e "$EXPORT_ROOT/$name" ]]; then
+    chown -R root:"$USER_NAME" "$(dirname "$EXPORT_ROOT/$name")"
     chown root:"$USER_NAME" "$EXPORT_ROOT/$name"
-    chmod 0640 "$EXPORT_ROOT/$name"
+    if [[ -d "$EXPORT_ROOT/$name" ]]; then
+      find "$EXPORT_ROOT/$name" -type d -exec chmod 0750 {} +
+      find "$EXPORT_ROOT/$name" -type f -exec chmod 0640 {} +
+    else
+      chmod 0640 "$EXPORT_ROOT/$name"
+    fi
   fi
 done
 

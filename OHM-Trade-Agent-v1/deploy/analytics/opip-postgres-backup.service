@@ -1,0 +1,11 @@
+[Unit]
+Description=Create verified O'Pip PostgreSQL dump
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/opip-postgres-backup
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true

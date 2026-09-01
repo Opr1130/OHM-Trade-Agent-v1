@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import logging
+from typing import Any
+
+from app.opip.data_platform.config import DataPlatformConfig
+from app.opip.data_platform.db import connect
+
+
+logger = logging.getLogger(__name__)
+
+
+def _iso(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        stamp = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc).isoformat()
+    return str(value) if value is not None else None
+
+
+def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
+    return {
+        "enabled": status != "DISABLED",
+        "available": False,
+        "status": status,
+        "error_type": error_type,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "stale": True,
+        "intelligence_daily": [],
+        "attrition_daily": [],
+        "rejection_mix_daily": [],
+        "stream_health": [],
+    }
+
+
+def read_historical_snapshot(
+    config: DataPlatformConfig | None = None,
+) -> dict[str, Any]:
+    """Read only small analytics views, failing soft to local dashboard data."""
+    settings = config or DataPlatformConfig.from_env()
+    dsn = settings.dashboard_dsn()
+    if not dsn:
+        return _empty("DISABLED")
+    try:
+        with connect(
+            dsn,
+            connect_timeout_seconds=settings.connect_timeout_seconds,
+            application_name="opip-dashboard-readonly",
+        ) as connection:
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    cursor.execute("SET TRANSACTION READ ONLY")
+                    cursor.execute(
+                        "SELECT set_config('statement_timeout', %s, true)",
+                        (f"{settings.statement_timeout_ms}ms",),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT day, events, early_watch_journeys,
+                               qualified_signals, paper_outcomes
+                        FROM signal.intelligence_daily_mv
+                        ORDER BY day DESC LIMIT 60
+                        """
+                    )
+                    intelligence = [
+                        {
+                            "date": (_iso(row[0]) or "")[:10],
+                            "events": int(row[1]),
+                            "early_watch_journeys": int(row[2]),
+                            "qualified_signals": int(row[3]),
+                            "paper_outcomes": int(row[4]),
+                        }
+                        for row in cursor.fetchall()
+                    ]
+                    cursor.execute(
+                        """
+                        SELECT day, scanner_type, outcome, reason_code,
+                               evaluations, instruments
+                        FROM market.attrition_daily_mv
+                        ORDER BY day DESC, scanner_type, outcome LIMIT 1000
+                        """
+                    )
+                    attrition = [
+                        {
+                            "date": (_iso(row[0]) or "")[:10],
+                            "scanner_type": row[1],
+                            "outcome": row[2],
+                            "reason_code": row[3],
+                            "evaluations": int(row[4]),
+                            "instruments": int(row[5]),
+                        }
+                        for row in cursor.fetchall()
+                    ]
+                    cursor.execute(
+                        """
+                        SELECT day, gate_name, reason_code, transitions
+                        FROM lifecycle.rejection_mix_daily_mv
+                        ORDER BY day DESC, transitions DESC LIMIT 1000
+                        """
+                    )
+                    rejection_mix = [
+                        {
+                            "date": (_iso(row[0]) or "")[:10],
+                            "gate_name": row[1],
+                            "reason_code": row[2],
+                            "transitions": int(row[3]),
+                        }
+                        for row in cursor.fetchall()
+                    ]
+                    cursor.execute(
+                        """
+                        SELECT stream_name, source_file, byte_offset,
+                               rows_ingested, source_size, updated_at,
+                               lag_seconds, unresolved_dead_letters,
+                               last_reconciliation_status, last_reconciled_at
+                        FROM ops.platform_health_v ORDER BY stream_name
+                        """
+                    )
+                    health = [
+                        {
+                            "stream_name": row[0],
+                            "source_file": row[1],
+                            "byte_offset": int(row[2]),
+                            "rows_ingested": int(row[3]),
+                            "source_size": int(row[4]),
+                            "updated_at": _iso(row[5]),
+                            "lag_seconds": int(row[6]),
+                            "unresolved_dead_letters": int(row[7]),
+                            "last_reconciliation_status": row[8],
+                            "last_reconciled_at": _iso(row[9]),
+                        }
+                        for row in cursor.fetchall()
+                    ]
+        maximum_lag = max((item["lag_seconds"] for item in health), default=0)
+        stale = maximum_lag > 1800 or any(
+            item["last_reconciliation_status"] not in {None, "CLEAN"}
+            or item["unresolved_dead_letters"] > 0
+            for item in health
+        )
+        return {
+            "enabled": True,
+            "available": True,
+            "status": "STALE" if stale else "OK",
+            "error_type": None,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "stale": stale,
+            "intelligence_daily": list(reversed(intelligence)),
+            "attrition_daily": attrition,
+            "rejection_mix_daily": rejection_mix,
+            "stream_health": health,
+        }
+    except Exception as exc:
+        logger.warning(
+            "O'Pip historical PostgreSQL read failed soft: %s", type(exc).__name__
+        )
+        return _empty("UNAVAILABLE", error_type=type(exc).__name__)

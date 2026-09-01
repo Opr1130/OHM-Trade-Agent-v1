@@ -1,0 +1,141 @@
+name: opip-data-platform
+
+services:
+  opip-postgres:
+    image: postgres:17-alpine
+    container_name: opip-postgres
+    restart: unless-stopped
+    env_file:
+      - /etc/opip-data-platform.env
+    environment:
+      POSTGRES_DB: ${OPIP_POSTGRES_DB:-opip}
+      POSTGRES_USER: ${OPIP_POSTGRES_ADMIN_USER:-opip_admin}
+      POSTGRES_PASSWORD: ${OPIP_POSTGRES_ADMIN_PASSWORD:?set in /etc/opip-data-platform.env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - listen_addresses=*
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=25
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    ports:
+      - "${OPIP_POSTGRES_BIND_ADDRESS:-127.0.0.1}:5432:5432"
+    volumes:
+      - /var/lib/opip-data-platform/postgres:/var/lib/postgresql/data
+      - /var/lib/opip-data-platform/config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      opip-analytics:
+        ipv4_address: 172.29.0.2
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: "0.45"
+    pids_limit: 192
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  opip-shipper:
+    build:
+      context: ../..
+    image: opip-data-platform:${OPIP_DEPLOYED_SHA:-local}
+    container_name: opip-shipper
+    restart: unless-stopped
+    depends_on:
+      opip-postgres:
+        condition: service_healthy
+    env_file:
+      - /etc/opip-data-platform.env
+    environment:
+      OPIP_DATA_PLATFORM_SHIPPER_ENABLED: "true"
+      OPIP_DATA_PLATFORM_DATA_ROOT: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+    command:
+      - python
+      - -m
+      - app.opip.data_platform.shipper
+      - --watch
+    volumes:
+      - /var/lib/opip-learning/data:/data:ro
+    networks:
+      opip-analytics:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    mem_limit: 128m
+    memswap_limit: 128m
+    cpus: "0.20"
+    pids_limit: 96
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  opip-data-admin:
+    profiles: ["admin"]
+    build:
+      context: ../..
+    image: opip-data-platform:${OPIP_DEPLOYED_SHA:-local}
+    depends_on:
+      opip-postgres:
+        condition: service_healthy
+    env_file:
+      - /etc/opip-data-platform.env
+    environment:
+      OPIP_DATA_PLATFORM_SHIPPER_ENABLED: "true"
+      OPIP_DATA_PLATFORM_DATA_ROOT: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - /var/lib/opip-learning/data:/data:ro
+      - /var/backups/opip-postgres:/backups:rw
+    networks:
+      opip-analytics:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.35"
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  opip-analytics:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
