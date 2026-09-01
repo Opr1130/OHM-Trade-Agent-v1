@@ -137,23 +137,43 @@ def ensure_monthly_partitions(
 
 
 def refresh_materialized_views(connection: Any) -> None:
+    from psycopg import sql
+
     views = (
-        "signal.intelligence_daily_mv",
-        "market.attrition_daily_mv",
-        "lifecycle.rejection_mix_daily_mv",
+        ("signal", "intelligence_daily_mv"),
+        ("market", "attrition_daily_mv"),
+        ("lifecycle", "rejection_mix_daily_mv"),
     )
+    populated_views: list[tuple[str, str, bool]] = []
     with connection.cursor() as cursor:
-        for view in views:
+        for schema_name, view_name in views:
             cursor.execute(
                 "SELECT c.relispopulated FROM pg_class c "
                 "WHERE c.oid = %s::regclass",
-                (view,),
+                (f"{schema_name}.{view_name}",),
             )
-            populated = bool(cursor.fetchone()[0])
-            cursor.execute(
-                f"REFRESH MATERIALIZED VIEW {'CONCURRENTLY ' if populated else ''}{view}"
+            populated_views.append(
+                (schema_name, view_name, bool(cursor.fetchone()[0]))
             )
+
+    # A population-state SELECT starts an implicit transaction on the normal
+    # admin connection. PostgreSQL forbids CONCURRENTLY inside that block.
     connection.commit()
+    prior_autocommit = bool(connection.autocommit)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            for schema_name, view_name, populated in populated_views:
+                concurrently = sql.SQL("CONCURRENTLY ") if populated else sql.SQL("")
+                cursor.execute(
+                    sql.SQL("REFRESH MATERIALIZED VIEW {}{}.{}").format(
+                        concurrently,
+                        sql.Identifier(schema_name),
+                        sql.Identifier(view_name),
+                    )
+                )
+    finally:
+        connection.autocommit = prior_autocommit
 
 
 def provision_login_roles(connection: Any, passwords: dict[str, str]) -> None:

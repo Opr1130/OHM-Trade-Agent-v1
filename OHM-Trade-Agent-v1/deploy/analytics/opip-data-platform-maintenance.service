@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=/etc/opip-data-platform.env
 ExecStart=/usr/local/sbin/opip-data-platform-maintenance
 User=root
 Group=root

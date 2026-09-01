@@ -51,19 +51,9 @@ if [[ ! "$OPIP_PRODUCTION_PRIVATE_CIDR" =~ ^10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,
   echo "OPIP_PRODUCTION_PRIVATE_CIDR must be a private 10.x.x.x/32 address" >&2
   exit 78
 fi
-: "${OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC:?verify off-host backup before database deployment}"
-: "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before database deployment}"
 now_epoch="$(date -u +%s)"
-backup_epoch="$(date -u -d "$OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
-restore_epoch="$(date -u -d "$OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
-if [[ ! "$backup_epoch" =~ ^[0-9]+$ ]] || (( now_epoch - backup_epoch > 8 * 86400 )); then
-  echo "off-host backup verification is missing or older than eight days" >&2
-  exit 70
-fi
-if [[ ! "$restore_epoch" =~ ^[0-9]+$ ]] || (( now_epoch - restore_epoch > 90 * 86400 )); then
-  echo "restore drill verification is missing or older than 90 days" >&2
-  exit 70
-fi
+backup_epoch=""
+restore_epoch=""
 
 git -C "$REPO_ROOT" fetch --prune origin main
 remote_main="$(git -C "$REPO_ROOT" rev-parse origin/main)"
@@ -134,10 +124,58 @@ require_stage() {
   }
 }
 
+validate_promotion_evidence() {
+  local latest_backup restore_state_epoch
+  : "${OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC:?verify off-host backup before promotion}"
+  : "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before promotion}"
+  backup_epoch="$(date -u -d "$OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
+  restore_epoch="$(date -u -d "$OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
+  if [[ ! "$backup_epoch" =~ ^[0-9]+$ ]] \
+    || (( backup_epoch > now_epoch || now_epoch - backup_epoch > 8 * 86400 )); then
+    echo "off-host backup verification is invalid, future-dated, or older than eight days" >&2
+    exit 70
+  fi
+  if [[ ! "$restore_epoch" =~ ^[0-9]+$ ]] \
+    || (( restore_epoch > now_epoch || now_epoch - restore_epoch > 90 * 86400 )); then
+    echo "restore drill verification is invalid, future-dated, or older than 90 days" >&2
+    exit 70
+  fi
+  latest_backup="$(find /var/backups/opip-postgres -maxdepth 1 -type f \
+    -name 'opip-postgres-*.dump' -printf '%T@ %p\n' \
+    | sort -nr | awk 'NR == 1 {sub(/^[^ ]+ /, ""); print}')"
+  [[ -n "$latest_backup" && -r "$latest_backup" && -r "$latest_backup.sha256" ]] || {
+    echo "a checksummed PostgreSQL dump is required before promotion" >&2
+    exit 70
+  }
+  sha256sum --check --status "$latest_backup.sha256" || {
+    echo "latest PostgreSQL dump checksum verification failed" >&2
+    exit 70
+  }
+  [[ -r "$STATE_ROOT/last-restore-drill.env" ]] || {
+    echo "local restore-drill evidence is required before promotion" >&2
+    exit 70
+  }
+  restore_state_epoch="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' \
+    "$STATE_ROOT/last-restore-drill.env")"
+  restore_state_epoch="$(date -u -d "$restore_state_epoch" +%s 2>/dev/null || true)"
+  if [[ ! "$restore_state_epoch" =~ ^[0-9]+$ ]] \
+    || (( restore_state_epoch > now_epoch || restore_state_epoch < restore_epoch )); then
+    echo "local restore-drill evidence is invalid, future-dated, or older than recorded evidence" >&2
+    exit 70
+  fi
+}
+
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
 docker compose -f "$COMPOSE" build opip-shipper opip-data-admin
 docker compose -f "$COMPOSE" up -d opip-postgres
 wait_for_postgres
+
+# A fresh host may initialize the empty database first. Promotion beyond the
+# empty stage requires a real dump, restore drill, and independently recorded
+# off-host evidence after PostgreSQL is running.
+if [[ "$STAGE" != "empty" ]]; then
+  validate_promotion_evidence
+fi
 
 if [[ "$STAGE" == "empty" ]]; then
   admin_run python -m app.opip.data_platform.migrations migrate
@@ -157,8 +195,9 @@ elif [[ "$STAGE" == "backfill" ]]; then
   fi
   : "${OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC:?record the empty-stage rollback verification before backfill}"
   rollback_epoch="$(date -u -d "$OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
-  if [[ ! "$rollback_epoch" =~ ^[0-9]+$ ]] || (( rollback_epoch < restore_epoch )); then
-    echo "empty-stage rollback evidence must be valid and newer than the restore drill" >&2
+  if [[ ! "$rollback_epoch" =~ ^[0-9]+$ ]] \
+    || (( rollback_epoch > now_epoch || rollback_epoch < restore_epoch )); then
+    echo "empty-stage rollback evidence must not be future-dated and must be newer than the restore drill" >&2
     exit 69
   fi
   admin_run python -m app.opip.data_platform.backfill
@@ -179,7 +218,8 @@ else
   # shellcheck disable=SC1090
   source "$STATE_FILE"
   shipper_epoch="$(date -u -d "$SHIPPER_STARTED_AT_UTC" +%s 2>/dev/null || true)"
-  if [[ ! "$shipper_epoch" =~ ^[0-9]+$ ]] || (( now_epoch - shipper_epoch < 7 * 86400 )); then
+  if [[ ! "$shipper_epoch" =~ ^[0-9]+$ ]] \
+    || (( shipper_epoch > now_epoch || now_epoch - shipper_epoch < 7 * 86400 )); then
     echo "shipper must soak for seven days before historical reads are eligible" >&2
     exit 69
   fi
@@ -188,6 +228,8 @@ else
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_state READS_READY_SHA "$TARGET_SHA"
 fi
+
+write_state DEPLOYED_SHA "$TARGET_SHA"
 
 install -o root -g root -m 0755 \
   "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \

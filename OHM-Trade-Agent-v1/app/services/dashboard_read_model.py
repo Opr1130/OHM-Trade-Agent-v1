@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -361,6 +361,19 @@ def _paper_status() -> dict[str, Any]:
     }
 
 
+def _historical_trend_for_scope(
+    rows: list[dict[str, Any]],
+    scope: str,
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    if scope != "today":
+        return rows
+    current_day = today or datetime.now(timezone.utc).date()
+    day_text = current_day.isoformat()
+    return [row for row in rows if str(row.get("date")) == day_text]
+
+
 def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     if scope not in {"today", "all"}:
         raise ValueError("scope must be today or all")
@@ -409,7 +422,10 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     sample_count = int(paper.get("count") or 0)
     evidence_state = "INSUFFICIENT_DATA" if sample_count < 30 else "MEASURED"
     historical = read_historical_snapshot()
-    historical_trend = historical.get("intelligence_daily") or []
+    historical_trend = _historical_trend_for_scope(
+        historical.get("intelligence_daily") or [],
+        scope,
+    )
 
     return {
         "schema_version": 2,

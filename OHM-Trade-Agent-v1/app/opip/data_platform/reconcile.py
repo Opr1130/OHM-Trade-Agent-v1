@@ -139,6 +139,7 @@ def reconcile_stream(
                     ),
                 ),
             )
+    connection.commit()
     return result
 
 

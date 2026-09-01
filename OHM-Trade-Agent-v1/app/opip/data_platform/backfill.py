@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gzip
 import hashlib
 import os
@@ -42,13 +43,17 @@ def _verified_archive_sha256(path: Path) -> str:
     checksum = path.with_suffix(path.suffix + ".sha256")
     if not checksum.is_file():
         raise RuntimeError(f"archive checksum is missing: {path}")
-    expected = checksum.read_text(encoding="utf-8").strip().split(maxsplit=1)[0]
+    fields = checksum.read_text(encoding="utf-8").strip().split(maxsplit=1)
+    if not fields:
+        raise RuntimeError(f"archive checksum is empty: {path}")
+    expected = fields[0]
     actual = _sha256_file(path)
     if len(expected) != 64 or expected.lower() != actual:
         raise RuntimeError(f"archive checksum mismatch: {path}")
     return actual
 
 
+@contextmanager
 def _decompressed(path: Path) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="opip-backfill-") as directory:
         target = Path(directory) / path.name.removesuffix(".gz")
@@ -72,7 +77,7 @@ def backfill(
         for archive in archives:
             digest = _verified_archive_sha256(archive)
             checkpoint_name = f"backfill:{spec.name}:{digest}"
-            for extracted in _decompressed(archive):
+            with _decompressed(archive) as extracted:
                 result = ship_stream(
                     connection,
                     spec=spec,
@@ -90,9 +95,7 @@ def backfill(
                     source_file=archive,
                 )
                 if reconciliation.status != "CLEAN":
-                    raise RuntimeError(
-                        f"archive reconciliation failed: {archive}"
-                    )
+                    raise RuntimeError(f"archive reconciliation failed: {archive}")
         if include_hot and hot_path.exists():
             result = ship_stream(
                 connection,

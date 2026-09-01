@@ -16,8 +16,25 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 GRANT USAGE ON SCHEMA market, lifecycle, signal, paper, learning, ops, raw
     TO opip_shipper;
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA market, lifecycle, signal, paper, learning, ops, raw
+GRANT SELECT ON ALL TABLES IN SCHEMA market, lifecycle, signal, paper, learning, ops, raw
     TO opip_shipper;
+GRANT INSERT, UPDATE ON
+    market.instrument,
+    market.instrument_alias,
+    market.screening,
+    market.observation,
+    lifecycle.episode,
+    lifecycle.candidate,
+    lifecycle.stage_transition,
+    signal.intelligence_event,
+    paper.trade,
+    paper.trade_event,
+    raw.ingested_event,
+    ops.ingest_checkpoint,
+    ops.dead_letter,
+    ops.reconciliation_run
+    TO opip_shipper;
+REVOKE INSERT, UPDATE, DELETE ON ops.schema_version FROM opip_shipper;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA market, lifecycle, signal, paper, learning, ops, raw
     TO opip_shipper;
 
@@ -34,6 +51,6 @@ GRANT SELECT ON signal.intelligence_daily_mv,
     ops.platform_health_v TO opip_dashboard;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA market, lifecycle, signal, paper, learning, ops, raw
-    GRANT SELECT, INSERT, UPDATE ON TABLES TO opip_shipper;
+    GRANT SELECT ON TABLES TO opip_shipper;
 ALTER DEFAULT PRIVILEGES IN SCHEMA market, lifecycle, signal, paper, learning, ops, raw
     GRANT USAGE, SELECT ON SEQUENCES TO opip_shipper;

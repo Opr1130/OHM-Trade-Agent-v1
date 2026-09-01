@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS market.observation (
 
 CREATE TABLE IF NOT EXISTS lifecycle.episode (
     episode_id text PRIMARY KEY,
+    revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
     cohort_id text,
     instrument_id bigint REFERENCES market.instrument(instrument_id),
     decision_at timestamptz NOT NULL,
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS lifecycle.episode (
 
 CREATE TABLE IF NOT EXISTS lifecycle.candidate (
     candidate_id text PRIMARY KEY,
+    revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
     episode_id text REFERENCES lifecycle.episode(episode_id),
     scan_id text NOT NULL,
     instrument_id bigint REFERENCES market.instrument(instrument_id),
@@ -139,6 +141,7 @@ CREATE TABLE IF NOT EXISTS signal.intelligence_event (
 
 CREATE TABLE IF NOT EXISTS paper.trade (
     paper_trade_id text PRIMARY KEY,
+    revision integer NOT NULL DEFAULT 1 CHECK (revision > 0),
     signal_id text,
     instrument_id bigint REFERENCES market.instrument(instrument_id),
     state text NOT NULL,
@@ -189,7 +192,10 @@ CREATE TABLE IF NOT EXISTS raw.ingested_event (
     observed_at timestamptz NOT NULL,
     payload jsonb NOT NULL,
     ingested_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (observed_at, stream_name, source_event_id, source_generation)
+    PRIMARY KEY (
+        observed_at, stream_name, source_event_id, source_file,
+        source_generation, source_byte_offset
+    )
 ) PARTITION BY RANGE (observed_at);
 
 CREATE TABLE IF NOT EXISTS ops.ingest_checkpoint (

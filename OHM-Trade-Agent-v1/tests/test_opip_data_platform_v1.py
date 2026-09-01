@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 
@@ -9,8 +9,15 @@ import pytest
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.backfill import archive_paths
 from app.opip.data_platform.backfill import _verified_archive_sha256
-from app.opip.data_platform.migrations import discover_migrations
-from app.opip.data_platform.read_model import read_historical_snapshot
+from app.opip.data_platform.health import _required_stream_readiness
+from app.opip.data_platform.migrations import (
+    discover_migrations,
+    refresh_materialized_views,
+)
+from app.opip.data_platform.read_model import (
+    _stream_health_is_stale,
+    read_historical_snapshot,
+)
 from app.opip.data_platform.shipper import (
     Checkpoint,
     checkpoint_is_continuous,
@@ -19,6 +26,7 @@ from app.opip.data_platform.shipper import (
     source_event_id,
 )
 from app.opip.data_platform.streams import STREAM_SPECS
+from app.services.dashboard_read_model import _historical_trend_for_scope
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +79,22 @@ def test_jsonl_reader_retries_torn_tail_and_validates_continuity(tmp_path):
     assert not checkpoint_is_continuous(path, checkpoint)
 
 
+def test_checkpoint_continuity_supports_rows_larger_than_prior_read_window(tmp_path):
+    path = tmp_path / "large-events.jsonl"
+    row = b'{"observed_at":"2026-09-01T00:00:00Z","payload":"' + (
+        b"x" * (300 * 1024)
+    ) + b'"}\n'
+    path.write_bytes(row)
+    source_line = next(iter_lines(path))
+    checkpoint = Checkpoint(
+        byte_offset=source_line.end_offset,
+        last_row_sha256=source_line.sha256,
+        rows_ingested=1,
+        source_size=path.stat().st_size,
+    )
+    assert checkpoint_is_continuous(path, checkpoint)
+
+
 def test_archive_discovery_is_scoped_to_each_stream(tmp_path):
     screening = next(item for item in STREAM_SPECS if item.name == "screening_evaluations")
     expected = (
@@ -104,6 +128,14 @@ def test_archive_checksum_is_required_and_verified(tmp_path):
     assert _verified_archive_sha256(archive).startswith("239f59ed")
 
 
+def test_archive_checksum_rejects_blank_sidecar(tmp_path):
+    archive = tmp_path / "events-blank.jsonl.gz"
+    archive.write_bytes(b"payload")
+    archive.with_suffix(archive.suffix + ".sha256").write_text("  \n")
+    with pytest.raises(RuntimeError, match="checksum is empty"):
+        _verified_archive_sha256(archive)
+
+
 @pytest.mark.parametrize(
     "field",
     ("observed_at", "recorded_at", "updated_at", "attempted_at", "scan_at"),
@@ -125,6 +157,93 @@ def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     assert "opip_shipper" in sql
     assert "timescaledb" not in sql.lower()
     assert "vector" not in sql.lower()
+    assert "source_generation, source_byte_offset" in sql
+    assert "revision integer NOT NULL DEFAULT 1" in sql
+    assert "REVOKE INSERT, UPDATE, DELETE ON ops.schema_version" in sql
+    assert "GRANT SELECT, INSERT, UPDATE ON ALL TABLES" not in sql
+    assert "GRANT SELECT, INSERT, UPDATE ON TABLES TO opip_shipper" not in sql
+
+
+def test_concurrent_materialized_view_refresh_uses_autocommit():
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            self.connection.events.append(
+                ("execute", self.connection.autocommit, repr(query), params)
+            )
+
+        def fetchone(self):
+            return (self.connection.population.pop(0),)
+
+    class Connection:
+        def __init__(self):
+            self.autocommit = False
+            self.population = [True, False, True]
+            self.events = []
+
+        def cursor(self):
+            return Cursor(self)
+
+        def commit(self):
+            self.events.append(("commit", self.autocommit, "", None))
+
+    connection = Connection()
+    refresh_materialized_views(connection)
+    refreshes = [event for event in connection.events if "REFRESH" in event[2]]
+    assert len(refreshes) == 3
+    assert all(event[1] is True for event in refreshes)
+    assert connection.events.index(refreshes[0]) > next(
+        index for index, event in enumerate(connection.events) if event[0] == "commit"
+    )
+    assert connection.autocommit is False
+
+
+def test_optional_streams_do_not_block_required_readiness():
+    required = [item.name for item in STREAM_SPECS if item.required]
+    rows = [
+        {
+            "stream_name": name,
+            "lag_seconds": 1,
+            "unresolved_dead_letters": 0,
+            "last_reconciliation_status": "CLEAN",
+        }
+        for name in required
+    ]
+    rows.append(
+        {
+            "stream_name": "paper_trade_events",
+            "lag_seconds": 99999,
+            "unresolved_dead_letters": 4,
+            "last_reconciliation_status": "MISMATCH",
+        }
+    )
+    required_names, missing, healthy = _required_stream_readiness(
+        rows,
+        maximum_lag_seconds=300,
+    )
+    assert required_names == sorted(required)
+    assert missing == []
+    assert healthy is True
+    assert _stream_health_is_stale(rows, maximum_lag_seconds=300) is False
+    assert _stream_health_is_stale(rows[1:], maximum_lag_seconds=300) is True
+
+
+def test_today_historical_trend_excludes_prior_dates():
+    rows = [{"date": "2026-08-31"}, {"date": "2026-09-01"}]
+    assert _historical_trend_for_scope(
+        rows,
+        "today",
+        today=date(2026, 9, 1),
+    ) == [{"date": "2026-09-01"}]
+    assert _historical_trend_for_scope(rows, "all") == rows
 
 
 def test_all_streams_are_exported_and_manifest_validated_before_promotion():
@@ -168,6 +287,19 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "analytics host must be resized to at least 2 GiB" in bootstrap
     assert "opip-learning-plane.lock" in bootstrap
     assert "remote_main" in bootstrap and "TARGET_SHA" in bootstrap
+    assert bootstrap.index("wait_for_postgres\n") < bootstrap.index(
+        "validate_promotion_evidence\n"
+    )
+    assert "backup_epoch > now_epoch" in bootstrap
+    assert "restore_epoch > now_epoch" in bootstrap
+    assert "rollback_epoch > now_epoch" in bootstrap
+    assert "a checksummed PostgreSQL dump is required before promotion" in bootstrap
+    maintenance = (
+        ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
+    ).read_text()
+    assert "/etc/opip-data-platform.env" in maintenance
+    assert "/var/lock/opip-learning-plane.lock" in maintenance
+    assert "DEPLOYED_SHA" in maintenance
     restore = (ROOT / "deploy/analytics/opip-postgres-restore-drill.sh").read_text()
     assert "pg_restore --exit-on-error" in restore
     assert "opip_restore_drill_" in restore

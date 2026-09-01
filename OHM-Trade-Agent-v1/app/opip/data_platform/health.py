@@ -10,6 +10,27 @@ from app.opip.data_platform.db import connect
 from app.opip.data_platform.streams import STREAM_SPECS
 
 
+def _required_stream_readiness(
+    streams: list[dict],
+    *,
+    maximum_lag_seconds: int,
+) -> tuple[list[str], list[str], bool]:
+    required_streams = sorted(item.name for item in STREAM_SPECS if item.required)
+    required_stream_set = set(required_streams)
+    present_streams = {str(item["stream_name"]) for item in streams}
+    missing_required = sorted(required_stream_set - present_streams)
+    required_rows = [
+        row for row in streams if str(row["stream_name"]) in required_stream_set
+    ]
+    healthy = not missing_required and all(
+        row["lag_seconds"] <= maximum_lag_seconds
+        and row["unresolved_dead_letters"] == 0
+        and row["last_reconciliation_status"] in {None, "CLEAN"}
+        for row in required_rows
+    )
+    return required_streams, missing_required, healthy
+
+
 def build_health(connection, *, maximum_lag_seconds: int = 1800) -> dict:
     with connection.transaction():
         with connection.cursor() as cursor:
@@ -35,14 +56,9 @@ def build_health(connection, *, maximum_lag_seconds: int = 1800) -> dict:
             database_bytes = int(cursor.fetchone()[0])
             cursor.execute("SELECT max(version) FROM ops.schema_version")
             schema_version = int(cursor.fetchone()[0] or 0)
-    required_streams = sorted(item.name for item in STREAM_SPECS if item.required)
-    present_streams = {str(item["stream_name"]) for item in streams}
-    missing_required = sorted(set(required_streams) - present_streams)
-    healthy = not missing_required and all(
-        row["lag_seconds"] <= maximum_lag_seconds
-        and row["unresolved_dead_letters"] == 0
-        and row["last_reconciliation_status"] in {None, "CLEAN"}
-        for row in streams
+    required_streams, missing_required, healthy = _required_stream_readiness(
+        streams,
+        maximum_lag_seconds=maximum_lag_seconds,
     )
     return {
         "status": "OK" if healthy else "DEGRADED",

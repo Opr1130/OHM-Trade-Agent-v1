@@ -122,13 +122,26 @@ def _last_complete_row_hash(path: Path, end_offset: int) -> str | None:
     if end_offset <= 0:
         return ""
     with path.open("rb") as handle:
-        window = min(end_offset, 256 * 1024)
-        handle.seek(end_offset - window)
-        raw = handle.read(window)
-    lines = [line for line in raw.splitlines() if line.strip()]
-    if not lines:
+        handle.seek(end_offset - 1)
+        if handle.read(1) != b"\n":
+            return None
+        row_end = end_offset - 1
+        chunks: list[bytes] = []
+        position = row_end
+        while position > 0:
+            start = max(0, position - 64 * 1024)
+            handle.seek(start)
+            chunk = handle.read(position - start)
+            boundary = chunk.rfind(b"\n")
+            if boundary >= 0:
+                chunks.append(chunk[boundary + 1 :])
+                break
+            chunks.append(chunk)
+            position = start
+    row = b"".join(reversed(chunks)).rstrip(b"\r")
+    if not row.strip():
         return None
-    return hashlib.sha256(lines[-1]).hexdigest()
+    return hashlib.sha256(row).hexdigest()
 
 
 def checkpoint_is_continuous(path: Path, checkpoint: Checkpoint) -> bool:
@@ -358,21 +371,25 @@ class DatabaseWriter:
             if not paper_trade_id:
                 raise ValueError("paper event has no paper_trade_id")
             state = str(row.get("status") or "UNKNOWN").upper()
+            revision = int(row.get("revision") or 1)
             cursor.execute(
                 """
                 INSERT INTO paper.trade(
-                    paper_trade_id, signal_id, instrument_id, state, opened_at,
+                    paper_trade_id, revision, signal_id, instrument_id, state, opened_at,
                     closed_at, realised_pnl, reconciliation_status,
                     strategy_version, config_version, model_version, payload
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'UNVERIFIED', %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'UNVERIFIED', %s, %s, %s, %s)
                 ON CONFLICT (paper_trade_id) DO UPDATE SET
+                    revision = EXCLUDED.revision,
                     state = EXCLUDED.state,
                     closed_at = coalesce(EXCLUDED.closed_at, paper.trade.closed_at),
                     realised_pnl = coalesce(EXCLUDED.realised_pnl, paper.trade.realised_pnl),
                     payload = EXCLUDED.payload
+                WHERE EXCLUDED.revision >= paper.trade.revision
                 """,
                 (
                     paper_trade_id,
+                    revision,
                     row.get("signal_id"),
                     instrument_id,
                     state,
@@ -397,7 +414,7 @@ class DatabaseWriter:
                 (
                     str(row.get("event_id") or event_id),
                     paper_trade_id,
-                    int(row.get("revision") or 1),
+                    revision,
                     str(row.get("event_type") or "UNKNOWN"),
                     stamp,
                     Jsonb(dict(row)),
@@ -425,18 +442,25 @@ class DatabaseWriter:
         strategy_version = str(row.get("strategy_version") or "UNKNOWN")
         config_version = str(row.get("gate_policy_version") or "UNKNOWN")
         model_version = row.get("intelligence_version")
+        revision = int(row.get("revision") or 1)
         cursor.execute(
             """
             INSERT INTO lifecycle.episode(
-                episode_id, cohort_id, instrument_id, decision_at, current_stage,
+                episode_id, revision, cohort_id, instrument_id, decision_at, current_stage,
                 terminal_reason, strategy_version, config_version, model_version
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (episode_id) DO UPDATE SET
+                revision = EXCLUDED.revision,
+                decision_at = EXCLUDED.decision_at,
                 current_stage = EXCLUDED.current_stage,
                 terminal_reason = EXCLUDED.terminal_reason
+            WHERE EXCLUDED.revision > lifecycle.episode.revision
+               OR (EXCLUDED.revision = lifecycle.episode.revision
+                   AND EXCLUDED.decision_at >= lifecycle.episode.decision_at)
             """,
             (
                 episode_id,
+                revision,
                 row.get("cohort_id"),
                 instrument_id,
                 stamp,
@@ -450,18 +474,24 @@ class DatabaseWriter:
         cursor.execute(
             """
             INSERT INTO lifecycle.candidate(
-                candidate_id, episode_id, scan_id, instrument_id, direction,
+                candidate_id, revision, episode_id, scan_id, instrument_id, direction,
                 decision_at, decision, terminal_reason_code, terminal_reason,
                 strategy_version, config_version, model_version, evidence
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (candidate_id) DO UPDATE SET
+                revision = EXCLUDED.revision,
+                decision_at = EXCLUDED.decision_at,
                 decision = EXCLUDED.decision,
                 terminal_reason_code = EXCLUDED.terminal_reason_code,
                 terminal_reason = EXCLUDED.terminal_reason,
                 evidence = EXCLUDED.evidence
+            WHERE EXCLUDED.revision > lifecycle.candidate.revision
+               OR (EXCLUDED.revision = lifecycle.candidate.revision
+                   AND EXCLUDED.decision_at >= lifecycle.candidate.decision_at)
             """,
             (
                 candidate_id,
+                revision,
                 episode_id,
                 str(row.get("scan_id") or "UNKNOWN"),
                 instrument_id,

@@ -6,9 +6,35 @@ from typing import Any
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
+from app.opip.data_platform.streams import STREAM_SPECS
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stream_health_is_stale(
+    health: list[dict[str, Any]],
+    *,
+    maximum_lag_seconds: int = 1800,
+) -> bool:
+    required_streams = {item.name for item in STREAM_SPECS if item.required}
+    required_health = [
+        item for item in health if str(item["stream_name"]) in required_streams
+    ]
+    present_required = {str(item["stream_name"]) for item in required_health}
+    maximum_lag = max(
+        (item["lag_seconds"] for item in required_health),
+        default=0,
+    )
+    return (
+        bool(required_streams - present_required)
+        or maximum_lag > maximum_lag_seconds
+        or any(
+            item["last_reconciliation_status"] not in {None, "CLEAN"}
+            or item["unresolved_dead_letters"] > 0
+            for item in required_health
+        )
+    )
 
 
 def _iso(value: Any) -> str | None:
@@ -131,12 +157,7 @@ def read_historical_snapshot(
                         }
                         for row in cursor.fetchall()
                     ]
-        maximum_lag = max((item["lag_seconds"] for item in health), default=0)
-        stale = maximum_lag > 1800 or any(
-            item["last_reconciliation_status"] not in {None, "CLEAN"}
-            or item["unresolved_dead_letters"] > 0
-            for item in health
-        )
+        stale = _stream_health_is_stale(health)
         return {
             "enabled": True,
             "available": True,
