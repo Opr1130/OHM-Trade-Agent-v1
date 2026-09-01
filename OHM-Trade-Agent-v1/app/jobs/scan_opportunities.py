@@ -1,9 +1,18 @@
 import logging
+import inspect
 from collections import Counter
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.core.config import get_settings
+from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
+from app.opip.decision.screening import (
+    ScannerType,
+    ScreeningEvaluation,
+    ScreeningOutcome,
+)
+from app.opip.decision.store import append_screening_evaluations
+from app.opip.identity import resolve_venue_instrument_identity
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
 from app.scanner.directional_candidates import select_directional_candidates
@@ -72,6 +81,58 @@ logger = logging.getLogger(__name__)
 # Backwards-compatible test/extension seam. Production default is the new mixed
 # directional selector; existing callers that patch select_candidates still work.
 select_candidates = select_directional_candidates
+
+
+def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
+    """Build the fail-soft, evidence-only Broad Search callback."""
+    def capture(snapshot, long_score, short_score, advanced_direction) -> None:
+        raw = str(
+            getattr(snapshot, "primary_pair", None)
+            or getattr(snapshot, "symbol", "")
+        )
+        try:
+            rows.append(
+                ScreeningEvaluation(
+                    observed_at=observed_at,
+                    scan_id=scan_id,
+                    scanner_type=ScannerType.BROAD_SEARCH,
+                    venue_instrument=resolve_venue_instrument_identity(
+                        raw,
+                        canonicalize_asset=canonicalize_asset,
+                        split_canonical_pair=split_canonical_pair,
+                        resolved_at_utc=observed_at,
+                    ),
+                    outcome=(
+                        ScreeningOutcome.ADVANCED
+                        if advanced_direction is not None
+                        else ScreeningOutcome.BELOW_THRESHOLD
+                    ),
+                    long_score=long_score,
+                    short_score=short_score,
+                    advanced_direction=advanced_direction,
+                    reason=(
+                        "directional technical threshold cleared"
+                        if advanced_direction is not None
+                        else "neither directional technical score cleared the threshold"
+                    ),
+                    metadata={"universe_count": int(universe_count)},
+                ).to_dict()
+            )
+        except Exception as exc:
+            logger.warning(
+                "O'Pip screening capture failed open scanner_type=BROAD_SEARCH "
+                "scan_id=%s raw=%s operation=build_screening_evaluation error=%s",
+                scan_id,
+                raw or "UNKNOWN",
+                type(exc).__name__,
+            )
+
+    return capture
+
+
+def _screening_scan_id(observer) -> str:
+    """Read the observer identity only for joining measurement rows."""
+    return str(observer.funnel.scan_id)
 
 
 def _record_coingecko_health_fail_open(settings, reference_summary, global_context) -> None:
@@ -647,7 +708,7 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
 
 
 
-def _apply_ranked_action_gates(ranked_opportunities, *, settings):
+def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None):
     """Apply scarce-capital/portfolio eligibility in global rank order.
 
     Approved candidates are added to a projected exposure list so lower-ranked
@@ -661,6 +722,10 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings):
             "ACTION GATE unavailable; no new trade alert authorized:",
             f"{type(exc).__name__}: {exc}",
         )
+        reason = f"{type(exc).__name__}: {exc}"
+        if opip is not None:
+            for ranked in ranked_opportunities:
+                opip.record_action_gate(ranked, allowed=None, reason=reason)
         return []
 
     eligible = []
@@ -673,12 +738,28 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings):
         alert.setdefault("profit_rank", ranked.rank)
         alert["profit_rank_score"] = ranked.profit_ranking.total_score
 
-        gate = apply_action_gate(
-            candidate=alert,
-            plan=plan,
-            account_capital=float(settings.account_equity),
-            active_trades=projected_trades,
-        )
+        try:
+            gate = apply_action_gate(
+                candidate=alert,
+                plan=plan,
+                account_capital=float(settings.account_equity),
+                active_trades=projected_trades,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            print(
+                f"ACTION GATE ERROR rank={ranked.rank} {direction} {plan.symbol}: "
+                f"{reason}"
+            )
+            if opip is not None:
+                opip.record_action_gate(ranked, allowed=None, reason=reason)
+            continue
+        if opip is not None:
+            opip.record_action_gate(
+                ranked,
+                allowed=bool(gate.allowed),
+                reason=str(gate.reason or ""),
+            )
         if not gate.allowed:
             print(
                 f"ACTION GATE REJECT rank={ranked.rank} {direction} {plan.symbol}: "
@@ -728,7 +809,33 @@ def main():
         str(signal.get("stage") or "UNKNOWN")
         for signal in local_movement_signals
     )
-    candidates = select_candidates(scan.snapshots)
+    # Construct the observer before selection so the screening rows and funnel
+    # share one scan identity.  No callback is installed while telemetry is
+    # dark, preserving the historical selector call exactly.
+    opip = build_scan_observer(
+        snapshots=scan.snapshots,
+        decision_at=decision_at,
+        account_equity=getattr(settings, "account_equity", None),
+    )
+    if opip.telemetry_enabled:
+        screening_rows: list[dict] = []
+        screening_scan_id = _screening_scan_id(opip)
+        screening_callback = _broad_screening_callback(
+            rows=screening_rows,
+            observed_at=decision_at,
+            scan_id=screening_scan_id,
+            universe_count=len(scan.snapshots),
+        )
+        selector_kwargs = {}
+        selector_parameters = inspect.signature(select_candidates).parameters
+        if "on_evaluated" in selector_parameters:
+            selector_kwargs["on_evaluated"] = screening_callback
+        if "scan_id" in selector_parameters:
+            selector_kwargs["scan_id"] = screening_scan_id
+        candidates = select_candidates(scan.snapshots, **selector_kwargs)
+        append_screening_evaluations(screening_rows, enabled=True)
+    else:
+        candidates = select_candidates(scan.snapshots)
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
     # tag existing native candidates with corroborating evidence. It cannot
@@ -752,11 +859,6 @@ def main():
     # O'Pip qualification funnel: observation only. Every hook below is
     # fail-soft and one-directional - it records what the production path just
     # decided and can never change that decision.
-    opip = build_scan_observer(
-        snapshots=scan.snapshots,
-        decision_at=decision_at,
-        account_equity=getattr(settings, "account_equity", None),
-    )
     opip.register_candidates(candidates)
     technical_candidate_count = len(candidates)
 
@@ -1406,9 +1508,14 @@ def main():
                 ranked.profit_ranking.total_score
             )
 
+    # A few extension tests replace this helper with the older two-argument
+    # seam.  Pass the observer only when the active implementation supports it.
+    action_gate_kwargs = {"settings": settings}
+    if "opip" in inspect.signature(_apply_ranked_action_gates).parameters:
+        action_gate_kwargs["opip"] = opip
     actionable_ranked_opportunities = _apply_ranked_action_gates(
         ranked_opportunities,
-        settings=settings,
+        **action_gate_kwargs,
     )
     print(
         "Actionable survivors after capital/portfolio gate:",

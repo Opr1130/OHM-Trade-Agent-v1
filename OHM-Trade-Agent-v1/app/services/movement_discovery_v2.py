@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import logging
 import math
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from app.exchanges.kraken import KrakenClient
 from app.scanner.market_scanner import analyze_symbol
@@ -34,6 +35,10 @@ MIN_COARSE_LIFT_FROM_24H_LOW_PCT = 2.0
 MAX_COARSE_DISTANCE_FROM_24H_HIGH_PCT = 6.0
 MIN_DISCOVERY_NOTIONAL_USD = 2_500.0
 DEFAULT_LEARNING_PATH = "/app/data/movement_discovery_v2_1.jsonl"
+
+
+logger = logging.getLogger(__name__)
+ScreeningCallback = Callable[[Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -93,6 +98,7 @@ class CoarseMover:
     lift_from_24h_low_pct: float
     distance_from_24h_high_pct: float
     coarse_score: float
+    universe_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -146,17 +152,66 @@ def _ticker_for_market(tickers: dict[str, dict[str, float]], pair_id: str, altna
     return tickers.get(pair_id) or tickers.get(altname) or tickers.get(display_pair)
 
 
-def discover_coarse_movers(client: KrakenClient | None = None, *, max_candidates: int = DEFAULT_DEEP_CANDIDATES,
-                            min_notional_usd: float = MIN_DISCOVERY_NOTIONAL_USD) -> list[CoarseMover]:
+def _emit_screening_fail_soft(
+    callback: ScreeningCallback | None,
+    payload: Mapping[str, Any],
+    *,
+    scan_id: str | None,
+) -> None:
+    if callback is None:
+        return
+    raw = str(payload.get("raw_identifier") or "UNKNOWN")
+    try:
+        callback(dict(payload))
+    except Exception as exc:
+        logger.warning(
+            "O'Pip screening callback failed open scanner_type=EARLY_WATCH "
+            "scan_id=%s raw=%s operation=record_screening_evaluation error=%s",
+            scan_id or "UNKNOWN",
+            raw,
+            type(exc).__name__,
+        )
+
+
+def discover_coarse_movers(
+    client: KrakenClient | None = None,
+    *,
+    max_candidates: int = DEFAULT_DEEP_CANDIDATES,
+    min_notional_usd: float = MIN_DISCOVERY_NOTIONAL_USD,
+    on_evaluated: ScreeningCallback | None = None,
+    scan_id: str | None = None,
+) -> list[CoarseMover]:
     """Cheap, permissive full-universe discovery. Never authorizes a trade."""
     client = client or KrakenClient()
     pair_details = client.get_asset_pairs()
+    universe_count = len(pair_details)
     markets: list[tuple[str, str, str, str, str]] = []
     for pair_id, details in pair_details.items():
+        raw_identifier = str(details.get("altname") or pair_id)
         if _is_excluded_market(details):
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "EXCLUDED_MARKET",
+                    "reason": "market excluded by the production universe policy",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         symbols = _market_symbols(details)
         if symbols is None:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "market symbols could not be resolved",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         base, quote = symbols
         altname = str(details.get("altname", pair_id)).upper()
@@ -174,41 +229,153 @@ def discover_coarse_movers(client: KrakenClient | None = None, *, max_candidates
     for pair_id, altname, display_pair, base, quote in markets:
         ticker = _ticker_for_market(tickers, pair_id, altname, display_pair)
         if ticker is None:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": altname or pair_id,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "ticker unavailable",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         current = by_asset.get(base)
         if current is None or (current[4] != "USD" and quote == "USD"):
+            if current is not None:
+                _emit_screening_fail_soft(
+                    on_evaluated,
+                    {
+                        "raw_identifier": current[1] or current[0],
+                        "outcome": "EXCLUDED_MARKET",
+                        "reason": "non-primary quote market for canonical asset",
+                        "metadata": {"universe_count": universe_count},
+                    },
+                    scan_id=scan_id,
+                )
             by_asset[base] = (pair_id, altname, display_pair, base, quote, ticker)
+        else:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": altname or pair_id,
+                    "outcome": "EXCLUDED_MARKET",
+                    "reason": "non-primary quote market for canonical asset",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
 
     movers: list[CoarseMover] = []
-    for _, _, display_pair, base, quote, ticker in by_asset.values():
+    for pair_id, altname, display_pair, base, quote, ticker in by_asset.values():
+        raw_identifier = altname or pair_id
         try:
             last = float(ticker.get("last") or 0.0)
             high = float(ticker.get("high_24h") or 0.0)
             low = float(ticker.get("low_24h") or 0.0)
             volume = float(ticker.get("volume_24h") or 0.0)
         except (TypeError, ValueError):
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "ticker contained a non-numeric field",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         if not all(math.isfinite(value) for value in (last, high, low, volume)):
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "ticker contained a non-finite field",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         if min(last, high, low) <= 0 or high < low or volume <= 0:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "ticker failed structural validity checks",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
         notional = last * volume
         lift = _pct(last, low)
         distance = max(0.0, (high - last) / last * 100.0)
         if not all(math.isfinite(value) for value in (notional, lift, distance)):
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": "derived coarse measurements were non-finite",
+                    "metadata": {"universe_count": universe_count},
+                },
+                scan_id=scan_id,
+            )
             continue
-        if notional < min_notional_usd or lift < MIN_COARSE_LIFT_FROM_24H_LOW_PCT or distance > MAX_COARSE_DISTANCE_FROM_24H_HIGH_PCT:
+        failed_predicates = []
+        if notional < min_notional_usd:
+            failed_predicates.append("minimum_notional_usd")
+        if lift < MIN_COARSE_LIFT_FROM_24H_LOW_PCT:
+            failed_predicates.append("minimum_lift_from_24h_low_pct")
+        if distance > MAX_COARSE_DISTANCE_FROM_24H_HIGH_PCT:
+            failed_predicates.append("maximum_distance_from_24h_high_pct")
+        if failed_predicates:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": raw_identifier,
+                    "outcome": "BELOW_COARSE_THRESHOLD",
+                    "reason": "one or more coarse predicates failed",
+                    "metadata": {
+                        "universe_count": universe_count,
+                        "failed_predicates": failed_predicates,
+                        "notional_usd": notional,
+                        "minimum_notional_usd": min_notional_usd,
+                        "lift_from_24h_low_pct": lift,
+                        "minimum_lift_from_24h_low_pct": MIN_COARSE_LIFT_FROM_24H_LOW_PCT,
+                        "distance_from_24h_high_pct": distance,
+                        "maximum_distance_from_24h_high_pct": MAX_COARSE_DISTANCE_FROM_24H_HIGH_PCT,
+                    },
+                },
+                scan_id=scan_id,
+            )
             continue
         liquidity_component = max(0.0, min(15.0, math.log10(max(notional, 1.0)) * 2.0))
         coarse_score = lift * 4.0 + max(0.0, 6.0 - distance) * 2.0 + liquidity_component
         if not math.isfinite(coarse_score):
             continue
         movers.append(CoarseMover(base, display_pair, f"{base}/{quote}", last, volume, notional,
-                                  high, low, lift, distance, round(coarse_score, 4)))
+                                  high, low, lift, distance, round(coarse_score, 4), universe_count))
 
     movers.sort(key=lambda item: (-item.coarse_score, -item.lift_from_24h_low_pct,
                                   -item.notional_24h_usd_approx, item.base_asset))
-    return movers[:max_candidates]
+    selected = movers[:max_candidates]
+    for mover in movers[max_candidates:]:
+        _emit_screening_fail_soft(
+            on_evaluated,
+            {
+                "raw_identifier": mover.primary_pair,
+                "outcome": "COARSE_RANK_LIMIT",
+                "long_score": mover.coarse_score,
+                "reason": "coarse candidate fell outside the deep-analysis cap",
+                "metadata": {"universe_count": universe_count},
+            },
+            scan_id=scan_id,
+        )
+    return selected
 
 
 def _momentum_state(one_hour: float, six_hour: float, day: float) -> str:
@@ -343,15 +510,61 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                             detection_timeframe=str(snapshot.movement_timeframe or "1H"))
 
 
-def scan_early_movers(client: KrakenClient | None = None, *, max_candidates: int = DEFAULT_DEEP_CANDIDATES):
-    coarse = discover_coarse_movers(client, max_candidates=max_candidates)
+def scan_early_movers(
+    client: KrakenClient | None = None,
+    *,
+    max_candidates: int = DEFAULT_DEEP_CANDIDATES,
+    on_coarse_evaluated: ScreeningCallback | None = None,
+    on_evaluated: ScreeningCallback | None = None,
+    scan_id: str | None = None,
+):
+    coarse = discover_coarse_movers(
+        client,
+        max_candidates=max_candidates,
+        on_evaluated=on_coarse_evaluated,
+        scan_id=scan_id,
+    )
     signals: list[EarlyMoverSignal] = []
     for mover in coarse:
         status, snapshot, _ = analyze_symbol(mover.primary_pair)
-        if status == "ok" and snapshot is not None:
-            signal = evaluate_early_mover(snapshot, mover)
-            if signal is not None:
-                signals.append(signal)
+        if status != "ok" or snapshot is None:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": mover.primary_pair,
+                    "outcome": "DATA_UNAVAILABLE",
+                    "reason": f"deep analysis unavailable: {status}",
+                    "metadata": {"universe_count": mover.universe_count},
+                },
+                scan_id=scan_id,
+            )
+            continue
+        signal = evaluate_early_mover(snapshot, mover)
+        if signal is None:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": mover.primary_pair,
+                    "outcome": "BELOW_THRESHOLD",
+                    "reason": "deep early-mover score did not advance",
+                    "metadata": {"universe_count": mover.universe_count},
+                },
+                scan_id=scan_id,
+            )
+            continue
+        signals.append(signal)
+        _emit_screening_fail_soft(
+            on_evaluated,
+            {
+                "raw_identifier": mover.primary_pair,
+                "outcome": "ADVANCED",
+                "long_score": signal.discovery_score,
+                "advanced_direction": "LONG",
+                "reason": "deep early-mover score advanced",
+                "metadata": {"universe_count": mover.universe_count},
+            },
+            scan_id=scan_id,
+        )
     signals.sort(key=lambda item: (-item.continuation_confidence, -item.entry_quality, -item.discovery_score, item.symbol))
     return coarse, signals
 

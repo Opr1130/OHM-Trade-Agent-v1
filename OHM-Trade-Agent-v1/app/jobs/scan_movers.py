@@ -1,6 +1,20 @@
 from datetime import datetime, timezone
+import logging
 
 from app.core.config import get_settings
+from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
+from app.opip.decision.identity import opip_scan_id
+from app.opip.decision.screening import (
+    ScannerType,
+    ScreeningEvaluation,
+    ScreeningOutcome,
+)
+from app.opip.decision.store import (
+    append_screening_evaluations,
+    opip_funnel_telemetry_enabled,
+    retention_capacity_health,
+)
+from app.opip.identity import resolve_venue_instrument_identity
 from app.services.alert_governor import (
     evaluate_opportunity_alert,
     record_opportunity_alert,
@@ -39,6 +53,45 @@ from app.services.telegram_delivery import (
     record_telegram_suppression,
     send_tracked_telegram,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _screening_capture_callback(*, rows, observed_at, scan_id):
+    """Build a measurement-only Early Watch callback."""
+    def capture(payload) -> None:
+        raw = str(payload.get("raw_identifier") or "")
+        try:
+            rows.append(
+                ScreeningEvaluation(
+                    observed_at=observed_at,
+                    scan_id=scan_id,
+                    scanner_type=ScannerType.EARLY_WATCH,
+                    venue_instrument=resolve_venue_instrument_identity(
+                        raw,
+                        canonicalize_asset=canonicalize_asset,
+                        split_canonical_pair=split_canonical_pair,
+                        resolved_at_utc=observed_at,
+                    ),
+                    outcome=ScreeningOutcome(str(payload["outcome"])),
+                    long_score=payload.get("long_score"),
+                    short_score=payload.get("short_score"),
+                    advanced_direction=payload.get("advanced_direction"),
+                    reason=payload.get("reason"),
+                    metadata=payload.get("metadata"),
+                ).to_dict()
+            )
+        except Exception as exc:
+            logger.warning(
+                "O'Pip screening capture failed open scanner_type=EARLY_WATCH "
+                "scan_id=%s raw=%s operation=build_screening_evaluation error=%s",
+                scan_id,
+                raw or "UNKNOWN",
+                type(exc).__name__,
+            )
+
+    return capture
 
 
 def _transition_key(signal) -> str:
@@ -421,7 +474,46 @@ def main() -> None:
         full_market, settings, decision_at=decision_at
     )
 
-    coarse, signals = scan_early_movers()
+    screening_enabled = opip_funnel_telemetry_enabled()
+    screening_rows: list[dict] = []
+    screening_scan_id = opip_scan_id(
+        cohort_id="EARLY_WATCH",
+        decision_at=decision_at,
+    )
+    if screening_enabled:
+        screening_callback = _screening_capture_callback(
+            rows=screening_rows,
+            observed_at=decision_at,
+            scan_id=screening_scan_id,
+        )
+        coarse, signals = scan_early_movers(
+            on_coarse_evaluated=screening_callback,
+            on_evaluated=screening_callback,
+            scan_id=screening_scan_id,
+        )
+        append_screening_evaluations(screening_rows, enabled=True)
+        observed_universe = next(
+            (
+                int(metadata["universe_count"])
+                for row in screening_rows
+                if isinstance((metadata := row.get("metadata")), dict)
+                and metadata.get("universe_count") is not None
+            ),
+            None,
+        )
+        try:
+            capacity = retention_capacity_health(
+                observed_early_watch_universe=observed_universe,
+            )
+            logger.info("O'Pip Stage 0 retention capacity health: %s", capacity.as_dict())
+        except Exception as exc:
+            logger.warning(
+                "O'Pip retention capacity health failed open: %s",
+                type(exc).__name__,
+            )
+    else:
+        # Keep the historical call signature on the default-dark path.
+        coarse, signals = scan_early_movers()
 
     try:
         queue_added, queue_failures = _enqueue_wave9_monitoring(
