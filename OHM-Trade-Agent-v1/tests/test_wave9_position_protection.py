@@ -231,10 +231,13 @@ def test_unpriced_non_cash_holding_is_never_silently_dropped():
 
 
 def test_managed_usdc_pair_does_not_duplicate_as_unmanaged():
+    managed_trade = trade(symbol="SOLUSDC")
+    managed_trade.entry_quantity = 2.0
+    managed_trade.remaining_quantity = 2.0
     resolver = KrakenExposureResolver(
         private_client=FakePrivate(balances={"SOL": 2.0}),
         public_client=FakePublic(),
-        trade_loader=lambda: [trade(symbol="SOLUSDC")],
+        trade_loader=lambda: [managed_trade],
     )
 
     resolved = resolver.resolve()
