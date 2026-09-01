@@ -4,6 +4,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from app.jobs.build_phase3c_forward_outcomes import (
+    _canonical_label_payload,
     build_outcomes,
     build_outcomes_bounded,
 )
@@ -435,3 +436,66 @@ def test_bounded_output_checkpoint_rejects_rewritten_ledger(tmp_path):
             state_path=state,
             now=BASE + timedelta(minutes=2),
         )
+
+
+def test_canonical_label_payload_marks_nonfinite_values_unusable_and_json_safe():
+    payload = _canonical_label_payload(
+        {
+            "snapshot_id": "S-BAD",
+            "outcome_source": "PROVISIONAL_EVENT_SAMPLED_FULL_MARKET_OBSERVATIONS",
+            "horizon_returns_pct": {"5m": float("nan"), "15m": 1.5},
+            "mfe_pct": float("inf"),
+            "window_complete": True,
+            "maturation_status": "MATURE_24H",
+        }
+    )
+
+    assert payload["horizon_returns_pct"]["5m"] is None
+    assert payload["horizon_returns_pct"]["15m"] == 1.5
+    assert payload["mfe_pct"] is None
+    assert payload["data_gap"] is True
+    assert payload["window_complete"] is False
+    assert payload["maturation_status"] == "UNUSABLE_NONFINITE"
+    assert payload["data_quality_nonfinite_count"] == 2
+    assert "NONFINITE_VALUE" in payload["data_quality_flags"]
+    json.dumps(payload, allow_nan=False)
+
+
+def test_bounded_queue_skips_nonfinite_snapshot_before_strict_serialization(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    poisoned = {
+        **_snapshot("BAD", "E-BAD"),
+        "reference_price": float("nan"),
+    }
+    valid = {
+        **_snapshot("GOOD", "E-GOOD"),
+        "decision_at_utc": (BASE + timedelta(minutes=1)).isoformat(),
+    }
+    snapshots.write_text(
+        json.dumps(poisoned) + "\n" + json.dumps(valid) + "\n",
+        encoding="utf-8",
+    )
+    observations.write_text(
+        json.dumps(_observation(BASE + timedelta(minutes=1), 10.0)) + "\n"
+        + json.dumps(
+            _observation(BASE + timedelta(hours=24, minutes=1), 11.0)
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        max_snapshots=10,
+        now=BASE + timedelta(hours=25),
+    )
+
+    assert [row["snapshot_id"] for row in rows] == ["GOOD"]
+    persisted = outcomes.read_text(encoding="utf-8")
+    assert '"snapshot_id":"BAD"' not in persisted.replace(" ", "")

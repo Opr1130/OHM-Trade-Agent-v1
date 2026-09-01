@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -75,12 +76,60 @@ def _repair_truncated_jsonl_tail(path: Path) -> bool:
     return True
 
 
+def _contains_nonfinite_json(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_contains_nonfinite_json(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite_json(item) for item in value)
+    return False
+
+
+def _sanitize_nonfinite_json(value: Any) -> tuple[Any, int]:
+    """Return JSON-safe evidence while counting every non-finite numeric value."""
+    if isinstance(value, float):
+        return (value, 0) if math.isfinite(value) else (None, 1)
+    if isinstance(value, dict):
+        normalized: dict[Any, Any] = {}
+        replaced = 0
+        for key, item in value.items():
+            clean, count = _sanitize_nonfinite_json(item)
+            normalized[key] = clean
+            replaced += count
+        return normalized, replaced
+    if isinstance(value, (list, tuple)):
+        normalized_items: list[Any] = []
+        replaced = 0
+        for item in value:
+            clean, count = _sanitize_nonfinite_json(item)
+            normalized_items.append(clean)
+            replaced += count
+        return normalized_items, replaced
+    return value, 0
+
+
 def _canonical_label_payload(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    payload = {
         key: value
         for key, value in row.items()
         if key not in {"outcome_record_id", "outcome_revision"}
     }
+    normalized, nonfinite_count = _sanitize_nonfinite_json(payload)
+    if nonfinite_count:
+        flags = [
+            str(item)
+            for item in normalized.get("data_quality_flags", [])
+            if str(item)
+        ]
+        if "NONFINITE_VALUE" not in flags:
+            flags.append("NONFINITE_VALUE")
+        normalized["data_quality_flags"] = flags
+        normalized["data_quality_nonfinite_count"] = nonfinite_count
+        normalized["data_gap"] = True
+        normalized["window_complete"] = False
+        normalized["maturation_status"] = "UNUSABLE_NONFINITE"
+    return normalized
 
 
 def _outcome_record_id(row: dict[str, Any]) -> str:
@@ -454,7 +503,17 @@ def _reconcile_snapshot_queue(
 
             snapshot_id = str(snapshot.get("snapshot_id", "") or "")
             decision_at = _parse_utc(snapshot.get("decision_at_utc"))
-            if not snapshot_id or decision_at is None:
+            try:
+                reference_price = float(snapshot.get("reference_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                reference_price = 0.0
+            if (
+                not snapshot_id
+                or decision_at is None
+                or not math.isfinite(reference_price)
+                or reference_price <= 0
+                or _contains_nonfinite_json(snapshot)
+            ):
                 continue
 
             normalized_snapshot = {
@@ -641,7 +700,7 @@ def build_outcomes_bounded(
                 ingestion.observations,
             )
             labels_by_snapshot = {
-                str(row.get("snapshot_id", "") or ""): row
+                str(row.get("snapshot_id", "") or ""): _canonical_label_payload(row)
                 for row in labels
                 if str(row.get("snapshot_id", "") or "")
             }
@@ -777,7 +836,8 @@ def build_outcomes(
             )
 
         pending: list[dict[str, Any]] = []
-        for label in labels:
+        for raw_label in labels:
+            label = _canonical_label_payload(raw_label)
             snapshot_id = str(label.get("snapshot_id", "") or "")
             if not snapshot_id:
                 continue

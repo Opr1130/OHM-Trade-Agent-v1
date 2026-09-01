@@ -11,7 +11,38 @@ EXPORT_ROOT="/var/lib/opip-learning-export"
 READER_STATE_ROOT="/var/lib/opip-learning-reader"
 FORCED_COMMAND="/usr/local/sbin/opip-learning-read-export"
 
+contains_control_character() {
+  local value="${1:-}"
+  local newline carriage_return tab
+  printf -v newline '\n'
+  printf -v carriage_return '\r'
+  printf -v tab '\t'
+  [[ "$value" == *"$newline"* || "$value" == *"$carriage_return"* || "$value" == *"$tab"* ]]
+}
+
+valid_ipv4_host_cidr() {
+  local cidr="${1:-}"
+  local ip octet
+  local -a octets=()
+
+  [[ "$cidr" == */32 ]] || return 1
+  ip="${cidr%/32}"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+  IFS='.' read -r -a octets <<< "$ip"
+  [[ "${#octets[@]}" -eq 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
 if [[ -z "$PUBLIC_KEY" || "$PUBLIC_KEY" != ssh-ed25519\ * || -z "$SOURCE_CIDR" ]]; then
+  echo "usage: $0 'ssh-ed25519 AAAA... opip-learning-worker' <learning-private-ip/32>" >&2
+  exit 64
+fi
+if contains_control_character "$PUBLIC_KEY" ||
+  contains_control_character "$SOURCE_CIDR" ||
+  ! valid_ipv4_host_cidr "$SOURCE_CIDR"; then
   echo "usage: $0 'ssh-ed25519 AAAA... opip-learning-worker' <learning-private-ip/32>" >&2
   exit 64
 fi
