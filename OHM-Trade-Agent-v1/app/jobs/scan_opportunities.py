@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 16668)
-Total output lines: 1604
-
 import logging
 import inspect
 from collections import Counter
@@ -618,7 +615,437 @@ def _target_quality(plan, snapshot):
     return evaluate_target_attainability(plan, snapshot)
 
 
-def _econo…4668 tokens truncated…{reference.price_divergence_pct if reference.price_divergence_pct is not None else 'N/A'}%"
+def _economic_quality(plan, snapshot, account_equity):
+    if snapshot.trade_direction == "SHORT":
+        return evaluate_economic_quality(
+            plan,
+            available_capital=account_equity,
+            max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+            direction="SHORT",
+            leverage=SHORT_VALIDATION_LEVERAGE,
+            estimated_margin_cost_pct=SHORT_MARGIN_COST_RESERVE_PCT,
+            max_account_risk_at_stop_pct=SHORT_MAX_ACCOUNT_RISK_AT_STOP_PCT,
+        )
+    return evaluate_economic_quality(
+        plan,
+        available_capital=account_equity,
+        max_capital_fraction=PRODUCTION_MAX_CAPITAL_FRACTION,
+    )
+
+
+def _telegram_delivery_ready(settings) -> bool:
+    return bool(
+        getattr(settings, "telegram_enabled", False)
+        and getattr(settings, "telegram_bot_token", None)
+        and getattr(settings, "telegram_chat_id", None)
+    )
+
+
+def _send_movement_notification(movement, settings) -> tuple[bool, bool]:
+    """Return (sent, failed).
+
+    Policy suppression / non-alert mode is not a delivery failure. Exceptions
+    from the actual notification path are surfaced and counted.
+    """
+    if (
+        bool(getattr(settings, "opip_actionable_only_alerts", False))
+        or str(getattr(settings, "price_movement_mode", "shadow")).lower() != "alert"
+        or not _telegram_delivery_ready(settings)
+    ):
+        return False, False
+    try:
+        sent = send_price_movement_update(
+            movement,
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            cooldown_seconds=int(
+                getattr(
+                    settings,
+                    "price_movement_alert_cooldown_seconds",
+                    21_600,
+                )
+            ),
+        )
+        return bool(sent), False
+    except Exception:
+        logger.exception(
+            "Price movement Telegram delivery failed symbol=%s stage=%s",
+            movement.get("symbol", "UNKNOWN"),
+            movement.get("stage", "UNKNOWN"),
+        )
+        return False, True
+
+
+def _assess_price_movement(snapshot, settings, market_intelligence=None):
+    """Evaluate and persist radar context without affecting candidate gates."""
+    if str(getattr(settings, "price_movement_mode", "shadow")).lower() == "off":
+        return None
+    try:
+        previous = get_latest_price_movement(snapshot.symbol)
+    except Exception:
+        previous = None
+    try:
+        signal = evaluate_price_movement(
+            snapshot,
+            market_intelligence=market_intelligence,
+            previous=previous,
+            watch_score=int(getattr(settings, "price_movement_watch_score", 35)),
+            ready_score=int(getattr(settings, "price_movement_ready_score", 70)),
+            expiry_hours=int(getattr(settings, "price_movement_expiry_hours", 12)),
+        )
+    except Exception:
+        return None
+    if signal is None:
+        return None
+    payload = signal.as_dict()
+    snapshot.price_movement_signal = payload
+    try:
+        record_price_movement(payload)
+    except Exception:
+        # Shadow persistence must never block scanning or an approved alert.
+        pass
+    return payload
+
+
+
+def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None):
+    """Apply scarce-capital/portfolio eligibility in global rank order.
+
+    Approved candidates are added to a projected exposure list so lower-ranked
+    signals cannot independently allocate the same capital/position slots.
+    A vetoed higher-ranked candidate does not block the next-best candidate.
+    """
+    try:
+        projected_trades = list(get_active_trades())
+    except Exception as exc:
+        print(
+            "ACTION GATE unavailable; no new trade alert authorized:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        reason = f"{type(exc).__name__}: {exc}"
+        if opip is not None:
+            for ranked in ranked_opportunities:
+                opip.record_action_gate(ranked, allowed=None, reason=reason)
+        return []
+
+    eligible = []
+    for ranked in ranked_opportunities:
+        opportunity = ranked.opportunity
+        alert = opportunity.alert
+        plan = opportunity.plan
+        direction = str(opportunity.snapshot.trade_direction or "LONG").upper()
+        alert["opportunity_rank"] = ranked.rank
+        alert.setdefault("profit_rank", ranked.rank)
+        alert["profit_rank_score"] = ranked.profit_ranking.total_score
+
+        try:
+            gate = apply_action_gate(
+                candidate=alert,
+                plan=plan,
+                account_capital=float(settings.account_equity),
+                active_trades=projected_trades,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            print(
+                f"ACTION GATE ERROR rank={ranked.rank} {direction} {plan.symbol}: "
+                f"{reason}"
+            )
+            if opip is not None:
+                opip.record_action_gate(ranked, allowed=None, reason=reason)
+            continue
+        if opip is not None:
+            opip.record_action_gate(
+                ranked,
+                allowed=bool(gate.allowed),
+                reason=str(gate.reason or ""),
+            )
+        if not gate.allowed:
+            print(
+                f"ACTION GATE REJECT rank={ranked.rank} {direction} {plan.symbol}: "
+                f"{gate.reason}"
+            )
+            continue
+
+        eligible.append(ranked)
+        try:
+            remove_entry_watch(plan.symbol, direction)
+        except Exception as exc:
+            # Accepted trade remains valid; queue cleanup is operational only.
+            print(
+                f"ENTRY WATCH cleanup failed open {direction} {plan.symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        projected_trades.append(
+            SimpleNamespace(
+                symbol=plan.symbol,
+                status="active",
+                direction=direction,
+                capital=float(alert.get("recommended_capital") or 0.0),
+                margin_leverage=float(
+                    alert.get("margin_leverage")
+                    or (2.0 if direction == "SHORT" else 1.0)
+                ),
+            )
+        )
+        print(
+            f"ACTION GATE PASS rank={ranked.rank} {direction} {plan.symbol}: "
+            f"capital={float(alert.get('recommended_capital') or 0.0):.2f}"
+        )
+    return eligible
+
+
+def main():
+    settings = get_settings()
+    scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
+    decision_at = datetime.now(timezone.utc)
+    market_regime = evaluate_market_regime(scan.snapshots)
+    local_movement_signals = [
+        signal
+        for snapshot in scan.snapshots
+        if (signal := _assess_price_movement(snapshot, settings)) is not None
+    ]
+    local_movement_counts = Counter(
+        str(signal.get("stage") or "UNKNOWN")
+        for signal in local_movement_signals
+    )
+    # Construct the observer before selection so the screening rows and funnel
+    # share one scan identity.  No callback is installed while telemetry is
+    # dark, preserving the historical selector call exactly.
+    opip = build_scan_observer(
+        snapshots=scan.snapshots,
+        decision_at=decision_at,
+        account_equity=getattr(settings, "account_equity", None),
+    )
+    if opip.telemetry_enabled:
+        screening_rows: list[dict] = []
+        screening_scan_id = _screening_scan_id(opip)
+        screening_callback = _broad_screening_callback(
+            rows=screening_rows,
+            observed_at=decision_at,
+            scan_id=screening_scan_id,
+            universe_count=len(scan.snapshots),
+        )
+        selector_kwargs = {}
+        selector_parameters = inspect.signature(select_candidates).parameters
+        if "on_evaluated" in selector_parameters:
+            selector_kwargs["on_evaluated"] = screening_callback
+        if "scan_id" in selector_parameters:
+            selector_kwargs["scan_id"] = screening_scan_id
+        candidates = select_candidates(scan.snapshots, **selector_kwargs)
+        append_screening_evaluations(screening_rows, enabled=True)
+    else:
+        candidates = select_candidates(scan.snapshots)
+
+    # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
+    # tag existing native candidates with corroborating evidence. It cannot
+    # create or promote a candidate, change direction/score, or bypass the
+    # native selector's asset/direction/cap/ranking invariants. A failure here
+    # must never abort the scan.
+    if getattr(settings, "tradingview_v2_enabled", False):
+        try:
+            from app.services.tradingview_inbox import (
+                merge_native_candidate_evidence,
+            )
+
+            attached = merge_native_candidate_evidence(candidates)
+            print("===== OHM TRADINGVIEW v2 EVIDENCE =====")
+            print("Native candidates tagged with TradingView confirmation:", attached)
+        except Exception:
+            logger.exception(
+                "TradingView v2 evidence merge failed open; continuing with native candidates only"
+            )
+
+    # O'Pip qualification funnel: observation only. Every hook below is
+    # fail-soft and one-directional - it records what the production path just
+    # decided and can never change that decision.
+    opip.register_candidates(candidates)
+    technical_candidate_count = len(candidates)
+
+    print("OHM AI Opportunity Scan")
+    if scan.universe is not None:
+        print("===== OHM UNIVERSE =====")
+        print("Eligible USD markets:", scan.universe.eligible_usd_markets)
+        print("Eligible USDT markets:", scan.universe.eligible_usdt_markets)
+        print("Unique underlying assets:", scan.universe.unique_underlying_assets)
+        print("Selected liquid assets:", scan.universe.selected_liquid_assets)
+        print(
+            "USDT/USD conversion:",
+            f"{scan.universe.usdt_usd_rate:.6f}"
+            if scan.universe.usdt_usd_rate is not None
+            else "UNAVAILABLE",
+        )
+        for warning in scan.universe.warnings:
+            print("UNIVERSE WARNING:", warning)
+    print("Requested:", scan.requested)
+    print("Analyzed:", scan.analyzed)
+    print("Skipped:", scan.skipped)
+    print("Failed:", scan.failed)
+    print("===== OHM PRICE MOVEMENT RADAR =====")
+    print("Price movement mode:", getattr(settings, "price_movement_mode", "shadow"))
+    print("Price movement WATCH:", local_movement_counts.get("WATCH", 0))
+    print("Price movement READY:", local_movement_counts.get("READY", 0))
+    print("Price movement CONFIRMED:", local_movement_counts.get("CONFIRMED", 0))
+    print("Price movement ACTIVE:", local_movement_counts.get("ACTIVE", 0))
+    print("===== OHM MARKET DATA VALIDATION =====")
+    print("Validated:", scan.analyzed)
+    print("Rejected:", scan.data_quality_rejected)
+    print("Warnings:", scan.data_quality_warnings)
+    for reason in scan.data_quality_rejections or []:
+        print("DATA REJECT:", reason)
+
+    long_count, short_count = _direction_counts(candidates)
+    print("Technical shortlist:", len(candidates))
+    print("Directional shortlist:", f"LONG={long_count}", f"SHORT={short_count}")
+    print("===== OHM MARKET REGIME =====")
+    print("Sample:", market_regime.sample_size)
+    print("Regime:", market_regime.regime)
+    print("BreadthScore:", market_regime.breadth_score if market_regime.breadth_score is not None else "N/A")
+    print("AboveEMA20:", market_regime.pct_above_ema20)
+    print("AboveEMA50:", market_regime.pct_above_ema50)
+    print("AboveEMA200:", market_regime.pct_above_ema200)
+    print("Positive24h:", market_regime.pct_positive_momentum_24h)
+    print("Positive72h:", market_regime.pct_positive_momentum_72h)
+    print("BullishTrend:", market_regime.pct_bullish_trend)
+
+    if not candidates:
+        print("No technical candidates.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
+        return
+
+    margin_summary = validate_short_margin_eligibility(
+        candidates,
+        account_leverage_ceiling=getattr(settings, "max_margin_leverage", 3.0),
+    )
+    print("===== OHM SHORT MARGIN ELIGIBILITY =====")
+    print(
+        "Margin candidates:",
+        f"requested={margin_summary.requested}",
+        f"eligible={margin_summary.eligible}",
+        f"ineligible={margin_summary.ineligible}",
+        f"unavailable={margin_summary.unavailable}",
+    )
+    for candidate in candidates:
+        if candidate.trade_direction == "SHORT":
+            print(
+                f"MARGIN {candidate.symbol}: Status={candidate.margin_validation_status} "
+                f"Venue={candidate.margin_venue_symbol or 'N/A'} "
+                f"MaxLeverage={candidate.margin_max_leverage or 'N/A'}x"
+            )
+            if str(candidate.margin_validation_status or "").upper() != "ELIGIBLE":
+                capture_snapshot_decision(
+                    candidate,
+                    decision="MARGIN_REJECT",
+                    market_regime=market_regime.regime,
+                    reason=f"margin status {candidate.margin_validation_status}",
+                    source="margin_eligibility_gate",
+                )
+    opip.record_margin(candidates)
+    candidates = keep_margin_tradeable_candidates(candidates)
+    if not candidates:
+        print("No directionally tradeable candidates after margin eligibility.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
+        return
+
+    secondary_summary = confirm_secondary_markets(
+        candidates,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+    )
+    print(
+        "Secondary confirmations:",
+        f"requested={secondary_summary.requested}",
+        f"analyzed={secondary_summary.analyzed}",
+        f"failed={secondary_summary.failed}",
+    )
+    for candidate in candidates:
+        print(
+            f"CROSS PAIR {candidate.underlying_asset or candidate.symbol}: "
+            f"Direction={candidate.trade_direction} "
+            f"Primary={candidate.primary_pair or candidate.symbol} "
+            f"Secondary={candidate.secondary_pair or 'NONE'} "
+            f"Combined=${candidate.combined_24h_liquidity_usd:,.2f} "
+            f"PrimaryVol={candidate.volume_ratio:.2f}x "
+            f"SecondaryVol={candidate.secondary_volume_ratio if candidate.secondary_volume_ratio is not None else 'N/A'} "
+            f"Status={candidate.cross_pair_confirmation_status}"
+        )
+
+    opip.record_cross_market(candidates)
+
+    execution_requested = len(candidates)
+    pre_execution_candidates = list(candidates)
+    candidates = deep_validate_candidates(
+        candidates,
+        settings.account_equity,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+    )
+    survived_execution_keys = {(c.symbol, c.trade_direction) for c in candidates}
+    for rejected in pre_execution_candidates:
+        if (rejected.symbol, rejected.trade_direction) not in survived_execution_keys:
+            capture_snapshot_decision(
+                rejected,
+                decision="EXECUTION_REJECT",
+                market_regime=market_regime.regime,
+                reason="filtered by deep execution validation",
+                source="execution_quality_gate",
+            )
+
+    strict_execution_candidates = []
+    for candidate in candidates:
+        execution = candidate.execution_validation
+        if candidate.trade_direction == "SHORT":
+            tradeable, reasons = short_execution_is_tradeable(candidate)
+            if not tradeable:
+                print(f"SHORT EXECUTION REJECT {candidate.symbol}: {'; '.join(reasons)}")
+                capture_snapshot_decision(
+                    candidate,
+                    decision="EXECUTION_REJECT",
+                    market_regime=market_regime.regime,
+                    reason="; ".join(reasons),
+                    source="short_execution_quality_gate",
+                )
+                continue
+        strict_execution_candidates.append(candidate)
+        data_status = candidate.market_data_validation.status if candidate.market_data_validation is not None else "UNAVAILABLE"
+        print(
+            f"EXECUTION {candidate.symbol}: Direction={candidate.trade_direction} "
+            f"Data={data_status} StructuralStatus={execution.status} "
+            f"BookCoverage={execution.book_coverage_status} "
+            f"Spread={execution.spread_bps if execution.spread_bps is not None else 'N/A'}bps "
+            f"BuyCoverage={execution.buy_visible_coverage_pct if execution.buy_visible_coverage_pct is not None else 'N/A'}% "
+            f"SellCoverage={execution.sell_visible_coverage_pct if execution.sell_visible_coverage_pct is not None else 'N/A'}% "
+            f"RoundTripDrag={execution.estimated_visible_round_trip_market_drag_pct if execution.estimated_visible_round_trip_market_drag_pct is not None else 'N/A'}% "
+            f"RecentTradeAge={execution.latest_trade_age_seconds if execution.latest_trade_age_seconds is not None else 'N/A'}s"
+        )
+    candidates = strict_execution_candidates
+    opip.record_execution(pre_execution_candidates)
+    print("Execution validation requested:", execution_requested)
+    print("Execution structural/short-quality rejects:", execution_requested - len(candidates))
+    if not candidates:
+        print("No candidates survived execution quality validation.")
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        _capture_native_scan_cohort(scan, decision_at=decision_at)
+        return
+
+    reference_summary = validate_finalist_references(
+        candidates,
+        scan.universe.usdt_usd_rate if scan.universe else None,
+        api_key=getattr(settings, "coingecko_api_key", None),
+    )
+    print("===== OHM INDEPENDENT REFERENCE VALIDATION =====")
+    print("Requested:", reference_summary.requested)
+    print("Available:", reference_summary.available)
+    print("Unavailable:", reference_summary.unavailable)
+    print("Ambiguous:", reference_summary.ambiguous)
+    print("API mode:", reference_summary.api_mode)
+    for candidate in candidates:
+        reference = candidate.independent_market_reference
+        print(
+            f"REFERENCE {candidate.symbol}: Direction={candidate.trade_direction} "
+            f"Status={reference.status} Matches={getattr(reference, 'matched_candidate_count', 0)} "
+            f"CoinGecko={reference.coingecko_id or 'N/A'} "
+            f"Divergence={reference.price_divergence_pct if reference.price_divergence_pct is not None else 'N/A'}%"
         )
 
     opip.record_reference(candidates)
