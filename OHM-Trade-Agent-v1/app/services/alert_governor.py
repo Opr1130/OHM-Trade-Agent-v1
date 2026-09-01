@@ -290,12 +290,14 @@ def record_opportunity_alert(
             reservations = _active_reservations(state, now=now)
             if created_new and reservation_token:
                 reservation = reservations.get(reservation_token)
-                if (
-                    not isinstance(reservation, dict)
-                    or str(reservation.get("identity") or "") != identity
+                if isinstance(reservation, dict) and (
+                    str(reservation.get("identity") or "") != identity
                     or str(reservation.get("transition_key") or "") != transition_key
                 ):
                     return
+                # Telegram delivery already succeeded. If the reservation has
+                # expired or disappeared, capacity is no longer reserved but the
+                # delivered card must still become canonical to prevent duplicates.
                 reservations.pop(reservation_token, None)
             state["new_card_reservations"] = reservations
 
