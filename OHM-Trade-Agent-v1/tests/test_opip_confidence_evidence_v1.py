@@ -54,6 +54,15 @@ def test_invalid_direction_is_fail_closed():
     assert candidate_alert_authorized(_item(direction="SIDEWAYS", confidence=100)) is False
 
 
+def test_missing_direction_is_fail_closed():
+    item = _item(confidence=100)
+    item.pop("direction")
+    assert candidate_alert_authorized(item) is False
+    result = evaluate_recommendation_gate_item(item)
+    assert result.status is GateStatus.FAIL
+    assert result.reason_code is ReasonCode.AI_DIRECTION_REJECTED
+
+
 def test_malformed_confidence_is_fail_closed():
     for malformed in (
         "bad",
@@ -290,3 +299,67 @@ def test_recent_funnel_normalizes_nonpositive_window(tmp_path):
             window_hours=requested,
         )
         assert report["window_hours"] == 1
+
+
+
+def test_recent_funnel_ignores_invalid_confidence_evidence(tmp_path):
+    funnel = tmp_path / "invalid-confidence.jsonl"
+    screening = tmp_path / "screening.jsonl"
+    summaries = tmp_path / "summaries.jsonl"
+    _write_jsonl(screening, [])
+    _write_jsonl(summaries, [])
+    _write_jsonl(
+        funnel,
+        [
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "REJECTED",
+                "terminal_reason_code": "AI_CONFIDENCE_INVALID",
+                "gate_results": [
+                    {
+                        "gate": "RECOMMENDATION_GATE",
+                        "status": "FAIL",
+                        "reason_code": "AI_CONFIDENCE_INVALID",
+                        "metadata": {"ai_decision": "alert", "ai_confidence": value},
+                    }
+                ],
+            }
+            for value in (101, True, 84.5, -1)
+        ],
+    )
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+    assert report["confidence_ge_85"] == 0
+    assert report["confidence_80_84"] == 0
+    assert report["confidence_70_79"] == 0
+    assert report["confidence_lt_70"] == 0
+
+
+def test_recent_funnel_skips_malformed_paper_admission_values(tmp_path):
+    funnel = tmp_path / "funnel.jsonl"
+    screening = tmp_path / "screening.jsonl"
+    summaries = tmp_path / "summaries.jsonl"
+    _write_jsonl(funnel, [])
+    _write_jsonl(screening, [])
+    _write_jsonl(
+        summaries,
+        [
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": 2},
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": "3"},
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": "unknown"},
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": True},
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": 1.5},
+            {"decision_at_utc": NOW.isoformat(), "paper_admission_eligible": -4},
+        ],
+    )
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+    assert report["paper_admission_eligible"] == 5
