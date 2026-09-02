@@ -78,6 +78,11 @@ STREAM_SPECS: tuple[StreamSpec, ...] = (
         Path("candidate_trace.jsonl"),
         "generic",
     ),
+    StreamSpec(
+        "opportunity_accountability",
+        Path("opip/opportunity_accountability.jsonl"),
+        "generic",
+    ),
 )
 
 
