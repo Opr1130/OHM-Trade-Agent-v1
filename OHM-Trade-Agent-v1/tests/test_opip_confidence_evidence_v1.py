@@ -55,10 +55,11 @@ def test_invalid_direction_is_fail_closed():
 
 
 def test_malformed_confidence_is_fail_closed():
-    assert candidate_alert_authorized(_item(confidence="bad")) is False
-    result = evaluate_recommendation_gate_item(_item(confidence="bad"))
-    assert result.status is GateStatus.FAIL
-    assert result.reason_code is ReasonCode.AI_CONFIDENCE_INVALID
+    for malformed in ("bad", True, False, None):
+        assert candidate_alert_authorized(_item(confidence=malformed)) is False
+        result = evaluate_recommendation_gate_item(_item(confidence=malformed))
+        assert result.status is GateStatus.FAIL
+        assert result.reason_code is ReasonCode.AI_CONFIDENCE_INVALID
 
 
 def test_low_confidence_gate_pass_is_tagged_as_measurement_evidence():
@@ -201,7 +202,8 @@ def test_recent_funnel_aggregates_confidence_and_primary_choke(tmp_path):
     assert report["confidence_80_84"] == 1
     assert report["confidence_70_79"] == 1
     assert report["qualified_signals"] == 1
-    assert report["paper_admitted"] == 1
+    assert report["paper_admission_eligible"] == 1
+    assert report["paper_admitted"] == "NOT_INSTRUMENTED"
     assert report["primary_choke"] == "CHIEF_WATCH_REJECT"
     assert report["measurement_only"] is True
     assert report["affects_trade_authority"] is False
@@ -220,4 +222,5 @@ def test_recent_funnel_renderer_marks_uninstrumented_stages(tmp_path):
     assert "OPIP_QUALIFICATION_FUNNEL" in rendered
     assert "trade_quality_pass=NOT_INSTRUMENTED" in rendered
     assert "capacity_reject=NOT_INSTRUMENTED" in rendered
+    assert "paper_admitted=NOT_INSTRUMENTED" in rendered
     assert "PRIMARY_CHOKE=NONE" in rendered
