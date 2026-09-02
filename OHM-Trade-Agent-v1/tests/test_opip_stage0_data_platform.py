@@ -266,3 +266,41 @@ def test_capital_gate_is_ordered_and_policy_attributed():
     from app.opip.decision.models import reason_class
 
     assert reason_class(ReasonCode.NO_CAPITAL) is ReasonClass.POLICY
+
+
+
+def test_capacity_projection_includes_recovered_long_funnel_states(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        store.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            total=100_000_000_000,
+            used=10_000_000_000,
+            free=90_000_000_000,
+        ),
+    )
+    universe = 100
+    health = store.retention_capacity_health(
+        qualification_dir=tmp_path,
+        observed_early_watch_universe=universe,
+    )
+
+    assert store.MAX_FUNNEL_CANDIDATES_PER_SCAN == 13
+    screening_rows_per_day = (
+        store.BROAD_SEARCH_MAX_INSTRUMENTS * store.BROAD_SEARCH_SCANS_PER_DAY
+        + store.EARLY_WATCH_DEEP_MAX_INSTRUMENTS
+        * store.EARLY_WATCH_SCANS_PER_DAY
+        + universe * store.EARLY_WATCH_SCANS_PER_DAY
+    )
+    daily_bytes = store.STAGE0_CAPACITY_SAFETY_FACTOR * (
+        screening_rows_per_day * store.SCREENING_P95_ROW_BYTES
+        + 13
+        * store.BROAD_SEARCH_SCANS_PER_DAY
+        * store.FUNNEL_P95_ROW_BYTES
+        + store.BROAD_SEARCH_SCANS_PER_DAY * store.SUMMARY_P95_ROW_BYTES
+    )
+    assert health.projected_14d_bytes == int(
+        daily_bytes * store.STAGE0_REQUIRED_RECOVERY_DAYS
+    )
