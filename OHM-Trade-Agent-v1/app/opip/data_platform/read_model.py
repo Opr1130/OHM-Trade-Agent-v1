@@ -150,6 +150,7 @@ def read_historical_snapshot(
                                    ranking_or_cap_miss_candidates,
                                    operational_executable_misses,
                                    estimated_missed_move_pct_sum,
+                                   decision_latency_samples,
                                    mean_decision_latency_ms
                             FROM learning.opportunity_accountability_daily_mv
                             ORDER BY day DESC LIMIT 60
@@ -169,8 +170,9 @@ def read_historical_snapshot(
                                 "estimated_missed_move_pct_sum": (
                                     float(row[9]) if row[9] is not None else 0.0
                                 ),
+                                "decision_latency_samples": int(row[10]),
                                 "mean_decision_latency_ms": (
-                                    float(row[10]) if row[10] is not None else None
+                                    float(row[11]) if row[11] is not None else None
                                 ),
                             }
                             for row in cursor.fetchall()
