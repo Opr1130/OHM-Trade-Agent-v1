@@ -108,3 +108,20 @@ def test_deploy_rollback_restores_installed_remote_ops():
     assert "remote-op-learning-diagnostics" in deploy
     assert 'replace_file_atomically "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' in deploy
     assert 'cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' not in deploy
+
+
+
+def test_learning_diagnostics_reports_unavailable_funnel_when_core_is_down():
+    diagnostics = (ROOT / "deploy/remote/diagnose-opip-learning.sh").read_text(
+        encoding="utf-8"
+    )
+    marker = "OPIP_QUALIFICATION_FUNNEL"
+    assert diagnostics.count(marker) >= 2
+    qualification_block = diagnostics[diagnostics.rfind(
+        "if docker inspect ohm-trade-agent"
+    ):]
+    assert "else" in qualification_block
+    assert 'echo "diagnostic=UNAVAILABLE"' in qualification_block
+    assert "degrade" in qualification_block
+    assert "docker stop" not in qualification_block
+    assert "docker rm" not in qualification_block
