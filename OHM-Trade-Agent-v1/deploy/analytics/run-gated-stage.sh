@@ -16,7 +16,7 @@ if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 64
 fi
 case "$STAGE" in
-  prepare|empty|backup|restore-drill|backfill|shipper|reads-ready) ;;
+  prepare|activate|empty|backup|restore-drill|backfill|shipper|reads-ready) ;;
   *) echo "unsupported analytics stage" >&2; exit 64 ;;
 esac
 if [[ "$RELEASE_DIR" != /var/tmp/opip-analytics-"$TARGET_SHA"-* ]]; then
@@ -40,6 +40,10 @@ case "$STAGE" in
   prepare)
     bash "$APP_ROOT/deploy/learning/bootstrap-opip-learning-worker.sh" \
       "$TARGET_SHA" 10.116.0.2 opiplearn
+    ;;
+  activate)
+    test -s /root/.ssh/opip-learning
+    test -s /root/.ssh/known_hosts
     systemctl start opip-learning-sync.service
     systemctl start opip-learning-capture.service
     systemctl start opip-learning-outcomes.service
@@ -61,10 +65,10 @@ case "$STAGE" in
     bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" empty
     ;;
   backup)
-    /usr/local/sbin/opip-postgres-backup
+    bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"
     ;;
   restore-drill)
-    /usr/local/sbin/opip-postgres-restore-drill
+    bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"
     ;;
   backfill|shipper|reads-ready)
     bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" "$STAGE"
