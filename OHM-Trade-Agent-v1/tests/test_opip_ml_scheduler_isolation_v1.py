@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -91,6 +92,13 @@ def test_production_export_is_copy_only_and_locked():
     assert "flock -x 8" in source
     assert "sha256sum" in source
     assert "schema_version=3" in source
+    assert 'archive_temp="$EXPORT_ROOT/.$archive_name.tmp.$$"' in source
+    assert source.count('install -d -o root -g "$READER_GROUP" -m 0750') >= 2
+    assert source.count("install -d -o root -g root -m 0700") >= 2
+    assert not re.search(
+        r"install\\s+-d\\s+-o\\s+root\\s+-g\\s+root\\s+-m\\s+0750\\b",
+        source,
+    )
     assert "mv -f" in source
     assert "python" not in source
     assert "docker" not in source

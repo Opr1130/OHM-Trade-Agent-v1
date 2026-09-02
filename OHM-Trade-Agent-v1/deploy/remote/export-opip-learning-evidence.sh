@@ -57,12 +57,22 @@ copy_locked_jsonl() {
   local archive_temp=""
   local archive_target=""
 
-  install -d -o root -g root -m 0750 "$(dirname "$temp")" "$(dirname "$target")"
+  if getent group "$READER_GROUP" >/dev/null 2>&1; then
+    install -d -o root -g "$READER_GROUP" -m 0750 \
+      "$(dirname "$temp")" "$(dirname "$target")"
+  else
+    install -d -o root -g root -m 0700 \
+      "$(dirname "$temp")" "$(dirname "$target")"
+  fi
   if [[ -n "$archive_name" ]]; then
     archive_temp="$EXPORT_ROOT/.$archive_name.tmp.$$"
     archive_target="$EXPORT_ROOT/$archive_name"
     rm -rf -- "$archive_temp"
-    install -d -o root -g root -m 0750 "$archive_temp"
+    if getent group "$READER_GROUP" >/dev/null 2>&1; then
+      install -d -o root -g "$READER_GROUP" -m 0750 "$archive_temp"
+    else
+      install -d -o root -g root -m 0700 "$archive_temp"
+    fi
   fi
 
   exec {source_fd}>>"$source_lock"
