@@ -132,6 +132,8 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert "trap cleanup EXIT INT TERM" in source
     assert 'docker rm -f "${remaining_ids[@]}"' in source
     assert source.count('MEMORY_LIMIT="384m"') == 2
+    assert 'MODULE="app.jobs.run_opportunity_intelligence_cycle"' in source
+    assert "app.jobs.build_phase3c_forward_outcomes" not in source
     assert 'MEMORY_LIMIT="512m"' not in source
     assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
 
