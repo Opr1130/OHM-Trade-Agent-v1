@@ -311,6 +311,13 @@ class OPipScanObserver:
                     "best_economic_net_profit": row.get("best_economic_net_profit"),
                     "target_qualified_any": bool(row.get("target_qualified_any")),
                     "economic_qualified_any": bool(row.get("economic_qualified_any")),
+                    "risk_levels": (
+                        dict(row.get("risk_levels"))
+                        if isinstance(row.get("risk_levels"), Mapping)
+                        else {}
+                    ),
+                    "measurement_only": True,
+                    "affects_trade_authority": False,
                 },
                 evaluated_at=self.decision_at,
             )
