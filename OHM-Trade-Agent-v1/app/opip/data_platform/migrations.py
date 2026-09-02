@@ -143,6 +143,7 @@ def refresh_materialized_views(connection: Any) -> None:
         ("signal", "intelligence_daily_mv"),
         ("market", "attrition_daily_mv"),
         ("lifecycle", "rejection_mix_daily_mv"),
+        ("learning", "opportunity_accountability_daily_mv"),
     )
     populated_views: list[tuple[str, str, bool]] = []
     with connection.cursor() as cursor:
