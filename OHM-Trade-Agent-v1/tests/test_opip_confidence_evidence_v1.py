@@ -482,3 +482,51 @@ def test_recent_funnel_uses_actual_first_terminal_gate_for_choke(tmp_path):
         "DETERMINISTIC_QUALITY": 1,
     }
     assert report["funnel_invariant_holds"] is True
+
+
+
+def test_recent_funnel_recovers_terminal_reason_class_from_matching_gate(tmp_path):
+    funnel = tmp_path / "funnel-terminal-class.jsonl"
+    screening = tmp_path / "screening-terminal-class.jsonl"
+    summaries = tmp_path / "summaries-terminal-class.jsonl"
+    _write_jsonl(screening, [])
+    _write_jsonl(summaries, [])
+    _write_jsonl(
+        funnel,
+        [
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "OPERATIONAL_FAILURE",
+                "first_terminal_gate": "EXECUTION_VALIDATION",
+                "terminal_reason_code": "GATE_EVALUATION_ERROR",
+                "gate_results": [
+                    {
+                        "gate": "MARGIN_ELIGIBILITY",
+                        "status": "PASS",
+                        "reason_class": "INFORMATIONAL",
+                        "metadata": {},
+                    },
+                    {
+                        "gate": "EXECUTION_VALIDATION",
+                        "status": "ERROR",
+                        "reason_code": "GATE_EVALUATION_ERROR",
+                        "reason_class": "OPERATIONAL",
+                        "metadata": {},
+                    },
+                ],
+            }
+        ],
+    )
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+
+    assert report["primary_choke"] == "EXECUTION_VALIDATION"
+    assert report["primary_operational_choke"] == "EXECUTION_VALIDATION"
+    assert report["operational_terminal_gate_counts"] == {
+        "EXECUTION_VALIDATION": 1
+    }
