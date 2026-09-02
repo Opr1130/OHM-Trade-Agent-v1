@@ -65,9 +65,22 @@ git -C "$REPO_ROOT" checkout -f main
 git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
 
 install -d -o root -g root -m 0700 \
-  "$STATE_ROOT/postgres" \
   "$STATE_ROOT/config" \
   /var/backups/opip-postgres
+# Never reset an initialized bind-mounted PGDATA directory to root:root while
+# PostgreSQL is running. Recover the directory owner from a canonical file so
+# repeat empty deployments remain safe without hard-coding the image UID/GID.
+if [[ -r "$STATE_ROOT/postgres/PG_VERSION" ]]; then
+  pgdata_owner="$(stat -c '%u:%g' "$STATE_ROOT/postgres/PG_VERSION")"
+  if [[ ! "$pgdata_owner" =~ ^[0-9]+:[0-9]+$ ]]; then
+    echo "unable to determine existing PostgreSQL data owner" >&2
+    exit 70
+  fi
+  chown "$pgdata_owner" "$STATE_ROOT/postgres"
+  chmod 0700 "$STATE_ROOT/postgres"
+else
+  install -d -o root -g root -m 0700 "$STATE_ROOT/postgres"
+fi
 if [[ ! -e "$STATE_FILE" ]]; then
   install -o root -g root -m 0600 /dev/null "$STATE_FILE"
 fi
