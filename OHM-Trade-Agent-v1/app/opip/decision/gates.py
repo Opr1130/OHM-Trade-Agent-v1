@@ -84,6 +84,15 @@ def evaluate_margin_gate(
             evaluated_at=evaluated_at,
             metadata=metadata,
         )
+    if status == "UNAVAILABLE":
+        return GateResult.build(
+            GateName.MARGIN_ELIGIBILITY,
+            GateStatus.FAIL,
+            ReasonCode.MARGIN_VALIDATION_UNAVAILABLE,
+            reason="Kraken margin pair discovery unavailable",
+            evaluated_at=evaluated_at,
+            metadata=metadata,
+        )
     return GateResult.build(
         GateName.MARGIN_ELIGIBILITY,
         GateStatus.FAIL,
