@@ -29,6 +29,8 @@ def test_remote_runner_keeps_existing_platform_evidence_gates():
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"' in runner
     assert runner.index("prepare)") < runner.index("activate)")
     assert 'systemctl disable --now "$unit"' in runner
+    assert '! systemctl is-active --quiet "$unit"' in runner
+    assert '! systemctl is-enabled --quiet "$unit"' in runner
     assert runner.count('grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA"') == 3
     assert 'bootstrap-opip-data-platform.sh\" \"$TARGET_SHA\" \"$STAGE\"' in runner
     assert "7 * 86400" in bootstrap
