@@ -15,9 +15,14 @@ from app.opip.decision.store import append_screening_evaluations
 from app.opip.identity import resolve_venue_instrument_identity
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
-from app.scanner.directional_candidates import select_directional_candidates
+from app.scanner.directional_candidates import (
+    MAX_PER_DIRECTION,
+    qualifying_long_alternatives,
+    select_directional_candidates,
+)
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
+    bound_recovered_longs,
     keep_margin_tradeable_candidates,
     validate_short_margin_eligibility,
 )
@@ -246,6 +251,31 @@ def _direction_counts(candidates):
         sum(c.trade_direction == "LONG" for c in candidates),
         sum(c.trade_direction == "SHORT" for c in candidates),
     )
+
+
+def _merge_recovered_tradingview_evidence(
+    recovered_longs,
+    *,
+    enabled: bool,
+) -> int:
+    """Attach advisory TradingView context to recovered LONGs, fail-soft."""
+    if not enabled or not recovered_longs:
+        return 0
+    try:
+        from app.services.tradingview_inbox import merge_native_candidate_evidence
+
+        attached = merge_native_candidate_evidence(recovered_longs)
+        print(
+            "Recovered LONGs tagged with TradingView confirmation:",
+            attached,
+        )
+        return int(attached)
+    except Exception:
+        logger.exception(
+            "TradingView v2 recovered-LONG evidence merge failed open; "
+            "continuing with native evidence only"
+        )
+        return 0
 
 
 def _capture_native_scan_cohort(scan, *, decision_at):
@@ -942,7 +972,46 @@ def main():
                     source="margin_eligibility_gate",
                 )
     opip.record_margin(candidates)
+    pre_margin_candidate_count = len(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
+    margin_opened_slots = pre_margin_candidate_count - len(candidates)
+    existing_assets = {
+        str(candidate.underlying_asset or candidate.symbol)
+        for candidate in candidates
+    }
+    recovery_pool = (
+        qualifying_long_alternatives(
+            scan.snapshots,
+            excluded_assets=existing_assets,
+        )
+        if margin_opened_slots > 0
+        else []
+    )
+    recovered_longs = bound_recovered_longs(
+        candidates,
+        recovery_pool,
+        max_per_direction=MAX_PER_DIRECTION,
+        recovery_slots=margin_opened_slots,
+    )
+    if recovered_longs:
+        # The rejected SHORT remains terminal and fail-closed. These LONGs
+        # independently cleared the same technical threshold before direction
+        # resolution and enter the normal downstream validation path from here.
+        # They are created after the initial TradingView augmentation pass, so
+        # restore advisory evidence before O'Pip/Chief sees the fallback.
+        _merge_recovered_tradingview_evidence(
+            recovered_longs,
+            enabled=bool(getattr(settings, "tradingview_v2_enabled", False)),
+        )
+        opip.register_candidates(recovered_longs)
+        opip.record_margin(recovered_longs)
+        candidates.extend(recovered_longs)
+        for fallback in recovered_longs:
+            print(
+                f"MARGIN LONG FALLBACK {fallback.symbol}: "
+                f"LongScore={fallback.technical_score} "
+                "Reason=preferred SHORT was not margin-tradeable"
+            )
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
         opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))

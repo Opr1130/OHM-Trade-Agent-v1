@@ -68,13 +68,22 @@ def select_directional_candidates(
 
         options: list[MarketSnapshot] = []
         if long_score >= min_score:
-            options.append(replace(snapshot, trade_direction="LONG"))
+            options.append(
+                replace(
+                    snapshot,
+                    trade_direction="LONG",
+                    directional_long_score=int(long_score),
+                    directional_short_score=int(short_score),
+                )
+            )
         if short_score >= min_score:
             options.append(
                 replace(
                     snapshot,
                     trade_direction="SHORT",
                     technical_score=short_score,
+                    directional_long_score=int(long_score),
+                    directional_short_score=int(short_score),
                 )
             )
         if not options:
@@ -125,3 +134,46 @@ def select_directional_candidates(
             break
 
     return selected
+
+
+
+def qualifying_long_alternatives(
+    snapshots: list[MarketSnapshot],
+    *,
+    excluded_assets: set[str] | None = None,
+    min_score: int = MIN_TECHNICAL_SCORE,
+) -> list[MarketSnapshot]:
+    """Return every independently qualifying LONG option in deterministic rank order."""
+    excluded = {str(asset) for asset in (excluded_assets or set())}
+    best_by_asset: dict[str, MarketSnapshot] = {}
+
+    for snapshot in snapshots:
+        asset = str(snapshot.underlying_asset or snapshot.symbol)
+        if asset in excluded:
+            continue
+        long_score = int(snapshot.technical_score)
+        if long_score < int(min_score):
+            continue
+        short_score = int(score_short_snapshot(snapshot).score)
+        candidate = replace(
+            snapshot,
+            trade_direction="LONG",
+            technical_score=long_score,
+            directional_long_score=long_score,
+            directional_short_score=short_score,
+        )
+        previous = best_by_asset.get(asset)
+        if (
+            previous is None
+            or candidate.technical_score > previous.technical_score
+            or (
+                candidate.technical_score == previous.technical_score
+                and candidate.symbol < previous.symbol
+            )
+        ):
+            best_by_asset[asset] = candidate
+
+    return sorted(
+        best_by_asset.values(),
+        key=lambda item: (-item.technical_score, item.symbol),
+    )

@@ -58,10 +58,10 @@ DEAD_LETTER_FILE = QUALIFICATION_DIR / "funnel_dead_letter.jsonl"
 # it is roughly 5.5 KB - the per-gate timestamp, threshold, measurement and
 # metadata are the point of the record and are not trimmed to flatter a number.
 #
-# Worst case is the directional cap of 8 candidates on the 5-minute SEARCH
-# cadence: ~2,300 rows and ~12.5 MiB a day. The 64 MiB / 50,000-line caps
-# therefore both land near a five-day full-fidelity forensic window at that
-# worst case, and far longer at realistic shortlist sizes.
+# Worst-case funnel persistence now includes recovery states: the initial
+# directional shortlist can register 8 candidates and up to 5 rejected SHORT
+# terminal rows can coexist with 5 recovered LONG rows. The deterministic
+# capacity projection below therefore uses 13 funnel rows per SEARCH scan.
 #
 # The scan-summary stream is ~1.9 KB per scan and is the long-horizon record:
 # 10,000 rows is about five weeks of continuous 5-minute scanning, which is
@@ -84,7 +84,11 @@ BROAD_SEARCH_MAX_INSTRUMENTS = 200
 BROAD_SEARCH_SCANS_PER_DAY = 288
 EARLY_WATCH_DEEP_MAX_INSTRUMENTS = 40
 EARLY_WATCH_SCANS_PER_DAY = 144
-MAX_FUNNEL_CANDIDATES_PER_SCAN = 8
+# A production scan initially registers at most 8 directional candidates.
+# Up to 5 rejected SHORT terminal states can remain in the forensic funnel
+# while the newly opened slots are refilled with independently qualified LONG
+# recovery candidates. Capacity must retain both states: 8 + 5 = 13 rows.
+MAX_FUNNEL_CANDIDATES_PER_SCAN = 13
 SCREENING_P95_ROW_BYTES = 750
 FUNNEL_P95_ROW_BYTES = 9_700
 SUMMARY_P95_ROW_BYTES = 1_900

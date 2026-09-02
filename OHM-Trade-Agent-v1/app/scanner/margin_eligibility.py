@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.exchanges.kraken import KrakenAPIError, KrakenClient
+from app.scanner.candidates import MIN_TECHNICAL_SCORE
 from app.scanner.models import MarketSnapshot
 
 
@@ -138,3 +139,85 @@ def keep_margin_tradeable_candidates(
         for candidate in candidates
         if candidate.trade_direction != "SHORT" or candidate.margin_eligible
     ]
+
+
+
+def recover_margin_rejected_long(
+    candidate: MarketSnapshot,
+    *,
+    min_score: int = MIN_TECHNICAL_SCORE,
+) -> MarketSnapshot | None:
+    """Recover an independently qualifying LONG after a SHORT margin stop.
+
+    The preferred SHORT remains fail-closed: this never authorizes or modifies
+    it. Recovery is allowed only when the selector previously recorded a LONG
+    technical score that already cleared the unchanged production threshold.
+    """
+    if str(candidate.trade_direction or "").upper() != "SHORT":
+        return None
+    if bool(candidate.margin_eligible):
+        return None
+    status = str(candidate.margin_validation_status or "").upper()
+    if status not in {"INELIGIBLE", "UNAVAILABLE"}:
+        return None
+
+    raw_long_score = candidate.directional_long_score
+    if raw_long_score is None:
+        return None
+    try:
+        long_score = int(raw_long_score)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if long_score < int(min_score):
+        return None
+
+    return replace(
+        candidate,
+        trade_direction="LONG",
+        technical_score=long_score,
+        margin_eligible=False,
+        margin_venue_symbol=None,
+        margin_max_leverage=None,
+        margin_validation_status="NOT_REQUIRED",
+        margin_warnings=None,
+    )
+
+
+def recover_margin_rejected_longs(
+    candidates: list[MarketSnapshot],
+    *,
+    min_score: int = MIN_TECHNICAL_SCORE,
+) -> list[MarketSnapshot]:
+    """Return LONG fallbacks for margin-stopped SHORT candidates only."""
+    recovered: list[MarketSnapshot] = []
+    for candidate in candidates:
+        fallback = recover_margin_rejected_long(candidate, min_score=min_score)
+        if fallback is not None:
+            recovered.append(fallback)
+    return recovered
+
+
+
+def bound_recovered_longs(
+    current_candidates: list[MarketSnapshot],
+    recovered_longs: list[MarketSnapshot],
+    *,
+    max_per_direction: int,
+    recovery_slots: int | None = None,
+) -> list[MarketSnapshot]:
+    """Limit ranked LONG fallbacks to direction capacity and opened margin slots."""
+    existing_longs = sum(
+        str(candidate.trade_direction or "").upper() == "LONG"
+        for candidate in current_candidates
+    )
+    directional_capacity = max(0, int(max_per_direction) - existing_longs)
+    opened_slots = (
+        len(recovered_longs)
+        if recovery_slots is None
+        else max(0, int(recovery_slots))
+    )
+    available = min(directional_capacity, opened_slots)
+    return sorted(
+        recovered_longs,
+        key=lambda candidate: (-candidate.technical_score, candidate.symbol),
+    )[:available]

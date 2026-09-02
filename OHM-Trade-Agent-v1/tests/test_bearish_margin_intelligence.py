@@ -3,11 +3,18 @@ from types import SimpleNamespace
 import pytest
 
 from app.exchanges.kraken import BookLevel, PreTradeBook, KrakenAPIError
-from app.scanner.directional_candidates import select_directional_candidates
+from app.opip.decision.gates import evaluate_margin_gate
+from app.opip.decision.models import DecisionOutcome, ReasonClass, ReasonCode, terminal_attribution
+from app.scanner.directional_candidates import (
+    qualifying_long_alternatives,
+    select_directional_candidates,
+)
 from app.scanner.execution_validation import evaluate_execution
 from app.scanner.margin_eligibility import (
+    bound_recovered_longs,
     validate_short_margin_eligibility,
     keep_margin_tradeable_candidates,
+    recover_margin_rejected_long,
 )
 from app.scanner.models import MarketSnapshot
 from app.scanner.short_execution_quality import short_execution_is_tradeable
@@ -242,3 +249,219 @@ def test_strict_short_execution_requires_fresh_two_sided_coverage():
     ok, reasons = short_execution_is_tradeable(s)
     assert not ok
     assert any("not fresh" in reason for reason in reasons)
+
+
+
+def test_margin_rejected_short_recovers_independently_qualified_long():
+    selected = select_directional_candidates(
+        [snapshot(symbol="FALLBACKUSD", underlying_asset="FALLBACK", technical_score=82)]
+    )
+    assert len(selected) == 1
+    preferred = selected[0]
+    assert preferred.trade_direction == "SHORT"
+    assert preferred.directional_long_score == 82
+    assert preferred.directional_short_score == preferred.technical_score
+
+    validate_short_margin_eligibility([preferred], client=MarginClient({}))
+    fallback = recover_margin_rejected_long(preferred)
+
+    assert fallback is not None
+    assert fallback.trade_direction == "LONG"
+    assert fallback.technical_score == 82
+    assert fallback.margin_validation_status == "NOT_REQUIRED"
+    assert fallback.margin_eligible is False
+
+
+def test_margin_rejected_short_does_not_promote_below_threshold_long():
+    preferred = snapshot(
+        symbol="NOFALLBACKUSD",
+        underlying_asset="NOFALLBACK",
+        trade_direction="SHORT",
+        technical_score=90,
+        directional_long_score=79,
+        directional_short_score=90,
+        margin_validation_status="INELIGIBLE",
+        margin_eligible=False,
+    )
+    assert recover_margin_rejected_long(preferred) is None
+
+
+def test_margin_eligible_short_never_falls_back_to_long():
+    preferred = snapshot(
+        symbol="SHORTOKUSD",
+        underlying_asset="SHORTOK",
+        trade_direction="SHORT",
+        technical_score=90,
+        directional_long_score=85,
+        directional_short_score=90,
+        margin_validation_status="ELIGIBLE",
+        margin_eligible=True,
+    )
+    assert recover_margin_rejected_long(preferred) is None
+
+
+
+def test_recovered_longs_respect_directional_cap():
+    current = [
+        snapshot(
+            symbol=f"LONG{i}USD",
+            underlying_asset=f"LONG{i}",
+            trade_direction="LONG",
+            technical_score=90 - i,
+        )
+        for i in range(3)
+    ]
+    recovered = [
+        snapshot(
+            symbol=f"RECOVER{i}USD",
+            underlying_asset=f"RECOVER{i}",
+            trade_direction="LONG",
+            technical_score=88 - i,
+        )
+        for i in range(5)
+    ]
+
+    admitted = bound_recovered_longs(
+        current,
+        recovered,
+        max_per_direction=5,
+    )
+
+    assert len(admitted) == 2
+    combined = current + admitted
+    assert sum(item.trade_direction == "LONG" for item in combined) == 5
+    assert [item.symbol for item in admitted] == ["RECOVER0USD", "RECOVER1USD"]
+
+
+
+def test_recovered_long_capacity_prefers_highest_long_score():
+    current = [
+        snapshot(
+            symbol=f"BASE{i}USD",
+            underlying_asset=f"BASE{i}",
+            trade_direction="LONG",
+            technical_score=95 - i,
+        )
+        for i in range(4)
+    ]
+    # Preserve an intentionally inverse input order to model rejected SHORT
+    # ordering differing from the recovered LONG ordering.
+    recovered = [
+        snapshot(
+            symbol="LOWLONGUSD",
+            underlying_asset="LOWLONG",
+            trade_direction="LONG",
+            technical_score=81,
+        ),
+        snapshot(
+            symbol="HIGHLONGUSD",
+            underlying_asset="HIGHLONG",
+            trade_direction="LONG",
+            technical_score=89,
+        ),
+    ]
+
+    admitted = bound_recovered_longs(
+        current,
+        recovered,
+        max_per_direction=5,
+    )
+
+    assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
+    assert admitted[0].technical_score == 89
+
+
+
+def test_margin_recovery_considers_dropped_high_scoring_long():
+    current = [
+        snapshot(
+            symbol=f"CURRENT{i}USD",
+            underlying_asset=f"CURRENT{i}",
+            trade_direction="LONG",
+            technical_score=95 - i,
+        )
+        for i in range(4)
+    ]
+    # LOWLONG models a LONG attached to a selected SHORT. HIGHLONG models an
+    # asset that could have been dropped by the earlier SHORT cap but whose
+    # independent LONG score is better. Recovery must rank the full snapshot
+    # pool, not only alternatives attached to selected SHORTs.
+    all_snapshots = [
+        snapshot(
+            symbol="LOWLONGUSD",
+            underlying_asset="LOWLONG",
+            technical_score=81,
+        ),
+        snapshot(
+            symbol="HIGHLONGUSD",
+            underlying_asset="HIGHLONG",
+            technical_score=89,
+        ),
+    ]
+
+    pool = qualifying_long_alternatives(
+        all_snapshots,
+        excluded_assets={
+            str(item.underlying_asset or item.symbol)
+            for item in current
+        },
+    )
+    admitted = bound_recovered_longs(
+        current,
+        pool,
+        max_per_direction=5,
+        recovery_slots=1,
+    )
+
+    assert [item.symbol for item in pool] == ["HIGHLONGUSD", "LOWLONGUSD"]
+    assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
+    assert admitted[0].technical_score == 89
+
+
+
+def test_qualifying_long_alternatives_tie_breaks_by_symbol():
+    first = snapshot(
+        symbol="ZZZUSD",
+        underlying_asset="SAME",
+        technical_score=88,
+    )
+    second = snapshot(
+        symbol="AAAUSD",
+        underlying_asset="SAME",
+        technical_score=88,
+    )
+
+    forward = qualifying_long_alternatives([first, second])
+    reverse = qualifying_long_alternatives([second, first])
+
+    assert [item.symbol for item in forward] == ["AAAUSD"]
+    assert [item.symbol for item in reverse] == ["AAAUSD"]
+
+
+
+def test_margin_unavailable_is_operational_not_policy():
+    s = snapshot(trade_direction="SHORT")
+    validate_short_margin_eligibility([s], client=MarginClient(error=True))
+
+    result = evaluate_margin_gate(s)
+    outcome, gate, reason_code, _ = terminal_attribution([result])
+
+    assert result.reason_code is ReasonCode.MARGIN_VALIDATION_UNAVAILABLE
+    assert result.reason_class is ReasonClass.OPERATIONAL
+    assert outcome is DecisionOutcome.OPERATIONAL_FAILURE
+    assert gate.value == "MARGIN_ELIGIBILITY"
+    assert reason_code is ReasonCode.MARGIN_VALIDATION_UNAVAILABLE
+
+
+def test_margin_ineligible_remains_policy_rejection():
+    s = snapshot(trade_direction="SHORT")
+    validate_short_margin_eligibility([s], client=MarginClient({}))
+
+    result = evaluate_margin_gate(s)
+    outcome, gate, reason_code, _ = terminal_attribution([result])
+
+    assert result.reason_code is ReasonCode.MARGIN_INELIGIBLE
+    assert result.reason_class is ReasonClass.POLICY
+    assert outcome is DecisionOutcome.REJECTED
+    assert gate.value == "MARGIN_ELIGIBILITY"
+    assert reason_code is ReasonCode.MARGIN_INELIGIBLE

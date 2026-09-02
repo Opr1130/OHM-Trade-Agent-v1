@@ -378,6 +378,10 @@ def _prefilter_evidence(candidate: MarketSnapshot, quality_by_risk_level: dict) 
         "symbol": candidate.symbol,
         "direction": candidate.trade_direction.upper(),
         **binding_deterministic_constraint(quality_by_risk_level),
+        "risk_levels": {
+            str(risk_level): dict(level)
+            for risk_level, level in quality_by_risk_level.items()
+        },
         "reason": "; ".join(reasons)
         or "no risk level clears both the target and economic gates",
     }
