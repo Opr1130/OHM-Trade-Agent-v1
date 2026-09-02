@@ -195,3 +195,19 @@ def recover_margin_rejected_longs(
         if fallback is not None:
             recovered.append(fallback)
     return recovered
+
+
+
+def bound_recovered_longs(
+    current_candidates: list[MarketSnapshot],
+    recovered_longs: list[MarketSnapshot],
+    *,
+    max_per_direction: int,
+) -> list[MarketSnapshot]:
+    """Limit LONG fallbacks without evicting candidates that already survived."""
+    existing_longs = sum(
+        str(candidate.trade_direction or "").upper() == "LONG"
+        for candidate in current_candidates
+    )
+    available = max(0, int(max_per_direction) - existing_longs)
+    return list(recovered_longs[:available])
