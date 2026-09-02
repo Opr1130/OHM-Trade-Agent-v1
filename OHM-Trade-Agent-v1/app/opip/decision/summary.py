@@ -239,3 +239,221 @@ def render_scan_summary_text(summary: Mapping[str, Any]) -> str:
         f"Funnel invariant holds: {'YES' if summary.get('invariant_holds') else 'NO'}"
     )
     return "\n".join(lines)
+
+
+def _parse_utc_timestamp(value: Any) -> "datetime | None":
+    from datetime import datetime, timezone
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def build_recent_qualification_funnel(
+    *,
+    funnel_events_path=None,
+    screening_evaluations_path=None,
+    scan_summaries_path=None,
+    now=None,
+    window_hours: int = 24,
+) -> dict[str, Any]:
+    """Aggregate persisted O'Pip evidence into a recent qualification funnel.
+
+    Read-only diagnostics only. It does not feed any ranking, qualification,
+    alert, paper-admission, or exchange path.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.opip.decision.store import (
+        FUNNEL_EVENTS_FILE,
+        SCAN_SUMMARIES_FILE,
+        SCREENING_EVALUATIONS_FILE,
+        read_jsonl,
+    )
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    current = current.astimezone(timezone.utc)
+    cutoff = current - timedelta(hours=max(1, int(window_hours)))
+
+    def recent(rows):
+        result = []
+        for row in rows:
+            observed = _parse_utc_timestamp(
+                row.get("decision_at_utc") or row.get("observed_at")
+            )
+            if observed is not None and observed >= cutoff:
+                result.append(row)
+        return result
+
+    events = recent(read_jsonl(funnel_events_path or FUNNEL_EVENTS_FILE))
+    screenings = recent(
+        read_jsonl(screening_evaluations_path or SCREENING_EVALUATIONS_FILE)
+    )
+    summaries = recent(read_jsonl(scan_summaries_path or SCAN_SUMMARIES_FILE))
+
+    counts = Counter()
+    rejections = Counter()
+
+    counts["market_observed"] = len(screenings)
+    counts["scanner_selected"] = sum(
+        1 for row in screenings if str(row.get("outcome") or "") == "ADVANCED"
+    )
+
+    for row in events:
+        decision = str(row.get("decision") or "")
+        if decision == "QUALIFIED":
+            counts["qualified_signals"] += 1
+        reason = str(row.get("terminal_reason_code") or "")
+        if decision != "QUALIFIED" and reason:
+            rejections[reason] += 1
+
+        gate_results = row.get("gate_results") or []
+        if not isinstance(gate_results, list):
+            continue
+        for gate in gate_results:
+            if not isinstance(gate, Mapping):
+                continue
+            name = str(gate.get("gate") or "")
+            status = str(gate.get("status") or "")
+            reason_code = str(gate.get("reason_code") or "")
+            metadata = gate.get("metadata") or {}
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+
+            if name == "DETERMINISTIC_QUALITY":
+                counts[
+                    "deterministic_prefilter_pass"
+                    if status == "PASS"
+                    else "deterministic_prefilter_reject"
+                ] += 1
+            elif name == "AI_ELIGIBILITY" and status == "PASS":
+                counts["chief_eligible"] += 1
+            elif name == "AI_INVOCATION":
+                if status == "PASS":
+                    counts["chief_invoked"] += 1
+                    invocation = str(metadata.get("invocation_status") or "")
+                    if invocation in {"SUCCEEDED", "CACHE_REUSED"}:
+                        counts["chief_succeeded"] += 1
+                    if invocation == "CACHE_REUSED":
+                        counts["chief_cache_reused"] += 1
+                elif reason_code == "AI_BUDGET_LIMIT":
+                    counts["chief_budget_blocked"] += 1
+                elif status in {"FAIL", "ERROR"}:
+                    counts["chief_failed"] += 1
+            elif name == "RECOMMENDATION_GATE":
+                ai_decision = str(metadata.get("ai_decision") or "").lower()
+                if ai_decision == "alert":
+                    counts["chief_alert"] += 1
+                elif ai_decision == "watch":
+                    counts["chief_watch"] += 1
+                elif ai_decision:
+                    counts["chief_reject"] += 1
+                confidence = metadata.get("ai_confidence")
+                try:
+                    confidence_value = int(confidence)
+                except (TypeError, ValueError):
+                    confidence_value = None
+                if confidence_value is not None:
+                    if confidence_value >= 85:
+                        counts["confidence_ge_85"] += 1
+                    elif confidence_value >= 80:
+                        counts["confidence_80_84"] += 1
+                    elif confidence_value >= 70:
+                        counts["confidence_70_79"] += 1
+                    else:
+                        counts["confidence_lt_70"] += 1
+            elif name == "TARGET_QUALITY":
+                counts["target_pass" if status == "PASS" else "target_reject"] += 1
+            elif name == "ECONOMIC_QUALITY":
+                counts["economic_pass" if status == "PASS" else "economic_reject"] += 1
+            elif name == "CAPITAL_PORTFOLIO_GATE":
+                counts[
+                    "action_gate_pass" if status == "PASS" else "action_gate_reject"
+                ] += 1
+
+    counts["paper_admitted"] = sum(
+        int(row.get("paper_admission_eligible") or 0) for row in summaries
+    )
+
+    choke_candidates = {
+        "DETERMINISTIC_PREFILTER": counts["deterministic_prefilter_reject"],
+        "CHIEF_FAILURE": counts["chief_failed"] + counts["chief_budget_blocked"],
+        "CHIEF_WATCH_REJECT": counts["chief_watch"] + counts["chief_reject"],
+        "TARGET_QUALITY": counts["target_reject"],
+        "ECONOMIC_QUALITY": counts["economic_reject"],
+        "ACTION_GATE": counts["action_gate_reject"],
+    }
+    primary_choke = (
+        max(choke_candidates, key=choke_candidates.get)
+        if choke_candidates and max(choke_candidates.values()) > 0
+        else "NONE"
+    )
+
+    return {
+        "window_hours": int(window_hours),
+        "generated_at_utc": current.isoformat(),
+        **dict(counts),
+        "trade_quality_pass": "NOT_INSTRUMENTED",
+        "trade_quality_reject": "NOT_INSTRUMENTED",
+        "capacity_pass": "NOT_INSTRUMENTED",
+        "capacity_reject": "NOT_INSTRUMENTED",
+        "primary_choke": primary_choke,
+        "top_rejection_reasons": dict(rejections.most_common(10)),
+        "measurement_only": True,
+        "affects_trade_authority": False,
+    }
+
+
+def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
+    """Render a compact diagnostics block for /diagnose-learning."""
+    keys = (
+        "market_observed",
+        "scanner_selected",
+        "deterministic_prefilter_pass",
+        "deterministic_prefilter_reject",
+        "chief_eligible",
+        "chief_invoked",
+        "chief_succeeded",
+        "chief_failed",
+        "chief_budget_blocked",
+        "chief_cache_reused",
+        "chief_alert",
+        "chief_watch",
+        "chief_reject",
+        "confidence_ge_85",
+        "confidence_80_84",
+        "confidence_70_79",
+        "confidence_lt_70",
+        "target_pass",
+        "target_reject",
+        "economic_pass",
+        "economic_reject",
+        "trade_quality_pass",
+        "trade_quality_reject",
+        "capacity_pass",
+        "capacity_reject",
+        "action_gate_pass",
+        "action_gate_reject",
+        "qualified_signals",
+        "paper_admitted",
+    )
+    lines = ["OPIP_QUALIFICATION_FUNNEL"]
+    for key in keys:
+        lines.append(f"{key}={report.get(key, 0)}")
+    lines.append(f"PRIMARY_CHOKE={report.get('primary_choke', 'NONE')}")
+    lines.append("TOP_REJECTION_REASONS")
+    reasons = report.get("top_rejection_reasons") or {}
+    if reasons:
+        for reason, count in reasons.items():
+            lines.append(f"{reason}={count}")
+    else:
+        lines.append("NONE=0")
+    return "\n".join(lines)
