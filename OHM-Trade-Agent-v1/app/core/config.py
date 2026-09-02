@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # evidence remains internal and Telegram is reserved for actionable new
     # trades plus material existing-position actions.
     opip_actionable_only_alerts: bool = True
+    # Explicit advisory Early Watch transport. This is deliberately separate
+    # from the Wave 9 actionable-only policy: enabling it permits only the
+    # deep-qualified EARLY_MOVER watch channel. It does not re-enable legacy
+    # broad-watch / price-movement Telegram and never grants trade authority.
+    opip_early_watch_alerts_enabled: bool = False
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).
