@@ -35,7 +35,7 @@ def candidate_alert_authorized(candidate: dict[str, Any]) -> bool:
     """
     decision = str(candidate.get("decision", "")).lower()
     risk_level = str(candidate.get("risk_level", "")).lower()
-    direction = str(candidate.get("direction", "LONG")).upper()
+    direction = str(candidate.get("direction") or "").upper()
     return (
         decision == "alert"
         and risk_level in ALLOWED_RISK_LEVELS
@@ -56,7 +56,7 @@ def qualified_alerts(review: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(candidate, dict):
             continue
         if candidate_alert_authorized(candidate):
-            candidate["direction"] = str(candidate.get("direction", "LONG")).upper()
+            candidate["direction"] = str(candidate.get("direction") or "").upper()
             results.append(candidate)
 
     return results
