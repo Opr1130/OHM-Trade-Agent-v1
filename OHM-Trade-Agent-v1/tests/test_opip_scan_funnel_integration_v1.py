@@ -12,6 +12,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import time
 
 from app.jobs import scan_opportunities
 from app.opip.decision import store
@@ -346,6 +347,54 @@ def test_qualified_scan_records_a_qualified_terminal_state(monkeypatch, tmp_path
     assert summary["ai_stage"]["invoked"] is True
     assert summary["ai_stage"]["confidence_summary"]["max"] == 95
     _assert_equivalent(summary)
+
+
+def test_ai_eligibility_timestamp_precedes_slow_chief_completion(
+    monkeypatch,
+    tmp_path,
+):
+    class _SlowOpenAI(_FakeOpenAI):
+        def _create(self, **kwargs):
+            time.sleep(0.03)
+            return super()._create(**kwargs)
+
+    snapshots = [_snapshot("RAYUSD", VIABLE)]
+    _install_scan(
+        monkeypatch,
+        tmp_path,
+        snapshots,
+        openai=_SlowOpenAI(
+            _chief_payload(
+                [
+                    {
+                        "symbol": "RAYUSD",
+                        "direction": "LONG",
+                        "rank": 1,
+                        "confidence": 95,
+                        "risk_level": "low",
+                        "decision": "alert",
+                        "reason": "slow review timing test",
+                    }
+                ]
+            )
+        ),
+    )
+    scan_opportunities.main()
+
+    summary = _summary(tmp_path)
+    events = store.read_funnel_events_for_scan(
+        summary["scan_id"],
+        path=tmp_path / "funnel_events.jsonl",
+    )
+    event = events[0]
+    gates = {
+        row["gate"]: datetime.fromisoformat(row["evaluated_at"])
+        for row in event["gate_results"]
+    }
+    assert gates["AI_INVOCATION"] > gates["AI_ELIGIBILITY"]
+    assert (
+        gates["AI_INVOCATION"] - gates["AI_ELIGIBILITY"]
+    ) >= timedelta(milliseconds=20)
 
 
 def test_ai_outage_is_reported_as_an_operational_failure(monkeypatch, tmp_path):
