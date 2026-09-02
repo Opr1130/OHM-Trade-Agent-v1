@@ -36,7 +36,7 @@ def test_ranking_enabled_still_applies_action_gate(monkeypatch):
 
 def test_ranking_disabled_still_applies_action_gate(monkeypatch):
     helpers = _load_profit_ranking_test_module()
-    events, _, sent = helpers._configure_pipeline(
+    events, _, _sent = helpers._configure_pipeline(
         monkeypatch,
         [{"symbol": "UNRANKEDGATEDUSD", "move": 7.0}],
     )
