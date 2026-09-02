@@ -8,6 +8,7 @@ in it comes from the funnel; nothing is hard-coded.
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from app.opip.decision.comparison import build_comparison_telemetry
@@ -241,8 +242,7 @@ def render_scan_summary_text(summary: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _parse_utc_timestamp(value: Any) -> "datetime | None":
-    from datetime import datetime, timezone
+def _parse_utc_timestamp(value: Any) -> datetime | None:
 
     if not value:
         return None
@@ -268,8 +268,6 @@ def build_recent_qualification_funnel(
     Read-only diagnostics only. It does not feed any ranking, qualification,
     alert, paper-admission, or exchange path.
     """
-    from datetime import datetime, timedelta, timezone
-
     from app.opip.decision.store import (
         FUNNEL_EVENTS_FILE,
         SCAN_SUMMARIES_FILE,
@@ -281,7 +279,8 @@ def build_recent_qualification_funnel(
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     current = current.astimezone(timezone.utc)
-    cutoff = current - timedelta(hours=max(1, int(window_hours)))
+    effective_window_hours = max(1, int(window_hours))
+    cutoff = current - timedelta(hours=effective_window_hours)
 
     def recent(rows):
         result = []
@@ -438,7 +437,7 @@ def build_recent_qualification_funnel(
     )
 
     return {
-        "window_hours": int(window_hours),
+        "window_hours": effective_window_hours,
         "generated_at_utc": current.isoformat(),
         **dict(counts),
         "trade_quality_pass": "NOT_INSTRUMENTED",
