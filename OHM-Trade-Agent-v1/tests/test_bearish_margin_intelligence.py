@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.exchanges.kraken import BookLevel, PreTradeBook, KrakenAPIError
-from app.scanner.directional_candidates import select_directional_candidates
+from app.scanner.directional_candidates import (
+    qualifying_long_alternatives,
+    select_directional_candidates,
+)
 from app.scanner.execution_validation import evaluate_execution
 from app.scanner.margin_eligibility import (
     bound_recovered_longs,
@@ -362,5 +365,52 @@ def test_recovered_long_capacity_prefers_highest_long_score():
         max_per_direction=5,
     )
 
+    assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
+    assert admitted[0].technical_score == 89
+
+
+
+def test_margin_recovery_considers_dropped_high_scoring_long():
+    current = [
+        snapshot(
+            symbol=f"CURRENT{i}USD",
+            underlying_asset=f"CURRENT{i}",
+            trade_direction="LONG",
+            technical_score=95 - i,
+        )
+        for i in range(4)
+    ]
+    # LOWLONG models a LONG attached to a selected SHORT. HIGHLONG models an
+    # asset that could have been dropped by the earlier SHORT cap but whose
+    # independent LONG score is better. Recovery must rank the full snapshot
+    # pool, not only alternatives attached to selected SHORTs.
+    all_snapshots = [
+        snapshot(
+            symbol="LOWLONGUSD",
+            underlying_asset="LOWLONG",
+            technical_score=81,
+        ),
+        snapshot(
+            symbol="HIGHLONGUSD",
+            underlying_asset="HIGHLONG",
+            technical_score=89,
+        ),
+    ]
+
+    pool = qualifying_long_alternatives(
+        all_snapshots,
+        excluded_assets={
+            str(item.underlying_asset or item.symbol)
+            for item in current
+        },
+    )
+    admitted = bound_recovered_longs(
+        current,
+        pool,
+        max_per_direction=5,
+        recovery_slots=1,
+    )
+
+    assert [item.symbol for item in pool] == ["HIGHLONGUSD", "LOWLONGUSD"]
     assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
     assert admitted[0].technical_score == 89
