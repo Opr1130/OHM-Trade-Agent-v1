@@ -13,6 +13,8 @@ def test_analytics_workflow_is_owner_gated_and_non_collapsible():
     assert "Require successful exact-SHA CI" in workflow
     assert "prepare|activate|empty|backup|restore-drill|backfill|shipper|reads-ready" in workflow
     assert "does not merge, trade, or enable production reads" in workflow
+    assert "Clean remote release and sealed environment" in workflow
+    assert "if: always() && steps.target.outputs.sha != ''" in workflow
 
 
 def test_remote_runner_keeps_existing_platform_evidence_gates():
@@ -26,6 +28,7 @@ def test_remote_runner_keeps_existing_platform_evidence_gates():
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"' in runner
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"' in runner
     assert runner.index("prepare)") < runner.index("activate)")
+    assert 'systemctl disable --now "$unit"' in runner
     assert runner.count('grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA"') == 3
     assert 'bootstrap-opip-data-platform.sh\" \"$TARGET_SHA\" \"$STAGE\"' in runner
     assert "7 * 86400" in bootstrap
