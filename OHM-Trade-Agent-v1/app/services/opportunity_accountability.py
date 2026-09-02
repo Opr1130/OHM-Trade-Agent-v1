@@ -715,6 +715,7 @@ def _reconcile_state(connection: sqlite3.Connection, path: Path) -> None:
     if not path.exists():
         if _state_offset(connection):
             connection.execute("DELETE FROM latest")
+            connection.execute("DELETE FROM signal_index")
             _set_state_offset(connection, 0)
             connection.commit()
         return
@@ -722,6 +723,7 @@ def _reconcile_state(connection: sqlite3.Connection, path: Path) -> None:
     offset = _state_offset(connection)
     if offset > size:
         connection.execute("DELETE FROM latest")
+        connection.execute("DELETE FROM signal_index")
         offset = 0
         _set_state_offset(connection, 0)
     with path.open("rb") as handle:
