@@ -203,13 +203,20 @@ def bound_recovered_longs(
     recovered_longs: list[MarketSnapshot],
     *,
     max_per_direction: int,
+    recovery_slots: int | None = None,
 ) -> list[MarketSnapshot]:
-    """Limit LONG fallbacks without evicting candidates that already survived."""
+    """Limit ranked LONG fallbacks to direction capacity and opened margin slots."""
     existing_longs = sum(
         str(candidate.trade_direction or "").upper() == "LONG"
         for candidate in current_candidates
     )
-    available = max(0, int(max_per_direction) - existing_longs)
+    directional_capacity = max(0, int(max_per_direction) - existing_longs)
+    opened_slots = (
+        len(recovered_longs)
+        if recovery_slots is None
+        else max(0, int(recovery_slots))
+    )
+    available = min(directional_capacity, opened_slots)
     return sorted(
         recovered_longs,
         key=lambda candidate: (-candidate.technical_score, candidate.symbol),
