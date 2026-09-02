@@ -309,6 +309,8 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "restore_epoch > now_epoch" in bootstrap
     assert "rollback_epoch > now_epoch" in bootstrap
     assert "restore drill must validate the attested PostgreSQL dump" in bootstrap
+    assert 'docker compose -f "$COMPOSE" build opip-shipper' in bootstrap
+    assert 'build opip-shipper opip-data-admin' not in bootstrap
     assert "explicit empty-stage rollback evidence is required before backfill" in bootstrap
     assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" not in bootstrap
     assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" not in bootstrap
