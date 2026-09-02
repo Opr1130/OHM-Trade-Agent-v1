@@ -31,6 +31,8 @@ DEFAULT_OUTCOME_FILE = Path("/app/data/phase3c_forward_outcomes.jsonl")
 DEFAULT_INTELLIGENCE_EVENT_FILE = Path("/app/data/intelligence_learning/events.jsonl")
 DEFAULT_LEDGER_FILE = Path("/app/data/opip/opportunity_accountability.jsonl")
 DEFAULT_SUMMARY_FILE = Path("/app/data/opip/opportunity_accountability_summary.json")
+DEFAULT_SCREENING_ARCHIVE = Path("/app/data/opip/qualification/screening_evaluations_archive")
+DEFAULT_FUNNEL_ARCHIVE = Path("/app/data/opip/qualification/funnel_events_archive")
 
 
 @dataclass(frozen=True)
@@ -969,6 +971,138 @@ def write_summary(
         except OSError:
             pass
     os.replace(temp, path)
+
+
+def _iter_jsonl_sources(
+    path: Path,
+    *,
+    archive_dir: Path | None = None,
+) -> Iterable[dict[str, Any]]:
+    sources: list[Path] = []
+    if archive_dir is not None and archive_dir.exists():
+        sources.extend(
+            item for item in sorted(archive_dir.rglob("*.jsonl")) if item.is_file()
+        )
+    sources.append(path)
+    for source in sources:
+        if not source.exists():
+            continue
+        try:
+            with source.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw in handle:
+                    text = raw.strip()
+                    if not text:
+                        continue
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        yield row
+        except OSError:
+            continue
+
+
+def build_incremental_from_outcomes(
+    outcome_rows: Iterable[Mapping[str, Any]],
+    *,
+    screening_path: Path = DEFAULT_SCREENING_FILE,
+    screening_archive: Path = DEFAULT_SCREENING_ARCHIVE,
+    funnel_path: Path = DEFAULT_FUNNEL_FILE,
+    funnel_archive: Path = DEFAULT_FUNNEL_ARCHIVE,
+    intelligence_event_path: Path = DEFAULT_INTELLIGENCE_EVENT_FILE,
+    ledger_path: Path = DEFAULT_LEDGER_FILE,
+    summary_path: Path = DEFAULT_SUMMARY_FILE,
+    state_path: Path | None = None,
+    policy: AccountabilityPolicy | None = None,
+) -> dict[str, Any]:
+    """Join only the outcome rows matured by the current bounded learning cycle."""
+    outcomes = [dict(row) for row in outcome_rows if isinstance(row, Mapping)]
+    target_keys = {
+        (_iso(row.get("reference_at")), _normalize_symbol(row.get("symbol")))
+        for row in outcomes
+        if _iso(row.get("reference_at")) and _normalize_symbol(row.get("symbol"))
+    }
+    if not target_keys:
+        summary = build_accountability_summary_from_state(
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        write_summary(summary, path=summary_path)
+        return summary
+
+    screening: list[dict[str, Any]] = []
+    for row in _iter_jsonl_sources(
+        screening_path,
+        archive_dir=screening_archive,
+    ):
+        if str(row.get("scanner_type") or "").upper() != "BROAD_SEARCH":
+            continue
+        key = (_iso(row.get("observed_at")), _screening_symbol(row))
+        if key in target_keys:
+            screening.append(row)
+
+    selected_scan_symbols = {
+        (str(row.get("scan_id") or ""), _screening_symbol(row))
+        for row in screening
+        if str(row.get("scan_id") or "")
+    }
+    funnel: list[dict[str, Any]] = []
+    for row in _iter_jsonl_sources(
+        funnel_path,
+        archive_dir=funnel_archive,
+    ):
+        key = (
+            str(row.get("scan_id") or ""),
+            _normalize_symbol(row.get("pair") or row.get("symbol") or row.get("asset")),
+        )
+        if key in selected_scan_symbols:
+            funnel.append(row)
+
+    signal_ids = {
+        str(row.get("signal_id") or "")
+        for row in funnel
+        if str(row.get("signal_id") or "")
+    }
+    intelligence: list[dict[str, Any]] = []
+    if signal_ids and intelligence_event_path.exists():
+        for row in _iter_jsonl_sources(intelligence_event_path):
+            if (
+                str(row.get("signal_id") or "") in signal_ids
+                and str(row.get("event_type") or "").upper()
+                in {"PAPER_ADMISSION", "PAPER_OUTCOME"}
+            ):
+                intelligence.append(row)
+
+    synthetic_snapshots = [
+        {
+            "decision_at_utc": row.get("reference_at"),
+            "symbol": row.get("symbol"),
+            "snapshot_id": row.get("snapshot_id"),
+            "episode_id": row.get("canonical_episode_id") or row.get("episode_id"),
+            "reference_price": row.get("reference_price"),
+        }
+        for row in outcomes
+    ]
+    accountability_rows = build_accountability_rows(
+        screening_rows=screening,
+        funnel_rows=funnel,
+        snapshot_rows=synthetic_snapshots,
+        outcome_rows=outcomes,
+        intelligence_events=intelligence,
+        policy=policy,
+    )
+    append_accountability_rows(
+        accountability_rows,
+        path=ledger_path,
+        state_path=state_path,
+    )
+    summary = build_accountability_summary_from_state(
+        ledger_path=ledger_path,
+        state_path=state_path,
+    )
+    write_summary(summary, path=summary_path)
+    return summary
 
 
 def build_from_files(
