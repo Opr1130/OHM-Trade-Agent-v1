@@ -384,8 +384,10 @@ def build_recent_qualification_funnel(
                     counts["action_gate_pass"] += 1
                 elif status == "FAIL":
                     counts["action_gate_reject"] += 1
+                elif status == "ERROR":
+                    counts["action_gate_error"] += 1
 
-    counts["paper_admitted"] = sum(
+    counts["paper_admission_eligible"] = sum(
         int(row.get("paper_admission_eligible") or 0) for row in summaries
     )
 
@@ -411,6 +413,7 @@ def build_recent_qualification_funnel(
         "trade_quality_reject": "NOT_INSTRUMENTED",
         "capacity_pass": "NOT_INSTRUMENTED",
         "capacity_reject": "NOT_INSTRUMENTED",
+        "paper_admitted": "NOT_INSTRUMENTED",
         "primary_choke": primary_choke,
         "top_rejection_reasons": dict(rejections.most_common(10)),
         "measurement_only": True,
@@ -448,7 +451,9 @@ def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
         "capacity_reject",
         "action_gate_pass",
         "action_gate_reject",
+        "action_gate_error",
         "qualified_signals",
+        "paper_admission_eligible",
         "paper_admitted",
     )
     lines = ["OPIP_QUALIFICATION_FUNNEL"]
