@@ -224,3 +224,39 @@ def test_recent_funnel_renderer_marks_uninstrumented_stages(tmp_path):
     assert "capacity_reject=NOT_INSTRUMENTED" in rendered
     assert "paper_admitted=NOT_INSTRUMENTED" in rendered
     assert "PRIMARY_CHOKE=NONE" in rendered
+
+
+
+def test_action_gate_error_is_not_reported_as_rejection(tmp_path):
+    funnel = tmp_path / "funnel.jsonl"
+    screening = tmp_path / "screening.jsonl"
+    summaries = tmp_path / "summaries.jsonl"
+    _write_jsonl(screening, [])
+    _write_jsonl(summaries, [])
+    _write_jsonl(
+        funnel,
+        [
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "OPERATIONAL_FAILURE",
+                "terminal_reason_code": "GATE_EVALUATION_ERROR",
+                "gate_results": [
+                    {
+                        "gate": "CAPITAL_PORTFOLIO_GATE",
+                        "status": "ERROR",
+                        "reason_code": "GATE_EVALUATION_ERROR",
+                        "metadata": {},
+                    }
+                ],
+            }
+        ],
+    )
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+    assert report["action_gate_error"] == 1
+    assert report["action_gate_reject"] == 0
+    assert report["primary_choke"] == "NONE"
