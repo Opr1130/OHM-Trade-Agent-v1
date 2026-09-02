@@ -427,7 +427,7 @@ def test_recent_funnel_uses_actual_first_terminal_gate_for_choke(tmp_path):
     _write_jsonl(screening, [])
     _write_jsonl(summaries, [])
     rows = []
-    for index in range(3):
+    for _ in range(3):
         rows.append(
             {
                 "decision_at_utc": NOW.isoformat(),
