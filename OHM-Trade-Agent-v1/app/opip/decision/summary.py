@@ -259,21 +259,36 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
 def _first_terminal_gate_from_row(row: Mapping[str, Any]) -> tuple[str | None, str | None]:
     explicit = str(row.get("first_terminal_gate") or "").strip()
     explicit_class = str(row.get("terminal_reason_class") or "").strip()
-    if explicit:
-        return explicit, explicit_class or None
+    if explicit and explicit_class:
+        return explicit, explicit_class
 
     gate_results = row.get("gate_results") or []
     if not isinstance(gate_results, list):
-        return None, explicit_class or None
+        return explicit or None, explicit_class or None
+
+    if explicit:
+        for gate in gate_results:
+            if not isinstance(gate, Mapping):
+                continue
+            if str(gate.get("gate") or "") != explicit:
+                continue
+            if str(gate.get("status") or "") not in {"FAIL", "ERROR"}:
+                continue
+            return (
+                explicit,
+                str(gate.get("reason_class") or "") or None,
+            )
+        return explicit, None
+
     for gate in gate_results:
         if not isinstance(gate, Mapping):
             continue
         if str(gate.get("status") or "") in {"FAIL", "ERROR"}:
             return (
                 str(gate.get("gate") or "") or None,
-                str(gate.get("reason_class") or "") or explicit_class or None,
+                str(gate.get("reason_class") or "") or None,
             )
-    return None, explicit_class or None
+    return None, None
 
 
 def build_recent_qualification_funnel(
