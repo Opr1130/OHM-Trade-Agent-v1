@@ -55,11 +55,26 @@ def test_invalid_direction_is_fail_closed():
 
 
 def test_malformed_confidence_is_fail_closed():
-    for malformed in ("bad", True, False, None):
+    for malformed in (
+        "bad",
+        True,
+        False,
+        None,
+        100.1,
+        -0.1,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+    ):
         assert candidate_alert_authorized(_item(confidence=malformed)) is False
         result = evaluate_recommendation_gate_item(_item(confidence=malformed))
         assert result.status is GateStatus.FAIL
         assert result.reason_code is ReasonCode.AI_CONFIDENCE_INVALID
+
+
+def test_integral_confidence_values_remain_valid_evidence():
+    for confidence in (0, 1, 70, 84, 85, 100, 85.0):
+        assert candidate_alert_authorized(_item(confidence=confidence)) is True
 
 
 def test_low_confidence_gate_pass_is_tagged_as_measurement_evidence():
@@ -260,3 +275,18 @@ def test_action_gate_error_is_not_reported_as_rejection(tmp_path):
     assert report["action_gate_error"] == 1
     assert report["action_gate_reject"] == 0
     assert report["primary_choke"] == "NONE"
+
+
+
+def test_recent_funnel_normalizes_nonpositive_window(tmp_path):
+    empty = tmp_path / "empty-window.jsonl"
+    empty.write_text("", encoding="utf-8")
+    for requested in (0, -5):
+        report = build_recent_qualification_funnel(
+            funnel_events_path=empty,
+            screening_evaluations_path=empty,
+            scan_summaries_path=empty,
+            now=NOW,
+            window_hours=requested,
+        )
+        assert report["window_hours"] == 1
