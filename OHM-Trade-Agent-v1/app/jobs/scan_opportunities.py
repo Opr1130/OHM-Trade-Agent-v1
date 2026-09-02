@@ -120,7 +120,31 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
                         if advanced_direction is not None
                         else "neither directional technical score cleared the threshold"
                     ),
-                    metadata={"universe_count": int(universe_count)},
+                    metadata={
+                        "universe_count": int(universe_count),
+                        "reference_price": (
+                            getattr(snapshot, "ticker_last", None)
+                            or getattr(snapshot, "last_price", None)
+                        ),
+                        "recent_24h_high": getattr(
+                            snapshot, "recent_24h_high", None
+                        ),
+                        "recent_24h_low": getattr(
+                            snapshot, "recent_24h_low", None
+                        ),
+                        "momentum_6h_pct": getattr(
+                            snapshot, "momentum_6h_pct", None
+                        ),
+                        "momentum_24h_pct": getattr(
+                            snapshot, "momentum_24h_pct", None
+                        ),
+                        "momentum_72h_pct": getattr(
+                            snapshot, "momentum_72h_pct", None
+                        ),
+                        "measurement_only": True,
+                        "affects_ranking": False,
+                        "affects_trade_authority": False,
+                    },
                 ).to_dict()
             )
         except Exception as exc:
