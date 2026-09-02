@@ -66,9 +66,11 @@ case "$STAGE" in
     bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" empty
     ;;
   backup)
+    grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA" /etc/opip-data-platform.env
     bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"
     ;;
   restore-drill)
+    grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA" /etc/opip-data-platform.env
     bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"
     ;;
   backfill|shipper|reads-ready)
