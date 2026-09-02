@@ -204,11 +204,6 @@ def _compact_card(signal) -> str:
         extended=signal.extended_move,
     )
     downside = downside_scenario_pct(risk)
-    action = (
-        "REVIEW ENTRY"
-        if str(signal.entry_recommendation).upper() == "BREAKOUT_ENTRY_POSSIBLE"
-        else "WATCH FOR PULLBACK"
-    )
     return (
         f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
         f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
@@ -216,7 +211,8 @@ def _compact_card(signal) -> str:
         f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
         f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
         f"Why now: {_best_signal_reason(signal)}\n"
-        f"Entry: {signal.entry_recommendation} | Action: {action}"
+        f"Entry context: {signal.entry_recommendation}\n"
+        "Action: WATCH ONLY — no entry is authorized"
     )
 
 
@@ -458,6 +454,22 @@ def _watch_telegram_enabled(settings) -> bool:
     )
 
 
+def _early_watch_telegram_enabled(settings) -> bool:
+    """Allow only explicit, advisory Early Watch Telegram under Wave 9.
+
+    This is intentionally independent from the legacy broad-watch transport.
+    OPIP_ACTIONABLE_ONLY_ALERTS may stay enabled while an operator opts into
+    deep-qualified EARLY_MOVER cards. These cards remain WATCH ONLY and never
+    grant entry, paper, or exchange authority.
+    """
+    return bool(
+        bool(getattr(settings, "opip_early_watch_alerts_enabled", False))
+        and settings.telegram_enabled
+        and settings.telegram_bot_token
+        and settings.telegram_chat_id
+    )
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -584,12 +596,18 @@ def main() -> None:
     transition_push_failures = 0
     early_mover_delivery: dict[str, tuple[str, bool]] = {}
     broad_watch_delivery: dict[str, tuple[str, bool]] = {}
-    if _watch_telegram_enabled(settings):
+    early_watch_transport_enabled = _early_watch_telegram_enabled(settings)
+    broad_watch_transport_enabled = _watch_telegram_enabled(settings)
+    if early_watch_transport_enabled or broad_watch_transport_enabled:
         repeat_cooldown = max(
             int(getattr(settings, "price_movement_alert_cooldown_seconds", 21600)),
             21600,
         )
-        eligible_signals = [item for item in signals if item.alert_eligible]
+        eligible_signals = (
+            [item for item in signals if item.alert_eligible]
+            if early_watch_transport_enabled
+            else []
+        )
         deep_alert_symbols = {item.symbol.upper() for item in eligible_signals}
         for signal in eligible_signals[:10]:
             transition_key = _transition_key(signal)
@@ -682,10 +700,14 @@ def main() -> None:
                 release_opportunity_alert_reservation(decision.reservation_token)
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
 
-        broad_feed = _broad_watch_feed(
-            full_market,
-            settings=settings,
-            excluded_symbols=deep_alert_symbols,
+        broad_feed = (
+            _broad_watch_feed(
+                full_market,
+                settings=settings,
+                excluded_symbols=deep_alert_symbols,
+            )
+            if broad_watch_transport_enabled
+            else []
         )
         for symbol, transition_key, message in broad_feed:
             identity = f"FULL_MARKET_WATCH:{symbol}"
