@@ -29,7 +29,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           set -euo pipefail
-          if [[ "$COMMENT_BODY" =~ ^/deploy-analytics[[:space:]]+([0-9a-f]{40})[[:space:]]+(prepare|activate|empty|backup|restore-drill|backfill|shipper|reads-ready)[[:space:]]*$ ]]; then
+          if [[ "$COMMENT_BODY" =~ ^/deploy-analytics[[:space:]]+([0-9a-f]{40})[[:space:]]+(prepare|activate|empty|backup|restore-drill|offhost-verified|rollback-verified|backfill|shipper|reads-ready)[[:space:]]*$ ]]; then
             TARGET_SHA="${BASH_REMATCH[1]}"
             STAGE="${BASH_REMATCH[2]}"
           else
