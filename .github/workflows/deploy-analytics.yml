@@ -1,0 +1,216 @@
+name: deploy-analytics
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: opip-analytics
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      startsWith(github.event.comment.body, '/deploy-analytics ')
+    runs-on: ubuntu-latest
+    environment: analytics-production
+    steps:
+      - name: Resolve exact stage and main SHA
+        id: target
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [[ "$COMMENT_BODY" =~ ^/deploy-analytics[[:space:]]+([0-9a-f]{40})[[:space:]]+(prepare|activate|empty|backup|restore-drill|backfill|shipper|reads-ready)[[:space:]]*$ ]]; then
+            TARGET_SHA="${BASH_REMATCH[1]}"
+            STAGE="${BASH_REMATCH[2]}"
+          else
+            echo "Refusing analytics deployment: command format is invalid." >&2
+            exit 64
+          fi
+          echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Require target to equal current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TARGET_SHA" = "$MAIN_SHA" || {
+            echo "Refusing analytics deployment: target is not current main." >&2
+            exit 65
+          }
+
+      - name: Require successful exact-SHA CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          test "$RESULT" = $'completed\tsuccess' || {
+            echo "Refusing analytics deployment: pytest.yml is not successful for the exact SHA." >&2
+            exit 1
+          }
+
+      - name: Check out exact approved release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      - name: Validate analytics connection secrets
+        env:
+          HOST: ${{ secrets.OPIP_ANALYTICS_HOST }}
+          USER: ${{ secrets.OPIP_ANALYTICS_USER }}
+          SSH_KEY_B64: ${{ secrets.OPIP_ANALYTICS_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_ANALYTICS_KNOWN_HOSTS }}
+          ANALYTICS_ENV_B64: ${{ secrets.OPIP_ANALYTICS_ENV_B64 }}
+          STAGE: ${{ steps.target.outputs.stage }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$USER"
+          test -n "$SSH_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+          if [[ "$STAGE" == "empty" ]]; then
+            test -n "$ANALYTICS_ENV_B64"
+          fi
+
+      - name: Configure pinned SSH identity
+        env:
+          SSH_KEY_B64: ${{ secrets.OPIP_ANALYTICS_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_ANALYTICS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/opip_analytics
+          chmod 600 ~/.ssh/opip_analytics
+          ssh-keygen -y -f ~/.ssh/opip_analytics >/dev/null
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload exact release and optional sealed environment
+        env:
+          HOST: ${{ secrets.OPIP_ANALYTICS_HOST }}
+          USER: ${{ secrets.OPIP_ANALYTICS_USER }}
+          PORT: ${{ secrets.OPIP_ANALYTICS_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          STAGE: ${{ steps.target.outputs.stage }}
+          ANALYTICS_ENV_B64: ${{ secrets.OPIP_ANALYTICS_ENV_B64 }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_analytics -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          REMOTE="$USER@$HOST"
+          RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
+          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
+          git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
+          if [[ "$STAGE" == "empty" ]]; then
+            printf '%s' "$ANALYTICS_ENV_B64" | base64 --decode > analytics.env
+            chmod 600 analytics.env
+            scp -i ~/.ssh/opip_analytics -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -P "$PORT" analytics.env "$REMOTE:/tmp/opip-analytics-env-$GITHUB_RUN_ID"
+            rm -f analytics.env
+          fi
+
+      - name: Run exactly one gated analytics stage
+        id: analytics_deploy
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_ANALYTICS_HOST }}
+          USER: ${{ secrets.OPIP_ANALYTICS_USER }}
+          PORT: ${{ secrets.OPIP_ANALYTICS_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          STAGE: ${{ steps.target.outputs.stage }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
+          ENV_UPLOAD=""
+          if [[ "$STAGE" == "empty" ]]; then
+            ENV_UPLOAD="/tmp/opip-analytics-env-$GITHUB_RUN_ID"
+          fi
+          ssh \
+            -i ~/.ssh/opip_analytics \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/analytics/run-gated-stage.sh' '$TARGET_SHA' '$STAGE' '$RELEASE_DIR' '$ENV_UPLOAD'" \
+            2>&1 | tee analytics-deploy.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q "O'Pip analytics stage succeeded" analytics-deploy.log; then
+            echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Clean remote release and sealed environment
+        if: always() && steps.target.outputs.sha != ''
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_ANALYTICS_HOST }}
+          USER: ${{ secrets.OPIP_ANALYTICS_USER }}
+          PORT: ${{ secrets.OPIP_ANALYTICS_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_analytics \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n rm -rf -- '$RELEASE_DIR'; sudo -n rm -f -- '/tmp/opip-analytics-env-$GITHUB_RUN_ID'"
+
+      - name: Publish analytics deployment receipt
+        if: always() && steps.target.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          STAGE: ${{ steps.target.outputs.stage }}
+          RESULT: ${{ steps.analytics_deploy.outputs.result }}
+          REMOTE_RC: ${{ steps.analytics_deploy.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          BODY=$(cat <<EOF
+          ## O'Pip Analytics Deployment Receipt
+          - **Result:** ${RESULT:-FAILED BEFORE REMOTE STAGE}
+          - **SHA:** \`$TARGET_SHA\`
+          - **Stage:** \`$STAGE\`
+          - **Remote exit code:** ${REMOTE_RC:-N/A}
+          - **Workflow run:** $RUN_URL
+
+          Production remains file-WAL authoritative; this workflow does not merge, trade, or enable production reads.
+          EOF
+          )
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
+
+      - name: Fail unless the requested stage succeeded
+        if: always() && steps.analytics_deploy.outputs.result != 'SUCCESS'
+        run: exit 1
