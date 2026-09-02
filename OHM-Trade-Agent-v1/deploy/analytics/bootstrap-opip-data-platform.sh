@@ -10,6 +10,9 @@ COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
 ENV_FILE="/etc/opip-data-platform.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
+OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
+RESTORE_EVIDENCE="$STATE_ROOT/last-restore-drill.env"
+ROLLBACK_EVIDENCE="$STATE_ROOT/empty-rollback.env"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "usage: $0 <40-char-main-sha> <empty|backfill|shipper|reads-ready>" >&2
@@ -138,11 +141,20 @@ require_stage() {
 }
 
 validate_promotion_evidence() {
-  local latest_backup restore_state_epoch
-  : "${OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC:?verify off-host backup before promotion}"
-  : "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before promotion}"
-  backup_epoch="$(date -u -d "$OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
-  restore_epoch="$(date -u -d "$OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
+  local latest_backup latest_backup_epoch offhost_at restore_at restore_backup
+  [[ -r "$OFFHOST_EVIDENCE" ]] || {
+    echo "independent off-host backup attestation is required before promotion" >&2
+    exit 70
+  }
+  [[ -r "$RESTORE_EVIDENCE" ]] || {
+    echo "local restore-drill evidence is required before promotion" >&2
+    exit 70
+  }
+  offhost_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$OFFHOST_EVIDENCE")"
+  restore_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$RESTORE_EVIDENCE")"
+  restore_backup="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$RESTORE_EVIDENCE")"
+  backup_epoch="$(date -u -d "$offhost_at" +%s 2>/dev/null || true)"
+  restore_epoch="$(date -u -d "$restore_at" +%s 2>/dev/null || true)"
   if [[ ! "$backup_epoch" =~ ^[0-9]+$ ]] \
     || (( backup_epoch > now_epoch || now_epoch - backup_epoch > 8 * 86400 )); then
     echo "off-host backup verification is invalid, future-dated, or older than eight days" >&2
@@ -164,16 +176,13 @@ validate_promotion_evidence() {
     echo "latest PostgreSQL dump checksum verification failed" >&2
     exit 70
   }
-  [[ -r "$STATE_ROOT/last-restore-drill.env" ]] || {
-    echo "local restore-drill evidence is required before promotion" >&2
+  latest_backup_epoch="$(stat -c '%Y' "$latest_backup")"
+  if (( backup_epoch < latest_backup_epoch )); then
+    echo "off-host backup attestation predates the latest local PostgreSQL dump" >&2
     exit 70
-  }
-  restore_state_epoch="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' \
-    "$STATE_ROOT/last-restore-drill.env")"
-  restore_state_epoch="$(date -u -d "$restore_state_epoch" +%s 2>/dev/null || true)"
-  if [[ ! "$restore_state_epoch" =~ ^[0-9]+$ ]] \
-    || (( restore_state_epoch > now_epoch || restore_state_epoch < restore_epoch )); then
-    echo "local restore-drill evidence is invalid, future-dated, or older than recorded evidence" >&2
+  fi
+  if [[ "$restore_backup" != "$(basename "$latest_backup")" ]]; then
+    echo "restore drill must validate the latest local PostgreSQL dump" >&2
     exit 70
   fi
 }
@@ -198,6 +207,7 @@ if [[ "$STAGE" == "empty" ]]; then
   fi
   write_state EMPTY_DEPLOY_COUNT "$((EMPTY_DEPLOY_COUNT + 1))"
   write_state EMPTY_LAST_SHA "$TARGET_SHA"
+  write_state EMPTY_LAST_COMPLETED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 elif [[ "$STAGE" == "backfill" ]]; then
   require_stage EMPTY_STARTED_AT_UTC "empty PostgreSQL stage"
   # shellcheck disable=SC1090
@@ -206,17 +216,24 @@ elif [[ "$STAGE" == "backfill" ]]; then
     echo "empty PostgreSQL stage requires two successful deploys before backfill" >&2
     exit 69
   fi
-  : "${OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC:?record the empty-stage rollback verification before backfill}"
-  : "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before validating rollback evidence}"
-  restore_epoch="${restore_epoch:-$(date -u -d "$OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" +%s 2>/dev/null || true)}"
-  if [[ ! "$restore_epoch" =~ ^[0-9]+$ ]] || (( restore_epoch > now_epoch )); then
-    echo "restore drill evidence is invalid or future-dated" >&2
+  [[ -r "$ROLLBACK_EVIDENCE" ]] || {
+    echo "explicit empty-stage rollback evidence is required before backfill" >&2
     exit 69
-  fi
-  rollback_epoch="$(date -u -d "$OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" +%s 2>/dev/null || true)"
+  }
+  rollback_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
+  rollback_restore_at="$(awk -F= '$1 == "restore_verified_at_utc" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
+  rollback_count="$(awk -F= '$1 == "empty_deploy_count" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
+  rollback_sha="$(awk -F= '$1 == "sha" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
+  rollback_epoch="$(date -u -d "$rollback_at" +%s 2>/dev/null || true)"
   if [[ ! "$rollback_epoch" =~ ^[0-9]+$ ]] \
     || (( rollback_epoch > now_epoch || rollback_epoch < restore_epoch )); then
     echo "empty-stage rollback evidence must not be future-dated and must be newer than the restore drill" >&2
+    exit 69
+  fi
+  if [[ "$rollback_restore_at" != "$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$RESTORE_EVIDENCE")" ]] \
+    || [[ ! "$rollback_count" =~ ^[0-9]+$ ]] || (( rollback_count < 2 )) \
+    || [[ "$rollback_sha" != "$TARGET_SHA" ]]; then
+    echo "empty-stage rollback evidence does not match the verified rollout state" >&2
     exit 69
   fi
   admin_run python -m app.opip.data_platform.backfill
