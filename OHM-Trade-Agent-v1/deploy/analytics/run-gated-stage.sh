@@ -42,13 +42,20 @@ case "$STAGE" in
       opip-learning-sync.timer \
       opip-learning-capture.timer \
       opip-learning-outcomes.timer; do
-      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      if systemctl cat "$unit" >/dev/null 2>&1; then
+        systemctl disable --now "$unit"
+        ! systemctl is-active --quiet "$unit"
+        ! systemctl is-enabled --quiet "$unit"
+      fi
     done
     for unit in \
       opip-learning-sync.service \
       opip-learning-capture.service \
       opip-learning-outcomes.service; do
-      systemctl stop "$unit" >/dev/null 2>&1 || true
+      if systemctl cat "$unit" >/dev/null 2>&1; then
+        systemctl stop "$unit"
+        ! systemctl is-active --quiet "$unit"
+      fi
     done
     bash "$APP_ROOT/deploy/learning/bootstrap-opip-learning-worker.sh" \
       "$TARGET_SHA" 10.116.0.2 opiplearn
