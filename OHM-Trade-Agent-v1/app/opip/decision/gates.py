@@ -325,10 +325,14 @@ def evaluate_recommendation_gate_item(
     decision = str(item.get("decision") or "").lower()
     risk_level = str(item.get("risk_level") or "").lower()
     direction = str(item.get("direction") or "LONG").upper()
-    try:
-        confidence = int(item.get("confidence"))
-    except (TypeError, ValueError):
+    raw_confidence = item.get("confidence")
+    if isinstance(raw_confidence, bool):
         confidence = None
+    else:
+        try:
+            confidence = int(raw_confidence)
+        except (TypeError, ValueError):
+            confidence = None
 
     metadata = {
         "ai_decision": decision,
