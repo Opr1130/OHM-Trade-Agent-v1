@@ -5,7 +5,7 @@ from typing import Any, Iterable
 from app.services.recommendation_gate import (
     ALLOWED_DIRECTIONS,
     ALLOWED_RISK_LEVELS,
-    MIN_CONFIDENCE,
+    candidate_alert_authorized,
 )
 from app.services.shadow_decision_capture import capture_snapshot_decision
 
@@ -50,30 +50,12 @@ def _market_intelligence_with_ai_route(
 
 
 def _qualified_ai_alert(candidate: dict[str, Any]) -> bool:
-    decision = str(candidate.get("decision") or "").lower()
-    risk_level = str(candidate.get("risk_level") or "").lower()
-    direction = str(candidate.get("direction") or "LONG").upper()
-    try:
-        confidence = int(candidate.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0
-    return (
-        decision == "alert"
-        and confidence >= MIN_CONFIDENCE
-        and risk_level in ALLOWED_RISK_LEVELS
-        and direction in ALLOWED_DIRECTIONS
-    )
-
+    return candidate_alert_authorized(candidate)
 
 def _non_alert_label(candidate: dict[str, Any]) -> str:
     decision = str(candidate.get("decision") or "").lower()
     risk_level = str(candidate.get("risk_level") or "").lower()
     direction = str(candidate.get("direction") or "LONG").upper()
-    try:
-        confidence = int(candidate.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0
-
     if decision == "watch":
         return "AI_WATCH"
     if decision == "reject":
@@ -82,8 +64,6 @@ def _non_alert_label(candidate: dict[str, Any]) -> str:
         return "AI_DIRECTION_REJECT"
     if decision == "alert" and risk_level not in ALLOWED_RISK_LEVELS:
         return "AI_RISK_REJECT"
-    if decision == "alert" and confidence < MIN_CONFIDENCE:
-        return "AI_CONFIDENCE_REJECT"
     return "AI_REJECT"
 
 
