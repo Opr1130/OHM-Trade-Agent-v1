@@ -249,6 +249,7 @@ def test_dashboard_accountability_rollup_reports_capture_and_latency():
                 "ranking_or_cap_miss_candidates": 1,
                 "operational_executable_misses": 0,
                 "estimated_missed_move_pct_sum": 5.2,
+                "decision_latency_samples": 3,
                 "mean_decision_latency_ms": 420.0,
             }
         ],
@@ -288,6 +289,9 @@ def test_incremental_join_reads_compressed_archived_screening_and_funnel(tmp_pat
     funnel_archive = tmp_path / "funnel_archive"
     screening_archive.mkdir()
     funnel_archive.mkdir()
+    (screening_archive / "screening-0-corrupt.jsonl.gz").write_bytes(
+        b"\x1f\x8b\x08\x00truncated"
+    )
     with gzip.open(
         screening_archive / "screening-1.jsonl.gz",
         "wt",
@@ -334,3 +338,98 @@ def test_incremental_join_reads_compressed_archived_screening_and_funnel(tmp_pat
     long_row = next(row for row in persisted if row["direction"] == "LONG")
     assert long_row["range_consumed_proxy_pct"] == 50.0
     assert long_row["affects_trade_authority"] is False
+
+
+def test_late_paper_outcome_revises_after_forward_queue_is_complete(tmp_path):
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+    events = tmp_path / "events.jsonl"
+    summary_path = tmp_path / "summary.json"
+
+    qualified = _rows(
+        [_screening()],
+        [
+            _funnel(
+                decision="QUALIFIED",
+                terminal_gate="FINAL_QUALIFICATION",
+                signal_id="SIG:LATE",
+            )
+        ],
+    )
+    append_accountability_rows(
+        qualified,
+        path=ledger,
+        state_path=state,
+    )
+
+    events.write_text(
+        json.dumps(
+            {
+                "event_type": "PAPER_OUTCOME",
+                "signal_id": "SIG:LATE",
+                "observed_at": (NOW + timedelta(hours=72)).isoformat(),
+                "payload": {
+                    "net_pnl": 21.5,
+                    "close_profit_ratio": 0.06,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = build_incremental_from_outcomes(
+        [],
+        intelligence_event_path=events,
+        ledger_path=ledger,
+        summary_path=summary_path,
+        state_path=state,
+    )
+
+    assert summary["paper"]["outcomes"] == 1
+    assert summary["paper"]["wins"] == 1
+    assert summary["paper"]["net_pnl"] == 21.5
+    rows = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    long_rows = [
+        row for row in rows
+        if row.get("direction") == "LONG"
+        and row.get("signal_id") == "SIG:LATE"
+    ]
+    assert len(long_rows) == 2
+    assert long_rows[-1]["revision"] == 2
+    assert long_rows[-1]["paper_outcome"]["payload"]["net_pnl"] == 21.5
+
+
+def test_nonfinite_paper_evidence_skips_only_the_offending_direction():
+    rows = build_accountability_rows(
+        screening_rows=[_screening()],
+        funnel_rows=[
+            _funnel(
+                decision="QUALIFIED",
+                terminal_gate="FINAL_QUALIFICATION",
+                signal_id="SIG:NAN",
+            )
+        ],
+        snapshot_rows=[_snapshot()],
+        outcome_rows=[_outcome()],
+        intelligence_events=[
+            {
+                "event_type": "PAPER_OUTCOME",
+                "signal_id": "SIG:NAN",
+                "observed_at": (NOW + timedelta(hours=1)).isoformat(),
+                "payload": {"net_pnl": float("nan")},
+            }
+        ],
+        policy=AccountabilityPolicy(
+            production_threshold=80,
+            shadow_threshold=70,
+            winner_move_pct=2,
+        ),
+    )
+
+    assert [row["direction"] for row in rows] == ["SHORT"]
+    assert rows[0]["measurement_only"] is True
