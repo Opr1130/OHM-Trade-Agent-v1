@@ -39,7 +39,7 @@ from app.services.chief_analyst import (
     SHORT_VALIDATION_LEVERAGE,
 )
 from app.services.economic_quality_gate import evaluate_economic_quality
-from app.services.recommendation_gate import candidate_alert_authorized
+from app.services.recommendation_gate import candidate_alert_authorized, parse_confidence
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
 
@@ -325,14 +325,7 @@ def evaluate_recommendation_gate_item(
     decision = str(item.get("decision") or "").lower()
     risk_level = str(item.get("risk_level") or "").lower()
     direction = str(item.get("direction") or "LONG").upper()
-    raw_confidence = item.get("confidence")
-    if isinstance(raw_confidence, bool):
-        confidence = None
-    else:
-        try:
-            confidence = int(raw_confidence)
-        except (TypeError, ValueError):
-            confidence = None
+    confidence = parse_confidence(item)
 
     metadata = {
         "ai_decision": decision,
