@@ -211,7 +211,7 @@ def _compact_card(signal) -> str:
         f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
         f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
         f"Why now: {_best_signal_reason(signal)}\n"
-        f"Entry context: {signal.entry_recommendation}\n"
+        f"Entry: {signal.entry_recommendation}\n"
         "Action: WATCH ONLY — no entry is authorized"
     )
 
