@@ -55,6 +55,7 @@ def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
         "intelligence_daily": [],
         "attrition_daily": [],
         "rejection_mix_daily": [],
+        "opportunity_accountability_daily": [],
         "stream_health": [],
     }
 
@@ -134,6 +135,47 @@ def read_historical_snapshot(
                         for row in cursor.fetchall()
                     ]
                     cursor.execute(
+                        "SELECT to_regclass('learning.opportunity_accountability_daily_mv')"
+                    )
+                    accountability_available = cursor.fetchone()[0] is not None
+                    accountability = []
+                    if accountability_available:
+                        cursor.execute(
+                            """
+                            SELECT day, directional_evaluations,
+                                   completed_forward_outcomes,
+                                   market_winner_candidates, captured_winners,
+                                   executable_false_negatives,
+                                   threshold_70_79_miss_candidates,
+                                   ranking_or_cap_miss_candidates,
+                                   operational_executable_misses,
+                                   estimated_missed_move_pct_sum,
+                                   mean_decision_latency_ms
+                            FROM learning.opportunity_accountability_daily_mv
+                            ORDER BY day DESC LIMIT 60
+                            """
+                        )
+                        accountability = [
+                            {
+                                "date": (_iso(row[0]) or "")[:10],
+                                "directional_evaluations": int(row[1]),
+                                "completed_forward_outcomes": int(row[2]),
+                                "market_winner_candidates": int(row[3]),
+                                "captured_winners": int(row[4]),
+                                "executable_false_negatives": int(row[5]),
+                                "threshold_70_79_miss_candidates": int(row[6]),
+                                "ranking_or_cap_miss_candidates": int(row[7]),
+                                "operational_executable_misses": int(row[8]),
+                                "estimated_missed_move_pct_sum": (
+                                    float(row[9]) if row[9] is not None else 0.0
+                                ),
+                                "mean_decision_latency_ms": (
+                                    float(row[10]) if row[10] is not None else None
+                                ),
+                            }
+                            for row in cursor.fetchall()
+                        ]
+                    cursor.execute(
                         """
                         SELECT stream_name, source_file, byte_offset,
                                rows_ingested, source_size, updated_at,
@@ -168,6 +210,7 @@ def read_historical_snapshot(
             "intelligence_daily": list(reversed(intelligence)),
             "attrition_daily": attrition,
             "rejection_mix_daily": rejection_mix,
+            "opportunity_accountability_daily": list(reversed(accountability)),
             "stream_health": health,
         }
     except Exception as exc:
