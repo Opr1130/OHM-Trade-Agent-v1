@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import math
@@ -981,14 +982,18 @@ def _iter_jsonl_sources(
     sources: list[Path] = []
     if archive_dir is not None and archive_dir.exists():
         sources.extend(
-            item for item in sorted(archive_dir.rglob("*.jsonl")) if item.is_file()
+            item
+            for pattern in ("*.jsonl", "*.jsonl.gz")
+            for item in sorted(archive_dir.rglob(pattern))
+            if item.is_file()
         )
     sources.append(path)
     for source in sources:
         if not source.exists():
             continue
         try:
-            with source.open("r", encoding="utf-8", errors="replace") as handle:
+            opener = gzip.open if source.suffix == ".gz" else source.open
+            with opener(source, "rt", encoding="utf-8", errors="replace") if source.suffix == ".gz" else opener("r", encoding="utf-8", errors="replace") as handle:
                 for raw in handle:
                     text = raw.strip()
                     if not text:
