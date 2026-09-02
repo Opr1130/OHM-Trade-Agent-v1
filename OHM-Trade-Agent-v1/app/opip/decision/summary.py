@@ -301,6 +301,38 @@ def build_recent_qualification_funnel(
 
     counts = Counter()
     rejections = Counter()
+    # Emit a stable zero-valued schema even when a stage has no observations.
+    # This keeps diagnostics machine-readable and avoids absence being confused
+    # with "not instrumented" or an aggregation error.
+    for key in (
+        "market_observed",
+        "scanner_selected",
+        "deterministic_prefilter_pass",
+        "deterministic_prefilter_reject",
+        "chief_eligible",
+        "chief_invoked",
+        "chief_succeeded",
+        "chief_failed",
+        "chief_budget_blocked",
+        "chief_cache_reused",
+        "chief_alert",
+        "chief_watch",
+        "chief_reject",
+        "confidence_ge_85",
+        "confidence_80_84",
+        "confidence_70_79",
+        "confidence_lt_70",
+        "target_pass",
+        "target_reject",
+        "economic_pass",
+        "economic_reject",
+        "action_gate_pass",
+        "action_gate_reject",
+        "action_gate_error",
+        "qualified_signals",
+        "paper_admission_eligible",
+    ):
+        counts[key] = 0
 
     counts["market_observed"] = len(screenings)
     counts["scanner_selected"] = sum(
