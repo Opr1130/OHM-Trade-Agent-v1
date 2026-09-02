@@ -21,7 +21,8 @@ import math
 import os
 from pathlib import Path
 import sqlite3
-from statistics import mean, median
+from statistics
+import zlib import mean, median
 from typing import Any, Iterable, Mapping
 
 
@@ -507,7 +508,10 @@ def build_accountability_rows(
                 "affects_alert_authority": False,
                 "affects_trade_authority": False,
             }
-            json.dumps(row, sort_keys=True, allow_nan=False)
+            try:
+                json.dumps(row, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError):
+                continue
             result.append(row)
 
     return sorted(
@@ -1071,7 +1075,7 @@ def _iter_jsonl_sources(
                         continue
                     if isinstance(row, dict):
                         yield row
-        except OSError:
+        except (OSError, EOFError, zlib.error):
             continue
 
 
