@@ -610,3 +610,35 @@ def test_nearest_miss_quotes_the_binding_metric_not_a_passing_one(
     assert terminal["metadata"]["binding_metric"] == "ECONOMIC_TARGET_2_MOVE_PCT"
     assert terminal["threshold"] == 4.0
     assert terminal["measured_value"] < 4.0
+
+
+
+def test_recovered_long_restores_tradingview_evidence(monkeypatch):
+    from app.services import tradingview_inbox
+
+    recovered = _snapshot("RECOVERUSD")
+    recovered.trade_direction = "LONG"
+    calls = []
+
+    def _attach(candidates):
+        calls.append([candidate.symbol for candidate in candidates])
+        candidates[0]._tradingview_evidence = {
+            "source_classification": "TRADINGVIEW_CONFIRMED_NATIVE",
+            "signal_id": "tv-recovered-1",
+        }
+        return 1
+
+    monkeypatch.setattr(
+        tradingview_inbox,
+        "merge_native_candidate_evidence",
+        _attach,
+    )
+
+    attached = scan_opportunities._merge_recovered_tradingview_evidence(
+        [recovered],
+        enabled=True,
+    )
+
+    assert attached == 1
+    assert calls == [["RECOVERUSD"]]
+    assert recovered._tradingview_evidence["signal_id"] == "tv-recovered-1"
