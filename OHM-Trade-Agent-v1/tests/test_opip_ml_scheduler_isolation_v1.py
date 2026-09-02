@@ -91,6 +91,9 @@ def test_production_export_is_copy_only_and_locked():
     assert "flock -x 8" in source
     assert "sha256sum" in source
     assert "schema_version=3" in source
+    assert source.count('install -d -o root -g "$READER_GROUP" -m 0750') >= 2
+    assert source.count("install -d -o root -g root -m 0700") >= 2
+    assert 'install -d -o root -g root -m 0750 "$(dirname "$temp")"' not in source
     assert "mv -f" in source
     assert "python" not in source
     assert "docker" not in source
