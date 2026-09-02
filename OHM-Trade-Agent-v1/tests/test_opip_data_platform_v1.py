@@ -215,6 +215,48 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     assert connection.autocommit is False
 
 
+def test_materialized_view_refresh_skips_unapplied_optional_view():
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            self.connection.events.append(
+                ("execute", self.connection.autocommit, repr(query), params)
+            )
+            self.connection.last_params = params
+
+        def fetchone(self):
+            relation = (self.connection.last_params or ("",))[0]
+            if relation == "learning.opportunity_accountability_daily_mv":
+                return None
+            return (True,)
+
+    class Connection:
+        def __init__(self):
+            self.autocommit = False
+            self.events = []
+            self.last_params = None
+
+        def cursor(self):
+            return Cursor(self)
+
+        def commit(self):
+            self.events.append(("commit", self.autocommit, "", None))
+
+    connection = Connection()
+    refresh_materialized_views(connection)
+    refreshes = [event for event in connection.events if "REFRESH" in event[2]]
+    assert len(refreshes) == 3
+    assert all("opportunity_accountability_daily_mv" not in event[2] for event in refreshes)
+
+
 def test_optional_streams_do_not_block_required_readiness():
     required = [item.name for item in STREAM_SPECS if item.required]
     rows = [
