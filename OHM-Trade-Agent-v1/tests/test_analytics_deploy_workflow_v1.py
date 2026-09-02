@@ -24,6 +24,7 @@ def test_remote_runner_keeps_existing_platform_evidence_gates():
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"' in runner
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"' in runner
     assert runner.index("prepare)") < runner.index("activate)")
+    assert 'grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA" /etc/opip-learning.env' in runner
     assert 'bootstrap-opip-data-platform.sh\" \"$TARGET_SHA\" \"$STAGE\"' in runner
     assert "7 * 86400" in bootstrap
     assert "health --require-ready" in bootstrap
