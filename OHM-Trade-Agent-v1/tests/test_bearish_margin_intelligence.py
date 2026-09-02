@@ -6,6 +6,7 @@ from app.exchanges.kraken import BookLevel, PreTradeBook, KrakenAPIError
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.execution_validation import evaluate_execution
 from app.scanner.margin_eligibility import (
+    bound_recovered_longs,
     validate_short_margin_eligibility,
     keep_margin_tradeable_candidates,
     recover_margin_rejected_long,
@@ -292,3 +293,36 @@ def test_margin_eligible_short_never_falls_back_to_long():
         margin_eligible=True,
     )
     assert recover_margin_rejected_long(preferred) is None
+
+
+
+def test_recovered_longs_respect_directional_cap():
+    current = [
+        snapshot(
+            symbol=f"LONG{i}USD",
+            underlying_asset=f"LONG{i}",
+            trade_direction="LONG",
+            technical_score=90 - i,
+        )
+        for i in range(3)
+    ]
+    recovered = [
+        snapshot(
+            symbol=f"RECOVER{i}USD",
+            underlying_asset=f"RECOVER{i}",
+            trade_direction="LONG",
+            technical_score=88 - i,
+        )
+        for i in range(5)
+    ]
+
+    admitted = bound_recovered_longs(
+        current,
+        recovered,
+        max_per_direction=5,
+    )
+
+    assert len(admitted) == 2
+    combined = current + admitted
+    assert sum(item.trade_direction == "LONG" for item in combined) == 5
+    assert [item.symbol for item in admitted] == ["RECOVER0USD", "RECOVER1USD"]
