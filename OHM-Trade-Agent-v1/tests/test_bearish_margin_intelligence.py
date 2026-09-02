@@ -326,3 +326,41 @@ def test_recovered_longs_respect_directional_cap():
     combined = current + admitted
     assert sum(item.trade_direction == "LONG" for item in combined) == 5
     assert [item.symbol for item in admitted] == ["RECOVER0USD", "RECOVER1USD"]
+
+
+
+def test_recovered_long_capacity_prefers_highest_long_score():
+    current = [
+        snapshot(
+            symbol=f"BASE{i}USD",
+            underlying_asset=f"BASE{i}",
+            trade_direction="LONG",
+            technical_score=95 - i,
+        )
+        for i in range(4)
+    ]
+    # Preserve an intentionally inverse input order to model rejected SHORT
+    # ordering differing from the recovered LONG ordering.
+    recovered = [
+        snapshot(
+            symbol="LOWLONGUSD",
+            underlying_asset="LOWLONG",
+            trade_direction="LONG",
+            technical_score=81,
+        ),
+        snapshot(
+            symbol="HIGHLONGUSD",
+            underlying_asset="HIGHLONG",
+            trade_direction="LONG",
+            technical_score=89,
+        ),
+    ]
+
+    admitted = bound_recovered_longs(
+        current,
+        recovered,
+        max_per_direction=5,
+    )
+
+    assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
+    assert admitted[0].technical_score == 89
