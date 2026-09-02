@@ -296,6 +296,10 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "analytics host must be resized to at least 2 GiB" in bootstrap
     assert "opip-learning-plane.lock" in bootstrap
     assert "remote_main" in bootstrap and "TARGET_SHA" in bootstrap
+    assert 'if [[ -r "$STATE_ROOT/postgres/PG_VERSION" ]]; then' in bootstrap
+    assert 'stat -c \'%u:%g\' "$STATE_ROOT/postgres/PG_VERSION"' in bootstrap
+    assert 'chown "$pgdata_owner" "$STATE_ROOT/postgres"' in bootstrap
+    assert '"$STATE_ROOT/postgres" \\\n  "$STATE_ROOT/config"' not in bootstrap
     assert bootstrap.index("wait_for_postgres\n") < bootstrap.index(
         "validate_promotion_evidence\n"
     )
