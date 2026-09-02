@@ -10,8 +10,11 @@ ALLOWED_DIRECTIONS = {"LONG", "SHORT"}
 
 
 def _parsed_confidence(candidate: dict[str, Any]) -> int | None:
+    raw = candidate.get("confidence")
+    if isinstance(raw, bool):
+        return None
     try:
-        value = int(candidate.get("confidence"))
+        value = int(raw)
     except (TypeError, ValueError):
         return None
     if value < 0 or value > 100:
