@@ -205,6 +205,10 @@ if docker inspect ohm-trade-agent >/dev/null 2>&1 \
     echo "diagnostic=UNAVAILABLE"
     degrade
   fi
+else
+  echo "OPIP_QUALIFICATION_FUNNEL"
+  echo "diagnostic=UNAVAILABLE"
+  degrade
 fi
 
 echo "diagnostics_status=$status"
