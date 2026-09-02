@@ -370,7 +370,7 @@ def _opportunity_accountability_snapshot(
             totals[key] += int(row.get(key) or 0)
         missed_move += float(row.get("estimated_missed_move_pct_sum") or 0.0)
         latency = _number(row.get("mean_decision_latency_ms"))
-        samples = int(row.get("directional_evaluations") or 0)
+        samples = int(row.get("decision_latency_samples") or 0)
         if latency is not None and samples > 0:
             weighted_latency += latency * samples
             latency_weight += samples
