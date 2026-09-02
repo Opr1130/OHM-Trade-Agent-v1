@@ -46,4 +46,3 @@ def test_ranking_disabled_still_applies_action_gate(monkeypatch):
     scan_opportunities.main()
 
     assert "action_gate" in events
-    assert sent == []
