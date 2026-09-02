@@ -141,7 +141,7 @@ require_stage() {
 }
 
 validate_promotion_evidence() {
-  local latest_backup latest_backup_epoch offhost_at restore_at restore_backup
+  local attested_backup_name attested_backup offhost_at restore_at restore_backup
   [[ -r "$OFFHOST_EVIDENCE" ]] || {
     echo "independent off-host backup attestation is required before promotion" >&2
     exit 70
@@ -151,6 +151,7 @@ validate_promotion_evidence() {
     exit 70
   }
   offhost_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$OFFHOST_EVIDENCE")"
+  attested_backup_name="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$OFFHOST_EVIDENCE")"
   restore_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$RESTORE_EVIDENCE")"
   restore_backup="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$RESTORE_EVIDENCE")"
   backup_epoch="$(date -u -d "$offhost_at" +%s 2>/dev/null || true)"
@@ -165,24 +166,25 @@ validate_promotion_evidence() {
     echo "restore drill verification is invalid, future-dated, or older than 90 days" >&2
     exit 70
   fi
-  latest_backup="$(find /var/backups/opip-postgres -maxdepth 1 -type f \
-    -name 'opip-postgres-*.dump' -printf '%T@ %p\n' \
-    | sort -nr | awk 'NR == 1 {sub(/^[^ ]+ /, ""); print}')"
-  [[ -n "$latest_backup" && -r "$latest_backup" && -r "$latest_backup.sha256" ]] || {
-    echo "a checksummed PostgreSQL dump is required before promotion" >&2
-    exit 70
-  }
-  sha256sum --check --status "$latest_backup.sha256" || {
-    echo "latest PostgreSQL dump checksum verification failed" >&2
-    exit 70
-  }
-  latest_backup_epoch="$(stat -c '%Y' "$latest_backup")"
-  if (( backup_epoch < latest_backup_epoch )); then
-    echo "off-host backup attestation predates the latest local PostgreSQL dump" >&2
+  if [[ ! "$attested_backup_name" =~ ^opip-postgres-[0-9]{8}T[0-9]{6}Z\.dump$ ]]; then
+    echo "off-host backup attestation references an invalid local dump name" >&2
     exit 70
   fi
-  if [[ "$restore_backup" != "$(basename "$latest_backup")" ]]; then
-    echo "restore drill must validate the latest local PostgreSQL dump" >&2
+  attested_backup="/var/backups/opip-postgres/$attested_backup_name"
+  [[ -r "$attested_backup" && -r "$attested_backup.sha256" ]] || {
+    echo "the attested PostgreSQL dump and checksum are required before promotion" >&2
+    exit 70
+  }
+  sha256sum --check --status "$attested_backup.sha256" || {
+    echo "attested PostgreSQL dump checksum verification failed" >&2
+    exit 70
+  }
+  if (( backup_epoch < $(stat -c '%Y' "$attested_backup") )); then
+    echo "off-host backup attestation predates the attested local PostgreSQL dump" >&2
+    exit 70
+  fi
+  if [[ "$restore_backup" != "$attested_backup_name" ]]; then
+    echo "restore drill must validate the attested PostgreSQL dump" >&2
     exit 70
   fi
 }
