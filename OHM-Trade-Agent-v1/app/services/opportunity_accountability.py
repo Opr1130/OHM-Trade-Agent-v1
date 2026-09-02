@@ -558,10 +558,19 @@ def _open_state(path: Path) -> sqlite3.Connection:
             estimated_missed_move REAL,
             decision_latency_ms REAL,
             paper_net_pnl REAL,
+            range_consumed_proxy REAL,
             row_json TEXT NOT NULL
         )
         """
     )
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(latest)").fetchall()
+    }
+    if "range_consumed_proxy" not in columns:
+        connection.execute(
+            "ALTER TABLE latest ADD COLUMN range_consumed_proxy REAL"
+        )
     connection.commit()
     return connection
 
@@ -614,8 +623,8 @@ def _upsert_state_row(connection: sqlite3.Connection, row: Mapping[str, Any]) ->
             captured_winner, executable_false_negative, threshold_miss,
             cap_miss, operational_miss, threshold_shadow,
             expanded_cap_shadow, estimated_missed_move,
-            decision_latency_ms, paper_net_pnl, row_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            decision_latency_ms, paper_net_pnl, range_consumed_proxy, row_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(accountability_id) DO UPDATE SET
             fingerprint = excluded.fingerprint,
             revision = excluded.revision,
@@ -634,6 +643,7 @@ def _upsert_state_row(connection: sqlite3.Connection, row: Mapping[str, Any]) ->
             estimated_missed_move = excluded.estimated_missed_move,
             decision_latency_ms = excluded.decision_latency_ms,
             paper_net_pnl = excluded.paper_net_pnl,
+            range_consumed_proxy = excluded.range_consumed_proxy,
             row_json = excluded.row_json
         WHERE excluded.revision >= latest.revision
         """,
@@ -656,6 +666,7 @@ def _upsert_state_row(connection: sqlite3.Connection, row: Mapping[str, Any]) ->
             _finite(row.get("estimated_missed_move_pct")),
             _finite(latency_map.get("decision_latency_ms")),
             _paper_net_pnl(row),
+            _finite(row.get("range_consumed_proxy_pct")),
             json.dumps(dict(row), sort_keys=True, allow_nan=False),
         ),
     )
@@ -879,7 +890,22 @@ def build_accountability_summary_from_state(
                    coalesce(sum(expanded_cap_shadow), 0),
                    count(paper_net_pnl),
                    coalesce(sum(CASE WHEN paper_net_pnl > 0 THEN 1 ELSE 0 END), 0),
-                   sum(paper_net_pnl)
+                   sum(paper_net_pnl),
+                   count(range_consumed_proxy),
+                   coalesce(sum(
+                       CASE
+                           WHEN market_winner = 1
+                            AND range_consumed_proxy < 50.0 THEN 1
+                           ELSE 0
+                       END
+                   ), 0),
+                   coalesce(sum(
+                       CASE
+                           WHEN market_winner = 1
+                            AND range_consumed_proxy >= 50.0 THEN 1
+                           ELSE 0
+                       END
+                   ), 0)
             FROM latest
             """
         ).fetchone()
@@ -958,8 +984,20 @@ def build_accountability_summary_from_state(
                 "production_changed": False,
             },
             "decay_aware": {
-                "status": "SHADOW_PROXY_ONLY",
-                "metric": "24h range consumed proxy when source snapshot is available",
+                "status": (
+                    "SHADOW_MEASURED"
+                    if int(aggregate[16]) > 0
+                    else "AWAITING_POINT_IN_TIME_RANGE_EVIDENCE"
+                ),
+                "metric": "24h range consumed proxy at screening time",
+                "samples": int(aggregate[16]),
+                "winner_candidates_before_50pct_range_consumed": int(
+                    aggregate[17]
+                ),
+                "winner_candidates_at_or_after_50pct_range_consumed": int(
+                    aggregate[18]
+                ),
+                "authoritative_move_completed_fraction": False,
                 "production_changed": False,
             },
         },
