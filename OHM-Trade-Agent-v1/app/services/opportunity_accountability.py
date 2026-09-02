@@ -248,6 +248,9 @@ def _directional_outcome(outcome: Mapping[str, Any] | None, direction: str) -> d
         "outcome_available": True,
         "outcome_complete": bool(outcome.get("window_complete", False)),
         "outcome_revision": int(outcome.get("outcome_revision") or 0),
+        "within_major_move_episode": bool(
+            outcome.get("within_major_move_episode", False)
+        ),
         "favorable_excursion_pct": favorable,
         "adverse_excursion_pct": adverse,
         "time_to_favorable_extreme_seconds": (
@@ -263,8 +266,12 @@ def _range_consumed_proxy(snapshot: Mapping[str, Any] | None, direction: str) ->
     if not isinstance(snapshot, Mapping):
         return None
     price = _finite(snapshot.get("reference_price") or snapshot.get("last_price"))
-    high = _finite(snapshot.get("high_24h"))
-    low = _finite(snapshot.get("low_24h"))
+    high = _finite(
+        snapshot.get("high_24h") or snapshot.get("recent_24h_high")
+    )
+    low = _finite(
+        snapshot.get("low_24h") or snapshot.get("recent_24h_low")
+    )
     if price is None or high is None or low is None or high <= low:
         return None
     if direction == "SHORT":
@@ -384,6 +391,16 @@ def build_accountability_rows(
             continue
 
         snapshot = snapshots.get((observed_at, symbol))
+        evidence_snapshot = dict(snapshot or {})
+        screening_metadata = screening.get("metadata")
+        if isinstance(screening_metadata, Mapping):
+            for source_name, target_name in (
+                ("reference_price", "reference_price"),
+                ("recent_24h_high", "recent_24h_high"),
+                ("recent_24h_low", "recent_24h_low"),
+            ):
+                if evidence_snapshot.get(target_name) is None:
+                    evidence_snapshot[target_name] = screening_metadata.get(source_name)
         snapshot_id = str((snapshot or {}).get("snapshot_id") or "")
         outcome_row = outcomes.get(snapshot_id)
         advanced_direction = str(screening.get("advanced_direction") or "").upper()
@@ -409,7 +426,7 @@ def build_accountability_rows(
             paper_admission = paper_admissions.get(signal_id)
             paper_outcome = paper_outcomes.get(signal_id)
             favorable = _finite(direction_outcome.get("favorable_excursion_pct"))
-            range_consumed = _range_consumed_proxy(snapshot, direction)
+            range_consumed = _range_consumed_proxy(evidence_snapshot, direction)
 
             identity_raw = "|".join(
                 [scan_id, symbol, direction, observed_at, snapshot_id or "NO_SNAPSHOT"]
@@ -992,8 +1009,20 @@ def _iter_jsonl_sources(
         if not source.exists():
             continue
         try:
-            opener = gzip.open if source.suffix == ".gz" else source.open
-            with opener(source, "rt", encoding="utf-8", errors="replace") if source.suffix == ".gz" else opener("r", encoding="utf-8", errors="replace") as handle:
+            if source.suffix == ".gz":
+                handle_context = gzip.open(
+                    source,
+                    "rt",
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            else:
+                handle_context = source.open(
+                    "r",
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            with handle_context as handle:
                 for raw in handle:
                     text = raw.strip()
                     if not text:
