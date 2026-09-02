@@ -344,6 +344,64 @@ def _recent_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return compact
 
 
+def _opportunity_accountability_snapshot(
+    historical: dict[str, Any],
+    scope: str,
+) -> dict[str, Any]:
+    rows = list(historical.get("opportunity_accountability_daily") or [])
+    if scope == "today":
+        today = datetime.now(timezone.utc).date().isoformat()
+        rows = [row for row in rows if str(row.get("date")) == today]
+    totals = {
+        "directional_evaluations": 0,
+        "completed_forward_outcomes": 0,
+        "market_winner_candidates": 0,
+        "captured_winners": 0,
+        "executable_false_negatives": 0,
+        "threshold_70_79_miss_candidates": 0,
+        "ranking_or_cap_miss_candidates": 0,
+        "operational_executable_misses": 0,
+    }
+    missed_move = 0.0
+    weighted_latency = 0.0
+    latency_weight = 0
+    for row in rows:
+        for key in totals:
+            totals[key] += int(row.get(key) or 0)
+        missed_move += float(row.get("estimated_missed_move_pct_sum") or 0.0)
+        latency = _number(row.get("mean_decision_latency_ms"))
+        samples = int(row.get("directional_evaluations") or 0)
+        if latency is not None and samples > 0:
+            weighted_latency += latency * samples
+            latency_weight += samples
+    denominator = totals["captured_winners"] + totals["executable_false_negatives"]
+    return {
+        "status": (
+            "MEASURED"
+            if totals["completed_forward_outcomes"] > 0
+            else "AWAITING_MATURE_OUTCOMES"
+        ),
+        **totals,
+        "opportunity_capture_rate_pct": _pct(
+            totals["captured_winners"],
+            denominator,
+        ),
+        "estimated_missed_move_pct_sum": round(missed_move, 6),
+        "mean_decision_latency_ms": (
+            round(weighted_latency / latency_weight, 3)
+            if latency_weight
+            else None
+        ),
+        "trend": rows,
+        "source": (
+            "POSTGRESQL"
+            if historical.get("available") and rows
+            else "AWAITING_ACCOUNTABILITY_READ_MODEL"
+        ),
+        "measurement_only": True,
+    }
+
+
 def _paper_status() -> dict[str, Any]:
     try:
         status = freqtrade_dry_run_status()
@@ -422,6 +480,10 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
     sample_count = int(paper.get("count") or 0)
     evidence_state = "INSUFFICIENT_DATA" if sample_count < 30 else "MEASURED"
     historical = read_historical_snapshot()
+    opportunity_accountability = _opportunity_accountability_snapshot(
+        historical,
+        scope,
+    )
     historical_trend = _historical_trend_for_scope(
         historical.get("intelligence_daily") or [],
         scope,
@@ -460,6 +522,7 @@ def build_dashboard_read_model(scope: str = "all") -> dict[str, Any]:
             "stage_pattern_performance": intelligence.get("early_stage_pattern_performance") or {},
         },
         "failure_eradication": _failure_snapshot(outcomes, profitability),
+        "opportunity_accountability": opportunity_accountability,
         "paper_engine": _paper_status(),
         "telegram_delivery": build_delivery_summary(scope=scope),
         "recent_events": _recent_events(events),
