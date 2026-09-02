@@ -420,3 +420,28 @@ def test_scan_instrumentation_is_observation_only():
     # only the summary it is reported in.
     assert "paper_admission_eligible = opip.record_paper_admission_eligibility(" in source
     assert source.count("= opip.") == 1
+
+
+
+def test_confidence_evidence_cannot_reach_alert_paper_or_order_code():
+    """The below-85 evidence tag must stay inside the observer/read side."""
+    source = inspect.getsource(gates.evaluate_recommendation_gate_item)
+    package_source = _opip_source()
+    assert "AI_CONFIDENCE_COUNTERFACTUAL" in source
+    forbidden = (
+        "send_trade_plan",
+        "send_telegram",
+        "publish_qualified_long",
+        "enroll_paper_opportunity",
+        "record_paper_admission(",
+        "place_order",
+        "create_order",
+        "submit_order",
+    )
+    for name in forbidden:
+        assert name not in source
+    # The O'Pip decision package remains an observer/read-side package: it may
+    # describe paper eligibility, but it must not invoke production admission
+    # or exchange-order functions.
+    for name in forbidden:
+        assert name not in package_source

@@ -405,7 +405,7 @@ def test_ai_returning_nothing_is_distinct_from_never_asking(monkeypatch, tmp_pat
     _assert_equivalent(summary)
 
 
-def test_low_confidence_is_attributed_to_the_recommendation_gate(
+def test_low_confidence_alert_continues_to_deterministic_qualification(
     monkeypatch, tmp_path
 ):
     snapshots = [_snapshot("RAYUSD", VIABLE)]
@@ -417,7 +417,7 @@ def test_low_confidence_is_attributed_to_the_recommendation_gate(
                     {
                         "symbol": "RAYUSD", "direction": "LONG", "rank": 1,
                         "confidence": 70, "risk_level": "low",
-                        "decision": "alert", "reason": "close but not clear",
+                        "decision": "alert", "reason": "valid alert, lower confidence",
                     }
                 ]
             )
@@ -426,18 +426,13 @@ def test_low_confidence_is_attributed_to_the_recommendation_gate(
     scan_opportunities.main()
 
     summary = _summary(tmp_path)
-    assert summary["terminal"]["top_reasons"] == {"AI_CONFIDENCE_BELOW_THRESHOLD": 1}
-    assert summary["terminal"]["dominant_terminal_gate"] == "RECOMMENDATION_GATE"
-    assert summary["terminal"]["reason_classes"]["MODEL"] == 1
+    assert summary["funnel"]["qualified"] == 1
+    assert summary["funnel"]["rejected_by_model"] == 0
+    assert summary["terminal"]["top_reasons"] == {}
     assert summary["ai_stage"]["confidence_summary"]["count"] == 1
     assert summary["ai_stage"]["confidence_summary"]["max"] == 70
     assert summary["ai_stage"]["confidence_summary"]["calibrated_probability"] is False
-    nearest = summary["nearest_misses"][0]
-    assert nearest["gate"] == "RECOMMENDATION_GATE"
-    assert nearest["threshold"] == 85
-    assert nearest["measured_value"] == 70
     _assert_equivalent(summary)
-
 
 def test_chief_watch_verdict_is_not_reported_as_low_confidence(monkeypatch, tmp_path):
     snapshots = [_snapshot("RAYUSD", VIABLE)]

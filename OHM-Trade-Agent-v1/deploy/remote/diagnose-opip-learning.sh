@@ -193,5 +193,23 @@ else
   status="FAIL"
 fi
 
+if docker inspect ohm-trade-agent >/dev/null 2>&1 \
+   && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
+  qualification_funnel="$(
+    docker exec ohm-trade-agent python -m app.opip.decision.diagnostics_cli --hours 24 2>/dev/null || true
+  )"
+  if [[ -n "$qualification_funnel" ]]; then
+    printf '%s\n' "$qualification_funnel"
+  else
+    echo "OPIP_QUALIFICATION_FUNNEL"
+    echo "diagnostic=UNAVAILABLE"
+    degrade
+  fi
+else
+  echo "OPIP_QUALIFICATION_FUNNEL"
+  echo "diagnostic=UNAVAILABLE"
+  degrade
+fi
+
 echo "diagnostics_status=$status"
 [[ "$status" != "FAIL" ]]

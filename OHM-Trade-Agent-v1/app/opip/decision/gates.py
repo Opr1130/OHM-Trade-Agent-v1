@@ -39,6 +39,7 @@ from app.services.chief_analyst import (
     SHORT_VALIDATION_LEVERAGE,
 )
 from app.services.economic_quality_gate import evaluate_economic_quality
+from app.services.recommendation_gate import candidate_alert_authorized, parse_confidence
 from app.services.short_target_attainability import evaluate_short_target_attainability
 from app.services.target_attainability import evaluate_target_attainability
 
@@ -315,20 +316,16 @@ def evaluate_recommendation_gate_item(
     *,
     evaluated_at: datetime | None = None,
 ) -> GateResult:
-    """Reproduce ``recommendation_gate.qualified_alerts`` for one AI candidate.
+    """Evaluate one Chief recommendation without treating confidence as authority.
 
-    The four failure modes are reported separately because they mean different
-    things: a WATCH is the model declining, a low confidence is the model
-    answering below the bar, and a bad risk level or direction is a malformed
-    or out-of-policy answer.
+    The Chief's numeric confidence is comparative review evidence, not a
+    calibrated probability. ALERT items with valid schema continue to the
+    unchanged deterministic gates even below the legacy 85 boundary.
     """
     decision = str(item.get("decision") or "").lower()
     risk_level = str(item.get("risk_level") or "").lower()
-    direction = str(item.get("direction") or "LONG").upper()
-    try:
-        confidence = int(item.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0
+    direction = str(item.get("direction") or "").upper()
+    confidence = parse_confidence(item)
 
     metadata = {
         "ai_decision": decision,
@@ -336,6 +333,8 @@ def evaluate_recommendation_gate_item(
         "ai_direction": direction,
         "ai_confidence": confidence,
         "ai_rank": item.get("rank"),
+        "calibrated_probability": False,
+        "confidence_is_trade_authority": False,
     }
 
     def _fail(code: ReasonCode, reason: str) -> GateResult:
@@ -353,7 +352,10 @@ def evaluate_recommendation_gate_item(
     if decision == "watch":
         return _fail(ReasonCode.AI_DECISION_WATCH, "Chief returned watch, not alert")
     if decision != "alert":
-        return _fail(ReasonCode.AI_DECISION_REJECT, f"Chief decision {decision or 'unknown'}")
+        return _fail(
+            ReasonCode.AI_DECISION_REJECT,
+            f"Chief decision {decision or 'unknown'}",
+        )
     if direction not in ALLOWED_DIRECTIONS:
         return _fail(
             ReasonCode.AI_DIRECTION_REJECTED,
@@ -364,22 +366,41 @@ def evaluate_recommendation_gate_item(
             ReasonCode.AI_RISK_LEVEL_REJECTED,
             f"risk level {risk_level or 'unknown'} is outside the allowed set",
         )
-    if confidence < AI_MIN_CONFIDENCE:
+    if confidence is None or confidence < 0 or confidence > 100:
         return _fail(
-            ReasonCode.AI_CONFIDENCE_BELOW_THRESHOLD,
-            f"confidence {confidence} is below the minimum {AI_MIN_CONFIDENCE}",
+            ReasonCode.AI_CONFIDENCE_INVALID,
+            "Chief confidence is missing or outside the required 0-100 schema",
         )
+    if not candidate_alert_authorized(item):
+        return _fail(
+            ReasonCode.AI_DECISION_REJECT,
+            "Chief candidate failed recommendation schema validation",
+        )
+
+    below_boundary = confidence < AI_MIN_CONFIDENCE
     return GateResult.build(
         GateName.RECOMMENDATION_GATE,
         GateStatus.PASS,
-        ReasonCode.GATE_PASSED,
-        reason="Chief alert cleared the recommendation gate",
+        (
+            ReasonCode.AI_CONFIDENCE_COUNTERFACTUAL
+            if below_boundary
+            else ReasonCode.GATE_PASSED
+        ),
+        reason=(
+            f"Chief alert admitted; confidence {confidence} is below the legacy "
+            f"measurement boundary {AI_MIN_CONFIDENCE}"
+            if below_boundary
+            else "Chief alert cleared the recommendation gate"
+        ),
         measured_value=confidence,
         threshold=AI_MIN_CONFIDENCE,
         evaluated_at=evaluated_at,
-        metadata=metadata,
+        metadata={
+            **metadata,
+            "below_legacy_confidence_boundary": below_boundary,
+            "measurement_only_confidence_boundary": True,
+        },
     )
-
 
 def target_quality_gate_from_result(
     result: Any,

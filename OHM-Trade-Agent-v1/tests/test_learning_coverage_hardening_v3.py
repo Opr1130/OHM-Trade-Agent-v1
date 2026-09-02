@@ -49,7 +49,7 @@ def test_chief_review_captures_watch_reject_and_not_selected(monkeypatch):
     assert result["not_selected"] == 1
 
 
-def test_chief_review_captures_low_confidence_alert(monkeypatch):
+def test_chief_review_defers_low_confidence_alert(monkeypatch):
     import app.services.chief_learning_capture as capture
 
     recorded = []
@@ -64,12 +64,13 @@ def test_chief_review_captures_low_confidence_alert(monkeypatch):
             {"symbol": "AAAUSD", "direction": "LONG", "decision": "alert", "confidence": 84, "risk_level": "low", "reason": "almost"},
         ],
     }
-    capture.capture_chief_review_decisions(
+    result = capture.capture_chief_review_decisions(
         review,
         eligible_candidates=[_candidate("AAAUSD")],
         market_regime_context=None,
     )
-    assert recorded == ["AI_CONFIDENCE_REJECT"]
+    assert recorded == []
+    assert result["qualified_alerts_deferred"] == 1
 
 
 def test_prefilter_rejection_distinguishes_target_from_economic(monkeypatch):
