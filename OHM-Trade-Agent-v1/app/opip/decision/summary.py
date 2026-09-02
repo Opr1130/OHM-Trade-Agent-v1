@@ -256,6 +256,26 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _first_terminal_gate_from_row(row: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    explicit = str(row.get("first_terminal_gate") or "").strip()
+    explicit_class = str(row.get("terminal_reason_class") or "").strip()
+    if explicit:
+        return explicit, explicit_class or None
+
+    gate_results = row.get("gate_results") or []
+    if not isinstance(gate_results, list):
+        return None, explicit_class or None
+    for gate in gate_results:
+        if not isinstance(gate, Mapping):
+            continue
+        if str(gate.get("status") or "") in {"FAIL", "ERROR"}:
+            return (
+                str(gate.get("gate") or "") or None,
+                str(gate.get("reason_class") or "") or explicit_class or None,
+            )
+    return None, explicit_class or None
+
+
 def build_recent_qualification_funnel(
     *,
     funnel_events_path=None,
@@ -299,14 +319,51 @@ def build_recent_qualification_funnel(
     )
     summaries = recent(read_jsonl(scan_summaries_path or SCAN_SUMMARIES_FILE))
 
+    broad_screenings = [
+        row
+        for row in screenings
+        if str(row.get("scanner_type") or "BROAD_SEARCH").upper()
+        == "BROAD_SEARCH"
+    ]
+    early_watch_screenings = [
+        row
+        for row in screenings
+        if str(row.get("scanner_type") or "").upper() == "EARLY_WATCH"
+    ]
+
     counts = Counter()
     rejections = Counter()
+    terminal_gates = Counter()
+    policy_terminal_gates = Counter()
+    operational_terminal_gates = Counter()
     # Emit a stable zero-valued schema even when a stage has no observations.
     # This keeps diagnostics machine-readable and avoids absence being confused
     # with "not instrumented" or an aggregation error.
     for key in (
         "market_observed",
         "scanner_selected",
+        "broad_search_observed",
+        "broad_search_threshold_advanced",
+        "broad_search_below_threshold",
+        "early_watch_observed",
+        "early_watch_advanced",
+        "funnel_candidates",
+        "funnel_qualified",
+        "funnel_rejected",
+        "funnel_operational_failure",
+        "funnel_incomplete",
+        "margin_pass",
+        "margin_reject",
+        "margin_error",
+        "execution_pass",
+        "execution_reject",
+        "execution_error",
+        "cross_market_pass",
+        "cross_market_skipped",
+        "reference_pass",
+        "reference_skipped",
+        "market_intelligence_pass",
+        "market_intelligence_skipped",
         "deterministic_prefilter_pass",
         "deterministic_prefilter_reject",
         "chief_eligible",
@@ -334,12 +391,48 @@ def build_recent_qualification_funnel(
     ):
         counts[key] = 0
 
-    counts["market_observed"] = len(screenings)
-    counts["scanner_selected"] = sum(
-        1 for row in screenings if str(row.get("outcome") or "") == "ADVANCED"
+    counts["broad_search_observed"] = len(broad_screenings)
+    counts["broad_search_threshold_advanced"] = sum(
+        1
+        for row in broad_screenings
+        if str(row.get("outcome") or "") == "ADVANCED"
     )
+    counts["broad_search_below_threshold"] = sum(
+        1
+        for row in broad_screenings
+        if str(row.get("outcome") or "") == "BELOW_THRESHOLD"
+    )
+    counts["early_watch_observed"] = len(early_watch_screenings)
+    counts["early_watch_advanced"] = sum(
+        1
+        for row in early_watch_screenings
+        if str(row.get("outcome") or "") == "ADVANCED"
+    )
+    # Backward-compatible aliases now explicitly mean Broad Search only.
+    counts["market_observed"] = counts["broad_search_observed"]
+    counts["scanner_selected"] = counts["broad_search_threshold_advanced"]
+
+    counts["funnel_candidates"] = len(events)
 
     for row in events:
+        decision = str(row.get("decision") or "")
+        if decision == "QUALIFIED":
+            counts["funnel_qualified"] += 1
+        elif decision == "REJECTED":
+            counts["funnel_rejected"] += 1
+        elif decision == "OPERATIONAL_FAILURE":
+            counts["funnel_operational_failure"] += 1
+        elif decision == "INCOMPLETE":
+            counts["funnel_incomplete"] += 1
+
+        first_terminal_gate, terminal_class = _first_terminal_gate_from_row(row)
+        if first_terminal_gate:
+            terminal_gates[first_terminal_gate] += 1
+            if terminal_class == "POLICY":
+                policy_terminal_gates[first_terminal_gate] += 1
+            elif terminal_class == "OPERATIONAL":
+                operational_terminal_gates[first_terminal_gate] += 1
+
         decision = str(row.get("decision") or "")
         if decision == "QUALIFIED":
             counts["qualified_signals"] += 1
@@ -360,7 +453,36 @@ def build_recent_qualification_funnel(
             if not isinstance(metadata, Mapping):
                 metadata = {}
 
-            if name == "DETERMINISTIC_QUALITY":
+            if name == "MARGIN_ELIGIBILITY":
+                if status == "PASS":
+                    counts["margin_pass"] += 1
+                elif status == "FAIL":
+                    counts["margin_reject"] += 1
+                elif status == "ERROR":
+                    counts["margin_error"] += 1
+            elif name == "EXECUTION_VALIDATION":
+                if status == "PASS":
+                    counts["execution_pass"] += 1
+                elif status == "FAIL":
+                    counts["execution_reject"] += 1
+                elif status == "ERROR":
+                    counts["execution_error"] += 1
+            elif name == "CROSS_MARKET_CONFIRMATION":
+                if status == "PASS":
+                    counts["cross_market_pass"] += 1
+                elif status == "SKIPPED":
+                    counts["cross_market_skipped"] += 1
+            elif name == "REFERENCE_VALIDATION":
+                if status == "PASS":
+                    counts["reference_pass"] += 1
+                elif status == "SKIPPED":
+                    counts["reference_skipped"] += 1
+            elif name == "MARKET_INTELLIGENCE":
+                if status == "PASS":
+                    counts["market_intelligence_pass"] += 1
+                elif status == "SKIPPED":
+                    counts["market_intelligence_skipped"] += 1
+            elif name == "DETERMINISTIC_QUALITY":
                 if status == "PASS":
                     counts["deterministic_prefilter_pass"] += 1
                 elif status == "FAIL":
@@ -433,18 +555,17 @@ def build_recent_qualification_funnel(
         _paper_admission_value(row) for row in summaries
     )
 
-    choke_candidates = {
-        "DETERMINISTIC_PREFILTER": counts["deterministic_prefilter_reject"],
-        "CHIEF_FAILURE": counts["chief_failed"] + counts["chief_budget_blocked"],
-        "CHIEF_WATCH_REJECT": counts["chief_watch"] + counts["chief_reject"],
-        "TARGET_QUALITY": counts["target_reject"],
-        "ECONOMIC_QUALITY": counts["economic_reject"],
-        "ACTION_GATE": counts["action_gate_reject"],
-    }
-    primary_choke = (
-        max(choke_candidates, key=choke_candidates.get)
-        if choke_candidates and max(choke_candidates.values()) > 0
-        else "NONE"
+    def _dominant(counter: Counter) -> str:
+        return counter.most_common(1)[0][0] if counter else "NONE"
+
+    primary_choke = _dominant(terminal_gates)
+    primary_policy_choke = _dominant(policy_terminal_gates)
+    primary_operational_choke = _dominant(operational_terminal_gates)
+    funnel_invariant_holds = counts["funnel_candidates"] == (
+        counts["funnel_qualified"]
+        + counts["funnel_rejected"]
+        + counts["funnel_operational_failure"]
+        + counts["funnel_incomplete"]
     )
 
     return {
@@ -457,6 +578,14 @@ def build_recent_qualification_funnel(
         "capacity_reject": "NOT_INSTRUMENTED",
         "paper_admitted": "NOT_INSTRUMENTED",
         "primary_choke": primary_choke,
+        "primary_policy_choke": primary_policy_choke,
+        "primary_operational_choke": primary_operational_choke,
+        "terminal_gate_counts": dict(terminal_gates.most_common()),
+        "policy_terminal_gate_counts": dict(policy_terminal_gates.most_common()),
+        "operational_terminal_gate_counts": dict(
+            operational_terminal_gates.most_common()
+        ),
+        "funnel_invariant_holds": funnel_invariant_holds,
         "top_rejection_reasons": dict(rejections.most_common(10)),
         "measurement_only": True,
         "affects_trade_authority": False,
@@ -468,6 +597,28 @@ def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
     keys = (
         "market_observed",
         "scanner_selected",
+        "broad_search_observed",
+        "broad_search_threshold_advanced",
+        "broad_search_below_threshold",
+        "early_watch_observed",
+        "early_watch_advanced",
+        "funnel_candidates",
+        "funnel_qualified",
+        "funnel_rejected",
+        "funnel_operational_failure",
+        "funnel_incomplete",
+        "margin_pass",
+        "margin_reject",
+        "margin_error",
+        "execution_pass",
+        "execution_reject",
+        "execution_error",
+        "cross_market_pass",
+        "cross_market_skipped",
+        "reference_pass",
+        "reference_skipped",
+        "market_intelligence_pass",
+        "market_intelligence_skipped",
         "deterministic_prefilter_pass",
         "deterministic_prefilter_reject",
         "chief_eligible",
@@ -502,6 +653,17 @@ def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
     for key in keys:
         lines.append(f"{key}={report.get(key, 0)}")
     lines.append(f"PRIMARY_CHOKE={report.get('primary_choke', 'NONE')}")
+    lines.append(
+        f"PRIMARY_POLICY_CHOKE={report.get('primary_policy_choke', 'NONE')}"
+    )
+    lines.append(
+        "PRIMARY_OPERATIONAL_CHOKE="
+        f"{report.get('primary_operational_choke', 'NONE')}"
+    )
+    lines.append(
+        "FUNNEL_INVARIANT_HOLDS="
+        f"{'YES' if report.get('funnel_invariant_holds') else 'NO'}"
+    )
     lines.append("TOP_REJECTION_REASONS")
     reasons = report.get("top_rejection_reasons") or {}
     if reasons:
