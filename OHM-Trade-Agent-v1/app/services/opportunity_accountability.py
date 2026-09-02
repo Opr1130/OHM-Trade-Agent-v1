@@ -543,6 +543,25 @@ def _open_state(path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS signal_index (
+            signal_id TEXT PRIMARY KEY,
+            accountability_id TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS paper_event_pending (
+            event_key TEXT PRIMARY KEY,
+            signal_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            observed_at TEXT,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS latest (
             accountability_id TEXT PRIMARY KEY,
             fingerprint TEXT NOT NULL,
@@ -674,6 +693,22 @@ def _upsert_state_row(connection: sqlite3.Connection, row: Mapping[str, Any]) ->
             json.dumps(dict(row), sort_keys=True, allow_nan=False),
         ),
     )
+    signal_id = str(row.get("signal_id") or "")
+    if signal_id:
+        connection.execute(
+            "DELETE FROM signal_index "
+            "WHERE accountability_id = ? AND signal_id <> ?",
+            (identity, signal_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO signal_index(signal_id, accountability_id)
+            VALUES (?, ?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                accountability_id = excluded.accountability_id
+            """,
+            (signal_id, identity),
+        )
 
 
 def _reconcile_state(connection: sqlite3.Connection, path: Path) -> None:
@@ -776,6 +811,247 @@ def append_accountability_rows(
         return appended
     finally:
         connection.close()
+
+
+def _metadata_int(
+    connection: sqlite3.Connection,
+    key: str,
+    default: int = 0,
+) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return default
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata_text(
+    connection: sqlite3.Connection,
+    key: str,
+) -> str | None:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (key,),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _set_metadata(
+    connection: sqlite3.Connection,
+    key: str,
+    value: Any,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(key), str(value)),
+    )
+
+
+def _paper_event_anchor(path: Path, offset: int) -> str:
+    if offset <= 0:
+        return ""
+    size = min(4096, offset)
+    with path.open("rb") as handle:
+        handle.seek(offset - size)
+        payload = handle.read(size)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _paper_event_key(row: Mapping[str, Any]) -> str | None:
+    try:
+        encoded = json.dumps(
+            dict(row),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
+    return "PAPER:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _apply_paper_event(
+    row: dict[str, Any],
+    event: Mapping[str, Any],
+) -> None:
+    event_type = str(event.get("event_type") or "").upper()
+    if event_type == "PAPER_ADMISSION":
+        row["paper_admission"] = {
+            "admitted": event.get("admitted"),
+            "reason": event.get("reason"),
+            "observed_at": event.get("observed_at"),
+            "payload": _paper_payload(event),
+        }
+    elif event_type == "PAPER_OUTCOME":
+        row["paper_outcome"] = {
+            "observed_at": event.get("observed_at"),
+            "payload": _paper_payload(event),
+        }
+
+
+def reconcile_paper_events(
+    *,
+    intelligence_event_path: Path = DEFAULT_INTELLIGENCE_EVENT_FILE,
+    ledger_path: Path = DEFAULT_LEDGER_FILE,
+    state_path: Path | None = None,
+) -> int:
+    """Incrementally apply paper admission/outcome events to existing rows.
+
+    Relevant events are first staged durably. This lets a paper event arrive
+    before its accountability row without being lost; once the signal mapping
+    exists, the event revises the append-only accountability row.
+    """
+    state_db = state_path or _state_path_for(ledger_path)
+    connection = _open_state(state_db)
+    processed_keys: list[str] = []
+    pending_updates: dict[str, dict[str, Any]] = {}
+    try:
+        _reconcile_state(connection, ledger_path)
+        if intelligence_event_path.exists():
+            size = intelligence_event_path.stat().st_size
+            offset = _metadata_int(connection, "paper_event_offset", 0)
+            expected_anchor = _metadata_text(
+                connection,
+                "paper_event_anchor_sha256",
+            ) or ""
+            if (
+                offset > size
+                or (
+                    offset > 0
+                    and _paper_event_anchor(intelligence_event_path, offset)
+                    != expected_anchor
+                )
+            ):
+                offset = 0
+
+            last_complete = offset
+            with intelligence_event_path.open("rb") as handle:
+                handle.seek(offset)
+                while True:
+                    raw = handle.readline()
+                    if not raw:
+                        break
+                    end = handle.tell()
+                    if not raw.endswith(b"\n"):
+                        break
+                    last_complete = end
+                    try:
+                        event = json.loads(
+                            raw.decode("utf-8", errors="replace")
+                        )
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = str(
+                        event.get("event_type") or ""
+                    ).upper()
+                    signal_id = str(event.get("signal_id") or "")
+                    if (
+                        event_type not in {
+                            "PAPER_ADMISSION",
+                            "PAPER_OUTCOME",
+                        }
+                        or not signal_id
+                    ):
+                        continue
+                    event_key = _paper_event_key(event)
+                    if event_key is None:
+                        continue
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO paper_event_pending(
+                            event_key, signal_id, event_type,
+                            observed_at, row_json
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_key,
+                            signal_id,
+                            event_type,
+                            str(event.get("observed_at") or ""),
+                            json.dumps(
+                                event,
+                                sort_keys=True,
+                                allow_nan=False,
+                            ),
+                        ),
+                    )
+
+            _set_metadata(
+                connection,
+                "paper_event_offset",
+                last_complete,
+            )
+            _set_metadata(
+                connection,
+                "paper_event_anchor_sha256",
+                _paper_event_anchor(
+                    intelligence_event_path,
+                    last_complete,
+                ),
+            )
+
+        joined = connection.execute(
+            """
+            SELECT p.event_key, p.row_json, s.accountability_id,
+                   l.row_json
+            FROM paper_event_pending p
+            JOIN signal_index s ON s.signal_id = p.signal_id
+            JOIN latest l ON l.accountability_id = s.accountability_id
+            ORDER BY coalesce(p.observed_at, ''), p.event_key
+            """
+        ).fetchall()
+        for event_key, event_raw, accountability_id, latest_raw in joined:
+            base = pending_updates.get(str(accountability_id))
+            if base is None:
+                try:
+                    parsed = json.loads(latest_raw)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                base = parsed
+                pending_updates[str(accountability_id)] = base
+            try:
+                event = json.loads(event_raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            _apply_paper_event(base, event)
+            processed_keys.append(str(event_key))
+        connection.commit()
+    finally:
+        connection.close()
+
+    if pending_updates:
+        append_accountability_rows(
+            pending_updates.values(),
+            path=ledger_path,
+            state_path=state_db,
+        )
+
+    if processed_keys:
+        connection = _open_state(state_db)
+        try:
+            _reconcile_state(connection, ledger_path)
+            connection.executemany(
+                "DELETE FROM paper_event_pending WHERE event_key = ?",
+                [(key,) for key in processed_keys],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    return len(processed_keys)
 
 
 def _pct(numerator: int, denominator: int) -> float | None:
@@ -1100,6 +1376,11 @@ def build_incremental_from_outcomes(
         if _iso(row.get("reference_at")) and _normalize_symbol(row.get("symbol"))
     }
     if not target_keys:
+        reconcile_paper_events(
+            intelligence_event_path=intelligence_event_path,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
         summary = build_accountability_summary_from_state(
             ledger_path=ledger_path,
             state_path=state_path,
@@ -1171,6 +1452,11 @@ def build_incremental_from_outcomes(
     append_accountability_rows(
         accountability_rows,
         path=ledger_path,
+        state_path=state_path,
+    )
+    reconcile_paper_events(
+        intelligence_event_path=intelligence_event_path,
+        ledger_path=ledger_path,
         state_path=state_path,
     )
     summary = build_accountability_summary_from_state(
