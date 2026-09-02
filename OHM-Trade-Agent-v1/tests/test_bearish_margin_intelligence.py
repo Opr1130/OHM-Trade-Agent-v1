@@ -414,3 +414,23 @@ def test_margin_recovery_considers_dropped_high_scoring_long():
     assert [item.symbol for item in pool] == ["HIGHLONGUSD", "LOWLONGUSD"]
     assert [item.symbol for item in admitted] == ["HIGHLONGUSD"]
     assert admitted[0].technical_score == 89
+
+
+
+def test_qualifying_long_alternatives_tie_breaks_by_symbol():
+    first = snapshot(
+        symbol="ZZZUSD",
+        underlying_asset="SAME",
+        technical_score=88,
+    )
+    second = snapshot(
+        symbol="AAAUSD",
+        underlying_asset="SAME",
+        technical_score=88,
+    )
+
+    forward = qualifying_long_alternatives([first, second])
+    reverse = qualifying_long_alternatives([second, first])
+
+    assert [item.symbol for item in forward] == ["AAAUSD"]
+    assert [item.symbol for item in reverse] == ["AAAUSD"]
