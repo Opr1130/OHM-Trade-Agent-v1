@@ -718,6 +718,9 @@ def review_candidates(
                     chief_eligible_candidates,
                     cached.get("opip_ai_route"),
                 )
+                stage_evidence["completed_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
                 cached["opip_stage_evidence"] = stage_evidence
                 return cached
         else:
