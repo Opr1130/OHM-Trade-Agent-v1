@@ -42,6 +42,7 @@ case "$STAGE" in
       "$TARGET_SHA" 10.116.0.2 opiplearn
     ;;
   activate)
+    grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA" /etc/opip-learning.env
     test -s /root/.ssh/opip-learning
     test -s /root/.ssh/known_hosts
     systemctl start opip-learning-sync.service
