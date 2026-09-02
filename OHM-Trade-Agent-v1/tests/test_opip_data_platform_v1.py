@@ -315,6 +315,8 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" not in bootstrap
     assert "offhost-verified" in runner
     assert "rollback-verified" in runner
+    assert 'docker compose -f "$COMPOSE" build opip-shipper' in bootstrap
+    assert 'docker compose -f "$COMPOSE" build opip-shipper opip-data-admin' not in bootstrap
     maintenance = (
         ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
     ).read_text()
