@@ -65,7 +65,7 @@ copy_locked_jsonl() {
       "$(dirname "$temp")" "$(dirname "$target")"
   fi
   if [[ -n "$archive_name" ]]; then
-    archive_temp="$EXPORT_ROOT/.$archive_name.tmp.$"
+    archive_temp="$EXPORT_ROOT/.$archive_name.tmp.$$"
     archive_target="$EXPORT_ROOT/$archive_name"
     rm -rf -- "$archive_temp"
     if getent group "$READER_GROUP" >/dev/null 2>&1; then
