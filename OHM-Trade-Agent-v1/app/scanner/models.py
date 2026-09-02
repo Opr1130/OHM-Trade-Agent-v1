@@ -99,6 +99,13 @@ class MarketSnapshot:
     # cloned with SHORT and a direction-specific technical score.
     trade_direction: str = "LONG"
 
+    # Direction-resolution evidence. The selector records both independent
+    # technical scores on the chosen candidate so a later fail-closed SHORT
+    # margin rejection can recover an already-qualified LONG without
+    # recomputing, lowering, or bypassing the technical threshold.
+    directional_long_score: int | None = None
+    directional_short_score: int | None = None
+
     underlying_asset: str = ""
     primary_pair: str = ""
     secondary_pair: str | None = None
