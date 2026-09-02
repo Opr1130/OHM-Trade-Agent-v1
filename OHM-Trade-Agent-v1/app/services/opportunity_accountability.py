@@ -19,6 +19,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sqlite3
 from statistics import mean, median
 from typing import Any, Iterable, Mapping
 
@@ -499,24 +500,179 @@ def build_accountability_rows(
     )
 
 
-def _latest_ledger_rows(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        identity = str(row.get("accountability_id") or "")
-        if not identity:
-            continue
-        try:
-            revision = int(row.get("revision") or 0)
-        except (TypeError, ValueError):
-            revision = 0
-        prior = latest.get(identity)
-        try:
-            prior_revision = int((prior or {}).get("revision") or 0)
-        except (TypeError, ValueError):
-            prior_revision = 0
-        if prior is None or revision >= prior_revision:
-            latest[identity] = dict(row)
-    return latest
+def _state_path_for(path: Path) -> Path:
+    return path.parent / f".{path.name}.state.sqlite3"
+
+
+def _open_state(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS latest (
+            accountability_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            classification TEXT NOT NULL,
+            terminal_gate TEXT,
+            outcome_complete INTEGER NOT NULL,
+            market_winner INTEGER NOT NULL,
+            captured_winner INTEGER NOT NULL,
+            executable_false_negative INTEGER NOT NULL,
+            threshold_miss INTEGER NOT NULL,
+            cap_miss INTEGER NOT NULL,
+            operational_miss INTEGER NOT NULL,
+            threshold_shadow INTEGER NOT NULL,
+            expanded_cap_shadow INTEGER NOT NULL,
+            estimated_missed_move REAL,
+            decision_latency_ms REAL,
+            paper_net_pnl REAL,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def _state_offset(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'ledger_offset'"
+    ).fetchone()
+    try:
+        return int(row[0]) if row is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_state_offset(connection: sqlite3.Connection, value: int) -> None:
+    connection.execute(
+        """
+        INSERT INTO metadata(key, value) VALUES ('ledger_offset', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(max(0, int(value))),),
+    )
+
+
+def _paper_net_pnl(row: Mapping[str, Any]) -> float | None:
+    paper = row.get("paper_outcome")
+    if not isinstance(paper, Mapping):
+        return None
+    payload = paper.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return _finite(payload.get("net_pnl"))
+
+
+def _upsert_state_row(connection: sqlite3.Connection, row: Mapping[str, Any]) -> None:
+    identity = str(row.get("accountability_id") or "")
+    fingerprint = str(row.get("accountability_record_id") or "")
+    if not identity or not fingerprint:
+        return
+    classification = str(row.get("opportunity_classification") or "UNKNOWN")
+    counterfactuals = row.get("counterfactuals")
+    counter = counterfactuals if isinstance(counterfactuals, Mapping) else {}
+    latency = row.get("latency")
+    latency_map = latency if isinstance(latency, Mapping) else {}
+    connection.execute(
+        """
+        INSERT INTO latest(
+            accountability_id, fingerprint, revision, observed_at,
+            classification, terminal_gate, outcome_complete, market_winner,
+            captured_winner, executable_false_negative, threshold_miss,
+            cap_miss, operational_miss, threshold_shadow,
+            expanded_cap_shadow, estimated_missed_move,
+            decision_latency_ms, paper_net_pnl, row_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(accountability_id) DO UPDATE SET
+            fingerprint = excluded.fingerprint,
+            revision = excluded.revision,
+            observed_at = excluded.observed_at,
+            classification = excluded.classification,
+            terminal_gate = excluded.terminal_gate,
+            outcome_complete = excluded.outcome_complete,
+            market_winner = excluded.market_winner,
+            captured_winner = excluded.captured_winner,
+            executable_false_negative = excluded.executable_false_negative,
+            threshold_miss = excluded.threshold_miss,
+            cap_miss = excluded.cap_miss,
+            operational_miss = excluded.operational_miss,
+            threshold_shadow = excluded.threshold_shadow,
+            expanded_cap_shadow = excluded.expanded_cap_shadow,
+            estimated_missed_move = excluded.estimated_missed_move,
+            decision_latency_ms = excluded.decision_latency_ms,
+            paper_net_pnl = excluded.paper_net_pnl,
+            row_json = excluded.row_json
+        WHERE excluded.revision >= latest.revision
+        """,
+        (
+            identity,
+            fingerprint,
+            int(row.get("revision") or 0),
+            str(row.get("observed_at") or ""),
+            classification,
+            row.get("terminal_gate"),
+            1 if bool(row.get("outcome_complete")) else 0,
+            1 if bool(row.get("market_winner")) else 0,
+            1 if classification == "CAPTURED_WINNER" else 0,
+            1 if bool(row.get("executable_false_negative")) else 0,
+            1 if classification == "THRESHOLD_70_79_MISS_CANDIDATE" else 0,
+            1 if classification == "RANKING_OR_CAP_MISS_CANDIDATE" else 0,
+            1 if classification == "OPERATIONAL_EXECUTABLE_MISS" else 0,
+            1 if bool(counter.get("threshold_70_79_shadow")) else 0,
+            1 if bool(counter.get("expanded_cap_shadow")) else 0,
+            _finite(row.get("estimated_missed_move_pct")),
+            _finite(latency_map.get("decision_latency_ms")),
+            _paper_net_pnl(row),
+            json.dumps(dict(row), sort_keys=True, allow_nan=False),
+        ),
+    )
+
+
+def _reconcile_state(connection: sqlite3.Connection, path: Path) -> None:
+    if not path.exists():
+        if _state_offset(connection):
+            connection.execute("DELETE FROM latest")
+            _set_state_offset(connection, 0)
+            connection.commit()
+        return
+    size = path.stat().st_size
+    offset = _state_offset(connection)
+    if offset > size:
+        connection.execute("DELETE FROM latest")
+        offset = 0
+        _set_state_offset(connection, 0)
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        last_complete = offset
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            end = handle.tell()
+            if not raw.endswith(b"\n"):
+                break
+            last_complete = end
+            try:
+                row = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                _upsert_state_row(connection, row)
+        _set_state_offset(connection, last_complete)
+    connection.commit()
 
 
 def _row_fingerprint(row: Mapping[str, Any]) -> str:
@@ -538,58 +694,59 @@ def append_accountability_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
     path: Path = DEFAULT_LEDGER_FILE,
+    state_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     pending = [dict(row) for row in rows]
-    existing = read_jsonl(path)
-    latest = _latest_ledger_rows(existing)
-    appended: list[dict[str, Any]] = []
     path.parent.mkdir(parents=True, exist_ok=True)
+    connection = _open_state(state_path or _state_path_for(path))
+    appended: list[dict[str, Any]] = []
+    try:
+        _reconcile_state(connection, path)
+        for row in pending:
+            identity = str(row.get("accountability_id") or "")
+            if not identity:
+                continue
+            fingerprint = _row_fingerprint(row)
+            prior = connection.execute(
+                "SELECT fingerprint, revision FROM latest WHERE accountability_id = ?",
+                (identity,),
+            ).fetchone()
+            if prior is not None and str(prior[0]) == fingerprint:
+                continue
+            revision = (int(prior[1]) if prior is not None else 0) + 1
+            materialized = {
+                **row,
+                "revision": revision,
+                "accountability_record_id": fingerprint,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "append_only": True,
+            }
+            appended.append(materialized)
 
-    for row in pending:
-        identity = str(row.get("accountability_id") or "")
-        if not identity:
-            continue
-        prior = latest.get(identity)
-        fingerprint = _row_fingerprint(row)
-        if prior is not None and str(prior.get("accountability_record_id") or "") == fingerprint:
-            continue
-        revision = int((prior or {}).get("revision") or 0) + 1
-        materialized = {
-            **row,
-            "revision": revision,
-            "accountability_record_id": fingerprint,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "append_only": True,
-        }
-        appended.append(materialized)
-        latest[identity] = materialized
-
-    if appended:
-        with path.open("a", encoding="utf-8") as handle:
-            for row in appended:
-                handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-            handle.flush()
-            try:
+        if appended:
+            with path.open("ab") as handle:
+                for row in appended:
+                    handle.write(
+                        (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode(
+                            "utf-8"
+                        )
+                    )
+                handle.flush()
                 os.fsync(handle.fileno())
-            except OSError:
-                pass
-    return list(latest.values())
+                end_offset = handle.tell()
+            for row in appended:
+                _upsert_state_row(connection, row)
+            _set_state_offset(connection, end_offset)
+            connection.commit()
+        return appended
+    finally:
+        connection.close()
 
 
 def _pct(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round(numerator / denominator * 100.0, 4)
-
-
-def _paper_net_pnl(row: Mapping[str, Any]) -> float | None:
-    paper = row.get("paper_outcome")
-    if not isinstance(paper, Mapping):
-        return None
-    payload = paper.get("payload")
-    if not isinstance(payload, Mapping):
-        return None
-    return _finite(payload.get("net_pnl"))
 
 
 def build_accountability_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -620,7 +777,6 @@ def build_accountability_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str,
         if isinstance(row.get("latency"), Mapping)
     ]
     latency_values = [value for value in latency_values if value is not None]
-
     by_terminal_gate: dict[str, int] = {}
     by_classification: dict[str, int] = {}
     for row in current:
@@ -629,13 +785,11 @@ def build_accountability_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str,
         if bool(row.get("market_winner")):
             gate = str(row.get("terminal_gate") or "NO_TERMINAL_GATE")
             by_terminal_gate[gate] = by_terminal_gate.get(gate, 0) + 1
-
     paper_values = [
         value for value in (_paper_net_pnl(row) for row in current) if value is not None
     ]
     paper_wins = sum(value > 0 for value in paper_values)
-
-    validated_opportunities = len(captured_winners) + len(executable_misses)
+    validated = len(captured_winners) + len(executable_misses)
     return {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -650,15 +804,9 @@ def build_accountability_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str,
             "ranking_or_cap_miss_candidates": len(cap_misses),
             "operational_executable_misses": len(operational_misses),
         },
-        "opportunity_capture_rate_pct": _pct(
-            len(captured_winners),
-            validated_opportunities,
-        ),
+        "opportunity_capture_rate_pct": _pct(len(captured_winners), validated),
         "estimated_missed_move_pct_sum": round(
-            sum(
-                float(row.get("estimated_missed_move_pct") or 0.0)
-                for row in executable_misses
-            ),
+            sum(float(row.get("estimated_missed_move_pct") or 0.0) for row in executable_misses),
             6,
         ),
         "by_classification": dict(sorted(by_classification.items())),
@@ -680,26 +828,118 @@ def build_accountability_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str,
             "win_rate_pct": _pct(paper_wins, len(paper_values)),
             "net_pnl": round(sum(paper_values), 8) if paper_values else None,
         },
+        "guardrails": {
+            "production_threshold_changed": False,
+            "margin_policy_changed": False,
+            "ranking_changed": False,
+            "alert_authority_changed": False,
+            "trade_authority_changed": False,
+        },
+    }
+
+
+def build_accountability_summary_from_state(
+    *,
+    ledger_path: Path = DEFAULT_LEDGER_FILE,
+    state_path: Path | None = None,
+) -> dict[str, Any]:
+    connection = _open_state(state_path or _state_path_for(ledger_path))
+    try:
+        _reconcile_state(connection, ledger_path)
+        aggregate = connection.execute(
+            """
+            SELECT count(*), coalesce(sum(outcome_complete), 0),
+                   coalesce(sum(market_winner), 0), coalesce(sum(captured_winner), 0),
+                   coalesce(sum(executable_false_negative), 0),
+                   coalesce(sum(threshold_miss), 0), coalesce(sum(cap_miss), 0),
+                   coalesce(sum(operational_miss), 0),
+                   coalesce(sum(estimated_missed_move), 0.0),
+                   avg(decision_latency_ms), count(decision_latency_ms),
+                   coalesce(sum(threshold_shadow), 0),
+                   coalesce(sum(expanded_cap_shadow), 0),
+                   count(paper_net_pnl),
+                   coalesce(sum(CASE WHEN paper_net_pnl > 0 THEN 1 ELSE 0 END), 0),
+                   sum(paper_net_pnl)
+            FROM latest
+            """
+        ).fetchone()
+        by_classification = {
+            str(name): int(count)
+            for name, count in connection.execute(
+                "SELECT classification, count(*) FROM latest GROUP BY classification"
+            ).fetchall()
+        }
+        by_gate = {
+            str(name or "NO_TERMINAL_GATE"): int(count)
+            for name, count in connection.execute(
+                """
+                SELECT terminal_gate, count(*) FROM latest
+                WHERE market_winner = 1
+                GROUP BY terminal_gate
+                """
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+
+    directional = int(aggregate[0])
+    completed = int(aggregate[1])
+    winners = int(aggregate[2])
+    captured = int(aggregate[3])
+    misses = int(aggregate[4])
+    threshold_misses = int(aggregate[5])
+    cap_misses = int(aggregate[6])
+    operational = int(aggregate[7])
+    paper_count = int(aggregate[13])
+    paper_wins = int(aggregate[14])
+    return {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "read_only": True,
+        "population": {
+            "directional_evaluations": directional,
+            "completed_forward_outcomes": completed,
+            "market_winner_candidates": winners,
+            "captured_winners": captured,
+            "executable_false_negatives": misses,
+            "threshold_70_79_miss_candidates": threshold_misses,
+            "ranking_or_cap_miss_candidates": cap_misses,
+            "operational_executable_misses": operational,
+        },
+        "opportunity_capture_rate_pct": _pct(captured, captured + misses),
+        "estimated_missed_move_pct_sum": round(float(aggregate[8] or 0.0), 6),
+        "by_classification": dict(sorted(by_classification.items())),
+        "missed_winners_by_terminal_gate": dict(
+            sorted(by_gate.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        "latency": {
+            "samples": int(aggregate[10]),
+            "mean_decision_latency_ms": (
+                round(float(aggregate[9]), 3) if aggregate[9] is not None else None
+            ),
+        },
+        "paper": {
+            "outcomes": paper_count,
+            "wins": paper_wins,
+            "win_rate_pct": _pct(paper_wins, paper_count),
+            "net_pnl": round(float(aggregate[15]), 8)
+            if aggregate[15] is not None
+            else None,
+        },
         "counterfactual_experiments": {
             "threshold_70_79": {
-                "population": sum(
-                    bool((row.get("counterfactuals") or {}).get("threshold_70_79_shadow"))
-                    for row in current
-                ),
-                "winner_candidates": len(threshold_misses),
+                "population": int(aggregate[11]),
+                "winner_candidates": threshold_misses,
                 "production_changed": False,
             },
             "expanded_cap": {
-                "population": sum(
-                    bool((row.get("counterfactuals") or {}).get("expanded_cap_shadow"))
-                    for row in current
-                ),
-                "winner_candidates": len(cap_misses),
+                "population": int(aggregate[12]),
+                "winner_candidates": cap_misses,
                 "production_changed": False,
             },
             "decay_aware": {
                 "status": "SHADOW_PROXY_ONLY",
-                "metric": "24h range consumed proxy",
+                "metric": "24h range consumed proxy when source snapshot is available",
                 "production_changed": False,
             },
         },
@@ -750,7 +990,7 @@ def build_from_files(
         intelligence_events=read_jsonl(intelligence_event_path),
         policy=policy,
     )
-    current = append_accountability_rows(rows, path=ledger_path)
-    summary = build_accountability_summary(current)
+    append_accountability_rows(rows, path=ledger_path)
+    summary = build_accountability_summary_from_state(ledger_path=ledger_path)
     write_summary(summary, path=summary_path)
     return summary
