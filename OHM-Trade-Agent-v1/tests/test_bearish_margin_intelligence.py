@@ -8,6 +8,7 @@ from app.scanner.execution_validation import evaluate_execution
 from app.scanner.margin_eligibility import (
     validate_short_margin_eligibility,
     keep_margin_tradeable_candidates,
+    recover_margin_rejected_long,
 )
 from app.scanner.models import MarketSnapshot
 from app.scanner.short_execution_quality import short_execution_is_tradeable
@@ -242,3 +243,52 @@ def test_strict_short_execution_requires_fresh_two_sided_coverage():
     ok, reasons = short_execution_is_tradeable(s)
     assert not ok
     assert any("not fresh" in reason for reason in reasons)
+
+
+
+def test_margin_rejected_short_recovers_independently_qualified_long():
+    selected = select_directional_candidates(
+        [snapshot(symbol="FALLBACKUSD", underlying_asset="FALLBACK", technical_score=82)]
+    )
+    assert len(selected) == 1
+    preferred = selected[0]
+    assert preferred.trade_direction == "SHORT"
+    assert preferred.directional_long_score == 82
+    assert preferred.directional_short_score == preferred.technical_score
+
+    validate_short_margin_eligibility([preferred], client=MarginClient({}))
+    fallback = recover_margin_rejected_long(preferred)
+
+    assert fallback is not None
+    assert fallback.trade_direction == "LONG"
+    assert fallback.technical_score == 82
+    assert fallback.margin_validation_status == "NOT_REQUIRED"
+    assert fallback.margin_eligible is False
+
+
+def test_margin_rejected_short_does_not_promote_below_threshold_long():
+    preferred = snapshot(
+        symbol="NOFALLBACKUSD",
+        underlying_asset="NOFALLBACK",
+        trade_direction="SHORT",
+        technical_score=90,
+        directional_long_score=79,
+        directional_short_score=90,
+        margin_validation_status="INELIGIBLE",
+        margin_eligible=False,
+    )
+    assert recover_margin_rejected_long(preferred) is None
+
+
+def test_margin_eligible_short_never_falls_back_to_long():
+    preferred = snapshot(
+        symbol="SHORTOKUSD",
+        underlying_asset="SHORTOK",
+        trade_direction="SHORT",
+        technical_score=90,
+        directional_long_score=85,
+        directional_short_score=90,
+        margin_validation_status="ELIGIBLE",
+        margin_eligible=True,
+    )
+    assert recover_margin_rejected_long(preferred) is None
