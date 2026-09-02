@@ -144,7 +144,7 @@ def test_early_watch_card_never_authorizes_entry():
     assert "REVIEW ENTRY" not in message
 
 def test_production_compose_explicitly_enables_early_watch():
-    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert 'OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"' in compose
     assert 'OPIP_ACTIONABLE_ONLY_ALERTS' not in compose
