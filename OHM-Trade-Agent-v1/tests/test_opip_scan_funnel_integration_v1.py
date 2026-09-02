@@ -9,6 +9,7 @@ re-derives them from the same evidence.
 """
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -642,3 +643,86 @@ def test_recovered_long_restores_tradingview_evidence(monkeypatch):
     assert attached == 1
     assert calls == [["RECOVERUSD"]]
     assert recovered._tradingview_evidence["signal_id"] == "tv-recovered-1"
+
+
+def test_production_margin_recovery_reranks_full_long_pool_end_to_end(
+    monkeypatch, tmp_path
+):
+    rejected_source = _snapshot("SHORTUSD", VIABLE)
+    rejected_source.technical_score = 82
+    better_long = _snapshot("BETTERUSD", VIABLE)
+    better_long.technical_score = 89
+    preferred_short = replace(
+        rejected_source,
+        trade_direction="SHORT",
+        technical_score=95,
+        directional_long_score=82,
+        directional_short_score=95,
+    )
+
+    _install_scan(
+        monkeypatch,
+        tmp_path,
+        [rejected_source, better_long],
+        openai=_FakeOpenAI(
+            _chief_payload(
+                [
+                    {
+                        "symbol": "BETTERUSD",
+                        "direction": "LONG",
+                        "rank": 1,
+                        "confidence": 95,
+                        "risk_level": "low",
+                        "decision": "alert",
+                        "reason": "best independently qualifying recovered LONG",
+                    }
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        scan_opportunities,
+        "select_candidates",
+        lambda items: [preferred_short],
+    )
+
+    def reject_short_margin(candidates, **kwargs):
+        assert candidates == [preferred_short]
+        preferred_short.margin_eligible = False
+        preferred_short.margin_validation_status = "INELIGIBLE"
+        return SimpleNamespace(
+            requested=1,
+            eligible=0,
+            ineligible=1,
+            unavailable=0,
+        )
+
+    monkeypatch.setattr(
+        scan_opportunities,
+        "validate_short_margin_eligibility",
+        reject_short_margin,
+    )
+
+    scan_opportunities.main()
+
+    summary = _summary(tmp_path)
+    events = store.read_funnel_events_for_scan(
+        summary["scan_id"],
+        path=tmp_path / "funnel_events.jsonl",
+    )
+    by_key = {
+        (event["pair"], event["direction"]): event
+        for event in events
+    }
+
+    assert by_key[("SHORTUSD", "SHORT")]["decision"] == "REJECTED"
+    assert (
+        by_key[("SHORTUSD", "SHORT")]["first_terminal_gate"]
+        == "MARGIN_ELIGIBILITY"
+    )
+    assert by_key[("BETTERUSD", "LONG")]["decision"] == "QUALIFIED"
+    assert ("SHORTUSD", "LONG") not in by_key
+    assert summary["funnel"]["entered"] == 2
+    assert summary["funnel"]["qualified"] == 1
+    assert summary["funnel"]["rejected_total"] == 1
+    assert summary["invariant_holds"] is True
