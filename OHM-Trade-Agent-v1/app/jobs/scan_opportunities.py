@@ -15,9 +15,10 @@ from app.opip.decision.store import append_screening_evaluations
 from app.opip.identity import resolve_venue_instrument_identity
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
-from app.scanner.directional_candidates import select_directional_candidates
+from app.scanner.directional_candidates import MAX_PER_DIRECTION, select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
+    bound_recovered_longs,
     keep_margin_tradeable_candidates,
     recover_margin_rejected_longs,
     validate_short_margin_eligibility,
@@ -945,6 +946,11 @@ def main():
     opip.record_margin(candidates)
     recovered_longs = recover_margin_rejected_longs(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
+    recovered_longs = bound_recovered_longs(
+        candidates,
+        recovered_longs,
+        max_per_direction=MAX_PER_DIRECTION,
+    )
     if recovered_longs:
         # The rejected SHORT remains terminal and fail-closed. These LONGs
         # independently cleared the same technical threshold before direction
