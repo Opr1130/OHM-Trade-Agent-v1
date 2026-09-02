@@ -93,6 +93,7 @@ STANDARD_HORIZONS: dict[str, timedelta] = {
     "60m": timedelta(minutes=60),
     "4h": timedelta(hours=4),
     "8h": timedelta(hours=8),
+    "12h": timedelta(hours=12),
     "24h": timedelta(hours=24),
 }
 
