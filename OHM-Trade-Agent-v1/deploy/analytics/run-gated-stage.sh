@@ -38,6 +38,18 @@ trap cleanup EXIT
 
 case "$STAGE" in
   prepare)
+    for unit in \
+      opip-learning-sync.timer \
+      opip-learning-capture.timer \
+      opip-learning-outcomes.timer; do
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    for unit in \
+      opip-learning-sync.service \
+      opip-learning-capture.service \
+      opip-learning-outcomes.service; do
+      systemctl stop "$unit" >/dev/null 2>&1 || true
+    done
     bash "$APP_ROOT/deploy/learning/bootstrap-opip-learning-worker.sh" \
       "$TARGET_SHA" 10.116.0.2 opiplearn
     ;;
