@@ -31,3 +31,19 @@ def test_ranking_enabled_still_applies_action_gate(monkeypatch):
     # for unavailable liquidity capacity. The invariant under test is that the
     # mandatory gate is invoked rather than bypassed.
     assert sent == []
+
+
+
+def test_ranking_disabled_still_applies_action_gate(monkeypatch):
+    helpers = _load_profit_ranking_test_module()
+    events, _, sent = helpers._configure_pipeline(
+        monkeypatch,
+        [{"symbol": "UNRANKEDGATEDUSD", "move": 7.0}],
+    )
+    settings = scan_opportunities.get_settings()
+    settings.opip_global_capital_ranking_enabled = False
+
+    scan_opportunities.main()
+
+    assert "action_gate" in events
+    assert sent == []
