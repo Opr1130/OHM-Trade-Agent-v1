@@ -9,13 +9,17 @@ ALLOWED_RISK_LEVELS = {"low", "medium"}
 ALLOWED_DIRECTIONS = {"LONG", "SHORT"}
 
 
-def _parsed_confidence(candidate: dict[str, Any]) -> int | None:
+def parse_confidence(candidate: dict[str, Any]) -> int | None:
+    """Parse Chief confidence using the fail-closed 0-100 integer schema."""
     raw = candidate.get("confidence")
     if isinstance(raw, bool):
         return None
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            return None
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if value < 0 or value > 100:
         return None
@@ -36,12 +40,12 @@ def candidate_alert_authorized(candidate: dict[str, Any]) -> bool:
         decision == "alert"
         and risk_level in ALLOWED_RISK_LEVELS
         and direction in ALLOWED_DIRECTIONS
-        and _parsed_confidence(candidate) is not None
+        and parse_confidence(candidate) is not None
     )
 
 
 def confidence_below_measurement_boundary(candidate: dict[str, Any]) -> bool:
-    value = _parsed_confidence(candidate)
+    value = parse_confidence(candidate)
     return value is not None and value < MIN_CONFIDENCE
 
 
