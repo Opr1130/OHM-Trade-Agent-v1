@@ -286,13 +286,15 @@ def test_analytics_topology_is_separate_bounded_and_without_trade_authority():
 
 def test_rollout_gates_prevent_immediate_cutover():
     bootstrap = (ROOT / "deploy/analytics/bootstrap-opip-data-platform.sh").read_text()
+    runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
     assert "empty|backfill|shipper|reads-ready" in bootstrap
     assert "EMPTY_DEPLOY_COUNT" in bootstrap
-    assert "OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" in bootstrap
+    assert "EMPTY_LAST_COMPLETED_AT_UTC" in bootstrap
     assert "7 * 86400" in bootstrap
     assert "health --require-ready" in bootstrap
-    assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" in bootstrap
-    assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" in bootstrap
+    assert "offhost-backup.env" in bootstrap
+    assert "last-restore-drill.env" in bootstrap
+    assert "empty-rollback.env" in bootstrap
     assert "analytics host must be resized to at least 2 GiB" in bootstrap
     assert "opip-learning-plane.lock" in bootstrap
     assert "remote_main" in bootstrap and "TARGET_SHA" in bootstrap
@@ -306,10 +308,13 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "backup_epoch > now_epoch" in bootstrap
     assert "restore_epoch > now_epoch" in bootstrap
     assert "rollback_epoch > now_epoch" in bootstrap
-    assert bootstrap.index(
-        ': "${OPIP_RESTORE_DRILL_VERIFIED_AT_UTC:?complete a restore drill before validating rollback evidence}"'
-    ) < bootstrap.index('rollback_epoch="$(date -u -d "$OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC"')
-    assert "a checksummed PostgreSQL dump is required before promotion" in bootstrap
+    assert "restore drill must validate the attested PostgreSQL dump" in bootstrap
+    assert "explicit empty-stage rollback evidence is required before backfill" in bootstrap
+    assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" not in bootstrap
+    assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" not in bootstrap
+    assert "OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" not in bootstrap
+    assert "offhost-verified" in runner
+    assert "rollback-verified" in runner
     maintenance = (
         ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
     ).read_text()

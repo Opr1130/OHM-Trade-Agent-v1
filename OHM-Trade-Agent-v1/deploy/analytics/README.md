@@ -22,24 +22,31 @@ to, waits for, or fails because of PostgreSQL.
    use the analytics container hostname `opip-postgres` in admin/shipper DSNs,
    and set mode `0600`.
 2. Set `OPIP_POSTGRES_BIND_ADDRESS` to the analytics droplet's private VPC IP.
-3. Run `bootstrap-opip-data-platform.sh <EXACT_MAIN_SHA> empty` as root twice,
-   with the architecture review's rollback drill between the two deploys.
-4. Record that drill in `OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC`, then advance one
-   explicit stage at a time: `backfill`, `shipper`, and `reads-ready`.
-5. Only after `reads-ready` succeeds, configure the production dashboard with
+3. Run the owner-gated `empty` stage twice with a successful restore drill
+   between the first and latest successful empty deployments.
+4. Verify the off-host infrastructure copy, then run `offhost-verified` to
+   record that independent attestation. Run `rollback-verified` to record the
+   two-empty-plus-restore evidence.
+5. Advance one explicit stage at a time: `backfill`, `shipper`, and
+   `reads-ready`.
+6. Only after `reads-ready` succeeds, configure the production dashboard with
    the read-only `opip_dashboard` credential, set
    `OPIP_DATA_PLATFORM_READS_ENABLED=true`, and keep the 1.5 second statement
    timeout. Live tiles remain file-backed.
 
 The stages are deliberately non-collapsible. `empty` installs PostgreSQL and
-the additive schema; `backfill` requires two empty deployments plus explicit
-rollback evidence; `shipper` requires a clean backfill; and `reads-ready`
-requires a seven-day shipper soak, clean reconciliation, lag below five
-minutes, and no unresolved dead letters. A failed step leaves the production
-scanner and its file WAL unchanged.
+the additive schema; `offhost-verified` records an owner attestation only
+after the independent infrastructure copy is verified; `rollback-verified`
+requires two successful empty deployments with a restore drill between them;
+`backfill` requires all of that durable evidence; `shipper` requires a clean
+backfill; and `reads-ready` requires a seven-day shipper soak, clean
+reconciliation, lag below five minutes, and no unresolved dead letters. A
+failed step leaves the production scanner and its file WAL unchanged.
 
 Nightly custom-format dumps are checksummed locally, but the off-host copy is
-an independent infrastructure responsibility. After the first dump and after
-every material schema change, run `opip-postgres-restore-drill`; it restores
+an independent infrastructure responsibility. The `offhost-verified` stage
+does not create that copy; it records the owner's attestation after the copy has
+been verified. After the first dump and after every material schema change, run
+`opip-postgres-restore-drill`; it restores
 into a temporary database, validates `ops.schema_version`, records evidence,
 and drops only that temporary database.
