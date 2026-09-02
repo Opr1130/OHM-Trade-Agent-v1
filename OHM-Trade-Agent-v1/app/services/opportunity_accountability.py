@@ -21,8 +21,8 @@ import math
 import os
 from pathlib import Path
 import sqlite3
-from statistics
-import zlib import mean, median
+from statistics import mean, median
+import zlib
 from typing import Any, Iterable, Mapping
 
 
