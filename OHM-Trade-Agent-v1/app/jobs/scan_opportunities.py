@@ -15,12 +15,15 @@ from app.opip.decision.store import append_screening_evaluations
 from app.opip.identity import resolve_venue_instrument_identity
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
-from app.scanner.directional_candidates import MAX_PER_DIRECTION, select_directional_candidates
+from app.scanner.directional_candidates import (
+    MAX_PER_DIRECTION,
+    qualifying_long_alternatives,
+    select_directional_candidates,
+)
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
     bound_recovered_longs,
     keep_margin_tradeable_candidates,
-    recover_margin_rejected_longs,
     validate_short_margin_eligibility,
 )
 from app.scanner.market_regime import evaluate_market_regime
@@ -944,12 +947,26 @@ def main():
                     source="margin_eligibility_gate",
                 )
     opip.record_margin(candidates)
-    recovered_longs = recover_margin_rejected_longs(candidates)
+    pre_margin_candidate_count = len(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
+    margin_opened_slots = pre_margin_candidate_count - len(candidates)
+    existing_assets = {
+        str(candidate.underlying_asset or candidate.symbol)
+        for candidate in candidates
+    }
+    recovery_pool = (
+        qualifying_long_alternatives(
+            scan.snapshots,
+            excluded_assets=existing_assets,
+        )
+        if margin_opened_slots > 0
+        else []
+    )
     recovered_longs = bound_recovered_longs(
         candidates,
-        recovered_longs,
+        recovery_pool,
         max_per_direction=MAX_PER_DIRECTION,
+        recovery_slots=margin_opened_slots,
     )
     if recovered_longs:
         # The rejected SHORT remains terminal and fail-closed. These LONGs
