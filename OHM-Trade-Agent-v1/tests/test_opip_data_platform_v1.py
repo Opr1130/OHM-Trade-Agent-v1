@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
 
 def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     migrations = discover_migrations()
-    assert [item.version for item in migrations] == [1, 2, 3]
+    assert [item.version for item in migrations] == [1, 2, 3, 4]
     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql
@@ -195,7 +195,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Connection:
         def __init__(self):
             self.autocommit = False
-            self.population = [True, False, True]
+            self.population = [True, False, True, False]
             self.events = []
 
         def cursor(self):
@@ -207,7 +207,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 3
+    assert len(refreshes) == 4
     assert all(event[1] is True for event in refreshes)
     assert connection.events.index(refreshes[0]) > next(
         index for index, event in enumerate(connection.events) if event[0] == "commit"
@@ -259,6 +259,10 @@ def test_all_streams_are_exported_and_manifest_validated_before_promotion():
     exporter = (ROOT / "deploy/remote/export-opip-learning-evidence.sh").read_text()
     sync = (ROOT / "deploy/learning/opip-learning-sync.sh").read_text()
     for spec in STREAM_SPECS:
+        # Opportunity accountability is produced on the isolated learning
+        # worker after sync; it is not a production-export source stream.
+        if spec.name == "opportunity_accountability":
+            continue
         relative = str(spec.relative_path)
         assert relative in exporter
         assert relative in sync
