@@ -253,6 +253,31 @@ def _direction_counts(candidates):
     )
 
 
+def _merge_recovered_tradingview_evidence(
+    recovered_longs,
+    *,
+    enabled: bool,
+) -> int:
+    """Attach advisory TradingView context to recovered LONGs, fail-soft."""
+    if not enabled or not recovered_longs:
+        return 0
+    try:
+        from app.services.tradingview_inbox import merge_native_candidate_evidence
+
+        attached = merge_native_candidate_evidence(recovered_longs)
+        print(
+            "Recovered LONGs tagged with TradingView confirmation:",
+            attached,
+        )
+        return int(attached)
+    except Exception:
+        logger.exception(
+            "TradingView v2 recovered-LONG evidence merge failed open; "
+            "continuing with native evidence only"
+        )
+        return 0
+
+
 def _capture_native_scan_cohort(scan, *, decision_at):
     """Capture the exact native production scan cohort for O'Pip evidence.
 
@@ -972,6 +997,12 @@ def main():
         # The rejected SHORT remains terminal and fail-closed. These LONGs
         # independently cleared the same technical threshold before direction
         # resolution and enter the normal downstream validation path from here.
+        # They are created after the initial TradingView augmentation pass, so
+        # restore advisory evidence before O'Pip/Chief sees the fallback.
+        _merge_recovered_tradingview_evidence(
+            recovered_longs,
+            enabled=bool(getattr(settings, "tradingview_v2_enabled", False)),
+        )
         opip.register_candidates(recovered_longs)
         opip.record_margin(recovered_longs)
         candidates.extend(recovered_longs)
