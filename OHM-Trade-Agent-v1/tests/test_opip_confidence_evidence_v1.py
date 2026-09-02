@@ -228,7 +228,11 @@ def test_recent_funnel_aggregates_confidence_and_primary_choke(tmp_path):
     assert report["qualified_signals"] == 1
     assert report["paper_admission_eligible"] == 1
     assert report["paper_admitted"] == "NOT_INSTRUMENTED"
-    assert report["primary_choke"] == "CHIEF_WATCH_REJECT"
+    assert report["primary_choke"] == "RECOMMENDATION_GATE"
+    assert report["funnel_candidates"] == 2
+    assert report["funnel_qualified"] == 1
+    assert report["funnel_rejected"] == 1
+    assert report["funnel_invariant_holds"] is True
     assert report["measurement_only"] is True
     assert report["affects_trade_authority"] is False
 
@@ -263,7 +267,9 @@ def test_action_gate_error_is_not_reported_as_rejection(tmp_path):
             {
                 "decision_at_utc": NOW.isoformat(),
                 "decision": "OPERATIONAL_FAILURE",
+                "first_terminal_gate": "CAPITAL_PORTFOLIO_GATE",
                 "terminal_reason_code": "GATE_EVALUATION_ERROR",
+                "terminal_reason_class": "OPERATIONAL",
                 "gate_results": [
                     {
                         "gate": "CAPITAL_PORTFOLIO_GATE",
@@ -283,7 +289,8 @@ def test_action_gate_error_is_not_reported_as_rejection(tmp_path):
     )
     assert report["action_gate_error"] == 1
     assert report["action_gate_reject"] == 0
-    assert report["primary_choke"] == "NONE"
+    assert report["primary_choke"] == "CAPITAL_PORTFOLIO_GATE"
+    assert report["primary_operational_choke"] == "CAPITAL_PORTFOLIO_GATE"
 
 
 
@@ -363,3 +370,115 @@ def test_recent_funnel_skips_malformed_paper_admission_values(tmp_path):
         now=NOW,
     )
     assert report["paper_admission_eligible"] == 5
+
+
+
+def test_recent_funnel_separates_broad_search_from_early_watch(tmp_path):
+    funnel = tmp_path / "funnel-mixed.jsonl"
+    screening = tmp_path / "screening-mixed.jsonl"
+    summaries = tmp_path / "summaries-mixed.jsonl"
+    _write_jsonl(funnel, [])
+    _write_jsonl(summaries, [])
+    _write_jsonl(
+        screening,
+        [
+            {
+                "observed_at": NOW.isoformat(),
+                "scanner_type": "BROAD_SEARCH",
+                "outcome": "ADVANCED",
+            },
+            {
+                "observed_at": NOW.isoformat(),
+                "scanner_type": "BROAD_SEARCH",
+                "outcome": "BELOW_THRESHOLD",
+            },
+            {
+                "observed_at": NOW.isoformat(),
+                "scanner_type": "EARLY_WATCH",
+                "outcome": "ADVANCED",
+            },
+            {
+                "observed_at": NOW.isoformat(),
+                "scanner_type": "EARLY_WATCH",
+                "outcome": "BELOW_COARSE_THRESHOLD",
+            },
+        ],
+    )
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+
+    assert report["market_observed"] == 2
+    assert report["scanner_selected"] == 1
+    assert report["broad_search_observed"] == 2
+    assert report["broad_search_threshold_advanced"] == 1
+    assert report["early_watch_observed"] == 2
+    assert report["early_watch_advanced"] == 1
+
+
+def test_recent_funnel_uses_actual_first_terminal_gate_for_choke(tmp_path):
+    funnel = tmp_path / "funnel-terminal.jsonl"
+    screening = tmp_path / "screening-terminal.jsonl"
+    summaries = tmp_path / "summaries-terminal.jsonl"
+    _write_jsonl(screening, [])
+    _write_jsonl(summaries, [])
+    rows = []
+    for index in range(3):
+        rows.append(
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "REJECTED",
+                "first_terminal_gate": "MARGIN_ELIGIBILITY",
+                "terminal_reason_code": "MARGIN_INELIGIBLE",
+                "terminal_reason_class": "POLICY",
+                "gate_results": [
+                    {
+                        "gate": "MARGIN_ELIGIBILITY",
+                        "status": "FAIL",
+                        "reason_code": "MARGIN_INELIGIBLE",
+                        "reason_class": "POLICY",
+                        "metadata": {},
+                    }
+                ],
+            }
+        )
+    rows.append(
+        {
+            "decision_at_utc": NOW.isoformat(),
+            "decision": "REJECTED",
+            "first_terminal_gate": "DETERMINISTIC_QUALITY",
+            "terminal_reason_code": "DETERMINISTIC_VIABILITY_FAILED",
+            "terminal_reason_class": "POLICY",
+            "gate_results": [
+                {
+                    "gate": "DETERMINISTIC_QUALITY",
+                    "status": "FAIL",
+                    "reason_code": "DETERMINISTIC_VIABILITY_FAILED",
+                    "reason_class": "POLICY",
+                    "metadata": {},
+                }
+            ],
+        }
+    )
+    _write_jsonl(funnel, rows)
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+
+    assert report["margin_reject"] == 3
+    assert report["deterministic_prefilter_reject"] == 1
+    assert report["primary_choke"] == "MARGIN_ELIGIBILITY"
+    assert report["primary_policy_choke"] == "MARGIN_ELIGIBILITY"
+    assert report["terminal_gate_counts"] == {
+        "MARGIN_ELIGIBILITY": 3,
+        "DETERMINISTIC_QUALITY": 1,
+    }
+    assert report["funnel_invariant_holds"] is True
