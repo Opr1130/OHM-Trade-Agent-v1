@@ -19,6 +19,7 @@ from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.global_market_context import load_coingecko_global_context
 from app.scanner.margin_eligibility import (
     keep_margin_tradeable_candidates,
+    recover_margin_rejected_longs,
     validate_short_margin_eligibility,
 )
 from app.scanner.market_regime import evaluate_market_regime
@@ -942,7 +943,21 @@ def main():
                     source="margin_eligibility_gate",
                 )
     opip.record_margin(candidates)
+    recovered_longs = recover_margin_rejected_longs(candidates)
     candidates = keep_margin_tradeable_candidates(candidates)
+    if recovered_longs:
+        # The rejected SHORT remains terminal and fail-closed. These LONGs
+        # independently cleared the same technical threshold before direction
+        # resolution and enter the normal downstream validation path from here.
+        opip.register_candidates(recovered_longs)
+        opip.record_margin(recovered_longs)
+        candidates.extend(recovered_longs)
+        for fallback in recovered_longs:
+            print(
+                f"MARGIN LONG FALLBACK {fallback.symbol}: "
+                f"LongScore={fallback.technical_score} "
+                "Reason=preferred SHORT was not margin-tradeable"
+            )
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
         opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
