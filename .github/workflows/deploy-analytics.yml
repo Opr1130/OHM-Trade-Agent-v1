@@ -166,6 +166,27 @@ jobs:
           fi
           exit 0
 
+      - name: Clean remote release and sealed environment
+        if: always() && steps.target.outputs.sha != ''
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_ANALYTICS_HOST }}
+          USER: ${{ secrets.OPIP_ANALYTICS_USER }}
+          PORT: ${{ secrets.OPIP_ANALYTICS_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_analytics \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n rm -rf -- '$RELEASE_DIR'; sudo -n rm -f -- '/tmp/opip-analytics-env-$GITHUB_RUN_ID'"
+
       - name: Publish analytics deployment receipt
         if: always() && steps.target.outputs.sha != ''
         env:
