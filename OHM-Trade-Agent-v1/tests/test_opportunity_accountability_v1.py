@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import gzip
+import json
 from pathlib import Path
 
 from app.services.dashboard_read_model import _opportunity_accountability_snapshot
@@ -8,6 +10,7 @@ from app.services.opportunity_accountability import (
     build_accountability_rows,
     build_accountability_summary,
     build_accountability_summary_from_state,
+    build_incremental_from_outcomes,
 )
 from app.services.signal_timing_v2 import STANDARD_HORIZONS
 
@@ -33,6 +36,12 @@ def _screening(
         "long_score": score_long,
         "short_score": score_short,
         "advanced_direction": advanced_direction,
+        "metadata": {
+            "reference_price": 100.0,
+            "recent_24h_high": 110.0,
+            "recent_24h_low": 90.0,
+            "measurement_only": True,
+        },
     }
 
 
@@ -272,3 +281,56 @@ def test_new_accountability_layer_has_no_execution_authority_imports():
         "telegram_bot_token",
     ):
         assert forbidden not in combined
+
+
+def test_incremental_join_reads_compressed_archived_screening_and_funnel(tmp_path):
+    screening_archive = tmp_path / "screening_archive"
+    funnel_archive = tmp_path / "funnel_archive"
+    screening_archive.mkdir()
+    funnel_archive.mkdir()
+    with gzip.open(
+        screening_archive / "screening-1.jsonl.gz",
+        "wt",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps(_screening()) + "\n")
+    with gzip.open(
+        funnel_archive / "funnel-1.jsonl.gz",
+        "wt",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps(_funnel()) + "\n")
+
+    ledger = tmp_path / "opportunity_accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+    summary_path = tmp_path / "summary.json"
+    summary = build_incremental_from_outcomes(
+        [_outcome()],
+        screening_path=tmp_path / "screening-hot.jsonl",
+        screening_archive=screening_archive,
+        funnel_path=tmp_path / "funnel-hot.jsonl",
+        funnel_archive=funnel_archive,
+        intelligence_event_path=tmp_path / "events.jsonl",
+        ledger_path=ledger,
+        summary_path=summary_path,
+        state_path=state,
+        policy=AccountabilityPolicy(
+            production_threshold=80,
+            shadow_threshold=70,
+            winner_move_pct=2,
+        ),
+    )
+
+    assert summary["population"]["directional_evaluations"] == 2
+    assert summary["population"]["executable_false_negatives"] == 1
+    assert summary["counterfactual_experiments"]["decay_aware"]["samples"] == 2
+    assert ledger.exists()
+    assert summary_path.exists()
+    persisted = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    long_row = next(row for row in persisted if row["direction"] == "LONG")
+    assert long_row["range_consumed_proxy_pct"] == 50.0
+    assert long_row["affects_trade_authority"] is False
