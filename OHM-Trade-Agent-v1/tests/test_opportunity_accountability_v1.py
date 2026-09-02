@@ -260,6 +260,44 @@ def test_dashboard_accountability_rollup_reports_capture_and_latency():
     assert snapshot["mean_decision_latency_ms"] == 420.0
 
 
+def test_dashboard_latency_weights_only_rows_with_latency():
+    historical = {
+        "available": True,
+        "opportunity_accountability_daily": [
+            {
+                "date": "2026-09-01",
+                "directional_evaluations": 1000,
+                "completed_forward_outcomes": 100,
+                "market_winner_candidates": 0,
+                "captured_winners": 0,
+                "executable_false_negatives": 0,
+                "threshold_70_79_miss_candidates": 0,
+                "ranking_or_cap_miss_candidates": 0,
+                "operational_executable_misses": 0,
+                "estimated_missed_move_pct_sum": 0.0,
+                "decision_latency_samples": 1,
+                "mean_decision_latency_ms": 100.0,
+            },
+            {
+                "date": "2026-09-02",
+                "directional_evaluations": 10,
+                "completed_forward_outcomes": 10,
+                "market_winner_candidates": 0,
+                "captured_winners": 0,
+                "executable_false_negatives": 0,
+                "threshold_70_79_miss_candidates": 0,
+                "ranking_or_cap_miss_candidates": 0,
+                "operational_executable_misses": 0,
+                "estimated_missed_move_pct_sum": 0.0,
+                "decision_latency_samples": 9,
+                "mean_decision_latency_ms": 500.0,
+            },
+        ],
+    }
+    snapshot = _opportunity_accountability_snapshot(historical, "all")
+    assert snapshot["mean_decision_latency_ms"] == 460.0
+
+
 def test_forward_outcomes_include_12h_horizon():
     assert STANDARD_HORIZONS["12h"] == timedelta(hours=12)
 
