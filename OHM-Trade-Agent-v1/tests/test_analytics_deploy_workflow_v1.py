@@ -10,7 +10,7 @@ def test_analytics_workflow_is_owner_gated_and_non_collapsible():
     assert "github.event.comment.author_association == 'OWNER'" in workflow
     assert "Require target to equal current main" in workflow
     assert "Require successful exact-SHA CI" in workflow
-    assert "prepare|empty|backup|restore-drill|backfill|shipper|reads-ready" in workflow
+    assert "prepare|activate|empty|backup|restore-drill|backfill|shipper|reads-ready" in workflow
     assert "does not merge, trade, or enable production reads" in workflow
 
 
@@ -21,6 +21,9 @@ def test_remote_runner_keeps_existing_platform_evidence_gates():
     assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" not in runner
     assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" not in runner
     assert 'backfill|shipper|reads-ready)' in runner
+    assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"' in runner
+    assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"' in runner
+    assert runner.index("prepare)") < runner.index("activate)")
     assert 'bootstrap-opip-data-platform.sh\" \"$TARGET_SHA\" \"$STAGE\"' in runner
     assert "7 * 86400" in bootstrap
     assert "health --require-ready" in bootstrap
