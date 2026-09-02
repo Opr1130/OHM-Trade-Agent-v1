@@ -210,4 +210,7 @@ def bound_recovered_longs(
         for candidate in current_candidates
     )
     available = max(0, int(max_per_direction) - existing_longs)
-    return list(recovered_longs[:available])
+    return sorted(
+        recovered_longs,
+        key=lambda candidate: (-candidate.technical_score, candidate.symbol),
+    )[:available]
