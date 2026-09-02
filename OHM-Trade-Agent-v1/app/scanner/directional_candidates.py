@@ -68,13 +68,22 @@ def select_directional_candidates(
 
         options: list[MarketSnapshot] = []
         if long_score >= min_score:
-            options.append(replace(snapshot, trade_direction="LONG"))
+            options.append(
+                replace(
+                    snapshot,
+                    trade_direction="LONG",
+                    directional_long_score=int(long_score),
+                    directional_short_score=int(short_score),
+                )
+            )
         if short_score >= min_score:
             options.append(
                 replace(
                     snapshot,
                     trade_direction="SHORT",
                     technical_score=short_score,
+                    directional_long_score=int(long_score),
+                    directional_short_score=int(short_score),
                 )
             )
         if not options:
