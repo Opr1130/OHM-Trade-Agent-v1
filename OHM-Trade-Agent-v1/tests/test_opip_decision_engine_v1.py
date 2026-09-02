@@ -251,8 +251,17 @@ def test_recommendation_gate_separates_every_ai_failure_mode():
         {"decision": "alert", "risk_level": "low", "direction": "LONG",
          "confidence": AI_MIN_CONFIDENCE - 1}
     )
-    assert low_confidence.reason_code is ReasonCode.AI_CONFIDENCE_BELOW_THRESHOLD
+    assert low_confidence.status is GateStatus.PASS
+    assert low_confidence.reason_code is ReasonCode.AI_CONFIDENCE_COUNTERFACTUAL
     assert low_confidence.threshold == AI_MIN_CONFIDENCE
+    assert low_confidence.metadata["confidence_is_trade_authority"] is False
+
+    malformed_confidence = evaluate_recommendation_gate_item(
+        {"decision": "alert", "risk_level": "low", "direction": "LONG",
+         "confidence": "not-a-number"}
+    )
+    assert malformed_confidence.status is GateStatus.FAIL
+    assert malformed_confidence.reason_code is ReasonCode.AI_CONFIDENCE_INVALID
 
     bad_risk = evaluate_recommendation_gate_item(
         {"decision": "alert", "risk_level": "high", "direction": "LONG",
