@@ -324,7 +324,7 @@ def evaluate_recommendation_gate_item(
     """
     decision = str(item.get("decision") or "").lower()
     risk_level = str(item.get("risk_level") or "").lower()
-    direction = str(item.get("direction") or "LONG").upper()
+    direction = str(item.get("direction") or "").upper()
     confidence = parse_confidence(item)
 
     metadata = {
