@@ -26,6 +26,7 @@ from app.opip.decision.models import (
     GateStatus,
 )
 from app.opip.decision.versioning import version_stamp
+from app.services.recommendation_gate import parse_confidence
 
 
 MAX_NEAREST_MISSES = 5
@@ -386,11 +387,9 @@ def build_recent_qualification_funnel(
                     counts["chief_watch"] += 1
                 elif ai_decision:
                     counts["chief_reject"] += 1
-                confidence = metadata.get("ai_confidence")
-                try:
-                    confidence_value = int(confidence)
-                except (TypeError, ValueError):
-                    confidence_value = None
+                confidence_value = parse_confidence(
+                    {"confidence": metadata.get("ai_confidence")}
+                )
                 if confidence_value is not None:
                     if confidence_value >= 85:
                         counts["confidence_ge_85"] += 1
@@ -418,8 +417,20 @@ def build_recent_qualification_funnel(
                 elif status == "ERROR":
                     counts["action_gate_error"] += 1
 
+    def _paper_admission_value(row: Mapping[str, Any]) -> int:
+        raw = row.get("paper_admission_eligible")
+        if isinstance(raw, bool):
+            return 0
+        if isinstance(raw, float) and not raw.is_integer():
+            return 0
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return value if value >= 0 else 0
+
     counts["paper_admission_eligible"] = sum(
-        int(row.get("paper_admission_eligible") or 0) for row in summaries
+        _paper_admission_value(row) for row in summaries
     )
 
     choke_candidates = {
