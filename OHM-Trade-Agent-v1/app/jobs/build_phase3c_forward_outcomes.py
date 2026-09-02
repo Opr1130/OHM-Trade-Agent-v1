@@ -383,6 +383,7 @@ def _next_due_at(
         timedelta(minutes=60),
         timedelta(hours=4),
         timedelta(hours=8),
+        timedelta(hours=12),
         timedelta(hours=24),
     )
     for delta in milestones:
