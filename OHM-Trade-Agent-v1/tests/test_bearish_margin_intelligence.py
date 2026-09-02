@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.exchanges.kraken import BookLevel, PreTradeBook, KrakenAPIError
+from app.opip.decision.gates import evaluate_margin_gate
+from app.opip.decision.models import DecisionOutcome, ReasonClass, ReasonCode, terminal_attribution
 from app.scanner.directional_candidates import (
     qualifying_long_alternatives,
     select_directional_candidates,
@@ -434,3 +436,32 @@ def test_qualifying_long_alternatives_tie_breaks_by_symbol():
 
     assert [item.symbol for item in forward] == ["AAAUSD"]
     assert [item.symbol for item in reverse] == ["AAAUSD"]
+
+
+
+def test_margin_unavailable_is_operational_not_policy():
+    s = snapshot(trade_direction="SHORT")
+    validate_short_margin_eligibility([s], client=MarginClient(error=True))
+
+    result = evaluate_margin_gate(s)
+    outcome, gate, reason_code, _ = terminal_attribution([result])
+
+    assert result.reason_code is ReasonCode.MARGIN_VALIDATION_UNAVAILABLE
+    assert result.reason_class is ReasonClass.OPERATIONAL
+    assert outcome is DecisionOutcome.OPERATIONAL_FAILURE
+    assert gate.value == "MARGIN_ELIGIBILITY"
+    assert reason_code is ReasonCode.MARGIN_VALIDATION_UNAVAILABLE
+
+
+def test_margin_ineligible_remains_policy_rejection():
+    s = snapshot(trade_direction="SHORT")
+    validate_short_margin_eligibility([s], client=MarginClient({}))
+
+    result = evaluate_margin_gate(s)
+    outcome, gate, reason_code, _ = terminal_attribution([result])
+
+    assert result.reason_code is ReasonCode.MARGIN_INELIGIBLE
+    assert result.reason_class is ReasonClass.POLICY
+    assert outcome is DecisionOutcome.REJECTED
+    assert gate.value == "MARGIN_ELIGIBILITY"
+    assert reason_code is ReasonCode.MARGIN_INELIGIBLE
