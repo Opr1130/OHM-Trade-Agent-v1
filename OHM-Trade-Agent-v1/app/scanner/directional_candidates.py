@@ -163,7 +163,14 @@ def qualifying_long_alternatives(
             directional_short_score=short_score,
         )
         previous = best_by_asset.get(asset)
-        if previous is None or candidate.technical_score > previous.technical_score:
+        if (
+            previous is None
+            or candidate.technical_score > previous.technical_score
+            or (
+                candidate.technical_score == previous.technical_score
+                and candidate.symbol < previous.symbol
+            )
+        ):
             best_by_asset[asset] = candidate
 
     return sorted(
