@@ -329,11 +329,10 @@ def build_recent_qualification_funnel(
                 metadata = {}
 
             if name == "DETERMINISTIC_QUALITY":
-                counts[
-                    "deterministic_prefilter_pass"
-                    if status == "PASS"
-                    else "deterministic_prefilter_reject"
-                ] += 1
+                if status == "PASS":
+                    counts["deterministic_prefilter_pass"] += 1
+                elif status == "FAIL":
+                    counts["deterministic_prefilter_reject"] += 1
             elif name == "AI_ELIGIBILITY" and status == "PASS":
                 counts["chief_eligible"] += 1
             elif name == "AI_INVOCATION":
@@ -371,13 +370,20 @@ def build_recent_qualification_funnel(
                     else:
                         counts["confidence_lt_70"] += 1
             elif name == "TARGET_QUALITY":
-                counts["target_pass" if status == "PASS" else "target_reject"] += 1
+                if status == "PASS":
+                    counts["target_pass"] += 1
+                elif status == "FAIL":
+                    counts["target_reject"] += 1
             elif name == "ECONOMIC_QUALITY":
-                counts["economic_pass" if status == "PASS" else "economic_reject"] += 1
+                if status == "PASS":
+                    counts["economic_pass"] += 1
+                elif status == "FAIL":
+                    counts["economic_reject"] += 1
             elif name == "CAPITAL_PORTFOLIO_GATE":
-                counts[
-                    "action_gate_pass" if status == "PASS" else "action_gate_reject"
-                ] += 1
+                if status == "PASS":
+                    counts["action_gate_pass"] += 1
+                elif status == "FAIL":
+                    counts["action_gate_reject"] += 1
 
     counts["paper_admitted"] = sum(
         int(row.get("paper_admission_eligible") or 0) for row in summaries
