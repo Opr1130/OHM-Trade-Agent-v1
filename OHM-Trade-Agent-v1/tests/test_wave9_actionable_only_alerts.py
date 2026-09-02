@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.jobs import scan_movers, scan_opportunities
@@ -141,4 +142,10 @@ def test_early_watch_card_never_authorizes_entry():
 
     assert "Action: WATCH ONLY — no entry is authorized" in message
     assert "REVIEW ENTRY" not in message
+
+def test_production_compose_explicitly_enables_early_watch():
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+
+    assert 'OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"' in compose
+    assert 'OPIP_ACTIONABLE_ONLY_ALERTS' not in compose
 
