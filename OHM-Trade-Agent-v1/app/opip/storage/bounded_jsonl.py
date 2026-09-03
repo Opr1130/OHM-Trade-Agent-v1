@@ -1004,7 +1004,12 @@ class BoundedJsonlArchive:
                 truncated=False,
                 warnings=("ARCHIVE_WINDOW_INDEX_UNAVAILABLE",),
             )
-        if not isinstance(state, dict) or state.get("schema_version") != 1:
+        if (
+            not isinstance(state, dict)
+            or type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
+            or type(state.get("manifest_present")) is not bool
+        ):
             return ArchiveWindowSelection(
                 paths=(),
                 complete=False,
@@ -1013,10 +1018,28 @@ class BoundedJsonlArchive:
             )
 
         complete = bool(state.get("complete", False))
+        manifest_present = state.get("manifest_present")
+        if complete and manifest_present is False:
+            archive_segments_exist = (
+                any(self.archive_dir.rglob(self.archive_glob))
+                if self.archive_dir.exists()
+                else False
+            )
+            if (
+                archive_segments_exist
+                or self.manifest_signature_file.exists()
+                or not self._window_index_state_proves_empty_archive_without_manifest()
+            ):
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_WINDOW_INDEX_INVALID",),
+                )
         if not complete:
             warnings.append("ARCHIVE_WINDOW_INDEX_INCOMPLETE")
 
-        if bool(state.get("manifest_present")):
+        if manifest_present:
             try:
                 manifest_stat = self.manifest_file.stat()
             except OSError:
