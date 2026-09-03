@@ -158,13 +158,22 @@ def test_repair_window_index_fails_closed_when_canonical_segment_is_missing(
     assert archive.repair_window_index_locked() is False
 
 
-def test_learning_export_repairs_indexes_before_publish_snapshot():
+def test_writer_and_deploy_repair_indexes_without_export_compute():
     exporter = (
         ROOT / "deploy" / "remote" / "export-opip-learning-evidence.sh"
     ).read_text(encoding="utf-8")
+    store = (
+        ROOT / "app" / "opip" / "decision" / "store.py"
+    ).read_text(encoding="utf-8")
+    deploy = (
+        ROOT / "deploy" / "remote" / "ohm-deploy"
+    ).read_text(encoding="utf-8")
+
+    assert "python" not in exporter
+    assert "docker" not in exporter
+    assert "archive.repair_window_index_locked()" in store
 
     repair = "python -m app.jobs.repair_opip_archive_window_indexes"
-    assert repair in exporter
-    assert "docker compose exec -T ohm-trade-agent" in exporter
-    assert exporter.index(repair) < exporter.index('touch "$PUBLISH_LOCK"')
-    assert exporter.index(repair) < exporter.index("copy_locked_jsonl()")
+    assert repair in deploy
+    assert deploy.index(repair) > deploy.index("wait_core_health")
+    assert "archive window-index repair deferred to writer maintenance" in deploy
