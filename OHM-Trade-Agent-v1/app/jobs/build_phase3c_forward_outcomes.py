@@ -18,6 +18,7 @@ import sqlite3
 from typing import Any
 
 from app.services.phase3c_outcomes import (
+    FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
     build_forward_outcome_labels,
     outcome_label_is_current,
 )
@@ -153,10 +154,85 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             outcome_record_id TEXT NOT NULL,
             outcome_revision INTEGER NOT NULL,
             window_complete INTEGER NOT NULL,
+            reference_at TEXT NOT NULL DEFAULT '',
+            label_schema_version INTEGER NOT NULL DEFAULT 0,
             row_json TEXT NOT NULL
         )
         """
     )
+    latest_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(latest_outcomes)"
+        ).fetchall()
+    }
+    if "reference_at" not in latest_columns:
+        connection.execute(
+            "ALTER TABLE latest_outcomes "
+            "ADD COLUMN reference_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "label_schema_version" not in latest_columns:
+        connection.execute(
+            "ALTER TABLE latest_outcomes "
+            "ADD COLUMN label_schema_version INTEGER NOT NULL DEFAULT 0"
+        )
+
+    index_fields_marker = connection.execute(
+        "SELECT value FROM metadata "
+        "WHERE key = 'latest_outcomes_index_fields_v1'"
+    ).fetchone()
+    if index_fields_marker is None:
+        connection.execute(
+            """
+            UPDATE latest_outcomes
+            SET reference_at = coalesce(
+                    CASE
+                        WHEN json_valid(row_json)
+                        THEN coalesce(
+                            json_extract(row_json, '$.reference_at'),
+                            json_extract(row_json, '$.decision_at_utc'),
+                            ''
+                        )
+                        ELSE ''
+                    END,
+                    ''
+                ),
+                label_schema_version = coalesce(
+                    CASE
+                        WHEN json_valid(row_json)
+                        THEN cast(
+                            coalesce(
+                                json_extract(
+                                    row_json,
+                                    '$.label_schema_version'
+                                ),
+                                0
+                            ) AS INTEGER
+                        )
+                        ELSE 0
+                    END,
+                    0
+                )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('latest_outcomes_index_fields_v1', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_latest_outcomes_reference "
+        "ON latest_outcomes(reference_at, snapshot_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_latest_outcomes_schema_reference "
+        "ON latest_outcomes("
+        "label_schema_version, window_complete, reference_at, snapshot_id"
+        ")"
+    )
+
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS accountability_handoff (
@@ -213,35 +289,19 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
 
         legacy_rows = connection.execute(
             """
-            WITH ordered AS (
-                SELECT
-                    snapshot_id,
-                    outcome_record_id,
-                    outcome_revision,
-                    row_json,
-                    coalesce(
-                        CASE
-                            WHEN json_valid(row_json)
-                            THEN json_extract(row_json, '$.reference_at')
-                            ELSE ''
-                        END,
-                        ''
-                    ) AS sort_reference_at
-                FROM latest_outcomes
-            )
             SELECT
                 snapshot_id,
                 outcome_record_id,
                 outcome_revision,
                 row_json,
-                sort_reference_at
-            FROM ordered
-            WHERE sort_reference_at > ?
+                reference_at
+            FROM latest_outcomes
+            WHERE reference_at > ?
                OR (
-                    sort_reference_at = ?
+                    reference_at = ?
                     AND snapshot_id > ?
                )
-            ORDER BY sort_reference_at, snapshot_id
+            ORDER BY reference_at, snapshot_id
             LIMIT ?
             """,
             (
@@ -480,12 +540,16 @@ def _upsert_latest_outcome(
             outcome_record_id,
             outcome_revision,
             window_complete,
+            reference_at,
+            label_schema_version,
             row_json
-        ) VALUES (?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(snapshot_id) DO UPDATE SET
             outcome_record_id = excluded.outcome_record_id,
             outcome_revision = excluded.outcome_revision,
             window_complete = excluded.window_complete,
+            reference_at = excluded.reference_at,
+            label_schema_version = excluded.label_schema_version,
             row_json = excluded.row_json
         WHERE excluded.outcome_revision >= latest_outcomes.outcome_revision
         """,
@@ -494,6 +558,12 @@ def _upsert_latest_outcome(
             outcome_record_id,
             revision,
             1 if bool(row.get("window_complete", False)) else 0,
+            str(
+                row.get("reference_at")
+                or row.get("decision_at_utc")
+                or ""
+            ),
+            int(row.get("label_schema_version", 0) or 0),
             json.dumps(row, sort_keys=True, allow_nan=False),
         ),
     )
@@ -728,6 +798,100 @@ def acknowledge_accountability_outcomes(
     return deleted
 
 
+def _seed_stale_schema_snapshot_queue(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
+    limit: int,
+) -> int:
+    """Seed completed stale-schema outcomes even when snapshot cursor is at EOF.
+
+    Synthetic queue rows retain the historical decision timestamp in row_json,
+    but use the current time in the queue's ordering column so fresh production
+    snapshots are processed first.
+    """
+    rows = connection.execute(
+        """
+        SELECT row_json
+        FROM latest_outcomes
+        WHERE window_complete = 1
+          AND label_schema_version < ?
+        ORDER BY reference_at, snapshot_id
+        LIMIT ?
+        """,
+        (FORWARD_OUTCOME_LABEL_SCHEMA_VERSION, int(limit)),
+    ).fetchall()
+    seeded = 0
+    for (raw,) in rows:
+        try:
+            prior = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(prior, dict):
+            continue
+
+        snapshot_id = str(prior.get("snapshot_id", "") or "").strip()
+        symbol = str(prior.get("symbol", "") or "").upper().strip()
+        decision_at = _parse_utc(
+            prior.get("reference_at", prior.get("decision_at_utc"))
+        )
+        try:
+            reference_price = float(prior.get("reference_price"))
+        except (TypeError, ValueError):
+            reference_price = 0.0
+        if (
+            not snapshot_id
+            or not symbol
+            or decision_at is None
+            or reference_price <= 0
+        ):
+            continue
+
+        synthetic_snapshot = {
+            "snapshot_id": snapshot_id,
+            "symbol": symbol,
+            "decision_at_utc": decision_at.isoformat(),
+            "reference_price": reference_price,
+            "episode_id": (
+                prior.get("canonical_episode_id")
+                or prior.get("episode_id")
+            ),
+            "stage": prior.get("stage"),
+            "decision_status": prior.get("decision_status"),
+            "suppressed": bool(prior.get("suppressed", False)),
+        }
+        connection.execute(
+            """
+            INSERT INTO snapshot_queue(
+                snapshot_id,
+                decision_at,
+                next_due_at,
+                row_json
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(snapshot_id) DO UPDATE SET
+                next_due_at = CASE
+                    WHEN snapshot_queue.next_due_at > excluded.next_due_at
+                    THEN excluded.next_due_at
+                    ELSE snapshot_queue.next_due_at
+                END
+            """,
+            (
+                snapshot_id,
+                now.isoformat(),
+                now.isoformat(),
+                json.dumps(
+                    synthetic_snapshot,
+                    sort_keys=True,
+                    allow_nan=False,
+                ),
+            ),
+        )
+        seeded += 1
+    if seeded:
+        connection.commit()
+    return seeded
+
+
 def _reconcile_snapshot_queue(
     connection: sqlite3.Connection,
     snapshot_path: Path,
@@ -913,6 +1077,11 @@ def build_outcomes_bounded(
         connection = _open_bounded_state(state_db)
         try:
             _reconcile_output_state(connection, output_path)
+            _seed_stale_schema_snapshot_queue(
+                connection,
+                now=evaluated_at,
+                limit=max_snapshots,
+            )
             _reconcile_snapshot_queue(
                 connection,
                 snapshot_path,
