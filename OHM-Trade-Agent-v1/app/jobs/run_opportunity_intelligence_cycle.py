@@ -13,7 +13,10 @@ from app.jobs.build_phase3c_forward_outcomes import (
     build_outcomes_bounded,
     pending_accountability_outcomes,
 )
-from app.services.opportunity_accountability import build_incremental_from_outcomes
+from app.services.opportunity_accountability import (
+    build_incremental_from_outcomes,
+    resolved_accountability_outcomes,
+)
 
 
 def main() -> None:
@@ -31,7 +34,8 @@ def main() -> None:
     # A failure here intentionally leaves the handoff unacknowledged. The next
     # isolated cycle replays it; append_accountability_rows is idempotent.
     summary = build_incremental_from_outcomes(outcomes)
-    acknowledged = acknowledge_accountability_outcomes(outcomes)
+    resolved = resolved_accountability_outcomes(outcomes)
+    acknowledged = acknowledge_accountability_outcomes(resolved)
 
     print(
         json.dumps(
@@ -39,6 +43,7 @@ def main() -> None:
                 "status": "OK",
                 "new_outcomes_evaluated": newly_evaluated,
                 "accountability_handoff_rows": len(outcomes),
+                "accountability_handoff_resolved": len(resolved),
                 "accountability_handoff_acknowledged": acknowledged,
                 "replayed_handoff": replayed_handoff,
                 "population": summary.get("population", {}),
