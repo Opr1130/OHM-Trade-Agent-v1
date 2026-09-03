@@ -1026,7 +1026,8 @@ class BoundedJsonlArchive:
                 else False
             )
             if (
-                archive_segments_exist
+                self.manifest_file.exists()
+                or archive_segments_exist
                 or self.manifest_signature_file.exists()
                 or not self._window_index_state_proves_empty_archive_without_manifest()
             ):
