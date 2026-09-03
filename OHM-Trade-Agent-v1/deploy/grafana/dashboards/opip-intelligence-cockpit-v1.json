@@ -1,0 +1,603 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Freshness Status",
+      "description": "LIVE only when source->DB lag and MV freshness are healthy and dead letters are zero.",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "type": "stat",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nWITH health AS (\n  SELECT coalesce(max(lag_seconds), 0)::bigint AS shipper_lag_seconds,\n         coalesce(sum(unresolved_dead_letters), 0)::bigint AS unresolved_dead_letters\n  FROM ops.platform_health_v\n), src AS (\n  SELECT extract(epoch FROM now() - max(observed_at))::bigint AS source_age_seconds,\n         extract(epoch FROM now() - max(ingested_at))::bigint AS db_lag_seconds\n  FROM raw.ingested_event\n), mv AS (\n  SELECT extract(epoch FROM now() - coalesce(max(day), now()))::bigint AS mv_age_seconds\n  FROM signal.intelligence_daily_mv\n)\nSELECT CASE WHEN greatest(\n  coalesce((SELECT shipper_lag_seconds FROM health), 0),\n  coalesce((SELECT db_lag_seconds FROM src), 0),\n  coalesce((SELECT mv_age_seconds FROM mv), 0)\n) > 300 OR coalesce((SELECT unresolved_dead_letters FROM health), 0) > 0\nTHEN 0 ELSE 1 END AS value\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "STALE DATA"
+                },
+                "1": {
+                  "text": "LIVE"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "System Pulse (freshness and backlog)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 10,
+        "x": 4,
+        "y": 0
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nWITH health AS (\n  SELECT coalesce(max(lag_seconds), 0)::bigint AS shipper_lag_seconds,\n         coalesce(sum(unresolved_dead_letters), 0)::bigint AS unresolved_dead_letters\n  FROM ops.platform_health_v\n), src AS (\n  SELECT max(observed_at) AS latest_source_event,\n         max(ingested_at) AS latest_db_ingest,\n         extract(epoch FROM now() - max(ingested_at))::bigint AS db_lag_seconds\n  FROM raw.ingested_event\n), mv AS (\n  SELECT extract(epoch FROM now() - coalesce(max(day), now()))::bigint AS mv_age_seconds\n  FROM signal.intelligence_daily_mv\n)\nSELECT now() AS observed_at,\n       coalesce((SELECT shipper_lag_seconds FROM health), 0) AS shipper_lag_seconds,\n       coalesce((SELECT db_lag_seconds FROM src), 0) AS db_lag_seconds,\n       coalesce((SELECT mv_age_seconds FROM mv), 0) AS mv_age_seconds,\n       coalesce((SELECT unresolved_dead_letters FROM health), 0) AS unresolved_dead_letters,\n       (SELECT latest_source_event FROM src) AS latest_source_event,\n       (SELECT latest_db_ingest FROM src) AS latest_db_ingest\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Deployment Markers (if emitted)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 10,
+        "x": 14,
+        "y": 0
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT now() AS observed_at,\n       coalesce(max(nullif(payload->>'production_sha', '')), 'UNAVAILABLE') AS production_sha,\n       coalesce(max(nullif(payload->>'analytics_sha', '')), 'UNAVAILABLE') AS analytics_sha,\n       (SELECT coalesce(max(sha256), 'UNAVAILABLE') FROM ops.schema_version) AS schema_sha\nFROM raw.ingested_event\nWHERE observed_at > now() - interval '30 days'\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Qualification Funnel (24h)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 5
+      },
+      "type": "bargauge",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT to_stage AS metric, count(*)::bigint AS value\nFROM lifecycle.stage_transition\nWHERE occurred_at > now() - interval '24 hours'\nGROUP BY to_stage\nORDER BY value DESC\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Current Chokes by Outcome (7d)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 5
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT now() AS time,\n       outcome AS metric,\n       sum(evaluations)::bigint AS value\nFROM market.attrition_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY outcome\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Rejection Reason Mix (7d)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 5
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT now() AS observed_at, gate_name, reason_code, sum(transitions)::bigint AS transitions\nFROM lifecycle.rejection_mix_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY gate_name, reason_code\nORDER BY transitions DESC\nLIMIT 40\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Opportunity Accountability Trend",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT day AS time,\n       directional_evaluations,\n       captured_winners,\n       executable_false_negatives,\n       threshold_70_79_miss_candidates,\n       ranking_or_cap_miss_candidates,\n       operational_executable_misses\nFROM learning.opportunity_accountability_daily_mv\nWHERE day > now() - interval '60 days'\nORDER BY day\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Opportunity Accountability Rollup",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT now() AS observed_at,\n       coalesce(sum(directional_evaluations), 0)::bigint AS directional_evaluations,\n       coalesce(sum(completed_forward_outcomes), 0)::bigint AS matured_forward_outcomes,\n       coalesce(sum(captured_winners), 0)::bigint AS captured_winners,\n       coalesce(sum(executable_false_negatives), 0)::bigint AS executable_false_negatives,\n       CASE WHEN coalesce(sum(market_winner_candidates), 0) = 0 THEN NULL\n            ELSE round(100.0 * sum(captured_winners) / sum(market_winner_candidates), 2)\n       END AS capture_rate_pct,\n       round(coalesce(sum(estimated_missed_move_pct_sum), 0), 4) AS estimated_missed_move_pct\nFROM learning.opportunity_accountability_daily_mv\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Paper Trading Performance (30d)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 18
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT now() AS observed_at,\n       count(*) FILTER (WHERE state NOT IN ('CLOSED', 'SETTLED'))::bigint AS open_trades,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED'))::bigint AS closed_trades,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) > 0)::bigint AS wins,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) <= 0)::bigint AS losses,\n       CASE WHEN count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED')) = 0 THEN NULL\n            ELSE round(100.0 * count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) > 0)\n                 / count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 2)\n       END AS win_rate_pct,\n       round(coalesce(sum(realised_pnl) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 0), 8) AS realised_pnl,\n       round(avg(realised_pnl) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 8) AS average_return\nFROM paper.trade\nWHERE coalesce(closed_at, opened_at, now()) > now() - interval '30 days'\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 10,
+      "title": "Signal Quality Evidence (recent 200)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       c.direction,\n       c.decision,\n       c.terminal_reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nORDER BY c.decision_at DESC\nLIMIT 200\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 11,
+      "title": "Learning Throughput (30d)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT date_trunc('day', observed_at) AS time,\n       count(*)::bigint AS feature_snapshots\nFROM learning.feature_snapshot\nWHERE observed_at > now() - interval '30 days'\nGROUP BY 1\nORDER BY 1\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Failure Eradication Signals (30d)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT date_trunc('day', first_seen_at) AS time,\n       stream_name || ':' || error_type AS metric,\n       count(*)::bigint AS value\nFROM ops.dead_letter\nWHERE first_seen_at > now() - interval '30 days'\nGROUP BY 1, 2\nORDER BY 1\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Latency (decision + ingest)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nWITH decision AS (\n  SELECT day,\n         mean_decision_latency_ms\n  FROM learning.opportunity_accountability_daily_mv\n  WHERE day > now() - interval '60 days'\n), ingest AS (\n  SELECT date_trunc('day', updated_at) AS day,\n         avg(lag_seconds) AS ingest_lag_seconds\n  FROM ops.platform_health_v\n  WHERE updated_at > now() - interval '60 days'\n  GROUP BY 1\n)\nSELECT d.day AS time,\n       d.mean_decision_latency_ms,\n       i.ingest_lag_seconds\nFROM decision d\nLEFT JOIN ingest i ON i.day = d.day\nORDER BY d.day\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Capacity Thresholds and Current State",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nWITH health AS (\n  SELECT coalesce(max(lag_seconds), 0)::bigint AS max_ingest_lag_seconds\n  FROM ops.platform_health_v\n)\nSELECT now() AS observed_at,\n       '<60% disk healthy; 70% warn; 80% urgent' AS disk_policy,\n       '<70% memory healthy; >80% sustained investigate' AS memory_policy,\n       '>75% sustained CPU investigate' AS cpu_policy,\n       '<2m ingest target; >5m warning' AS ingest_policy,\n       '<2m dashboard target; >5m stale' AS dashboard_policy,\n       (SELECT max_ingest_lag_seconds FROM health) AS max_ingest_lag_seconds\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    },
+    {
+      "id": 15,
+      "title": "Archive Growth Telemetry (if emitted)",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "type": "timeseries",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "\nSELECT date_trunc('day', observed_at) AS time,\n       avg((payload->>'archive_bytes')::numeric) AS archive_bytes\nFROM raw.ingested_event\nWHERE observed_at > now() - interval '30 days'\n  AND coalesce(payload->>'archive_bytes', '') ~ '^[0-9]+$'\nGROUP BY 1\nORDER BY 1\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Per-Asset / Pair Drilldown",
+      "description": "",
+      "datasource": {
+        "type": "postgres",
+        "uid": "opip-analytics-postgres"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "type": "table",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       s.scanner_type,\n       c.direction,\n       st.gate_name,\n       st.reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version,\n       c.decision\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nLEFT JOIN market.screening s ON s.scan_id = c.scan_id AND s.instrument_id = c.instrument_id\nLEFT JOIN LATERAL (\n  SELECT gate_name, reason_code\n  FROM lifecycle.stage_transition t\n  WHERE t.candidate_id = c.candidate_id\n  ORDER BY t.occurred_at DESC\n  LIMIT 1\n) st ON true\nWHERE (${symbol:singlequote} = '__all' OR i.canonical_asset IN (${symbol:singlequote}))\n  AND (${strategy:singlequote} = '__all' OR c.strategy_version IN (${strategy:singlequote}))\n  AND (${scanner:singlequote} = '__all' OR s.scanner_type IN (${scanner:singlequote}))\n  AND (${direction:singlequote} = '__all' OR c.direction IN (${direction:singlequote}))\n  AND (${gate_reason:singlequote} = '__all' OR coalesce(st.reason_code, 'NONE') IN (${gate_reason:singlequote}))\n  AND (${model_version:singlequote} = '__all' OR coalesce(c.model_version, 'NONE') IN (${model_version:singlequote}))\n  AND (${config_version:singlequote} = '__all' OR c.config_version IN (${config_version:singlequote}))\n  AND c.decision_at BETWEEN $__timeFrom() AND $__timeTo()\nORDER BY c.decision_at DESC\nLIMIT 500\n",
+          "editorMode": "code"
+        }
+      ],
+      "options": {}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "opip",
+    "intelligence",
+    "analytics"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "symbol",
+        "label": "symbol",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT canonical_asset AS __text, canonical_asset AS __value FROM market.instrument ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "strategy",
+        "label": "strategy",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT strategy_version AS __text, strategy_version AS __value FROM lifecycle.candidate WHERE strategy_version IS NOT NULL ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "scanner",
+        "label": "scanner",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT scanner_type AS __text, scanner_type AS __value FROM market.screening ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "direction",
+        "label": "direction",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT direction AS __text, direction AS __value FROM lifecycle.candidate ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "gate_reason",
+        "label": "gate/reason",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT coalesce(reason_code, 'NONE') AS __text, coalesce(reason_code, 'NONE') AS __value FROM lifecycle.stage_transition ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "model_version",
+        "label": "model version",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT coalesce(model_version, 'NONE') AS __text, coalesce(model_version, 'NONE') AS __value FROM lifecycle.candidate ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      },
+      {
+        "name": "config_version",
+        "label": "config/policy version",
+        "type": "query",
+        "datasource": {
+          "type": "postgres",
+          "uid": "opip-analytics-postgres"
+        },
+        "query": "SELECT DISTINCT config_version AS __text, config_version AS __value FROM lifecycle.candidate ORDER BY 1",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "__all",
+        "refresh": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "O'Pip Intelligence Cockpit v1",
+  "uid": "opip-intelligence-cockpit-v1",
+  "version": 1,
+  "weekStart": ""
+}

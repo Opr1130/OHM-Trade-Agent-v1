@@ -4,6 +4,9 @@ This is a derived, non-authoritative PostgreSQL 17 analytics plane. Production
 files remain the durable write-ahead log. The scanner never imports, connects
 to, waits for, or fails because of PostgreSQL.
 
+Grafana is the primary intelligence visualization plane on this host and must
+use the read-only `opip_dashboard` role only.
+
 ## Required host boundary
 
 - deploy only on the separate learning/analytics droplet;
@@ -14,6 +17,8 @@ to, waits for, or fails because of PostgreSQL.
 - bind port 5432 only to the private VPC address and firewall it to the
   production private IP;
 - use independent SCRAM passwords for admin, shipper, learning, and dashboard;
+- keep Grafana bound to loopback/private network and front it with a TLS
+  reverse proxy (do not expose an unauthenticated public port 3000);
 - enable weekly off-host droplet backup before calling the platform complete.
 
 ## Deployment
@@ -33,6 +38,9 @@ to, waits for, or fails because of PostgreSQL.
    the read-only `opip_dashboard` credential, set
    `OPIP_DATA_PLATFORM_READS_ENABLED=true`, and keep the 1.5 second statement
    timeout. Live tiles remain file-backed.
+7. Start Grafana with
+   `docker compose -f deploy/analytics/docker-compose.yml up -d opip-grafana`,
+   then configure TLS reverse proxy routing to the private bind endpoint.
 
 The stages are deliberately non-collapsible. `empty` installs PostgreSQL and
 the additive schema; `offhost-verified` records an owner attestation only
@@ -50,3 +58,40 @@ been verified. After the first dump and after every material schema change, run
 `opip-postgres-restore-drill`; it restores
 into a temporary database, validates `ops.schema_version`, records evidence,
 and drops only that temporary database.
+
+## Intelligence Cockpit provisioning
+
+Grafana assets are provisioned as code:
+
+- `deploy/grafana/provisioning/datasources/opip-postgres.yml`
+- `deploy/grafana/provisioning/dashboards/opip-dashboards.yml`
+- `deploy/grafana/dashboards/opip-intelligence-cockpit-v1.json`
+
+Datasource credentials are externalized in `/etc/opip-data-platform.env` and
+must map to the read-only PostgreSQL role.
+
+## Storage lifecycle policy (fail-closed)
+
+Retention pruning for derived PostgreSQL partitions remains in
+`app.opip.data_platform.maintenance` and does not touch canonical source files
+or verified archives.
+
+Archive lifecycle tiers:
+
+- HOT (0-7 days): active append-only evidence remains directly readable.
+- WARM (7-90 days): immutable compressed segments (`.gz` or `.zst`) with
+  checksum and manifest evidence.
+- COLD (90+ days): off-host archival eligibility only after finalized marker,
+  checksum validation, manifest inclusion, archive verification, and explicit
+  off-host verification evidence.
+
+Use:
+
+```bash
+python -m app.opip.data_platform.archive_lifecycle \
+  --root /var/lib/opip-learning/data/opip/qualification \
+  --fail-if-cold-unverified
+```
+
+The lifecycle checker is fail-closed: old local files are never cleanup-eligible
+from age alone.

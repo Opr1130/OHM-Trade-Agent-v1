@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+from typing import Iterable
+
+
+@dataclass(frozen=True)
+class SegmentLifecycleAssessment:
+    path: str
+    tier: str
+    age_days: int
+    compression: str
+    finalized: bool
+    checksum_verified: bool
+    manifest_recorded: bool
+    archive_verified: bool
+    offhost_verified: bool
+    cleanup_eligible: bool
+    blockers: list[str]
+
+
+def _age_days(path: Path, *, now: datetime) -> int:
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    delta = now - modified
+    return max(0, int(delta.total_seconds() // 86400))
+
+
+def _tier_for_age(age_days: int) -> str:
+    if age_days < 7:
+        return "HOT"
+    if age_days < 90:
+        return "WARM"
+    return "COLD"
+
+
+def _compression(path: Path) -> str:
+    name = path.name.lower()
+    if name.endswith(".zst"):
+        return "zstd"
+    if name.endswith(".gz"):
+        return "gzip"
+    return "none"
+
+
+def _checksum_sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _has_manifest_entry(manifest: Path, segment: Path) -> bool:
+    if not manifest.is_file():
+        return False
+    token = segment.name
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if token and token in line:
+            return True
+    return False
+
+
+def _verify_checksum_sidecar(segment: Path) -> bool:
+    checksum_path = segment.with_suffix(segment.suffix + ".sha256")
+    if not checksum_path.is_file():
+        return False
+    fields = checksum_path.read_text(encoding="utf-8").strip().split(maxsplit=1)
+    if not fields or len(fields[0]) != 64:
+        return False
+    return fields[0].lower() == _checksum_sha(segment)
+
+
+def assess_segment(
+    segment: Path,
+    *,
+    now: datetime | None = None,
+    require_offhost: bool = True,
+) -> SegmentLifecycleAssessment:
+    clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age_days = _age_days(segment, now=clock)
+    tier = _tier_for_age(age_days)
+    compression = _compression(segment)
+
+    finalized = segment.with_suffix(segment.suffix + ".finalized").is_file()
+    checksum_verified = _verify_checksum_sidecar(segment)
+    manifest_recorded = _has_manifest_entry(segment.parent / "manifest.env", segment)
+    archive_verified = segment.with_suffix(segment.suffix + ".archive.verified").is_file()
+    offhost_verified = segment.with_suffix(segment.suffix + ".offhost.verified").is_file()
+
+    blockers: list[str] = []
+    if not finalized:
+        blockers.append("segment_not_finalized")
+    if not checksum_verified:
+        blockers.append("checksum_missing_or_mismatch")
+    if not manifest_recorded:
+        blockers.append("manifest_not_updated")
+    if not archive_verified:
+        blockers.append("archive_not_verified")
+    if require_offhost and not offhost_verified:
+        blockers.append("offhost_backup_not_verified")
+    if tier in {"WARM", "COLD"} and compression not in {"gzip", "zstd"}:
+        blockers.append("warm_cold_segment_must_be_compressed")
+
+    cleanup_eligible = tier == "COLD" and not blockers
+
+    return SegmentLifecycleAssessment(
+        path=str(segment),
+        tier=tier,
+        age_days=age_days,
+        compression=compression,
+        finalized=finalized,
+        checksum_verified=checksum_verified,
+        manifest_recorded=manifest_recorded,
+        archive_verified=archive_verified,
+        offhost_verified=offhost_verified,
+        cleanup_eligible=cleanup_eligible,
+        blockers=blockers,
+    )
+
+
+def discover_segments(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and (
+            path.name.endswith(".jsonl.gz")
+            or path.name.endswith(".jsonl.zst")
+            or path.name.endswith(".jsonl")
+        )
+        and ".tmp" not in path.name
+    )
+
+
+def assess_root(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    require_offhost: bool = True,
+) -> list[SegmentLifecycleAssessment]:
+    return [
+        assess_segment(path, now=now, require_offhost=require_offhost)
+        for path in discover_segments(root)
+    ]
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Assess O'Pip archive lifecycle eligibility")
+    parser.add_argument("--root", required=True, help="Path containing finalized archive segments")
+    parser.add_argument("--json", action="store_true", help="Emit JSON report")
+    parser.add_argument(
+        "--no-require-offhost",
+        action="store_true",
+        help="Do not require off-host verification marker for cleanup eligibility",
+    )
+    parser.add_argument(
+        "--fail-if-cold-unverified",
+        action="store_true",
+        help="Exit non-zero when any COLD segment is not cleanup-eligible",
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    root = Path(args.root).expanduser().resolve()
+    assessments = assess_root(root, require_offhost=not args.no_require_offhost)
+
+    if args.json:
+        print(json.dumps([asdict(item) for item in assessments], indent=2))
+    else:
+        for item in assessments:
+            print(
+                f"{item.tier:>4} age_days={item.age_days:>4} "
+                f"cleanup_eligible={str(item.cleanup_eligible).lower():<5} "
+                f"compression={item.compression:<5} {item.path}"
+            )
+            if item.blockers:
+                print(f"  blockers={','.join(item.blockers)}")
+
+    if args.fail_if_cold_unverified:
+        blocked_cold = [
+            item for item in assessments
+            if item.tier == "COLD" and not item.cleanup_eligible
+        ]
+        if blocked_cold:
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
