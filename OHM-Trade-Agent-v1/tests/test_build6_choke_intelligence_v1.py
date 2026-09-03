@@ -59,7 +59,7 @@ def test_build6_attributes_margin_and_deterministic_chokes(tmp_path):
                 "gate_results": [
                     {
                         "gate": "MARGIN_ELIGIBILITY",
-                        "status": "ERROR",
+                        "status": "FAIL",
                         "reason_code": "MARGIN_VALIDATION_UNAVAILABLE",
                         "reason_class": "OPERATIONAL",
                         "metadata": {
@@ -126,6 +126,8 @@ def test_build6_attributes_margin_and_deterministic_chokes(tmp_path):
     )
 
     assert report["primary_choke"] == "MARGIN_ELIGIBILITY"
+    assert report["margin_reject"] == 1
+    assert report["margin_error"] == 1
     choke = report["choke_analysis"]
     assert choke["measurement_only"] is True
     assert choke["policy_change_authorized"] is False
@@ -291,3 +293,45 @@ def test_build6_separates_deterministic_errors_from_policy_rejects(tmp_path):
     assert deterministic["rejects"] == 0
     assert deterministic["errors"] == 1
     assert report["primary_operational_choke"] == "DETERMINISTIC_QUALITY"
+
+
+def test_build6_margin_unavailable_reason_code_is_operational_without_reason_class(tmp_path):
+    funnel, screening, summaries = _paths(tmp_path)
+    _write_jsonl(
+        funnel,
+        [
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "OPERATIONAL_FAILURE",
+                "first_terminal_gate": "MARGIN_ELIGIBILITY",
+                "terminal_reason_code": "MARGIN_VALIDATION_UNAVAILABLE",
+                "terminal_reason_class": "OPERATIONAL",
+                "gate_results": [
+                    {
+                        "gate": "MARGIN_ELIGIBILITY",
+                        "status": "FAIL",
+                        "reason_code": "MARGIN_VALIDATION_UNAVAILABLE",
+                        "metadata": {
+                            "margin_validation_status": "UNAVAILABLE",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+
+    assert report["margin_reject"] == 0
+    assert report["margin_error"] == 1
+    margin = report["choke_analysis"]["margin_eligibility"]
+    assert margin["rejects"] == 0
+    assert margin["errors"] == 1
+    assert margin["rejection_reason_counts"] == {
+        "MARGIN_VALIDATION_UNAVAILABLE": 1,
+    }
