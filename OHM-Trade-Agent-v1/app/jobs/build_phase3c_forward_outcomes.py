@@ -214,6 +214,10 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             if not snapshot_id or not outcome_record_id:
                 continue
             try:
+                revision = int(outcome_revision)
+            except (TypeError, ValueError):
+                continue
+            try:
                 parsed = json.loads(row_json)
             except (TypeError, json.JSONDecodeError):
                 continue
@@ -246,7 +250,7 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
                 (
                     snapshot_id,
                     outcome_record_id,
-                    int(outcome_revision),
+                    revision,
                     reference_at,
                     row_json,
                 ),
@@ -400,7 +404,11 @@ def _upsert_latest_outcome(
     ).strip()
     if not snapshot_id:
         return
-    connection.execute(
+    try:
+        revision = int(row.get("outcome_revision", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    latest_cursor = connection.execute(
         """
         INSERT INTO latest_outcomes(
             snapshot_id,
@@ -419,7 +427,7 @@ def _upsert_latest_outcome(
         (
             snapshot_id,
             outcome_record_id,
-            int(row.get("outcome_revision", 0) or 0),
+            revision,
             1 if bool(row.get("window_complete", False)) else 0,
             json.dumps(row, sort_keys=True, allow_nan=False),
         ),
@@ -430,12 +438,14 @@ def _upsert_latest_outcome(
         or ""
     )
     if not outcome_record_id:
-        # Keep latest_outcomes aligned with the source ledger for forensics,
-        # but never let a malformed identity enter the replay gate.
-        connection.execute(
-            "DELETE FROM accountability_handoff WHERE snapshot_id = ?",
-            (snapshot_id,),
-        )
+        # Delete only when this malformed revision actually became the latest
+        # stored revision. A stale malformed ledger row must never erase a
+        # newer valid unacknowledged handoff.
+        if int(latest_cursor.rowcount or 0) > 0:
+            connection.execute(
+                "DELETE FROM accountability_handoff WHERE snapshot_id = ?",
+                (snapshot_id,),
+            )
         return
     connection.execute(
         """
@@ -456,7 +466,7 @@ def _upsert_latest_outcome(
         (
             snapshot_id,
             outcome_record_id,
-            int(row.get("outcome_revision", 0) or 0),
+            revision,
             reference_at,
             json.dumps(row, sort_keys=True, allow_nan=False),
         ),
@@ -624,8 +634,12 @@ def acknowledge_accountability_outcomes(
         try:
             _reconcile_output_state(connection, output_path)
             for row in outcomes:
-                snapshot_id = str(row.get("snapshot_id", "") or "")
-                record_id = str(row.get("outcome_record_id", "") or "")
+                snapshot_id = str(
+                    row.get("snapshot_id", "") or ""
+                ).strip()
+                record_id = str(
+                    row.get("outcome_record_id", "") or ""
+                ).strip()
                 if not snapshot_id or not record_id:
                     continue
                 cursor = connection.execute(
