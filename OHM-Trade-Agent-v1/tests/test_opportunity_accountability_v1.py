@@ -260,6 +260,96 @@ def test_incomplete_archive_window_is_not_silently_accepted(
         )
 
 
+
+def test_incremental_join_splits_archive_ceiling_batches(monkeypatch, tmp_path):
+    screening_path = tmp_path / "screening.jsonl"
+    funnel_path = tmp_path / "funnel.jsonl"
+    screening_archive = tmp_path / "screening_archive"
+    funnel_archive = tmp_path / "funnel_archive"
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+    summary_path = tmp_path / "summary.json"
+
+    later = NOW + timedelta(hours=6)
+    screening_rows = [
+        _screening(scan_id="SCAN:1"),
+        {
+            **_screening(scan_id="SCAN:2", symbol="LATERUSD"),
+            "observed_at": later.isoformat(),
+        },
+    ]
+    funnel_rows = [
+        _funnel(scan_id="SCAN:1"),
+        {
+            **_funnel(scan_id="SCAN:2", symbol="LATERUSD"),
+            "decision_at_utc": later.isoformat(),
+        },
+    ]
+    outcomes = [
+        _outcome(snapshot_id="SNAP:1"),
+        {
+            **_outcome(snapshot_id="SNAP:2", symbol="LATERUSD"),
+            "reference_at": later.isoformat(),
+        },
+    ]
+    screening_path.write_text(
+        "".join(json.dumps(row) + "\\n" for row in screening_rows),
+        encoding="utf-8",
+    )
+    funnel_path.write_text(
+        "".join(json.dumps(row) + "\\n" for row in funnel_rows),
+        encoding="utf-8",
+    )
+
+    real_selector = accountability._window_archive_selection
+
+    def bounded_selector(path, *, archive_dir, start, through, kind):
+        if through - start > timedelta(hours=2):
+            return SimpleNamespace(), SimpleNamespace(
+                paths=(),
+                complete=False,
+                truncated=True,
+                warnings=("ARCHIVE_SEGMENT_CEILING_REACHED",),
+            )
+        # Narrow recursive partitions use the fixture files directly.
+        return None
+
+    monkeypatch.setattr(
+        accountability,
+        "_window_archive_selection",
+        bounded_selector,
+    )
+    summary = build_incremental_from_outcomes(
+        outcomes,
+        screening_path=screening_path,
+        screening_archive=screening_archive,
+        funnel_path=funnel_path,
+        funnel_archive=funnel_archive,
+        intelligence_event_path=tmp_path / "events.jsonl",
+        ledger_path=ledger,
+        summary_path=summary_path,
+        state_path=state,
+        policy=AccountabilityPolicy(
+            production_threshold=80,
+            shadow_threshold=70,
+            winner_move_pct=2,
+        ),
+    )
+
+    assert summary["batch_disposition"] == {
+        "accepted": 2,
+        "terminal_rejected": 0,
+        "unresolved": 0,
+    }
+    assert len(
+        resolved_accountability_outcomes(
+            outcomes,
+            ledger_path=ledger,
+            state_path=state,
+        )
+    ) == 2
+
+
 def test_threshold_70_79_winner_is_visible_without_changing_production():
     rows = _rows(
         [
