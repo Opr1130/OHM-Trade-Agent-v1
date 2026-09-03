@@ -763,6 +763,72 @@ def test_archive_window_index_force_rebuild_recovers_cached_incomplete_state(
     assert repaired.paths == (archived,)
 
 
+
+@pytest.mark.parametrize("tamper_mode", ["digest_format", "manifest_key_mismatch"])
+def test_archive_window_force_rebuild_rejects_invalid_manifest_segment_identity(
+    tmp_path,
+    tamper_mode,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    manifest = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
+    segments = manifest["segments"]
+    original_key, original_row = next(iter(segments.items()))
+    if tamper_mode == "digest_format":
+        original_row["sha256"] = "x"
+    else:
+        segments["0" * 64] = segments.pop(original_key)
+
+    archive.manifest_file.write_text(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    archive._write_manifest_signature_locked(
+        bounded_jsonl.sha256_file(archive.manifest_file)
+    )
+
+    state = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    state["complete"] = False
+    archive.window_index_state_file.write_text(
+        json.dumps(state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    assert archive.ensure_window_index_locked(force_rebuild=True) is False
+    rebuilt_state = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    assert rebuilt_state["complete"] is False
+
+
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
     tmp_path, monkeypatch
 ):
