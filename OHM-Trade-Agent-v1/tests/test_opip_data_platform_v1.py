@@ -191,6 +191,29 @@ def test_opportunity_accountability_migration_is_single_well_formed_definition()
     assert "avg(" in sql
 
 
+def test_accountability_sql_matches_executable_miss_semantics():
+    migration = next(
+        item for item in discover_migrations()
+        if item.version == 4
+    )
+    sql = migration.path.read_text(encoding="utf-8")
+    missed_move_case = sql.split("AS estimated_missed_move_pct_sum", 1)[0]
+    assert "executable_false_negative" in missed_move_case
+
+
+def test_dashboard_hides_outcome_metrics_until_measured():
+    html = (ROOT / "app" / "api" / "dashboard.html").read_text(encoding="utf-8")
+    assert "const oaMeasured=oa.status==='MEASURED'" in html
+    for element_id in (
+        "execMissed",
+        "oppCapture",
+        "thresholdMiss",
+        "capMiss",
+        "operationalMiss",
+    ):
+        assert f"$('{element_id}').textContent=oaMeasured?" in html
+
+
 def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Cursor:
         def __init__(self, connection):
