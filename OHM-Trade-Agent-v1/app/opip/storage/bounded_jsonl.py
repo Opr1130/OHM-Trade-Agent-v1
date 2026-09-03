@@ -261,6 +261,42 @@ class BoundedJsonlArchive:
     def manifest_signature_file(self) -> Path:
         return self.manifest_file.with_suffix(self.manifest_file.suffix + ".sha256")
 
+    def _window_index_state_proves_empty_archive_without_manifest(self) -> bool:
+        """Return true only for a previously certified, zero-coverage empty index."""
+        if not self.window_index_state_file.exists():
+            return False
+        try:
+            state = json.loads(
+                self.window_index_state_file.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(state, dict):
+            return False
+        shard_digests = state.get("shard_sha256")
+        if (
+            state.get("schema_version") != 1
+            or state.get("manifest_present") is not False
+            or state.get("manifest_size") != 0
+            or state.get("manifest_mtime_ns") != 0
+            or str(state.get("manifest_sha256") or "")
+            or state.get("complete") is not True
+            or str(state.get("coverage_start_day") or "")
+            or str(state.get("coverage_through_day") or "")
+            or state.get("coverage_day_count") != 0
+            or not isinstance(shard_digests, dict)
+            or bool(shard_digests)
+        ):
+            return False
+        try:
+            unexpected_index_entries = any(
+                entry != self.window_index_state_file
+                for entry in self.window_index_dir.iterdir()
+            )
+        except OSError:
+            return False
+        return not unexpected_index_entries
+
     def _read_manifest_signature(self) -> str | None:
         try:
             tokens = self.manifest_signature_file.read_text(
@@ -555,16 +591,32 @@ class BoundedJsonlArchive:
         or stale. Steady-state window selection never loads the master manifest.
         """
         if not self.manifest_file.exists():
-            # Derived window-index state can exist before the first immutable
-            # archive segment. Only real gzip evidence requires a manifest.
+            # A no-manifest directory is empty only when there is no canonical
+            # archive evidence and no prior manifest/index evidence to lose.
             archive_segments_exist = (
                 any(self.archive_dir.rglob(self.archive_glob))
                 if self.archive_dir.exists()
                 else False
             )
-            complete = not archive_segments_exist
-            self._write_window_index_state_locked(complete=complete)
-            return complete
+            if archive_segments_exist:
+                # For a brand-new orphan segment, persist an incomplete state
+                # so bounded readers fail closed. Preserve any existing state
+                # verbatim because it may be the only evidence of prior
+                # manifest/coverage metadata.
+                if not self.window_index_state_file.exists():
+                    self._write_window_index_state_locked(complete=False)
+                return False
+            if self.manifest_signature_file.exists():
+                return False
+            if self.window_index_state_file.exists():
+                if not self._window_index_state_proves_empty_archive_without_manifest():
+                    return False
+            elif self.window_index_dir.exists():
+                # A pre-existing derived directory without its state is
+                # ambiguous (for example, an interrupted copy/write).
+                return False
+            self._write_window_index_state_locked(complete=True)
+            return True
 
         manifest_signature = self._read_manifest_signature()
         if manifest_signature is None:
