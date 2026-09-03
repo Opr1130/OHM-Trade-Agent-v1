@@ -15,6 +15,7 @@ from app.jobs.build_phase3c_forward_outcomes import (
 )
 from app.services.opportunity_accountability import (
     build_incremental_from_outcomes,
+    repair_accountability_archive_indexes,
     resolved_accountability_outcomes,
 )
 
@@ -37,8 +38,10 @@ def main() -> None:
     summary = {}
     resolved = []
     acknowledged = 0
+    archive_index_status: dict[str, bool] = {}
     accountability_error: Exception | None = None
     try:
+        archive_index_status = repair_accountability_archive_indexes()
         summary = build_incremental_from_outcomes(outcomes)
         resolved = resolved_accountability_outcomes(outcomes)
         acknowledged = acknowledge_accountability_outcomes(resolved)
@@ -70,6 +73,7 @@ def main() -> None:
                 "opportunity_capture_rate_pct": summary.get(
                     "opportunity_capture_rate_pct"
                 ),
+                "accountability_archive_indexes": archive_index_status,
                 "measurement_only": True,
                 "trade_authority_changed": False,
             },
