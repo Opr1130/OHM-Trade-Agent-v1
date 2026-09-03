@@ -1,6 +1,9 @@
 import json
 import sqlite3
 from pathlib import Path
+import subprocess
+
+import pytest
 
 from app.jobs import build_phase3c_forward_outcomes as outcomes_job
 
@@ -176,6 +179,69 @@ def test_latest_outcome_index_migration_resumes_after_committed_cursor(tmp_path)
     connection.close()
 
 
+
+def test_latest_outcome_index_migration_stops_when_wal_checkpoint_is_blocked(
+    tmp_path,
+):
+    state = tmp_path / "outcomes.state.sqlite3"
+    writer = sqlite3.connect(state)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA busy_timeout=50")
+    _legacy_state(writer)
+    for index in range(5):
+        row = {
+            "reference_at": f"2026-09-01T00:0{index}:00+00:00",
+            "label_schema_version": 2,
+        }
+        writer.execute(
+            """
+            INSERT INTO latest_outcomes(
+                snapshot_id,
+                outcome_record_id,
+                outcome_revision,
+                window_complete,
+                row_json
+            ) VALUES (?, ?, 1, 1, ?)
+            """,
+            (f"S{index}", f"OUT:{index}", json.dumps(row)),
+        )
+    writer.commit()
+
+    reader = sqlite3.connect(state)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM latest_outcomes").fetchone()
+
+    with pytest.raises(
+        RuntimeError,
+        match="LATEST_OUTCOMES_MIGRATION_WAL_CHECKPOINT_BLOCKED",
+    ):
+        outcomes_job._migrate_latest_outcome_index_fields(
+            writer,
+            batch_size=2,
+        )
+
+    cursor = writer.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (outcomes_job._LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
+    ).fetchone()
+    assert cursor is not None
+    assert int(cursor[0]) == 2
+    assert writer.execute(
+        "SELECT count(*) FROM latest_outcomes WHERE reference_at != ''"
+    ).fetchone()[0] == 2
+
+    reader.rollback()
+    reader.close()
+
+    outcomes_job._migrate_latest_outcome_index_fields(
+        writer,
+        batch_size=2,
+    )
+    assert writer.execute(
+        "SELECT count(*) FROM latest_outcomes WHERE reference_at != ''"
+    ).fetchone()[0] == 5
+    writer.close()
+
 def test_learning_worker_prepare_bounds_derived_docker_storage():
     bootstrap = (
         ROOT / "deploy" / "learning" / "bootstrap-opip-learning-worker.sh"
@@ -185,6 +251,9 @@ def test_learning_worker_prepare_bounds_derived_docker_storage():
     assert "docker builder prune -af" in bootstrap
     assert 'target_image="opip-learning:$TARGET_SHA"' in bootstrap
     assert 'configured_image=""' in bootstrap
+    assert "configured_image_known=false" in bootstrap
+    assert 'source "$ENV_FILE"' in bootstrap
+    assert "configured_image_known=true" in bootstrap
     assert 'docker image rm "$image"' in bootstrap
     assert '"$image" != "$configured_image"' in bootstrap
     assert '"$image" != "$target_image"' in bootstrap
@@ -198,3 +267,25 @@ def test_learning_worker_prepare_bounds_derived_docker_storage():
     assert 'rm -rf "$DATA_ROOT"' not in bootstrap
     assert "outcomes.state.sqlite3" not in bootstrap
     assert "p1_shadow_outbox.jsonl" not in bootstrap
+
+
+
+def test_learning_worker_configured_image_parsing_normalizes_shell_quotes(tmp_path):
+    env_file = tmp_path / "opip-learning.env"
+    env_file.write_text(
+        'OPIP_LEARNING_IMAGE="opip-learning:rollback"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -Eeuo pipefail; source "$1"; printf "%s" "$OPIP_LEARNING_IMAGE"',
+            "_",
+            str(env_file),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == "opip-learning:rollback"
