@@ -13,7 +13,7 @@ failure, or late decision hid a profitable market move.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import json
@@ -25,6 +25,11 @@ from statistics import mean, median
 import zlib
 from typing import Any, Iterable, Mapping
 
+from app.opip.decision.store import (
+    funnel_events_archive,
+    screening_evaluations_archive,
+)
+
 
 DEFAULT_SCREENING_FILE = Path("/app/data/opip/qualification/screening_evaluations.jsonl")
 DEFAULT_FUNNEL_FILE = Path("/app/data/opip/qualification/funnel_events.jsonl")
@@ -35,6 +40,8 @@ DEFAULT_LEDGER_FILE = Path("/app/data/opip/opportunity_accountability.jsonl")
 DEFAULT_SUMMARY_FILE = Path("/app/data/opip/opportunity_accountability_summary.json")
 DEFAULT_SCREENING_ARCHIVE = Path("/app/data/opip/qualification/screening_evaluations_archive")
 DEFAULT_FUNNEL_ARCHIVE = Path("/app/data/opip/qualification/funnel_events_archive")
+ACCOUNTABILITY_ARCHIVE_WINDOW_PAD = timedelta(minutes=15)
+ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW = 64
 
 
 @dataclass(frozen=True)
@@ -1394,6 +1401,48 @@ def _iter_jsonl_sources(
             continue
 
 
+def _iter_windowed_jsonl_sources(
+    path: Path,
+    *,
+    archive_dir: Path,
+    start: datetime,
+    through: datetime,
+    kind: str,
+) -> Iterable[dict[str, Any]]:
+    """Read HOT plus only manifest-selected archive segments for a time window."""
+    expected_archive = path.parent / f"{path.stem}_archive"
+    if archive_dir != expected_archive:
+        # Test/custom layouts do not necessarily carry the production manifest.
+        # They remain bounded by the caller's fixture/layout size.
+        yield from _iter_jsonl_sources(path, archive_dir=archive_dir)
+        return
+
+    if kind == "screening":
+        archive = screening_evaluations_archive(path)
+    elif kind == "funnel":
+        archive = funnel_events_archive(path)
+    else:
+        raise ValueError(f"unsupported accountability archive kind: {kind}")
+
+    selection = archive.archive_paths_for_visible_window(
+        start=start,
+        through=through,
+        max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
+    )
+    if not selection.complete:
+        warning = ",".join(selection.warnings) or "UNKNOWN"
+        raise RuntimeError(
+            "ACCOUNTABILITY_ARCHIVE_WINDOW_INCOMPLETE:"
+            f"{kind}:{warning}"
+        )
+
+    yield from archive.iter_archive_rows_from_paths(
+        selection.paths,
+        strict=True,
+    )
+    yield from _iter_jsonl_sources(path)
+
+
 def build_incremental_from_outcomes(
     outcome_rows: Iterable[Mapping[str, Any]],
     *,
@@ -1414,7 +1463,12 @@ def build_incremental_from_outcomes(
         for row in outcomes
         if _iso(row.get("reference_at")) and _normalize_symbol(row.get("symbol"))
     }
-    if not target_keys:
+    target_times = [
+        stamp
+        for stamp in (_parse_utc(row.get("reference_at")) for row in outcomes)
+        if stamp is not None
+    ]
+    if not target_keys or not target_times:
         reconcile_paper_events(
             intelligence_event_path=intelligence_event_path,
             ledger_path=ledger_path,
@@ -1427,10 +1481,16 @@ def build_incremental_from_outcomes(
         write_summary(summary, path=summary_path)
         return summary
 
+    window_start = min(target_times) - ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    window_through = max(target_times) + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+
     screening: list[dict[str, Any]] = []
-    for row in _iter_jsonl_sources(
+    for row in _iter_windowed_jsonl_sources(
         screening_path,
         archive_dir=screening_archive,
+        start=window_start,
+        through=window_through,
+        kind="screening",
     ):
         if str(row.get("scanner_type") or "").upper() != "BROAD_SEARCH":
             continue
@@ -1444,9 +1504,12 @@ def build_incremental_from_outcomes(
         if str(row.get("scan_id") or "")
     }
     funnel: list[dict[str, Any]] = []
-    for row in _iter_jsonl_sources(
+    for row in _iter_windowed_jsonl_sources(
         funnel_path,
         archive_dir=funnel_archive,
+        start=window_start,
+        through=window_through,
+        kind="funnel",
     ):
         key = (
             str(row.get("scan_id") or ""),
