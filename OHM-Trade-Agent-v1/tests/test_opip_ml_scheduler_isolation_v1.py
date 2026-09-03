@@ -149,6 +149,8 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
     assert pending < build < resolved < ack
     assert "acknowledge_accountability_outcomes(outcomes)" not in source
     assert "if not outcomes:" in source
+    assert "if replayed_handoff:" in source
+    assert source.rindex("build_outcomes_bounded()") > ack
 
 
 def test_learning_systemd_services_enforce_post_run_cleanup():
