@@ -77,6 +77,16 @@ def snapshot(**overrides) -> MarketSnapshot:
     return MarketSnapshot(**values)
 
 
+def test_null_scan_observer_accepts_trade_quality_hook():
+    observer = observer_module.NullScanObserver()
+    assert observer.record_trade_quality(
+        snapshot(),
+        actionable=False,
+        reason="test rejection",
+        metadata={"score": 0.0},
+    ) is None
+
+
 def execution(status="VALID", **overrides) -> ExecutionValidation:
     values = dict(
         status=status,
