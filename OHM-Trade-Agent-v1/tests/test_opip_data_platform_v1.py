@@ -363,6 +363,9 @@ def test_all_streams_are_exported_and_manifest_validated_before_promotion():
         # Opportunity accountability is produced on the isolated learning
         # worker after sync; it is not a production-export source stream.
         if spec.name == "opportunity_accountability":
+            relative = str(spec.relative_path)
+            assert relative not in exporter
+            assert relative not in sync
             continue
         relative = str(spec.relative_path)
         assert relative in exporter
