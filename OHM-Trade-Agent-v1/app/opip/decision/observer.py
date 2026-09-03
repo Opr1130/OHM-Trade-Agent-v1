@@ -584,6 +584,48 @@ class OPipScanObserver:
         except Exception as exc:
             self._degrade("record_snapshot_missing", exc)
 
+    def record_trade_quality(
+        self,
+        snapshot: Any,
+        *,
+        actionable: bool | None,
+        reason: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record the production trade-quality monitor as an explicit gate."""
+        try:
+            self._remember(snapshot)
+            if actionable is None:
+                status = GateStatus.ERROR
+                code = ReasonCode.TRADE_QUALITY_UNAVAILABLE
+            elif actionable:
+                status = GateStatus.PASS
+                code = ReasonCode.GATE_PASSED
+            else:
+                status = GateStatus.FAIL
+                code = ReasonCode.TRADE_QUALITY_REJECTED
+            gate = GateResult.build(
+                GateName.TRADE_QUALITY,
+                status,
+                code,
+                reason=reason,
+                evaluated_at=self._evaluated_at(),
+                metadata=metadata,
+            )
+            self._record(snapshot, gate)
+            if gate.is_terminal:
+                if actionable is None:
+                    self.funnel.record_legacy_outcome(
+                        getattr(snapshot, "symbol", ""),
+                        getattr(snapshot, "trade_direction", "LONG"),
+                        decision=LEGACY_OPERATIONAL_FAILURE,
+                        terminal_reason=reason,
+                    )
+                else:
+                    self._reject(snapshot, reason)
+        except Exception as exc:
+            self._degrade("record_trade_quality", exc)
+
     def record_target_quality(self, snapshot: Any, result: Any) -> None:
         """Record production's own target attainability verdict."""
         try:
