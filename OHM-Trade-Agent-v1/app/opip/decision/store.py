@@ -361,8 +361,9 @@ def _append_rows(
         lock = path.parent / f".{path.name}.lock"
         archive = _archive_for(path, max_bytes=max_bytes, keep_lines=keep_lines)
         with registry_lock(lock):
-            # One-time legacy backfill; steady state is an O(1) manifest-stat
-            # check. Learning window selection never scans the lifetime archive.
+            # One-time legacy backfill; steady state reads a tiny
+            # cryptographic manifest-version sidecar. Learning window selection
+            # never scans the lifetime archive.
             try:
                 archive.ensure_window_index_locked()
             except Exception as exc:
