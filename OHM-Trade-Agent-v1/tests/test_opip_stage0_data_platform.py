@@ -416,7 +416,7 @@ def test_stale_valid_window_shard_fails_digest_authentication(tmp_path):
     assert "ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH" in selection.warnings
 
 
-def test_corrupt_window_shard_is_not_overwritten_as_complete(tmp_path):
+def test_corrupt_window_shard_is_rebuilt_on_next_archive_rotation(tmp_path):
     hot = tmp_path / "funnel_events.jsonl"
     archive = BoundedJsonlArchive(
         data_file=hot,
@@ -453,26 +453,22 @@ def test_corrupt_window_shard_is_not_overwritten_as_complete(tmp_path):
         )
         for index in range(4)
     )
+
+    # The next archive rotation detects the corrupt certified shard and
+    # immediately rebuilds the window index from the canonical master manifest.
+    # Callers should therefore observe the repaired state, not a transient
+    # incomplete state.
     assert archive.compact_locked() is not None
-
-    selection = archive.archive_paths_for_visible_window(
-        start=NOW - timedelta(minutes=1),
-        through=NOW + timedelta(minutes=2),
-        max_segments=8,
-    )
-    assert selection.complete is False
-    assert "ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH" in selection.warnings
-
-    # The next writer maintenance pass rebuilds the incomplete index from the
-    # canonical master manifest rather than trusting/overwriting the bad shard.
-    assert archive.ensure_window_index_locked() is True
     repaired = archive.archive_paths_for_visible_window(
         start=NOW - timedelta(minutes=1),
         through=NOW + timedelta(minutes=2),
         max_segments=8,
     )
     assert repaired.complete is True
+    assert repaired.truncated is False
+    assert repaired.warnings == ()
     assert len(repaired.paths) == 2
+    assert archive.ensure_window_index_locked() is True
 
 
 def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
