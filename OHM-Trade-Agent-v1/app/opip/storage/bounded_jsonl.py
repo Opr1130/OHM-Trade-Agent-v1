@@ -620,8 +620,18 @@ class BoundedJsonlArchive:
         complete = True
         coverage_start_day: str | None = None
         coverage_through_day: str | None = None
-        for row in segments.values():
+        for manifest_digest, row in segments.items():
             if not isinstance(row, dict):
+                complete = False
+                continue
+            row_digest = str(row.get("sha256") or "").lower()
+            manifest_digest_text = str(manifest_digest or "").lower()
+            digest_is_valid = (
+                len(row_digest) == 64
+                and all(char in "0123456789abcdef" for char in row_digest)
+                and manifest_digest_text == row_digest
+            )
+            if not digest_is_valid:
                 complete = False
                 continue
             try:
