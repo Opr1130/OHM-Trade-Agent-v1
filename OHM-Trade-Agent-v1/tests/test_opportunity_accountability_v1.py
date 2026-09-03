@@ -227,6 +227,70 @@ def test_windowed_archive_reader_uses_manifest_selected_segments(
     )
 
 
+
+
+def test_incomplete_legacy_archive_window_repairs_once_then_reads(
+    monkeypatch,
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive_dir = tmp_path / "screening_evaluations_archive"
+    selected_path = archive_dir / "selected.jsonl.gz"
+    calls = {"selection": 0}
+
+    class RepairableArchive:
+        def archive_paths_for_visible_window(self, **_kwargs):
+            calls["selection"] += 1
+            if calls["selection"] == 1:
+                return SimpleNamespace(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_WINDOW_INDEX_INCOMPLETE",),
+                )
+            return SimpleNamespace(
+                paths=(selected_path,),
+                complete=True,
+                truncated=False,
+                warnings=(),
+            )
+
+        def ensure_window_index_locked(self, **kwargs):
+            calls["repair_kwargs"] = kwargs
+            return True
+
+        def iter_archive_rows_from_paths(self, paths, *, strict=False):
+            calls["paths"] = tuple(paths)
+            calls["strict"] = strict
+            yield {"source": "archive", "observed_at": NOW.isoformat()}
+
+    archive = RepairableArchive()
+    monkeypatch.setattr(
+        accountability,
+        "screening_evaluations_archive",
+        lambda _path: archive,
+    )
+
+    rows = list(
+        accountability._iter_windowed_jsonl_sources(
+            hot,
+            archive_dir=archive_dir,
+            start=NOW - timedelta(minutes=1),
+            through=NOW + timedelta(minutes=1),
+            kind="screening",
+        )
+    )
+
+    assert rows == [{"source": "archive", "observed_at": NOW.isoformat()}]
+    assert calls["selection"] == 2
+    assert calls["repair_kwargs"] == {
+        "force_rebuild": True,
+        "repair_legacy_visibility": True,
+    }
+    assert calls["paths"] == (selected_path,)
+    assert calls["strict"] is True
+
+
 def test_incomplete_archive_window_is_not_silently_accepted(
     monkeypatch,
     tmp_path,
