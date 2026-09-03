@@ -543,7 +543,14 @@ class BoundedJsonlArchive:
         or stale. Steady-state window selection never loads the master manifest.
         """
         if not self.manifest_file.exists():
-            complete = not self.archive_dir.exists()
+            # The derived window-index directory may exist before the first
+            # immutable archive segment is ever created. Its presence is not
+            # archived evidence. Fail closed only when a real gzip segment
+            # exists without its canonical manifest.
+            archive_segments_exist = any(
+                self.archive_dir.rglob(self.archive_glob)
+            ) if self.archive_dir.exists() else False
+            complete = not archive_segments_exist
             self._write_window_index_state_locked(complete=complete)
             return complete
 
