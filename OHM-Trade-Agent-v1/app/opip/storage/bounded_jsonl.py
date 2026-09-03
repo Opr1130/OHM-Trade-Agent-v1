@@ -412,23 +412,27 @@ class BoundedJsonlArchive:
             if not isinstance(row, dict):
                 complete = False
                 continue
-            verification = ArchiveVerification(
-                archive=str(row.get("archive") or ""),
-                tier=str(row.get("tier") or ""),
-                sha256=str(row.get("sha256") or ""),
-                row_count=int(row.get("row_count") or 0),
-                bytes=int(row.get("bytes") or 0),
-                first_visible_at_utc=(
-                    str(row.get("first_visible_at_utc"))
-                    if row.get("first_visible_at_utc") is not None
-                    else None
-                ),
-                last_visible_at_utc=(
-                    str(row.get("last_visible_at_utc"))
-                    if row.get("last_visible_at_utc") is not None
-                    else None
-                ),
-            )
+            try:
+                verification = ArchiveVerification(
+                    archive=str(row.get("archive") or ""),
+                    tier=str(row.get("tier") or ""),
+                    sha256=str(row.get("sha256") or ""),
+                    row_count=int(row.get("row_count") or 0),
+                    bytes=int(row.get("bytes") or 0),
+                    first_visible_at_utc=(
+                        str(row.get("first_visible_at_utc"))
+                        if row.get("first_visible_at_utc") is not None
+                        else None
+                    ),
+                    last_visible_at_utc=(
+                        str(row.get("last_visible_at_utc"))
+                        if row.get("last_visible_at_utc") is not None
+                        else None
+                    ),
+                )
+            except (TypeError, ValueError):
+                complete = False
+                continue
             days = self._verification_days(verification)
             if not days or not verification.archive or not verification.sha256:
                 complete = False
