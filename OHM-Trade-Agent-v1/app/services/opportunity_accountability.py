@@ -579,6 +579,18 @@ def _open_state(path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS paper_event_latest (
+            signal_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_key TEXT NOT NULL,
+            observed_at TEXT,
+            row_json TEXT NOT NULL,
+            PRIMARY KEY(signal_id, event_type)
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS outcome_disposition (
             outcome_record_id TEXT PRIMARY KEY,
             snapshot_id TEXT NOT NULL,
@@ -903,11 +915,19 @@ def _paper_event_key(row: Mapping[str, Any]) -> str | None:
             dict(row),
             sort_keys=True,
             separators=(",", ":"),
-            allow_nan=False,
+            allow_nan=True,
         )
     except (TypeError, ValueError):
         return None
     return "PAPER:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _paper_event_is_json_safe(row: Mapping[str, Any]) -> bool:
+    try:
+        json.dumps(dict(row), sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _apply_paper_event(
@@ -998,25 +1018,54 @@ def reconcile_paper_events(
                     event_key = _paper_event_key(event)
                     if event_key is None:
                         continue
+                    observed_at = str(event.get("observed_at") or "")
+                    encoded_event = json.dumps(
+                        event,
+                        sort_keys=True,
+                        allow_nan=True,
+                    )
                     connection.execute(
                         """
-                        INSERT OR IGNORE INTO paper_event_pending(
-                            event_key, signal_id, event_type,
+                        INSERT INTO paper_event_latest(
+                            signal_id, event_type, event_key,
                             observed_at, row_json
                         ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(signal_id, event_type) DO UPDATE SET
+                            event_key = excluded.event_key,
+                            observed_at = excluded.observed_at,
+                            row_json = excluded.row_json
+                        WHERE coalesce(excluded.observed_at, '')
+                              > coalesce(paper_event_latest.observed_at, '')
+                           OR (
+                                coalesce(excluded.observed_at, '')
+                                = coalesce(paper_event_latest.observed_at, '')
+                                AND excluded.event_key > paper_event_latest.event_key
+                           )
                         """,
                         (
-                            event_key,
                             signal_id,
                             event_type,
-                            str(event.get("observed_at") or ""),
-                            json.dumps(
-                                event,
-                                sort_keys=True,
-                                allow_nan=False,
-                            ),
+                            event_key,
+                            observed_at,
+                            encoded_event,
                         ),
                     )
+                    if _paper_event_is_json_safe(event):
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO paper_event_pending(
+                                event_key, signal_id, event_type,
+                                observed_at, row_json
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                event_key,
+                                signal_id,
+                                event_type,
+                                observed_at,
+                                encoded_event,
+                            ),
+                        )
 
             _set_metadata(
                 connection,
@@ -1084,6 +1133,47 @@ def reconcile_paper_events(
         finally:
             connection.close()
     return len(processed_keys)
+
+
+def _paper_events_for_signals(
+    signal_ids: Iterable[str],
+    *,
+    ledger_path: Path,
+    state_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return latest staged paper evidence for a bounded set of signal IDs."""
+    ids = sorted({str(value) for value in signal_ids if str(value)})
+    if not ids:
+        return []
+    connection = _open_state(state_path or _state_path_for(ledger_path))
+    try:
+        rows: list[tuple[Any, ...]] = []
+        for start in range(0, len(ids), 400):
+            chunk = ids[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                connection.execute(
+                    f"""
+                    SELECT row_json
+                    FROM paper_event_latest
+                    WHERE signal_id IN ({placeholders})
+                    ORDER BY coalesce(observed_at, ''), event_key
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+            )
+    finally:
+        connection.close()
+
+    result: list[dict[str, Any]] = []
+    for (raw,) in rows:
+        try:
+            event = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(event, dict):
+            result.append(event)
+    return result
 
 
 def _derive_outcome_dispositions(
