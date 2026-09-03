@@ -40,12 +40,17 @@ FORWARD_OUTCOME_LABEL_SCHEMA_VERSION = 2
 REQUIRED_FORWARD_HORIZONS = tuple(STANDARD_HORIZONS)
 
 
+def stored_label_schema_version(row: Mapping[str, Any]) -> int:
+    """Return a native integer schema version, otherwise a non-current sentinel."""
+    raw = row.get("label_schema_version", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw
+
+
 def outcome_label_is_current(row: Mapping[str, Any]) -> bool:
     """Return True only when a stored outcome matches the current label schema."""
-    try:
-        version = int(row.get("label_schema_version", 0) or 0)
-    except (TypeError, ValueError):
-        return False
+    version = stored_label_schema_version(row)
     if version != FORWARD_OUTCOME_LABEL_SCHEMA_VERSION:
         return False
 
