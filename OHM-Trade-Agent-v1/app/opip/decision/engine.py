@@ -353,6 +353,20 @@ class OPipDecisionEngine:
             ):
                 return _finish()
 
+            results.append(
+                GateResult.build(
+                    GateName.TRADE_QUALITY,
+                    GateStatus.SKIPPED,
+                    ReasonCode.TRADE_QUALITY_NOT_APPLICABLE_TO_SHADOW_ENGINE,
+                    reason=(
+                        "shadow engine does not reproduce the production "
+                        "trade-quality monitor; the live observer captures "
+                        "its authoritative production verdict"
+                    ),
+                    evaluated_at=self.decision_at,
+                )
+            )
+
             risk_level = str(item.get("risk_level") or "medium").lower()
             plan = (
                 build_entry_exit_plan(snapshot, risk_level, direction="SHORT")
