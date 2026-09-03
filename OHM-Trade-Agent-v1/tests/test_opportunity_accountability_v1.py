@@ -277,6 +277,7 @@ def test_learning_replica_repairs_incomplete_derived_archive_index(
             start=NOW - timedelta(minutes=1),
             through=NOW + timedelta(minutes=1),
             kind="screening",
+            replica_mode=True,
         )
     )
     assert rows == [{"source": "archive", "observed_at": NOW.isoformat()}]
@@ -319,6 +320,48 @@ def test_production_path_never_repairs_incomplete_archive_index(
                 start=NOW - timedelta(minutes=1),
                 through=NOW + timedelta(minutes=1),
                 kind="screening",
+            )
+        )
+    assert calls["rebuild"] == 0
+
+
+def test_environment_flag_cannot_enable_repair_without_explicit_replica_mode(
+    monkeypatch,
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive_dir = tmp_path / "screening_evaluations_archive"
+    calls = {"rebuild": 0}
+
+    class IncompleteArchive:
+        def archive_paths_for_visible_window(self, **_kwargs):
+            return SimpleNamespace(
+                paths=(),
+                complete=False,
+                truncated=False,
+                warnings=("ARCHIVE_WINDOW_INDEX_INCOMPLETE",),
+            )
+
+        def rebuild_window_index_from_verified_manifest_locked(self):
+            calls["rebuild"] += 1
+            return True
+
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    monkeypatch.setattr(
+        accountability,
+        "screening_evaluations_archive",
+        lambda _path: IncompleteArchive(),
+    )
+
+    with pytest.raises(RuntimeError, match="ACCOUNTABILITY_ARCHIVE_WINDOW_INCOMPLETE"):
+        list(
+            accountability._iter_windowed_jsonl_sources(
+                hot,
+                archive_dir=archive_dir,
+                start=NOW - timedelta(minutes=1),
+                through=NOW + timedelta(minutes=1),
+                kind="screening",
+                replica_mode=False,
             )
         )
     assert calls["rebuild"] == 0
