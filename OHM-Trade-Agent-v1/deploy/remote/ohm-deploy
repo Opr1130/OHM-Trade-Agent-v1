@@ -291,6 +291,16 @@ if ! wait_core_health; then
   false
 fi
 
+# Archive-window indexes are derived qualification evidence metadata. Repair
+# them once on the freshly deployed SHA under each stream's writer lock. This
+# is not learning computation and cannot affect ranking, alerts, paper, or
+# exchange authority. A failure is surfaced but does not roll back a healthy
+# deterministic core; the writer path will retry on the next evidence append.
+if ! docker compose exec -T ohm-trade-agent \
+  python -m app.jobs.repair_opip_archive_window_indexes; then
+  echo "O'Pip archive window-index repair deferred to writer maintenance" >&2
+fi
+
 if [[ ! -s "$SCHEDULER_RECONCILE" ]]; then
   echo "scheduler reconciliation script missing" >&2
   false

@@ -351,6 +351,53 @@ class BoundedJsonlArchive:
                 )
             except ValueError:
                 coverage_day_count = 0
+        shard_stats: dict[str, dict[str, int]] = {}
+        for day in (shard_sha256 or {}):
+            shard = self.window_index_dir / f"{day}.json"
+            try:
+                stat = shard.stat()
+            except OSError:
+                continue
+            shard_stats[str(day)] = {
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+
+        segment_stats: dict[str, dict[str, Any]] = {}
+        segment_count = 0
+        if manifest_present:
+            try:
+                raw_manifest = json.loads(
+                    self.manifest_file.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                raw_manifest = {}
+            raw_segments = (
+                raw_manifest.get("segments")
+                if isinstance(raw_manifest, dict)
+                else None
+            )
+            if isinstance(raw_segments, dict):
+                segment_count = len(raw_segments)
+                for key, row in raw_segments.items():
+                    if not isinstance(row, dict):
+                        continue
+                    rel = str(row.get("archive") or "").strip()
+                    expected_sha = str(row.get("sha256") or key or "").strip()
+                    if not rel or not expected_sha:
+                        continue
+                    candidate = (self.archive_dir / rel).resolve()
+                    try:
+                        candidate.relative_to(self.archive_dir.resolve())
+                        stat = candidate.stat()
+                    except (OSError, ValueError):
+                        continue
+                    segment_stats[expected_sha] = {
+                        "archive": rel,
+                        "size": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
+
         return {
             "schema_version": 1,
             "manifest_present": manifest_present,
@@ -362,6 +409,9 @@ class BoundedJsonlArchive:
             "coverage_through_day": coverage_through_day,
             "coverage_day_count": coverage_day_count,
             "shard_sha256": dict(sorted((shard_sha256 or {}).items())),
+            "shard_stat": dict(sorted(shard_stats.items())),
+            "segment_count": segment_count,
+            "segment_stat": dict(sorted(segment_stats.items())),
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -536,6 +586,109 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
 
+    def _cached_window_index_valid_locked(
+        self,
+        *,
+        state: Mapping[str, Any],
+        manifest_signature: str,
+    ) -> bool:
+        """Validate immutable-file fingerprints without rehashing history."""
+        try:
+            manifest_stat = self.manifest_file.stat()
+        except OSError:
+            return False
+        try:
+            if (
+                int(state.get("manifest_size") or -1) != int(manifest_stat.st_size)
+                or int(state.get("manifest_mtime_ns") or -1)
+                != int(manifest_stat.st_mtime_ns)
+                or str(state.get("manifest_sha256") or "") != manifest_signature
+            ):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        coverage_start = str(state.get("coverage_start_day") or "") or None
+        coverage_through = str(state.get("coverage_through_day") or "") or None
+        raw_digests = state.get("shard_sha256")
+        digest_map = raw_digests if isinstance(raw_digests, dict) else {}
+        raw_shard_stats = state.get("shard_stat")
+        shard_stats = raw_shard_stats if isinstance(raw_shard_stats, dict) else {}
+        try:
+            expected_count = int(state.get("coverage_day_count") or 0)
+        except (TypeError, ValueError):
+            return False
+
+        if coverage_start and coverage_through:
+            try:
+                expected_days = self._window_day_keys(
+                    datetime.fromisoformat(coverage_start).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    datetime.fromisoformat(coverage_through).replace(
+                        tzinfo=timezone.utc
+                    ),
+                )
+            except ValueError:
+                return False
+            if (
+                expected_count != len(expected_days)
+                or set(digest_map) != set(expected_days)
+                or set(shard_stats) != set(expected_days)
+            ):
+                return False
+        elif expected_count == 0 and not digest_map and not shard_stats:
+            expected_days = ()
+        else:
+            return False
+
+        for day in expected_days:
+            expected = shard_stats.get(day)
+            if not isinstance(expected, Mapping):
+                return False
+            shard = self.window_index_dir / f"{day}.json"
+            try:
+                stat = shard.stat()
+                if (
+                    int(expected.get("size") or -1) != int(stat.st_size)
+                    or int(expected.get("mtime_ns") or -1)
+                    != int(stat.st_mtime_ns)
+                ):
+                    return False
+            except (OSError, TypeError, ValueError):
+                return False
+
+        raw_segment_stats = state.get("segment_stat")
+        segment_stats = (
+            raw_segment_stats if isinstance(raw_segment_stats, dict) else {}
+        )
+        try:
+            segment_count = int(state.get("segment_count") or 0)
+        except (TypeError, ValueError):
+            return False
+        if len(segment_stats) != segment_count:
+            return False
+        for expected_sha, raw in segment_stats.items():
+            if not isinstance(raw, Mapping):
+                return False
+            rel = str(raw.get("archive") or "").strip()
+            if len(str(expected_sha)) != 64 or not rel:
+                return False
+            candidate = (self.archive_dir / rel).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+                stat = candidate.stat()
+                if (
+                    int(raw.get("size") or -1) != int(stat.st_size)
+                    or int(raw.get("mtime_ns") or -1)
+                    != int(stat.st_mtime_ns)
+                ):
+                    return False
+            except (OSError, TypeError, ValueError):
+                return False
+        return True
+
+
     def ensure_window_index_locked(self) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
 
@@ -543,7 +696,14 @@ class BoundedJsonlArchive:
         or stale. Steady-state window selection never loads the master manifest.
         """
         if not self.manifest_file.exists():
-            complete = not self.archive_dir.exists()
+            # The derived window-index directory may exist before the first
+            # immutable archive segment is ever created. Its presence is not
+            # archived evidence. Fail closed only when a real gzip segment
+            # exists without its canonical manifest.
+            archive_segments_exist = any(
+                self.archive_dir.rglob(self.archive_glob)
+            ) if self.archive_dir.exists() else False
+            complete = not archive_segments_exist
             self._write_window_index_state_locked(complete=complete)
             return complete
 
@@ -571,26 +731,13 @@ class BoundedJsonlArchive:
             )
             if version_matches:
                 if not bool(state.get("complete", False)):
-                    # Cache a failed/incomplete build for this immutable
-                    # manifest version. The next manifest update changes the
-                    # version and triggers a rebuild exactly once.
-                    return False
-                coverage_start = str(state.get("coverage_start_day") or "") or None
-                coverage_through = str(state.get("coverage_through_day") or "") or None
-                raw_digests = state.get("shard_sha256")
-                digest_map = raw_digests if isinstance(raw_digests, dict) else {}
-                expected_count = int(state.get("coverage_day_count") or 0)
-                if coverage_start and coverage_through:
-                    if (
-                        expected_count > 0
-                        and len(digest_map) == expected_count
-                        and all(
-                            isinstance(digest, str) and len(digest) == 64
-                            for digest in digest_map.values()
-                        )
-                    ):
-                        return True
-                elif expected_count == 0 and not digest_map:
+                    # A failed build is repairable: do not permanently cache
+                    # incomplete state for an otherwise unchanged manifest.
+                    pass
+                elif self._cached_window_index_valid_locked(
+                    state=state,
+                    manifest_signature=manifest_signature,
+                ):
                     return True
 
         try:
@@ -637,6 +784,19 @@ class BoundedJsonlArchive:
                 continue
             days = self._verification_days(verification)
             if not days or not verification.archive or not verification.sha256:
+                complete = False
+                continue
+            candidate = (self.archive_dir / verification.archive).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+                candidate_stat = candidate.stat()
+            except (OSError, ValueError):
+                complete = False
+                continue
+            if (
+                verification.bytes > 0
+                and int(candidate_stat.st_size) != int(verification.bytes)
+            ):
                 complete = False
                 continue
             entry = {
@@ -701,6 +861,151 @@ class BoundedJsonlArchive:
             shard_sha256=shard_digests,
         )
         return complete
+
+    def repair_window_index_locked(self) -> bool:
+        """Repair a derived window index from canonical verified archive data.
+
+        Callers must hold the stream's exclusive writer lock. The canonical
+        manifest remains authoritative. Only manifest rows missing valid
+        visibility metadata are reparsed from their checksum-verified archive
+        segment; healthy historical segments are not rescanned.
+        """
+        if self.ensure_window_index_locked():
+            return True
+        if not self.manifest_file.exists():
+            return False
+
+        try:
+            manifest_signature = self._verified_manifest_signature_locked()
+            raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+            self._write_window_index_state_locked(complete=False)
+            return False
+
+        segments = raw.get("segments") if isinstance(raw, dict) else None
+        if not isinstance(segments, dict):
+            self._write_window_index_state_locked(complete=False)
+            return False
+
+        changed = False
+        complete = True
+        repaired_segments = dict(segments)
+        for key, row in segments.items():
+            if not isinstance(row, dict):
+                complete = False
+                continue
+
+            try:
+                verification = ArchiveVerification(
+                    archive=str(row.get("archive") or ""),
+                    tier=str(row.get("tier") or ""),
+                    sha256=str(row.get("sha256") or ""),
+                    row_count=int(row.get("row_count") or 0),
+                    bytes=int(row.get("bytes") or 0),
+                    first_visible_at_utc=(
+                        str(row.get("first_visible_at_utc"))
+                        if row.get("first_visible_at_utc") is not None
+                        else None
+                    ),
+                    last_visible_at_utc=(
+                        str(row.get("last_visible_at_utc"))
+                        if row.get("last_visible_at_utc") is not None
+                        else None
+                    ),
+                )
+            except (TypeError, ValueError):
+                verification = None
+
+            if (
+                verification is not None
+                and verification.archive
+                and verification.sha256
+                and self._verification_days(verification)
+            ):
+                continue
+
+            rel = str(row.get("archive") or "").strip()
+            expected_sha = str(row.get("sha256") or "").strip()
+            if not rel or not expected_sha:
+                complete = False
+                continue
+
+            candidate = (self.archive_dir / rel).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+            except ValueError:
+                complete = False
+                continue
+            if not candidate.exists():
+                complete = False
+                continue
+
+            tier = str(row.get("tier") or "").strip()
+            if not tier:
+                try:
+                    candidate.relative_to(self.cold_archive_dir.resolve())
+                    tier = "COLD"
+                except ValueError:
+                    tier = "WARM"
+
+            try:
+                repaired = self.verify_archive_file(candidate, tier=tier)
+            except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
+                complete = False
+                continue
+            if repaired.sha256 != expected_sha or str(key) != expected_sha:
+                complete = False
+                continue
+            if not self._verification_days(repaired):
+                complete = False
+                continue
+
+            repaired_segments[str(key)] = {
+                **row,
+                "archive": repaired.archive,
+                "tier": repaired.tier,
+                "sha256": repaired.sha256,
+                "row_count": repaired.row_count,
+                "bytes": repaired.bytes,
+                "first_visible_at_utc": repaired.first_visible_at_utc,
+                "last_visible_at_utc": repaired.last_visible_at_utc,
+                "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            changed = True
+
+        if changed:
+            payload = {
+                "schema_version": 1,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "segments": repaired_segments,
+            }
+            write_atomic_lines(
+                self.manifest_file,
+                [
+                    json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            self._write_manifest_signature_locked(sha256_file(self.manifest_file))
+        else:
+            # Authenticate that the canonical manifest did not change while
+            # the repair inspected its derived state.
+            if self._verified_manifest_signature_locked() != manifest_signature:
+                self._write_window_index_state_locked(complete=False)
+                return False
+
+        # Rebuild the derived index from the canonical manifest even when this
+        # manifest version previously cached complete=false.
+        if self.window_index_dir.exists():
+            shutil.rmtree(self.window_index_dir)
+        rebuilt = self.ensure_window_index_locked()
+        return bool(complete and rebuilt)
+
 
     def repair_tail(self) -> None:
         repair_truncated_tail(self.data_file, parse_line=self.parse_line)
