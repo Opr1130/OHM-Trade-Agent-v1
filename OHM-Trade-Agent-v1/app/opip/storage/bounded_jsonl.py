@@ -293,15 +293,15 @@ class BoundedJsonlArchive:
         if manifest_present:
             stat = self.manifest_file.stat()
             manifest_size = stat.st_size
-            manifest_mtime_ns = stat.st_mtime_ns
+            manifest_sha256 = sha256_file(self.manifest_file)
         else:
             manifest_size = 0
-            manifest_mtime_ns = 0
+            manifest_sha256 = ""
         return {
             "schema_version": 1,
             "manifest_present": manifest_present,
             "manifest_size": manifest_size,
-            "manifest_mtime_ns": manifest_mtime_ns,
+            "manifest_sha256": manifest_sha256,
             "complete": bool(complete),
             "coverage_start_day": coverage_start_day,
             "coverage_through_day": coverage_through_day,
@@ -492,6 +492,7 @@ class BoundedJsonlArchive:
             return complete
 
         manifest_stat = self.manifest_file.stat()
+        manifest_sha256 = sha256_file(self.manifest_file)
         if self.window_index_state_file.exists():
             try:
                 state = json.loads(
@@ -504,8 +505,7 @@ class BoundedJsonlArchive:
                 and state.get("schema_version") == 1
                 and bool(state.get("manifest_present"))
                 and int(state.get("manifest_size") or -1) == manifest_stat.st_size
-                and int(state.get("manifest_mtime_ns") or -1)
-                == manifest_stat.st_mtime_ns
+                and str(state.get("manifest_sha256") or "") == manifest_sha256
             )
             if version_matches:
                 if not bool(state.get("complete", False)):
@@ -861,10 +861,18 @@ class BoundedJsonlArchive:
                     truncated=False,
                     warnings=("ARCHIVE_MANIFEST_UNAVAILABLE",),
                 )
+            try:
+                manifest_sha256 = sha256_file(self.manifest_file)
+            except OSError:
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_MANIFEST_UNAVAILABLE",),
+                )
             if (
                 int(state.get("manifest_size") or -1) != manifest_stat.st_size
-                or int(state.get("manifest_mtime_ns") or -1)
-                != manifest_stat.st_mtime_ns
+                or str(state.get("manifest_sha256") or "") != manifest_sha256
             ):
                 return ArchiveWindowSelection(
                     paths=(),
