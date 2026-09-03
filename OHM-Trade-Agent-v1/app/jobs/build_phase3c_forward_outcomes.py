@@ -163,6 +163,17 @@ def _latest_outcome_index_values(row_json: str) -> tuple[str, int]:
     return reference_at, schema_version
 
 
+def _truncate_latest_outcome_migration_wal(
+    connection: sqlite3.Connection,
+) -> None:
+    """Fail closed when a reader prevents reclaiming the migration WAL."""
+    result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if result is None or int(result[0]) != 0:
+        raise RuntimeError(
+            "LATEST_OUTCOMES_MIGRATION_WAL_CHECKPOINT_BLOCKED"
+        )
+
+
 def _migrate_latest_outcome_index_fields(
     connection: sqlite3.Connection,
     *,
@@ -234,7 +245,7 @@ def _migrate_latest_outcome_index_fields(
                 (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
             )
             connection.commit()
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _truncate_latest_outcome_migration_wal(connection)
             return
 
         updates = []
@@ -263,7 +274,7 @@ def _migrate_latest_outcome_index_fields(
             (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY, str(cursor)),
         )
         connection.commit()
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        _truncate_latest_outcome_migration_wal(connection)
 
 
 def _open_bounded_state(path: Path) -> sqlite3.Connection:
