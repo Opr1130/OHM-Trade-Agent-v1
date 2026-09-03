@@ -31,18 +31,31 @@ def main() -> None:
         newly_evaluated = len(evaluated)
         outcomes = pending_accountability_outcomes()
 
-    # A failure here intentionally leaves the handoff unacknowledged. The next
-    # isolated cycle replays it; append_accountability_rows is idempotent.
-    summary = build_incremental_from_outcomes(outcomes)
-    resolved = resolved_accountability_outcomes(outcomes)
-    acknowledged = acknowledge_accountability_outcomes(resolved)
+    # A failed accountability replay remains unacknowledged, but it must not
+    # starve current outcome maturation. Preserve the accountability exception
+    # and run one bounded current maturation pass before re-raising it.
+    summary = {}
+    resolved = []
+    acknowledged = 0
+    accountability_error: Exception | None = None
+    try:
+        summary = build_incremental_from_outcomes(outcomes)
+        resolved = resolved_accountability_outcomes(outcomes)
+        acknowledged = acknowledge_accountability_outcomes(resolved)
+    except Exception as exc:
+        accountability_error = exc
 
-    # Historical upgrade replay must not starve current outcome maturation.
-    # Mature one bounded current batch after replay; its handoff is processed
-    # on a subsequent cycle under the same at-least-once contract.
     if replayed_handoff:
-        evaluated = build_outcomes_bounded()
-        newly_evaluated += len(evaluated)
+        try:
+            evaluated = build_outcomes_bounded()
+            newly_evaluated += len(evaluated)
+        except Exception as maturation_error:
+            if accountability_error is not None:
+                raise accountability_error from maturation_error
+            raise
+
+    if accountability_error is not None:
+        raise accountability_error
 
     print(
         json.dumps(
