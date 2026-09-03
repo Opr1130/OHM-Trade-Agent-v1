@@ -56,6 +56,7 @@ def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
         "attrition_daily": [],
         "rejection_mix_daily": [],
         "opportunity_accountability_daily": [],
+        "opportunity_accountability_all_time": {},
         "stream_health": [],
     }
 
@@ -139,6 +140,7 @@ def read_historical_snapshot(
                     )
                     accountability_available = cursor.fetchone()[0] is not None
                     accountability = []
+                    accountability_all_time = {}
                     if accountability_available:
                         cursor.execute(
                             """
@@ -177,6 +179,46 @@ def read_historical_snapshot(
                             }
                             for row in cursor.fetchall()
                         ]
+                        cursor.execute(
+                            """
+                            SELECT
+                                coalesce(sum(directional_evaluations), 0),
+                                coalesce(sum(completed_forward_outcomes), 0),
+                                coalesce(sum(market_winner_candidates), 0),
+                                coalesce(sum(captured_winners), 0),
+                                coalesce(sum(executable_false_negatives), 0),
+                                coalesce(sum(threshold_70_79_miss_candidates), 0),
+                                coalesce(sum(ranking_or_cap_miss_candidates), 0),
+                                coalesce(sum(operational_executable_misses), 0),
+                                coalesce(sum(estimated_missed_move_pct_sum), 0),
+                                coalesce(sum(decision_latency_samples), 0),
+                                CASE
+                                    WHEN coalesce(sum(decision_latency_samples), 0) > 0
+                                    THEN sum(
+                                        coalesce(mean_decision_latency_ms, 0)
+                                        * decision_latency_samples
+                                    ) / sum(decision_latency_samples)
+                                    ELSE NULL
+                                END
+                            FROM learning.opportunity_accountability_daily_mv
+                            """
+                        )
+                        row = cursor.fetchone()
+                        accountability_all_time = {
+                            "directional_evaluations": int(row[0]),
+                            "completed_forward_outcomes": int(row[1]),
+                            "market_winner_candidates": int(row[2]),
+                            "captured_winners": int(row[3]),
+                            "executable_false_negatives": int(row[4]),
+                            "threshold_70_79_miss_candidates": int(row[5]),
+                            "ranking_or_cap_miss_candidates": int(row[6]),
+                            "operational_executable_misses": int(row[7]),
+                            "estimated_missed_move_pct_sum": float(row[8]),
+                            "decision_latency_samples": int(row[9]),
+                            "mean_decision_latency_ms": (
+                                float(row[10]) if row[10] is not None else None
+                            ),
+                        }
                     cursor.execute(
                         """
                         SELECT stream_name, source_file, byte_offset,
@@ -213,6 +255,7 @@ def read_historical_snapshot(
             "attrition_daily": attrition,
             "rejection_mix_daily": rejection_mix,
             "opportunity_accountability_daily": list(reversed(accountability)),
+            "opportunity_accountability_all_time": accountability_all_time,
             "stream_health": health,
         }
     except Exception as exc:
