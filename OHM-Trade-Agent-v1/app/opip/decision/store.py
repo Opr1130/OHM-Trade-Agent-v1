@@ -361,6 +361,9 @@ def _append_rows(
         lock = path.parent / f".{path.name}.lock"
         archive = _archive_for(path, max_bytes=max_bytes, keep_lines=keep_lines)
         with registry_lock(lock):
+            # One-time legacy backfill; steady state is an O(1) manifest-stat
+            # check. Learning window selection never scans the lifetime archive.
+            archive.ensure_window_index_locked()
             archive.repair_tail()
             written = archive.append_encoded_many_locked(encoded_rows)
             try:
