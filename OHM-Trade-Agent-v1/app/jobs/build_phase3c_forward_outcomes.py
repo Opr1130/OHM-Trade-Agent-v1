@@ -136,117 +136,43 @@ def _bounded_state_path(output_path: Path) -> Path:
     return output_path.parent / f".{output_path.name}.state.sqlite3"
 
 
-def _open_bounded_state(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=FULL")
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS latest_outcomes (
-            snapshot_id TEXT PRIMARY KEY,
-            outcome_record_id TEXT NOT NULL,
-            outcome_revision INTEGER NOT NULL,
-            window_complete INTEGER NOT NULL,
-            reference_at TEXT NOT NULL DEFAULT '',
-            label_schema_version INTEGER NOT NULL DEFAULT 0,
-            row_json TEXT NOT NULL
-        )
-        """
-    )
-    latest_columns = {
-        str(row[1])
-        for row in connection.execute(
-            "PRAGMA table_info(latest_outcomes)"
-        ).fetchall()
-    }
-    if "reference_at" not in latest_columns:
-        connection.execute(
-            "ALTER TABLE latest_outcomes "
-            "ADD COLUMN reference_at TEXT NOT NULL DEFAULT ''"
-        )
-    if "label_schema_version" not in latest_columns:
-        connection.execute(
-            "ALTER TABLE latest_outcomes "
-            "ADD COLUMN label_schema_version INTEGER NOT NULL DEFAULT 0"
-        )
+_LATEST_OUTCOME_INDEX_MIGRATION_BATCH_SIZE = 500
+_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY = (
+    "latest_outcomes_index_fields_migration_cursor_v3"
+)
 
-    index_fields_marker = connection.execute(
-        "SELECT value FROM metadata "
-        "WHERE key = 'latest_outcomes_index_fields_v1'"
-    ).fetchone()
-    if index_fields_marker is None:
-        connection.execute(
-            """
-            UPDATE latest_outcomes
-            SET reference_at = coalesce(
-                    CASE
-                        WHEN json_valid(row_json)
-                        THEN coalesce(
-                            json_extract(row_json, '$.reference_at'),
-                            json_extract(row_json, '$.decision_at_utc'),
-                            ''
-                        )
-                        ELSE ''
-                    END,
-                    ''
-                ),
-                label_schema_version = coalesce(
-                    CASE
-                        WHEN json_valid(row_json)
-                        THEN cast(
-                            coalesce(
-                                json_extract(
-                                    row_json,
-                                    '$.label_schema_version'
-                                ),
-                                0
-                            ) AS INTEGER
-                        )
-                        ELSE 0
-                    END,
-                    0
-                )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO metadata(key, value)
-            VALUES ('latest_outcomes_index_fields_v1', '1')
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """
-        )
-    schema_type_marker = connection.execute(
-        "SELECT value FROM metadata "
-        "WHERE key = 'latest_outcomes_schema_type_v2'"
-    ).fetchone()
-    if schema_type_marker is None:
-        connection.execute(
-            """
-            UPDATE latest_outcomes
-            SET label_schema_version = CASE
-                WHEN json_valid(row_json)
-                 AND json_type(row_json, '$.label_schema_version') = 'integer'
-                THEN json_extract(row_json, '$.label_schema_version')
-                ELSE 0
-            END
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO metadata(key, value)
-            VALUES ('latest_outcomes_schema_type_v2', '1')
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """
-        )
+
+def _latest_outcome_index_values(row_json: str) -> tuple[str, int]:
+    try:
+        payload = json.loads(row_json)
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    reference_at = str(
+        payload.get("reference_at") or payload.get("decision_at_utc") or ""
+    )
+    raw_schema_version = payload.get("label_schema_version")
+    schema_version = (
+        raw_schema_version
+        if isinstance(raw_schema_version, int)
+        and not isinstance(raw_schema_version, bool)
+        else 0
+    )
+    return reference_at, schema_version
+
+
+def _migrate_latest_outcome_index_fields(
+    connection: sqlite3.Connection,
+    *,
+    batch_size: int = _LATEST_OUTCOME_INDEX_MIGRATION_BATCH_SIZE,
+) -> None:
+    """Backfill denormalized index fields without a lifetime-sized WAL write."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    _migrate_latest_outcome_index_fields(connection)
 
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_latest_outcomes_reference "
