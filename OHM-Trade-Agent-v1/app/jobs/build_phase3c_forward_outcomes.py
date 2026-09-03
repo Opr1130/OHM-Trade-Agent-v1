@@ -17,7 +17,10 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
-from app.services.phase3c_outcomes import build_forward_outcome_labels
+from app.services.phase3c_outcomes import (
+    build_forward_outcome_labels,
+    outcome_label_is_current,
+)
 from app.services.registry_io import registry_lock
 from app.services.signal_quality_phase2 import DEFAULT_OBSERVATION_FILE, read_observations
 from app.services.signal_quality_phase3c import read_jsonl
@@ -526,8 +529,15 @@ def _next_due_at(
     *,
     evaluated_at: datetime,
 ) -> datetime | None:
-    if bool(row.get("window_complete", False)):
+    if (
+        bool(row.get("window_complete", False))
+        and outcome_label_is_current(row)
+    ):
         return None
+    if bool(row.get("window_complete", False)):
+        # Completed under an older label schema: re-evaluate immediately once
+        # so newly introduced horizons become available historically.
+        return evaluated_at
     reference_at = _parse_utc(
         row.get("reference_at", row.get("decision_at_utc"))
     )
@@ -708,7 +718,11 @@ def _reconcile_snapshot_queue(
             }
 
             prior = _latest_outcome_row(connection, snapshot_id)
-            if prior is not None and bool(prior.get("window_complete", False)):
+            if (
+                prior is not None
+                and bool(prior.get("window_complete", False))
+                and outcome_label_is_current(prior)
+            ):
                 connection.execute(
                     "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
                     (snapshot_id,),
