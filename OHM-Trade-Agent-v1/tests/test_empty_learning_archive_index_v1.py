@@ -334,6 +334,7 @@ def test_noncanonical_empty_state_fields_cannot_certify_archive(tmp_path):
 def test_invalid_updated_at_cannot_certify_empty_archive(tmp_path):
     """Invalid state timestamps remain unchanged and fail closed on reads."""
     archive = _archive(tmp_path)
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
     archive.window_index_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "schema_version": 1,
@@ -370,6 +371,7 @@ def test_invalid_updated_at_cannot_certify_empty_archive(tmp_path):
 def test_overflowing_updated_at_cannot_certify_empty_archive(tmp_path):
     """UTC normalization overflow is treated as invalid archive state."""
     archive = _archive(tmp_path)
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
     archive.window_index_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "schema_version": 1,
