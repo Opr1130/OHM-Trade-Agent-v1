@@ -661,6 +661,89 @@ def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
     assert selection.paths == (archived,)
 
 
+
+def test_replica_window_index_rebuild_preserves_canonical_archive_evidence(tmp_path):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+
+    manifest_before = archive.manifest_file.read_bytes()
+    signature_before = archive.manifest_signature_file.read_bytes()
+    archived_before = archived.read_bytes()
+    checksum_before = archived.with_suffix(archived.suffix + ".sha256").read_bytes()
+
+    state = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    state["complete"] = False
+    archive.window_index_state_file.write_text(
+        json.dumps(state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    assert archive.rebuild_window_index_from_verified_manifest_locked() is True
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == (archived,)
+    assert archive.manifest_file.read_bytes() == manifest_before
+    assert archive.manifest_signature_file.read_bytes() == signature_before
+    assert archived.read_bytes() == archived_before
+    assert archived.with_suffix(archived.suffix + ".sha256").read_bytes() == checksum_before
+
+
+def test_replica_window_index_rebuild_fails_closed_on_manifest_signature_mismatch(
+    tmp_path,
+):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    archive.manifest_signature_file.write_text(
+        "0" * 64 + "  manifest.json\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="archive manifest signature mismatch"):
+        archive.rebuild_window_index_from_verified_manifest_locked()
+
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
     tmp_path, monkeypatch
 ):
