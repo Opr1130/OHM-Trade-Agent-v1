@@ -60,6 +60,20 @@ def _observation(at, price):
 
 
 
+@pytest.mark.parametrize("malformed_version", [2.8, "2", True, False])
+def test_outcome_label_current_rejects_coerced_schema_versions(malformed_version):
+    row = {
+        "label_schema_version": malformed_version,
+        "horizon_returns_pct": {
+            label: 0.0 for label in REQUIRED_FORWARD_HORIZONS
+        },
+        "horizon_observed": {
+            label: True for label in REQUIRED_FORWARD_HORIZONS
+        },
+    }
+    assert outcome_label_is_current(row) is False
+
+
 def test_outcome_label_current_rejects_future_schema_versions():
     row = {
         "label_schema_version": FORWARD_OUTCOME_LABEL_SCHEMA_VERSION + 1,
