@@ -197,7 +197,8 @@ def test_accountability_sql_matches_executable_miss_semantics():
         if item.version == 4
     )
     sql = migration.path.read_text(encoding="utf-8")
-    missed_move_case = sql.split("AS estimated_missed_move_pct_sum", 1)[0]
+    prefix = sql.split("AS estimated_missed_move_pct_sum", 1)[0]
+    missed_move_case = prefix[prefix.rindex("sum("):]
     assert "executable_false_negative" in missed_move_case
 
 
