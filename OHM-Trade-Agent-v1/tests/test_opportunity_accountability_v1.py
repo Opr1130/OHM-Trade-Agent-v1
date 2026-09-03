@@ -416,6 +416,50 @@ def test_dashboard_accountability_rollup_reports_capture_and_latency():
     assert snapshot["mean_decision_latency_ms"] == 420.0
 
 
+def test_dashboard_all_time_uses_complete_database_aggregate_not_trend_window():
+    historical = {
+        "available": True,
+        "opportunity_accountability_daily": [
+            {
+                "date": "2026-09-02",
+                "directional_evaluations": 10,
+                "completed_forward_outcomes": 8,
+                "market_winner_candidates": 2,
+                "captured_winners": 1,
+                "executable_false_negatives": 1,
+                "threshold_70_79_miss_candidates": 0,
+                "ranking_or_cap_miss_candidates": 0,
+                "operational_executable_misses": 0,
+                "estimated_missed_move_pct_sum": 2.0,
+                "decision_latency_samples": 2,
+                "mean_decision_latency_ms": 100.0,
+            }
+        ],
+        "opportunity_accountability_all_time": {
+            "directional_evaluations": 1000,
+            "completed_forward_outcomes": 800,
+            "market_winner_candidates": 200,
+            "captured_winners": 150,
+            "executable_false_negatives": 50,
+            "threshold_70_79_miss_candidates": 20,
+            "ranking_or_cap_miss_candidates": 10,
+            "operational_executable_misses": 5,
+            "estimated_missed_move_pct_sum": 123.4,
+            "decision_latency_samples": 400,
+            "mean_decision_latency_ms": 250.0,
+        },
+    }
+
+    snapshot = _opportunity_accountability_snapshot(historical, "all")
+    assert snapshot["directional_evaluations"] == 1000
+    assert snapshot["captured_winners"] == 150
+    assert snapshot["executable_false_negatives"] == 50
+    assert snapshot["opportunity_capture_rate_pct"] == 75.0
+    assert snapshot["estimated_missed_move_pct_sum"] == 123.4
+    assert snapshot["mean_decision_latency_ms"] == 250.0
+    assert len(snapshot["trend"]) == 1
+
+
 def test_dashboard_latency_weights_only_rows_with_latency():
     historical = {
         "available": True,
