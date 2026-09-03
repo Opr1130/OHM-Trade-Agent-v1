@@ -299,20 +299,30 @@ def _latency_evidence(funnel: Mapping[str, Any] | None) -> dict[str, Any]:
 
     elapsed: dict[str, float] = {}
     deltas: dict[str, float] = {}
-    previous = started
     latest = started
+    ordered: list[tuple[datetime, int, str]] = []
     gates = funnel.get("gate_results")
-    for gate in gates if isinstance(gates, list) else []:
+    for index, gate in enumerate(gates if isinstance(gates, list) else []):
         if not isinstance(gate, Mapping):
             continue
         name = str(gate.get("gate") or "")
         at = _parse_utc(gate.get("evaluated_at"))
         if not name or at is None:
             continue
-        elapsed[name] = round(max(0.0, (at - started).total_seconds() * 1000.0), 3)
-        deltas[name] = round(max(0.0, (at - previous).total_seconds() * 1000.0), 3)
-        previous = at
+        elapsed[name] = round(
+            max(0.0, (at - started).total_seconds() * 1000.0),
+            3,
+        )
+        ordered.append((at, index, name))
         latest = max(latest, at)
+
+    previous = started
+    for at, _index, name in sorted(ordered, key=lambda item: (item[0], item[1])):
+        deltas[name] = round(
+            max(0.0, (at - previous).total_seconds() * 1000.0),
+            3,
+        )
+        previous = max(previous, at)
 
     return {
         "decision_latency_ms": round(max(0.0, (latest - started).total_seconds() * 1000.0), 3),
