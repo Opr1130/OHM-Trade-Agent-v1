@@ -280,6 +280,62 @@ def test_archive_window_selection_uses_day_shards_without_history_scan(
     assert selection.paths == (archived,)
 
 
+def test_archive_rotation_does_not_rehash_unrelated_historical_day(
+    tmp_path,
+    monkeypatch,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    old_shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+
+    future = NOW + timedelta(days=2)
+    hot.write_bytes(
+        b"".join(
+            encode_row(
+                {
+                    "observed_at": (
+                        future + timedelta(seconds=index)
+                    ).isoformat(),
+                    "row": 100 + index,
+                }
+            )
+            for index in range(5)
+        )
+    )
+
+    real_sha256 = bounded_jsonl.sha256_file
+
+    def guarded_sha256(path):
+        if path == old_shard:
+            raise AssertionError(
+                "new archive rotation rehashed unrelated historical shard"
+            )
+        return real_sha256(path)
+
+    monkeypatch.setattr(bounded_jsonl, "sha256_file", guarded_sha256)
+    assert archive.compact_locked() is not None
+
+
 def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
     tmp_path,
 ):
