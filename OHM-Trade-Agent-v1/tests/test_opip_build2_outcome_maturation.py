@@ -653,6 +653,87 @@ def test_bounded_outcome_handoff_replays_until_accountability_ack(tmp_path):
     ) == []
 
 
+def test_completed_v1_outcome_requeues_for_new_12h_horizon(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshot = _snapshot()
+    snapshots.write_text(json.dumps(snapshot) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=12), 10.5)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=24), 11.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    legacy = {
+        **snapshot,
+        "label_schema_version": 1,
+        "reference_at": BASE.isoformat(),
+        "reference_price": 10.0,
+        "horizon_returns_pct": {
+            "5m": None,
+            "15m": None,
+            "30m": None,
+            "60m": None,
+            "4h": None,
+            "8h": None,
+            "24h": 10.0,
+        },
+        "horizon_observed": {
+            "5m": False,
+            "15m": False,
+            "30m": False,
+            "60m": False,
+            "4h": False,
+            "8h": False,
+            "24h": True,
+        },
+        "mfe_pct": 10.0,
+        "mfe_at": (BASE + timedelta(hours=24)).isoformat(),
+        "time_to_mfe_seconds": 24 * 60 * 60,
+        "mae_pct": 0.0,
+        "mae_at": (BASE + timedelta(hours=12)).isoformat(),
+        "time_to_mae_seconds": 12 * 60 * 60,
+        "max_adverse_excursion_pct": 0.0,
+        "window_complete": True,
+        "maturation_status": "MATURE_24H",
+        "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
+        "outcome_record_id": "OUT:LEGACY-V1",
+        "outcome_revision": 1,
+        "append_only": True,
+    }
+    outcomes.write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+
+    rows = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=24, minutes=1),
+    )
+
+    assert len(rows) == 1
+    current = rows[0]
+    assert current["snapshot_id"] == "S1"
+    assert current["label_schema_version"] == 2
+    assert "12h" in current["horizon_returns_pct"]
+    assert "12h" in current["horizon_observed"]
+    assert current["outcome_revision"] == 2
+    assert current["window_complete"] is True
+
+    # Once migrated to the current schema, the completed row retires again.
+    assert build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=25),
+    ) == []
+
+
 def test_bounded_outcomes_revisit_partial_only_at_next_milestone(tmp_path):
     snapshots = tmp_path / "snapshots.jsonl"
     observations = tmp_path / "observations.jsonl"
