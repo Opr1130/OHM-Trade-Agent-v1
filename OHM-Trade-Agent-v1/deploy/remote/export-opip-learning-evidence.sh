@@ -13,7 +13,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk; do
+for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk docker; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required export command: $cmd" >&2
     exit 69
@@ -31,6 +31,15 @@ if ! flock -n 9; then
   echo "O'Pip learning export already active; skipping"
   exit 0
 fi
+
+# Canonical archive indexes are derived evidence metadata. Repair them under
+# each stream's writer lock before taking the publish snapshot so the learning
+# worker never inherits a known-incomplete legacy index.
+(
+  cd "$APP_ROOT"
+  docker compose exec -T ohm-trade-agent \
+    python -m app.jobs.repair_opip_archive_window_indexes
+)
 
 touch "$PUBLISH_LOCK"
 if getent group "$READER_GROUP" >/dev/null 2>&1; then
