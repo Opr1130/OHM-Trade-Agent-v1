@@ -21,6 +21,7 @@ from app.services.phase3c_outcomes import (
     FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
     build_forward_outcome_labels,
     outcome_label_is_current,
+    stored_label_schema_version,
 )
 from app.services.registry_io import registry_lock
 from app.services.signal_quality_phase2 import DEFAULT_OBSERVATION_FILE, read_observations
@@ -223,6 +224,30 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """
         )
+    schema_type_marker = connection.execute(
+        "SELECT value FROM metadata "
+        "WHERE key = 'latest_outcomes_schema_type_v2'"
+    ).fetchone()
+    if schema_type_marker is None:
+        connection.execute(
+            """
+            UPDATE latest_outcomes
+            SET label_schema_version = CASE
+                WHEN json_valid(row_json)
+                 AND json_type(row_json, '$.label_schema_version') = 'integer'
+                THEN json_extract(row_json, '$.label_schema_version')
+                ELSE 0
+            END
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('latest_outcomes_schema_type_v2', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_latest_outcomes_reference "
         "ON latest_outcomes(reference_at, snapshot_id)"
@@ -544,12 +569,7 @@ def _upsert_latest_outcome(
         revision = int(row.get("outcome_revision", 0) or 0)
     except (TypeError, ValueError):
         return
-    try:
-        label_schema_version = int(
-            row.get("label_schema_version", 0) or 0
-        )
-    except (TypeError, ValueError):
-        label_schema_version = 0
+    label_schema_version = stored_label_schema_version(row)
     latest_cursor = connection.execute(
         """
         INSERT INTO latest_outcomes(
