@@ -351,6 +351,53 @@ class BoundedJsonlArchive:
                 )
             except ValueError:
                 coverage_day_count = 0
+        shard_stats: dict[str, dict[str, int]] = {}
+        for day in (shard_sha256 or {}):
+            shard = self.window_index_dir / f"{day}.json"
+            try:
+                stat = shard.stat()
+            except OSError:
+                continue
+            shard_stats[str(day)] = {
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+
+        segment_stats: dict[str, dict[str, Any]] = {}
+        segment_count = 0
+        if manifest_present:
+            try:
+                raw_manifest = json.loads(
+                    self.manifest_file.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                raw_manifest = {}
+            raw_segments = (
+                raw_manifest.get("segments")
+                if isinstance(raw_manifest, dict)
+                else None
+            )
+            if isinstance(raw_segments, dict):
+                segment_count = len(raw_segments)
+                for key, row in raw_segments.items():
+                    if not isinstance(row, dict):
+                        continue
+                    rel = str(row.get("archive") or "").strip()
+                    expected_sha = str(row.get("sha256") or key or "").strip()
+                    if not rel or not expected_sha:
+                        continue
+                    candidate = (self.archive_dir / rel).resolve()
+                    try:
+                        candidate.relative_to(self.archive_dir.resolve())
+                        stat = candidate.stat()
+                    except (OSError, ValueError):
+                        continue
+                    segment_stats[expected_sha] = {
+                        "archive": rel,
+                        "size": int(stat.st_size),
+                        "mtime_ns": int(stat.st_mtime_ns),
+                    }
+
         return {
             "schema_version": 1,
             "manifest_present": manifest_present,
@@ -362,6 +409,9 @@ class BoundedJsonlArchive:
             "coverage_through_day": coverage_through_day,
             "coverage_day_count": coverage_day_count,
             "shard_sha256": dict(sorted((shard_sha256 or {}).items())),
+            "shard_stat": dict(sorted(shard_stats.items())),
+            "segment_count": segment_count,
+            "segment_stat": dict(sorted(segment_stats.items())),
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -542,17 +592,28 @@ class BoundedJsonlArchive:
         state: Mapping[str, Any],
         manifest_signature: str,
     ) -> bool:
-        """Verify cached index files and canonical segments before reuse."""
+        """Validate immutable-file fingerprints without rehashing history."""
         try:
-            if self._verified_manifest_signature_locked() != manifest_signature:
+            manifest_stat = self.manifest_file.stat()
+        except OSError:
+            return False
+        try:
+            if (
+                int(state.get("manifest_size") or -1) != int(manifest_stat.st_size)
+                or int(state.get("manifest_mtime_ns") or -1)
+                != int(manifest_stat.st_mtime_ns)
+                or str(state.get("manifest_sha256") or "") != manifest_signature
+            ):
                 return False
-        except (OSError, RuntimeError):
+        except (TypeError, ValueError):
             return False
 
         coverage_start = str(state.get("coverage_start_day") or "") or None
         coverage_through = str(state.get("coverage_through_day") or "") or None
         raw_digests = state.get("shard_sha256")
         digest_map = raw_digests if isinstance(raw_digests, dict) else {}
+        raw_shard_stats = state.get("shard_stat")
+        shard_stats = raw_shard_stats if isinstance(raw_shard_stats, dict) else {}
         try:
             expected_count = int(state.get("coverage_day_count") or 0)
         except (TypeError, ValueError):
@@ -573,59 +634,58 @@ class BoundedJsonlArchive:
             if (
                 expected_count != len(expected_days)
                 or set(digest_map) != set(expected_days)
+                or set(shard_stats) != set(expected_days)
             ):
                 return False
-        elif expected_count == 0 and not digest_map:
+        elif expected_count == 0 and not digest_map and not shard_stats:
             expected_days = ()
         else:
             return False
 
-        verified_segments: set[str] = set()
         for day in expected_days:
+            expected = shard_stats.get(day)
+            if not isinstance(expected, Mapping):
+                return False
             shard = self.window_index_dir / f"{day}.json"
-            expected_digest = str(digest_map.get(day) or "")
-            if len(expected_digest) != 64:
-                return False
             try:
-                if sha256_file(shard) != expected_digest:
-                    return False
-                raw = json.loads(shard.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                return False
-            if (
-                not isinstance(raw, dict)
-                or raw.get("schema_version") != 1
-                or str(raw.get("day") or "") != day
-            ):
-                return False
-            segments = raw.get("segments")
-            if not isinstance(segments, dict):
-                return False
-            for segment_sha, entry in segments.items():
-                expected_sha = str(segment_sha or "")
-                if expected_sha in verified_segments:
-                    continue
-                if not isinstance(entry, Mapping):
-                    return False
-                rel = str(entry.get("archive") or "").strip()
-                recorded_sha = str(entry.get("sha256") or "").strip()
+                stat = shard.stat()
                 if (
-                    len(expected_sha) != 64
-                    or recorded_sha != expected_sha
-                    or not rel
+                    int(expected.get("size") or -1) != int(stat.st_size)
+                    or int(expected.get("mtime_ns") or -1)
+                    != int(stat.st_mtime_ns)
                 ):
                     return False
-                candidate = (self.archive_dir / rel).resolve()
-                try:
-                    candidate.relative_to(self.archive_dir.resolve())
-                except ValueError:
+            except (OSError, TypeError, ValueError):
+                return False
+
+        raw_segment_stats = state.get("segment_stat")
+        segment_stats = (
+            raw_segment_stats if isinstance(raw_segment_stats, dict) else {}
+        )
+        try:
+            segment_count = int(state.get("segment_count") or 0)
+        except (TypeError, ValueError):
+            return False
+        if len(segment_stats) != segment_count:
+            return False
+        for expected_sha, raw in segment_stats.items():
+            if not isinstance(raw, Mapping):
+                return False
+            rel = str(raw.get("archive") or "").strip()
+            if len(str(expected_sha)) != 64 or not rel:
+                return False
+            candidate = (self.archive_dir / rel).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+                stat = candidate.stat()
+                if (
+                    int(raw.get("size") or -1) != int(stat.st_size)
+                    or int(raw.get("mtime_ns") or -1)
+                    != int(stat.st_mtime_ns)
+                ):
                     return False
-                try:
-                    if self._sha256_file(candidate) != expected_sha:
-                        return False
-                except OSError:
-                    return False
-                verified_segments.add(expected_sha)
+            except (OSError, TypeError, ValueError):
+                return False
         return True
 
 
@@ -729,11 +789,14 @@ class BoundedJsonlArchive:
             candidate = (self.archive_dir / verification.archive).resolve()
             try:
                 candidate.relative_to(self.archive_dir.resolve())
-                actual_sha = self._sha256_file(candidate)
+                candidate_stat = candidate.stat()
             except (OSError, ValueError):
                 complete = False
                 continue
-            if actual_sha != verification.sha256:
+            if (
+                verification.bytes > 0
+                and int(candidate_stat.st_size) != int(verification.bytes)
+            ):
                 complete = False
                 continue
             entry = {
