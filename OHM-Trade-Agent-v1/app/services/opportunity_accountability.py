@@ -1691,6 +1691,7 @@ def _window_archive_selection(
     start: datetime,
     through: datetime,
     kind: str,
+    replica_mode: bool = False,
 ):
     """Return the production archive selection, or None for custom layouts."""
     expected_archive = path.parent / f"{path.stem}_archive"
@@ -1712,7 +1713,8 @@ def _window_archive_selection(
         in {"1", "true", "yes", "on"}
     )
     if (
-        replica_repair_enabled
+        replica_mode
+        and replica_repair_enabled
         and not selection.complete
         and selection.warnings == ("ARCHIVE_WINDOW_INDEX_INCOMPLETE",)
     ):
@@ -1733,6 +1735,7 @@ def _iter_windowed_jsonl_sources(
     start: datetime,
     through: datetime,
     kind: str,
+    replica_mode: bool = False,
 ) -> Iterable[dict[str, Any]]:
     """Read HOT plus only manifest-selected archive segments for a time window."""
     selected = _window_archive_selection(
@@ -1741,6 +1744,7 @@ def _iter_windowed_jsonl_sources(
         start=start,
         through=through,
         kind=kind,
+        replica_mode=replica_mode,
     )
     if selected is None:
         # Test/custom layouts do not necessarily carry the production manifest.
@@ -1774,6 +1778,7 @@ def build_incremental_from_outcomes(
     summary_path: Path = DEFAULT_SUMMARY_FILE,
     state_path: Path | None = None,
     policy: AccountabilityPolicy | None = None,
+    replica_mode: bool = False,
 ) -> dict[str, Any]:
     """Join only the outcome rows matured by the current bounded learning cycle."""
     outcomes = [dict(row) for row in outcome_rows if isinstance(row, Mapping)]
@@ -1842,6 +1847,7 @@ def build_incremental_from_outcomes(
             start=window_start,
             through=window_through,
             kind=source_kind,
+            replica_mode=replica_mode,
         )
         if selected is None:
             continue
@@ -1878,6 +1884,7 @@ def build_incremental_from_outcomes(
                 summary_path=summary_path,
                 state_path=state_path,
                 policy=policy,
+                replica_mode=replica_mode,
             )
             disposition = part_summary.get("batch_disposition")
             if isinstance(disposition, Mapping):
@@ -1935,6 +1942,7 @@ def build_incremental_from_outcomes(
         start=window_start,
         through=window_through,
         kind="screening",
+        replica_mode=replica_mode,
     ):
         if str(row.get("scanner_type") or "").upper() != "BROAD_SEARCH":
             continue
@@ -1954,6 +1962,7 @@ def build_incremental_from_outcomes(
         start=window_start,
         through=window_through,
         kind="funnel",
+        replica_mode=replica_mode,
     ):
         key = (
             str(row.get("scan_id") or ""),
