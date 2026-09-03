@@ -815,6 +815,22 @@ def acknowledge_accountability_outcomes(
     return deleted
 
 
+def _ensure_schema_migration_attempt_table(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migration_attempt (
+            snapshot_id TEXT NOT NULL,
+            target_schema_version INTEGER NOT NULL,
+            attempted_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id, target_schema_version)
+        )
+        """
+    )
+
+
 def _record_schema_migration_attempt(
     connection: sqlite3.Connection,
     *,
@@ -824,6 +840,7 @@ def _record_schema_migration_attempt(
 ) -> None:
     if not snapshot_id:
         return
+    _ensure_schema_migration_attempt_table(connection)
     connection.execute(
         """
         INSERT INTO schema_migration_attempt(
@@ -854,6 +871,7 @@ def _seed_stale_schema_snapshot_queue(
     but use the current time in the queue's ordering column so fresh production
     snapshots are processed first.
     """
+    _ensure_schema_migration_attempt_table(connection)
     oldest = connection.execute(
         """
         SELECT reference_at
