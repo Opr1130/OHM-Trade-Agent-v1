@@ -16,6 +16,11 @@ from app.services.signal_quality_phase3c import (
     canonical_capture_coverage,
     join_point_in_time_evidence,
 )
+from app.services.phase3c_outcomes import (
+    FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
+    REQUIRED_FORWARD_HORIZONS,
+    outcome_label_is_current,
+)
 
 
 BASE = datetime(2026, 8, 1, tzinfo=timezone.utc)
@@ -52,6 +57,20 @@ def _observation(at, price):
         "lift_from_24h_low_pct": 0.0,
         "distance_from_24h_high_pct": 0.0,
     }
+
+
+
+def test_outcome_label_current_rejects_future_schema_versions():
+    row = {
+        "label_schema_version": FORWARD_OUTCOME_LABEL_SCHEMA_VERSION + 1,
+        "horizon_returns_pct": {
+            label: 0.0 for label in REQUIRED_FORWARD_HORIZONS
+        },
+        "horizon_observed": {
+            label: True for label in REQUIRED_FORWARD_HORIZONS
+        },
+    }
+    assert outcome_label_is_current(row) is False
 
 
 def test_outcome_maturation_is_append_only_and_idempotent(tmp_path):
