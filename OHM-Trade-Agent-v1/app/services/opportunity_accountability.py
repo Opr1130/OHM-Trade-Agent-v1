@@ -1731,6 +1731,31 @@ def _iter_windowed_jsonl_sources(
         yield from _iter_jsonl_sources(path, archive_dir=archive_dir)
         return
     archive, selection = selected
+    if (
+        not selection.complete
+        and "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in set(selection.warnings)
+    ):
+        # Learning sync copies an immutable archive generation. Older valid
+        # manifests can lack visibility metadata introduced with the window
+        # index, leaving a permanently cached incomplete state. Repair that
+        # copied index once by re-verifying every affected archive checksum.
+        ensure_index = getattr(archive, "ensure_window_index_locked", None)
+        if callable(ensure_index):
+            try:
+                repaired = bool(
+                    ensure_index(
+                        force_rebuild=True,
+                        repair_legacy_visibility=True,
+                    )
+                )
+            except (OSError, RuntimeError, ValueError):
+                repaired = False
+            if repaired:
+                selection = archive.archive_paths_for_visible_window(
+                    start=start,
+                    through=through,
+                    max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
+                )
     if not selection.complete:
         warning = ",".join(selection.warnings) or "UNKNOWN"
         raise RuntimeError(
