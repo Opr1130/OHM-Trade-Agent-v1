@@ -821,7 +821,7 @@ def _seed_stale_schema_snapshot_queue(
         SELECT reference_at
         FROM latest_outcomes
         WHERE window_complete = 1
-          AND label_schema_version < ?
+          AND label_schema_version <> ?
           AND reference_at <> ''
         ORDER BY reference_at, snapshot_id
         LIMIT 1
@@ -840,7 +840,7 @@ def _seed_stale_schema_snapshot_queue(
         SELECT row_json
         FROM latest_outcomes
         WHERE window_complete = 1
-          AND label_schema_version < ?
+          AND label_schema_version <> ?
           AND reference_at >= ?
           AND reference_at < ?
         ORDER BY reference_at, snapshot_id
