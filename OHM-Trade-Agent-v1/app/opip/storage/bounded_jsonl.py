@@ -273,6 +273,19 @@ class BoundedJsonlArchive:
             return False
         if not isinstance(state, dict):
             return False
+        canonical_keys = {
+            "schema_version",
+            "manifest_present",
+            "manifest_size",
+            "manifest_mtime_ns",
+            "manifest_sha256",
+            "complete",
+            "coverage_start_day",
+            "coverage_through_day",
+            "coverage_day_count",
+            "shard_sha256",
+            "updated_at_utc",
+        }
         shard_digests = state.get("shard_sha256")
         zero_integer_fields = (
             "manifest_size",
@@ -280,19 +293,23 @@ class BoundedJsonlArchive:
             "coverage_day_count",
         )
         if (
-            type(state.get("schema_version")) is not int
+            set(state) != canonical_keys
+            or type(state.get("schema_version")) is not int
             or state.get("schema_version") != 1
             or state.get("manifest_present") is not False
             or any(
                 type(state.get(field)) is not int or state.get(field) != 0
                 for field in zero_integer_fields
             )
-            or str(state.get("manifest_sha256") or "")
+            or type(state.get("manifest_sha256")) is not str
+            or state.get("manifest_sha256") != ""
             or state.get("complete") is not True
-            or str(state.get("coverage_start_day") or "")
-            or str(state.get("coverage_through_day") or "")
+            or state.get("coverage_start_day") is not None
+            or state.get("coverage_through_day") is not None
             or not isinstance(shard_digests, dict)
             or bool(shard_digests)
+            or not isinstance(state.get("updated_at_utc"), str)
+            or not state.get("updated_at_utc")
         ):
             return False
         try:
