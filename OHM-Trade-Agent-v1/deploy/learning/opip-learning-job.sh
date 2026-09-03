@@ -77,7 +77,7 @@ trap cleanup EXIT INT TERM
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
-timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS"   docker run --rm     --name "$CONTAINER_NAME"     --label "$LABEL"     --network none     --memory "$MEMORY_LIMIT"     --memory-swap "$MEMORY_LIMIT"     --cpus "$CPU_LIMIT"     --pids-limit 128     --oom-score-adj 700     --read-only     --cap-drop ALL     --security-opt no-new-privileges:true     --tmpfs /tmp:rw,noexec,nosuid,size=48m     --tmpfs /var/run:rw,noexec,nosuid,size=16m     -e P1_SHADOW_OUTBOX_ENABLED=true     -e PYTHONDONTWRITEBYTECODE=1     -v "$DATA_ROOT:/app/data"     "$OPIP_LEARNING_IMAGE"     python -m "$MODULE"
+timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS"   docker run --rm     --name "$CONTAINER_NAME"     --label "$LABEL"     --network none     --memory "$MEMORY_LIMIT"     --memory-swap "$MEMORY_LIMIT"     --cpus "$CPU_LIMIT"     --pids-limit 128     --oom-score-adj 700     --read-only     --cap-drop ALL     --security-opt no-new-privileges:true     --tmpfs /tmp:rw,noexec,nosuid,size=48m     --tmpfs /var/run:rw,noexec,nosuid,size=16m     -e P1_SHADOW_OUTBOX_ENABLED=true     -e OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true     -e PYTHONDONTWRITEBYTECODE=1     -v "$DATA_ROOT:/app/data"     "$OPIP_LEARNING_IMAGE"     python -m "$MODULE"
 rc=$?
 set -e
 

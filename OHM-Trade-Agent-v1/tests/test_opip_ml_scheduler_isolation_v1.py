@@ -143,7 +143,9 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
         ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
     ).read_text(encoding="utf-8")
     pending = source.index("pending_accountability_outcomes()")
-    build = source.index("build_incremental_from_outcomes(outcomes)")
+    build = source.index(
+        "build_incremental_from_outcomes(outcomes, replica_mode=True)"
+    )
     resolved = source.index("resolved_accountability_outcomes(outcomes)")
     ack = source.index("acknowledge_accountability_outcomes(resolved)")
     assert pending < build < resolved < ack
@@ -208,6 +210,7 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert '--env-file' not in runner
     assert '$APP_ROOT/.env' not in runner
     assert "P1_SHADOW_OUTBOX_ENABLED=true" in runner
+    assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true" in runner
 
 
 def test_deploy_reconciles_paper_topology_before_marking_last_good():
