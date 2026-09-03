@@ -138,6 +138,17 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
 
 
+def test_opportunity_cycle_acks_only_after_accountability_build():
+    source = (
+        ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
+    ).read_text(encoding="utf-8")
+    pending = source.index("pending_accountability_outcomes()")
+    build = source.index("build_incremental_from_outcomes(outcomes)")
+    ack = source.index("acknowledge_accountability_outcomes(outcomes)")
+    assert pending < build < ack
+    assert "if not outcomes:" in source
+
+
 def test_learning_systemd_services_enforce_post_run_cleanup():
     capture = (LEARNING / "opip-learning-capture.service").read_text(
         encoding="utf-8"
