@@ -30,12 +30,20 @@ prune_stale_learning_storage() {
   command -v docker >/dev/null 2>&1 || return 0
 
   local configured_image=""
+  local configured_image_known=false
   local target_image="opip-learning:$TARGET_SHA"
   if [[ -r "$ENV_FILE" ]]; then
-    configured_image="$(
-      awk -F= '$1 == "OPIP_LEARNING_IMAGE" {sub(/^[^=]*=/, ""); print; exit}' \
-        "$ENV_FILE"
-    )"
+    if configured_image="$(
+      set +u
+      # Match opip-learning-job.sh semantics so shell quotes are normalized.
+      # shellcheck disable=SC1090
+      source "$ENV_FILE"
+      printf '%s' "${OPIP_LEARNING_IMAGE:-}"
+    )" && [[ -n "$configured_image" ]]; then
+      configured_image_known=true
+    else
+      configured_image=""
+    fi
   fi
 
   # Build cache is fully derived. Keep only the currently configured release
@@ -44,7 +52,11 @@ prune_stale_learning_storage() {
   docker builder prune -af >/dev/null 2>&1 || true
   while IFS= read -r image; do
     [[ "$image" == opip-learning:* ]] || continue
-    if [[ "$image" != "$configured_image" && "$image" != "$target_image" ]]; then
+    # If the configured image cannot be parsed exactly, retain tagged
+    # learning images rather than risking deletion of the active rollback image.
+    if [[ "$configured_image_known" == true \
+       && "$image" != "$configured_image" \
+       && "$image" != "$target_image" ]]; then
       docker image rm "$image" >/dev/null 2>&1 || true
     fi
   done < <(
