@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 from datetime import datetime, timedelta, timezone
 
+from app.jobs import build_phase3c_forward_outcomes as outcomes_job
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
     build_outcomes,
@@ -386,6 +387,118 @@ def test_legacy_malformed_handoff_is_skipped_and_cleaned_on_upgrade(tmp_path):
         assert connection.execute(
             "SELECT count(*) FROM accountability_handoff"
         ).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch):
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    monkeypatch.setattr(
+        outcomes_job,
+        "ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE",
+        2,
+    )
+
+    connection = sqlite3.connect(state)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE latest_outcomes (
+                snapshot_id TEXT PRIMARY KEY,
+                outcome_record_id TEXT NOT NULL,
+                outcome_revision INTEGER NOT NULL,
+                window_complete INTEGER NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE snapshot_queue (
+                snapshot_id TEXT PRIMARY KEY,
+                decision_at TEXT NOT NULL,
+                next_due_at TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        for index in range(3):
+            snapshot_id = f"LEGACY-{index:02d}"
+            row = {
+                **_snapshot(snapshot_id, f"E{index}"),
+                "reference_at": (
+                    BASE + timedelta(minutes=index)
+                ).isoformat(),
+                "outcome_record_id": f"OUT:{snapshot_id}",
+                "outcome_revision": 1,
+                "window_complete": True,
+            }
+            connection.execute(
+                """
+                INSERT INTO latest_outcomes(
+                    snapshot_id, outcome_record_id, outcome_revision,
+                    window_complete, row_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    row["outcome_record_id"],
+                    1,
+                    1,
+                    json.dumps(row, sort_keys=True),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    first = pending_accountability_outcomes(
+        output_path=output,
+        state_path=state,
+    )
+    assert [row["snapshot_id"] for row in first] == [
+        "LEGACY-00",
+        "LEGACY-01",
+    ]
+
+    connection = sqlite3.connect(state)
+    try:
+        metadata = dict(connection.execute(
+            "SELECT key, value FROM metadata"
+        ).fetchall())
+        assert metadata["accountability_handoff_backfill_cursor_v1"] == "LEGACY-01"
+        assert "accountability_handoff_backfill_v1" not in metadata
+    finally:
+        connection.close()
+
+    assert acknowledge_accountability_outcomes(
+        first,
+        output_path=output,
+        state_path=state,
+    ) == 2
+
+    second = pending_accountability_outcomes(
+        output_path=output,
+        state_path=state,
+    )
+    assert [row["snapshot_id"] for row in second] == ["LEGACY-02"]
+
+    connection = sqlite3.connect(state)
+    try:
+        metadata = dict(connection.execute(
+            "SELECT key, value FROM metadata"
+        ).fetchall())
+        assert metadata["accountability_handoff_backfill_v1"] == "1"
+        assert "accountability_handoff_backfill_cursor_v1" not in metadata
     finally:
         connection.close()
 
