@@ -257,6 +257,43 @@ class BoundedJsonlArchive:
     def window_index_state_file(self) -> Path:
         return self.window_index_dir / "state.json"
 
+    @property
+    def manifest_signature_file(self) -> Path:
+        return self.manifest_file.with_suffix(self.manifest_file.suffix + ".sha256")
+
+    def _read_manifest_signature(self) -> str | None:
+        try:
+            tokens = self.manifest_signature_file.read_text(
+                encoding="utf-8"
+            ).split()
+        except OSError:
+            return None
+        if not tokens:
+            return None
+        digest = str(tokens[0]).lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            return None
+        return digest
+
+    def _write_manifest_signature_locked(self, digest: str) -> None:
+        write_atomic_lines(
+            self.manifest_signature_file,
+            [f"{digest}  {self.manifest_file.name}\n".encode("utf-8")],
+        )
+
+    def _verified_manifest_signature_locked(self) -> str:
+        if not self.manifest_file.exists():
+            raise RuntimeError("archive manifest is unavailable")
+        actual = sha256_file(self.manifest_file)
+        expected = self._read_manifest_signature()
+        if expected is None:
+            # One-time legacy bootstrap under the source writer lock.
+            self._write_manifest_signature_locked(actual)
+            return actual
+        if actual != expected:
+            raise RuntimeError("archive manifest signature mismatch")
+        return actual
+
     @staticmethod
     def _window_day_keys(start: datetime, through: datetime) -> tuple[str, ...]:
         current = start.astimezone(timezone.utc).date()
@@ -294,7 +331,9 @@ class BoundedJsonlArchive:
             stat = self.manifest_file.stat()
             manifest_size = stat.st_size
             manifest_mtime_ns = stat.st_mtime_ns
-            manifest_sha256 = sha256_file(self.manifest_file)
+            manifest_sha256 = self._read_manifest_signature()
+            if manifest_sha256 is None:
+                manifest_sha256 = self._verified_manifest_signature_locked()
         else:
             manifest_size = 0
             manifest_mtime_ns = 0
@@ -508,7 +547,15 @@ class BoundedJsonlArchive:
             self._write_window_index_state_locked(complete=complete)
             return complete
 
-        manifest_stat = self.manifest_file.stat()
+        manifest_signature = self._read_manifest_signature()
+        if manifest_signature is None:
+            # Legacy/bootstrap path only. Steady-state batches read the tiny
+            # signature sidecar instead of hashing the lifetime manifest.
+            try:
+                manifest_signature = self._verified_manifest_signature_locked()
+            except RuntimeError:
+                self._write_window_index_state_locked(complete=False)
+                return False
         if self.window_index_state_file.exists():
             try:
                 state = json.loads(
@@ -520,9 +567,7 @@ class BoundedJsonlArchive:
                 isinstance(state, dict)
                 and state.get("schema_version") == 1
                 and bool(state.get("manifest_present"))
-                and int(state.get("manifest_size") or -1) == manifest_stat.st_size
-                and int(state.get("manifest_mtime_ns") or -1)
-                == manifest_stat.st_mtime_ns
+                and str(state.get("manifest_sha256") or "") == manifest_signature
             )
             if version_matches:
                 if not bool(state.get("complete", False)):
@@ -549,8 +594,10 @@ class BoundedJsonlArchive:
                     return True
 
         try:
+            if self._verified_manifest_signature_locked() != manifest_signature:
+                raise RuntimeError("archive manifest signature changed during rebuild")
             raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
             self._write_window_index_state_locked(complete=False)
             return False
         segments = raw.get("segments") if isinstance(raw, dict) else None
@@ -735,6 +782,10 @@ class BoundedJsonlArchive:
             if manifest_existed
             else True
         )
+        if manifest_existed:
+            # Mutation is infrequent (archive rotation/tiering), so authenticate
+            # the full canonical manifest here before carrying forward entries.
+            self._verified_manifest_signature_locked()
         payload: dict[str, Any] = {}
         if self.manifest_file.exists():
             try:
@@ -773,6 +824,7 @@ class BoundedJsonlArchive:
                 + b"\n"
             ],
         )
+        self._write_manifest_signature_locked(sha256_file(self.manifest_file))
         if not prior_complete:
             # The manifest version just changed. Rebuild an incomplete index
             # once from the canonical manifest instead of retrying on every
