@@ -488,12 +488,19 @@ def build_recent_qualification_funnel(
                 metadata = {}
 
             if name == "MARGIN_ELIGIBILITY":
+                reason_class = str(gate.get("reason_class") or "").upper()
+                operational_margin_failure = (
+                    status == "ERROR"
+                    or reason_class == "OPERATIONAL"
+                    or reason_code == "MARGIN_VALIDATION_UNAVAILABLE"
+                )
                 if status == "PASS":
                     counts["margin_pass"] += 1
-                elif status == "FAIL":
-                    counts["margin_reject"] += 1
-                elif status == "ERROR":
-                    counts["margin_error"] += 1
+                elif status in {"FAIL", "ERROR"}:
+                    if operational_margin_failure:
+                        counts["margin_error"] += 1
+                    else:
+                        counts["margin_reject"] += 1
                 if status in {"FAIL", "ERROR"}:
                     margin_status = str(
                         metadata.get("margin_validation_status")
