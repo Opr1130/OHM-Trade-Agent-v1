@@ -702,6 +702,149 @@ class BoundedJsonlArchive:
         )
         return complete
 
+    def repair_window_index_locked(self) -> bool:
+        """Repair a derived window index from canonical verified archive data.
+
+        Callers must hold the stream's exclusive writer lock. The canonical
+        manifest remains authoritative. Only manifest rows missing valid
+        visibility metadata are reparsed from their checksum-verified archive
+        segment; healthy historical segments are not rescanned.
+        """
+        if not self.manifest_file.exists():
+            return self.ensure_window_index_locked()
+
+        try:
+            manifest_signature = self._verified_manifest_signature_locked()
+            raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+            self._write_window_index_state_locked(complete=False)
+            return False
+
+        segments = raw.get("segments") if isinstance(raw, dict) else None
+        if not isinstance(segments, dict):
+            self._write_window_index_state_locked(complete=False)
+            return False
+
+        changed = False
+        complete = True
+        repaired_segments = dict(segments)
+        for key, row in segments.items():
+            if not isinstance(row, dict):
+                complete = False
+                continue
+
+            try:
+                verification = ArchiveVerification(
+                    archive=str(row.get("archive") or ""),
+                    tier=str(row.get("tier") or ""),
+                    sha256=str(row.get("sha256") or ""),
+                    row_count=int(row.get("row_count") or 0),
+                    bytes=int(row.get("bytes") or 0),
+                    first_visible_at_utc=(
+                        str(row.get("first_visible_at_utc"))
+                        if row.get("first_visible_at_utc") is not None
+                        else None
+                    ),
+                    last_visible_at_utc=(
+                        str(row.get("last_visible_at_utc"))
+                        if row.get("last_visible_at_utc") is not None
+                        else None
+                    ),
+                )
+            except (TypeError, ValueError):
+                verification = None
+
+            if (
+                verification is not None
+                and verification.archive
+                and verification.sha256
+                and self._verification_days(verification)
+            ):
+                continue
+
+            rel = str(row.get("archive") or "").strip()
+            expected_sha = str(row.get("sha256") or "").strip()
+            if not rel or not expected_sha:
+                complete = False
+                continue
+
+            candidate = (self.archive_dir / rel).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+            except ValueError:
+                complete = False
+                continue
+            if not candidate.exists():
+                complete = False
+                continue
+
+            tier = str(row.get("tier") or "").strip()
+            if not tier:
+                try:
+                    candidate.relative_to(self.cold_archive_dir.resolve())
+                    tier = "COLD"
+                except ValueError:
+                    tier = "WARM"
+
+            try:
+                repaired = self.verify_archive_file(candidate, tier=tier)
+            except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError):
+                complete = False
+                continue
+            if repaired.sha256 != expected_sha or str(key) != expected_sha:
+                complete = False
+                continue
+            if not self._verification_days(repaired):
+                complete = False
+                continue
+
+            repaired_segments[str(key)] = {
+                **row,
+                "archive": repaired.archive,
+                "tier": repaired.tier,
+                "sha256": repaired.sha256,
+                "row_count": repaired.row_count,
+                "bytes": repaired.bytes,
+                "first_visible_at_utc": repaired.first_visible_at_utc,
+                "last_visible_at_utc": repaired.last_visible_at_utc,
+                "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            changed = True
+
+        if changed:
+            payload = {
+                "schema_version": 1,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "segments": repaired_segments,
+            }
+            write_atomic_lines(
+                self.manifest_file,
+                [
+                    json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            self._write_manifest_signature_locked(sha256_file(self.manifest_file))
+        else:
+            # Authenticate that the canonical manifest did not change while
+            # the repair inspected its derived state.
+            if self._verified_manifest_signature_locked() != manifest_signature:
+                self._write_window_index_state_locked(complete=False)
+                return False
+
+        # Rebuild the derived index from the canonical manifest even when this
+        # manifest version previously cached complete=false.
+        if self.window_index_dir.exists():
+            shutil.rmtree(self.window_index_dir)
+        rebuilt = self.ensure_window_index_locked()
+        return bool(complete and rebuilt)
+
+
     def repair_tail(self) -> None:
         repair_truncated_tail(self.data_file, parse_line=self.parse_line)
 
