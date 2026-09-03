@@ -98,6 +98,37 @@ def test_real_archive_segment_without_manifest_remains_fail_closed(tmp_path):
 
     assert archive.ensure_window_index_locked() is False
 
+
+
+def test_cached_complete_index_rebuilds_when_a_shard_is_deleted(tmp_path):
+    archive = _archive(tmp_path)
+    state = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    assert state["complete"] is True
+    shard = next(archive.window_index_dir.glob("20*.json"))
+    shard.unlink()
+
+    assert archive.repair_window_index_locked() is True
+    assert shard.exists()
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert len(selection.paths) == 1
+
+
+def test_cached_complete_index_fails_when_canonical_segment_is_deleted(tmp_path):
+    archive = _archive(tmp_path)
+    assert archive.ensure_window_index_locked() is True
+    segment = next(archive.archive_dir.glob("*.jsonl.gz"))
+    segment.unlink()
+
+    assert archive.repair_window_index_locked() is False
+
+
 def test_repair_window_index_backfills_legacy_visibility_metadata(tmp_path):
     archive = _archive(tmp_path)
     manifest = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
@@ -175,5 +206,7 @@ def test_writer_and_deploy_repair_indexes_without_export_compute():
 
     repair = "python -m app.jobs.repair_opip_archive_window_indexes"
     assert repair in deploy
-    assert deploy.index(repair) > deploy.index("wait_core_health")
+    health_invocation = 'if ! wait_core_health; then'
+    assert health_invocation in deploy
+    assert deploy.index(repair) > deploy.index(health_invocation)
     assert "archive window-index repair deferred to writer maintenance" in deploy
