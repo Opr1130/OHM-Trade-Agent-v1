@@ -143,10 +143,11 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
         ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
     ).read_text(encoding="utf-8")
     pending = source.index("pending_accountability_outcomes()")
+    repair = source.index("repair_accountability_archive_indexes()")
     build = source.index("build_incremental_from_outcomes(outcomes)")
     resolved = source.index("resolved_accountability_outcomes(outcomes)")
     ack = source.index("acknowledge_accountability_outcomes(resolved)")
-    assert pending < build < resolved < ack
+    assert pending < repair < build < resolved < ack
     assert "acknowledge_accountability_outcomes(outcomes)" not in source
     assert "if not outcomes:" in source
     assert "if replayed_handoff:" in source

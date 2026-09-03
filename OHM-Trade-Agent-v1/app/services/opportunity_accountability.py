@@ -29,6 +29,7 @@ from app.opip.decision.store import (
     funnel_events_archive,
     screening_evaluations_archive,
 )
+from app.services.registry_io import registry_lock
 
 
 DEFAULT_SCREENING_FILE = Path("/app/data/opip/qualification/screening_evaluations.jsonl")
@@ -1682,6 +1683,46 @@ def _iter_jsonl_sources(
                         yield row
         except (OSError, EOFError, zlib.error):
             continue
+
+
+def repair_accountability_archive_indexes(
+    *,
+    screening_path: Path = DEFAULT_SCREENING_FILE,
+    screening_archive: Path = DEFAULT_SCREENING_ARCHIVE,
+    funnel_path: Path = DEFAULT_FUNNEL_FILE,
+    funnel_archive: Path = DEFAULT_FUNNEL_ARCHIVE,
+) -> dict[str, bool]:
+    """Repair derived archive-window indexes on the isolated learning copy.
+
+    The canonical gzip segments and their checksums remain authoritative. A
+    normal fast-path check runs first; only an already-incomplete index triggers
+    a full manifest-derived rebuild. Any structural manifest/evidence problem
+    still fails closed.
+    """
+    targets = (
+        ("screening", screening_path, screening_archive, screening_evaluations_archive),
+        ("funnel", funnel_path, funnel_archive, funnel_events_archive),
+    )
+    status: dict[str, bool] = {}
+    for kind, path, archive_dir, factory in targets:
+        expected_archive = path.parent / f"{path.stem}_archive"
+        if archive_dir != expected_archive:
+            # Custom/test layouts do not carry the production index contract.
+            status[kind] = True
+            continue
+
+        archive = factory(path)
+        lock = path.parent / f".{path.name}.lock"
+        with registry_lock(lock):
+            healthy = archive.ensure_window_index_locked()
+            if not healthy:
+                healthy = archive.ensure_window_index_locked(force_rebuild=True)
+        status[kind] = bool(healthy)
+        if not healthy:
+            raise RuntimeError(
+                f"ACCOUNTABILITY_ARCHIVE_INDEX_REPAIR_FAILED:{kind}"
+            )
+    return status
 
 
 def _window_archive_selection(

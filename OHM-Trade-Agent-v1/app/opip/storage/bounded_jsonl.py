@@ -536,14 +536,24 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
 
-    def ensure_window_index_locked(self) -> bool:
+    def ensure_window_index_locked(self, *, force_rebuild: bool = False) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
 
         This method may scan the master manifest only when the index is absent
-        or stale. Steady-state window selection never loads the master manifest.
+        or stale. ``force_rebuild`` is an explicit recovery path for an
+        authenticated manifest whose prior derived index build was incomplete;
+        steady-state callers leave it false and never rescan lifetime history.
         """
         if not self.manifest_file.exists():
-            complete = not self.archive_dir.exists()
+            # Export/sync may materialize an empty archive directory before the
+            # first compaction. That is healthy: there is no archived evidence
+            # for a manifest to describe. Fail closed only when archive segments
+            # actually exist without canonical manifest metadata.
+            has_archive_segments = (
+                self.archive_dir.exists()
+                and any(self.archive_dir.rglob(self.archive_glob))
+            )
+            complete = not has_archive_segments
             self._write_window_index_state_locked(complete=complete)
             return complete
 
@@ -569,7 +579,7 @@ class BoundedJsonlArchive:
                 and bool(state.get("manifest_present"))
                 and str(state.get("manifest_sha256") or "") == manifest_signature
             )
-            if version_matches:
+            if version_matches and not force_rebuild:
                 if not bool(state.get("complete", False)):
                     # Cache a failed/incomplete build for this immutable
                     # manifest version. The next manifest update changes the
@@ -610,8 +620,18 @@ class BoundedJsonlArchive:
         complete = True
         coverage_start_day: str | None = None
         coverage_through_day: str | None = None
-        for row in segments.values():
+        for manifest_digest, row in segments.items():
             if not isinstance(row, dict):
+                complete = False
+                continue
+            row_digest = str(row.get("sha256") or "").lower()
+            manifest_digest_text = str(manifest_digest or "").lower()
+            digest_is_valid = (
+                len(row_digest) == 64
+                and all(char in "0123456789abcdef" for char in row_digest)
+                and manifest_digest_text == row_digest
+            )
+            if not digest_is_valid:
                 complete = False
                 continue
             try:
