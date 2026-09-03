@@ -1662,6 +1662,25 @@ def build_incremental_from_outcomes(
         if stamp is not None
     ]
     if not target_keys or not target_times:
+        terminal = [
+            {
+                "outcome_record_id": str(row.get("outcome_record_id") or ""),
+                "snapshot_id": str(row.get("snapshot_id") or ""),
+                "disposition": "TERMINAL_REJECTED",
+                "reason": "MALFORMED_OUTCOME_IDENTITY",
+                "accountability_rows": 0,
+                "measurement_only": True,
+                "affects_trade_authority": False,
+            }
+            for row in outcomes
+            if str(row.get("outcome_record_id") or "")
+            and str(row.get("snapshot_id") or "")
+        ]
+        _persist_outcome_dispositions(
+            terminal,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
         reconcile_paper_events(
             intelligence_event_path=intelligence_event_path,
             ledger_path=ledger_path,
@@ -1671,6 +1690,11 @@ def build_incremental_from_outcomes(
             ledger_path=ledger_path,
             state_path=state_path,
         )
+        summary["batch_disposition"] = {
+            "accepted": 0,
+            "terminal_rejected": len(terminal),
+            "unresolved": max(0, len(outcomes) - len(terminal)),
+        }
         write_summary(summary, path=summary_path)
         return summary
 
@@ -1749,6 +1773,16 @@ def build_incremental_from_outcomes(
         path=ledger_path,
         state_path=state_path,
     )
+    dispositions = _derive_outcome_dispositions(
+        outcomes,
+        screening,
+        accountability_rows,
+    )
+    _persist_outcome_dispositions(
+        dispositions,
+        ledger_path=ledger_path,
+        state_path=state_path,
+    )
     reconcile_paper_events(
         intelligence_event_path=intelligence_event_path,
         ledger_path=ledger_path,
@@ -1758,6 +1792,22 @@ def build_incremental_from_outcomes(
         ledger_path=ledger_path,
         state_path=state_path,
     )
+    accepted = sum(
+        row.get("disposition") == "ACCEPTED"
+        for row in dispositions
+    )
+    terminal_rejected = sum(
+        row.get("disposition") == "TERMINAL_REJECTED"
+        for row in dispositions
+    )
+    summary["batch_disposition"] = {
+        "accepted": accepted,
+        "terminal_rejected": terminal_rejected,
+        "unresolved": max(
+            0,
+            len(outcomes) - accepted - terminal_rejected,
+        ),
+    }
     write_summary(summary, path=summary_path)
     return summary
 
