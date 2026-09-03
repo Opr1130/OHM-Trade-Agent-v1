@@ -766,8 +766,16 @@ class BoundedJsonlArchive:
             coverage_through_day,
             shard_digests,
         ) = self._update_window_index_verification_locked(verification)
+        if not indexed:
+            # The incremental index detected missing/corrupt certified state.
+            # Rebuild once from the just-written canonical manifest. If that
+            # manifest is itself structurally incomplete, the rebuild records
+            # complete=false and that manifest version is then safely cached.
+            self.window_index_state_file.unlink(missing_ok=True)
+            self.ensure_window_index_locked()
+            return
         self._write_window_index_state_locked(
-            complete=prior_complete and indexed,
+            complete=True,
             coverage_start_day=coverage_start_day,
             coverage_through_day=coverage_through_day,
             shard_sha256=shard_digests,
