@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 
 logger = logging.getLogger(__name__)
@@ -384,33 +384,41 @@ class BoundedJsonlArchive:
         }
         self.window_index_dir.mkdir(parents=True, exist_ok=True)
 
-        coverage_days = self._window_day_keys(
-            datetime.fromisoformat(new_start).replace(tzinfo=timezone.utc),
-            datetime.fromisoformat(new_through).replace(tzinfo=timezone.utc),
-        )
-        for day in coverage_days:
-            shard = self.window_index_dir / f"{day}.json"
-            within_old = bool(
-                old_start
-                and old_through
-                and old_start <= day <= old_through
+        def _day_start(day: str) -> datetime:
+            return datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+
+        # Only create/check the newly extended edges of the dense coverage.
+        # Historical certified days are not rehashed on every archive rotation.
+        extension_days: list[str] = []
+        if old_start and old_through:
+            if new_start < old_start:
+                extension_days.extend(
+                    self._window_day_keys(
+                        _day_start(new_start),
+                        _day_start(old_start) - timedelta(days=1),
+                    )
+                )
+            if new_through > old_through:
+                extension_days.extend(
+                    self._window_day_keys(
+                        _day_start(old_through) + timedelta(days=1),
+                        _day_start(new_through),
+                    )
+                )
+        else:
+            extension_days.extend(
+                self._window_day_keys(
+                    _day_start(new_start),
+                    _day_start(new_through),
+                )
             )
+
+        for day in extension_days:
+            shard = self.window_index_dir / f"{day}.json"
             if shard.exists():
-                if within_old:
-                    expected = shard_digests.get(day)
-                    if not expected or sha256_file(shard) != expected:
-                        return False, old_start, old_through, shard_digests
-                else:
-                    try:
-                        raw = json.loads(shard.read_text(encoding="utf-8"))
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        return False, old_start, old_through, shard_digests
-                    segments = raw.get("segments") if isinstance(raw, dict) else None
-                    if not isinstance(segments, dict):
-                        return False, old_start, old_through, shard_digests
-                    shard_digests[day] = sha256_file(shard)
-                continue
-            if within_old:
+                # An uncertified pre-existing shard is ambiguous. Keep the
+                # index incomplete so ensure_window_index_locked() rebuilds it
+                # from the canonical master manifest on the next writer pass.
                 return False, old_start, old_through, shard_digests
             write_atomic_lines(
                 shard,
