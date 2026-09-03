@@ -261,11 +261,12 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             row_json,
             sort_reference_at,
         ) in legacy_rows:
-            snapshot_id = str(snapshot_id or "").strip()
+            raw_snapshot_id = str(snapshot_id or "")
+            snapshot_id = raw_snapshot_id.strip()
             outcome_record_id = str(outcome_record_id or "").strip()
             last_reference = str(sort_reference_at or "")
-            if snapshot_id:
-                last_snapshot_id = snapshot_id
+            if raw_snapshot_id:
+                last_snapshot_id = raw_snapshot_id
             if not snapshot_id or not outcome_record_id:
                 continue
             try:
