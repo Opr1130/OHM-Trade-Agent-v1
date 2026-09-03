@@ -189,29 +189,81 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
 
     backfill_marker = connection.execute(
         "SELECT value FROM metadata "
-        "WHERE key = 'accountability_handoff_backfill_v1'"
+        "WHERE key = 'accountability_handoff_backfill_v2'"
     ).fetchone()
     if backfill_marker is None:
         cursor_row = connection.execute(
             "SELECT value FROM metadata "
-            "WHERE key = 'accountability_handoff_backfill_cursor_v1'"
+            "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
         ).fetchone()
-        cursor = str(cursor_row[0]) if cursor_row is not None else ""
+        cursor_reference = ""
+        cursor_snapshot = ""
+        if cursor_row is not None:
+            try:
+                cursor_payload = json.loads(str(cursor_row[0]))
+            except (TypeError, json.JSONDecodeError):
+                cursor_payload = {}
+            if isinstance(cursor_payload, dict):
+                cursor_reference = str(
+                    cursor_payload.get("reference_at") or ""
+                )
+                cursor_snapshot = str(
+                    cursor_payload.get("snapshot_id") or ""
+                )
+
         legacy_rows = connection.execute(
             """
-            SELECT snapshot_id, outcome_record_id, outcome_revision, row_json
-            FROM latest_outcomes
-            WHERE snapshot_id > ?
-            ORDER BY snapshot_id
+            WITH ordered AS (
+                SELECT
+                    snapshot_id,
+                    outcome_record_id,
+                    outcome_revision,
+                    row_json,
+                    coalesce(
+                        CASE
+                            WHEN json_valid(row_json)
+                            THEN json_extract(row_json, '$.reference_at')
+                            ELSE ''
+                        END,
+                        ''
+                    ) AS sort_reference_at
+                FROM latest_outcomes
+            )
+            SELECT
+                snapshot_id,
+                outcome_record_id,
+                outcome_revision,
+                row_json,
+                sort_reference_at
+            FROM ordered
+            WHERE sort_reference_at > ?
+               OR (
+                    sort_reference_at = ?
+                    AND snapshot_id > ?
+               )
+            ORDER BY sort_reference_at, snapshot_id
             LIMIT ?
             """,
-            (cursor, ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE),
+            (
+                cursor_reference,
+                cursor_reference,
+                cursor_snapshot,
+                ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE,
+            ),
         ).fetchall()
 
-        last_snapshot_id = cursor
-        for snapshot_id, outcome_record_id, outcome_revision, row_json in legacy_rows:
+        last_reference = cursor_reference
+        last_snapshot_id = cursor_snapshot
+        for (
+            snapshot_id,
+            outcome_record_id,
+            outcome_revision,
+            row_json,
+            sort_reference_at,
+        ) in legacy_rows:
             snapshot_id = str(snapshot_id or "").strip()
             outcome_record_id = str(outcome_record_id or "").strip()
+            last_reference = str(sort_reference_at or "")
             if snapshot_id:
                 last_snapshot_id = snapshot_id
             if not snapshot_id or not outcome_record_id:
@@ -263,10 +315,19 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             connection.execute(
                 """
                 INSERT INTO metadata(key, value)
-                VALUES ('accountability_handoff_backfill_cursor_v1', ?)
+                VALUES ('accountability_handoff_backfill_cursor_v2', ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
-                (last_snapshot_id,),
+                (
+                    json.dumps(
+                        {
+                            "reference_at": last_reference,
+                            "snapshot_id": last_snapshot_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
             )
             connection.commit()
 
@@ -274,13 +335,13 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             connection.execute(
                 """
                 INSERT INTO metadata(key, value)
-                VALUES ('accountability_handoff_backfill_v1', '1')
+                VALUES ('accountability_handoff_backfill_v2', '1')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
             connection.execute(
                 "DELETE FROM metadata "
-                "WHERE key = 'accountability_handoff_backfill_cursor_v1'"
+                "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
             )
     connection.commit()
     return connection
