@@ -277,3 +277,55 @@ def test_reader_rejects_certified_empty_state_when_manifest_appears(tmp_path):
     assert selection.complete is False
     assert selection.paths == ()
     assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
+
+
+def test_noncanonical_empty_state_fields_cannot_certify_archive(tmp_path):
+    """Missing or falsy noncanonical fields cannot certify an empty archive."""
+    base_state = {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": True,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": NOW.isoformat(),
+    }
+    cases = (
+        ("missing_manifest_sha256", "manifest_sha256", None, True),
+        ("missing_coverage_start", "coverage_start_day", None, True),
+        ("missing_coverage_through", "coverage_through_day", None, True),
+        ("missing_updated_at", "updated_at_utc", None, True),
+        ("false_manifest_sha256", "manifest_sha256", False, False),
+        ("false_coverage_start", "coverage_start_day", False, False),
+        ("false_coverage_through", "coverage_through_day", False, False),
+        ("empty_updated_at", "updated_at_utc", "", False),
+    )
+
+    for name, field, value, omit in cases:
+        archive = _archive(tmp_path / name)
+        archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+        state = dict(base_state)
+        if omit:
+            state.pop(field)
+        else:
+            state[field] = value
+        archive.window_index_state_file.write_text(
+            json.dumps(state, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        before = archive.window_index_state_file.read_bytes()
+
+        assert archive.ensure_window_index_locked() is False
+        assert archive.window_index_state_file.read_bytes() == before
+
+        selection = archive.archive_paths_for_visible_window(
+            start=NOW - timedelta(minutes=1),
+            through=NOW + timedelta(minutes=1),
+            max_segments=8,
+        )
+        assert selection.complete is False
+        assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
