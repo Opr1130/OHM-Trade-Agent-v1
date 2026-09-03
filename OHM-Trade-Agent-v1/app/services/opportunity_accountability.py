@@ -1162,11 +1162,36 @@ def build_accountability_summary_from_state(
         aggregate = connection.execute(
             """
             SELECT count(*), coalesce(sum(outcome_complete), 0),
-                   coalesce(sum(market_winner), 0), coalesce(sum(captured_winner), 0),
-                   coalesce(sum(executable_false_negative), 0),
-                   coalesce(sum(threshold_miss), 0), coalesce(sum(cap_miss), 0),
-                   coalesce(sum(operational_miss), 0),
-                   coalesce(sum(estimated_missed_move), 0.0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1 AND market_winner = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1 AND captured_winner = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1
+                             AND executable_false_negative = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1 AND threshold_miss = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1 AND cap_miss = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1 AND operational_miss = 1
+                            THEN 1 ELSE 0 END
+                   ), 0),
+                   coalesce(sum(
+                       CASE WHEN outcome_complete = 1
+                             AND executable_false_negative = 1
+                            THEN estimated_missed_move ELSE 0.0 END
+                   ), 0.0),
                    avg(decision_latency_ms), count(decision_latency_ms),
                    coalesce(sum(threshold_shadow), 0),
                    coalesce(sum(expanded_cap_shadow), 0),
@@ -1176,14 +1201,16 @@ def build_accountability_summary_from_state(
                    count(range_consumed_proxy),
                    coalesce(sum(
                        CASE
-                           WHEN market_winner = 1
+                           WHEN outcome_complete = 1
+                            AND market_winner = 1
                             AND range_consumed_proxy < 50.0 THEN 1
                            ELSE 0
                        END
                    ), 0),
                    coalesce(sum(
                        CASE
-                           WHEN market_winner = 1
+                           WHEN outcome_complete = 1
+                            AND market_winner = 1
                             AND range_consumed_proxy >= 50.0 THEN 1
                            ELSE 0
                        END
@@ -1202,7 +1229,7 @@ def build_accountability_summary_from_state(
             for name, count in connection.execute(
                 """
                 SELECT terminal_gate, count(*) FROM latest
-                WHERE market_winner = 1
+                WHERE outcome_complete = 1 AND market_winner = 1
                 GROUP BY terminal_gate
                 """
             ).fetchall()
