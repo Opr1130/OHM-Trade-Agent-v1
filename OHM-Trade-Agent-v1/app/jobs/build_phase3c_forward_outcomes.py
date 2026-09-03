@@ -108,6 +108,7 @@ BOUNDED_BASELINE_LOOKBACK = timedelta(hours=24)
 BOUNDED_FORWARD_GRACE = timedelta(hours=25)
 BOUNDED_RETRY_DELAY = timedelta(hours=1)
 BOUNDED_CHECKPOINT_ANCHOR_BYTES = 4096
+ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE = 500
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -188,18 +189,28 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
         "WHERE key = 'accountability_handoff_backfill_v1'"
     ).fetchone()
     if backfill_marker is None:
+        cursor_row = connection.execute(
+            "SELECT value FROM metadata "
+            "WHERE key = 'accountability_handoff_backfill_cursor_v1'"
+        ).fetchone()
+        cursor = str(cursor_row[0]) if cursor_row is not None else ""
         legacy_rows = connection.execute(
             """
             SELECT snapshot_id, outcome_record_id, outcome_revision, row_json
             FROM latest_outcomes
-            WHERE snapshot_id NOT IN (
-                SELECT snapshot_id FROM accountability_handoff
-            )
-            """
+            WHERE snapshot_id > ?
+            ORDER BY snapshot_id
+            LIMIT ?
+            """,
+            (cursor, ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE),
         ).fetchall()
+
+        last_snapshot_id = cursor
         for snapshot_id, outcome_record_id, outcome_revision, row_json in legacy_rows:
             snapshot_id = str(snapshot_id or "").strip()
             outcome_record_id = str(outcome_record_id or "").strip()
+            if snapshot_id:
+                last_snapshot_id = snapshot_id
             if not snapshot_id or not outcome_record_id:
                 continue
             try:
@@ -217,30 +228,53 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
                 continue
             connection.execute(
                 """
-                INSERT OR REPLACE INTO accountability_handoff(
+                INSERT INTO accountability_handoff(
                     snapshot_id,
                     outcome_record_id,
                     outcome_revision,
                     reference_at,
                     row_json
                 ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                    outcome_record_id = excluded.outcome_record_id,
+                    outcome_revision = excluded.outcome_revision,
+                    reference_at = excluded.reference_at,
+                    row_json = excluded.row_json
+                WHERE excluded.outcome_revision
+                      >= accountability_handoff.outcome_revision
                 """,
                 (
-                    str(snapshot_id),
-                    str(outcome_record_id),
+                    snapshot_id,
+                    outcome_record_id,
                     int(outcome_revision),
                     reference_at,
                     row_json,
                 ),
             )
-        connection.execute(
-            """
-            INSERT INTO metadata(key, value)
-            VALUES ('accountability_handoff_backfill_v1', '1')
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """
-        )
 
+        if legacy_rows:
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES ('accountability_handoff_backfill_cursor_v1', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (last_snapshot_id,),
+            )
+            connection.commit()
+
+        if len(legacy_rows) < ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE:
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES ('accountability_handoff_backfill_v1', '1')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            )
+            connection.execute(
+                "DELETE FROM metadata "
+                "WHERE key = 'accountability_handoff_backfill_cursor_v1'"
+            )
     connection.commit()
     return connection
 
