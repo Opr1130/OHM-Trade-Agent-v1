@@ -15,6 +15,7 @@ from app.services.opportunity_accountability import (
     build_accountability_summary,
     build_accountability_summary_from_state,
     build_incremental_from_outcomes,
+    resolved_accountability_outcomes,
 )
 from app.services.signal_timing_v2 import STANDARD_HORIZONS
 
@@ -72,6 +73,7 @@ def _outcome(
 ):
     return {
         "snapshot_id": snapshot_id,
+        "outcome_record_id": f"OUT:{snapshot_id}:{revision}",
         "symbol": symbol,
         "reference_at": NOW.isoformat(),
         "reference_price": 100.0,
@@ -474,6 +476,136 @@ def test_new_accountability_layer_has_no_execution_authority_imports():
         "telegram_bot_token",
     ):
         assert forbidden not in combined
+
+
+def test_invalid_directional_evidence_gets_durable_terminal_disposition(
+    tmp_path,
+):
+    screening_path = tmp_path / "screening.jsonl"
+    screening_archive = tmp_path / "screening_archive"
+    funnel_path = tmp_path / "funnel.jsonl"
+    funnel_archive = tmp_path / "funnel_archive"
+    events = tmp_path / "events.jsonl"
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+    summary_path = tmp_path / "summary.json"
+
+    screening_path.write_text(
+        json.dumps(_screening()) + "\n",
+        encoding="utf-8",
+    )
+    funnel_path.write_text(
+        json.dumps(
+            _funnel(
+                decision="QUALIFIED",
+                terminal_gate="FINAL_QUALIFICATION",
+                signal_id="SIG:POISON",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events.write_text(
+        json.dumps(
+            {
+                "event_type": "PAPER_OUTCOME",
+                "signal_id": "SIG:POISON",
+                "observed_at": (NOW + timedelta(hours=1)).isoformat(),
+                "payload": {"net_pnl": float("nan")},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    outcome = _outcome()
+
+    summary = build_incremental_from_outcomes(
+        [outcome],
+        screening_path=screening_path,
+        screening_archive=screening_archive,
+        funnel_path=funnel_path,
+        funnel_archive=funnel_archive,
+        intelligence_event_path=events,
+        ledger_path=ledger,
+        summary_path=summary_path,
+        state_path=state,
+        policy=AccountabilityPolicy(
+            production_threshold=80,
+            shadow_threshold=70,
+            winner_move_pct=2,
+        ),
+    )
+
+    assert summary["batch_disposition"] == {
+        "accepted": 0,
+        "terminal_rejected": 1,
+        "unresolved": 0,
+    }
+    resolved = resolved_accountability_outcomes(
+        [outcome],
+        ledger_path=ledger,
+        state_path=state,
+    )
+    assert [row["outcome_record_id"] for row in resolved] == [
+        outcome["outcome_record_id"]
+    ]
+
+    # Only the healthy SHORT directional row is persisted; the poisoned LONG
+    # row is not silently treated as accepted.
+    rows = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["direction"] for row in rows] == ["SHORT"]
+
+
+def test_valid_incremental_outcome_gets_durable_accepted_disposition(tmp_path):
+    screening_path = tmp_path / "screening.jsonl"
+    funnel_path = tmp_path / "funnel.jsonl"
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+    summary_path = tmp_path / "summary.json"
+    outcome = _outcome()
+
+    screening_path.write_text(
+        json.dumps(_screening()) + "\n",
+        encoding="utf-8",
+    )
+    funnel_path.write_text(
+        json.dumps(_funnel()) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = build_incremental_from_outcomes(
+        [outcome],
+        screening_path=screening_path,
+        screening_archive=tmp_path / "screening_archive",
+        funnel_path=funnel_path,
+        funnel_archive=tmp_path / "funnel_archive",
+        intelligence_event_path=tmp_path / "events.jsonl",
+        ledger_path=ledger,
+        summary_path=summary_path,
+        state_path=state,
+        policy=AccountabilityPolicy(
+            production_threshold=80,
+            shadow_threshold=70,
+            winner_move_pct=2,
+        ),
+    )
+
+    assert summary["batch_disposition"] == {
+        "accepted": 1,
+        "terminal_rejected": 0,
+        "unresolved": 0,
+    }
+    assert len(
+        resolved_accountability_outcomes(
+            [outcome],
+            ledger_path=ledger,
+            state_path=state,
+        )
+    ) == 1
 
 
 def test_incremental_join_reads_compressed_archived_screening_and_funnel(tmp_path):
