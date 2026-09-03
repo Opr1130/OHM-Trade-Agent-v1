@@ -182,6 +182,61 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_snapshot_queue_due "
         "ON snapshot_queue(next_due_at, decision_at)"
     )
+
+    backfill_marker = connection.execute(
+        "SELECT value FROM metadata "
+        "WHERE key = 'accountability_handoff_backfill_v1'"
+    ).fetchone()
+    if backfill_marker is None:
+        legacy_rows = connection.execute(
+            """
+            SELECT snapshot_id, outcome_record_id, outcome_revision, row_json
+            FROM latest_outcomes
+            WHERE snapshot_id NOT IN (
+                SELECT snapshot_id FROM accountability_handoff
+            )
+            """
+        ).fetchall()
+        for snapshot_id, outcome_record_id, outcome_revision, row_json in legacy_rows:
+            try:
+                parsed = json.loads(row_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            reference_at = str(
+                parsed.get("reference_at")
+                or parsed.get("decision_at_utc")
+                or ""
+            )
+            if not reference_at:
+                continue
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO accountability_handoff(
+                    snapshot_id,
+                    outcome_record_id,
+                    outcome_revision,
+                    reference_at,
+                    row_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(snapshot_id),
+                    str(outcome_record_id),
+                    int(outcome_revision),
+                    reference_at,
+                    row_json,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('accountability_handoff_backfill_v1', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+
     connection.commit()
     return connection
 
