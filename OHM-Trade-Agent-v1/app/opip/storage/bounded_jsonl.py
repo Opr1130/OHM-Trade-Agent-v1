@@ -717,8 +717,10 @@ class BoundedJsonlArchive:
         visibility metadata are reparsed from their checksum-verified archive
         segment; healthy historical segments are not rescanned.
         """
+        if self.ensure_window_index_locked():
+            return True
         if not self.manifest_file.exists():
-            return self.ensure_window_index_locked()
+            return False
 
         try:
             manifest_signature = self._verified_manifest_signature_locked()
