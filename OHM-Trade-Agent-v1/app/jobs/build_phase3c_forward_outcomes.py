@@ -205,6 +205,7 @@ def _migrate_latest_outcome_index_fields(
             (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
         )
         connection.commit()
+        _truncate_latest_outcome_migration_wal(connection)
         return
 
     cursor_row = connection.execute(
