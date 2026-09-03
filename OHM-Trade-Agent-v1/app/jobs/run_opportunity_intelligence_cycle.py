@@ -8,18 +8,39 @@ from __future__ import annotations
 
 import json
 
-from app.jobs.build_phase3c_forward_outcomes import build_outcomes_bounded
+from app.jobs.build_phase3c_forward_outcomes import (
+    acknowledge_accountability_outcomes,
+    build_outcomes_bounded,
+    pending_accountability_outcomes,
+)
 from app.services.opportunity_accountability import build_incremental_from_outcomes
 
 
 def main() -> None:
-    outcomes = build_outcomes_bounded()
+    # Drain any durable handoff left by an interrupted prior cycle before
+    # maturing more snapshots. This bounds backlog growth and gives
+    # accountability at-least-once delivery semantics.
+    outcomes = pending_accountability_outcomes()
+    replayed_handoff = bool(outcomes)
+    newly_evaluated = 0
+    if not outcomes:
+        evaluated = build_outcomes_bounded()
+        newly_evaluated = len(evaluated)
+        outcomes = pending_accountability_outcomes()
+
+    # A failure here intentionally leaves the handoff unacknowledged. The next
+    # isolated cycle replays it; append_accountability_rows is idempotent.
     summary = build_incremental_from_outcomes(outcomes)
+    acknowledged = acknowledge_accountability_outcomes(outcomes)
+
     print(
         json.dumps(
             {
                 "status": "OK",
-                "outcomes_evaluated": len(outcomes),
+                "new_outcomes_evaluated": newly_evaluated,
+                "accountability_handoff_rows": len(outcomes),
+                "accountability_handoff_acknowledged": acknowledged,
+                "replayed_handoff": replayed_handoff,
                 "population": summary.get("population", {}),
                 "opportunity_capture_rate_pct": summary.get(
                     "opportunity_capture_rate_pct"
