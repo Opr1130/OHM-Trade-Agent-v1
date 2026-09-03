@@ -173,6 +173,24 @@ def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     assert "GRANT SELECT, INSERT, UPDATE ON TABLES TO opip_shipper" not in sql
 
 
+def test_opportunity_accountability_migration_is_single_well_formed_definition():
+    migration = next(
+        item for item in discover_migrations()
+        if item.version == 4
+    )
+    sql = migration.path.read_text(encoding="utf-8")
+    assert sql.count(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS "
+        "learning.opportunity_accountability_daily_mv"
+    ) == 1
+    assert sql.count("AS decision_latency_samples") == 1
+    assert sql.count("AS mean_decision_latency_ms") == 1
+    assert sql.count("FROM learning.opportunity_accountability_latest_v") == 1
+    assert "outcome_complete" in sql
+    assert "count(*) FILTER" in sql
+    assert "avg(" in sql
+
+
 def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Cursor:
         def __init__(self, connection):
