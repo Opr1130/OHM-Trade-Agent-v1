@@ -373,6 +373,29 @@ def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
     assert selection.complete is False
     assert "ARCHIVE_WINDOW_SHARD_MISSING" in selection.warnings
 
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(minutes=1, seconds=index)
+                ).isoformat(),
+                "row": 100 + index,
+            }
+        )
+        for index in range(4)
+    )
+    # The next rotation must treat the missing hash target as an incomplete
+    # index and rebuild from the canonical manifest rather than raising.
+    assert archive.compact_locked() is not None
+    repaired = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=2),
+        max_segments=8,
+    )
+    assert repaired.complete is True
+    assert repaired.warnings == ()
+    assert len(repaired.paths) == 2
+
 
 def test_stale_valid_window_shard_fails_digest_authentication(tmp_path):
     hot = tmp_path / "screening_evaluations.jsonl"
