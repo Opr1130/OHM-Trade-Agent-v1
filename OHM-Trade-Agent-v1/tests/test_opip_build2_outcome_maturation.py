@@ -740,6 +740,180 @@ def test_completed_v1_outcome_requeues_for_new_12h_horizon(tmp_path):
     ) == []
 
 
+def test_completed_v1_outcome_migrates_with_snapshot_cursor_already_at_eof(
+    tmp_path,
+):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshot = _snapshot()
+    snapshot_bytes = (json.dumps(snapshot, sort_keys=True) + "\n").encode("utf-8")
+    snapshots.write_bytes(snapshot_bytes)
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=12), 10.5)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=24), 11.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    legacy = {
+        **snapshot,
+        "label_schema_version": 1,
+        "reference_at": BASE.isoformat(),
+        "reference_price": 10.0,
+        "horizon_returns_pct": {
+            "5m": None,
+            "15m": None,
+            "30m": None,
+            "60m": None,
+            "4h": None,
+            "8h": None,
+            "24h": 10.0,
+        },
+        "horizon_observed": {
+            "5m": False,
+            "15m": False,
+            "30m": False,
+            "60m": False,
+            "4h": False,
+            "8h": False,
+            "24h": True,
+        },
+        "mfe_pct": 10.0,
+        "mfe_at": (BASE + timedelta(hours=24)).isoformat(),
+        "time_to_mfe_seconds": 24 * 60 * 60,
+        "mae_pct": 0.0,
+        "mae_at": (BASE + timedelta(hours=12)).isoformat(),
+        "time_to_mae_seconds": 12 * 60 * 60,
+        "max_adverse_excursion_pct": 0.0,
+        "window_complete": True,
+        "maturation_status": "MATURE_24H",
+        "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
+        "outcome_record_id": "OUT:LEGACY-EOF",
+        "outcome_revision": 1,
+        "append_only": True,
+    }
+    outcome_bytes = (json.dumps(legacy, sort_keys=True) + "\n").encode("utf-8")
+    outcomes.write_bytes(outcome_bytes)
+
+    connection = sqlite3.connect(state)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE latest_outcomes (
+                snapshot_id TEXT PRIMARY KEY,
+                outcome_record_id TEXT NOT NULL,
+                outcome_revision INTEGER NOT NULL,
+                window_complete INTEGER NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE snapshot_queue (
+                snapshot_id TEXT PRIMARY KEY,
+                decision_at TEXT NOT NULL,
+                next_due_at TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO latest_outcomes(
+                snapshot_id, outcome_record_id, outcome_revision,
+                window_complete, row_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "S1",
+                legacy["outcome_record_id"],
+                1,
+                1,
+                json.dumps(legacy, sort_keys=True),
+            ),
+        )
+
+        checkpoint_values = {
+            "output_indexed_offset": str(len(outcome_bytes)),
+            "output_anchor_start": "0",
+            "output_anchor_size": str(len(outcome_bytes)),
+            "output_anchor_sha256": hashlib.sha256(outcome_bytes).hexdigest(),
+            "snapshot_indexed_offset": str(len(snapshot_bytes)),
+            "snapshot_anchor_start": "0",
+            "snapshot_anchor_size": str(len(snapshot_bytes)),
+            "snapshot_anchor_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+        }
+        for key, value in checkpoint_values.items():
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    rows = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=24, minutes=1),
+    )
+    assert len(rows) == 1
+    assert rows[0]["label_schema_version"] == 2
+    assert rows[0]["horizon_returns_pct"]["12h"] == pytest.approx(5.0)
+    assert rows[0]["window_complete"] is True
+
+    connection = sqlite3.connect(state)
+    try:
+        metadata = dict(
+            connection.execute("SELECT key, value FROM metadata").fetchall()
+        )
+        # Production migration is seeded from latest_outcomes; no snapshot
+        # rewind is needed even though the persisted cursor remains at EOF.
+        assert int(metadata["snapshot_indexed_offset"]) == len(snapshot_bytes)
+
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(latest_outcomes)"
+            ).fetchall()
+        }
+        assert {"reference_at", "label_schema_version"} <= columns
+
+        indexes = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA index_list(latest_outcomes)"
+            ).fetchall()
+        }
+        assert "idx_latest_outcomes_reference" in indexes
+        assert "idx_latest_outcomes_schema_reference" in indexes
+
+        latest = connection.execute(
+            """
+            SELECT reference_at, label_schema_version
+            FROM latest_outcomes
+            WHERE snapshot_id = 'S1'
+            """
+        ).fetchone()
+        assert latest == (BASE.isoformat(), 2)
+    finally:
+        connection.close()
+
+
 def test_bounded_outcomes_revisit_partial_only_at_next_milestone(tmp_path):
     snapshots = tmp_path / "snapshots.jsonl"
     observations = tmp_path / "observations.jsonl"
