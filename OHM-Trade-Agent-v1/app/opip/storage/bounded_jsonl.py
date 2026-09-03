@@ -261,6 +261,66 @@ class BoundedJsonlArchive:
     def manifest_signature_file(self) -> Path:
         return self.manifest_file.with_suffix(self.manifest_file.suffix + ".sha256")
 
+    def _window_index_state_proves_empty_archive_without_manifest(self) -> bool:
+        """Return true only for a previously certified, zero-coverage empty index."""
+        if not self.window_index_state_file.exists():
+            return False
+        try:
+            state = json.loads(
+                self.window_index_state_file.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(state, dict):
+            return False
+        canonical_keys = {
+            "schema_version",
+            "manifest_present",
+            "manifest_size",
+            "manifest_mtime_ns",
+            "manifest_sha256",
+            "complete",
+            "coverage_start_day",
+            "coverage_through_day",
+            "coverage_day_count",
+            "shard_sha256",
+            "updated_at_utc",
+        }
+        shard_digests = state.get("shard_sha256")
+        zero_integer_fields = (
+            "manifest_size",
+            "manifest_mtime_ns",
+            "coverage_day_count",
+        )
+        if (
+            set(state) != canonical_keys
+            or type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
+            or state.get("manifest_present") is not False
+            or any(
+                type(state.get(field)) is not int or state.get(field) != 0
+                for field in zero_integer_fields
+            )
+            or type(state.get("manifest_sha256")) is not str
+            or state.get("manifest_sha256") != ""
+            or state.get("complete") is not True
+            or state.get("coverage_start_day") is not None
+            or state.get("coverage_through_day") is not None
+            or not isinstance(shard_digests, dict)
+            or bool(shard_digests)
+            or not isinstance(state.get("updated_at_utc"), str)
+            or self._parse_manifest_time(state.get("updated_at_utc")) is None
+        ):
+            return False
+        try:
+            unexpected_index_entries = any(
+                entry != self.window_index_state_file
+                for entry in self.window_index_dir.iterdir()
+            )
+        except OSError:
+            return False
+        return not unexpected_index_entries
+
     def _read_manifest_signature(self) -> str | None:
         try:
             tokens = self.manifest_signature_file.read_text(
@@ -555,16 +615,41 @@ class BoundedJsonlArchive:
         or stale. Steady-state window selection never loads the master manifest.
         """
         if not self.manifest_file.exists():
-            # Derived window-index state can exist before the first immutable
-            # archive segment. Only real gzip evidence requires a manifest.
+            # A no-manifest directory is empty only when there is no canonical
+            # archive evidence and no prior manifest/index evidence to lose.
             archive_segments_exist = (
                 any(self.archive_dir.rglob(self.archive_glob))
                 if self.archive_dir.exists()
                 else False
             )
-            complete = not archive_segments_exist
-            self._write_window_index_state_locked(complete=complete)
-            return complete
+            if archive_segments_exist:
+                # New evidence invalidates a previously certified-empty state.
+                # Preserve any other existing state verbatim because it may be
+                # the only evidence of prior manifest/coverage metadata.
+                if (
+                    not self.window_index_state_file.exists()
+                    or self._window_index_state_proves_empty_archive_without_manifest()
+                ):
+                    self._write_window_index_state_locked(complete=False)
+                return False
+            if self.manifest_signature_file.exists():
+                # A signature sidecar is canonical lineage evidence. Invalidate
+                # only a certified-empty state; preserve all other prior state.
+                if (
+                    not self.window_index_state_file.exists()
+                    or self._window_index_state_proves_empty_archive_without_manifest()
+                ):
+                    self._write_window_index_state_locked(complete=False)
+                return False
+            if self.window_index_state_file.exists():
+                if not self._window_index_state_proves_empty_archive_without_manifest():
+                    return False
+            elif self.window_index_dir.exists():
+                # A pre-existing derived directory without its state is
+                # ambiguous (for example, an interrupted copy/write).
+                return False
+            self._write_window_index_state_locked(complete=True)
+            return True
 
         manifest_signature = self._read_manifest_signature()
         if manifest_signature is None:
@@ -890,11 +975,11 @@ class BoundedJsonlArchive:
             return None
         try:
             parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             return None
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            return None
-        return parsed.astimezone(timezone.utc)
 
     def archive_paths_for_visible_window(
         self,
@@ -936,7 +1021,12 @@ class BoundedJsonlArchive:
                 truncated=False,
                 warnings=("ARCHIVE_WINDOW_INDEX_UNAVAILABLE",),
             )
-        if not isinstance(state, dict) or state.get("schema_version") != 1:
+        if (
+            not isinstance(state, dict)
+            or type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
+            or type(state.get("manifest_present")) is not bool
+        ):
             return ArchiveWindowSelection(
                 paths=(),
                 complete=False,
@@ -945,10 +1035,29 @@ class BoundedJsonlArchive:
             )
 
         complete = bool(state.get("complete", False))
+        manifest_present = state.get("manifest_present")
+        if complete and manifest_present is False:
+            archive_segments_exist = (
+                any(self.archive_dir.rglob(self.archive_glob))
+                if self.archive_dir.exists()
+                else False
+            )
+            if (
+                self.manifest_file.exists()
+                or archive_segments_exist
+                or self.manifest_signature_file.exists()
+                or not self._window_index_state_proves_empty_archive_without_manifest()
+            ):
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_WINDOW_INDEX_INVALID",),
+                )
         if not complete:
             warnings.append("ARCHIVE_WINDOW_INDEX_INCOMPLETE")
 
-        if bool(state.get("manifest_present")):
+        if manifest_present:
             try:
                 manifest_stat = self.manifest_file.stat()
             except OSError:
