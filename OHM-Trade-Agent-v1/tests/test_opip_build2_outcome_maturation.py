@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 
@@ -267,6 +268,13 @@ def test_existing_outcome_state_backfills_accountability_handoff_on_upgrade(tmp_
         "window_complete": True,
     }
 
+    output_bytes = (
+        json.dumps(legacy_row, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    output.write_bytes(output_bytes)
+    output_size = len(output_bytes)
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+
     connection = sqlite3.connect(state)
     try:
         connection.execute(
@@ -316,12 +324,19 @@ def test_existing_outcome_state_backfills_accountability_handoff_on_upgrade(tmp_
                 json.dumps(legacy_row, sort_keys=True),
             ),
         )
-        connection.execute(
-            """
-            INSERT INTO metadata(key, value)
-            VALUES ('output_indexed_offset', '999999')
-            """
-        )
+        for key, value in (
+            ("output_indexed_offset", str(output_size)),
+            ("output_anchor_start", "0"),
+            ("output_anchor_size", str(output_size)),
+            ("output_anchor_sha256", output_sha256),
+        ):
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES (?, ?)
+                """,
+                (key, value),
+            )
         connection.commit()
     finally:
         connection.close()
