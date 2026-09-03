@@ -1684,6 +1684,31 @@ def _iter_jsonl_sources(
             continue
 
 
+def _window_archive_selection(
+    path: Path,
+    *,
+    archive_dir: Path,
+    start: datetime,
+    through: datetime,
+    kind: str,
+):
+    """Return the production archive selection, or None for custom layouts."""
+    expected_archive = path.parent / f"{path.stem}_archive"
+    if archive_dir != expected_archive:
+        return None
+    if kind == "screening":
+        archive = screening_evaluations_archive(path)
+    elif kind == "funnel":
+        archive = funnel_events_archive(path)
+    else:
+        raise ValueError(f"unsupported accountability archive kind: {kind}")
+    return archive, archive.archive_paths_for_visible_window(
+        start=start,
+        through=through,
+        max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
+    )
+
+
 def _iter_windowed_jsonl_sources(
     path: Path,
     *,
@@ -1693,25 +1718,19 @@ def _iter_windowed_jsonl_sources(
     kind: str,
 ) -> Iterable[dict[str, Any]]:
     """Read HOT plus only manifest-selected archive segments for a time window."""
-    expected_archive = path.parent / f"{path.stem}_archive"
-    if archive_dir != expected_archive:
+    selected = _window_archive_selection(
+        path,
+        archive_dir=archive_dir,
+        start=start,
+        through=through,
+        kind=kind,
+    )
+    if selected is None:
         # Test/custom layouts do not necessarily carry the production manifest.
         # They remain bounded by the caller's fixture/layout size.
         yield from _iter_jsonl_sources(path, archive_dir=archive_dir)
         return
-
-    if kind == "screening":
-        archive = screening_evaluations_archive(path)
-    elif kind == "funnel":
-        archive = funnel_events_archive(path)
-    else:
-        raise ValueError(f"unsupported accountability archive kind: {kind}")
-
-    selection = archive.archive_paths_for_visible_window(
-        start=start,
-        through=through,
-        max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
-    )
+    archive, selection = selected
     if not selection.complete:
         warning = ",".join(selection.warnings) or "UNKNOWN"
         raise RuntimeError(
@@ -1790,6 +1809,107 @@ def build_incremental_from_outcomes(
 
     window_start = min(target_times) - ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
     window_through = max(target_times) + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+
+    # A broad handoff can legitimately span more archive segments than one
+    # bounded lookup allows (for example, after a historical backfill). Split
+    # only on the segment-ceiling condition so corrupt/missing archive evidence
+    # continues to fail closed and remains repairable.
+    ceiling_reached = False
+    for source_path, source_archive, source_kind in (
+        (screening_path, screening_archive, "screening"),
+        (funnel_path, funnel_archive, "funnel"),
+    ):
+        selected = _window_archive_selection(
+            source_path,
+            archive_dir=source_archive,
+            start=window_start,
+            through=window_through,
+            kind=source_kind,
+        )
+        if selected is None:
+            continue
+        _archive, selection = selected
+        if (
+            not selection.complete
+            and "ARCHIVE_SEGMENT_CEILING_REACHED" in selection.warnings
+        ):
+            ceiling_reached = True
+            break
+
+    if ceiling_reached and len(outcomes) > 1:
+        ordered = sorted(
+            outcomes,
+            key=lambda row: (
+                _iso(row.get("reference_at")) or "",
+                str(row.get("snapshot_id") or ""),
+            ),
+        )
+        midpoint = max(1, len(ordered) // 2)
+        parts = (ordered[:midpoint], ordered[midpoint:])
+        batch_counts = {"accepted": 0, "terminal_rejected": 0, "unresolved": 0}
+        for part in parts:
+            if not part:
+                continue
+            part_summary = build_incremental_from_outcomes(
+                part,
+                screening_path=screening_path,
+                screening_archive=screening_archive,
+                funnel_path=funnel_path,
+                funnel_archive=funnel_archive,
+                intelligence_event_path=intelligence_event_path,
+                ledger_path=ledger_path,
+                summary_path=summary_path,
+                state_path=state_path,
+                policy=policy,
+            )
+            disposition = part_summary.get("batch_disposition")
+            if isinstance(disposition, Mapping):
+                for key in batch_counts:
+                    batch_counts[key] += int(disposition.get(key) or 0)
+        summary = build_accountability_summary_from_state(
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        summary["batch_disposition"] = batch_counts
+        write_summary(summary, path=summary_path)
+        return summary
+
+    if ceiling_reached:
+        terminal = [
+            {
+                "outcome_record_id": str(row.get("outcome_record_id") or ""),
+                "snapshot_id": str(row.get("snapshot_id") or ""),
+                "disposition": "TERMINAL_REJECTED",
+                "reason": "ARCHIVE_SEGMENT_CEILING_REACHED",
+                "accountability_rows": 0,
+                "measurement_only": True,
+                "affects_trade_authority": False,
+            }
+            for row in outcomes
+            if str(row.get("outcome_record_id") or "")
+            and str(row.get("snapshot_id") or "")
+        ]
+        _persist_outcome_dispositions(
+            terminal,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        reconcile_paper_events(
+            intelligence_event_path=intelligence_event_path,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        summary = build_accountability_summary_from_state(
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        summary["batch_disposition"] = {
+            "accepted": 0,
+            "terminal_rejected": len(terminal),
+            "unresolved": max(0, len(outcomes) - len(terminal)),
+        }
+        write_summary(summary, path=summary_path)
+        return summary
 
     screening: list[dict[str, Any]] = []
     for row in _iter_windowed_jsonl_sources(
