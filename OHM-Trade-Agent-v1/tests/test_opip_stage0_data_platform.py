@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -220,6 +220,103 @@ def test_archive_retry_reuses_published_content_before_compacting_hot(
     assert len(list((tmp_path / "archive").glob("evidence-*.jsonl.gz"))) == 1
     assert len(list(archive.iter_archive_rows())) == 3
     assert len(list(archive.iter_hot_rows())) == 2
+
+
+def test_archive_window_selection_uses_day_shards_without_history_scan(
+    tmp_path,
+    monkeypatch,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+    assert archive.window_index_state_file.exists()
+
+    path_type = type(archive.manifest_file)
+    real_read_text = path_type.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == archive.manifest_file:
+            raise AssertionError(
+                "steady-state window selection read the full master manifest"
+            )
+        return real_read_text(self, *args, **kwargs)
+
+    def forbidden_rglob(self, *_args, **_kwargs):
+        raise AssertionError(
+            "steady-state window selection enumerated lifetime archives"
+        )
+
+    monkeypatch.setattr(path_type, "read_text", guarded_read_text)
+    monkeypatch.setattr(path_type, "rglob", forbidden_rglob)
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.truncated is False
+    assert selection.paths == (archived,)
+
+
+def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+
+    # Simulate a pre-window-index production archive copied to a new worker.
+    import shutil
+    shutil.rmtree(archive.window_index_dir)
+    assert not archive.window_index_state_file.exists()
+
+    assert archive.ensure_window_index_locked() is True
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == (archived,)
 
 
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
