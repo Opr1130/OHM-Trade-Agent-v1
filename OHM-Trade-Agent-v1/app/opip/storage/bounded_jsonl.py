@@ -493,15 +493,20 @@ class BoundedJsonlArchive:
                 )
             except (OSError, ValueError, json.JSONDecodeError):
                 state = None
-            if (
+            version_matches = (
                 isinstance(state, dict)
                 and state.get("schema_version") == 1
                 and bool(state.get("manifest_present"))
                 and int(state.get("manifest_size") or -1) == manifest_stat.st_size
                 and int(state.get("manifest_mtime_ns") or -1)
                 == manifest_stat.st_mtime_ns
-                and bool(state.get("complete", False))
-            ):
+            )
+            if version_matches:
+                if not bool(state.get("complete", False)):
+                    # Cache a failed/incomplete build for this immutable
+                    # manifest version. The next manifest update changes the
+                    # version and triggers a rebuild exactly once.
+                    return False
                 coverage_start = str(state.get("coverage_start_day") or "") or None
                 coverage_through = str(state.get("coverage_through_day") or "") or None
                 raw_digests = state.get("shard_sha256")
@@ -749,6 +754,12 @@ class BoundedJsonlArchive:
                 + b"\n"
             ],
         )
+        if not prior_complete:
+            # The manifest version just changed. Rebuild an incomplete index
+            # once from the canonical manifest instead of retrying on every
+            # append batch.
+            self.ensure_window_index_locked()
+            return
         (
             indexed,
             coverage_start_day,
