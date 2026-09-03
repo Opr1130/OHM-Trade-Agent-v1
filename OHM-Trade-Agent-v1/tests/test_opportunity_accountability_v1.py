@@ -2,7 +2,11 @@ from datetime import datetime, timedelta, timezone
 import gzip
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from app.services import opportunity_accountability as accountability
 from app.services.dashboard_read_model import _opportunity_accountability_snapshot
 from app.services.opportunity_accountability import (
     AccountabilityPolicy,
@@ -137,6 +141,121 @@ def _rows(screening, funnel=(), outcome=None, events=()):
             winner_move_pct=2,
         ),
     )
+
+
+def test_gate_deltas_follow_completion_time_not_serialized_gate_order():
+    funnel = {
+        "decision_at_utc": NOW.isoformat(),
+        "gate_results": [
+            {
+                "gate": "LATER_SERIALIZED_FIRST",
+                "evaluated_at": (
+                    NOW + timedelta(milliseconds=300)
+                ).isoformat(),
+            },
+            {
+                "gate": "EARLIER_SERIALIZED_SECOND",
+                "evaluated_at": (
+                    NOW + timedelta(milliseconds=100)
+                ).isoformat(),
+            },
+        ],
+    }
+    latency = accountability._latency_evidence(funnel)
+    assert latency["decision_latency_ms"] == 300.0
+    assert latency["gate_delta_ms"]["EARLIER_SERIALIZED_SECOND"] == 100.0
+    assert latency["gate_delta_ms"]["LATER_SERIALIZED_FIRST"] == 200.0
+
+
+def test_windowed_archive_reader_uses_manifest_selected_segments(
+    monkeypatch,
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive_dir = tmp_path / "screening_evaluations_archive"
+    hot.write_text(
+        json.dumps({"source": "hot", "observed_at": NOW.isoformat()}) + "\n",
+        encoding="utf-8",
+    )
+    selected_path = archive_dir / "selected.jsonl.gz"
+    calls = {}
+
+    class FakeArchive:
+        def archive_paths_for_visible_window(
+            self,
+            *,
+            start,
+            through,
+            max_segments,
+        ):
+            calls["window"] = (start, through, max_segments)
+            return SimpleNamespace(
+                paths=(selected_path,),
+                complete=True,
+                truncated=False,
+                warnings=(),
+            )
+
+        def iter_archive_rows_from_paths(self, paths, *, strict=False):
+            calls["paths"] = tuple(paths)
+            calls["strict"] = strict
+            yield {"source": "archive", "observed_at": NOW.isoformat()}
+
+    monkeypatch.setattr(
+        accountability,
+        "screening_evaluations_archive",
+        lambda _path: FakeArchive(),
+    )
+
+    rows = list(
+        accountability._iter_windowed_jsonl_sources(
+            hot,
+            archive_dir=archive_dir,
+            start=NOW - timedelta(minutes=1),
+            through=NOW + timedelta(minutes=1),
+            kind="screening",
+        )
+    )
+    assert [row["source"] for row in rows] == ["archive", "hot"]
+    assert calls["paths"] == (selected_path,)
+    assert calls["strict"] is True
+    assert (
+        calls["window"][2]
+        == accountability.ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW
+    )
+
+
+def test_incomplete_archive_window_is_not_silently_accepted(
+    monkeypatch,
+    tmp_path,
+):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive_dir = tmp_path / "funnel_events_archive"
+
+    class IncompleteArchive:
+        def archive_paths_for_visible_window(self, **_kwargs):
+            return SimpleNamespace(
+                paths=(),
+                complete=False,
+                truncated=True,
+                warnings=("ARCHIVE_SEGMENT_CEILING_REACHED",),
+            )
+
+    monkeypatch.setattr(
+        accountability,
+        "funnel_events_archive",
+        lambda _path: IncompleteArchive(),
+    )
+    with pytest.raises(RuntimeError, match="ACCOUNTABILITY_ARCHIVE_WINDOW_INCOMPLETE"):
+        list(
+            accountability._iter_windowed_jsonl_sources(
+                hot,
+                archive_dir=archive_dir,
+                start=NOW - timedelta(minutes=1),
+                through=NOW + timedelta(minutes=1),
+                kind="funnel",
+            )
+        )
 
 
 def test_threshold_70_79_winner_is_visible_without_changing_production():
