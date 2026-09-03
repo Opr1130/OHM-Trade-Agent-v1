@@ -214,6 +214,24 @@ def test_dashboard_hides_outcome_metrics_until_measured():
         assert f"$('{element_id}').textContent=oaMeasured?" in html
 
 
+def test_accountability_read_model_separates_all_time_totals_from_60_day_trend():
+    source = (
+        ROOT / "app" / "opip" / "data_platform" / "read_model.py"
+    ).read_text(encoding="utf-8")
+    assert "ORDER BY day DESC LIMIT 60" in source
+    assert '"opportunity_accountability_all_time"' in source
+    aggregate_start = source.index(
+        "coalesce(sum(directional_evaluations), 0)"
+    )
+    aggregate_end = source.index(
+        "FROM learning.opportunity_accountability_daily_mv",
+        aggregate_start,
+    )
+    aggregate_query = source[aggregate_start:aggregate_end]
+    assert "LIMIT 60" not in aggregate_query
+    assert "decision_latency_samples" in aggregate_query
+
+
 def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Cursor:
         def __init__(self, connection):
