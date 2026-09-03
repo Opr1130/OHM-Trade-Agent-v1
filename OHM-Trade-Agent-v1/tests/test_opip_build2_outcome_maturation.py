@@ -898,6 +898,147 @@ def test_stale_schema_seed_is_reference_time_local(tmp_path):
         connection.close()
 
 
+def test_stale_schema_attempt_advances_past_exhausted_reference_window(tmp_path):
+    state = tmp_path / "state.sqlite3"
+    connection = outcomes_job._open_bounded_state(state)
+    try:
+        for snapshot_id, at in (
+            ("EXHAUSTED", BASE - timedelta(days=365)),
+            ("NEXT", BASE - timedelta(days=360)),
+        ):
+            prior = {
+                **_snapshot(snapshot_id, f"E-{snapshot_id}"),
+                "reference_at": at.isoformat(),
+                "decision_at_utc": at.isoformat(),
+                "reference_price": 10.0,
+                "label_schema_version": 1,
+                "window_complete": True,
+                "outcome_record_id": f"OUT:{snapshot_id}",
+                "outcome_revision": 1,
+            }
+            connection.execute(
+                """
+                INSERT INTO latest_outcomes(
+                    snapshot_id, outcome_record_id, outcome_revision,
+                    window_complete, reference_at, label_schema_version,
+                    row_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    prior["outcome_record_id"],
+                    1,
+                    1,
+                    at.isoformat(),
+                    1,
+                    json.dumps(prior, sort_keys=True),
+                ),
+            )
+        connection.commit()
+
+        assert outcomes_job._seed_stale_schema_snapshot_queue(
+            connection,
+            now=BASE,
+            limit=500,
+        ) == 1
+        first = connection.execute(
+            "SELECT snapshot_id FROM snapshot_queue ORDER BY snapshot_id"
+        ).fetchall()
+        assert first == [("EXHAUSTED",)]
+
+        outcomes_job._record_schema_migration_attempt(
+            connection,
+            snapshot_id="EXHAUSTED",
+            attempted_at=BASE,
+            reason="NO_LABEL_FROM_RETAINED_OBSERVATIONS",
+        )
+        connection.execute("DELETE FROM snapshot_queue")
+        connection.commit()
+
+        assert outcomes_job._seed_stale_schema_snapshot_queue(
+            connection,
+            now=BASE + timedelta(minutes=1),
+            limit=500,
+        ) == 1
+        second = connection.execute(
+            "SELECT snapshot_id FROM snapshot_queue ORDER BY snapshot_id"
+        ).fetchall()
+        assert second == [("NEXT",)]
+    finally:
+        connection.close()
+
+
+def test_incomplete_schema_migration_preserves_completed_latest_outcome(tmp_path):
+    outcomes = tmp_path / "outcomes.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    legacy = {
+        **_snapshot("LEGACY-INCOMPLETE", "E-LEGACY"),
+        "label_schema_version": 1,
+        "reference_at": (BASE - timedelta(days=365)).isoformat(),
+        "decision_at_utc": (BASE - timedelta(days=365)).isoformat(),
+        "reference_price": 10.0,
+        "horizon_returns_pct": {"24h": 5.0},
+        "horizon_observed": {"24h": True},
+        "mfe_pct": 5.0,
+        "mae_pct": -1.0,
+        "window_complete": True,
+        "maturation_status": "MATURE_24H",
+        "outcome_record_type": "FORWARD_OUTCOME_MATURATION",
+        "outcome_record_id": "OUT:LEGACY-INCOMPLETE",
+        "outcome_revision": 1,
+        "append_only": True,
+    }
+    outcomes.write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+    observations.write_text("", encoding="utf-8")
+
+    built = build_outcomes_bounded(
+        snapshot_path=tmp_path / "missing-snapshots.jsonl",
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE,
+    )
+    assert built == []
+    assert len(outcomes.read_text(encoding="utf-8").splitlines()) == 1
+
+    connection = sqlite3.connect(state)
+    try:
+        latest = connection.execute(
+            """
+            SELECT outcome_record_id, outcome_revision, window_complete,
+                   label_schema_version
+            FROM latest_outcomes
+            WHERE snapshot_id = 'LEGACY-INCOMPLETE'
+            """
+        ).fetchone()
+        assert latest == ("OUT:LEGACY-INCOMPLETE", 1, 1, 1)
+        attempt = connection.execute(
+            """
+            SELECT target_schema_version, reason
+            FROM schema_migration_attempt
+            WHERE snapshot_id = 'LEGACY-INCOMPLETE'
+            """
+        ).fetchone()
+        assert attempt is not None
+        assert attempt[0] == FORWARD_OUTCOME_LABEL_SCHEMA_VERSION
+        assert attempt[1] in {
+            "NO_LABEL_FROM_RETAINED_OBSERVATIONS",
+            "INCOMPLETE_MIGRATION_LABEL",
+        }
+    finally:
+        connection.close()
+
+    # The exhausted row is not reseeded forever on the next cycle.
+    assert build_outcomes_bounded(
+        snapshot_path=tmp_path / "missing-snapshots.jsonl",
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(minutes=10),
+    ) == []
+
+
 def test_completed_v1_outcome_migrates_with_snapshot_cursor_already_at_eof(
     tmp_path,
 ):
