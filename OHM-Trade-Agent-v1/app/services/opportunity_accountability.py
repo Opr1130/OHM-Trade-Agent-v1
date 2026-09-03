@@ -579,6 +579,19 @@ def _open_state(path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS outcome_disposition (
+            outcome_record_id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            accountability_rows INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS latest (
             accountability_id TEXT PRIMARY KEY,
             fingerprint TEXT NOT NULL,
@@ -1071,6 +1084,186 @@ def reconcile_paper_events(
         finally:
             connection.close()
     return len(processed_keys)
+
+
+def _derive_outcome_dispositions(
+    outcomes: list[dict[str, Any]],
+    screening_rows: list[dict[str, Any]],
+    accountability_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Resolve each outcome to accepted or an explicit terminal rejection."""
+    snapshot_by_key = {
+        (
+            _iso(row.get("reference_at")),
+            _normalize_symbol(row.get("symbol")),
+        ): str(row.get("snapshot_id") or "")
+        for row in outcomes
+        if _iso(row.get("reference_at"))
+        and _normalize_symbol(row.get("symbol"))
+        and str(row.get("snapshot_id") or "")
+    }
+    screening_by_snapshot: dict[str, list[dict[str, Any]]] = {}
+    for row in screening_rows:
+        key = (_iso(row.get("observed_at")), _screening_symbol(row))
+        snapshot_id = snapshot_by_key.get(key)
+        if snapshot_id:
+            screening_by_snapshot.setdefault(snapshot_id, []).append(row)
+
+    built_directions: dict[str, set[str]] = {}
+    for row in accountability_rows:
+        snapshot_id = str(row.get("snapshot_id") or "")
+        direction = str(row.get("direction") or "").upper()
+        if snapshot_id and direction in {"LONG", "SHORT"}:
+            built_directions.setdefault(snapshot_id, set()).add(direction)
+
+    dispositions: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        snapshot_id = str(outcome.get("snapshot_id") or "")
+        record_id = str(outcome.get("outcome_record_id") or "")
+        if not snapshot_id or not record_id:
+            continue
+
+        matched_screening = screening_by_snapshot.get(snapshot_id, [])
+        expected: set[str] = set()
+        for screening in matched_screening:
+            if screening.get("long_score") is not None:
+                expected.add("LONG")
+            if screening.get("short_score") is not None:
+                expected.add("SHORT")
+        built = built_directions.get(snapshot_id, set())
+
+        if not matched_screening:
+            disposition = "TERMINAL_REJECTED"
+            reason = "NO_SCREENING_EVIDENCE"
+        elif not expected:
+            disposition = "TERMINAL_REJECTED"
+            reason = "NO_DIRECTIONAL_SCORE_EVIDENCE"
+        elif expected.issubset(built):
+            disposition = "ACCEPTED"
+            reason = "ACCOUNTABILITY_ROWS_DURABLE"
+        else:
+            disposition = "TERMINAL_REJECTED"
+            reason = "INVALID_OR_UNSERIALIZABLE_DIRECTIONAL_EVIDENCE"
+
+        dispositions.append(
+            {
+                "outcome_record_id": record_id,
+                "snapshot_id": snapshot_id,
+                "disposition": disposition,
+                "reason": reason,
+                "expected_directions": sorted(expected),
+                "persisted_directions": sorted(built),
+                "accountability_rows": len(built),
+                "measurement_only": True,
+                "affects_trade_authority": False,
+            }
+        )
+    return dispositions
+
+
+def _persist_outcome_dispositions(
+    dispositions: Iterable[Mapping[str, Any]],
+    *,
+    ledger_path: Path,
+    state_path: Path | None = None,
+) -> None:
+    """Persist resolved per-outcome accountability dispositions durably."""
+    pending = [dict(row) for row in dispositions]
+    if not pending:
+        return
+    connection = _open_state(state_path or _state_path_for(ledger_path))
+    try:
+        _reconcile_state(connection, ledger_path)
+        for row in pending:
+            record_id = str(row.get("outcome_record_id") or "")
+            snapshot_id = str(row.get("snapshot_id") or "")
+            disposition = str(row.get("disposition") or "")
+            reason = str(row.get("reason") or "")
+            if (
+                not record_id
+                or not snapshot_id
+                or disposition not in {"ACCEPTED", "TERMINAL_REJECTED"}
+                or not reason
+            ):
+                continue
+            materialized = {
+                **row,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            connection.execute(
+                """
+                INSERT INTO outcome_disposition(
+                    outcome_record_id,
+                    snapshot_id,
+                    disposition,
+                    reason,
+                    accountability_rows,
+                    recorded_at,
+                    row_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(outcome_record_id) DO UPDATE SET
+                    snapshot_id = excluded.snapshot_id,
+                    disposition = excluded.disposition,
+                    reason = excluded.reason,
+                    accountability_rows = excluded.accountability_rows,
+                    recorded_at = excluded.recorded_at,
+                    row_json = excluded.row_json
+                """,
+                (
+                    record_id,
+                    snapshot_id,
+                    disposition,
+                    reason,
+                    int(row.get("accountability_rows") or 0),
+                    materialized["recorded_at"],
+                    json.dumps(materialized, sort_keys=True, allow_nan=False),
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def resolved_accountability_outcomes(
+    outcomes: Iterable[Mapping[str, Any]],
+    *,
+    ledger_path: Path = DEFAULT_LEDGER_FILE,
+    state_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return only outcomes with a durable accepted/terminal disposition."""
+    candidates = [dict(row) for row in outcomes if isinstance(row, Mapping)]
+    record_ids = [
+        str(row.get("outcome_record_id") or "")
+        for row in candidates
+        if str(row.get("outcome_record_id") or "")
+    ]
+    if not record_ids:
+        return []
+
+    connection = _open_state(state_path or _state_path_for(ledger_path))
+    try:
+        _reconcile_state(connection, ledger_path)
+        resolved_ids: set[str] = set()
+        for start in range(0, len(record_ids), 400):
+            chunk = record_ids[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                f"""
+                SELECT outcome_record_id
+                FROM outcome_disposition
+                WHERE outcome_record_id IN ({placeholders})
+                  AND disposition IN ('ACCEPTED', 'TERMINAL_REJECTED')
+                """,
+                tuple(chunk),
+            ).fetchall()
+            resolved_ids.update(str(row[0]) for row in rows)
+    finally:
+        connection.close()
+    return [
+        row
+        for row in candidates
+        if str(row.get("outcome_record_id") or "") in resolved_ids
+    ]
 
 
 def _pct(numerator: int, denominator: int) -> float | None:
