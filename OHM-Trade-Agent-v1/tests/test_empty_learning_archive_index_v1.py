@@ -257,3 +257,23 @@ def test_reader_rejects_certified_empty_state_when_orphan_evidence_appears(tmp_p
     )
     assert selection.complete is False
     assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
+
+
+def test_reader_rejects_certified_empty_state_when_manifest_appears(tmp_path):
+    """A newly published manifest invalidates stale empty certification."""
+    archive = _archive(tmp_path)
+    assert archive.ensure_window_index_locked() is True
+
+    archive.manifest_file.write_text(
+        json.dumps({"schema_version": 1, "segments": {}}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
