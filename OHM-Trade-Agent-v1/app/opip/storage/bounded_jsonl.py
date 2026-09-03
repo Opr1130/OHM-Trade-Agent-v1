@@ -545,7 +545,15 @@ class BoundedJsonlArchive:
         steady-state callers leave it false and never rescan lifetime history.
         """
         if not self.manifest_file.exists():
-            complete = not self.archive_dir.exists()
+            # Export/sync may materialize an empty archive directory before the
+            # first compaction. That is healthy: there is no archived evidence
+            # for a manifest to describe. Fail closed only when archive segments
+            # actually exist without canonical manifest metadata.
+            has_archive_segments = (
+                self.archive_dir.exists()
+                and any(self.archive_dir.rglob(self.archive_glob))
+            )
+            complete = not has_archive_segments
             self._write_window_index_state_locked(complete=complete)
             return complete
 
