@@ -64,6 +64,7 @@ def _outcome(
     mfe=6.0,
     mae=-1.0,
     revision=1,
+    window_complete=True,
 ):
     return {
         "snapshot_id": snapshot_id,
@@ -76,7 +77,7 @@ def _outcome(
         "time_to_mfe_seconds": 600,
         "time_to_mae_seconds": 300,
         "horizon_returns_pct": {"15m": 2.5, "60m": 4.0, "12h": 5.0},
-        "window_complete": True,
+        "window_complete": bool(window_complete),
         "outcome_revision": revision,
     }
 
@@ -232,6 +233,40 @@ def test_append_only_state_is_idempotent_and_revises_maturing_outcome(tmp_path):
     )
     assert summary["population"]["directional_evaluations"] == 2
     assert summary["population"]["executable_false_negatives"] == 1
+
+
+def test_provisional_winner_is_excluded_until_outcome_matures(tmp_path):
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "accountability.sqlite3"
+
+    partial = _rows(
+        [_screening()],
+        [_funnel()],
+        outcome=_outcome(window_complete=False, revision=1),
+    )
+    append_accountability_rows(partial, path=ledger, state_path=state)
+    provisional = build_accountability_summary_from_state(
+        ledger_path=ledger,
+        state_path=state,
+    )
+    assert provisional["population"]["completed_forward_outcomes"] == 0
+    assert provisional["population"]["market_winner_candidates"] == 0
+    assert provisional["population"]["executable_false_negatives"] == 0
+    assert provisional["opportunity_capture_rate_pct"] is None
+
+    mature = _rows(
+        [_screening()],
+        [_funnel()],
+        outcome=_outcome(window_complete=True, revision=2),
+    )
+    append_accountability_rows(mature, path=ledger, state_path=state)
+    completed = build_accountability_summary_from_state(
+        ledger_path=ledger,
+        state_path=state,
+    )
+    assert completed["population"]["completed_forward_outcomes"] == 2
+    assert completed["population"]["market_winner_candidates"] == 1
+    assert completed["population"]["executable_false_negatives"] == 1
 
 
 def test_dashboard_accountability_rollup_reports_capture_and_latency():
