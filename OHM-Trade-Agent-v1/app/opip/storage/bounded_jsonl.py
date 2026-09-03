@@ -293,18 +293,35 @@ class BoundedJsonlArchive:
         if manifest_present:
             stat = self.manifest_file.stat()
             manifest_size = stat.st_size
+            manifest_mtime_ns = stat.st_mtime_ns
             manifest_sha256 = sha256_file(self.manifest_file)
         else:
             manifest_size = 0
+            manifest_mtime_ns = 0
             manifest_sha256 = ""
+        coverage_day_count = 0
+        if coverage_start_day and coverage_through_day:
+            try:
+                coverage_day_count = max(
+                    0,
+                    (
+                        datetime.fromisoformat(coverage_through_day).date()
+                        - datetime.fromisoformat(coverage_start_day).date()
+                    ).days
+                    + 1,
+                )
+            except ValueError:
+                coverage_day_count = 0
         return {
             "schema_version": 1,
             "manifest_present": manifest_present,
             "manifest_size": manifest_size,
+            "manifest_mtime_ns": manifest_mtime_ns,
             "manifest_sha256": manifest_sha256,
             "complete": bool(complete),
             "coverage_start_day": coverage_start_day,
             "coverage_through_day": coverage_through_day,
+            "coverage_day_count": coverage_day_count,
             "shard_sha256": dict(sorted((shard_sha256 or {}).items())),
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
@@ -492,7 +509,6 @@ class BoundedJsonlArchive:
             return complete
 
         manifest_stat = self.manifest_file.stat()
-        manifest_sha256 = sha256_file(self.manifest_file)
         if self.window_index_state_file.exists():
             try:
                 state = json.loads(
@@ -505,7 +521,8 @@ class BoundedJsonlArchive:
                 and state.get("schema_version") == 1
                 and bool(state.get("manifest_present"))
                 and int(state.get("manifest_size") or -1) == manifest_stat.st_size
-                and str(state.get("manifest_sha256") or "") == manifest_sha256
+                and int(state.get("manifest_mtime_ns") or -1)
+                == manifest_stat.st_mtime_ns
             )
             if version_matches:
                 if not bool(state.get("complete", False)):
@@ -517,22 +534,18 @@ class BoundedJsonlArchive:
                 coverage_through = str(state.get("coverage_through_day") or "") or None
                 raw_digests = state.get("shard_sha256")
                 digest_map = raw_digests if isinstance(raw_digests, dict) else {}
+                expected_count = int(state.get("coverage_day_count") or 0)
                 if coverage_start and coverage_through:
-                    expected_days = self._window_day_keys(
-                        datetime.fromisoformat(coverage_start).replace(
-                            tzinfo=timezone.utc
-                        ),
-                        datetime.fromisoformat(coverage_through).replace(
-                            tzinfo=timezone.utc
-                        ),
-                    )
-                    if all(
-                        isinstance(digest_map.get(day), str)
-                        and len(str(digest_map.get(day))) == 64
-                        for day in expected_days
+                    if (
+                        expected_count > 0
+                        and len(digest_map) == expected_count
+                        and all(
+                            isinstance(digest, str) and len(digest) == 64
+                            for digest in digest_map.values()
+                        )
                     ):
                         return True
-                elif not digest_map:
+                elif expected_count == 0 and not digest_map:
                     return True
 
         try:
