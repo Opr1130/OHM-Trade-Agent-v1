@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from app.jobs import repair_opip_archive_window_indexes as repair_job
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
     encode_row,
@@ -210,3 +211,26 @@ def test_writer_and_deploy_repair_indexes_without_export_compute():
     assert health_invocation in deploy
     assert deploy.index(repair) > deploy.index(health_invocation)
     assert "archive window-index repair deferred to writer maintenance" in deploy
+
+
+
+def test_repair_job_checks_later_streams_after_one_exception(monkeypatch):
+    seen = []
+
+    def fake_repair(path, archive):
+        name = str(getattr(archive, "archive_prefix", "unknown"))
+        seen.append(name)
+        if len(seen) == 1:
+            raise TimeoutError("writer busy")
+        return True
+
+    monkeypatch.setattr(repair_job, "_repair_one", fake_repair)
+
+    try:
+        repair_job.main()
+    except RuntimeError as exc:
+        assert "OPIP_ARCHIVE_WINDOW_INDEX_REPAIR_FAILED:screening" in str(exc)
+    else:
+        raise AssertionError("repair job must report the failed stream")
+
+    assert len(seen) == 3
