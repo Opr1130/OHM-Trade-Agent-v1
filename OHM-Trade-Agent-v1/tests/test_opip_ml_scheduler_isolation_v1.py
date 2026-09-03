@@ -143,7 +143,9 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
         ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
     ).read_text(encoding="utf-8")
     pending = source.index("pending_accountability_outcomes()")
-    build = source.index("build_incremental_from_outcomes(outcomes)")
+    build = source.index(
+        "build_incremental_from_outcomes(outcomes, replica_mode=True)"
+    )
     resolved = source.index("resolved_accountability_outcomes(outcomes)")
     ack = source.index("acknowledge_accountability_outcomes(resolved)")
     assert pending < build < resolved < ack
