@@ -39,6 +39,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_learning_unit() {
+  local unit="$1"
+  if systemctl start "$unit"; then
+    return 0
+  fi
+
+  echo "O'Pip learning unit failed: $unit" >&2
+  systemctl status "$unit" --no-pager --full >&2 || true
+  journalctl -u "$unit" -n 160 --no-pager >&2 || true
+  return 1
+}
+
 case "$STAGE" in
   prepare)
     for unit in \
@@ -67,9 +79,9 @@ case "$STAGE" in
     grep -Fxq "OPIP_DEPLOYED_SHA=$TARGET_SHA" /etc/opip-learning.env
     test -s /root/.ssh/opip-learning
     test -s /root/.ssh/known_hosts
-    systemctl start opip-learning-sync.service
-    systemctl start opip-learning-capture.service
-    systemctl start opip-learning-outcomes.service
+    start_learning_unit opip-learning-sync.service
+    start_learning_unit opip-learning-capture.service
+    start_learning_unit opip-learning-outcomes.service
     systemctl enable --now \
       opip-learning-sync.timer \
       opip-learning-capture.timer \

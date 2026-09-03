@@ -48,6 +48,9 @@ def test_remote_runner_records_real_local_evidence_without_mutable_secret_timest
     assert 'systemctl disable --now "$unit"' in runner
     assert '! systemctl is-active --quiet "$unit"' in runner
     assert '! systemctl is-enabled --quiet "$unit"' in runner
+    assert 'start_learning_unit opip-learning-outcomes.service' in runner
+    assert 'systemctl status "$unit" --no-pager --full' in runner
+    assert 'journalctl -u "$unit" -n 160 --no-pager' in runner
 
     assert "7 * 86400" in bootstrap
     assert "health --require-ready" in bootstrap
