@@ -1,9 +1,11 @@
 """O'Pip Decision Engine, qualification funnel, and read-model behaviour."""
 
 from datetime import datetime, timedelta, timezone
+import time
 
 import pytest
 
+from app.opip.decision import observer as observer_module
 from app.opip.decision import store
 from app.opip.decision.comparison import build_comparison_telemetry, compare_candidate
 from app.opip.decision.engine import CandidateEvidence, OPipDecisionEngine
@@ -73,6 +75,16 @@ def snapshot(**overrides) -> MarketSnapshot:
     )
     values.update(overrides)
     return MarketSnapshot(**values)
+
+
+def test_null_scan_observer_accepts_trade_quality_hook():
+    observer = observer_module.NullScanObserver()
+    assert observer.record_trade_quality(
+        snapshot(),
+        actionable=False,
+        reason="test rejection",
+        metadata={"score": 0.0},
+    ) is None
 
 
 def execution(status="VALID", **overrides) -> ExecutionValidation:
@@ -771,6 +783,42 @@ class _ExplodingCandidate:
     @property
     def trade_direction(self):
         raise RuntimeError("evidence unavailable")
+
+
+def test_observer_gate_timestamp_reflects_completion(monkeypatch):
+    candidate = snapshot()
+    observer = OPipScanObserver(
+        snapshots=[candidate],
+        decision_at=datetime.now(timezone.utc),
+        account_equity=10_000.0,
+        telemetry_enabled=False,
+    )
+    observer.register_candidates([candidate])
+
+    def delayed_margin(candidate, *, evaluated_at):
+        time.sleep(0.02)
+        return GateResult.build(
+            GateName.MARGIN_ELIGIBILITY,
+            GateStatus.PASS,
+            ReasonCode.GATE_PASSED,
+            reason="delayed test gate",
+            evaluated_at=evaluated_at,
+        )
+
+    monkeypatch.setattr(
+        observer_module,
+        "evaluate_margin_gate",
+        delayed_margin,
+    )
+    started = datetime.now(timezone.utc)
+    observer.record_margin([candidate])
+    result = next(
+        item
+        for item in observer.funnel.get("SOLUSD", "LONG").gate_results
+        if item.gate is GateName.MARGIN_ELIGIBILITY
+    )
+    completed = datetime.fromisoformat(result.evaluated_at)
+    assert completed >= started + timedelta(milliseconds=10)
 
 
 def test_observer_degradation_is_reported_not_raised():

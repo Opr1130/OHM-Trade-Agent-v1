@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
 
 def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     migrations = discover_migrations()
-    assert [item.version for item in migrations] == [1, 2, 3]
+    assert [item.version for item in migrations] == [1, 2, 3, 4]
     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql
@@ -171,6 +171,66 @@ def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     assert "REVOKE INSERT, UPDATE, DELETE ON ops.schema_version" in sql
     assert "GRANT SELECT, INSERT, UPDATE ON ALL TABLES" not in sql
     assert "GRANT SELECT, INSERT, UPDATE ON TABLES TO opip_shipper" not in sql
+
+
+def test_opportunity_accountability_migration_is_single_well_formed_definition():
+    migration = next(
+        item for item in discover_migrations()
+        if item.version == 4
+    )
+    sql = migration.path.read_text(encoding="utf-8")
+    assert sql.count(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS "
+        "learning.opportunity_accountability_daily_mv"
+    ) == 1
+    assert sql.count("AS decision_latency_samples") == 1
+    assert sql.count("AS mean_decision_latency_ms") == 1
+    assert sql.count("FROM learning.opportunity_accountability_latest_v") == 1
+    assert "outcome_complete" in sql
+    assert "count(*) FILTER" in sql
+    assert "avg(" in sql
+
+
+def test_accountability_sql_matches_executable_miss_semantics():
+    migration = next(
+        item for item in discover_migrations()
+        if item.version == 4
+    )
+    sql = migration.path.read_text(encoding="utf-8")
+    prefix = sql.split("AS estimated_missed_move_pct_sum", 1)[0]
+    missed_move_case = prefix[prefix.rindex("sum("):]
+    assert "executable_false_negative" in missed_move_case
+
+
+def test_dashboard_hides_outcome_metrics_until_measured():
+    html = (ROOT / "app" / "api" / "dashboard.html").read_text(encoding="utf-8")
+    assert "const oaMeasured=oa.status==='MEASURED'" in html
+    for element_id in (
+        "execMissed",
+        "oppCapture",
+        "thresholdMiss",
+        "capMiss",
+        "operationalMiss",
+    ):
+        assert f"$('{element_id}').textContent=oaMeasured?" in html
+
+
+def test_accountability_read_model_separates_all_time_totals_from_60_day_trend():
+    source = (
+        ROOT / "app" / "opip" / "data_platform" / "read_model.py"
+    ).read_text(encoding="utf-8")
+    assert "ORDER BY day DESC LIMIT 60" in source
+    assert '"opportunity_accountability_all_time"' in source
+    aggregate_start = source.index(
+        "coalesce(sum(directional_evaluations), 0)"
+    )
+    aggregate_end = source.index(
+        "FROM learning.opportunity_accountability_daily_mv",
+        aggregate_start,
+    )
+    aggregate_query = source[aggregate_start:aggregate_end]
+    assert "LIMIT 60" not in aggregate_query
+    assert "decision_latency_samples" in aggregate_query
 
 
 def test_concurrent_materialized_view_refresh_uses_autocommit():
@@ -195,7 +255,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Connection:
         def __init__(self):
             self.autocommit = False
-            self.population = [True, False, True]
+            self.population = [True, False, True, False]
             self.events = []
 
         def cursor(self):
@@ -207,12 +267,54 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 3
+    assert len(refreshes) == 4
     assert all(event[1] is True for event in refreshes)
     assert connection.events.index(refreshes[0]) > next(
         index for index, event in enumerate(connection.events) if event[0] == "commit"
     )
     assert connection.autocommit is False
+
+
+def test_materialized_view_refresh_skips_unapplied_optional_view():
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            self.connection.events.append(
+                ("execute", self.connection.autocommit, repr(query), params)
+            )
+            self.connection.last_params = params
+
+        def fetchone(self):
+            relation = (self.connection.last_params or ("",))[0]
+            if relation == "learning.opportunity_accountability_daily_mv":
+                return None
+            return (True,)
+
+    class Connection:
+        def __init__(self):
+            self.autocommit = False
+            self.events = []
+            self.last_params = None
+
+        def cursor(self):
+            return Cursor(self)
+
+        def commit(self):
+            self.events.append(("commit", self.autocommit, "", None))
+
+    connection = Connection()
+    refresh_materialized_views(connection)
+    refreshes = [event for event in connection.events if "REFRESH" in event[2]]
+    assert len(refreshes) == 3
+    assert all("opportunity_accountability_daily_mv" not in event[2] for event in refreshes)
 
 
 def test_optional_streams_do_not_block_required_readiness():
@@ -259,6 +361,13 @@ def test_all_streams_are_exported_and_manifest_validated_before_promotion():
     exporter = (ROOT / "deploy/remote/export-opip-learning-evidence.sh").read_text()
     sync = (ROOT / "deploy/learning/opip-learning-sync.sh").read_text()
     for spec in STREAM_SPECS:
+        # Opportunity accountability is produced on the isolated learning
+        # worker after sync; it is not a production-export source stream.
+        if spec.name == "opportunity_accountability":
+            relative = str(spec.relative_path)
+            assert relative not in exporter
+            assert relative not in sync
+            continue
         relative = str(spec.relative_path)
         assert relative in exporter
         assert relative in sync

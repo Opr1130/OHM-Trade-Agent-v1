@@ -361,6 +361,17 @@ def _append_rows(
         lock = path.parent / f".{path.name}.lock"
         archive = _archive_for(path, max_bytes=max_bytes, keep_lines=keep_lines)
         with registry_lock(lock):
+            # One-time legacy backfill; steady state reads a tiny
+            # cryptographic manifest-version sidecar. Learning window selection
+            # never scans the lifetime archive.
+            try:
+                archive.ensure_window_index_locked()
+            except Exception as exc:
+                logger.error(
+                    "O'Pip archive window-index maintenance failed open for %s: %s",
+                    path,
+                    type(exc).__name__,
+                )
             archive.repair_tail()
             written = archive.append_encoded_many_locked(encoded_rows)
             try:

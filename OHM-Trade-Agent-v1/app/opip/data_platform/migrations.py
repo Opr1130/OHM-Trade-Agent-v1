@@ -143,17 +143,21 @@ def refresh_materialized_views(connection: Any) -> None:
         ("signal", "intelligence_daily_mv"),
         ("market", "attrition_daily_mv"),
         ("lifecycle", "rejection_mix_daily_mv"),
+        ("learning", "opportunity_accountability_daily_mv"),
     )
     populated_views: list[tuple[str, str, bool]] = []
     with connection.cursor() as cursor:
         for schema_name, view_name in views:
             cursor.execute(
                 "SELECT c.relispopulated FROM pg_class c "
-                "WHERE c.oid = %s::regclass",
+                "WHERE c.oid = to_regclass(%s)",
                 (f"{schema_name}.{view_name}",),
             )
+            row = cursor.fetchone()
+            if row is None:
+                continue
             populated_views.append(
-                (schema_name, view_name, bool(cursor.fetchone()[0]))
+                (schema_name, view_name, bool(row[0]))
             )
 
     # A population-state SELECT starts an implicit transaction on the normal

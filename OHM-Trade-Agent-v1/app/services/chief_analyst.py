@@ -195,6 +195,7 @@ def _new_stage_evidence() -> dict:
         "invocation_status": CHIEF_SKIPPED_NO_ELIGIBLE,
         "failure_type": None,
         "invoked_at": None,
+        "completed_at": None,
         "provider": None,
         "model": None,
         "route_tier": None,
@@ -522,14 +523,20 @@ def review_candidates(
         if account_equity is not None:
             quality_by_risk_level, viable = _quality_by_risk_level(candidate, account_equity)
             if not viable:
+                prefilter_evaluated_at = datetime.now(
+                    timezone.utc
+                ).isoformat()
                 capture_prefilter_rejection(
                     candidate,
                     quality_by_risk_level=quality_by_risk_level,
                     market_regime_context=market_regime_context,
                 )
-                stage_evidence["prefiltered"].append(
-                    _prefilter_evidence(candidate, quality_by_risk_level)
+                prefilter_row = _prefilter_evidence(
+                    candidate,
+                    quality_by_risk_level,
                 )
+                prefilter_row["evaluated_at"] = prefilter_evaluated_at
+                stage_evidence["prefiltered"].append(prefilter_row)
                 continue
 
         direction = candidate.trade_direction.upper()
@@ -627,7 +634,11 @@ def review_candidates(
         payload.append(candidate_context)
         chief_eligible_candidates.append(candidate)
         stage_evidence["eligible"].append(
-            {"symbol": candidate.symbol, "direction": direction}
+            {
+                "symbol": candidate.symbol,
+                "direction": direction,
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            }
         )
 
     stage_evidence["eligible_candidate_count"] = len(payload)
@@ -672,6 +683,9 @@ def review_candidates(
             chief_eligible_candidates,
             cached.get("opip_ai_route"),
         )
+        stage_evidence["completed_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
         cached["opip_stage_evidence"] = stage_evidence
         return cached
 
@@ -705,6 +719,9 @@ def review_candidates(
                     chief_eligible_candidates,
                     cached.get("opip_ai_route"),
                 )
+                stage_evidence["completed_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
                 cached["opip_stage_evidence"] = stage_evidence
                 return cached
         else:
@@ -715,6 +732,9 @@ def review_candidates(
             )
             stage_evidence["invocation_status"] = CHIEF_BUDGET_BLOCKED
             stage_evidence["failure_type"] = "CHIEF_BUDGET_LIMIT"
+            stage_evidence["completed_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
             return _no_trade_review(
                 f"Chief API skipped: {blocked}.",
                 failure_code="CHIEF_BUDGET_LIMIT",
@@ -724,6 +744,7 @@ def review_candidates(
 
     try:
         max_output_tokens = _max_output_tokens()
+        stage_evidence["invoked_at"] = datetime.now(timezone.utc).isoformat()
         routed = invoke_chief_review(
             route_plan,
             system_prompt=SYSTEM_PROMPT,
@@ -785,7 +806,7 @@ def review_candidates(
         print(f"CHIEF SUPPRESSED Reason=CHIEF_UNAVAILABLE Error={type(exc).__name__}")
         stage_evidence["invocation_status"] = CHIEF_FAILED
         stage_evidence["failure_type"] = type(exc).__name__
-        stage_evidence["invoked_at"] = datetime.now(timezone.utc).isoformat()
+        stage_evidence["completed_at"] = datetime.now(timezone.utc).isoformat()
         return _no_trade_review(
             f"Chief unavailable; fail-closed: {type(exc).__name__}.",
             failure_code="CHIEF_UNAVAILABLE",
@@ -797,7 +818,7 @@ def review_candidates(
     review["chief_cache_reused"] = False
     review["chief_eligible_candidates"] = len(payload)
     stage_evidence["invocation_status"] = CHIEF_SUCCEEDED
-    stage_evidence["invoked_at"] = datetime.now(timezone.utc).isoformat()
+    stage_evidence["completed_at"] = datetime.now(timezone.utc).isoformat()
     stage_evidence["returned_candidate_count"] = len(
         review.get("top_candidates") or []
     )

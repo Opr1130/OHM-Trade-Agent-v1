@@ -29,10 +29,39 @@ from app.services.signal_quality_phase2 import (
     build_all_episodes,
     build_timelines,
 )
-from app.services.signal_timing_v2 import compute_forward_outcome
+from app.services.signal_timing_v2 import (
+    STANDARD_HORIZONS,
+    compute_forward_outcome,
+)
 
 
 DEFAULT_CONTINUITY_SECONDS = 1500.0  # 600s nominal scan * 2.5 continuity multiplier
+FORWARD_OUTCOME_LABEL_SCHEMA_VERSION = 2
+REQUIRED_FORWARD_HORIZONS = tuple(STANDARD_HORIZONS)
+
+
+def stored_label_schema_version(row: Mapping[str, Any]) -> int:
+    """Return a native integer schema version, otherwise a non-current sentinel."""
+    raw = row.get("label_schema_version", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw
+
+
+def outcome_label_is_current(row: Mapping[str, Any]) -> bool:
+    """Return True only when a stored outcome matches the current label schema."""
+    version = stored_label_schema_version(row)
+    if version != FORWARD_OUTCOME_LABEL_SCHEMA_VERSION:
+        return False
+
+    returns = row.get("horizon_returns_pct")
+    observed = row.get("horizon_observed")
+    if not isinstance(returns, Mapping) or not isinstance(observed, Mapping):
+        return False
+    return all(
+        label in returns and label in observed
+        for label in REQUIRED_FORWARD_HORIZONS
+    )
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -186,7 +215,7 @@ def build_forward_outcome_labels(
         canonical_episode_id = str(snapshot.get("episode_id", "") or "") or None
         signal_episode_id = signal_ids.get(snapshot_id)
         payload: dict[str, Any] = {
-            "label_schema_version": 1,
+            "label_schema_version": FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
             "snapshot_id": snapshot_id,
             "symbol": symbol,
             "reference_at": at.isoformat(),

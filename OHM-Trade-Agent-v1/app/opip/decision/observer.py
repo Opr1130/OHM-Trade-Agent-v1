@@ -19,7 +19,8 @@ comparison would be a tautology and would prove nothing about equivalence.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.opip.decision.comparison import (
@@ -129,6 +130,28 @@ class OPipScanObserver:
             "O'Pip funnel stage %s failed open: %s", stage, type(exc).__name__
         )
 
+    @staticmethod
+    def _evaluated_at() -> datetime:
+        """Timestamp instrumentation when a production stage actually completes."""
+        return datetime.now(timezone.utc)
+
+    def _completed(self, result: GateResult) -> GateResult:
+        """Stamp a translated gate only after its observer evaluation completes."""
+        return replace(result, evaluated_at=self._evaluated_at().isoformat())
+
+    def _evidence_at(self, value: Any) -> datetime:
+        """Use a source-stage timestamp when present, otherwise fail soft to now."""
+        if value:
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+        return self._evaluated_at()
+
     def _episode_id(self, symbol: str) -> str | None:
         try:
             return canonical_episode_id(
@@ -187,7 +210,9 @@ class OPipScanObserver:
         try:
             for candidate in candidates:
                 self._remember(candidate)
-                result = evaluate_margin_gate(candidate, evaluated_at=self.decision_at)
+                result = self._completed(
+                    evaluate_margin_gate(candidate, evaluated_at=self.decision_at)
+                )
                 self._record(candidate, result)
                 if result.is_terminal:
                     self._reject(candidate, result.reason)
@@ -198,12 +223,13 @@ class OPipScanObserver:
         try:
             for candidate in candidates:
                 self._remember(candidate)
-                self._record(
-                    candidate,
+                result = self._completed(
                     evaluate_cross_market_gate(
-                        candidate, evaluated_at=self.decision_at
-                    ),
+                        candidate,
+                        evaluated_at=self.decision_at,
+                    )
                 )
+                self._record(candidate, result)
         except Exception as exc:
             self._degrade("record_cross_market", exc)
 
@@ -217,8 +243,11 @@ class OPipScanObserver:
         try:
             for candidate in candidates:
                 self._remember(candidate)
-                result = evaluate_execution_gate(
-                    candidate, evaluated_at=self.decision_at
+                result = self._completed(
+                    evaluate_execution_gate(
+                        candidate,
+                        evaluated_at=self.decision_at,
+                    )
                 )
                 self._record(candidate, result)
                 if result.is_terminal:
@@ -230,10 +259,13 @@ class OPipScanObserver:
         try:
             for candidate in candidates:
                 self._remember(candidate)
-                self._record(
-                    candidate,
-                    evaluate_reference_gate(candidate, evaluated_at=self.decision_at),
+                result = self._completed(
+                    evaluate_reference_gate(
+                        candidate,
+                        evaluated_at=self.decision_at,
+                    )
                 )
+                self._record(candidate, result)
         except Exception as exc:
             self._degrade("record_reference", exc)
 
@@ -246,14 +278,14 @@ class OPipScanObserver:
             lookup = assessments or {}
             for candidate in candidates:
                 self._remember(candidate)
-                self._record(
-                    candidate,
+                result = self._completed(
                     evaluate_market_intelligence_gate(
                         candidate,
                         assessment=lookup.get(getattr(candidate, "symbol", "")),
                         evaluated_at=self.decision_at,
-                    ),
+                    )
                 )
+                self._record(candidate, result)
         except Exception as exc:
             self._degrade("record_market_intelligence", exc)
 
@@ -285,7 +317,10 @@ class OPipScanObserver:
             )
 
             self._record_prefilter(evidence.get("prefiltered") or [])
-            self._record_ai_eligibility(evidence.get("eligible") or [])
+            self._record_ai_eligibility(
+                evidence.get("eligible") or [],
+                invocation_completed_at=evidence.get("completed_at"),
+            )
             self._record_ai_outcome(returned)
         except Exception as exc:
             self._degrade("record_ai_stage", exc)
@@ -319,7 +354,7 @@ class OPipScanObserver:
                     "measurement_only": True,
                     "affects_trade_authority": False,
                 },
-                evaluated_at=self.decision_at,
+                evaluated_at=self._evidence_at(row.get("evaluated_at")),
             )
             self.funnel.record(symbol, direction, result)
             self.funnel.record_legacy_outcome(
@@ -329,11 +364,18 @@ class OPipScanObserver:
                 terminal_reason=result.reason,
             )
 
-    def _record_ai_eligibility(self, eligible: Sequence[Mapping[str, Any]]) -> None:
+    def _record_ai_eligibility(
+        self,
+        eligible: Sequence[Mapping[str, Any]],
+        *,
+        invocation_completed_at: Any = None,
+    ) -> None:
         stage = self.funnel.ai_stage
+        invocation_at = self._evidence_at(invocation_completed_at)
         for row in eligible:
             symbol = str(row.get("symbol") or "")
             direction = normalize_direction(row.get("direction"))
+            eligible_at = self._evidence_at(row.get("evaluated_at"))
             self.funnel.record(
                 symbol,
                 direction,
@@ -342,7 +384,7 @@ class OPipScanObserver:
                     GateStatus.PASS,
                     ReasonCode.GATE_PASSED,
                     reason="cleared the deterministic viability prefilter",
-                    evaluated_at=self.decision_at,
+                    evaluated_at=eligible_at,
                 ),
             )
             self.funnel.record(
@@ -353,11 +395,11 @@ class OPipScanObserver:
                     GateStatus.PASS,
                     ReasonCode.GATE_PASSED,
                     reason="candidate was submitted for Chief review",
-                    evaluated_at=self.decision_at,
+                    evaluated_at=eligible_at,
                 ),
             )
 
-            invocation = self._ai_invocation_result()
+            invocation = self._ai_invocation_result(evaluated_at=invocation_at)
             self.funnel.record(symbol, direction, invocation)
             if invocation.is_terminal:
                 self.funnel.record_legacy_outcome(
@@ -371,7 +413,7 @@ class OPipScanObserver:
                     terminal_reason=invocation.reason,
                 )
 
-    def _ai_invocation_result(self) -> GateResult:
+    def _ai_invocation_result(self, *, evaluated_at: datetime) -> GateResult:
         stage = self.funnel.ai_stage
         metadata = {
             "invocation_status": stage.invocation_status,
@@ -387,7 +429,7 @@ class OPipScanObserver:
                 GateStatus.FAIL,
                 ReasonCode.AI_BUDGET_LIMIT,
                 reason="Chief review suppressed by the daily budget guard",
-                evaluated_at=self.decision_at,
+                evaluated_at=evaluated_at,
                 metadata=metadata,
             )
         if stage.invocation_status == AI_FAILED:
@@ -396,7 +438,7 @@ class OPipScanObserver:
                 GateStatus.FAIL,
                 ReasonCode.AI_SERVICE_UNAVAILABLE,
                 reason=f"Chief unavailable: {stage.failure_type or 'unknown'}",
-                evaluated_at=self.decision_at,
+                evaluated_at=evaluated_at,
                 metadata=metadata,
             )
         return GateResult.build(
@@ -404,7 +446,7 @@ class OPipScanObserver:
             GateStatus.PASS,
             ReasonCode.GATE_PASSED,
             reason=f"Chief review {stage.invocation_status}",
-            evaluated_at=self.decision_at,
+            evaluated_at=evaluated_at,
             metadata=metadata,
         )
 
@@ -440,7 +482,7 @@ class OPipScanObserver:
                     GateStatus.PASS,
                     ReasonCode.GATE_PASSED,
                     reason="Chief returned this candidate",
-                    evaluated_at=self.decision_at,
+                    evaluated_at=self._evaluated_at(),
                     metadata={"ai_rank": item.get("rank")},
                 ),
             )
@@ -453,7 +495,7 @@ class OPipScanObserver:
                     ReasonCode.GATE_PASSED,
                     reason="Chief comparative review confidence recorded",
                     measured_value=item.get("confidence"),
-                    evaluated_at=self.decision_at,
+                    evaluated_at=self._evaluated_at(),
                     metadata={
                         "ai_confidence": item.get("confidence"),
                         "ai_rank": item.get("rank"),
@@ -463,8 +505,11 @@ class OPipScanObserver:
                     },
                 ),
             )
-            gate = evaluate_recommendation_gate_item(
-                dict(item), evaluated_at=self.decision_at
+            gate = self._completed(
+                evaluate_recommendation_gate_item(
+                    dict(item),
+                    evaluated_at=self.decision_at,
+                )
             )
             self.funnel.record(symbol, direction, gate)
             if gate.is_terminal:
@@ -499,7 +544,7 @@ class OPipScanObserver:
                 GateStatus.FAIL,
                 code,
                 reason=reason,
-                evaluated_at=self.decision_at,
+                evaluated_at=self._evaluated_at(),
                 metadata={
                     "candidates_returned_by_ai": stage.candidates_returned_by_ai
                 },
@@ -527,7 +572,7 @@ class OPipScanObserver:
                     GateStatus.ERROR,
                     ReasonCode.SNAPSHOT_MISSING,
                     reason="snapshot for the alerted symbol/direction was not found",
-                    evaluated_at=self.decision_at,
+                    evaluated_at=self._evaluated_at(),
                 ),
             )
             self.funnel.record_legacy_outcome(
@@ -539,12 +584,57 @@ class OPipScanObserver:
         except Exception as exc:
             self._degrade("record_snapshot_missing", exc)
 
+    def record_trade_quality(
+        self,
+        snapshot: Any,
+        *,
+        actionable: bool | None,
+        reason: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record the production trade-quality monitor as an explicit gate."""
+        try:
+            self._remember(snapshot)
+            if actionable is None:
+                status = GateStatus.ERROR
+                code = ReasonCode.TRADE_QUALITY_UNAVAILABLE
+            elif actionable:
+                status = GateStatus.PASS
+                code = ReasonCode.GATE_PASSED
+            else:
+                status = GateStatus.FAIL
+                code = ReasonCode.TRADE_QUALITY_REJECTED
+            gate = GateResult.build(
+                GateName.TRADE_QUALITY,
+                status,
+                code,
+                reason=reason,
+                evaluated_at=self._evaluated_at(),
+                metadata=metadata,
+            )
+            self._record(snapshot, gate)
+            if gate.is_terminal:
+                if actionable is None:
+                    self.funnel.record_legacy_outcome(
+                        getattr(snapshot, "symbol", ""),
+                        getattr(snapshot, "trade_direction", "LONG"),
+                        decision=LEGACY_OPERATIONAL_FAILURE,
+                        terminal_reason=reason,
+                    )
+                else:
+                    self._reject(snapshot, reason)
+        except Exception as exc:
+            self._degrade("record_trade_quality", exc)
+
     def record_target_quality(self, snapshot: Any, result: Any) -> None:
         """Record production's own target attainability verdict."""
         try:
             self._remember(snapshot)
-            gate = target_quality_gate_from_result(
-                result, evaluated_at=self.decision_at
+            gate = self._completed(
+                target_quality_gate_from_result(
+                    result,
+                    evaluated_at=self.decision_at,
+                )
             )
             self._record(snapshot, gate)
             if gate.is_terminal:
@@ -556,8 +646,11 @@ class OPipScanObserver:
         """Record production's own economic quality verdict."""
         try:
             self._remember(snapshot)
-            gate = economic_quality_gate_from_result(
-                result, evaluated_at=self.decision_at
+            gate = self._completed(
+                economic_quality_gate_from_result(
+                    result,
+                    evaluated_at=self.decision_at,
+                )
             )
             self._record(snapshot, gate)
             if gate.is_terminal:
@@ -594,7 +687,7 @@ class OPipScanObserver:
                 status,
                 code,
                 reason=reason,
-                evaluated_at=self.decision_at,
+                evaluated_at=self._evaluated_at(),
                 metadata={"profit_rank": getattr(ranked, "rank", None)},
             )
             self._record(snapshot, result)
@@ -625,7 +718,7 @@ class OPipScanObserver:
                         ReasonCode.QUALIFIED,
                         reason="candidate cleared every production qualification gate",
                         measured_value=ranked.profit_ranking.total_score,
-                        evaluated_at=self.decision_at,
+                        evaluated_at=self._evaluated_at(),
                         metadata={"profit_rank": ranked.rank},
                     ),
                 )
@@ -683,7 +776,7 @@ class OPipScanObserver:
                         else GateStatus.SKIPPED,
                         code,
                         reason=reason,
-                        evaluated_at=self.decision_at,
+                        evaluated_at=self._evaluated_at(),
                         metadata={"paper_enabled": bool(paper_enabled)},
                     ),
                 )
@@ -838,6 +931,16 @@ class NullScanObserver:
         return None
 
     def record_snapshot_missing(self, symbol: str, direction: str) -> None:
+        return None
+
+    def record_trade_quality(
+        self,
+        snapshot: Any,
+        *,
+        actionable: bool | None,
+        reason: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         return None
 
     def record_target_quality(self, snapshot: Any, result: Any) -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -220,6 +222,443 @@ def test_archive_retry_reuses_published_content_before_compacting_hot(
     assert len(list((tmp_path / "archive").glob("evidence-*.jsonl.gz"))) == 1
     assert len(list(archive.iter_archive_rows())) == 3
     assert len(list(archive.iter_hot_rows())) == 2
+
+
+def test_archive_window_selection_uses_day_shards_without_history_scan(
+    tmp_path,
+    monkeypatch,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+    assert archive.window_index_state_file.exists()
+
+    path_type = type(archive.manifest_file)
+    real_read_text = path_type.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == archive.manifest_file:
+            raise AssertionError(
+                "steady-state window selection read the full master manifest"
+            )
+        return real_read_text(self, *args, **kwargs)
+
+    def forbidden_rglob(self, *_args, **_kwargs):
+        raise AssertionError(
+            "steady-state window selection enumerated lifetime archives"
+        )
+
+    monkeypatch.setattr(path_type, "read_text", guarded_read_text)
+    monkeypatch.setattr(path_type, "rglob", forbidden_rglob)
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.truncated is False
+    assert selection.paths == (archived,)
+
+
+def test_archive_rotation_does_not_rehash_unrelated_historical_day(
+    tmp_path,
+    monkeypatch,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    old_shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+
+    future = NOW + timedelta(days=2)
+    hot.write_bytes(
+        b"".join(
+            encode_row(
+                {
+                    "observed_at": (
+                        future + timedelta(seconds=index)
+                    ).isoformat(),
+                    "row": 100 + index,
+                }
+            )
+            for index in range(5)
+        )
+    )
+
+    real_sha256 = bounded_jsonl.sha256_file
+
+    def guarded_sha256(path):
+        if path == old_shard:
+            raise AssertionError(
+                "new archive rotation rehashed unrelated historical shard"
+            )
+        return real_sha256(path)
+
+    monkeypatch.setattr(bounded_jsonl, "sha256_file", guarded_sha256)
+    assert archive.compact_locked() is not None
+
+
+def test_archive_window_index_survives_manifest_mtime_transport_change(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    state_before = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    assert len(state_before["manifest_sha256"]) == 64
+
+    stat = archive.manifest_file.stat()
+    os.utime(
+        archive.manifest_file,
+        (stat.st_atime + 5, stat.st_mtime + 5),
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.warnings == ()
+    assert len(selection.paths) == 1
+    assert archive.ensure_window_index_locked() is True
+
+
+def test_archive_writer_fast_path_uses_manifest_signature_sidecar(
+    tmp_path, monkeypatch
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    assert archive.manifest_signature_file.exists()
+
+    def forbidden_manifest_hash(path):
+        if path == archive.manifest_file:
+            raise AssertionError("steady-state writer rehashed lifetime manifest")
+        return bounded_jsonl.sha256_file(path)
+
+    real_sha256 = bounded_jsonl.sha256_file
+
+    def guarded_sha256(path):
+        if path == archive.manifest_file:
+            raise AssertionError("steady-state writer rehashed lifetime manifest")
+        return real_sha256(path)
+
+    monkeypatch.setattr(bounded_jsonl, "sha256_file", guarded_sha256)
+    assert archive.ensure_window_index_locked() is True
+
+
+def test_archive_manifest_tamper_fails_reader_digest_validation(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    original = archive.manifest_file.read_text(encoding="utf-8")
+    tampered = original.replace('"tier":"WARM"', '"tier":"W0RM"', 1)
+    assert len(tampered) == len(original)
+    archive.manifest_file.write_text(tampered, encoding="utf-8")
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_INDEX_STALE" in selection.warnings
+
+
+def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    assert shard.exists()
+    shard.unlink()
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_WINDOW_SHARD_MISSING" in selection.warnings
+
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(minutes=1, seconds=index)
+                ).isoformat(),
+                "row": 100 + index,
+            }
+        )
+        for index in range(4)
+    )
+    # The next rotation must treat the missing hash target as an incomplete
+    # index and rebuild from the canonical manifest rather than raising.
+    assert archive.compact_locked() is not None
+    repaired = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=2),
+        max_segments=8,
+    )
+    assert repaired.complete is True
+    assert repaired.warnings == ()
+    assert len(repaired.paths) == 2
+
+
+def test_stale_valid_window_shard_fails_digest_authentication(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    payload = json.loads(shard.read_text(encoding="utf-8"))
+    payload["segments"] = {}
+    shard.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH" in selection.warnings
+
+
+def test_corrupt_window_shard_is_rebuilt_on_next_archive_rotation(tmp_path):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    shard.write_text("{corrupt", encoding="utf-8")
+
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(minutes=1, seconds=index)
+                ).isoformat(),
+                "row": 100 + index,
+            }
+        )
+        for index in range(4)
+    )
+
+    # The next archive rotation detects the corrupt certified shard and
+    # immediately rebuilds the window index from the canonical master manifest.
+    # Callers should therefore observe the repaired state, not a transient
+    # incomplete state.
+    assert archive.compact_locked() is not None
+    repaired = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=2),
+        max_segments=8,
+    )
+    assert repaired.complete is True
+    assert repaired.truncated is False
+    assert repaired.warnings == ()
+    assert len(repaired.paths) == 2
+    assert archive.ensure_window_index_locked() is True
+
+
+def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+
+    # Simulate a pre-window-index production archive copied to a new worker.
+    import shutil
+    shutil.rmtree(archive.window_index_dir)
+    assert not archive.window_index_state_file.exists()
+
+    assert archive.ensure_window_index_locked() is True
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == (archived,)
 
 
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(

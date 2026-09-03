@@ -20,7 +20,7 @@ Guarantees preserved from Sequence 2:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import json
@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 
 logger = logging.getLogger(__name__)
@@ -249,6 +249,459 @@ class BoundedJsonlArchive:
     def archive_glob(self) -> str:
         return f"{self.archive_prefix}-*.jsonl.gz"
 
+    @property
+    def window_index_dir(self) -> Path:
+        return self.archive_dir / "window_index_v1"
+
+    @property
+    def window_index_state_file(self) -> Path:
+        return self.window_index_dir / "state.json"
+
+    @property
+    def manifest_signature_file(self) -> Path:
+        return self.manifest_file.with_suffix(self.manifest_file.suffix + ".sha256")
+
+    def _read_manifest_signature(self) -> str | None:
+        try:
+            tokens = self.manifest_signature_file.read_text(
+                encoding="utf-8"
+            ).split()
+        except OSError:
+            return None
+        if not tokens:
+            return None
+        digest = str(tokens[0]).lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            return None
+        return digest
+
+    def _write_manifest_signature_locked(self, digest: str) -> None:
+        write_atomic_lines(
+            self.manifest_signature_file,
+            [f"{digest}  {self.manifest_file.name}\n".encode("utf-8")],
+        )
+
+    def _verified_manifest_signature_locked(self) -> str:
+        if not self.manifest_file.exists():
+            raise RuntimeError("archive manifest is unavailable")
+        actual = sha256_file(self.manifest_file)
+        expected = self._read_manifest_signature()
+        if expected is None:
+            # One-time legacy bootstrap under the source writer lock.
+            self._write_manifest_signature_locked(actual)
+            return actual
+        if actual != expected:
+            raise RuntimeError("archive manifest signature mismatch")
+        return actual
+
+    @staticmethod
+    def _window_day_keys(start: datetime, through: datetime) -> tuple[str, ...]:
+        current = start.astimezone(timezone.utc).date()
+        final = through.astimezone(timezone.utc).date()
+        keys: list[str] = []
+        while current <= final:
+            keys.append(current.isoformat())
+            current += timedelta(days=1)
+        return tuple(keys)
+
+    @staticmethod
+    def _verification_days(
+        verification: ArchiveVerification,
+    ) -> tuple[str, ...]:
+        first = BoundedJsonlArchive._parse_manifest_time(
+            verification.first_visible_at_utc
+        )
+        last = BoundedJsonlArchive._parse_manifest_time(
+            verification.last_visible_at_utc
+        )
+        if first is None or last is None or first > last:
+            return ()
+        return BoundedJsonlArchive._window_day_keys(first, last)
+
+    def _window_index_state_payload(
+        self,
+        *,
+        complete: bool,
+        coverage_start_day: str | None = None,
+        coverage_through_day: str | None = None,
+        shard_sha256: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        manifest_present = self.manifest_file.exists()
+        if manifest_present:
+            stat = self.manifest_file.stat()
+            manifest_size = stat.st_size
+            manifest_mtime_ns = stat.st_mtime_ns
+            manifest_sha256 = self._read_manifest_signature()
+            if manifest_sha256 is None:
+                manifest_sha256 = self._verified_manifest_signature_locked()
+        else:
+            manifest_size = 0
+            manifest_mtime_ns = 0
+            manifest_sha256 = ""
+        coverage_day_count = 0
+        if coverage_start_day and coverage_through_day:
+            try:
+                coverage_day_count = max(
+                    0,
+                    (
+                        datetime.fromisoformat(coverage_through_day).date()
+                        - datetime.fromisoformat(coverage_start_day).date()
+                    ).days
+                    + 1,
+                )
+            except ValueError:
+                coverage_day_count = 0
+        return {
+            "schema_version": 1,
+            "manifest_present": manifest_present,
+            "manifest_size": manifest_size,
+            "manifest_mtime_ns": manifest_mtime_ns,
+            "manifest_sha256": manifest_sha256,
+            "complete": bool(complete),
+            "coverage_start_day": coverage_start_day,
+            "coverage_through_day": coverage_through_day,
+            "coverage_day_count": coverage_day_count,
+            "shard_sha256": dict(sorted((shard_sha256 or {}).items())),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _write_window_index_state_locked(
+        self,
+        *,
+        complete: bool,
+        coverage_start_day: str | None = None,
+        coverage_through_day: str | None = None,
+        shard_sha256: Mapping[str, str] | None = None,
+    ) -> None:
+        self.window_index_dir.mkdir(parents=True, exist_ok=True)
+        write_atomic_lines(
+            self.window_index_state_file,
+            [
+                json.dumps(
+                    self._window_index_state_payload(
+                        complete=complete,
+                        coverage_start_day=coverage_start_day,
+                        coverage_through_day=coverage_through_day,
+                        shard_sha256=shard_sha256,
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                + b"\n"
+            ],
+        )
+
+    def _update_window_index_verification_locked(
+        self,
+        verification: ArchiveVerification,
+    ) -> tuple[bool, str | None, str | None, dict[str, str]]:
+        days = self._verification_days(verification)
+        if not days:
+            return False, None, None, {}
+
+        state: dict[str, Any] = {}
+        if self.window_index_state_file.exists():
+            try:
+                raw_state = json.loads(
+                    self.window_index_state_file.read_text(encoding="utf-8")
+                )
+                if isinstance(raw_state, dict):
+                    state = raw_state
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False, None, None, {}
+
+        old_start = str(state.get("coverage_start_day") or "") or None
+        old_through = str(state.get("coverage_through_day") or "") or None
+        raw_digests = state.get("shard_sha256")
+        shard_digests = (
+            {
+                str(day): str(digest)
+                for day, digest in raw_digests.items()
+                if str(day) and str(digest)
+            }
+            if isinstance(raw_digests, dict)
+            else {}
+        )
+
+        new_start = min([day for day in days] + ([old_start] if old_start else []))
+        new_through = max(
+            [day for day in days] + ([old_through] if old_through else [])
+        )
+
+        entry = {
+            "archive": verification.archive,
+            "tier": verification.tier,
+            "sha256": verification.sha256,
+            "row_count": verification.row_count,
+            "bytes": verification.bytes,
+            "first_visible_at_utc": verification.first_visible_at_utc,
+            "last_visible_at_utc": verification.last_visible_at_utc,
+        }
+        self.window_index_dir.mkdir(parents=True, exist_ok=True)
+
+        def _day_start(day: str) -> datetime:
+            return datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+
+        # Only create/check the newly extended edges of the dense coverage.
+        # Historical certified days are not rehashed on every archive rotation.
+        extension_days: list[str] = []
+        if old_start and old_through:
+            if new_start < old_start:
+                extension_days.extend(
+                    self._window_day_keys(
+                        _day_start(new_start),
+                        _day_start(old_start) - timedelta(days=1),
+                    )
+                )
+            if new_through > old_through:
+                extension_days.extend(
+                    self._window_day_keys(
+                        _day_start(old_through) + timedelta(days=1),
+                        _day_start(new_through),
+                    )
+                )
+        else:
+            extension_days.extend(
+                self._window_day_keys(
+                    _day_start(new_start),
+                    _day_start(new_through),
+                )
+            )
+
+        for day in extension_days:
+            shard = self.window_index_dir / f"{day}.json"
+            if shard.exists():
+                # An uncertified pre-existing shard is ambiguous. Keep the
+                # index incomplete so ensure_window_index_locked() rebuilds it
+                # from the canonical master manifest on the next writer pass.
+                return False, old_start, old_through, shard_digests
+            write_atomic_lines(
+                shard,
+                [
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "day": day,
+                            "segments": {},
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            shard_digests[day] = sha256_file(shard)
+
+        for day in days:
+            shard = self.window_index_dir / f"{day}.json"
+            expected = shard_digests.get(day)
+            if expected is None:
+                return False, old_start, old_through, shard_digests
+            try:
+                actual_digest = sha256_file(shard)
+            except OSError:
+                return False, old_start, old_through, shard_digests
+            if actual_digest != expected:
+                return False, old_start, old_through, shard_digests
+            try:
+                raw = json.loads(shard.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False, old_start, old_through, shard_digests
+            if not isinstance(raw, dict):
+                return False, old_start, old_through, shard_digests
+            segments = raw.get("segments")
+            if not isinstance(segments, dict):
+                return False, old_start, old_through, shard_digests
+            segments[verification.sha256] = entry
+            write_atomic_lines(
+                shard,
+                [
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "day": day,
+                            "segments": segments,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            shard_digests[day] = sha256_file(shard)
+
+        return True, new_start, new_through, shard_digests
+
+
+    def ensure_window_index_locked(self) -> bool:
+        """Backfill/repair the day-sharded manifest index once per manifest version.
+
+        This method may scan the master manifest only when the index is absent
+        or stale. Steady-state window selection never loads the master manifest.
+        """
+        if not self.manifest_file.exists():
+            complete = not self.archive_dir.exists()
+            self._write_window_index_state_locked(complete=complete)
+            return complete
+
+        manifest_signature = self._read_manifest_signature()
+        if manifest_signature is None:
+            # Legacy/bootstrap path only. Steady-state batches read the tiny
+            # signature sidecar instead of hashing the lifetime manifest.
+            try:
+                manifest_signature = self._verified_manifest_signature_locked()
+            except RuntimeError:
+                self._write_window_index_state_locked(complete=False)
+                return False
+        if self.window_index_state_file.exists():
+            try:
+                state = json.loads(
+                    self.window_index_state_file.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                state = None
+            version_matches = (
+                isinstance(state, dict)
+                and state.get("schema_version") == 1
+                and bool(state.get("manifest_present"))
+                and str(state.get("manifest_sha256") or "") == manifest_signature
+            )
+            if version_matches:
+                if not bool(state.get("complete", False)):
+                    # Cache a failed/incomplete build for this immutable
+                    # manifest version. The next manifest update changes the
+                    # version and triggers a rebuild exactly once.
+                    return False
+                coverage_start = str(state.get("coverage_start_day") or "") or None
+                coverage_through = str(state.get("coverage_through_day") or "") or None
+                raw_digests = state.get("shard_sha256")
+                digest_map = raw_digests if isinstance(raw_digests, dict) else {}
+                expected_count = int(state.get("coverage_day_count") or 0)
+                if coverage_start and coverage_through:
+                    if (
+                        expected_count > 0
+                        and len(digest_map) == expected_count
+                        and all(
+                            isinstance(digest, str) and len(digest) == 64
+                            for digest in digest_map.values()
+                        )
+                    ):
+                        return True
+                elif expected_count == 0 and not digest_map:
+                    return True
+
+        try:
+            if self._verified_manifest_signature_locked() != manifest_signature:
+                raise RuntimeError("archive manifest signature changed during rebuild")
+            raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError, RuntimeError):
+            self._write_window_index_state_locked(complete=False)
+            return False
+        segments = raw.get("segments") if isinstance(raw, dict) else None
+        if not isinstance(segments, dict):
+            self._write_window_index_state_locked(complete=False)
+            return False
+
+        shards: dict[str, dict[str, dict[str, Any]]] = {}
+        shard_digests: dict[str, str] = {}
+        complete = True
+        coverage_start_day: str | None = None
+        coverage_through_day: str | None = None
+        for row in segments.values():
+            if not isinstance(row, dict):
+                complete = False
+                continue
+            try:
+                verification = ArchiveVerification(
+                    archive=str(row.get("archive") or ""),
+                    tier=str(row.get("tier") or ""),
+                    sha256=str(row.get("sha256") or ""),
+                    row_count=int(row.get("row_count") or 0),
+                    bytes=int(row.get("bytes") or 0),
+                    first_visible_at_utc=(
+                        str(row.get("first_visible_at_utc"))
+                        if row.get("first_visible_at_utc") is not None
+                        else None
+                    ),
+                    last_visible_at_utc=(
+                        str(row.get("last_visible_at_utc"))
+                        if row.get("last_visible_at_utc") is not None
+                        else None
+                    ),
+                )
+            except (TypeError, ValueError):
+                complete = False
+                continue
+            days = self._verification_days(verification)
+            if not days or not verification.archive or not verification.sha256:
+                complete = False
+                continue
+            entry = {
+                "archive": verification.archive,
+                "tier": verification.tier,
+                "sha256": verification.sha256,
+                "row_count": verification.row_count,
+                "bytes": verification.bytes,
+                "first_visible_at_utc": verification.first_visible_at_utc,
+                "last_visible_at_utc": verification.last_visible_at_utc,
+            }
+            for day in days:
+                shards.setdefault(day, {})[verification.sha256] = entry
+                coverage_start_day = (
+                    day
+                    if coverage_start_day is None
+                    else min(coverage_start_day, day)
+                )
+                coverage_through_day = (
+                    day
+                    if coverage_through_day is None
+                    else max(coverage_through_day, day)
+                )
+
+        if self.window_index_dir.exists():
+            shutil.rmtree(self.window_index_dir)
+        self.window_index_dir.mkdir(parents=True, exist_ok=True)
+        if coverage_start_day and coverage_through_day:
+            dense_days = self._window_day_keys(
+                datetime.fromisoformat(coverage_start_day).replace(
+                    tzinfo=timezone.utc
+                ),
+                datetime.fromisoformat(coverage_through_day).replace(
+                    tzinfo=timezone.utc
+                ),
+            )
+        else:
+            dense_days = ()
+        for day in dense_days:
+            shard = self.window_index_dir / f"{day}.json"
+            write_atomic_lines(
+                shard,
+                [
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "day": day,
+                            "segments": shards.get(day, {}),
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            shard_digests[day] = sha256_file(shard)
+        self._write_window_index_state_locked(
+            complete=complete,
+            coverage_start_day=coverage_start_day,
+            coverage_through_day=coverage_through_day,
+            shard_sha256=shard_digests,
+        )
+        return complete
+
     def repair_tail(self) -> None:
         repair_truncated_tail(self.data_file, parse_line=self.parse_line)
 
@@ -321,6 +774,18 @@ class BoundedJsonlArchive:
         )
 
     def update_manifest_locked(self, verification: ArchiveVerification) -> None:
+        # Backfill legacy segments once before mutating the master manifest.
+        # The source writer lock held by callers makes the rebuild deterministic.
+        manifest_existed = self.manifest_file.exists()
+        prior_complete = (
+            self.ensure_window_index_locked()
+            if manifest_existed
+            else True
+        )
+        if manifest_existed:
+            # Mutation is infrequent (archive rotation/tiering), so authenticate
+            # the full canonical manifest here before carrying forward entries.
+            self._verified_manifest_signature_locked()
         payload: dict[str, Any] = {}
         if self.manifest_file.exists():
             try:
@@ -358,6 +823,33 @@ class BoundedJsonlArchive:
                 ).encode("utf-8")
                 + b"\n"
             ],
+        )
+        self._write_manifest_signature_locked(sha256_file(self.manifest_file))
+        if not prior_complete:
+            # The manifest version just changed. Rebuild an incomplete index
+            # once from the canonical manifest instead of retrying on every
+            # append batch.
+            self.ensure_window_index_locked()
+            return
+        (
+            indexed,
+            coverage_start_day,
+            coverage_through_day,
+            shard_digests,
+        ) = self._update_window_index_verification_locked(verification)
+        if not indexed:
+            # The incremental index detected missing/corrupt certified state.
+            # Rebuild once from the just-written canonical manifest. If that
+            # manifest is itself structurally incomplete, the rebuild records
+            # complete=false and that manifest version is then safely cached.
+            self.window_index_state_file.unlink(missing_ok=True)
+            self.ensure_window_index_locked()
+            return
+        self._write_window_index_state_locked(
+            complete=True,
+            coverage_start_day=coverage_start_day,
+            coverage_through_day=coverage_through_day,
+            shard_sha256=shard_digests,
         )
 
     @staticmethod
@@ -400,37 +892,125 @@ class BoundedJsonlArchive:
         if not self.archive_dir.exists():
             return ArchiveWindowSelection(paths=(), complete=True, truncated=False)
 
-        archive_files = tuple(self.archive_dir.rglob(self.archive_glob))
-        if not archive_files:
-            return ArchiveWindowSelection(paths=(), complete=True, truncated=False)
-
         warnings: list[str] = []
         try:
-            raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
-            segments = raw.get("segments") if isinstance(raw, dict) else None
+            state = json.loads(
+                self.window_index_state_file.read_text(encoding="utf-8")
+            )
         except (OSError, ValueError, json.JSONDecodeError):
-            segments = None
-        if not isinstance(segments, dict):
             return ArchiveWindowSelection(
                 paths=(),
                 complete=False,
                 truncated=False,
-                warnings=("ARCHIVE_MANIFEST_UNAVAILABLE",),
+                warnings=("ARCHIVE_WINDOW_INDEX_UNAVAILABLE",),
+            )
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            return ArchiveWindowSelection(
+                paths=(),
+                complete=False,
+                truncated=False,
+                warnings=("ARCHIVE_WINDOW_INDEX_INVALID",),
             )
 
-        candidates: list[tuple[datetime, datetime, Path]] = []
-        complete = True
-        for row in segments.values():
-            if not isinstance(row, dict):
-                complete = False
-                warnings.append("ARCHIVE_MANIFEST_ROW_INVALID")
+        complete = bool(state.get("complete", False))
+        if not complete:
+            warnings.append("ARCHIVE_WINDOW_INDEX_INCOMPLETE")
+
+        if bool(state.get("manifest_present")):
+            try:
+                manifest_stat = self.manifest_file.stat()
+            except OSError:
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_MANIFEST_UNAVAILABLE",),
+                )
+            try:
+                manifest_sha256 = sha256_file(self.manifest_file)
+            except OSError:
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_MANIFEST_UNAVAILABLE",),
+                )
+            if (
+                int(state.get("manifest_size") or -1) != manifest_stat.st_size
+                or str(state.get("manifest_sha256") or "") != manifest_sha256
+            ):
+                return ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=("ARCHIVE_WINDOW_INDEX_STALE",),
+                )
+
+        coverage_start_day = str(
+            state.get("coverage_start_day") or ""
+        ) or None
+        coverage_through_day = str(
+            state.get("coverage_through_day") or ""
+        ) or None
+        raw_digests = state.get("shard_sha256")
+        shard_digests = raw_digests if isinstance(raw_digests, dict) else {}
+        if coverage_start_day and coverage_through_day and not shard_digests:
+            complete = False
+            warnings.append("ARCHIVE_WINDOW_DIGESTS_UNAVAILABLE")
+
+        rows_by_sha: dict[str, dict[str, Any]] = {}
+        for day in self._window_day_keys(start, through):
+            shard = self.window_index_dir / f"{day}.json"
+            if not shard.exists():
+                if (
+                    coverage_start_day
+                    and coverage_through_day
+                    and coverage_start_day <= day <= coverage_through_day
+                ):
+                    complete = False
+                    warnings.append("ARCHIVE_WINDOW_SHARD_MISSING")
                 continue
+            expected_digest = str(shard_digests.get(day) or "")
+            if not expected_digest:
+                complete = False
+                warnings.append("ARCHIVE_WINDOW_SHARD_DIGEST_MISSING")
+                continue
+            try:
+                actual_digest = sha256_file(shard)
+            except OSError:
+                complete = False
+                warnings.append("ARCHIVE_WINDOW_SHARD_UNREADABLE")
+                continue
+            if actual_digest != expected_digest:
+                complete = False
+                warnings.append("ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH")
+                continue
+            try:
+                raw = json.loads(shard.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                complete = False
+                warnings.append("ARCHIVE_WINDOW_SHARD_UNREADABLE")
+                continue
+            segments = raw.get("segments") if isinstance(raw, dict) else None
+            if not isinstance(segments, dict):
+                complete = False
+                warnings.append("ARCHIVE_WINDOW_SHARD_INVALID")
+                continue
+            for sha256, row in segments.items():
+                if isinstance(row, dict):
+                    rows_by_sha[str(sha256)] = row
+                else:
+                    complete = False
+                    warnings.append("ARCHIVE_WINDOW_ROW_INVALID")
+
+        candidates: list[tuple[datetime, datetime, Path]] = []
+        for row in rows_by_sha.values():
             first = self._parse_manifest_time(row.get("first_visible_at_utc"))
             last = self._parse_manifest_time(row.get("last_visible_at_utc"))
             rel = str(row.get("archive") or "").strip()
             if first is None or last is None or not rel:
                 complete = False
-                warnings.append("ARCHIVE_MANIFEST_RANGE_MISSING")
+                warnings.append("ARCHIVE_WINDOW_RANGE_MISSING")
                 continue
             if last < start or first > through:
                 continue
@@ -439,7 +1019,7 @@ class BoundedJsonlArchive:
                 candidate.relative_to(self.archive_dir.resolve())
             except ValueError:
                 complete = False
-                warnings.append("ARCHIVE_MANIFEST_PATH_INVALID")
+                warnings.append("ARCHIVE_WINDOW_PATH_INVALID")
                 continue
             if not candidate.exists():
                 complete = False

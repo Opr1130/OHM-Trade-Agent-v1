@@ -132,8 +132,25 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert "trap cleanup EXIT INT TERM" in source
     assert 'docker rm -f "${remaining_ids[@]}"' in source
     assert source.count('MEMORY_LIMIT="384m"') == 2
+    assert 'MODULE="app.jobs.run_opportunity_intelligence_cycle"' in source
+    assert "app.jobs.build_phase3c_forward_outcomes" not in source
     assert 'MEMORY_LIMIT="512m"' not in source
     assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
+
+
+def test_opportunity_cycle_acks_only_after_accountability_build():
+    source = (
+        ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
+    ).read_text(encoding="utf-8")
+    pending = source.index("pending_accountability_outcomes()")
+    build = source.index("build_incremental_from_outcomes(outcomes)")
+    resolved = source.index("resolved_accountability_outcomes(outcomes)")
+    ack = source.index("acknowledge_accountability_outcomes(resolved)")
+    assert pending < build < resolved < ack
+    assert "acknowledge_accountability_outcomes(outcomes)" not in source
+    assert "if not outcomes:" in source
+    assert "if replayed_handoff:" in source
+    assert source.rindex("build_outcomes_bounded()") > ack
 
 
 def test_learning_systemd_services_enforce_post_run_cleanup():
