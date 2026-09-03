@@ -285,6 +285,8 @@ class BoundedJsonlArchive:
         self,
         *,
         complete: bool,
+        coverage_start_day: str | None = None,
+        coverage_through_day: str | None = None,
     ) -> dict[str, Any]:
         manifest_present = self.manifest_file.exists()
         if manifest_present:
@@ -300,16 +302,28 @@ class BoundedJsonlArchive:
             "manifest_size": manifest_size,
             "manifest_mtime_ns": manifest_mtime_ns,
             "complete": bool(complete),
+            "coverage_start_day": coverage_start_day,
+            "coverage_through_day": coverage_through_day,
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
 
-    def _write_window_index_state_locked(self, *, complete: bool) -> None:
+    def _write_window_index_state_locked(
+        self,
+        *,
+        complete: bool,
+        coverage_start_day: str | None = None,
+        coverage_through_day: str | None = None,
+    ) -> None:
         self.window_index_dir.mkdir(parents=True, exist_ok=True)
         write_atomic_lines(
             self.window_index_state_file,
             [
                 json.dumps(
-                    self._window_index_state_payload(complete=complete),
+                    self._window_index_state_payload(
+                        complete=complete,
+                        coverage_start_day=coverage_start_day,
+                        coverage_through_day=coverage_through_day,
+                    ),
                     sort_keys=True,
                     separators=(",", ":"),
                     allow_nan=False,
@@ -321,10 +335,29 @@ class BoundedJsonlArchive:
     def _update_window_index_verification_locked(
         self,
         verification: ArchiveVerification,
-    ) -> bool:
+    ) -> tuple[bool, str | None, str | None]:
         days = self._verification_days(verification)
         if not days:
-            return False
+            return False, None, None
+
+        state: dict[str, Any] = {}
+        if self.window_index_state_file.exists():
+            try:
+                raw_state = json.loads(
+                    self.window_index_state_file.read_text(encoding="utf-8")
+                )
+                if isinstance(raw_state, dict):
+                    state = raw_state
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False, None, None
+
+        old_start = str(state.get("coverage_start_day") or "") or None
+        old_through = str(state.get("coverage_through_day") or "") or None
+        new_start = min([day for day in days] + ([old_start] if old_start else []))
+        new_through = max(
+            [day for day in days] + ([old_through] if old_through else [])
+        )
+
         entry = {
             "archive": verification.archive,
             "tier": verification.tier,
@@ -335,19 +368,53 @@ class BoundedJsonlArchive:
             "last_visible_at_utc": verification.last_visible_at_utc,
         }
         self.window_index_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extend the dense day coverage only outside the previously certified
+        # interval. A missing file inside the old interval is corruption and
+        # must never be silently recreated as empty.
+        coverage_days = self._window_day_keys(
+            datetime.fromisoformat(new_start).replace(tzinfo=timezone.utc),
+            datetime.fromisoformat(new_through).replace(tzinfo=timezone.utc),
+        )
+        for day in coverage_days:
+            shard = self.window_index_dir / f"{day}.json"
+            within_old = bool(
+                old_start
+                and old_through
+                and old_start <= day <= old_through
+            )
+            if shard.exists():
+                continue
+            if within_old:
+                return False, old_start, old_through
+            write_atomic_lines(
+                shard,
+                [
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "day": day,
+                            "segments": {},
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+
         for day in days:
             shard = self.window_index_dir / f"{day}.json"
-            payload: dict[str, Any] = {}
-            if shard.exists():
-                try:
-                    raw = json.loads(shard.read_text(encoding="utf-8"))
-                    if isinstance(raw, dict):
-                        payload = raw
-                except (OSError, ValueError, json.JSONDecodeError):
-                    payload = {}
-            segments = payload.get("segments")
+            try:
+                raw = json.loads(shard.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False, old_start, old_through
+            if not isinstance(raw, dict):
+                return False, old_start, old_through
+            segments = raw.get("segments")
             if not isinstance(segments, dict):
-                segments = {}
+                return False, old_start, old_through
             segments[verification.sha256] = entry
             write_atomic_lines(
                 shard,
@@ -365,7 +432,8 @@ class BoundedJsonlArchive:
                     + b"\n"
                 ],
             )
-        return True
+        return True, new_start, new_through
+
 
     def ensure_window_index_locked(self) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
@@ -393,8 +461,9 @@ class BoundedJsonlArchive:
                 and int(state.get("manifest_size") or -1) == manifest_stat.st_size
                 and int(state.get("manifest_mtime_ns") or -1)
                 == manifest_stat.st_mtime_ns
+                and bool(state.get("complete", False))
             ):
-                return bool(state.get("complete", False))
+                return True
 
         try:
             raw = json.loads(self.manifest_file.read_text(encoding="utf-8"))
@@ -408,6 +477,8 @@ class BoundedJsonlArchive:
 
         shards: dict[str, dict[str, dict[str, Any]]] = {}
         complete = True
+        coverage_start_day: str | None = None
+        coverage_through_day: str | None = None
         for row in segments.values():
             if not isinstance(row, dict):
                 complete = False
@@ -448,11 +519,32 @@ class BoundedJsonlArchive:
             }
             for day in days:
                 shards.setdefault(day, {})[verification.sha256] = entry
+                coverage_start_day = (
+                    day
+                    if coverage_start_day is None
+                    else min(coverage_start_day, day)
+                )
+                coverage_through_day = (
+                    day
+                    if coverage_through_day is None
+                    else max(coverage_through_day, day)
+                )
 
         if self.window_index_dir.exists():
             shutil.rmtree(self.window_index_dir)
         self.window_index_dir.mkdir(parents=True, exist_ok=True)
-        for day, day_segments in sorted(shards.items()):
+        if coverage_start_day and coverage_through_day:
+            dense_days = self._window_day_keys(
+                datetime.fromisoformat(coverage_start_day).replace(
+                    tzinfo=timezone.utc
+                ),
+                datetime.fromisoformat(coverage_through_day).replace(
+                    tzinfo=timezone.utc
+                ),
+            )
+        else:
+            dense_days = ()
+        for day in dense_days:
             write_atomic_lines(
                 self.window_index_dir / f"{day}.json",
                 [
@@ -460,7 +552,7 @@ class BoundedJsonlArchive:
                         {
                             "schema_version": 1,
                             "day": day,
-                            "segments": day_segments,
+                            "segments": shards.get(day, {}),
                         },
                         sort_keys=True,
                         separators=(",", ":"),
@@ -469,7 +561,11 @@ class BoundedJsonlArchive:
                     + b"\n"
                 ],
             )
-        self._write_window_index_state_locked(complete=complete)
+        self._write_window_index_state_locked(
+            complete=complete,
+            coverage_start_day=coverage_start_day,
+            coverage_through_day=coverage_through_day,
+        )
         return complete
 
     def repair_tail(self) -> None:
@@ -590,9 +686,15 @@ class BoundedJsonlArchive:
                 + b"\n"
             ],
         )
-        indexed = self._update_window_index_verification_locked(verification)
+        (
+            indexed,
+            coverage_start_day,
+            coverage_through_day,
+        ) = self._update_window_index_verification_locked(verification)
         self._write_window_index_state_locked(
-            complete=prior_complete and indexed
+            complete=prior_complete and indexed,
+            coverage_start_day=coverage_start_day,
+            coverage_through_day=coverage_through_day,
         )
 
     @staticmethod
@@ -681,10 +783,24 @@ class BoundedJsonlArchive:
                     warnings=("ARCHIVE_WINDOW_INDEX_STALE",),
                 )
 
+        coverage_start_day = str(
+            state.get("coverage_start_day") or ""
+        ) or None
+        coverage_through_day = str(
+            state.get("coverage_through_day") or ""
+        ) or None
+
         rows_by_sha: dict[str, dict[str, Any]] = {}
         for day in self._window_day_keys(start, through):
             shard = self.window_index_dir / f"{day}.json"
             if not shard.exists():
+                if (
+                    coverage_start_day
+                    and coverage_through_day
+                    and coverage_start_day <= day <= coverage_through_day
+                ):
+                    complete = False
+                    warnings.append("ARCHIVE_WINDOW_SHARD_MISSING")
                 continue
             try:
                 raw = json.loads(shard.read_text(encoding="utf-8"))
