@@ -4,8 +4,10 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from app.jobs.build_phase3c_forward_outcomes import (
+    acknowledge_accountability_outcomes,
     build_outcomes,
     build_outcomes_bounded,
+    pending_accountability_outcomes,
 )
 from app.services.signal_quality_phase3c import (
     canonical_capture_coverage,
@@ -250,6 +252,63 @@ def test_bounded_outcome_maturation_processes_due_queue_in_batches(tmp_path):
     )
     assert third == []
     assert len(outcomes.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_bounded_outcome_handoff_replays_until_accountability_ack(tmp_path):
+    snapshots = tmp_path / "snapshots.jsonl"
+    observations = tmp_path / "observations.jsonl"
+    outcomes = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+
+    snapshots.write_text(json.dumps(_snapshot()) + "\n", encoding="utf-8")
+    observations.write_text(
+        json.dumps(_observation(BASE, 10.0)) + "\n"
+        + json.dumps(_observation(BASE + timedelta(hours=24), 11.0)) + "\n",
+        encoding="utf-8",
+    )
+
+    built = build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=24, minutes=1),
+    )
+    assert len(built) == 1
+    assert built[0]["window_complete"] is True
+
+    pending = pending_accountability_outcomes(
+        output_path=outcomes,
+        state_path=state,
+    )
+    assert [row["snapshot_id"] for row in pending] == ["S1"]
+
+    # The maturation queue has retired S1, but the independent handoff remains
+    # durable until the downstream accountability write is acknowledged.
+    assert build_outcomes_bounded(
+        snapshot_path=snapshots,
+        observation_path=observations,
+        output_path=outcomes,
+        state_path=state,
+        now=BASE + timedelta(hours=25),
+    ) == []
+    replay = pending_accountability_outcomes(
+        output_path=outcomes,
+        state_path=state,
+    )
+    assert [row["outcome_record_id"] for row in replay] == [
+        built[0]["outcome_record_id"]
+    ]
+
+    assert acknowledge_accountability_outcomes(
+        replay,
+        output_path=outcomes,
+        state_path=state,
+    ) == 1
+    assert pending_accountability_outcomes(
+        output_path=outcomes,
+        state_path=state,
+    ) == []
 
 
 def test_bounded_outcomes_revisit_partial_only_at_next_milestone(tmp_path):
