@@ -172,6 +172,143 @@ def _migrate_latest_outcome_index_fields(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
+    completed = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT key
+            FROM metadata
+            WHERE key IN (
+                'latest_outcomes_index_fields_v1',
+                'latest_outcomes_schema_type_v2'
+            )
+            """
+        ).fetchall()
+    }
+    if completed == {
+        "latest_outcomes_index_fields_v1",
+        "latest_outcomes_schema_type_v2",
+    }:
+        connection.execute(
+            "DELETE FROM metadata WHERE key = ?",
+            (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
+        )
+        connection.commit()
+        return
+
+    cursor_row = connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
+    ).fetchone()
+    try:
+        cursor = max(0, int(cursor_row[0])) if cursor_row is not None else 0
+    except (TypeError, ValueError):
+        cursor = 0
+
+    while True:
+        rows = connection.execute(
+            """
+            SELECT rowid, row_json
+            FROM latest_outcomes
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT ?
+            """,
+            (cursor, batch_size),
+        ).fetchall()
+        if not rows:
+            for marker in (
+                "latest_outcomes_index_fields_v1",
+                "latest_outcomes_schema_type_v2",
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES (?, '1')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (marker,),
+                )
+            connection.execute(
+                "DELETE FROM metadata WHERE key = ?",
+                (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY,),
+            )
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return
+
+        updates = []
+        for rowid, row_json in rows:
+            reference_at, schema_version = _latest_outcome_index_values(
+                str(row_json or "")
+            )
+            updates.append((reference_at, schema_version, int(rowid)))
+
+        connection.executemany(
+            """
+            UPDATE latest_outcomes
+            SET reference_at = ?,
+                label_schema_version = ?
+            WHERE rowid = ?
+            """,
+            updates,
+        )
+        cursor = int(rows[-1][0])
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_LATEST_OUTCOME_INDEX_MIGRATION_CURSOR_KEY, str(cursor)),
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def _open_bounded_state(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS latest_outcomes (
+            snapshot_id TEXT PRIMARY KEY,
+            outcome_record_id TEXT NOT NULL,
+            outcome_revision INTEGER NOT NULL,
+            window_complete INTEGER NOT NULL,
+            reference_at TEXT NOT NULL DEFAULT '',
+            label_schema_version INTEGER NOT NULL DEFAULT 0,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    latest_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(latest_outcomes)"
+        ).fetchall()
+    }
+    if "reference_at" not in latest_columns:
+        connection.execute(
+            "ALTER TABLE latest_outcomes "
+            "ADD COLUMN reference_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "label_schema_version" not in latest_columns:
+        connection.execute(
+            "ALTER TABLE latest_outcomes "
+            "ADD COLUMN label_schema_version INTEGER NOT NULL DEFAULT 0"
+        )
+
     _migrate_latest_outcome_index_fields(connection)
 
     connection.execute(
