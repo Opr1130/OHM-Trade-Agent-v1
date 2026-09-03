@@ -50,31 +50,7 @@ SELECT
         CASE
             WHEN coalesce((payload->>'outcome_complete')::boolean, false)
              AND coalesce((payload->>'executable_false_negative')::boolean, false)
-             AND coalesce(payload->>'estimated_missed_move_pct', '') ~ '^-?[0-9]+(\.[0-9]+)?
-    ) AS estimated_missed_move_pct_sum,
-    count(*) FILTER (
-        WHERE coalesce(payload#>>'{latency,decision_latency_ms}', '') ~ '^[0-9]+(\.[0-9]+)?$'
-    ) AS decision_latency_samples,
-    avg(
-        CASE
-            WHEN coalesce(payload#>>'{latency,decision_latency_ms}', '') ~ '^[0-9]+(\.[0-9]+)?$'
-                THEN (payload#>>'{latency,decision_latency_ms}')::numeric
-            ELSE NULL
-        END
-    ) AS mean_decision_latency_ms
-FROM learning.opportunity_accountability_latest_v
-GROUP BY date_trunc('day', observed_at)
-WITH NO DATA;
-
-CREATE UNIQUE INDEX IF NOT EXISTS opportunity_accountability_daily_mv_day_idx
-    ON learning.opportunity_accountability_daily_mv (day);
-
-GRANT USAGE ON SCHEMA learning TO opip_dashboard;
-GRANT SELECT ON
-    learning.opportunity_accountability_latest_v,
-    learning.opportunity_accountability_daily_mv
-TO opip_dashboard;
-
+             AND coalesce(payload->>'estimated_missed_move_pct', '') ~ '^-?[0-9]+(\.[0-9]+)?$'
                 THEN (payload->>'estimated_missed_move_pct')::numeric
             ELSE 0
         END
