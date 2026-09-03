@@ -113,6 +113,7 @@ BOUNDED_FORWARD_GRACE = timedelta(hours=25)
 BOUNDED_RETRY_DELAY = timedelta(hours=1)
 BOUNDED_CHECKPOINT_ANCHOR_BYTES = 4096
 ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE = 500
+STALE_SCHEMA_MIGRATION_WINDOW = timedelta(days=1)
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -816,16 +817,42 @@ def _seed_stale_schema_snapshot_queue(
     but use the current time in the queue's ordering column so fresh production
     snapshots are processed first.
     """
+    oldest = connection.execute(
+        """
+        SELECT reference_at
+        FROM latest_outcomes
+        WHERE window_complete = 1
+          AND label_schema_version < ?
+          AND reference_at <> ''
+        ORDER BY reference_at, snapshot_id
+        LIMIT 1
+        """,
+        (FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,),
+    ).fetchone()
+    if oldest is None:
+        return 0
+    oldest_at = _parse_utc(oldest[0])
+    if oldest_at is None:
+        return 0
+    window_end = oldest_at + STALE_SCHEMA_MIGRATION_WINDOW
+
     rows = connection.execute(
         """
         SELECT row_json
         FROM latest_outcomes
         WHERE window_complete = 1
           AND label_schema_version < ?
+          AND reference_at >= ?
+          AND reference_at < ?
         ORDER BY reference_at, snapshot_id
         LIMIT ?
         """,
-        (FORWARD_OUTCOME_LABEL_SCHEMA_VERSION, int(limit)),
+        (
+            FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
+            oldest_at.isoformat(),
+            window_end.isoformat(),
+            int(limit),
+        ),
     ).fetchall()
     seeded = 0
     for (raw,) in rows:
@@ -865,6 +892,7 @@ def _seed_stale_schema_snapshot_queue(
             "stage": prior.get("stage"),
             "decision_status": prior.get("decision_status"),
             "suppressed": bool(prior.get("suppressed", False)),
+            "schema_migration_only": True,
         }
         connection.execute(
             """
@@ -1011,16 +1039,39 @@ def _due_snapshot_batch(
     now: datetime,
     limit: int,
 ) -> list[dict[str, Any]]:
-    rows = connection.execute(
+    """Return one isolated class of due work: live first, migration second."""
+    live_rows = connection.execute(
         """
         SELECT row_json
         FROM snapshot_queue
         WHERE next_due_at <= ?
+          AND coalesce(
+                json_extract(row_json, '$.schema_migration_only'),
+                0
+              ) = 0
         ORDER BY decision_at, snapshot_id
         LIMIT ?
         """,
         (now.isoformat(), int(limit)),
     ).fetchall()
+
+    rows = live_rows
+    if not rows:
+        rows = connection.execute(
+            """
+            SELECT row_json
+            FROM snapshot_queue
+            WHERE next_due_at <= ?
+              AND coalesce(
+                    json_extract(row_json, '$.schema_migration_only'),
+                    0
+                  ) = 1
+            ORDER BY json_extract(row_json, '$.decision_at_utc'), snapshot_id
+            LIMIT ?
+            """,
+            (now.isoformat(), int(limit)),
+        ).fetchall()
+
     result: list[dict[str, Any]] = []
     for (raw,) in rows:
         try:
