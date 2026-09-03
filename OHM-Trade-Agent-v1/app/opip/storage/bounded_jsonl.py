@@ -275,6 +275,18 @@ class BoundedJsonlArchive:
             return None
         return digest
 
+    def _verified_manifest_signature_for_replica(self) -> str:
+        """Require an existing, valid sidecar when reading a copied replica."""
+        if not self.manifest_file.exists():
+            raise RuntimeError("archive manifest is unavailable")
+        expected = self._read_manifest_signature()
+        if expected is None:
+            raise RuntimeError("archive manifest signature is unavailable or invalid")
+        actual = sha256_file(self.manifest_file)
+        if actual != expected:
+            raise RuntimeError("archive manifest signature mismatch")
+        return actual
+
     def _write_manifest_signature_locked(self, digest: str) -> None:
         write_atomic_lines(
             self.manifest_signature_file,
@@ -710,8 +722,7 @@ class BoundedJsonlArchive:
         rewritten. A signature mismatch or structurally incomplete manifest
         still fails closed.
         """
-        if self.manifest_file.exists():
-            self._verified_manifest_signature_locked()
+        self._verified_manifest_signature_for_replica()
         if self.window_index_dir.exists():
             shutil.rmtree(self.window_index_dir)
         return self.ensure_window_index_locked()
