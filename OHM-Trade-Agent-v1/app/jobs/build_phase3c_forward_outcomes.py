@@ -198,6 +198,10 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             """
         ).fetchall()
         for snapshot_id, outcome_record_id, outcome_revision, row_json in legacy_rows:
+            snapshot_id = str(snapshot_id or "").strip()
+            outcome_record_id = str(outcome_record_id or "").strip()
+            if not snapshot_id or not outcome_record_id:
+                continue
             try:
                 parsed = json.loads(row_json)
             except (TypeError, json.JSONDecodeError):
@@ -356,7 +360,10 @@ def _upsert_latest_outcome(
     connection: sqlite3.Connection,
     row: dict[str, Any],
 ) -> None:
-    snapshot_id = str(row.get("snapshot_id", "") or "")
+    snapshot_id = str(row.get("snapshot_id", "") or "").strip()
+    outcome_record_id = str(
+        row.get("outcome_record_id", "") or ""
+    ).strip()
     if not snapshot_id:
         return
     connection.execute(
@@ -377,7 +384,7 @@ def _upsert_latest_outcome(
         """,
         (
             snapshot_id,
-            str(row.get("outcome_record_id", "") or ""),
+            outcome_record_id,
             int(row.get("outcome_revision", 0) or 0),
             1 if bool(row.get("window_complete", False)) else 0,
             json.dumps(row, sort_keys=True, allow_nan=False),
@@ -388,6 +395,14 @@ def _upsert_latest_outcome(
         or row.get("decision_at_utc")
         or ""
     )
+    if not outcome_record_id:
+        # Keep latest_outcomes aligned with the source ledger for forensics,
+        # but never let a malformed identity enter the replay gate.
+        connection.execute(
+            "DELETE FROM accountability_handoff WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        return
     connection.execute(
         """
         INSERT INTO accountability_handoff(
@@ -406,7 +421,7 @@ def _upsert_latest_outcome(
         """,
         (
             snapshot_id,
-            str(row.get("outcome_record_id", "") or ""),
+            outcome_record_id,
             int(row.get("outcome_revision", 0) or 0),
             reference_at,
             json.dumps(row, sort_keys=True, allow_nan=False),
@@ -527,6 +542,14 @@ def pending_accountability_outcomes(
         connection = _open_bounded_state(state_db)
         try:
             _reconcile_output_state(connection, output_path)
+            connection.execute(
+                """
+                DELETE FROM accountability_handoff
+                WHERE trim(snapshot_id) = ''
+                   OR trim(outcome_record_id) = ''
+                """
+            )
+            connection.commit()
             rows = connection.execute(
                 """
                 SELECT row_json
