@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -334,6 +335,54 @@ def test_archive_rotation_does_not_rehash_unrelated_historical_day(
 
     monkeypatch.setattr(bounded_jsonl, "sha256_file", guarded_sha256)
     assert archive.compact_locked() is not None
+
+
+def test_archive_window_index_survives_manifest_mtime_transport_change(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    state_before = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    assert len(state_before["manifest_sha256"]) == 64
+
+    stat = archive.manifest_file.stat()
+    os.utime(
+        archive.manifest_file,
+        (stat.st_atime + 5, stat.st_mtime + 5),
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.warnings == ()
+    assert len(selection.paths) == 1
+    assert archive.ensure_window_index_locked() is True
 
 
 def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
