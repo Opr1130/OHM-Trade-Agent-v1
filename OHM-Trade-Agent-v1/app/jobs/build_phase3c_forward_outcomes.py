@@ -155,6 +155,21 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS accountability_handoff (
+            snapshot_id TEXT PRIMARY KEY,
+            outcome_record_id TEXT NOT NULL,
+            outcome_revision INTEGER NOT NULL,
+            reference_at TEXT NOT NULL,
+            row_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_accountability_handoff_reference "
+        "ON accountability_handoff(reference_at, snapshot_id)"
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS snapshot_queue (
             snapshot_id TEXT PRIMARY KEY,
             decision_at TEXT NOT NULL,
@@ -313,6 +328,35 @@ def _upsert_latest_outcome(
             json.dumps(row, sort_keys=True, allow_nan=False),
         ),
     )
+    reference_at = str(
+        row.get("reference_at")
+        or row.get("decision_at_utc")
+        or ""
+    )
+    connection.execute(
+        """
+        INSERT INTO accountability_handoff(
+            snapshot_id,
+            outcome_record_id,
+            outcome_revision,
+            reference_at,
+            row_json
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_id) DO UPDATE SET
+            outcome_record_id = excluded.outcome_record_id,
+            outcome_revision = excluded.outcome_revision,
+            reference_at = excluded.reference_at,
+            row_json = excluded.row_json
+        WHERE excluded.outcome_revision >= accountability_handoff.outcome_revision
+        """,
+        (
+            snapshot_id,
+            str(row.get("outcome_record_id", "") or ""),
+            int(row.get("outcome_revision", 0) or 0),
+            reference_at,
+            json.dumps(row, sort_keys=True, allow_nan=False),
+        ),
+    )
 
 
 def _reconcile_output_state(
@@ -410,6 +454,80 @@ def _latest_outcome_row(
     except (TypeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def pending_accountability_outcomes(
+    *,
+    output_path: Path = DEFAULT_OUTPUT,
+    state_path: Path | None = None,
+    limit: int = BOUNDED_MAX_SNAPSHOTS,
+) -> list[dict[str, Any]]:
+    """Return durable, unacknowledged outcome revisions for accountability."""
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    state_db = state_path or _bounded_state_path(output_path)
+    lock = output_path.parent / f".{output_path.name}.lock"
+    with registry_lock(lock):
+        _repair_truncated_jsonl_tail(output_path)
+        connection = _open_bounded_state(state_db)
+        try:
+            _reconcile_output_state(connection, output_path)
+            rows = connection.execute(
+                """
+                SELECT row_json
+                FROM accountability_handoff
+                ORDER BY reference_at, snapshot_id
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        finally:
+            connection.close()
+
+    result: list[dict[str, Any]] = []
+    for (raw,) in rows:
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def acknowledge_accountability_outcomes(
+    outcomes: list[dict[str, Any]],
+    *,
+    output_path: Path = DEFAULT_OUTPUT,
+    state_path: Path | None = None,
+) -> int:
+    """Acknowledge only revisions durably consumed by accountability."""
+    if not outcomes:
+        return 0
+    state_db = state_path or _bounded_state_path(output_path)
+    lock = output_path.parent / f".{output_path.name}.lock"
+    deleted = 0
+    with registry_lock(lock):
+        connection = _open_bounded_state(state_db)
+        try:
+            _reconcile_output_state(connection, output_path)
+            for row in outcomes:
+                snapshot_id = str(row.get("snapshot_id", "") or "")
+                record_id = str(row.get("outcome_record_id", "") or "")
+                if not snapshot_id or not record_id:
+                    continue
+                cursor = connection.execute(
+                    """
+                    DELETE FROM accountability_handoff
+                    WHERE snapshot_id = ? AND outcome_record_id = ?
+                    """,
+                    (snapshot_id, record_id),
+                )
+                deleted += max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        finally:
+            connection.close()
+    return deleted
 
 
 def _reconcile_snapshot_queue(
