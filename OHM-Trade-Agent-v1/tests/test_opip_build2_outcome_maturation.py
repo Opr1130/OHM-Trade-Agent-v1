@@ -431,7 +431,7 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
             )
             """
         )
-        legacy_ids = ("LEGACY-Z", "LEGACY-A", "LEGACY-M")
+        legacy_ids = ("LEGACY-Z", " LEGACY-A", "LEGACY-M")
         for index, snapshot_id in enumerate(legacy_ids):
             row = {
                 **_snapshot(snapshot_id, f"E{index}"),
@@ -467,7 +467,7 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
     )
     assert [row["snapshot_id"] for row in first] == [
         "LEGACY-Z",
-        "LEGACY-A",
+        " LEGACY-A",
     ]
 
     connection = sqlite3.connect(state)
@@ -480,7 +480,7 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         )
         assert cursor == {
             "reference_at": (BASE + timedelta(minutes=1)).isoformat(),
-            "snapshot_id": "LEGACY-A",
+            "snapshot_id": " LEGACY-A",
         }
         assert "accountability_handoff_backfill_v2" not in metadata
     finally:
