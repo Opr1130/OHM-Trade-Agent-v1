@@ -523,6 +523,9 @@ def review_candidates(
         if account_equity is not None:
             quality_by_risk_level, viable = _quality_by_risk_level(candidate, account_equity)
             if not viable:
+                prefilter_evaluated_at = datetime.now(
+                    timezone.utc
+                ).isoformat()
                 capture_prefilter_rejection(
                     candidate,
                     quality_by_risk_level=quality_by_risk_level,
@@ -532,9 +535,7 @@ def review_candidates(
                     candidate,
                     quality_by_risk_level,
                 )
-                prefilter_row["evaluated_at"] = datetime.now(
-                    timezone.utc
-                ).isoformat()
+                prefilter_row["evaluated_at"] = prefilter_evaluated_at
                 stage_evidence["prefiltered"].append(prefilter_row)
                 continue
 
