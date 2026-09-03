@@ -208,6 +208,7 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert '--env-file' not in runner
     assert '$APP_ROOT/.env' not in runner
     assert "P1_SHADOW_OUTBOX_ENABLED=true" in runner
+    assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true" in runner
 
 
 def test_deploy_reconciles_paper_topology_before_marking_last_good():
