@@ -385,6 +385,84 @@ def test_archive_window_index_survives_manifest_mtime_transport_change(
     assert archive.ensure_window_index_locked() is True
 
 
+def test_archive_writer_fast_path_uses_manifest_signature_sidecar(
+    tmp_path, monkeypatch
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    assert archive.manifest_signature_file.exists()
+
+    def forbidden_manifest_hash(path):
+        if path == archive.manifest_file:
+            raise AssertionError("steady-state writer rehashed lifetime manifest")
+        return bounded_jsonl.sha256_file(path)
+
+    real_sha256 = bounded_jsonl.sha256_file
+
+    def guarded_sha256(path):
+        if path == archive.manifest_file:
+            raise AssertionError("steady-state writer rehashed lifetime manifest")
+        return real_sha256(path)
+
+    monkeypatch.setattr(bounded_jsonl, "sha256_file", guarded_sha256)
+    assert archive.ensure_window_index_locked() is True
+
+
+def test_archive_manifest_tamper_fails_reader_digest_validation(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    original = archive.manifest_file.read_text(encoding="utf-8")
+    tampered = original.replace('"tier":"WARM"', '"tier":"W0RM"', 1)
+    assert len(tampered) == len(original)
+    archive.manifest_file.write_text(tampered, encoding="utf-8")
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_INDEX_STALE" in selection.warnings
+
+
 def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
     tmp_path,
 ):
