@@ -744,6 +744,47 @@ def test_replica_window_index_rebuild_fails_closed_on_manifest_signature_mismatc
     with pytest.raises(RuntimeError, match="archive manifest signature mismatch"):
         archive.rebuild_window_index_from_verified_manifest_locked()
 
+
+@pytest.mark.parametrize("sidecar_payload", [None, "", "not-a-digest\n"])
+def test_replica_window_index_rebuild_requires_valid_existing_signature(
+    tmp_path,
+    sidecar_payload,
+):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (NOW + timedelta(seconds=index)).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    if sidecar_payload is None:
+        archive.manifest_signature_file.unlink()
+    else:
+        archive.manifest_signature_file.write_text(
+            sidecar_payload,
+            encoding="utf-8",
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="archive manifest signature is unavailable or invalid",
+    ):
+        archive.rebuild_window_index_from_verified_manifest_locked()
+
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
     tmp_path, monkeypatch
 ):
