@@ -85,7 +85,10 @@ def test_build6_attributes_margin_and_deterministic_chokes(tmp_path):
                         "threshold_distance": -0.08,
                         "metadata": {
                             "binding_metric": "ECONOMIC_REWARD_TO_RISK",
-                            "risk_levels_evaluated": ["low", "medium"],
+                            "risk_levels": {
+                                "low": {"target_qualified": False},
+                                "medium": {"target_qualified": False},
+                            },
                         },
                     }
                 ],
