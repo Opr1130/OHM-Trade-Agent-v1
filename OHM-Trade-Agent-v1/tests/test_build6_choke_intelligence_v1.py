@@ -229,3 +229,44 @@ def test_build6_ignores_nonfinite_or_malformed_threshold_distance(tmp_path):
     assert deterministic["threshold_distance_samples"] == 0
     assert deterministic["nearest_threshold_gap_pct"] is None
     assert deterministic["median_threshold_gap_pct"] is None
+
+
+
+def test_build6_separates_deterministic_errors_from_policy_rejects(tmp_path):
+    funnel, screening, summaries = _paths(tmp_path)
+    _write_jsonl(
+        funnel,
+        [
+            {
+                "decision_at_utc": NOW.isoformat(),
+                "decision": "OPERATIONAL_FAILURE",
+                "first_terminal_gate": "DETERMINISTIC_QUALITY",
+                "terminal_reason_code": "GATE_EVALUATION_ERROR",
+                "terminal_reason_class": "OPERATIONAL",
+                "gate_results": [
+                    {
+                        "gate": "DETERMINISTIC_QUALITY",
+                        "status": "ERROR",
+                        "reason_code": "GATE_EVALUATION_ERROR",
+                        "reason_class": "OPERATIONAL",
+                        "metadata": {
+                            "binding_metric": "UNKNOWN",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+
+    assert report["deterministic_prefilter_reject"] == 0
+    assert report["deterministic_prefilter_error"] == 1
+    deterministic = report["choke_analysis"]["deterministic_viability"]
+    assert deterministic["rejects"] == 0
+    assert deterministic["errors"] == 1
+    assert report["primary_operational_choke"] == "DETERMINISTIC_QUALITY"
