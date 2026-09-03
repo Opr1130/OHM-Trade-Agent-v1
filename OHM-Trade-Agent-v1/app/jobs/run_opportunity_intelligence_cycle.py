@@ -37,6 +37,13 @@ def main() -> None:
     resolved = resolved_accountability_outcomes(outcomes)
     acknowledged = acknowledge_accountability_outcomes(resolved)
 
+    # Historical upgrade replay must not starve current outcome maturation.
+    # Mature one bounded current batch after replay; its handoff is processed
+    # on a subsequent cycle under the same at-least-once contract.
+    if replayed_handoff:
+        evaluated = build_outcomes_bounded()
+        newly_evaluated += len(evaluated)
+
     print(
         json.dumps(
             {
