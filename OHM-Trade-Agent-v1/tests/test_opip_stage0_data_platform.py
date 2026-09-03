@@ -279,6 +279,103 @@ def test_archive_window_selection_uses_day_shards_without_history_scan(
     assert selection.paths == (archived,)
 
 
+def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    assert shard.exists()
+    shard.unlink()
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_WINDOW_SHARD_MISSING" in selection.warnings
+
+
+def test_corrupt_window_shard_is_not_overwritten_as_complete(tmp_path):
+    hot = tmp_path / "funnel_events.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "funnel_events_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="funnel_events",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    shard.write_text("{corrupt", encoding="utf-8")
+
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(minutes=1, seconds=index)
+                ).isoformat(),
+                "row": 100 + index,
+            }
+        )
+        for index in range(4)
+    )
+    assert archive.compact_locked() is not None
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=2),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_WINDOW_SHARD_UNREADABLE" in selection.warnings
+
+    # The next writer maintenance pass rebuilds the incomplete index from the
+    # canonical master manifest rather than trusting/overwriting the bad shard.
+    assert archive.ensure_window_index_locked() is True
+    repaired = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=2),
+        max_segments=8,
+    )
+    assert repaired.complete is True
+    assert len(repaired.paths) == 2
+
+
 def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
     hot = tmp_path / "funnel_events.jsonl"
     archive = BoundedJsonlArchive(
