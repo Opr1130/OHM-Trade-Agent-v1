@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -317,6 +318,48 @@ def test_archive_window_selection_fails_closed_when_certified_shard_is_missing(
     assert "ARCHIVE_WINDOW_SHARD_MISSING" in selection.warnings
 
 
+def test_stale_valid_window_shard_fails_digest_authentication(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    assert archive.compact_locked() is not None
+
+    shard = archive.window_index_dir / f"{NOW.date().isoformat()}.json"
+    payload = json.loads(shard.read_text(encoding="utf-8"))
+    payload["segments"] = {}
+    shard.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH" in selection.warnings
+
+
 def test_corrupt_window_shard_is_not_overwritten_as_complete(tmp_path):
     hot = tmp_path / "funnel_events.jsonl"
     archive = BoundedJsonlArchive(
@@ -362,7 +405,7 @@ def test_corrupt_window_shard_is_not_overwritten_as_complete(tmp_path):
         max_segments=8,
     )
     assert selection.complete is False
-    assert "ARCHIVE_WINDOW_SHARD_UNREADABLE" in selection.warnings
+    assert "ARCHIVE_WINDOW_SHARD_DIGEST_MISMATCH" in selection.warnings
 
     # The next writer maintenance pass rebuilds the incomplete index from the
     # canonical master manifest rather than trusting/overwriting the bad shard.
