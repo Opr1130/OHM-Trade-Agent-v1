@@ -11,6 +11,7 @@ NOW = datetime(2026, 9, 3, 19, 0, tzinfo=timezone.utc)
 
 
 def _archive(tmp_path):
+    """Build an isolated screening-evidence archive for regression tests."""
     hot = tmp_path / "screening_evaluations.jsonl"
     return BoundedJsonlArchive(
         data_file=hot,
@@ -24,6 +25,7 @@ def _archive(tmp_path):
 
 
 def test_derived_only_archive_directory_is_complete_without_manifest(tmp_path):
+    """A genuinely empty derived-only archive is certified complete."""
     archive = _archive(tmp_path)
 
     assert archive.ensure_window_index_locked() is True
@@ -44,6 +46,7 @@ def test_derived_only_archive_directory_is_complete_without_manifest(tmp_path):
 
 
 def test_real_archive_segment_without_manifest_remains_fail_closed(tmp_path):
+    """An orphan gzip segment without a manifest remains incomplete."""
     archive = _archive(tmp_path)
     archive.archive_dir.mkdir(parents=True, exist_ok=True)
     (archive.archive_dir / "screening_evaluations-orphan.jsonl.gz").write_bytes(
@@ -62,6 +65,7 @@ def test_real_archive_segment_without_manifest_remains_fail_closed(tmp_path):
 
 
 def test_prior_manifest_index_state_without_manifest_remains_fail_closed(tmp_path):
+    """Prior manifest-backed index evidence is preserved and fails closed."""
     archive = _archive(tmp_path)
     archive.window_index_dir.mkdir(parents=True, exist_ok=True)
     prior_state = {
@@ -96,6 +100,7 @@ def test_prior_manifest_index_state_without_manifest_remains_fail_closed(tmp_pat
 
 
 def test_manifest_signature_without_manifest_remains_fail_closed(tmp_path):
+    """A manifest signature sidecar without its manifest is incomplete."""
     archive = _archive(tmp_path)
     archive.archive_dir.mkdir(parents=True, exist_ok=True)
     archive.manifest_signature_file.write_text(
@@ -113,10 +118,11 @@ def test_manifest_signature_without_manifest_remains_fail_closed(tmp_path):
         max_segments=8,
     )
     assert selection.complete is False
-    assert "ARCHIVE_WINDOW_INDEX_UNAVAILABLE" in selection.warnings
+    assert "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in selection.warnings
 
 
 def test_incomplete_zero_coverage_state_is_not_reclassified_as_empty(tmp_path):
+    """An incomplete zero-coverage state is never promoted to complete."""
     archive = _archive(tmp_path)
     archive.window_index_dir.mkdir(parents=True, exist_ok=True)
     prior_state = {
@@ -143,6 +149,7 @@ def test_incomplete_zero_coverage_state_is_not_reclassified_as_empty(tmp_path):
 
 
 def test_certified_empty_state_is_invalidated_when_orphan_segment_appears(tmp_path):
+    """New orphan segment evidence invalidates a prior empty certification."""
     archive = _archive(tmp_path)
     assert archive.ensure_window_index_locked() is True
 
@@ -166,6 +173,7 @@ def test_certified_empty_state_is_invalidated_when_orphan_segment_appears(tmp_pa
 
 
 def test_certified_empty_state_is_invalidated_when_signature_appears(tmp_path):
+    """New signature evidence invalidates a prior empty certification."""
     archive = _archive(tmp_path)
     assert archive.ensure_window_index_locked() is True
 
@@ -189,6 +197,7 @@ def test_certified_empty_state_is_invalidated_when_signature_appears(tmp_path):
 
 
 def test_boolean_numeric_metadata_cannot_certify_empty_archive(tmp_path):
+    """Boolean numeric metadata cannot pass canonical empty-state validation."""
     boolean_cases = {
         "schema_version": True,
         "manifest_size": False,
@@ -222,3 +231,29 @@ def test_boolean_numeric_metadata_cannot_certify_empty_archive(tmp_path):
 
         assert archive.ensure_window_index_locked() is False
         assert archive.window_index_state_file.read_bytes() == before
+
+        selection = archive.archive_paths_for_visible_window(
+            start=NOW - timedelta(minutes=1),
+            through=NOW + timedelta(minutes=1),
+            max_segments=8,
+        )
+        assert selection.complete is False
+        assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
+
+
+def test_reader_rejects_certified_empty_state_when_orphan_evidence_appears(tmp_path):
+    """The read path independently rejects stale empty certification."""
+    archive = _archive(tmp_path)
+    assert archive.ensure_window_index_locked() is True
+
+    (archive.archive_dir / "screening_evaluations-direct-orphan.jsonl.gz").write_bytes(
+        b"orphan"
+    )
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
