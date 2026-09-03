@@ -1336,6 +1336,12 @@ def main():
                     f"TRADE QUALITY candidate rejected after evaluator failure "
                     f"{direction} {snapshot.symbol}: {type(exc).__name__}: {exc}"
                 )
+                opip.record_trade_quality(
+                    snapshot,
+                    actionable=None,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    metadata={"failure_type": type(exc).__name__},
+                )
                 capture_snapshot_decision(
                     snapshot,
                     decision="TRADE_QUALITY_UNAVAILABLE",
@@ -1355,6 +1361,25 @@ def main():
             alert["exhaustion_state"] = trade_quality.entry.exhaustion_risk
             alert["trade_quality_actionable"] = trade_quality.actionable
             alert["score_is_probability"] = False
+            trade_quality_reason = (
+                f"Continuation={trade_quality.continuation.decision}/"
+                f"{trade_quality.continuation.score} "
+                f"Entry={trade_quality.entry.decision}/"
+                f"{trade_quality.entry.quality_score} "
+                f"Exhaustion={trade_quality.entry.exhaustion_risk}"
+            )
+            opip.record_trade_quality(
+                snapshot,
+                actionable=bool(trade_quality.actionable),
+                reason=trade_quality_reason,
+                metadata={
+                    "continuation_score": trade_quality.continuation.score,
+                    "continuation_decision": trade_quality.continuation.decision,
+                    "entry_quality_score": trade_quality.entry.quality_score,
+                    "entry_decision": trade_quality.entry.decision,
+                    "exhaustion_risk": trade_quality.entry.exhaustion_risk,
+                },
+            )
             try:
                 alert["trade_quality_evidence_id"] = record_trade_quality_evidence(
                     feature_snapshot=feature_snapshot,
@@ -1389,22 +1414,15 @@ def main():
                     )
 
             if not trade_quality.actionable:
-                quality_reason = (
-                    f"Continuation={trade_quality.continuation.decision}/"
-                    f"{trade_quality.continuation.score} "
-                    f"Entry={trade_quality.entry.decision}/"
-                    f"{trade_quality.entry.quality_score} "
-                    f"Exhaustion={trade_quality.entry.exhaustion_risk}"
-                )
                 print(
                     f"TRADE QUALITY MONITOR {direction} {snapshot.symbol}: "
-                    f"{quality_reason}"
+                    f"{trade_quality_reason}"
                 )
                 capture_snapshot_decision(
                     snapshot,
                     decision="TRADE_QUALITY_MONITOR",
                     market_regime=market_regime.regime,
-                    reason=quality_reason,
+                    reason=trade_quality_reason,
                     source="wave9_trade_quality_gate",
                 )
                 continue
