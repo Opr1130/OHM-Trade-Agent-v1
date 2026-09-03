@@ -144,8 +144,10 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
     ).read_text(encoding="utf-8")
     pending = source.index("pending_accountability_outcomes()")
     build = source.index("build_incremental_from_outcomes(outcomes)")
-    ack = source.index("acknowledge_accountability_outcomes(outcomes)")
-    assert pending < build < ack
+    resolved = source.index("resolved_accountability_outcomes(outcomes)")
+    ack = source.index("acknowledge_accountability_outcomes(resolved)")
+    assert pending < build < resolved < ack
+    assert "acknowledge_accountability_outcomes(outcomes)" not in source
     assert "if not outcomes:" in source
 
 
