@@ -533,6 +533,12 @@ def _upsert_latest_outcome(
         revision = int(row.get("outcome_revision", 0) or 0)
     except (TypeError, ValueError):
         return
+    try:
+        label_schema_version = int(
+            row.get("label_schema_version", 0) or 0
+        )
+    except (TypeError, ValueError):
+        label_schema_version = 0
     latest_cursor = connection.execute(
         """
         INSERT INTO latest_outcomes(
@@ -563,7 +569,7 @@ def _upsert_latest_outcome(
                 or row.get("decision_at_utc")
                 or ""
             ),
-            int(row.get("label_schema_version", 0) or 0),
+            label_schema_version,
             json.dumps(row, sort_keys=True, allow_nan=False),
         ),
     )
