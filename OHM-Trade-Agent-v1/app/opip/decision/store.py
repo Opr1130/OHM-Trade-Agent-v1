@@ -365,7 +365,7 @@ def _append_rows(
             # cryptographic manifest-version sidecar. Learning window selection
             # never scans the lifetime archive.
             try:
-                archive.ensure_window_index_locked()
+                archive.repair_window_index_locked()
             except Exception as exc:
                 logger.error(
                     "O'Pip archive window-index maintenance failed open for %s: %s",
