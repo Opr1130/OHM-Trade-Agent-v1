@@ -309,7 +309,7 @@ class BoundedJsonlArchive:
             or not isinstance(shard_digests, dict)
             or bool(shard_digests)
             or not isinstance(state.get("updated_at_utc"), str)
-            or not state.get("updated_at_utc")
+            or self._parse_manifest_time(state.get("updated_at_utc")) is None
         ):
             return False
         try:
