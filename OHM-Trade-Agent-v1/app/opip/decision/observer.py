@@ -933,6 +933,16 @@ class NullScanObserver:
     def record_snapshot_missing(self, symbol: str, direction: str) -> None:
         return None
 
+    def record_trade_quality(
+        self,
+        snapshot: Any,
+        *,
+        actionable: bool | None,
+        reason: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        return None
+
     def record_target_quality(self, snapshot: Any, result: Any) -> None:
         return None
 
