@@ -536,11 +536,13 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
 
-    def ensure_window_index_locked(self) -> bool:
+    def ensure_window_index_locked(self, *, force_rebuild: bool = False) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
 
         This method may scan the master manifest only when the index is absent
-        or stale. Steady-state window selection never loads the master manifest.
+        or stale. ``force_rebuild`` is an explicit recovery path for an
+        authenticated manifest whose prior derived index build was incomplete;
+        steady-state callers leave it false and never rescan lifetime history.
         """
         if not self.manifest_file.exists():
             complete = not self.archive_dir.exists()
@@ -569,7 +571,7 @@ class BoundedJsonlArchive:
                 and bool(state.get("manifest_present"))
                 and str(state.get("manifest_sha256") or "") == manifest_signature
             )
-            if version_matches:
+            if version_matches and not force_rebuild:
                 if not bool(state.get("complete", False)):
                     # Cache a failed/incomplete build for this immutable
                     # manifest version. The next manifest update changes the
