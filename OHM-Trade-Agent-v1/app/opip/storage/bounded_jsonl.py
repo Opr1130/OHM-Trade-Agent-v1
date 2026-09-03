@@ -274,16 +274,23 @@ class BoundedJsonlArchive:
         if not isinstance(state, dict):
             return False
         shard_digests = state.get("shard_sha256")
+        zero_integer_fields = (
+            "manifest_size",
+            "manifest_mtime_ns",
+            "coverage_day_count",
+        )
         if (
-            state.get("schema_version") != 1
+            type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
             or state.get("manifest_present") is not False
-            or state.get("manifest_size") != 0
-            or state.get("manifest_mtime_ns") != 0
+            or any(
+                type(state.get(field)) is not int or state.get(field) != 0
+                for field in zero_integer_fields
+            )
             or str(state.get("manifest_sha256") or "")
             or state.get("complete") is not True
             or str(state.get("coverage_start_day") or "")
             or str(state.get("coverage_through_day") or "")
-            or state.get("coverage_day_count") != 0
             or not isinstance(shard_digests, dict)
             or bool(shard_digests)
         ):
@@ -599,14 +606,23 @@ class BoundedJsonlArchive:
                 else False
             )
             if archive_segments_exist:
-                # For a brand-new orphan segment, persist an incomplete state
-                # so bounded readers fail closed. Preserve any existing state
-                # verbatim because it may be the only evidence of prior
-                # manifest/coverage metadata.
-                if not self.window_index_state_file.exists():
+                # New evidence invalidates a previously certified-empty state.
+                # Preserve any other existing state verbatim because it may be
+                # the only evidence of prior manifest/coverage metadata.
+                if (
+                    not self.window_index_state_file.exists()
+                    or self._window_index_state_proves_empty_archive_without_manifest()
+                ):
                     self._write_window_index_state_locked(complete=False)
                 return False
             if self.manifest_signature_file.exists():
+                # A signature sidecar is canonical lineage evidence. Invalidate
+                # only a certified-empty state; preserve all other prior state.
+                if (
+                    not self.window_index_state_file.exists()
+                    or self._window_index_state_proves_empty_archive_without_manifest()
+                ):
+                    self._write_window_index_state_locked(complete=False)
                 return False
             if self.window_index_state_file.exists():
                 if not self._window_index_state_proves_empty_archive_without_manifest():
