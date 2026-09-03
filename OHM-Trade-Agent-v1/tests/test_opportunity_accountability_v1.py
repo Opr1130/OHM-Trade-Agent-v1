@@ -441,7 +441,7 @@ def test_incremental_join_splits_archive_ceiling_batches(monkeypatch, tmp_path):
     )
 
 
-    def bounded_selector(path, *, archive_dir, start, through, kind):
+    def bounded_selector(path, *, archive_dir, start, through, kind, replica_mode=False):
         if through - start > timedelta(hours=2):
             return SimpleNamespace(), SimpleNamespace(
                 paths=(),
