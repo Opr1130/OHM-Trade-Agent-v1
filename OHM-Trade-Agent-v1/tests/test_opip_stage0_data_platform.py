@@ -661,6 +661,56 @@ def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
     assert selection.paths == (archived,)
 
 
+
+def test_archive_window_index_force_rebuild_recovers_cached_incomplete_state(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+
+    state = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    state["complete"] = False
+    archive.window_index_state_file.write_text(
+        json.dumps(state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    assert archive.ensure_window_index_locked() is False
+    assert archive.ensure_window_index_locked(force_rebuild=True) is True
+
+    repaired = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert repaired.complete is True
+    assert repaired.warnings == ()
+    assert repaired.paths == (archived,)
+
+
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
     tmp_path, monkeypatch
 ):
