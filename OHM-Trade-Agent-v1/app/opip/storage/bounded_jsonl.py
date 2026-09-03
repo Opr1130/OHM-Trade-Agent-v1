@@ -702,6 +702,20 @@ class BoundedJsonlArchive:
         )
         return complete
 
+    def rebuild_window_index_from_verified_manifest_locked(self) -> bool:
+        """Rebuild only derived window-index files from verified archive evidence.
+
+        This is intended for immutable/read-only replicas whose caller already
+        serializes access. The canonical manifest and archive segments are never
+        rewritten. A signature mismatch or structurally incomplete manifest
+        still fails closed.
+        """
+        if self.manifest_file.exists():
+            self._verified_manifest_signature_locked()
+        if self.window_index_dir.exists():
+            shutil.rmtree(self.window_index_dir)
+        return self.ensure_window_index_locked()
+
     def repair_tail(self) -> None:
         repair_truncated_tail(self.data_file, parse_line=self.parse_line)
 
