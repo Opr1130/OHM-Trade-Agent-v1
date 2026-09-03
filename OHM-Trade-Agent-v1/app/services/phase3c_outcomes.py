@@ -46,7 +46,7 @@ def outcome_label_is_current(row: Mapping[str, Any]) -> bool:
         version = int(row.get("label_schema_version", 0) or 0)
     except (TypeError, ValueError):
         return False
-    if version < FORWARD_OUTCOME_LABEL_SCHEMA_VERSION:
+    if version != FORWARD_OUTCOME_LABEL_SCHEMA_VERSION:
         return False
 
     returns = row.get("horizon_returns_pct")
