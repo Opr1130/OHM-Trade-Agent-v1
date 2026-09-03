@@ -431,8 +431,8 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
             )
             """
         )
-        for index in range(3):
-            snapshot_id = f"LEGACY-{index:02d}"
+        legacy_ids = ("LEGACY-Z", "LEGACY-A", "LEGACY-M")
+        for index, snapshot_id in enumerate(legacy_ids):
             row = {
                 **_snapshot(snapshot_id, f"E{index}"),
                 "reference_at": (
@@ -466,8 +466,8 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         state_path=state,
     )
     assert [row["snapshot_id"] for row in first] == [
-        "LEGACY-00",
-        "LEGACY-01",
+        "LEGACY-Z",
+        "LEGACY-A",
     ]
 
     connection = sqlite3.connect(state)
@@ -475,8 +475,14 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         metadata = dict(connection.execute(
             "SELECT key, value FROM metadata"
         ).fetchall())
-        assert metadata["accountability_handoff_backfill_cursor_v1"] == "LEGACY-01"
-        assert "accountability_handoff_backfill_v1" not in metadata
+        cursor = json.loads(
+            metadata["accountability_handoff_backfill_cursor_v2"]
+        )
+        assert cursor == {
+            "reference_at": (BASE + timedelta(minutes=1)).isoformat(),
+            "snapshot_id": "LEGACY-A",
+        }
+        assert "accountability_handoff_backfill_v2" not in metadata
     finally:
         connection.close()
 
@@ -490,15 +496,15 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         output_path=output,
         state_path=state,
     )
-    assert [row["snapshot_id"] for row in second] == ["LEGACY-02"]
+    assert [row["snapshot_id"] for row in second] == ["LEGACY-M"]
 
     connection = sqlite3.connect(state)
     try:
         metadata = dict(connection.execute(
             "SELECT key, value FROM metadata"
         ).fetchall())
-        assert metadata["accountability_handoff_backfill_v1"] == "1"
-        assert "accountability_handoff_backfill_cursor_v1" not in metadata
+        assert metadata["accountability_handoff_backfill_v2"] == "1"
+        assert "accountability_handoff_backfill_cursor_v2" not in metadata
     finally:
         connection.close()
 
