@@ -538,15 +538,12 @@ def build_recent_qualification_funnel(
                     deterministic_binding_metrics[binding_metric] += 1
                     persisted_risk_levels = metadata.get("risk_levels")
                     if isinstance(persisted_risk_levels, Mapping):
-                        risk_level_names = persisted_risk_levels.keys()
+                        risk_level_names = list(persisted_risk_levels)
                     else:
                         risk_level_names = (
                             metadata.get("risk_levels_evaluated") or []
                         )
-                    if isinstance(
-                        risk_level_names,
-                        (list, tuple, set, type({}.keys())),
-                    ):
+                    if isinstance(risk_level_names, (list, tuple, set)):
                         for risk_level in risk_level_names:
                             label = str(risk_level or "").strip().upper()
                             if label:
