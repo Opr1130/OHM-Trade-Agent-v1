@@ -13,7 +13,7 @@ datasources:
       password: ${OPIP_GRAFANA_DB_PASSWORD}
     jsonData:
       database: ${OPIP_GRAFANA_DB_NAME:-opip}
-      sslmode: ${OPIP_GRAFANA_DB_SSLMODE:-disable}
+      sslmode: ${OPIP_GRAFANA_DB_SSLMODE:-require}
       postgresVersion: 1700
       timescaledb: false
       maxOpenConns: 10

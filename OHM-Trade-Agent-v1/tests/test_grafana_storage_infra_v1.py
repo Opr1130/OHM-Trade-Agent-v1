@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from app.opip.data_platform.archive_lifecycle import assess_segment
+from app.opip.data_platform.archive_lifecycle import assess_segment, discover_segments
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,7 +68,7 @@ def test_intelligence_cockpit_dashboard_contains_required_sections_and_variables
         "Signal Quality Evidence (recent 200)",
         "Learning Throughput (30d)",
         "Failure Eradication Signals (30d)",
-        "Latency (decision + ingest)",
+        "Latency (decision trend + current ingest lag)",
         "Per-Asset / Pair Drilldown",
     ):
         assert required in titles
@@ -123,3 +123,65 @@ def test_archive_lifecycle_is_fail_closed_for_cold_segment_until_all_evidence_ex
     complete = assess_segment(segment)
     assert complete.cleanup_eligible is True
     assert complete.blockers == []
+
+
+def test_archive_lifecycle_manifest_requires_exact_segment_name(tmp_path):
+    segment = tmp_path / "screening-20250101.jsonl.gz"
+    segment.write_bytes(b"payload")
+    import os
+
+    old = 1700000000
+    os.utime(segment, (old, old))
+    checksum = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{checksum}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    segment.with_suffix(segment.suffix + ".finalized").write_text("ok\n", encoding="utf-8")
+    segment.with_suffix(segment.suffix + ".archive.verified").write_text("ok\n", encoding="utf-8")
+    segment.with_suffix(segment.suffix + ".offhost.verified").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "manifest.env").write_text(
+        "segment=screening-20250101.jsonl.gz.extra\n",
+        encoding="utf-8",
+    )
+
+    assessed = assess_segment(segment)
+    assert assessed.manifest_recorded is False
+    assert "manifest_not_updated" in assessed.blockers
+
+
+def test_archive_lifecycle_hot_and_warm_tiers_keep_expected_compression_rules(tmp_path):
+    hot = tmp_path / "hot-segment.jsonl"
+    hot.write_bytes(b"hot")
+    warm = tmp_path / "warm-segment.jsonl"
+    warm.write_bytes(b"warm")
+
+    import os
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    os.utime(hot, (now.timestamp(), now.timestamp()))
+    warm_age = now.timestamp() - 20 * 86400
+    os.utime(warm, (warm_age, warm_age))
+
+    hot_assessed = assess_segment(hot, require_offhost=False)
+    assert hot_assessed.tier == "HOT"
+    assert hot_assessed.blockers == []
+
+    warm_assessed = assess_segment(warm, require_offhost=False)
+    assert warm_assessed.tier == "WARM"
+    assert "segment_not_finalized" in warm_assessed.blockers
+    assert "checksum_missing_or_mismatch" in warm_assessed.blockers
+    assert "manifest_not_updated" in warm_assessed.blockers
+    assert "archive_not_verified" in warm_assessed.blockers
+    assert "warm_cold_segment_must_be_compressed" in warm_assessed.blockers
+
+
+def test_archive_lifecycle_discovery_ignores_sidecar_markers(tmp_path):
+    segment = tmp_path / "segment-1.jsonl.gz"
+    segment.write_bytes(b"payload")
+    (tmp_path / "segment-1.jsonl.gz.sha256").write_text("x", encoding="utf-8")
+    (tmp_path / "segment-1.jsonl.gz.finalized").write_text("x", encoding="utf-8")
+    (tmp_path / "segment-1.jsonl.gz.archive.verified").write_text("x", encoding="utf-8")
+    (tmp_path / "segment-1.jsonl.gz.offhost.verified").write_text("x", encoding="utf-8")
+    assert discover_segments(tmp_path) == [segment]

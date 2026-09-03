@@ -168,7 +168,7 @@
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "\nSELECT now() AS time,\n       outcome AS metric,\n       sum(evaluations)::bigint AS value\nFROM market.attrition_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY outcome\n",
+          "rawSql": "\nSELECT day AS time,\n       outcome AS metric,\n       sum(evaluations)::bigint AS value\nFROM market.attrition_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY day, outcome\nORDER BY day\n",
           "editorMode": "code"
         }
       ],
@@ -371,7 +371,7 @@
     },
     {
       "id": 13,
-      "title": "Latency (decision + ingest)",
+      "title": "Latency (decision trend + current ingest lag)",
       "description": "",
       "datasource": {
         "type": "postgres",
@@ -383,21 +383,15 @@
         "x": 12,
         "y": 25
       },
-      "type": "timeseries",
+      "type": "table",
       "targets": [
         {
           "refId": "A",
-          "format": "time_series",
-          "rawSql": "\nWITH decision AS (\n  SELECT day,\n         mean_decision_latency_ms\n  FROM learning.opportunity_accountability_daily_mv\n  WHERE day > now() - interval '60 days'\n), ingest AS (\n  SELECT date_trunc('day', updated_at) AS day,\n         avg(lag_seconds) AS ingest_lag_seconds\n  FROM ops.platform_health_v\n  WHERE updated_at > now() - interval '60 days'\n  GROUP BY 1\n)\nSELECT d.day AS time,\n       d.mean_decision_latency_ms,\n       i.ingest_lag_seconds\nFROM decision d\nLEFT JOIN ingest i ON i.day = d.day\nORDER BY d.day\n",
+          "format": "table",
+          "rawSql": "\nWITH latest_decision AS (\n  SELECT day,\n         mean_decision_latency_ms,\n         decision_latency_samples\n  FROM learning.opportunity_accountability_daily_mv\n  ORDER BY day DESC\n  LIMIT 1\n), health AS (\n  SELECT coalesce(max(lag_seconds), 0)::bigint AS ingest_lag_seconds,\n         coalesce(sum(unresolved_dead_letters), 0)::bigint AS unresolved_dead_letters\n  FROM ops.platform_health_v\n)\nSELECT now() AS observed_at,\n       (SELECT day FROM latest_decision) AS latest_decision_day,\n       (SELECT mean_decision_latency_ms FROM latest_decision) AS latest_mean_decision_latency_ms,\n       (SELECT decision_latency_samples FROM latest_decision) AS latest_decision_samples,\n       (SELECT ingest_lag_seconds FROM health) AS current_ingest_lag_seconds,\n       (SELECT unresolved_dead_letters FROM health) AS unresolved_dead_letters\n",
           "editorMode": "code"
         }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      }
+      ]
     },
     {
       "id": 14,
@@ -473,7 +467,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       s.scanner_type,\n       c.direction,\n       st.gate_name,\n       st.reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version,\n       c.decision\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nLEFT JOIN market.screening s ON s.scan_id = c.scan_id AND s.instrument_id = c.instrument_id\nLEFT JOIN LATERAL (\n  SELECT gate_name, reason_code\n  FROM lifecycle.stage_transition t\n  WHERE t.candidate_id = c.candidate_id\n  ORDER BY t.occurred_at DESC\n  LIMIT 1\n) st ON true\nWHERE (${symbol:singlequote} = '__all' OR i.canonical_asset IN (${symbol:singlequote}))\n  AND (${strategy:singlequote} = '__all' OR c.strategy_version IN (${strategy:singlequote}))\n  AND (${scanner:singlequote} = '__all' OR s.scanner_type IN (${scanner:singlequote}))\n  AND (${direction:singlequote} = '__all' OR c.direction IN (${direction:singlequote}))\n  AND (${gate_reason:singlequote} = '__all' OR coalesce(st.reason_code, 'NONE') IN (${gate_reason:singlequote}))\n  AND (${model_version:singlequote} = '__all' OR coalesce(c.model_version, 'NONE') IN (${model_version:singlequote}))\n  AND (${config_version:singlequote} = '__all' OR c.config_version IN (${config_version:singlequote}))\n  AND c.decision_at BETWEEN $__timeFrom() AND $__timeTo()\nORDER BY c.decision_at DESC\nLIMIT 500\n",
+          "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       s.scanner_type,\n       c.direction,\n       st.gate_name,\n       st.reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version,\n       c.decision\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nLEFT JOIN market.screening s ON s.scan_id = c.scan_id AND s.instrument_id = c.instrument_id\nLEFT JOIN LATERAL (\n  SELECT gate_name, reason_code\n  FROM lifecycle.stage_transition t\n  WHERE t.candidate_id = c.candidate_id\n  ORDER BY t.occurred_at DESC\n  LIMIT 1\n) st ON true\nWHERE (${symbol:singlequote} = '__all' OR i.canonical_asset IN (${symbol:singlequote}))\n  AND (${strategy:singlequote} = '__all' OR c.strategy_version IN (${strategy:singlequote}))\n  AND (${scanner:singlequote} = '__all' OR coalesce(s.scanner_type, 'NONE') IN (${scanner:singlequote}))\n  AND (${direction:singlequote} = '__all' OR c.direction IN (${direction:singlequote}))\n  AND (${gate_reason:singlequote} = '__all' OR coalesce(st.reason_code, 'NONE') IN (${gate_reason:singlequote}))\n  AND (${model_version:singlequote} = '__all' OR coalesce(c.model_version, 'NONE') IN (${model_version:singlequote}))\n  AND (${config_version:singlequote} = '__all' OR coalesce(c.config_version, 'NONE') IN (${config_version:singlequote}))\n  AND c.decision_at BETWEEN $__timeFrom() AND $__timeTo()\nORDER BY c.decision_at DESC\nLIMIT 500\n",
           "editorMode": "code"
         }
       ],
@@ -526,7 +520,7 @@
           "type": "postgres",
           "uid": "opip-analytics-postgres"
         },
-        "query": "SELECT DISTINCT scanner_type AS __text, scanner_type AS __value FROM market.screening ORDER BY 1",
+        "query": "SELECT DISTINCT coalesce(scanner_type, 'NONE') AS __text, coalesce(scanner_type, 'NONE') AS __value FROM market.screening ORDER BY 1",
         "multi": true,
         "includeAll": true,
         "allValue": "__all",
@@ -582,7 +576,7 @@
           "type": "postgres",
           "uid": "opip-analytics-postgres"
         },
-        "query": "SELECT DISTINCT config_version AS __text, config_version AS __value FROM lifecycle.candidate ORDER BY 1",
+        "query": "SELECT DISTINCT coalesce(config_version, 'NONE') AS __text, coalesce(config_version, 'NONE') AS __value FROM lifecycle.candidate ORDER BY 1",
         "multi": true,
         "includeAll": true,
         "allValue": "__all",

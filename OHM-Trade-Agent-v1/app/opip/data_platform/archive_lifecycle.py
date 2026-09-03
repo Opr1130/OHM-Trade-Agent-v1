@@ -60,7 +60,12 @@ def _has_manifest_entry(manifest: Path, segment: Path) -> bool:
         return False
     token = segment.name
     for line in manifest.read_text(encoding="utf-8").splitlines():
-        if token and token in line:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().lower() not in {"segment", "segment_name", "file", "name"}:
+            continue
+        if value.strip() == token:
             return True
     return False
 
@@ -93,15 +98,16 @@ def assess_segment(
     offhost_verified = segment.with_suffix(segment.suffix + ".offhost.verified").is_file()
 
     blockers: list[str] = []
-    if not finalized:
-        blockers.append("segment_not_finalized")
-    if not checksum_verified:
-        blockers.append("checksum_missing_or_mismatch")
-    if not manifest_recorded:
-        blockers.append("manifest_not_updated")
-    if not archive_verified:
-        blockers.append("archive_not_verified")
-    if require_offhost and not offhost_verified:
+    if tier in {"WARM", "COLD"}:
+        if not finalized:
+            blockers.append("segment_not_finalized")
+        if not checksum_verified:
+            blockers.append("checksum_missing_or_mismatch")
+        if not manifest_recorded:
+            blockers.append("manifest_not_updated")
+        if not archive_verified:
+            blockers.append("archive_not_verified")
+    if tier == "COLD" and require_offhost and not offhost_verified:
         blockers.append("offhost_backup_not_verified")
     if tier in {"WARM", "COLD"} and compression not in {"gzip", "zstd"}:
         blockers.append("warm_cold_segment_must_be_compressed")
@@ -124,14 +130,21 @@ def assess_segment(
 
 
 def discover_segments(root: Path) -> list[Path]:
+    sidecar_suffixes = (
+        ".sha256",
+        ".finalized",
+        ".archive.verified",
+        ".offhost.verified",
+    )
     return sorted(
         path
         for path in root.rglob("*")
         if path.is_file()
+        and not any(path.name.endswith(suffix) for suffix in sidecar_suffixes)
         and (
-            path.name.endswith(".jsonl.gz")
-            or path.name.endswith(".jsonl.zst")
-            or path.name.endswith(".jsonl")
+            path.suffixes[-2:] == [".jsonl", ".gz"]
+            or path.suffixes[-2:] == [".jsonl", ".zst"]
+            or path.suffixes[-1:] == [".jsonl"]
         )
         and ".tmp" not in path.name
     )
