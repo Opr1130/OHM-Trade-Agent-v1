@@ -365,3 +365,39 @@ def test_invalid_updated_at_cannot_certify_empty_archive(tmp_path):
     assert selection.complete is False
     assert selection.paths == ()
     assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
+
+
+def test_overflowing_updated_at_cannot_certify_empty_archive(tmp_path):
+    """UTC normalization overflow is treated as invalid archive state."""
+    archive = _archive(tmp_path)
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": True,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": "0001-01-01T00:00:00+23:59",
+    }
+    archive.window_index_state_file.write_text(
+        json.dumps(state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    before = archive.window_index_state_file.read_bytes()
+
+    assert archive.ensure_window_index_locked() is False
+    assert archive.window_index_state_file.read_bytes() == before
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert selection.paths == ()
+    assert "ARCHIVE_WINDOW_INDEX_INVALID" in selection.warnings
