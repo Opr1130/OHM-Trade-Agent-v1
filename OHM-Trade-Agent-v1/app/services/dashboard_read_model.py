@@ -348,10 +348,13 @@ def _opportunity_accountability_snapshot(
     historical: dict[str, Any],
     scope: str,
 ) -> dict[str, Any]:
-    rows = list(historical.get("opportunity_accountability_daily") or [])
+    trend_rows = list(historical.get("opportunity_accountability_daily") or [])
+    rows = trend_rows
     if scope == "today":
         today = datetime.now(timezone.utc).date().isoformat()
-        rows = [row for row in rows if str(row.get("date")) == today]
+        rows = [row for row in trend_rows if str(row.get("date")) == today]
+    all_time = historical.get("opportunity_accountability_all_time")
+    use_all_time = scope != "today" and isinstance(all_time, dict) and bool(all_time)
     totals = {
         "directional_evaluations": 0,
         "completed_forward_outcomes": 0,
@@ -365,15 +368,24 @@ def _opportunity_accountability_snapshot(
     missed_move = 0.0
     weighted_latency = 0.0
     latency_weight = 0
-    for row in rows:
+    if use_all_time:
         for key in totals:
-            totals[key] += int(row.get(key) or 0)
-        missed_move += float(row.get("estimated_missed_move_pct_sum") or 0.0)
-        latency = _number(row.get("mean_decision_latency_ms"))
-        samples = int(row.get("decision_latency_samples") or 0)
-        if latency is not None and samples > 0:
-            weighted_latency += latency * samples
-            latency_weight += samples
+            totals[key] = int(all_time.get(key) or 0)
+        missed_move = float(all_time.get("estimated_missed_move_pct_sum") or 0.0)
+        latency = _number(all_time.get("mean_decision_latency_ms"))
+        latency_weight = int(all_time.get("decision_latency_samples") or 0)
+        if latency is not None and latency_weight > 0:
+            weighted_latency = latency * latency_weight
+    else:
+        for row in rows:
+            for key in totals:
+                totals[key] += int(row.get(key) or 0)
+            missed_move += float(row.get("estimated_missed_move_pct_sum") or 0.0)
+            latency = _number(row.get("mean_decision_latency_ms"))
+            samples = int(row.get("decision_latency_samples") or 0)
+            if latency is not None and samples > 0:
+                weighted_latency += latency * samples
+                latency_weight += samples
     denominator = totals["captured_winners"] + totals["executable_false_negatives"]
     return {
         "status": (
@@ -395,7 +407,7 @@ def _opportunity_accountability_snapshot(
         "trend": rows,
         "source": (
             "POSTGRESQL"
-            if historical.get("available") and rows
+            if historical.get("available") and (rows or use_all_time)
             else "AWAITING_ACCOUNTABILITY_READ_MODEL"
         ),
         "measurement_only": True,
