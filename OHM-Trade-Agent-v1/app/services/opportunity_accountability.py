@@ -1735,20 +1735,12 @@ def build_incremental_from_outcomes(
         if key in selected_scan_symbols:
             funnel.append(row)
 
-    signal_ids = {
-        str(row.get("signal_id") or "")
-        for row in funnel
-        if str(row.get("signal_id") or "")
-    }
+    # Paper admission/outcome evidence is reconciled below through the
+    # durable offset-backed event state. Do not rescan the append-only
+    # intelligence ledger for each bounded outcome batch; signal_index joins
+    # allow events that arrive before or after accountability rows to revise
+    # the append-only ledger at-least-once.
     intelligence: list[dict[str, Any]] = []
-    if signal_ids and intelligence_event_path.exists():
-        for row in _iter_jsonl_sources(intelligence_event_path):
-            if (
-                str(row.get("signal_id") or "") in signal_ids
-                and str(row.get("event_type") or "").upper()
-                in {"PAPER_ADMISSION", "PAPER_OUTCOME"}
-            ):
-                intelligence.append(row)
 
     synthetic_snapshots = [
         {
