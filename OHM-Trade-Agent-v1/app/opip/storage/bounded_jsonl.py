@@ -536,6 +536,99 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
 
+    def _cached_window_index_valid_locked(
+        self,
+        *,
+        state: Mapping[str, Any],
+        manifest_signature: str,
+    ) -> bool:
+        """Verify cached index files and canonical segments before reuse."""
+        try:
+            if self._verified_manifest_signature_locked() != manifest_signature:
+                return False
+        except (OSError, RuntimeError):
+            return False
+
+        coverage_start = str(state.get("coverage_start_day") or "") or None
+        coverage_through = str(state.get("coverage_through_day") or "") or None
+        raw_digests = state.get("shard_sha256")
+        digest_map = raw_digests if isinstance(raw_digests, dict) else {}
+        try:
+            expected_count = int(state.get("coverage_day_count") or 0)
+        except (TypeError, ValueError):
+            return False
+
+        if coverage_start and coverage_through:
+            try:
+                expected_days = self._window_day_keys(
+                    datetime.fromisoformat(coverage_start).replace(
+                        tzinfo=timezone.utc
+                    ),
+                    datetime.fromisoformat(coverage_through).replace(
+                        tzinfo=timezone.utc
+                    ),
+                )
+            except ValueError:
+                return False
+            if (
+                expected_count != len(expected_days)
+                or set(digest_map) != set(expected_days)
+            ):
+                return False
+        elif expected_count == 0 and not digest_map:
+            expected_days = ()
+        else:
+            return False
+
+        verified_segments: set[str] = set()
+        for day in expected_days:
+            shard = self.window_index_dir / f"{day}.json"
+            expected_digest = str(digest_map.get(day) or "")
+            if len(expected_digest) != 64:
+                return False
+            try:
+                if sha256_file(shard) != expected_digest:
+                    return False
+                raw = json.loads(shard.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
+            if (
+                not isinstance(raw, dict)
+                or raw.get("schema_version") != 1
+                or str(raw.get("day") or "") != day
+            ):
+                return False
+            segments = raw.get("segments")
+            if not isinstance(segments, dict):
+                return False
+            for segment_sha, entry in segments.items():
+                expected_sha = str(segment_sha or "")
+                if expected_sha in verified_segments:
+                    continue
+                if not isinstance(entry, Mapping):
+                    return False
+                rel = str(entry.get("archive") or "").strip()
+                recorded_sha = str(entry.get("sha256") or "").strip()
+                if (
+                    len(expected_sha) != 64
+                    or recorded_sha != expected_sha
+                    or not rel
+                ):
+                    return False
+                candidate = (self.archive_dir / rel).resolve()
+                try:
+                    candidate.relative_to(self.archive_dir.resolve())
+                except ValueError:
+                    return False
+                try:
+                    if self._sha256_file(candidate) != expected_sha:
+                        return False
+                except OSError:
+                    return False
+                verified_segments.add(expected_sha)
+        return True
+
+
     def ensure_window_index_locked(self) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
 
@@ -578,26 +671,13 @@ class BoundedJsonlArchive:
             )
             if version_matches:
                 if not bool(state.get("complete", False)):
-                    # Cache a failed/incomplete build for this immutable
-                    # manifest version. The next manifest update changes the
-                    # version and triggers a rebuild exactly once.
-                    return False
-                coverage_start = str(state.get("coverage_start_day") or "") or None
-                coverage_through = str(state.get("coverage_through_day") or "") or None
-                raw_digests = state.get("shard_sha256")
-                digest_map = raw_digests if isinstance(raw_digests, dict) else {}
-                expected_count = int(state.get("coverage_day_count") or 0)
-                if coverage_start and coverage_through:
-                    if (
-                        expected_count > 0
-                        and len(digest_map) == expected_count
-                        and all(
-                            isinstance(digest, str) and len(digest) == 64
-                            for digest in digest_map.values()
-                        )
-                    ):
-                        return True
-                elif expected_count == 0 and not digest_map:
+                    # A failed build is repairable: do not permanently cache
+                    # incomplete state for an otherwise unchanged manifest.
+                    pass
+                elif self._cached_window_index_valid_locked(
+                    state=state,
+                    manifest_signature=manifest_signature,
+                ):
                     return True
 
         try:
@@ -644,6 +724,16 @@ class BoundedJsonlArchive:
                 continue
             days = self._verification_days(verification)
             if not days or not verification.archive or not verification.sha256:
+                complete = False
+                continue
+            candidate = (self.archive_dir / verification.archive).resolve()
+            try:
+                candidate.relative_to(self.archive_dir.resolve())
+                actual_sha = self._sha256_file(candidate)
+            except (OSError, ValueError):
+                complete = False
+                continue
+            if actual_sha != verification.sha256:
                 complete = False
                 continue
             entry = {
