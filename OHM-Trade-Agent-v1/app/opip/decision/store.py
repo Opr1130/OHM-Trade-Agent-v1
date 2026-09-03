@@ -363,7 +363,14 @@ def _append_rows(
         with registry_lock(lock):
             # One-time legacy backfill; steady state is an O(1) manifest-stat
             # check. Learning window selection never scans the lifetime archive.
-            archive.ensure_window_index_locked()
+            try:
+                archive.ensure_window_index_locked()
+            except Exception as exc:
+                logger.error(
+                    "O'Pip archive window-index maintenance failed open for %s: %s",
+                    path,
+                    type(exc).__name__,
+                )
             archive.repair_tail()
             written = archive.append_encoded_many_locked(encoded_rows)
             try:
