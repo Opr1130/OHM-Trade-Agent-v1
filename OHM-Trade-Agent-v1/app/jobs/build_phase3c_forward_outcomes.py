@@ -260,6 +260,17 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
         """
     )
     connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migration_attempt (
+            snapshot_id TEXT NOT NULL,
+            target_schema_version INTEGER NOT NULL,
+            attempted_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id, target_schema_version)
+        )
+        """
+    )
+    connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_snapshot_queue_due "
         "ON snapshot_queue(next_due_at, decision_at)"
     )
@@ -804,6 +815,33 @@ def acknowledge_accountability_outcomes(
     return deleted
 
 
+def _record_schema_migration_attempt(
+    connection: sqlite3.Connection,
+    *,
+    snapshot_id: str,
+    attempted_at: datetime,
+    reason: str,
+) -> None:
+    if not snapshot_id:
+        return
+    connection.execute(
+        """
+        INSERT INTO schema_migration_attempt(
+            snapshot_id, target_schema_version, attempted_at, reason
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(snapshot_id, target_schema_version) DO UPDATE SET
+            attempted_at = excluded.attempted_at,
+            reason = excluded.reason
+        """,
+        (
+            snapshot_id,
+            FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
+            attempted_at.isoformat(),
+            reason,
+        ),
+    )
+
+
 def _seed_stale_schema_snapshot_queue(
     connection: sqlite3.Connection,
     *,
@@ -823,10 +861,19 @@ def _seed_stale_schema_snapshot_queue(
         WHERE window_complete = 1
           AND label_schema_version <> ?
           AND reference_at <> ''
+          AND NOT EXISTS (
+                SELECT 1
+                FROM schema_migration_attempt attempt
+                WHERE attempt.snapshot_id = latest_outcomes.snapshot_id
+                  AND attempt.target_schema_version = ?
+          )
         ORDER BY reference_at, snapshot_id
         LIMIT 1
         """,
-        (FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,),
+        (
+            FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
+            FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
+        ),
     ).fetchone()
     if oldest is None:
         return 0
@@ -843,6 +890,12 @@ def _seed_stale_schema_snapshot_queue(
           AND label_schema_version <> ?
           AND reference_at >= ?
           AND reference_at < ?
+          AND NOT EXISTS (
+                SELECT 1
+                FROM schema_migration_attempt attempt
+                WHERE attempt.snapshot_id = latest_outcomes.snapshot_id
+                  AND attempt.target_schema_version = ?
+          )
         ORDER BY reference_at, snapshot_id
         LIMIT ?
         """,
@@ -850,6 +903,7 @@ def _seed_stale_schema_snapshot_queue(
             FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
             oldest_at.isoformat(),
             window_end.isoformat(),
+            FORWARD_OUTCOME_LABEL_SCHEMA_VERSION,
             int(limit),
         ),
     ).fetchall()
@@ -1197,22 +1251,48 @@ def build_outcomes_bounded(
             for snapshot in snapshots:
                 snapshot_id = str(snapshot.get("snapshot_id", "") or "")
                 label = labels_by_snapshot.get(snapshot_id)
+                migration_only = bool(snapshot.get("schema_migration_only"))
                 if label is None:
-                    next_due = _next_due_at(
-                        snapshot,
-                        evaluated_at=evaluated_at,
-                    )
-                    if next_due is None:
+                    if migration_only:
+                        _record_schema_migration_attempt(
+                            connection,
+                            snapshot_id=snapshot_id,
+                            attempted_at=evaluated_at,
+                            reason="NO_LABEL_FROM_RETAINED_OBSERVATIONS",
+                        )
                         connection.execute(
                             "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
                             (snapshot_id,),
                         )
                     else:
-                        connection.execute(
-                            "UPDATE snapshot_queue SET next_due_at = ? "
-                            "WHERE snapshot_id = ?",
-                            (next_due.isoformat(), snapshot_id),
+                        next_due = _next_due_at(
+                            snapshot,
+                            evaluated_at=evaluated_at,
                         )
+                        if next_due is None:
+                            connection.execute(
+                                "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                                (snapshot_id,),
+                            )
+                        else:
+                            connection.execute(
+                                "UPDATE snapshot_queue SET next_due_at = ? "
+                                "WHERE snapshot_id = ?",
+                                (next_due.isoformat(), snapshot_id),
+                            )
+                    continue
+
+                if migration_only and not bool(label.get("window_complete", False)):
+                    _record_schema_migration_attempt(
+                        connection,
+                        snapshot_id=snapshot_id,
+                        attempted_at=evaluated_at,
+                        reason="INCOMPLETE_MIGRATION_LABEL",
+                    )
+                    connection.execute(
+                        "DELETE FROM snapshot_queue WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    )
                     continue
 
                 record_id = _outcome_record_id(label)
