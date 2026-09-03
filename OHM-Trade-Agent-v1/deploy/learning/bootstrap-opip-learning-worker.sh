@@ -26,9 +26,54 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
+prune_stale_learning_storage() {
+  command -v docker >/dev/null 2>&1 || return 0
+
+  local configured_image=""
+  local configured_image_known=false
+  local target_image="opip-learning:$TARGET_SHA"
+  if [[ -r "$ENV_FILE" ]]; then
+    if configured_image="$(
+      set +u
+      # Match opip-learning-job.sh semantics so shell quotes are normalized.
+      # shellcheck disable=SC1090
+      source "$ENV_FILE"
+      printf '%s' "${OPIP_LEARNING_IMAGE:-}"
+    )" && [[ -n "$configured_image" ]]; then
+      configured_image_known=true
+    else
+      configured_image=""
+    fi
+  fi
+
+  # Build cache is fully derived. Keep only the currently configured release
+  # image plus the requested target so repeated exact-SHA prepares remain
+  # rollback-safe without accumulating every historical learning image.
+  docker builder prune -af >/dev/null 2>&1 || true
+  while IFS= read -r image; do
+    [[ "$image" == opip-learning:* ]] || continue
+    # If the configured image cannot be parsed exactly, retain tagged
+    # learning images rather than risking deletion of the active rollback image.
+    if [[ "$configured_image_known" == true \
+       && "$image" != "$configured_image" \
+       && "$image" != "$target_image" ]]; then
+      docker image rm "$image" >/dev/null 2>&1 || true
+    fi
+  done < <(
+    docker image ls --format '{{.Repository}}:{{.Tag}}' opip-learning \
+      2>/dev/null || true
+  )
+  docker image prune -f >/dev/null 2>&1 || true
+}
+
+# Existing workers can be disk-constrained before apt/git/build gets a chance
+# to run. Reclaim only derived Docker cache/stale O'Pip images up front.
+prune_stale_learning_storage
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y docker.io docker-compose-v2 git openssh-client ca-certificates
+apt-get clean
 
 systemctl enable --now docker
 install -d -o root -g root -m 0755 "$ROOT" "$DATA_ROOT/data" "$DATA_ROOT/state"
@@ -49,6 +94,7 @@ git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
 
 IMAGE="opip-learning:$TARGET_SHA"
 docker build -t "$IMAGE" "$APP_ROOT"
+docker image prune -f >/dev/null 2>&1 || true
 
 install -o root -g root -m 0755   "$APP_ROOT/deploy/learning/opip-learning-sync.sh"   /usr/local/sbin/opip-learning-sync
 install -o root -g root -m 0755   "$APP_ROOT/deploy/learning/opip-learning-job.sh"   /usr/local/sbin/opip-learning-job
