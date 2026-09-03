@@ -1825,12 +1825,25 @@ def build_incremental_from_outcomes(
         if key in selected_scan_symbols:
             funnel.append(row)
 
-    # Paper admission/outcome evidence is reconciled below through the
-    # durable offset-backed event state. Do not rescan the append-only
-    # intelligence ledger for each bounded outcome batch; signal_index joins
-    # allow events that arrive before or after accountability rows to revise
-    # the append-only ledger at-least-once.
-    intelligence: list[dict[str, Any]] = []
+    # Advance the durable paper-event cursor once, then join the latest
+    # staged evidence by the bounded signal-id set for this batch. The durable
+    # latest index preserves events that arrived before accountability rows and
+    # prevents later outcome revisions from dropping already-known paper data.
+    reconcile_paper_events(
+        intelligence_event_path=intelligence_event_path,
+        ledger_path=ledger_path,
+        state_path=state_path,
+    )
+    signal_ids = {
+        str(row.get("signal_id") or "")
+        for row in funnel
+        if str(row.get("signal_id") or "")
+    }
+    intelligence = _paper_events_for_signals(
+        signal_ids,
+        ledger_path=ledger_path,
+        state_path=state_path,
+    )
 
     synthetic_snapshots = [
         {
