@@ -39,7 +39,7 @@ def main() -> None:
     acknowledged = 0
     accountability_error: Exception | None = None
     try:
-        summary = build_incremental_from_outcomes(outcomes)
+        summary = build_incremental_from_outcomes(outcomes, replica_mode=True)
         resolved = resolved_accountability_outcomes(outcomes)
         acknowledged = acknowledge_accountability_outcomes(resolved)
     except Exception as exc:
