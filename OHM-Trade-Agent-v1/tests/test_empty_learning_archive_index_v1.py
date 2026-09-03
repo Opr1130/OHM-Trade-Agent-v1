@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
@@ -58,3 +59,83 @@ def test_real_archive_segment_without_manifest_remains_fail_closed(tmp_path):
     )
     assert selection.complete is False
     assert "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in selection.warnings
+
+
+def test_prior_manifest_index_state_without_manifest_remains_fail_closed(tmp_path):
+    archive = _archive(tmp_path)
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    prior_state = {
+        "schema_version": 1,
+        "manifest_present": True,
+        "manifest_size": 123,
+        "manifest_mtime_ns": 456,
+        "manifest_sha256": "a" * 64,
+        "complete": True,
+        "coverage_start_day": "2026-09-01",
+        "coverage_through_day": "2026-09-02",
+        "coverage_day_count": 2,
+        "shard_sha256": {"2026-09-01": "b" * 64, "2026-09-02": "c" * 64},
+        "updated_at_utc": NOW.isoformat(),
+    }
+    archive.window_index_state_file.write_text(
+        json.dumps(prior_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    before = archive.window_index_state_file.read_bytes()
+
+    assert archive.ensure_window_index_locked() is False
+    assert archive.window_index_state_file.read_bytes() == before
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_MANIFEST_UNAVAILABLE" in selection.warnings
+
+
+def test_manifest_signature_without_manifest_remains_fail_closed(tmp_path):
+    archive = _archive(tmp_path)
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    archive.manifest_signature_file.write_text(
+        f'{"d" * 64}  {archive.manifest_file.name}\n',
+        encoding="utf-8",
+    )
+
+    assert archive.ensure_window_index_locked() is False
+    assert not archive.window_index_state_file.exists()
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is False
+    assert "ARCHIVE_WINDOW_INDEX_UNAVAILABLE" in selection.warnings
+
+
+def test_incomplete_zero_coverage_state_is_not_reclassified_as_empty(tmp_path):
+    archive = _archive(tmp_path)
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    prior_state = {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": False,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": NOW.isoformat(),
+    }
+    archive.window_index_state_file.write_text(
+        json.dumps(prior_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    before = archive.window_index_state_file.read_bytes()
+
+    assert archive.ensure_window_index_locked() is False
+    assert archive.window_index_state_file.read_bytes() == before
