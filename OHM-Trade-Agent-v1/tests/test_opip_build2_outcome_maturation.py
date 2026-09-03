@@ -740,6 +740,145 @@ def test_completed_v1_outcome_requeues_for_new_12h_horizon(tmp_path):
     ) == []
 
 
+def test_due_snapshot_batch_never_mixes_live_and_schema_migration(tmp_path):
+    state = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(state)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE snapshot_queue (
+                snapshot_id TEXT PRIMARY KEY,
+                decision_at TEXT NOT NULL,
+                next_due_at TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        live = {
+            **_snapshot("LIVE-S1", "LIVE-E1"),
+            "decision_at_utc": BASE.isoformat(),
+        }
+        migration = {
+            **_snapshot("OLD-S1", "OLD-E1"),
+            "decision_at_utc": (
+                BASE - timedelta(days=365)
+            ).isoformat(),
+            "schema_migration_only": True,
+        }
+        for row, queue_time in (
+            (live, BASE),
+            (migration, BASE + timedelta(minutes=1)),
+        ):
+            connection.execute(
+                """
+                INSERT INTO snapshot_queue(
+                    snapshot_id, decision_at, next_due_at, row_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    row["snapshot_id"],
+                    queue_time.isoformat(),
+                    BASE.isoformat(),
+                    json.dumps(row, sort_keys=True),
+                ),
+            )
+        connection.commit()
+
+        first = outcomes_job._due_snapshot_batch(
+            connection,
+            now=BASE + timedelta(minutes=2),
+            limit=500,
+        )
+        assert [row["snapshot_id"] for row in first] == ["LIVE-S1"]
+
+        connection.execute(
+            "DELETE FROM snapshot_queue WHERE snapshot_id = 'LIVE-S1'"
+        )
+        connection.commit()
+        second = outcomes_job._due_snapshot_batch(
+            connection,
+            now=BASE + timedelta(minutes=2),
+            limit=500,
+        )
+        assert [row["snapshot_id"] for row in second] == ["OLD-S1"]
+    finally:
+        connection.close()
+
+
+def test_stale_schema_seed_is_reference_time_local(tmp_path):
+    state = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(state)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE latest_outcomes (
+                snapshot_id TEXT PRIMARY KEY,
+                outcome_record_id TEXT NOT NULL,
+                outcome_revision INTEGER NOT NULL,
+                window_complete INTEGER NOT NULL,
+                reference_at TEXT NOT NULL,
+                label_schema_version INTEGER NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE snapshot_queue (
+                snapshot_id TEXT PRIMARY KEY,
+                decision_at TEXT NOT NULL,
+                next_due_at TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        for snapshot_id, at in (
+            ("OLD-DAY-1", BASE - timedelta(days=365)),
+            ("OLD-DAY-2", BASE - timedelta(days=360)),
+        ):
+            prior = {
+                **_snapshot(snapshot_id, f"E-{snapshot_id}"),
+                "reference_at": at.isoformat(),
+                "decision_at_utc": at.isoformat(),
+                "reference_price": 10.0,
+                "label_schema_version": 1,
+                "window_complete": True,
+            }
+            connection.execute(
+                """
+                INSERT INTO latest_outcomes(
+                    snapshot_id, outcome_record_id, outcome_revision,
+                    window_complete, reference_at, label_schema_version,
+                    row_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    f"OUT:{snapshot_id}",
+                    1,
+                    1,
+                    at.isoformat(),
+                    1,
+                    json.dumps(prior, sort_keys=True),
+                ),
+            )
+        connection.commit()
+
+        seeded = outcomes_job._seed_stale_schema_snapshot_queue(
+            connection,
+            now=BASE,
+            limit=500,
+        )
+        assert seeded == 1
+        queued = connection.execute(
+            "SELECT snapshot_id, row_json FROM snapshot_queue"
+        ).fetchall()
+        assert [row[0] for row in queued] == ["OLD-DAY-1"]
+        assert json.loads(queued[0][1])["schema_migration_only"] is True
+    finally:
+        connection.close()
+
+
 def test_completed_v1_outcome_migrates_with_snapshot_cursor_already_at_eof(
     tmp_path,
 ):
