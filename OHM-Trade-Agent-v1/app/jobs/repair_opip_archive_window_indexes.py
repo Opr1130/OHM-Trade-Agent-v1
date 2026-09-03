@@ -49,7 +49,16 @@ def main() -> None:
     )
     failed: list[str] = []
     for name, path, archive in checks:
-        if not _repair_one(path, archive):
+        try:
+            repaired = _repair_one(path, archive)
+        except Exception as exc:
+            print(
+                "O'Pip archive window-index repair failed:",
+                f"stream={name}",
+                f"error={type(exc).__name__}",
+            )
+            repaired = False
+        if not repaired:
             failed.append(name)
     if failed:
         raise RuntimeError(
