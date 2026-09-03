@@ -661,6 +661,87 @@ def test_archive_window_index_rebuilds_legacy_master_manifest(tmp_path):
     assert selection.paths == (archived,)
 
 
+
+
+def test_archive_window_index_repairs_legacy_missing_visibility_metadata(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.append_encoded_many_locked(
+        encode_row(
+            {
+                "observed_at": (
+                    NOW + timedelta(seconds=index)
+                ).isoformat(),
+                "row": index,
+            }
+        )
+        for index in range(5)
+    )
+    archived = archive.compact_locked()
+    assert archived is not None
+
+    manifest = json.loads(
+        archive.manifest_file.read_text(encoding="utf-8")
+    )
+    for row in manifest["segments"].values():
+        row.pop("first_visible_at_utc", None)
+        row.pop("last_visible_at_utc", None)
+    archive.manifest_file.write_text(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    digest = bounded_jsonl.sha256_file(archive.manifest_file)
+    archive.manifest_signature_file.write_text(
+        f"{digest}  {archive.manifest_file.name}\n",
+        encoding="utf-8",
+    )
+
+    import shutil
+    shutil.rmtree(archive.window_index_dir)
+
+    assert archive.ensure_window_index_locked() is False
+    incomplete = json.loads(
+        archive.window_index_state_file.read_text(encoding="utf-8")
+    )
+    assert incomplete["complete"] is False
+
+    assert (
+        archive.ensure_window_index_locked(
+            force_rebuild=True,
+            repair_legacy_visibility=True,
+        )
+        is True
+    )
+    repaired_manifest = json.loads(
+        archive.manifest_file.read_text(encoding="utf-8")
+    )
+    repaired_row = next(iter(repaired_manifest["segments"].values()))
+    assert repaired_row["first_visible_at_utc"]
+    assert repaired_row["last_visible_at_utc"]
+
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.warnings == ()
+    assert selection.paths == (archived,)
+
+
 def test_capacity_health_uses_measured_universe_and_preserves_reserve(
     tmp_path, monkeypatch
 ):
