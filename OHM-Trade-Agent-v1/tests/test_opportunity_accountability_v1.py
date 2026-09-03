@@ -293,15 +293,14 @@ def test_incremental_join_splits_archive_ceiling_batches(monkeypatch, tmp_path):
         },
     ]
     screening_path.write_text(
-        "".join(json.dumps(row) + "\\n" for row in screening_rows),
+        "".join(json.dumps(row) + "\n" for row in screening_rows),
         encoding="utf-8",
     )
     funnel_path.write_text(
-        "".join(json.dumps(row) + "\\n" for row in funnel_rows),
+        "".join(json.dumps(row) + "\n" for row in funnel_rows),
         encoding="utf-8",
     )
 
-    real_selector = accountability._window_archive_selection
 
     def bounded_selector(path, *, archive_dir, start, through, kind):
         if through - start > timedelta(hours=2):
