@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -252,6 +253,85 @@ def test_bounded_outcome_maturation_processes_due_queue_in_batches(tmp_path):
     )
     assert third == []
     assert len(outcomes.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_existing_outcome_state_backfills_accountability_handoff_on_upgrade(tmp_path):
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    legacy_row = {
+        **_snapshot(),
+        "reference_at": BASE.isoformat(),
+        "snapshot_id": "LEGACY-S1",
+        "outcome_record_id": "OUT:LEGACY-S1",
+        "outcome_revision": 3,
+        "window_complete": True,
+    }
+
+    connection = sqlite3.connect(state)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE latest_outcomes (
+                snapshot_id TEXT PRIMARY KEY,
+                outcome_record_id TEXT NOT NULL,
+                outcome_revision INTEGER NOT NULL,
+                window_complete INTEGER NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE snapshot_queue (
+                snapshot_id TEXT PRIMARY KEY,
+                decision_at TEXT NOT NULL,
+                next_due_at TEXT NOT NULL,
+                row_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO latest_outcomes(
+                snapshot_id,
+                outcome_record_id,
+                outcome_revision,
+                window_complete,
+                row_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                legacy_row["snapshot_id"],
+                legacy_row["outcome_record_id"],
+                legacy_row["outcome_revision"],
+                1,
+                json.dumps(legacy_row, sort_keys=True),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('output_indexed_offset', '999999')
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    pending = pending_accountability_outcomes(
+        output_path=output,
+        state_path=state,
+    )
+    assert [row["snapshot_id"] for row in pending] == ["LEGACY-S1"]
+    assert pending[0]["outcome_record_id"] == "OUT:LEGACY-S1"
 
 
 def test_bounded_outcome_handoff_replays_until_accountability_ack(tmp_path):
