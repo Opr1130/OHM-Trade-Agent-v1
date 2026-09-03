@@ -136,9 +136,20 @@ def read_historical_snapshot(
                         for row in cursor.fetchall()
                     ]
                     cursor.execute(
-                        "SELECT to_regclass('learning.opportunity_accountability_daily_mv')"
+                        """
+                        SELECT coalesce(
+                            (
+                                SELECT relispopulated
+                                FROM pg_class
+                                WHERE oid = to_regclass(
+                                    'learning.opportunity_accountability_daily_mv'
+                                )
+                            ),
+                            false
+                        )
+                        """
                     )
-                    accountability_available = cursor.fetchone()[0] is not None
+                    accountability_available = bool(cursor.fetchone()[0])
                     accountability = []
                     accountability_all_time = {}
                     if accountability_available:
