@@ -326,8 +326,7 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
             snapshot_id = raw_snapshot_id.strip()
             outcome_record_id = str(outcome_record_id or "").strip()
             last_reference = str(sort_reference_at or "")
-            if raw_snapshot_id:
-                last_snapshot_id = raw_snapshot_id
+            last_snapshot_id = raw_snapshot_id
             if not snapshot_id or not outcome_record_id:
                 continue
             try:
