@@ -441,7 +441,13 @@ class BoundedJsonlArchive:
         for day in days:
             shard = self.window_index_dir / f"{day}.json"
             expected = shard_digests.get(day)
-            if expected is None or sha256_file(shard) != expected:
+            if expected is None:
+                return False, old_start, old_through, shard_digests
+            try:
+                actual_digest = sha256_file(shard)
+            except OSError:
+                return False, old_start, old_through, shard_digests
+            if actual_digest != expected:
                 return False, old_start, old_through, shard_digests
             try:
                 raw = json.loads(shard.read_text(encoding="utf-8"))
