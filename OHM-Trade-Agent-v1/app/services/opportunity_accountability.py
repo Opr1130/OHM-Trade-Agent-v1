@@ -1702,11 +1702,28 @@ def _window_archive_selection(
         archive = funnel_events_archive(path)
     else:
         raise ValueError(f"unsupported accountability archive kind: {kind}")
-    return archive, archive.archive_paths_for_visible_window(
+    selection = archive.archive_paths_for_visible_window(
         start=start,
         through=through,
         max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
     )
+    replica_repair_enabled = (
+        os.getenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if (
+        replica_repair_enabled
+        and not selection.complete
+        and selection.warnings == ("ARCHIVE_WINDOW_INDEX_INCOMPLETE",)
+    ):
+        rebuilt = archive.rebuild_window_index_from_verified_manifest_locked()
+        if rebuilt:
+            selection = archive.archive_paths_for_visible_window(
+                start=start,
+                through=through,
+                max_segments=ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW,
+            )
+    return archive, selection
 
 
 def _iter_windowed_jsonl_sources(
