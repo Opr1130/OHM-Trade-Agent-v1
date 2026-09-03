@@ -48,6 +48,56 @@ def _resign_manifest(archive: BoundedJsonlArchive) -> None:
     )
 
 
+
+
+def test_derived_only_archive_directory_remains_complete_without_manifest(
+    tmp_path,
+):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+
+    assert archive.ensure_window_index_locked() is True
+    assert archive.window_index_dir.exists()
+    assert archive.manifest_file.exists() is False
+
+    # The first maintenance pass creates only derived index state. A second
+    # pass must not misclassify that derived directory as archived evidence.
+    assert archive.ensure_window_index_locked() is True
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == ()
+
+
+def test_real_archive_segment_without_manifest_remains_fail_closed(tmp_path):
+    hot = tmp_path / "screening_evaluations.jsonl"
+    archive = BoundedJsonlArchive(
+        data_file=hot,
+        archive_dir=tmp_path / "screening_evaluations_archive",
+        max_bytes=100_000,
+        keep_lines=2,
+        archive_prefix="screening_evaluations",
+        parse_line=parse_json_object_line,
+        visible_at=lambda row: datetime.fromisoformat(row["observed_at"]),
+    )
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    (archive.archive_dir / "screening_evaluations-orphan.jsonl.gz").write_bytes(
+        b"orphan"
+    )
+
+    assert archive.ensure_window_index_locked() is False
+
 def test_repair_window_index_backfills_legacy_visibility_metadata(tmp_path):
     archive = _archive(tmp_path)
     manifest = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
