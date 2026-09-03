@@ -374,10 +374,9 @@ class BoundedJsonlArchive:
         or stale. Steady-state window selection never loads the master manifest.
         """
         if not self.manifest_file.exists():
-            self._write_window_index_state_locked(
-                complete=not self.archive_dir.exists()
-            )
-            return False
+            complete = not self.archive_dir.exists()
+            self._write_window_index_state_locked(complete=complete)
+            return complete
 
         manifest_stat = self.manifest_file.stat()
         if self.window_index_state_file.exists():
@@ -543,7 +542,12 @@ class BoundedJsonlArchive:
     def update_manifest_locked(self, verification: ArchiveVerification) -> None:
         # Backfill legacy segments once before mutating the master manifest.
         # The source writer lock held by callers makes the rebuild deterministic.
-        self.ensure_window_index_locked()
+        manifest_existed = self.manifest_file.exists()
+        prior_complete = (
+            self.ensure_window_index_locked()
+            if manifest_existed
+            else True
+        )
         payload: dict[str, Any] = {}
         if self.manifest_file.exists():
             try:
@@ -583,7 +587,9 @@ class BoundedJsonlArchive:
             ],
         )
         indexed = self._update_window_index_verification_locked(verification)
-        self._write_window_index_state_locked(complete=indexed)
+        self._write_window_index_state_locked(
+            complete=prior_complete and indexed
+        )
 
     @staticmethod
     def _parse_manifest_time(value: Any) -> datetime | None:
