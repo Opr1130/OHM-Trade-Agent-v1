@@ -399,6 +399,8 @@ def build_recent_qualification_funnel(
         "market_intelligence_skipped",
         "deterministic_prefilter_pass",
         "deterministic_prefilter_reject",
+        "deterministic_prefilter_error",
+        "deterministic_prefilter_error",
         "chief_eligible",
         "chief_invoked",
         "chief_succeeded",
@@ -528,6 +530,8 @@ def build_recent_qualification_funnel(
                     counts["deterministic_prefilter_pass"] += 1
                 elif status == "FAIL":
                     counts["deterministic_prefilter_reject"] += 1
+                elif status == "ERROR":
+                    counts["deterministic_prefilter_error"] += 1
                 if status in {"FAIL", "ERROR"}:
                     binding_metric = str(
                         metadata.get("binding_metric") or "UNKNOWN"
@@ -673,6 +677,7 @@ def build_recent_qualification_funnel(
             },
             "deterministic_viability": {
                 "rejects": counts["deterministic_prefilter_reject"],
+                "errors": counts["deterministic_prefilter_error"],
                 "binding_metric_counts": dict(
                     deterministic_binding_metrics.most_common()
                 ),
