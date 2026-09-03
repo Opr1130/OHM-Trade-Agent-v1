@@ -536,7 +536,63 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
 
-    def ensure_window_index_locked(self) -> bool:
+    def _manifest_verification_from_row(
+        self,
+        row: Mapping[str, Any],
+    ) -> ArchiveVerification:
+        return ArchiveVerification(
+            archive=str(row.get("archive") or ""),
+            tier=str(row.get("tier") or ""),
+            sha256=str(row.get("sha256") or ""),
+            row_count=int(row.get("row_count") or 0),
+            bytes=int(row.get("bytes") or 0),
+            first_visible_at_utc=(
+                str(row.get("first_visible_at_utc"))
+                if row.get("first_visible_at_utc") is not None
+                else None
+            ),
+            last_visible_at_utc=(
+                str(row.get("last_visible_at_utc"))
+                if row.get("last_visible_at_utc") is not None
+                else None
+            ),
+        )
+
+    def _repair_legacy_manifest_verification_locked(
+        self,
+        segment_key: str,
+        row: Mapping[str, Any],
+        verification: ArchiveVerification,
+    ) -> ArchiveVerification:
+        """Re-verify one legacy segment to recover missing visibility metadata."""
+        rel = str(verification.archive or "").strip()
+        tier = str(verification.tier or "").strip()
+        expected_sha = str(verification.sha256 or segment_key).strip()
+        if not rel or not tier or not expected_sha:
+            raise RuntimeError("legacy archive manifest identity is incomplete")
+
+        candidate = (self.archive_dir / rel).resolve()
+        try:
+            candidate.relative_to(self.archive_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError("legacy archive manifest path is invalid") from exc
+
+        repaired = self.verify_archive_file(candidate, tier=tier)
+        if repaired.sha256 != expected_sha or str(segment_key) != repaired.sha256:
+            raise RuntimeError("legacy archive manifest checksum identity mismatch")
+        if verification.row_count > 0 and repaired.row_count != verification.row_count:
+            raise RuntimeError("legacy archive manifest row-count mismatch")
+        if verification.bytes > 0 and repaired.bytes != verification.bytes:
+            raise RuntimeError("legacy archive manifest byte-count mismatch")
+        return repaired
+
+
+    def ensure_window_index_locked(
+        self,
+        *,
+        force_rebuild: bool = False,
+        repair_legacy_visibility: bool = False,
+    ) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
 
         This method may scan the master manifest only when the index is absent
@@ -572,9 +628,10 @@ class BoundedJsonlArchive:
             if version_matches:
                 if not bool(state.get("complete", False)):
                     # Cache a failed/incomplete build for this immutable
-                    # manifest version. The next manifest update changes the
-                    # version and triggers a rebuild exactly once.
-                    return False
+                    # manifest version. A bounded recovery caller may force one
+                    # checksum-verified rebuild of a copied legacy archive.
+                    if not force_rebuild:
+                        return False
                 coverage_start = str(state.get("coverage_start_day") or "") or None
                 coverage_through = str(state.get("coverage_through_day") or "") or None
                 raw_digests = state.get("shard_sha256")
@@ -608,34 +665,50 @@ class BoundedJsonlArchive:
         shards: dict[str, dict[str, dict[str, Any]]] = {}
         shard_digests: dict[str, str] = {}
         complete = True
+        manifest_repaired = False
         coverage_start_day: str | None = None
         coverage_through_day: str | None = None
-        for row in segments.values():
+        for segment_key, row in list(segments.items()):
             if not isinstance(row, dict):
                 complete = False
                 continue
             try:
-                verification = ArchiveVerification(
-                    archive=str(row.get("archive") or ""),
-                    tier=str(row.get("tier") or ""),
-                    sha256=str(row.get("sha256") or ""),
-                    row_count=int(row.get("row_count") or 0),
-                    bytes=int(row.get("bytes") or 0),
-                    first_visible_at_utc=(
-                        str(row.get("first_visible_at_utc"))
-                        if row.get("first_visible_at_utc") is not None
-                        else None
-                    ),
-                    last_visible_at_utc=(
-                        str(row.get("last_visible_at_utc"))
-                        if row.get("last_visible_at_utc") is not None
-                        else None
-                    ),
-                )
+                verification = self._manifest_verification_from_row(row)
             except (TypeError, ValueError):
                 complete = False
                 continue
             days = self._verification_days(verification)
+            if (
+                not days
+                and repair_legacy_visibility
+                and verification.archive
+                and verification.sha256
+            ):
+                try:
+                    verification = self._repair_legacy_manifest_verification_locked(
+                        str(segment_key),
+                        row,
+                        verification,
+                    )
+                except (OSError, RuntimeError, ValueError, KeyError):
+                    complete = False
+                    continue
+                repaired_row = dict(row)
+                repaired_row.update(
+                    {
+                        "archive": verification.archive,
+                        "tier": verification.tier,
+                        "sha256": verification.sha256,
+                        "row_count": verification.row_count,
+                        "bytes": verification.bytes,
+                        "first_visible_at_utc": verification.first_visible_at_utc,
+                        "last_visible_at_utc": verification.last_visible_at_utc,
+                        "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                segments[str(segment_key)] = repaired_row
+                manifest_repaired = True
+                days = self._verification_days(verification)
             if not days or not verification.archive or not verification.sha256:
                 complete = False
                 continue
@@ -660,6 +733,26 @@ class BoundedJsonlArchive:
                     if coverage_through_day is None
                     else max(coverage_through_day, day)
                 )
+
+        if manifest_repaired:
+            repaired_manifest = {
+                "schema_version": 1,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+                "segments": segments,
+            }
+            write_atomic_lines(
+                self.manifest_file,
+                [
+                    json.dumps(
+                        repaired_manifest,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    + b"\n"
+                ],
+            )
+            self._write_manifest_signature_locked(sha256_file(self.manifest_file))
 
         if self.window_index_dir.exists():
             shutil.rmtree(self.window_index_dir)
