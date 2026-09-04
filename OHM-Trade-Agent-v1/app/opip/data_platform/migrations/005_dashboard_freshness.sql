@@ -1,15 +1,9 @@
 -- Canonical dashboard freshness contract.
 --
--- ops.dashboard_freshness_v is the single classification consumed by Grafana,
--- the API/dashboard read model, stale-data selection, and
--- `health --require-ready`.  The classification constants mirror
--- app/opip/data_platform/freshness.py exactly; that module is the source of
--- truth and any policy change requires a new migration plus the parity tests
--- in tests/test_opip_dashboard_freshness_v1.py.
+-- The materialized layer stores evidence only. Time-relative status and age
+-- are evaluated in ops.dashboard_freshness_v against the current clock so a
+-- stopped refresher can never leave a frozen LIVE status behind.
 
--- Required-stream policy is protected configuration: the shipper role only
--- reads it.  Synchronization runs under an administrative or maintenance role
--- through `migrations sync-required-streams`.
 CREATE TABLE IF NOT EXISTS ops.required_stream (
     stream_name text PRIMARY KEY,
     required boolean NOT NULL,
@@ -26,9 +20,6 @@ GRANT SELECT ON ops.required_stream TO opip_shipper;
 GRANT SELECT ON ops.required_stream TO opip_learning;
 GRANT SELECT ON ops.required_stream TO opip_dashboard;
 
--- Maintenance evidence recorded by the analytics maintenance wrapper.  Both
--- the shipper (no writes) and the dashboard role (read-only) are denied
--- mutation; only the maintenance/admin role records runs.
 CREATE TABLE IF NOT EXISTS ops.maintenance_run (
     maintenance_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     status text NOT NULL CHECK (status IN ('SUCCESS', 'FAILED', 'SKIPPED')),
@@ -64,21 +55,6 @@ IMMUTABLE
 AS $$
     SELECT CASE
         WHEN NOT p_policy_present THEN 'UNKNOWN_STREAM_POLICY'
-        WHEN NOT p_required THEN CASE
-            WHEN p_last_ingested_at IS NOT NULL
-                AND p_last_ingested_at <= p_now
-                AND p_now - p_last_ingested_at <= interval '86400 seconds'
-                THEN NULL
-            WHEN p_last_ingested_at IS NULL
-                AND p_source_updated_at IS NOT NULL
-                AND p_source_updated_at <= p_now
-                AND p_now - p_source_updated_at <= interval '86400 seconds'
-                THEN NULL
-            ELSE 'STALE_DATA'
-        END
-        WHEN p_last_ingested_at IS NULL THEN 'MISSING_STREAM_ROW'
-        WHEN p_requires_typed AND p_typed_watermark_at IS NULL
-            THEN 'MISSING_TYPED_PROJECTION'
         WHEN greatest(
             coalesce(p_source_updated_at, '-infinity'::timestamptz),
             coalesce(p_last_ingested_at, '-infinity'::timestamptz),
@@ -86,6 +62,16 @@ AS $$
             coalesce(p_last_polled_at, '-infinity'::timestamptz),
             coalesce(p_last_reconciled_at, '-infinity'::timestamptz)
         ) > p_now + interval '300 seconds' THEN 'INVALID_TIMESTAMPS'
+        WHEN NOT p_required THEN CASE
+            WHEN coalesce(p_last_ingested_at, p_source_updated_at) IS NOT NULL
+                AND p_now - coalesce(p_last_ingested_at, p_source_updated_at)
+                    <= interval '86400 seconds'
+                THEN NULL
+            ELSE 'STALE_DATA'
+        END
+        WHEN p_last_ingested_at IS NULL THEN 'MISSING_STREAM_ROW'
+        WHEN p_requires_typed AND p_typed_watermark_at IS NULL
+            THEN 'MISSING_TYPED_PROJECTION'
         WHEN p_reconciliation_status = 'ERROR' THEN 'RECONCILIATION_ERROR'
         WHEN p_reconciliation_status IS NULL OR p_reconciliation_status <> 'CLEAN'
             THEN 'RECONCILIATION_UNKNOWN'
@@ -103,77 +89,19 @@ AS $$
     END
 $$;
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS ops.dashboard_freshness_mv AS
-WITH maintenance_latest AS (
-    SELECT status, finished_at
-    FROM ops.maintenance_run
-    ORDER BY finished_at DESC
-    LIMIT 1
-),
-maintenance_drift AS (
-    SELECT count(*) > 0 AS drift
-    FROM ops.maintenance_run
-    WHERE policy_fingerprint IS NOT NULL
-      AND policy_fingerprint <> (
-          SELECT rs.sync_fingerprint FROM ops.required_stream rs LIMIT 1
-      )
-),
-policy_present AS (
-    SELECT count(*) > 0 AS present FROM ops.required_stream
-),
-components AS (
+CREATE MATERIALIZED VIEW ops.dashboard_freshness_mv AS
+WITH policy_components AS (
     SELECT
         policy.stream_name,
-        CASE
-            WHEN ops.freshness_reason(
-                policy.required,
-                policy.requires_typed_projection,
-                policy.threshold_seconds,
-                true,
-                checkpoint.updated_at,
-                raw_watermark.last_ingested_at,
-                typed_watermark.watermark_at,
-                checkpoint.updated_at,
-                coalesce(dead.dead_letters, 0),
-                reconcile.status,
-                reconcile.checked_at,
-                now()
-            ) IS NULL THEN 'LIVE'
-            WHEN ops.freshness_reason(
-                policy.required,
-                policy.requires_typed_projection,
-                policy.threshold_seconds,
-                true,
-                checkpoint.updated_at,
-                raw_watermark.last_ingested_at,
-                typed_watermark.watermark_at,
-                checkpoint.updated_at,
-                coalesce(dead.dead_letters, 0),
-                reconcile.status,
-                reconcile.checked_at,
-                now()
-            ) = 'STALE_DATA' THEN 'STALE'
-            ELSE 'UNAVAILABLE'
-        END AS status,
-        ops.freshness_reason(
-            policy.required,
-            policy.requires_typed_projection,
-            policy.threshold_seconds,
-            true,
-            checkpoint.updated_at,
-            raw_watermark.last_ingested_at,
-            typed_watermark.watermark_at,
-            checkpoint.updated_at,
-            coalesce(dead.dead_letters, 0),
-            reconcile.status,
-            reconcile.checked_at,
-            now()
-        ) AS reason,
-        CASE
-            WHEN policy.requires_typed_projection THEN typed_watermark.watermark_at
-            ELSE raw_watermark.last_ingested_at
-        END AS reference_at,
-        coalesce(dead.dead_letters, 0) AS unresolved_dead_letters,
+        policy.required,
+        policy.requires_typed_projection,
+        policy.threshold_seconds,
+        true AS policy_present,
+        checkpoint.updated_at AS source_updated_at,
+        raw_watermark.last_ingested_at,
+        typed_watermark.watermark_at AS typed_watermark_at,
+        checkpoint.updated_at AS last_polled_at,
+        coalesce(dead.dead_letters, 0)::bigint AS unresolved_dead_letters,
         reconcile.status AS last_reconciliation_status,
         reconcile.checked_at AS last_reconciled_at
     FROM ops.required_stream policy
@@ -212,114 +140,163 @@ components AS (
         ORDER BY item.checked_at DESC
         LIMIT 1
     ) reconcile ON true
-    UNION ALL
+),
+unknown_names AS (
+    SELECT stream_name FROM ops.ingest_checkpoint
+    UNION
+    SELECT stream_name FROM raw.ingested_event
+    EXCEPT
+    SELECT stream_name FROM ops.required_stream
+),
+unknown_components AS (
     SELECT
-        checkpoint.stream_name,
-        CASE
-            WHEN ops.freshness_reason(
-                false, false, 86400, false,
-                checkpoint.updated_at, NULL, NULL, checkpoint.updated_at,
-                0, NULL, NULL, now()
-            ) IS NULL THEN 'LIVE'
-            ELSE 'UNAVAILABLE'
-        END AS status,
-        'UNKNOWN_STREAM_POLICY'::text AS reason,
-        checkpoint.updated_at AS reference_at,
+        unknown.stream_name,
+        false AS required,
+        false AS requires_typed_projection,
+        86400::integer AS threshold_seconds,
+        false AS policy_present,
+        checkpoint.updated_at AS source_updated_at,
+        raw_watermark.last_ingested_at,
+        NULL::timestamptz AS typed_watermark_at,
+        checkpoint.updated_at AS last_polled_at,
         0::bigint AS unresolved_dead_letters,
         NULL::text AS last_reconciliation_status,
         NULL::timestamptz AS last_reconciled_at
-    FROM ops.ingest_checkpoint checkpoint
-    WHERE NOT EXISTS (
-        SELECT 1 FROM ops.required_stream policy
-        WHERE policy.stream_name = checkpoint.stream_name
-    )
-    UNION ALL
+    FROM unknown_names unknown
+    LEFT JOIN ops.ingest_checkpoint checkpoint
+        ON checkpoint.stream_name = unknown.stream_name
+    LEFT JOIN LATERAL (
+        SELECT max(item.ingested_at) AS last_ingested_at
+        FROM raw.ingested_event item
+        WHERE item.stream_name = unknown.stream_name
+    ) raw_watermark ON true
+)
+SELECT *, now() AS snapshot_refreshed_at FROM policy_components
+UNION ALL
+SELECT *, now() AS snapshot_refreshed_at FROM unknown_components
+WITH NO DATA;
+
+CREATE UNIQUE INDEX dashboard_freshness_mv_stream_idx
+    ON ops.dashboard_freshness_mv (stream_name);
+
+CREATE OR REPLACE VIEW ops.dashboard_freshness_v AS
+WITH evaluated AS (
     SELECT
-        '__maintenance__'::text,
+        evidence.*,
+        reason_eval.reason,
         CASE
-            WHEN NOT (SELECT present FROM policy_present)
+            WHEN reason_eval.reason IS NULL THEN 'LIVE'
+            WHEN reason_eval.reason = 'STALE_DATA' THEN 'STALE'
+            ELSE 'UNAVAILABLE'
+        END AS status,
+        CASE
+            WHEN evidence.requires_typed_projection
+                THEN evidence.typed_watermark_at
+            WHEN evidence.required
+                THEN evidence.last_ingested_at
+            ELSE coalesce(evidence.last_ingested_at, evidence.source_updated_at)
+        END AS reference_at
+    FROM ops.dashboard_freshness_mv evidence
+    CROSS JOIN LATERAL (
+        SELECT ops.freshness_reason(
+            evidence.required,
+            evidence.requires_typed_projection,
+            evidence.threshold_seconds,
+            evidence.policy_present,
+            evidence.source_updated_at,
+            evidence.last_ingested_at,
+            evidence.typed_watermark_at,
+            evidence.last_polled_at,
+            evidence.unresolved_dead_letters,
+            evidence.last_reconciliation_status,
+            evidence.last_reconciled_at,
+            now()
+        ) AS reason
+    ) reason_eval
+),
+maintenance_latest AS (
+    SELECT status, finished_at, policy_fingerprint
+    FROM ops.maintenance_run
+    ORDER BY finished_at DESC, maintenance_id DESC
+    LIMIT 1
+),
+policy_meta AS (
+    SELECT
+        count(*) > 0 AS present,
+        count(DISTINCT sync_fingerprint) = 1 AS uniform_fingerprint,
+        max(sync_fingerprint) AS current_fingerprint
+    FROM ops.required_stream
+),
+maintenance_eval AS (
+    SELECT
+        CASE
+            WHEN NOT meta.present THEN 'UNAVAILABLE'
+            WHEN NOT meta.uniform_fingerprint THEN 'UNAVAILABLE'
+            WHEN latest.status IS NULL THEN 'UNAVAILABLE'
+            WHEN latest.policy_fingerprint IS DISTINCT FROM meta.current_fingerprint
                 THEN 'UNAVAILABLE'
-            WHEN (SELECT drift FROM maintenance_drift)
+            WHEN latest.status <> 'SUCCESS' THEN 'UNAVAILABLE'
+            WHEN latest.finished_at > now() + interval '300 seconds'
                 THEN 'UNAVAILABLE'
-            WHEN (SELECT status FROM maintenance_latest) IS NULL
-                THEN 'UNAVAILABLE'
-            WHEN (SELECT status FROM maintenance_latest) <> 'SUCCESS'
-                THEN 'UNAVAILABLE'
-            WHEN (SELECT finished_at FROM maintenance_latest)
-                > now() + interval '300 seconds'
-                THEN 'UNAVAILABLE'
-            WHEN now() - (SELECT finished_at FROM maintenance_latest)
-                > interval '3600 seconds'
+            WHEN now() - latest.finished_at > interval '3600 seconds'
                 THEN 'UNAVAILABLE'
             ELSE 'LIVE'
         END AS status,
         CASE
-            WHEN NOT (SELECT present FROM policy_present)
-                THEN 'MISSING_POLICY'
-            WHEN (SELECT drift FROM maintenance_drift)
+            WHEN NOT meta.present THEN 'MISSING_POLICY'
+            WHEN NOT meta.uniform_fingerprint THEN 'CONFIGURATION_DRIFT'
+            WHEN latest.status IS NULL THEN 'MAINTENANCE_NEVER_RAN'
+            WHEN latest.policy_fingerprint IS DISTINCT FROM meta.current_fingerprint
                 THEN 'CONFIGURATION_DRIFT'
-            WHEN (SELECT status FROM maintenance_latest) IS NULL
-                THEN 'MAINTENANCE_NEVER_RAN'
-            WHEN (SELECT status FROM maintenance_latest) <> 'SUCCESS'
-                THEN 'MAINTENANCE_FAILED'
-            WHEN (SELECT finished_at FROM maintenance_latest)
-                > now() + interval '300 seconds'
+            WHEN latest.status <> 'SUCCESS' THEN 'MAINTENANCE_FAILED'
+            WHEN latest.finished_at > now() + interval '300 seconds'
                 THEN 'INVALID_TIMESTAMPS'
-            WHEN now() - (SELECT finished_at FROM maintenance_latest)
-                > interval '3600 seconds'
+            WHEN now() - latest.finished_at > interval '3600 seconds'
                 THEN 'MAINTENANCE_STALE'
             ELSE NULL
         END AS reason,
-        (SELECT finished_at FROM maintenance_latest) AS reference_at,
-        0::bigint AS unresolved_dead_letters,
-        NULL::text AS last_reconciliation_status,
-        NULL::timestamptz AS last_reconciled_at
-),
-freshness_snapshot AS (
-    SELECT
-        stream_name,
-        status,
-        reason,
-        reference_at,
-        unresolved_dead_letters,
-        last_reconciliation_status,
-        last_reconciled_at,
-        CASE
-            WHEN reference_at IS NULL OR reference_at > now() THEN NULL
-            ELSE extract(epoch FROM (now() - reference_at))::bigint
-        END AS age_seconds
-    FROM components
+        latest.finished_at AS reference_at
+    FROM policy_meta meta
+    LEFT JOIN maintenance_latest latest ON true
 )
 SELECT
     stream_name,
+    required,
     status,
     reason,
     reference_at,
     unresolved_dead_letters,
     last_reconciliation_status,
     last_reconciled_at,
-    age_seconds
-FROM freshness_snapshot
-WITH NO DATA;
-
-CREATE UNIQUE INDEX IF NOT EXISTS dashboard_freshness_mv_stream_idx
-    ON ops.dashboard_freshness_mv (stream_name);
-
-CREATE OR REPLACE VIEW ops.dashboard_freshness_v AS
+    CASE
+        WHEN reference_at IS NULL THEN NULL
+        ELSE greatest(0, extract(epoch FROM (now() - reference_at)))::bigint
+    END AS age_seconds,
+    snapshot_refreshed_at
+FROM evaluated
+UNION ALL
 SELECT
-    stream_name,
+    '__maintenance__'::text,
+    true,
     status,
     reason,
     reference_at,
-    unresolved_dead_letters,
-    last_reconciliation_status,
-    last_reconciled_at,
-    age_seconds
-FROM ops.dashboard_freshness_mv;
+    0::bigint,
+    NULL::text,
+    NULL::timestamptz,
+    CASE
+        WHEN reference_at IS NULL THEN NULL
+        ELSE greatest(0, extract(epoch FROM (now() - reference_at)))::bigint
+    END,
+    NULL::timestamptz
+FROM maintenance_eval;
 
 GRANT SELECT ON ops.dashboard_freshness_mv TO opip_dashboard;
 GRANT SELECT ON ops.dashboard_freshness_mv TO opip_shipper;
 GRANT SELECT ON ops.dashboard_freshness_mv TO opip_learning;
+GRANT SELECT ON ops.dashboard_freshness_v TO opip_dashboard;
+GRANT SELECT ON ops.dashboard_freshness_v TO opip_shipper;
+GRANT SELECT ON ops.dashboard_freshness_v TO opip_learning;
 
 CREATE OR REPLACE VIEW ops.platform_health_v AS
 SELECT
@@ -337,7 +314,8 @@ SELECT
     freshness.last_reconciliation_status,
     freshness.last_reconciled_at,
     freshness.status AS freshness_status,
-    freshness.reason AS freshness_reason
+    freshness.reason AS freshness_reason,
+    freshness.required
 FROM ops.dashboard_freshness_v freshness
 LEFT JOIN ops.ingest_checkpoint checkpoint
     ON checkpoint.stream_name = freshness.stream_name
