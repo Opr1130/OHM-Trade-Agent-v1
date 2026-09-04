@@ -211,11 +211,11 @@ evaluated AS (
             ELSE 'UNAVAILABLE'
         END AS status,
         CASE
+            WHEN NOT watermarks.required
+                THEN coalesce(watermarks.last_ingested_at, watermarks.source_updated_at)
             WHEN watermarks.requires_typed_projection
                 THEN watermarks.typed_watermark_at
-            WHEN watermarks.required
-                THEN watermarks.last_ingested_at
-            ELSE coalesce(watermarks.last_ingested_at, watermarks.source_updated_at)
+            ELSE watermarks.last_ingested_at
         END AS reference_at
     FROM current_watermarks watermarks
     CROSS JOIN LATERAL (
