@@ -190,7 +190,9 @@ validate_promotion_evidence() {
 }
 
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-# Both services share the same immutable image tag; build once to avoid a\n# concurrent BuildKit export race on the identical tag.\ndocker compose -f "$COMPOSE" build opip-shipper
+# Both services share the same immutable image tag; build once to avoid a
+# concurrent BuildKit export race on the identical tag.
+docker compose -f "$COMPOSE" build opip-shipper
 docker compose -f "$COMPOSE" up -d opip-postgres
 wait_for_postgres
 

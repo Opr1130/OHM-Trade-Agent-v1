@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -418,7 +419,36 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "restore_epoch > now_epoch" in bootstrap
     assert "rollback_epoch > now_epoch" in bootstrap
     assert "restore drill must validate the attested PostgreSQL dump" in bootstrap
-    assert 'docker compose -f "$COMPOSE" build opip-shipper' in bootstrap
+    assert re.search(
+        r'^docker compose -f "\\$COMPOSE" build opip-shipper    assert 'build opip-shipper opip-data-admin' not in bootstrap
+    assert "explicit empty-stage rollback evidence is required before backfill" in bootstrap
+    assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" not in bootstrap
+    assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" not in bootstrap
+    assert "OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" not in bootstrap
+    assert "offhost-verified" in runner
+    assert "rollback-verified" in runner
+    maintenance = (
+        ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
+    ).read_text()
+    assert "/etc/opip-data-platform.env" in maintenance
+    assert "/var/lock/opip-learning-plane.lock" in maintenance
+    assert "DEPLOYED_SHA" in maintenance
+    restore = (ROOT / "deploy/analytics/opip-postgres-restore-drill.sh").read_text()
+    assert "pg_restore --exit-on-error" in restore
+    assert "opip_restore_drill_" in restore
+    assert "ops.schema_version" in restore
+    assert "dropdb --if-exists --force" in restore
+
+
+def test_config_json_round_trip_has_no_authority_fields():
+    payload = json.dumps(DataPlatformConfig().__dict__, default=str)
+    assert "kraken" not in payload.lower()
+    assert "telegram" not in payload.lower()
+    assert "leverage" not in payload.lower()
+,
+        bootstrap,
+        flags=re.MULTILINE,
+    )
     assert 'build opip-shipper opip-data-admin' not in bootstrap
     assert "explicit empty-stage rollback evidence is required before backfill" in bootstrap
     assert "OPIP_OFFHOST_BACKUP_VERIFIED_AT_UTC" not in bootstrap
