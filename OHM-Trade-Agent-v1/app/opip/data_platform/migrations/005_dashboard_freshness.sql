@@ -268,22 +268,13 @@ policy_meta AS (
         count(DISTINCT sync_fingerprint) = 1 AS uniform_fingerprint,
         max(sync_fingerprint) AS current_fingerprint,
         -- Complete policy validation: every expected stream must exist with correct attributes
-        bool_and(
-            validation.actual_required IS NOT NULL
-            AND validation.actual_required = validation.expected_required
-            AND validation.actual_typed = validation.expected_typed
-            AND validation.actual_threshold IS NOT DISTINCT FROM validation.expected_threshold
-        ) AS policy_complete
-    FROM ops.required_stream
-    CROSS JOIN LATERAL (
-        SELECT bool_and(
+        (SELECT bool_and(
             actual_required IS NOT NULL
             AND actual_required = expected_required
             AND actual_typed = expected_typed
             AND actual_threshold IS NOT DISTINCT FROM expected_threshold
-        ) AS policy_complete
-        FROM policy_validation
-    ) validation
+        ) FROM policy_validation) AS policy_complete
+    FROM ops.required_stream
 ),
 maintenance_eval AS (
     SELECT
