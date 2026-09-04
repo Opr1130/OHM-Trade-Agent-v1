@@ -231,18 +231,66 @@ maintenance_latest AS (
     ORDER BY finished_at DESC, maintenance_id DESC
     LIMIT 1
 ),
+expected_policy AS (
+    -- Canonical required-stream policy embedded from STREAM_SPECS.
+    -- This must match the synchronized policy exactly or maintenance fails closed.
+    VALUES
+        ('screening_evaluations', true, true, NULL),
+        ('funnel_events', true, true, NULL),
+        ('scan_summaries', true, false, NULL),
+        ('intelligence_events', true, true, NULL),
+        ('full_market_observations', true, true, NULL),
+        ('p1_shadow_outbox', false, false, 86400),
+        ('p1_evidence_ledger', false, false, 86400),
+        ('paper_trade_events', false, true, 86400),
+        ('telegram_delivery_events', false, false, 86400),
+        ('decision_telemetry', false, false, 86400),
+        ('trade_quality_evidence', false, false, 86400),
+        ('candidate_trace', false, false, 86400),
+        ('opportunity_accountability', false, false, 86400)
+),
+policy_validation AS (
+    SELECT
+        expected.column1 AS stream_name,
+        expected.column2 AS expected_required,
+        expected.column3 AS expected_typed,
+        expected.column4 AS expected_threshold,
+        actual.required AS actual_required,
+        actual.requires_typed_projection AS actual_typed,
+        actual.threshold_seconds AS actual_threshold
+    FROM expected_policy expected
+    FULL OUTER JOIN ops.required_stream actual
+        ON actual.stream_name = expected.column1
+),
 policy_meta AS (
     SELECT
         count(*) > 0 AS present,
         count(DISTINCT sync_fingerprint) = 1 AS uniform_fingerprint,
-        max(sync_fingerprint) AS current_fingerprint
+        max(sync_fingerprint) AS current_fingerprint,
+        -- Complete policy validation: every expected stream must exist with correct attributes
+        bool_and(
+            validation.actual_required IS NOT NULL
+            AND validation.actual_required = validation.expected_required
+            AND validation.actual_typed = validation.expected_typed
+            AND validation.actual_threshold IS NOT DISTINCT FROM validation.expected_threshold
+        ) AS policy_complete
     FROM ops.required_stream
+    CROSS JOIN LATERAL (
+        SELECT bool_and(
+            actual_required IS NOT NULL
+            AND actual_required = expected_required
+            AND actual_typed = expected_typed
+            AND actual_threshold IS NOT DISTINCT FROM expected_threshold
+        ) AS policy_complete
+        FROM policy_validation
+    ) validation
 ),
 maintenance_eval AS (
     SELECT
         CASE
             WHEN NOT meta.present THEN 'UNAVAILABLE'
             WHEN NOT meta.uniform_fingerprint THEN 'UNAVAILABLE'
+            WHEN NOT coalesce(meta.policy_complete, false) THEN 'UNAVAILABLE'
             WHEN latest.status IS NULL THEN 'UNAVAILABLE'
             WHEN latest.policy_fingerprint IS DISTINCT FROM meta.current_fingerprint
                 THEN 'UNAVAILABLE'
@@ -260,6 +308,7 @@ maintenance_eval AS (
         CASE
             WHEN NOT meta.present THEN 'MISSING_POLICY'
             WHEN NOT meta.uniform_fingerprint THEN 'CONFIGURATION_DRIFT'
+            WHEN NOT coalesce(meta.policy_complete, false) THEN 'CONFIGURATION_DRIFT'
             WHEN latest.status IS NULL THEN 'MAINTENANCE_NEVER_RAN'
             WHEN latest.policy_fingerprint IS DISTINCT FROM meta.current_fingerprint
                 THEN 'CONFIGURATION_DRIFT'

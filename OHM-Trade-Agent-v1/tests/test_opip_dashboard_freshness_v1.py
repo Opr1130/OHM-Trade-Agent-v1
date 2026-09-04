@@ -20,6 +20,7 @@ from app.opip.data_platform.config import DataPlatformConfig  # noqa: F401
 from app.opip.data_platform.db import connect
 from app.opip.data_platform.freshness import (
     DEFAULT_MAX_AGE_SECONDS,
+    MAINTENANCE_STALE_MAX_AGE_SECONDS,
     MaintenanceInput,
     StreamInput,
     classify_freshness,
@@ -633,7 +634,7 @@ def test_maintenance_timestamp_missing_stale_or_future(pg_connection):
     _record_maintenance(
         pg_connection,
         status="SUCCESS",
-        finished_at=_now() - timedelta(seconds=DEFAULT_MAX_AGE_SECONDS + 60),
+        finished_at=_now() - timedelta(seconds=MAINTENANCE_STALE_MAX_AGE_SECONDS + 60),
     )
     canonical = _canonical_row(pg_connection, "__maintenance__")
     assert canonical == {"status": "UNAVAILABLE", "reason": "MAINTENANCE_STALE"}
@@ -661,6 +662,36 @@ def test_missing_policy_table_content_fails_closed(pg_connection):
     pg_connection.commit()
     canonical = _canonical_row(pg_connection, "__maintenance__")
     assert canonical == {"status": "UNAVAILABLE", "reason": "MISSING_POLICY"}
+
+
+def test_deleted_required_stream_policy_row_fails_closed(pg_connection):
+    """Regression: deleting one required stream must cause CONFIGURATION_DRIFT.
+
+    The canonical SQL path must validate the complete synchronized policy contract,
+    not merely nonempty/uniform fingerprint. A reduced policy table can still have
+    one valid uniform fingerprint but cause a missing stream to vanish from
+    canonical freshness evaluation.
+    """
+    _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
+    # Verify healthy baseline
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "LIVE", "reason": None}
+    # Delete one required stream from policy
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM ops.required_stream WHERE stream_name = 'scan_summaries'"
+        )
+    pg_connection.commit()
+    _refresh_freshness(pg_connection)
+    # Maintenance must detect configuration drift
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "UNAVAILABLE", "reason": "CONFIGURATION_DRIFT"}
+    # Aggregate freshness must not be ready
+    freshness = build_freshness(pg_connection)
+    assert freshness["ready"] is False
+    assert freshness["status"] == "UNAVAILABLE"
+    assert "CONFIGURATION_DRIFT" in [p["reason"] for p in freshness["problems"]]
 
 
 def test_health_require_ready_exit_code_matches_canonical_freshness(
