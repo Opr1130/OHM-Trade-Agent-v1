@@ -161,12 +161,8 @@ def refresh_materialized_views(connection: Any) -> None:
             row = cursor.fetchone()
             if row is None:
                 continue
-            populated_views.append(
-                (schema_name, view_name, bool(row[0]))
-            )
+            populated_views.append((schema_name, view_name, bool(row[0])))
 
-    # A population-state SELECT starts an implicit transaction on the normal
-    # admin connection. PostgreSQL forbids CONCURRENTLY inside that block.
     connection.commit()
     prior_autocommit = bool(connection.autocommit)
     connection.autocommit = True
@@ -205,13 +201,7 @@ def provision_login_roles(connection: Any, passwords: dict[str, str]) -> None:
 
 
 def sync_required_streams(connection: Any) -> int:
-    """Synchronize required-stream policy under an administrative role.
-
-    ``ops.required_stream`` is protected freshness policy: the shipper and
-    dashboard roles hold no write grants, and this command connects only with
-    ``OPIP_ANALYTICS_ADMIN_DATABASE_URL``.  It never falls back to shipper
-    credentials.  Returns the number of synchronized streams.
-    """
+    """Synchronize protected required-stream policy under an administrative role."""
     snapshot = stream_policy_snapshot()
     fingerprint = policy_fingerprint()
     rows = [
@@ -289,6 +279,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("O'Pip materialized views refreshed")
         elif args.command == "sync-required-streams":
             count = sync_required_streams(connection)
+            refresh_materialized_views(connection)
             print(f"O'Pip required-stream policy synchronized: {count} streams")
         else:
             provision_login_roles(

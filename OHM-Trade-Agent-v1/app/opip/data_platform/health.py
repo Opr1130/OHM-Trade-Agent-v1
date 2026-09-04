@@ -63,26 +63,20 @@ def _canonical_stream_inputs(
     connection: Any,
     policy: dict[str, dict[str, Any]],
 ) -> list[StreamInput]:
-    """Collect per-stream evidence; never substitute ingestion for typed data.
-
-    Rows in ``ops.ingest_checkpoint`` or ``raw.ingested_event`` that have no
-    synchronized policy entry are surfaced as unknown-policy streams so
-    ungoverned producers fail closed instead of reading as healthy.
-    """
+    """Collect per-stream evidence without substituting ingestion for typed data."""
     evidence: dict[str, dict[str, Any]] = {}
-    unknown_streams: list[str] = []
+    unknown_streams: set[str] = set()
     with connection.cursor() as cursor:
         cursor.execute("SELECT stream_name, updated_at FROM ops.ingest_checkpoint")
         for name, updated_at in cursor.fetchall():
             name = str(name)
-            if name not in evidence:
-                if name in policy:
-                    evidence[name] = _blank_evidence()
-                else:
-                    unknown_streams.append(name)
-                    continue
+            if name not in policy:
+                unknown_streams.add(name)
+                continue
+            evidence.setdefault(name, _blank_evidence())
             evidence[name]["source_updated_at"] = _datetime(updated_at)
             evidence[name]["last_polled_at"] = _datetime(updated_at)
+
         cursor.execute(
             """
             SELECT stream_name, max(ingested_at)
@@ -92,13 +86,12 @@ def _canonical_stream_inputs(
         )
         for name, ingested_at in cursor.fetchall():
             name = str(name)
-            if name not in evidence:
-                if name in policy:
-                    evidence[name] = _blank_evidence()
-                else:
-                    unknown_streams.append(name)
-                    continue
+            if name not in policy:
+                unknown_streams.add(name)
+                continue
+            evidence.setdefault(name, _blank_evidence())
             evidence[name]["last_ingested_at"] = _datetime(ingested_at)
+
         cursor.execute(
             """
             SELECT stream_name, count(*)
@@ -109,12 +102,11 @@ def _canonical_stream_inputs(
         )
         for name, count in cursor.fetchall():
             name = str(name)
-            if name not in evidence:
-                if name in policy:
-                    evidence[name] = _blank_evidence()
-                else:
-                    continue
+            if name not in policy:
+                continue
+            evidence.setdefault(name, _blank_evidence())
             evidence[name]["unresolved_dead_letters"] = int(count)
+
         cursor.execute(
             """
             SELECT DISTINCT ON (stream_name) stream_name, status, checked_at
@@ -124,13 +116,12 @@ def _canonical_stream_inputs(
         )
         for name, status, checked_at in cursor.fetchall():
             name = str(name)
-            if name not in evidence:
-                if name in policy:
-                    evidence[name] = _blank_evidence()
-                else:
-                    continue
+            if name not in policy:
+                continue
+            evidence.setdefault(name, _blank_evidence())
             evidence[name]["last_reconciliation_status"] = status
             evidence[name]["last_reconciled_at"] = _datetime(checked_at)
+
         watermark_queries = dict(TYPED_WATERMARK_SQL)
         for name, stream_policy in policy.items():
             if not stream_policy["requires_typed_projection"]:
@@ -138,15 +129,15 @@ def _canonical_stream_inputs(
             evidence.setdefault(name, _blank_evidence())
             cursor.execute(watermark_queries[_kind_for(name)])
             evidence[name]["typed_watermark_at"] = _datetime(cursor.fetchone()[0])
+
     for name in policy:
         evidence.setdefault(name, _blank_evidence())
+
     inputs = [
         StreamInput(
             stream_name=name,
             required=bool(policy[name]["required"]),
-            requires_typed_projection=bool(
-                policy[name]["requires_typed_projection"]
-            ),
+            requires_typed_projection=bool(policy[name]["requires_typed_projection"]),
             threshold_seconds=policy[name]["threshold_seconds"],
             source_updated_at=row["source_updated_at"],
             last_ingested_at=row["last_ingested_at"],
@@ -174,44 +165,47 @@ def _canonical_stream_inputs(
             last_reconciled_at=None,
             policy_present=False,
         )
-        for name in unknown_streams
+        for name in sorted(unknown_streams)
     )
     return inputs
 
 
 def _maintenance_input(connection: Any) -> MaintenanceInput:
+    """Return latest maintenance evidence and compare only current fingerprints."""
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT status, finished_at
+            SELECT status, finished_at, policy_fingerprint
             FROM ops.maintenance_run
-            ORDER BY finished_at DESC
+            ORDER BY finished_at DESC, maintenance_id DESC
             LIMIT 1
             """
         )
         latest = cursor.fetchone()
         cursor.execute(
             """
-            SELECT count(*)
-            FROM ops.maintenance_run
-            WHERE policy_fingerprint IS NOT NULL
-              AND policy_fingerprint <> (
-                  SELECT sync_fingerprint FROM ops.required_stream LIMIT 1
-              )
+            SELECT count(*), count(DISTINCT sync_fingerprint), max(sync_fingerprint)
+            FROM ops.required_stream
             """
         )
-        drift = bool(int(cursor.fetchone()[0]))
-        cursor.execute("SELECT count(*) FROM ops.required_stream")
-        policy_present = bool(int(cursor.fetchone()[0]))
-    if not policy_present:
+        policy_count, fingerprint_count, current_fingerprint = cursor.fetchone()
+
+    if int(policy_count) == 0:
         return MaintenanceInput(None, None, True)
+
     if latest is None:
-        return MaintenanceInput(None, None, drift)
+        return MaintenanceInput(None, None, False)
+
+    drift = (
+        int(fingerprint_count) != 1
+        or latest[2] is None
+        or str(latest[2]) != str(current_fingerprint)
+    )
     return MaintenanceInput(str(latest[0]), _datetime(latest[1]), drift)
 
 
 def build_freshness(connection: Any) -> dict[str, Any]:
-    """Canonical freshness shared with ops.dashboard_freshness_v."""
+    """Build canonical current-time freshness from protected policy and evidence."""
     policy = stream_policy_snapshot()
     with connection.cursor() as cursor:
         cursor.execute("SELECT count(*) FROM ops.required_stream")
@@ -254,10 +248,14 @@ def build_freshness(connection: Any) -> dict[str, Any]:
 
 
 def build_health(connection, *, maximum_lag_seconds: int = 1800) -> dict:
-    freshness = build_freshness(connection)
+    """Read one transactionally consistent, read-only health snapshot."""
     with connection.transaction():
         with connection.cursor() as cursor:
             cursor.execute("SET TRANSACTION READ ONLY")
+
+        freshness = build_freshness(connection)
+
+        with connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT stream_name, lag_seconds, unresolved_dead_letters,
@@ -269,13 +267,11 @@ def build_health(connection, *, maximum_lag_seconds: int = 1800) -> dict:
             streams = [
                 {
                     "stream_name": row[0],
-                    "lag_seconds": (int(row[1]) if row[1] is not None else None),
+                    "lag_seconds": int(row[1]) if row[1] is not None else None,
                     "unresolved_dead_letters": int(row[2]),
                     "last_reconciliation_status": row[3],
                     "last_reconciled_at": (
-                        row[4].isoformat()
-                        if isinstance(row[4], datetime)
-                        else None
+                        row[4].isoformat() if isinstance(row[4], datetime) else None
                     ),
                     "rows_ingested": int(row[5]) if row[5] is not None else 0,
                     "freshness_status": row[6],
@@ -287,6 +283,7 @@ def build_health(connection, *, maximum_lag_seconds: int = 1800) -> dict:
             database_bytes = int(cursor.fetchone()[0])
             cursor.execute("SELECT max(version) FROM ops.schema_version")
             schema_version = int(cursor.fetchone()[0] or 0)
+
     return {
         "status": "OK" if freshness["ready"] else "DEGRADED",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -332,9 +329,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         health = build_health(connection)
     print(json.dumps(health, sort_keys=True, default=str))
     if args.require_ready:
-        # Rollout readiness is the canonical freshness contract: any missing
-        # stream, reconciliation failure, stale typed projection, maintenance
-        # failure, configuration drift, or invalid timestamp fails closed.
         return 0 if health["freshness"]["ready"] else 2
     return 0 if health["status"] == "OK" else 2
 

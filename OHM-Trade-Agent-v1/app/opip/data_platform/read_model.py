@@ -16,20 +16,12 @@ def _stream_health_is_stale(
     *,
     maximum_lag_seconds: int = 1800,
 ) -> bool:
-    """Compatibility helper: freshness is canonical in ops.dashboard_freshness_v.
-
-    Rows consumed here carry the canonical per-stream ``freshness_status``;
-    stale-data selection is any required stream that is not LIVE.  Legacy rows
-    without the canonical status fall back to the closed lag/reconciliation
-    checks so older callers never read a false LIVE.
-    """
+    """Return whether required canonical stream health is stale or unavailable."""
     required = [item for item in health if item.get("required")]
     if any("freshness_status" in item for item in health):
         if not required:
             return True
-        return any(
-            str(item.get("freshness_status")) != "LIVE" for item in required
-        )
+        return any(str(item.get("freshness_status")) != "LIVE" for item in required)
     present = {str(item["stream_name"]) for item in health}
     maximum_lag = max(
         (
@@ -83,7 +75,7 @@ def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
 def read_historical_snapshot(
     config: DataPlatformConfig | None = None,
 ) -> dict[str, Any]:
-    """Read only small analytics views, failing soft to local dashboard data."""
+    """Read small analytics views, failing soft to local dashboard data."""
     settings = config or DataPlatformConfig.from_env()
     dsn = settings.dashboard_dsn()
     if not dsn:
@@ -255,7 +247,7 @@ def read_historical_snapshot(
                                rows_ingested, source_size, updated_at,
                                lag_seconds, unresolved_dead_letters,
                                last_reconciliation_status, last_reconciled_at,
-                               freshness_status, freshness_reason
+                               freshness_status, freshness_reason, required
                         FROM ops.platform_health_v ORDER BY stream_name
                         """
                     )
@@ -264,22 +256,16 @@ def read_historical_snapshot(
                             "stream_name": row[0],
                             "source_file": row[1],
                             "byte_offset": int(row[2]) if row[2] is not None else 0,
-                            "rows_ingested": (
-                                int(row[3]) if row[3] is not None else 0
-                            ),
-                            "source_size": (
-                                int(row[4]) if row[4] is not None else 0
-                            ),
+                            "rows_ingested": int(row[3]) if row[3] is not None else 0,
+                            "source_size": int(row[4]) if row[4] is not None else 0,
                             "updated_at": _iso(row[5]),
-                            "lag_seconds": (
-                                int(row[6]) if row[6] is not None else None
-                            ),
+                            "lag_seconds": int(row[6]) if row[6] is not None else None,
                             "unresolved_dead_letters": int(row[7]),
                             "last_reconciliation_status": row[8],
                             "last_reconciled_at": _iso(row[9]),
                             "freshness_status": row[10],
                             "freshness_reason": row[11],
-                            "required": True,
+                            "required": bool(row[12]),
                         }
                         for row in cursor.fetchall()
                     ]
@@ -291,6 +277,7 @@ def read_historical_snapshot(
                         """
                     )
                     maintenance_row = cursor.fetchone()
+
         canonical_problems = [
             {"stream": row["stream_name"], "reason": row["freshness_reason"]}
             for row in health
@@ -300,17 +287,42 @@ def read_historical_snapshot(
             canonical_problems.append(
                 {"stream": "__maintenance__", "reason": maintenance_row[1]}
             )
-        canonical_status = (
-            "UNAVAILABLE"
-            if any(row["freshness_status"] == "UNAVAILABLE" for row in health)
-            or (
-                maintenance_row is not None
-                and maintenance_row[0] == "UNAVAILABLE"
+
+        blocking_health = [
+            row
+            for row in health
+            if row["required"] or row["freshness_reason"] == "UNKNOWN_STREAM_POLICY"
+        ]
+
+        if not health or maintenance_row is None:
+            canonical_status = "UNAVAILABLE"
+        elif any(row["freshness_status"] == "UNAVAILABLE" for row in blocking_health) or maintenance_row[0] == "UNAVAILABLE":
+            canonical_status = "UNAVAILABLE"
+        elif any(row["freshness_status"] == "STALE" for row in blocking_health) or maintenance_row[0] == "STALE":
+            canonical_status = "STALE"
+        else:
+            canonical_status = "LIVE"
+
+        component_status = {
+            row["stream_name"]: row["freshness_status"] for row in health
+        }
+        if maintenance_row is not None:
+            component_status["__maintenance__"] = maintenance_row[0]
+
+        if canonical_status == "LIVE":
+            canonical_reason = "OK"
+        else:
+            canonical_reason = next(
+                (
+                    problem["reason"]
+                    for problem in canonical_problems
+                    if component_status.get(problem["stream"]) == canonical_status
+                ),
+                canonical_problems[0]["reason"]
+                if canonical_problems
+                else "READ_UNAVAILABLE",
             )
-            else "STALE"
-            if any(row["freshness_status"] == "STALE" for row in health)
-            else "LIVE"
-        )
+
         stale = canonical_status != "LIVE"
         return {
             "enabled": True,
@@ -322,11 +334,7 @@ def read_historical_snapshot(
             "freshness": {
                 "status": canonical_status,
                 "ready": canonical_status == "LIVE",
-                "reason": (
-                    canonical_problems[0]["reason"]
-                    if canonical_problems
-                    else "OK"
-                ),
+                "reason": canonical_reason,
                 "problems": canonical_problems,
             },
             "intelligence_daily": list(reversed(intelligence)),
