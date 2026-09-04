@@ -270,6 +270,7 @@ def _seed_all_healthy(connection) -> None:
     for stream in stream_policy_snapshot():
         _seed_healthy_stream(connection, stream)
     _record_maintenance(connection, status="SUCCESS", finished_at=_now())
+    connection.commit()
 
 
 def _canonical_row(connection, stream: str) -> dict:
@@ -669,6 +670,7 @@ def test_health_require_ready_exit_code_matches_canonical_freshness(
     monkeypatch.delenv("OPIP_DATA_PLATFORM_READS_ENABLED", raising=False)
     # Fully healthy -> ready, exit 0
     _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
     assert health_main(["--require-ready"]) == 0
     capsys.readouterr()
     # Break one required stream -> nonzero exit
@@ -693,6 +695,7 @@ def test_require_ready_does_not_depend_on_dashboard_reads_flag(
     monkeypatch.setenv("OPIP_ANALYTICS_DATABASE_URL", DSN)
     monkeypatch.delenv("OPIP_DATA_PLATFORM_READS_ENABLED", raising=False)
     _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
     assert health_main(["--require-ready"]) == 0
     capsys.readouterr()
 

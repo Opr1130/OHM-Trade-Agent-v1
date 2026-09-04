@@ -19,6 +19,11 @@ DEFAULT_MAX_AGE_SECONDS = 3600
 NON_REQUIRED_MAX_AGE_SECONDS = 86400
 MAX_FUTURE_SKEW_SECONDS = 300
 
+# Maintenance-specific thresholds compatible with hourly scheduling + jitter
+MAINTENANCE_LIVE_MAX_AGE_SECONDS = 4500  # 75 minutes
+MAINTENANCE_DEGRADED_MAX_AGE_SECONDS = 5400  # 90 minutes
+MAINTENANCE_STALE_MAX_AGE_SECONDS = 7200  # 2 hours
+
 STATUSES = ("LIVE", "DEGRADED", "STALE", "UNAVAILABLE")
 MAINTENANCE_COMPONENT = "__maintenance__"
 
@@ -58,6 +63,9 @@ def policy_fingerprint() -> str:
         "default_max_age_seconds": DEFAULT_MAX_AGE_SECONDS,
         "non_required_max_age_seconds": NON_REQUIRED_MAX_AGE_SECONDS,
         "max_future_skew_seconds": MAX_FUTURE_SKEW_SECONDS,
+        "maintenance_live_max_age_seconds": MAINTENANCE_LIVE_MAX_AGE_SECONDS,
+        "maintenance_degraded_max_age_seconds": MAINTENANCE_DEGRADED_MAX_AGE_SECONDS,
+        "maintenance_stale_max_age_seconds": MAINTENANCE_STALE_MAX_AGE_SECONDS,
         "maintenance_statuses": ("SUCCESS",),
         "streams": stream_policy_snapshot(),
     }
@@ -231,11 +239,11 @@ def classify_maintenance(
 
     age = _age_seconds(finished, now)
     assert age is not None
-    if age > DEFAULT_MAX_AGE_SECONDS:
+    if age > MAINTENANCE_STALE_MAX_AGE_SECONDS:
         return MaintenanceAssessment("UNAVAILABLE", "MAINTENANCE_STALE", False)
-    if age > DEGRADED_MAX_AGE_SECONDS:
+    if age > MAINTENANCE_DEGRADED_MAX_AGE_SECONDS:
         return MaintenanceAssessment("STALE", "MAINTENANCE_STALE", False)
-    if age > LIVE_MAX_AGE_SECONDS:
+    if age > MAINTENANCE_LIVE_MAX_AGE_SECONDS:
         return MaintenanceAssessment("DEGRADED", "MAINTENANCE_DELAYED", False)
     return MaintenanceAssessment("LIVE", None, False)
 
@@ -288,11 +296,19 @@ def classify_freshness(
     if overall == "LIVE":
         reason = "OK"
     else:
+        # Aggregate reason must come from a gating component only
+        gating_stream_names = {
+            item.stream_name for item in stream_items
+            if item.required or not item.policy_present
+        }
+        gating_stream_names.add(MAINTENANCE_COMPONENT)
+
         reason = next(
             (
                 problem["reason"]
                 for problem in problems
-                if component_status.get(problem["stream"]) == overall
+                if problem["stream"] in gating_stream_names
+                and component_status.get(problem["stream"]) == overall
             ),
             problems[0]["reason"] if problems else "READ_UNAVAILABLE",
         )

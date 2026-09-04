@@ -170,6 +170,35 @@ def _canonical_stream_inputs(
     return inputs
 
 
+def _validate_policy_sync(connection: Any) -> tuple[bool, int, int]:
+    """Validate complete required-stream policy synchronization."""
+    expected_policy = stream_policy_snapshot()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT stream_name, required, requires_typed_projection, threshold_seconds
+            FROM ops.required_stream
+            """
+        )
+        db_rows = {row[0]: row[1:] for row in cursor.fetchall()}
+
+    if len(db_rows) != len(expected_policy):
+        return False, len(expected_policy), len(db_rows)
+
+    for stream_name, expected in expected_policy.items():
+        if stream_name not in db_rows:
+            return False, len(expected_policy), len(db_rows)
+        db_required, db_typed, db_threshold = db_rows[stream_name]
+        if (
+            db_required != expected["required"]
+            or db_typed != expected["requires_typed_projection"]
+            or db_threshold != expected["threshold_seconds"]
+        ):
+            return False, len(expected_policy), len(db_rows)
+
+    return True, len(expected_policy), len(db_rows)
+
+
 def _maintenance_input(connection: Any) -> MaintenanceInput:
     """Return latest maintenance evidence and compare only current fingerprints."""
     with connection.cursor() as cursor:
@@ -191,6 +220,11 @@ def _maintenance_input(connection: Any) -> MaintenanceInput:
         policy_count, fingerprint_count, current_fingerprint = cursor.fetchone()
 
     if int(policy_count) == 0:
+        return MaintenanceInput(None, None, True)
+
+    # Validate complete policy synchronization
+    policy_valid, expected_count, actual_count = _validate_policy_sync(connection)
+    if not policy_valid:
         return MaintenanceInput(None, None, True)
 
     if latest is None:

@@ -89,7 +89,7 @@ AS $$
     END
 $$;
 
-CREATE MATERIALIZED VIEW ops.dashboard_freshness_mv AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS ops.dashboard_freshness_mv AS
 WITH policy_components AS (
     SELECT
         policy.stream_name,
@@ -97,36 +97,10 @@ WITH policy_components AS (
         policy.requires_typed_projection,
         policy.threshold_seconds,
         true AS policy_present,
-        checkpoint.updated_at AS source_updated_at,
-        raw_watermark.last_ingested_at,
-        typed_watermark.watermark_at AS typed_watermark_at,
-        checkpoint.updated_at AS last_polled_at,
         coalesce(dead.dead_letters, 0)::bigint AS unresolved_dead_letters,
         reconcile.status AS last_reconciliation_status,
         reconcile.checked_at AS last_reconciled_at
     FROM ops.required_stream policy
-    LEFT JOIN ops.ingest_checkpoint checkpoint
-        ON checkpoint.stream_name = policy.stream_name
-    LEFT JOIN LATERAL (
-        SELECT max(item.ingested_at) AS last_ingested_at
-        FROM raw.ingested_event item
-        WHERE item.stream_name = policy.stream_name
-    ) raw_watermark ON true
-    LEFT JOIN LATERAL (
-        SELECT CASE policy.stream_name
-            WHEN 'screening_evaluations'
-                THEN (SELECT max(observed_at) FROM market.screening)
-            WHEN 'funnel_events'
-                THEN (SELECT max(occurred_at) FROM lifecycle.stage_transition)
-            WHEN 'intelligence_events'
-                THEN (SELECT max(observed_at) FROM signal.intelligence_event)
-            WHEN 'full_market_observations'
-                THEN (SELECT max(observed_at) FROM market.observation)
-            WHEN 'paper_trade_events'
-                THEN (SELECT max(occurred_at) FROM paper.trade_event)
-            ELSE NULL
-        END AS watermark_at
-    ) typed_watermark ON true
     LEFT JOIN LATERAL (
         SELECT count(*) AS dead_letters
         FROM ops.dead_letter item
@@ -144,7 +118,14 @@ WITH policy_components AS (
 unknown_names AS (
     SELECT stream_name FROM ops.ingest_checkpoint
     UNION
-    SELECT stream_name FROM raw.ingested_event
+    SELECT DISTINCT stream_name FROM raw.ingested_event
+    WHERE observed_at >= now() - interval '7 days'
+    UNION
+    SELECT DISTINCT stream_name FROM ops.dead_letter
+    WHERE first_seen_at >= now() - interval '7 days'
+    UNION
+    SELECT DISTINCT stream_name FROM ops.reconciliation_run
+    WHERE checked_at >= now() - interval '7 days'
     EXCEPT
     SELECT stream_name FROM ops.required_stream
 ),
@@ -155,21 +136,10 @@ unknown_components AS (
         false AS requires_typed_projection,
         86400::integer AS threshold_seconds,
         false AS policy_present,
-        checkpoint.updated_at AS source_updated_at,
-        raw_watermark.last_ingested_at,
-        NULL::timestamptz AS typed_watermark_at,
-        checkpoint.updated_at AS last_polled_at,
         0::bigint AS unresolved_dead_letters,
         NULL::text AS last_reconciliation_status,
         NULL::timestamptz AS last_reconciled_at
     FROM unknown_names unknown
-    LEFT JOIN ops.ingest_checkpoint checkpoint
-        ON checkpoint.stream_name = unknown.stream_name
-    LEFT JOIN LATERAL (
-        SELECT max(item.ingested_at) AS last_ingested_at
-        FROM raw.ingested_event item
-        WHERE item.stream_name = unknown.stream_name
-    ) raw_watermark ON true
 )
 SELECT *, now() AS snapshot_refreshed_at FROM policy_components
 UNION ALL
@@ -180,9 +150,48 @@ CREATE UNIQUE INDEX dashboard_freshness_mv_stream_idx
     ON ops.dashboard_freshness_mv (stream_name);
 
 CREATE OR REPLACE VIEW ops.dashboard_freshness_v AS
-WITH evaluated AS (
+WITH current_watermarks AS (
     SELECT
-        evidence.*,
+        evidence.stream_name,
+        evidence.required,
+        evidence.requires_typed_projection,
+        evidence.threshold_seconds,
+        evidence.policy_present,
+        checkpoint.updated_at AS source_updated_at,
+        raw_watermark.last_ingested_at,
+        typed_watermark.watermark_at AS typed_watermark_at,
+        checkpoint.updated_at AS last_polled_at,
+        evidence.unresolved_dead_letters,
+        evidence.last_reconciliation_status,
+        evidence.last_reconciled_at,
+        evidence.snapshot_refreshed_at
+    FROM ops.dashboard_freshness_mv evidence
+    LEFT JOIN ops.ingest_checkpoint checkpoint
+        ON checkpoint.stream_name = evidence.stream_name
+    LEFT JOIN LATERAL (
+        SELECT max(item.ingested_at) AS last_ingested_at
+        FROM raw.ingested_event item
+        WHERE item.stream_name = evidence.stream_name
+    ) raw_watermark ON true
+    LEFT JOIN LATERAL (
+        SELECT CASE evidence.stream_name
+            WHEN 'screening_evaluations'
+                THEN (SELECT max(observed_at) FROM market.screening)
+            WHEN 'funnel_events'
+                THEN (SELECT max(occurred_at) FROM lifecycle.stage_transition)
+            WHEN 'intelligence_events'
+                THEN (SELECT max(observed_at) FROM signal.intelligence_event)
+            WHEN 'full_market_observations'
+                THEN (SELECT max(observed_at) FROM market.observation)
+            WHEN 'paper_trade_events'
+                THEN (SELECT max(occurred_at) FROM paper.trade_event)
+            ELSE NULL
+        END AS watermark_at
+    ) typed_watermark ON true
+),
+evaluated AS (
+    SELECT
+        watermarks.*,
         reason_eval.reason,
         CASE
             WHEN reason_eval.reason IS NULL THEN 'LIVE'
@@ -191,26 +200,26 @@ WITH evaluated AS (
             ELSE 'UNAVAILABLE'
         END AS status,
         CASE
-            WHEN evidence.requires_typed_projection
-                THEN evidence.typed_watermark_at
-            WHEN evidence.required
-                THEN evidence.last_ingested_at
-            ELSE coalesce(evidence.last_ingested_at, evidence.source_updated_at)
+            WHEN watermarks.requires_typed_projection
+                THEN watermarks.typed_watermark_at
+            WHEN watermarks.required
+                THEN watermarks.last_ingested_at
+            ELSE coalesce(watermarks.last_ingested_at, watermarks.source_updated_at)
         END AS reference_at
-    FROM ops.dashboard_freshness_mv evidence
+    FROM current_watermarks watermarks
     CROSS JOIN LATERAL (
         SELECT ops.freshness_reason(
-            evidence.required,
-            evidence.requires_typed_projection,
-            evidence.threshold_seconds,
-            evidence.policy_present,
-            evidence.source_updated_at,
-            evidence.last_ingested_at,
-            evidence.typed_watermark_at,
-            evidence.last_polled_at,
-            evidence.unresolved_dead_letters,
-            evidence.last_reconciliation_status,
-            evidence.last_reconciled_at,
+            watermarks.required,
+            watermarks.requires_typed_projection,
+            watermarks.threshold_seconds,
+            watermarks.policy_present,
+            watermarks.source_updated_at,
+            watermarks.last_ingested_at,
+            watermarks.typed_watermark_at,
+            watermarks.last_polled_at,
+            watermarks.unresolved_dead_letters,
+            watermarks.last_reconciliation_status,
+            watermarks.last_reconciled_at,
             now()
         ) AS reason
     ) reason_eval
@@ -239,11 +248,11 @@ maintenance_eval AS (
             WHEN latest.status <> 'SUCCESS' THEN 'UNAVAILABLE'
             WHEN latest.finished_at > now() + interval '300 seconds'
                 THEN 'UNAVAILABLE'
-            WHEN now() - latest.finished_at > interval '3600 seconds'
+            WHEN now() - latest.finished_at > interval '7200 seconds'
                 THEN 'UNAVAILABLE'
-            WHEN now() - latest.finished_at > interval '300 seconds'
+            WHEN now() - latest.finished_at > interval '5400 seconds'
                 THEN 'STALE'
-            WHEN now() - latest.finished_at > interval '120 seconds'
+            WHEN now() - latest.finished_at > interval '4500 seconds'
                 THEN 'DEGRADED'
             ELSE 'LIVE'
         END AS status,
@@ -256,11 +265,11 @@ maintenance_eval AS (
             WHEN latest.status <> 'SUCCESS' THEN 'MAINTENANCE_FAILED'
             WHEN latest.finished_at > now() + interval '300 seconds'
                 THEN 'INVALID_TIMESTAMPS'
-            WHEN now() - latest.finished_at > interval '3600 seconds'
+            WHEN now() - latest.finished_at > interval '7200 seconds'
                 THEN 'MAINTENANCE_STALE'
-            WHEN now() - latest.finished_at > interval '300 seconds'
+            WHEN now() - latest.finished_at > interval '5400 seconds'
                 THEN 'MAINTENANCE_STALE'
-            WHEN now() - latest.finished_at > interval '120 seconds'
+            WHEN now() - latest.finished_at > interval '4500 seconds'
                 THEN 'MAINTENANCE_DELAYED'
             ELSE NULL
         END AS reason,

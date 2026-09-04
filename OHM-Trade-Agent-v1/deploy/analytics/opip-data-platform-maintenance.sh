@@ -28,4 +28,6 @@ docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
   python -m app.opip.data_platform.reconcile
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
+  python -m app.opip.data_platform.migrations refresh-freshness
+docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
   python -m app.opip.data_platform.health
