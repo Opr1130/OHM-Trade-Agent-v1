@@ -11,11 +11,15 @@ from typing import Any, Iterable
 from app.opip.data_platform.streams import STREAM_SPECS
 
 
+LIVE_MAX_AGE_SECONDS = 120
+DEGRADED_MAX_AGE_SECONDS = 300
+# Beyond this extreme age, required evidence is treated as unsafe/unavailable.
+# Kept as the compatibility constant consumed by existing regression coverage.
 DEFAULT_MAX_AGE_SECONDS = 3600
 NON_REQUIRED_MAX_AGE_SECONDS = 86400
 MAX_FUTURE_SKEW_SECONDS = 300
 
-STATUSES = ("LIVE", "STALE", "UNAVAILABLE")
+STATUSES = ("LIVE", "DEGRADED", "STALE", "UNAVAILABLE")
 MAINTENANCE_COMPONENT = "__maintenance__"
 
 TYPED_WATERMARK_SQL = (
@@ -28,7 +32,7 @@ TYPED_WATERMARK_SQL = (
 
 
 def stream_threshold_seconds(spec: Any) -> int | None:
-    """Return the per-stream threshold; required streams fail closed at default age."""
+    """Return the per-stream extreme-age threshold used for optional streams."""
     if spec.required:
         return None
     return NON_REQUIRED_MAX_AGE_SECONDS
@@ -49,6 +53,8 @@ def stream_policy_snapshot() -> dict[str, dict[str, Any]]:
 def policy_fingerprint() -> str:
     """Return a stable hash of the expected freshness policy."""
     snapshot = {
+        "live_max_age_seconds": LIVE_MAX_AGE_SECONDS,
+        "degraded_max_age_seconds": DEGRADED_MAX_AGE_SECONDS,
         "default_max_age_seconds": DEFAULT_MAX_AGE_SECONDS,
         "non_required_max_age_seconds": NON_REQUIRED_MAX_AGE_SECONDS,
         "max_future_skew_seconds": MAX_FUTURE_SKEW_SECONDS,
@@ -142,7 +148,11 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
         return StreamAssessment("UNAVAILABLE", "UNKNOWN_STREAM_POLICY", None, None, ())
 
     if invalid:
-        reference = stamps["typed_watermark_at"] or stamps["last_ingested_at"] or stamps["source_updated_at"]
+        reference = (
+            stamps["typed_watermark_at"]
+            or stamps["last_ingested_at"]
+            or stamps["source_updated_at"]
+        )
         return StreamAssessment(
             "UNAVAILABLE",
             "INVALID_TIMESTAMPS",
@@ -154,14 +164,20 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
     if not item.required:
         reference = stamps["last_ingested_at"] or stamps["source_updated_at"]
         age = _age_seconds(reference, now)
-        if reference is not None and age is not None and age <= NON_REQUIRED_MAX_AGE_SECONDS:
+        if (
+            reference is not None
+            and age is not None
+            and age <= NON_REQUIRED_MAX_AGE_SECONDS
+        ):
             return StreamAssessment("LIVE", None, reference, age, ())
         return StreamAssessment("STALE", "STALE_DATA", reference, age, ())
 
     if stamps["last_ingested_at"] is None:
         return StreamAssessment("UNAVAILABLE", "MISSING_STREAM_ROW", None, None, ())
     if item.requires_typed_projection and stamps["typed_watermark_at"] is None:
-        return StreamAssessment("UNAVAILABLE", "MISSING_TYPED_PROJECTION", None, None, ())
+        return StreamAssessment(
+            "UNAVAILABLE", "MISSING_TYPED_PROJECTION", None, None, ()
+        )
 
     status = item.last_reconciliation_status
     if status == "ERROR":
@@ -179,21 +195,25 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
     age = _age_seconds(reference, now)
 
     if item.unresolved_dead_letters > 0:
-        return StreamAssessment("UNAVAILABLE", "UNRESOLVED_DEAD_LETTERS", reference, age, ())
+        return StreamAssessment(
+            "UNAVAILABLE", "UNRESOLVED_DEAD_LETTERS", reference, age, ()
+        )
 
     assert reference is not None and age is not None
     if age > DEFAULT_MAX_AGE_SECONDS:
-        threshold = item.threshold_seconds
-        if threshold is None or age > threshold:
-            return StreamAssessment(
-                "UNAVAILABLE", "PER_STREAM_THRESHOLD_EXCEEDED", reference, age, ()
-            )
+        return StreamAssessment(
+            "UNAVAILABLE", "PER_STREAM_THRESHOLD_EXCEEDED", reference, age, ()
+        )
+    if age > DEGRADED_MAX_AGE_SECONDS:
         return StreamAssessment("STALE", "STALE_DATA", reference, age, ())
-
+    if age > LIVE_MAX_AGE_SECONDS:
+        return StreamAssessment("DEGRADED", "DATA_DELAYED", reference, age, ())
     return StreamAssessment("LIVE", None, reference, age, ())
 
 
-def classify_maintenance(item: MaintenanceInput, *, now: datetime) -> MaintenanceAssessment:
+def classify_maintenance(
+    item: MaintenanceInput, *, now: datetime
+) -> MaintenanceAssessment:
     """Classify the latest maintenance evidence."""
     if item.configuration_drift:
         return MaintenanceAssessment("UNAVAILABLE", "CONFIGURATION_DRIFT", True)
@@ -208,8 +228,15 @@ def classify_maintenance(item: MaintenanceInput, *, now: datetime) -> Maintenanc
         return MaintenanceAssessment("UNAVAILABLE", "MAINTENANCE_FAILED", False)
     if finished is None:
         return MaintenanceAssessment("UNAVAILABLE", "INVALID_TIMESTAMPS", False)
-    if _age_seconds(finished, now) > DEFAULT_MAX_AGE_SECONDS:
+
+    age = _age_seconds(finished, now)
+    assert age is not None
+    if age > DEFAULT_MAX_AGE_SECONDS:
         return MaintenanceAssessment("UNAVAILABLE", "MAINTENANCE_STALE", False)
+    if age > DEGRADED_MAX_AGE_SECONDS:
+        return MaintenanceAssessment("STALE", "MAINTENANCE_STALE", False)
+    if age > LIVE_MAX_AGE_SECONDS:
+        return MaintenanceAssessment("DEGRADED", "MAINTENANCE_DELAYED", False)
     return MaintenanceAssessment("LIVE", None, False)
 
 
@@ -248,10 +275,14 @@ def classify_freshness(
         overall = "UNAVAILABLE"
     elif "STALE" in gating_statuses:
         overall = "STALE"
+    elif "DEGRADED" in gating_statuses:
+        overall = "DEGRADED"
     else:
         overall = "LIVE"
 
-    component_status = {name: assessment.status for name, assessment in per_stream.items()}
+    component_status = {
+        name: assessment.status for name, assessment in per_stream.items()
+    }
     component_status[MAINTENANCE_COMPONENT] = maintenance_result.status
 
     if overall == "LIVE":

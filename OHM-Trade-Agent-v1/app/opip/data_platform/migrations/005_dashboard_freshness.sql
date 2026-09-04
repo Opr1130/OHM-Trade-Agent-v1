@@ -3,6 +3,8 @@
 -- The materialized layer stores evidence only. Time-relative status and age
 -- are evaluated in ops.dashboard_freshness_v against the current clock so a
 -- stopped refresher can never leave a frozen LIVE status behind.
+-- Required data contract: LIVE <=120s, DEGRADED <=300s, STALE <=3600s,
+-- UNAVAILABLE beyond that extreme age or whenever freshness is unsafe to infer.
 
 CREATE TABLE IF NOT EXISTS ops.required_stream (
     stream_name text PRIMARY KEY,
@@ -78,13 +80,11 @@ AS $$
         WHEN p_last_reconciled_at IS NULL THEN 'MISSING_RECONCILIATION'
         WHEN p_unresolved_dead_letters > 0 THEN 'UNRESOLVED_DEAD_LETTERS'
         WHEN p_now - coalesce(p_typed_watermark_at, p_last_ingested_at)
-            > interval '3600 seconds' THEN CASE
-                WHEN p_threshold_seconds IS NULL
-                    OR p_now - coalesce(p_typed_watermark_at, p_last_ingested_at)
-                        > make_interval(secs => p_threshold_seconds)
-                    THEN 'PER_STREAM_THRESHOLD_EXCEEDED'
-                ELSE 'STALE_DATA'
-            END
+            > interval '3600 seconds' THEN 'PER_STREAM_THRESHOLD_EXCEEDED'
+        WHEN p_now - coalesce(p_typed_watermark_at, p_last_ingested_at)
+            > interval '300 seconds' THEN 'STALE_DATA'
+        WHEN p_now - coalesce(p_typed_watermark_at, p_last_ingested_at)
+            > interval '120 seconds' THEN 'DATA_DELAYED'
         ELSE NULL
     END
 $$;
@@ -186,6 +186,7 @@ WITH evaluated AS (
         reason_eval.reason,
         CASE
             WHEN reason_eval.reason IS NULL THEN 'LIVE'
+            WHEN reason_eval.reason = 'DATA_DELAYED' THEN 'DEGRADED'
             WHEN reason_eval.reason = 'STALE_DATA' THEN 'STALE'
             ELSE 'UNAVAILABLE'
         END AS status,
@@ -240,6 +241,10 @@ maintenance_eval AS (
                 THEN 'UNAVAILABLE'
             WHEN now() - latest.finished_at > interval '3600 seconds'
                 THEN 'UNAVAILABLE'
+            WHEN now() - latest.finished_at > interval '300 seconds'
+                THEN 'STALE'
+            WHEN now() - latest.finished_at > interval '120 seconds'
+                THEN 'DEGRADED'
             ELSE 'LIVE'
         END AS status,
         CASE
@@ -253,6 +258,10 @@ maintenance_eval AS (
                 THEN 'INVALID_TIMESTAMPS'
             WHEN now() - latest.finished_at > interval '3600 seconds'
                 THEN 'MAINTENANCE_STALE'
+            WHEN now() - latest.finished_at > interval '300 seconds'
+                THEN 'MAINTENANCE_STALE'
+            WHEN now() - latest.finished_at > interval '120 seconds'
+                THEN 'MAINTENANCE_DELAYED'
             ELSE NULL
         END AS reason,
         latest.finished_at AS reference_at

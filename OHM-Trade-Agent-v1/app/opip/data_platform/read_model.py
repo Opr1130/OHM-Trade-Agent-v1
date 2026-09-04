@@ -296,10 +296,18 @@ def read_historical_snapshot(
 
         if not health or maintenance_row is None:
             canonical_status = "UNAVAILABLE"
-        elif any(row["freshness_status"] == "UNAVAILABLE" for row in blocking_health) or maintenance_row[0] == "UNAVAILABLE":
+        elif any(
+            row["freshness_status"] == "UNAVAILABLE" for row in blocking_health
+        ) or maintenance_row[0] == "UNAVAILABLE":
             canonical_status = "UNAVAILABLE"
-        elif any(row["freshness_status"] == "STALE" for row in blocking_health) or maintenance_row[0] == "STALE":
+        elif any(
+            row["freshness_status"] == "STALE" for row in blocking_health
+        ) or maintenance_row[0] == "STALE":
             canonical_status = "STALE"
+        elif any(
+            row["freshness_status"] == "DEGRADED" for row in blocking_health
+        ) or maintenance_row[0] == "DEGRADED":
+            canonical_status = "DEGRADED"
         else:
             canonical_status = "LIVE"
 
