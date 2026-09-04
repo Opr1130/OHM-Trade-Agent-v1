@@ -181,6 +181,31 @@ def refresh_materialized_views(connection: Any) -> None:
         connection.autocommit = prior_autocommit
 
 
+def refresh_freshness_view(connection: Any) -> None:
+    """Refresh only the dashboard freshness materialized view."""
+    from psycopg import sql
+
+    connection.commit()
+    prior_autocommit = bool(connection.autocommit)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT c.relispopulated FROM pg_class c "
+                "WHERE c.oid = to_regclass('ops.dashboard_freshness_mv')"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                concurrently = sql.SQL("CONCURRENTLY ") if bool(row[0]) else sql.SQL("")
+                cursor.execute(
+                    sql.SQL("REFRESH MATERIALIZED VIEW {}ops.dashboard_freshness_mv").format(
+                        concurrently
+                    )
+                )
+    finally:
+        connection.autocommit = prior_autocommit
+
+
 def provision_login_roles(connection: Any, passwords: dict[str, str]) -> None:
     from psycopg import sql
 
@@ -256,6 +281,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "migrate",
             "partitions",
             "refresh-views",
+            "refresh-freshness",
             "provision-roles",
             "sync-required-streams",
         ),
@@ -277,6 +303,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "refresh-views":
             refresh_materialized_views(connection)
             print("O'Pip materialized views refreshed")
+        elif args.command == "refresh-freshness":
+            refresh_freshness_view(connection)
+            print("O'Pip dashboard freshness view refreshed")
         elif args.command == "sync-required-streams":
             count = sync_required_streams(connection)
             refresh_materialized_views(connection)

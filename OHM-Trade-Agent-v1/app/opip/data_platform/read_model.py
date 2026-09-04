@@ -64,7 +64,7 @@ def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
         "opportunity_accountability_all_time": {},
         "stream_health": [],
         "freshness": {
-            "status": status,
+            "status": "UNAVAILABLE",
             "ready": False,
             "reason": "DISABLED" if status == "DISABLED" else "READ_UNAVAILABLE",
             "problems": [],

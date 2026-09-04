@@ -172,6 +172,7 @@ WITH current_watermarks AS (
         SELECT max(item.ingested_at) AS last_ingested_at
         FROM raw.ingested_event item
         WHERE item.stream_name = evidence.stream_name
+          AND item.observed_at >= now() - interval '7 days'
     ) raw_watermark ON true
     LEFT JOIN LATERAL (
         SELECT CASE evidence.stream_name

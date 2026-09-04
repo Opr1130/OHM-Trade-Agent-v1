@@ -8,6 +8,9 @@ from app.opip.data_platform.freshness import (
     DEGRADED_MAX_AGE_SECONDS,
     DEFAULT_MAX_AGE_SECONDS,
     LIVE_MAX_AGE_SECONDS,
+    MAINTENANCE_DEGRADED_MAX_AGE_SECONDS,
+    MAINTENANCE_LIVE_MAX_AGE_SECONDS,
+    MAINTENANCE_STALE_MAX_AGE_SECONDS,
     MaintenanceInput,
     StreamInput,
     classify_freshness,
@@ -92,10 +95,13 @@ def test_optional_stale_stream_does_not_gate_required_live_stream():
 @pytest.mark.parametrize(
     ("age_seconds", "status", "reason"),
     [
-        (LIVE_MAX_AGE_SECONDS - 1, "LIVE", None),
-        (LIVE_MAX_AGE_SECONDS + 1, "DEGRADED", "MAINTENANCE_DELAYED"),
-        (DEGRADED_MAX_AGE_SECONDS + 1, "STALE", "MAINTENANCE_STALE"),
-        (DEFAULT_MAX_AGE_SECONDS + 1, "UNAVAILABLE", "MAINTENANCE_STALE"),
+        (MAINTENANCE_LIVE_MAX_AGE_SECONDS - 1, "LIVE", None),
+        (MAINTENANCE_LIVE_MAX_AGE_SECONDS, "LIVE", None),
+        (MAINTENANCE_LIVE_MAX_AGE_SECONDS + 1, "DEGRADED", "MAINTENANCE_DELAYED"),
+        (MAINTENANCE_DEGRADED_MAX_AGE_SECONDS, "DEGRADED", "MAINTENANCE_DELAYED"),
+        (MAINTENANCE_DEGRADED_MAX_AGE_SECONDS + 1, "STALE", "MAINTENANCE_STALE"),
+        (MAINTENANCE_STALE_MAX_AGE_SECONDS, "STALE", "MAINTENANCE_STALE"),
+        (MAINTENANCE_STALE_MAX_AGE_SECONDS + 1, "UNAVAILABLE", "MAINTENANCE_STALE"),
     ],
 )
 def test_maintenance_threshold_contract(age_seconds, status, reason):
