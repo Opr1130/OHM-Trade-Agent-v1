@@ -317,17 +317,25 @@ def read_historical_snapshot(
         if maintenance_row is not None:
             component_status["__maintenance__"] = maintenance_row[0]
 
+        blocking_streams = {row["stream_name"] for row in blocking_health}
+        blocking_streams.add("__maintenance__")
+        blocking_problems = [
+            problem
+            for problem in canonical_problems
+            if problem["stream"] in blocking_streams
+        ]
+
         if canonical_status == "LIVE":
             canonical_reason = "OK"
         else:
             canonical_reason = next(
                 (
                     problem["reason"]
-                    for problem in canonical_problems
+                    for problem in blocking_problems
                     if component_status.get(problem["stream"]) == canonical_status
                 ),
-                canonical_problems[0]["reason"]
-                if canonical_problems
+                blocking_problems[0]["reason"]
+                if blocking_problems
                 else "READ_UNAVAILABLE",
             )
 
