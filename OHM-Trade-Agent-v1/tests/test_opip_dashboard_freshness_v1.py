@@ -694,6 +694,73 @@ def test_deleted_required_stream_policy_row_fails_closed(pg_connection):
     assert "CONFIGURATION_DRIFT" in [p["reason"] for p in freshness["problems"]]
 
 
+def test_unexpected_policy_row_fails_closed(pg_connection):
+    """Regression: an unexpected ops.required_stream row must force drift.
+
+    policy_validation uses a FULL OUTER JOIN. For an unexpected actual row the
+    expected fields are NULL, so the attribute comparisons alone can evaluate to
+    NULL and PostgreSQL bool_and ignores NULL inputs, leaving policy_complete
+    true. Requiring both expected_stream_name and actual_stream_name to be
+    present makes this fail closed.
+    """
+    _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
+    # Verify healthy baseline
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "LIVE", "reason": None}
+    # Insert an unexpected stream not present in the canonical expected policy.
+    # Give it a NULL threshold (as required streams carry) so the old bool_and
+    # attribute-comparison-only logic would have ignored it and stayed LIVE.
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO ops.required_stream(
+                stream_name, required, requires_typed_projection,
+                threshold_seconds, sync_fingerprint
+            ) VALUES ('rogue_unexpected_stream', true, false, NULL, %s)
+            """,
+            (policy_fingerprint(),),
+        )
+    pg_connection.commit()
+    _refresh_freshness(pg_connection)
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "UNAVAILABLE", "reason": "CONFIGURATION_DRIFT"}
+    # Aggregate freshness must not be ready
+    freshness = build_freshness(pg_connection)
+    assert freshness["ready"] is False
+    assert freshness["status"] == "UNAVAILABLE"
+    assert "CONFIGURATION_DRIFT" in [p["reason"] for p in freshness["problems"]]
+
+
+def test_mutated_policy_field_fails_closed(pg_connection):
+    """Regression: mutating a synchronized policy attribute must force drift.
+
+    Even when every expected stream row is present, changing a required flag,
+    typed-projection flag, or threshold must make policy_complete false so the
+    canonical maintenance component reports CONFIGURATION_DRIFT.
+    """
+    _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
+    # Verify healthy baseline
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "LIVE", "reason": None}
+    # Mutate the required flag of a required stream to false
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE ops.required_stream SET required = false "
+            "WHERE stream_name = 'scan_summaries'"
+        )
+    pg_connection.commit()
+    _refresh_freshness(pg_connection)
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "UNAVAILABLE", "reason": "CONFIGURATION_DRIFT"}
+    # Aggregate freshness must not be ready
+    freshness = build_freshness(pg_connection)
+    assert freshness["ready"] is False
+    assert freshness["status"] == "UNAVAILABLE"
+    assert "CONFIGURATION_DRIFT" in [p["reason"] for p in freshness["problems"]]
+
+
 def test_health_require_ready_exit_code_matches_canonical_freshness(
     pg_connection, monkeypatch, capsys
 ):
@@ -873,6 +940,39 @@ def test_migration_five_defines_canonical_contract():
     assert "INVALID_TIMESTAMPS" in sql
     assert "RECONCILIATION_ERROR" in sql
     assert "PER_STREAM_THRESHOLD_EXCEEDED" in sql
+
+
+def test_typed_projection_sql_case_matches_stream_specs():
+    """The SQL typed-watermark CASE must mirror STREAM_SPECS exactly.
+
+    Every stream that requires a typed projection must have a CASE branch in the
+    canonical view, and no stream that does not require a typed projection may
+    appear there. This keeps the SQL watermark mapping from silently diverging
+    from the Python STREAM_SPECS contract.
+    """
+    migration = next(
+        item for item in discover_migrations() if item.version == 5
+    )
+    sql = migration.path.read_text(encoding="utf-8")
+    case_start = sql.index("CASE evidence.stream_name")
+    case_end = sql.index("END AS watermark_at", case_start)
+    case_body = sql[case_start:case_end]
+
+    typed_streams = {
+        spec.name for spec in STREAM_SPECS if spec.requires_typed_projection
+    }
+    non_typed_streams = {
+        spec.name for spec in STREAM_SPECS if not spec.requires_typed_projection
+    }
+
+    for stream in typed_streams:
+        assert f"WHEN '{stream}'" in case_body, (
+            f"typed stream {stream} missing from SQL watermark CASE"
+        )
+    for stream in non_typed_streams:
+        assert f"WHEN '{stream}'" not in case_body, (
+            f"non-typed stream {stream} must not appear in SQL watermark CASE"
+        )
 
 
 def test_shell_and_docs_reference_canonical_contract():

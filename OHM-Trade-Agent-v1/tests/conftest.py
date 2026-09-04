@@ -65,18 +65,3 @@ def isolate_outcome_registry_with_existing_trade_fixtures(request, monkeypatch):
         "STATE_FILE",
         tmp_path / "attention_budget_state.json",
     )
-
-
-@pytest.fixture(autouse=True)
-def commit_freshness_seed_before_cross_connection_health(request, monkeypatch):
-    """Publish freshness seed rows before tests open a second health connection."""
-    module = getattr(request.node, "module", None)
-    if module is None or not hasattr(module, "_seed_all_healthy"):
-        return
-    original = module._seed_all_healthy
-
-    def seeded_and_committed(connection):
-        original(connection)
-        connection.commit()
-
-    monkeypatch.setattr(module, "_seed_all_healthy", seeded_and_committed)

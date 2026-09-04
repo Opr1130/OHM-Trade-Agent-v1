@@ -251,10 +251,11 @@ expected_policy AS (
 ),
 policy_validation AS (
     SELECT
-        expected.column1 AS stream_name,
+        expected.column1 AS expected_stream_name,
         expected.column2 AS expected_required,
         expected.column3 AS expected_typed,
         expected.column4 AS expected_threshold,
+        actual.stream_name AS actual_stream_name,
         actual.required AS actual_required,
         actual.requires_typed_projection AS actual_typed,
         actual.threshold_seconds AS actual_threshold
@@ -267,13 +268,20 @@ policy_meta AS (
         count(*) > 0 AS present,
         count(DISTINCT sync_fingerprint) = 1 AS uniform_fingerprint,
         max(sync_fingerprint) AS current_fingerprint,
-        -- Complete policy validation: every expected stream must exist with correct attributes
-        (SELECT bool_and(
-            actual_required IS NOT NULL
+        -- Complete policy validation, fail-closed: every expected stream must
+        -- exist with correct attributes AND no unexpected stream may be present.
+        -- Requiring both expected_stream_name and actual_stream_name to be
+        -- non-null makes the FULL OUTER JOIN reject both a missing expected row
+        -- and an unexpected actual row. bool_and ignores NULL inputs, so the
+        -- attribute comparisons alone cannot be trusted to fail closed when a
+        -- FULL OUTER JOIN leaves expected fields NULL for an unexpected row.
+        (SELECT coalesce(bool_and(
+            expected_stream_name IS NOT NULL
+            AND actual_stream_name IS NOT NULL
             AND actual_required = expected_required
             AND actual_typed = expected_typed
             AND actual_threshold IS NOT DISTINCT FROM expected_threshold
-        ) FROM policy_validation) AS policy_complete
+        ), false) FROM policy_validation) AS policy_complete
     FROM ops.required_stream
 ),
 maintenance_eval AS (
