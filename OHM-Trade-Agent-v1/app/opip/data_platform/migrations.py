@@ -11,6 +11,10 @@ from typing import Any, Iterable
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
+from app.opip.data_platform.freshness import (
+    policy_fingerprint,
+    stream_policy_snapshot,
+)
 
 
 MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_(?P<name>[a-z0-9_]+)\.sql$")
@@ -144,6 +148,7 @@ def refresh_materialized_views(connection: Any) -> None:
         ("market", "attrition_daily_mv"),
         ("lifecycle", "rejection_mix_daily_mv"),
         ("learning", "opportunity_accountability_daily_mv"),
+        ("ops", "dashboard_freshness_mv"),
     )
     populated_views: list[tuple[str, str, bool]] = []
     with connection.cursor() as cursor:
@@ -199,6 +204,53 @@ def provision_login_roles(connection: Any, passwords: dict[str, str]) -> None:
                 )
 
 
+def sync_required_streams(connection: Any) -> int:
+    """Synchronize required-stream policy under an administrative role.
+
+    ``ops.required_stream`` is protected freshness policy: the shipper and
+    dashboard roles hold no write grants, and this command connects only with
+    ``OPIP_ANALYTICS_ADMIN_DATABASE_URL``.  It never falls back to shipper
+    credentials.  Returns the number of synchronized streams.
+    """
+    snapshot = stream_policy_snapshot()
+    fingerprint = policy_fingerprint()
+    rows = [
+        (
+            name,
+            bool(policy["required"]),
+            bool(policy["requires_typed_projection"]),
+            policy["threshold_seconds"],
+            fingerprint,
+        )
+        for name, policy in sorted(snapshot.items())
+    ]
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO ops.required_stream(
+                    stream_name, required, requires_typed_projection,
+                    threshold_seconds, sync_fingerprint
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (stream_name) DO UPDATE SET
+                    required = EXCLUDED.required,
+                    requires_typed_projection = EXCLUDED.requires_typed_projection,
+                    threshold_seconds = EXCLUDED.threshold_seconds,
+                    sync_fingerprint = EXCLUDED.sync_fingerprint,
+                    synced_at = now()
+                """,
+                rows,
+            )
+            cursor.execute(
+                """
+                DELETE FROM ops.required_stream policy
+                WHERE NOT (policy.stream_name = ANY(%s))
+                """,
+                ([name for name, *_rest in rows],),
+            )
+    return len(rows)
+
+
 def _admin_dsn() -> str:
     dsn = os.getenv("OPIP_ANALYTICS_ADMIN_DATABASE_URL")
     if not dsn:
@@ -210,7 +262,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the O'Pip analytics schema")
     parser.add_argument(
         "command",
-        choices=("migrate", "partitions", "refresh-views", "provision-roles"),
+        choices=(
+            "migrate",
+            "partitions",
+            "refresh-views",
+            "provision-roles",
+            "sync-required-streams",
+        ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
     config = DataPlatformConfig.from_env()
@@ -229,6 +287,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "refresh-views":
             refresh_materialized_views(connection)
             print("O'Pip materialized views refreshed")
+        elif args.command == "sync-required-streams":
+            count = sync_required_streams(connection)
+            print(f"O'Pip required-stream policy synchronized: {count} streams")
         else:
             provision_login_roles(
                 connection,

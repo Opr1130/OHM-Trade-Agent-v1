@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
 
 def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     migrations = discover_migrations()
-    assert [item.version for item in migrations] == [1, 2, 3, 4]
+    assert [item.version for item in migrations] == [1, 2, 3, 4, 5]
     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql
@@ -255,7 +255,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Connection:
         def __init__(self):
             self.autocommit = False
-            self.population = [True, False, True, False]
+            self.population = [True, False, True, False, False]
             self.events = []
 
         def cursor(self):
@@ -267,7 +267,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 4
+    assert len(refreshes) == 5
     assert all(event[1] is True for event in refreshes)
     assert connection.events.index(refreshes[0]) > next(
         index for index, event in enumerate(connection.events) if event[0] == "commit"
@@ -313,7 +313,7 @@ def test_materialized_view_refresh_skips_unapplied_optional_view():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 3
+    assert len(refreshes) == 4
     assert all("opportunity_accountability_daily_mv" not in event[2] for event in refreshes)
 
 
@@ -325,6 +325,8 @@ def test_optional_streams_do_not_block_required_readiness():
             "lag_seconds": 1,
             "unresolved_dead_letters": 0,
             "last_reconciliation_status": "CLEAN",
+            "required": True,
+            "freshness_status": "LIVE",
         }
         for name in required
     ]
@@ -334,6 +336,8 @@ def test_optional_streams_do_not_block_required_readiness():
             "lag_seconds": 99999,
             "unresolved_dead_letters": 4,
             "last_reconciliation_status": "MISMATCH",
+            "required": False,
+            "freshness_status": "STALE",
         }
     )
     required_names, missing, healthy = _required_stream_readiness(
@@ -344,7 +348,9 @@ def test_optional_streams_do_not_block_required_readiness():
     assert missing == []
     assert healthy is True
     assert _stream_health_is_stale(rows, maximum_lag_seconds=300) is False
-    assert _stream_health_is_stale(rows[1:], maximum_lag_seconds=300) is True
+    degraded = [dict(row) for row in rows]
+    degraded[0]["freshness_status"] = "UNAVAILABLE"
+    assert _stream_health_is_stale(degraded, maximum_lag_seconds=300) is True
 
 
 def test_today_historical_trend_excludes_prior_dates():

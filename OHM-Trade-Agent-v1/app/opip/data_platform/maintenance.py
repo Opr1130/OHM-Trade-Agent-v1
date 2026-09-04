@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
+from app.opip.data_platform.freshness import policy_fingerprint
 from app.opip.data_platform.migrations import (
     ensure_monthly_partitions,
     refresh_materialized_views,
@@ -18,6 +19,39 @@ from app.opip.data_platform.streams import STREAM_SPECS
 PARTITION_RE = re.compile(
     r"^(screening|observation|stage_transition|intelligence_event|ingested_event)_([0-9]{6})$"
 )
+
+
+def record_maintenance_run(
+    connection: Any,
+    *,
+    status: str,
+    detail: str | None,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    """Record one maintenance cycle as freshness evidence.
+
+    Runs under the administrative/maintenance role only; the shipper and
+    dashboard roles hold no write grant on ``ops.maintenance_run``.
+    """
+    if status not in {"SUCCESS", "FAILED", "SKIPPED"}:
+        raise ValueError(f"invalid maintenance status: {status}")
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ops.maintenance_run(
+                    status, detail, policy_fingerprint, started_at, finished_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    status,
+                    (detail or "")[:4000] or None,
+                    policy_fingerprint(),
+                    started_at.astimezone(timezone.utc),
+                    finished_at.astimezone(timezone.utc),
+                ),
+            )
 
 
 def prune_analytical_retention(
@@ -109,14 +143,48 @@ def main(argv: Iterable[str] | None = None) -> int:
     dsn = os.getenv("OPIP_ANALYTICS_ADMIN_DATABASE_URL") or config.database_url
     if not dsn:
         raise RuntimeError("OPIP_ANALYTICS_DATABASE_URL is required")
-    with connect(
-        dsn,
-        connect_timeout_seconds=config.connect_timeout_seconds,
-        application_name="opip-maintenance",
-    ) as connection:
-        ensure_monthly_partitions(connection)
-        refresh_materialized_views(connection)
-        dropped = prune_analytical_retention(connection) if args.prune else []
+    started_at = datetime.now(timezone.utc)
+    status = "SUCCESS"
+    detail: str | None = None
+    dropped: list[str] = []
+    try:
+        with connect(
+            dsn,
+            connect_timeout_seconds=config.connect_timeout_seconds,
+            application_name="opip-maintenance",
+        ) as connection:
+            ensure_monthly_partitions(connection)
+            refresh_materialized_views(connection)
+            dropped = (
+                prune_analytical_retention(connection) if args.prune else []
+            )
+            record_maintenance_run(
+                connection,
+                status="SUCCESS",
+                detail=f"dropped_partitions={dropped}",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+    except Exception as error:
+        status = "FAILED"
+        detail = f"{type(error).__name__}: {error}"
+        try:
+            with connect(
+                dsn,
+                connect_timeout_seconds=config.connect_timeout_seconds,
+                application_name="opip-maintenance",
+            ) as connection:
+                record_maintenance_run(
+                    connection,
+                    status=status,
+                    detail=detail,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
+        except Exception:
+            pass
+        print(f"O'Pip maintenance failed: {detail}")
+        return 2
     print(f"O'Pip maintenance complete; dropped_partitions={dropped}")
     return 0
 

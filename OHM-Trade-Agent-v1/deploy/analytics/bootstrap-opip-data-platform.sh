@@ -204,6 +204,7 @@ fi
 if [[ "$STAGE" == "empty" ]]; then
   admin_run python -m app.opip.data_platform.migrations migrate
   admin_run python -m app.opip.data_platform.migrations provision-roles
+  admin_run python -m app.opip.data_platform.migrations sync-required-streams
   if [[ -z "${EMPTY_STARTED_AT_UTC:-}" ]]; then
     write_state EMPTY_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
@@ -238,6 +239,8 @@ elif [[ "$STAGE" == "backfill" ]]; then
     echo "empty-stage rollback evidence does not match the verified rollout state" >&2
     exit 69
   fi
+  admin_run python -m app.opip.data_platform.migrations migrate
+  admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.backfill
   admin_run python -m app.opip.data_platform.migrations refresh-views
   admin_run python -m app.opip.data_platform.reconcile
@@ -245,6 +248,8 @@ elif [[ "$STAGE" == "backfill" ]]; then
   write_state BACKFILL_SHA "$TARGET_SHA"
 elif [[ "$STAGE" == "shipper" ]]; then
   require_stage BACKFILL_COMPLETED_AT_UTC "clean backfill"
+  admin_run python -m app.opip.data_platform.migrations migrate
+  admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   docker compose -f "$COMPOSE" up -d opip-shipper
   if [[ -z "${SHIPPER_STARTED_AT_UTC:-}" ]]; then
@@ -261,6 +266,8 @@ else
     echo "shipper must soak for seven days before historical reads are eligible" >&2
     exit 69
   fi
+  admin_run python -m app.opip.data_platform.migrations migrate
+  admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   admin_run python -m app.opip.data_platform.health --require-ready
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
