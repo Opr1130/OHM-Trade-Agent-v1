@@ -161,7 +161,11 @@ WITH current_watermarks AS (
         raw_watermark.last_ingested_at,
         typed_watermark.watermark_at AS typed_watermark_at,
         checkpoint.updated_at AS last_polled_at,
-        evidence.unresolved_dead_letters,
+        -- Query CURRENT unresolved dead-letter evidence live from ops.dead_letter
+        -- rather than the snapshot stored in the materialized view, so a newly
+        -- dead-lettered row immediately prevents LIVE without waiting for a
+        -- materialized-view refresh.
+        dead_letter_evidence.unresolved_dead_letters,
         evidence.last_reconciliation_status,
         evidence.last_reconciled_at,
         evidence.snapshot_refreshed_at
@@ -174,6 +178,12 @@ WITH current_watermarks AS (
         WHERE item.stream_name = evidence.stream_name
           AND item.observed_at >= now() - interval '7 days'
     ) raw_watermark ON true
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS unresolved_dead_letters
+        FROM ops.dead_letter item
+        WHERE item.stream_name = evidence.stream_name
+          AND item.resolved_at IS NULL
+    ) dead_letter_evidence ON true
     LEFT JOIN LATERAL (
         SELECT CASE evidence.stream_name
             WHEN 'screening_evaluations'

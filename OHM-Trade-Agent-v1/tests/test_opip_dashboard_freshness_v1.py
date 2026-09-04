@@ -1009,3 +1009,114 @@ def test_maintenance_records_success_run(pg_connection):
     pg_connection.commit()
     canonical = _canonical_row(pg_connection, "__maintenance__")
     assert canonical == {"status": "LIVE", "reason": None}
+
+
+# ---------------------------------------------------------------------------
+# Regression: canonical view queries CURRENT dead-letter evidence live
+# ---------------------------------------------------------------------------
+
+
+def _insert_dead_letter(connection, stream: str) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO ops.dead_letter(
+                stream_name, source_file, source_generation, source_byte_offset,
+                source_row_sha256, raw_text, error_type, error_message
+            ) VALUES (%s, %s, 1, 0, %s, 'raw', 'TEST', 'boom')
+            ON CONFLICT DO NOTHING
+            """,
+            (stream, f"/data/{stream}.jsonl", f"{stream}-dead-sha"),
+        )
+
+
+def test_new_dead_letter_prevents_live_without_materialized_view_refresh(
+    pg_connection,
+):
+    """Regression: a freshly dead-lettered row must immediately block LIVE.
+
+    The canonical normal view must read CURRENT unresolved dead-letter evidence
+    from ops.dead_letter rather than the snapshot stored in the materialized
+    view, so a new dead letter prevents LIVE even before refresh-freshness runs.
+    """
+    stream = "scan_summaries"
+    _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
+    # Healthy baseline is LIVE.
+    assert _canonical_row(pg_connection, stream) == {"status": "LIVE", "reason": None}
+    # Insert a new unresolved dead letter but DO NOT refresh the materialized
+    # view. The snapshot evidence still reports zero dead letters.
+    _insert_dead_letter(pg_connection, stream)
+    pg_connection.commit()
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT unresolved_dead_letters FROM ops.dashboard_freshness_mv "
+            "WHERE stream_name = %s",
+            (stream,),
+        )
+        assert cursor.fetchone()[0] == 0
+    # The canonical view must still see the live dead letter and block LIVE,
+    # even though the materialized-view snapshot is stale at zero.
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT status, reason
+            FROM ops.dashboard_freshness_v
+            WHERE stream_name = %s
+            """,
+            (stream,),
+        )
+        row = cursor.fetchone()
+    assert row is not None
+    assert (row[0], row[1]) == ("UNAVAILABLE", "UNRESOLVED_DEAD_LETTERS")
+
+
+def test_resolved_dead_letter_does_not_block_live(pg_connection):
+    """Regression: only unresolved dead letters block LIVE in the canonical view."""
+    stream = "scan_summaries"
+    _seed_all_healthy(pg_connection)
+    _refresh_freshness(pg_connection)
+    _insert_dead_letter(pg_connection, stream)
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE ops.dead_letter SET resolved_at = now() "
+            "WHERE stream_name = %s",
+            (stream,),
+        )
+    pg_connection.commit()
+    canonical = _canonical_row(pg_connection, stream)
+    assert canonical == {"status": "LIVE", "reason": None}
+
+
+# ---------------------------------------------------------------------------
+# Regression: Python raw watermark applies the same 7-day observed_at window
+# ---------------------------------------------------------------------------
+
+
+def test_python_raw_watermark_applies_7_day_observed_window(pg_connection):
+    """Regression: Python health must ignore raw events older than 7 days.
+
+    The canonical SQL view filters raw.ingested_event by observed_at within the
+    last 7 days when computing the ingestion watermark. Python health must apply
+    the same window so an ancient event cannot masquerade as a fresh watermark
+    and diverge from the canonical SQL classification.
+    """
+    stream = "scan_summaries"
+    _seed_all_healthy(pg_connection)
+    # Replace the stream's only raw event with one observed more than 7 days ago.
+    old = _now() - timedelta(days=8)
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM raw.ingested_event WHERE stream_name = %s", (stream,)
+        )
+    pg_connection.commit()
+    _insert_raw(pg_connection, stream, observed_at=old)
+    pg_connection.commit()
+    # Canonical SQL: no recent raw watermark -> MISSING_STREAM_ROW.
+    canonical = _canonical_row(pg_connection, stream)
+    assert canonical == {"status": "UNAVAILABLE", "reason": "MISSING_STREAM_ROW"}
+    # Python health must classify the same evidence identically.
+    freshness = build_freshness(pg_connection)
+    assessment = freshness["streams"][stream]
+    assert assessment["status"] == "UNAVAILABLE"
+    assert assessment["reason"] == "MISSING_STREAM_ROW"

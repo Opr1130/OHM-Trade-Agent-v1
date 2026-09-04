@@ -81,6 +81,7 @@ def _canonical_stream_inputs(
             """
             SELECT stream_name, max(ingested_at)
             FROM raw.ingested_event
+            WHERE observed_at >= now() - interval '7 days'
             GROUP BY stream_name
             """
         )

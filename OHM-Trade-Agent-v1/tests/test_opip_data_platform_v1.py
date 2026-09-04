@@ -445,6 +445,30 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "dropdb --if-exists --force" in restore
 
 
+def test_maintenance_always_refreshes_freshness_after_reconcile_mismatch():
+    """Regression: a non-zero reconcile (MISMATCH) must not skip refresh-freshness.
+
+    The maintenance script runs under `set -e`. If reconcile returns non-zero the
+    script must capture that exit status (so it does not abort) and STILL run
+    refresh-freshness and health afterwards, then exit with the preserved
+    reconcile status so callers observe the mismatch.
+    """
+    maintenance = (
+        ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
+    ).read_text()
+    # Reconcile exit status is captured, not allowed to abort the script.
+    assert "RECONCILE_STATUS=0" in maintenance
+    assert "python -m app.opip.data_platform.reconcile || RECONCILE_STATUS=$?" in maintenance
+    # refresh-freshness and health must appear AFTER the reconcile command so a
+    # MISMATCH/non-zero return cannot skip the freshness refresh.
+    reconcile_pos = maintenance.index("app.opip.data_platform.reconcile")
+    refresh_pos = maintenance.index("refresh-freshness")
+    health_pos = maintenance.index("app.opip.data_platform.health")
+    assert reconcile_pos < refresh_pos < health_pos
+    # The preserved reconcile status is the final exit status.
+    assert 'exit "$RECONCILE_STATUS"' in maintenance
+
+
 def test_config_json_round_trip_has_no_authority_fields():
     payload = json.dumps(DataPlatformConfig().__dict__, default=str)
     assert "kraken" not in payload.lower()

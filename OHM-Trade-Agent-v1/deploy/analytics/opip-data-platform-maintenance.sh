@@ -25,9 +25,18 @@ flock -n 9 || exit 0
 
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
   python -m app.opip.data_platform.maintenance --prune
+
+# Reconciliation may legitimately report MISMATCH (non-zero) when the file WAL
+# and database diverge. Preserve its exit status, but ALWAYS refresh freshness
+# afterwards so the canonical view reflects the reconciliation outcome instead
+# of being skipped on a non-zero return.
+RECONCILE_STATUS=0
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
-  python -m app.opip.data_platform.reconcile
+  python -m app.opip.data_platform.reconcile || RECONCILE_STATUS=$?
+
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
   python -m app.opip.data_platform.migrations refresh-freshness
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
   python -m app.opip.data_platform.health
+
+exit "$RECONCILE_STATUS"
