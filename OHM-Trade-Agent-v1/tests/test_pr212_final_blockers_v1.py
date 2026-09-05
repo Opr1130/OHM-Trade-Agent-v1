@@ -97,9 +97,10 @@ def test_analytics_clients_require_verified_tls_and_mount_ca():
     ).read_text(encoding="utf-8")
 
     tls_query = "sslmode=verify-full&sslrootcert=/etc/opip-data-platform/tls/postgres-ca.crt"
-    assert f"OPIP_ANALYTICS_ADMIN_DATABASE_URL=postgresql://" in env_example
-    assert f"OPIP_ANALYTICS_DATABASE_URL=postgresql://" in env_example
+    assert 'OPIP_ANALYTICS_ADMIN_DATABASE_URL="postgresql://' in env_example
+    assert 'OPIP_ANALYTICS_DATABASE_URL="postgresql://' in env_example
     assert env_example.count(tls_query) == 2
+    assert "# Keep the DSNs double-quoted because this file is sourced by the bootstrap" in env_example
 
     ca_mount = (
         "/etc/opip-data-platform/tls/postgres-ca.crt:"
@@ -133,7 +134,7 @@ def test_deployment_markers_select_coherent_latest_rows():
     assert "WITH latest_marker AS" in sql
     assert "ORDER BY observed_at DESC, ingested_at DESC" in sql
     assert "observed_at > now() - interval '30 days'" in sql
-    assert "WITH latest_marker AS" in sql and "latest_schema AS" in sql
+    assert "latest_schema AS" in sql
     assert "ORDER BY version DESC" in sql
     assert "schema_row.applied_at AS schema_applied_at" in sql
     assert "marker.observed_at" in sql
