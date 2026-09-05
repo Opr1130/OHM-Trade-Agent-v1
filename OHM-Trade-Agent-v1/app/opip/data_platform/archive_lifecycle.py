@@ -84,8 +84,8 @@ def assess_segment(
     segment: Path,
     *,
     now: datetime | None = None,
-    require_offhost: bool = True,
 ) -> SegmentLifecycleAssessment:
+    """Assess lifecycle state; COLD cleanup always requires off-host verification."""
     clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     age_days = _age_days(segment, now=clock)
     tier = _tier_for_age(age_days)
@@ -107,7 +107,7 @@ def assess_segment(
             blockers.append("manifest_not_updated")
         if not archive_verified:
             blockers.append("archive_not_verified")
-    if tier == "COLD" and require_offhost and not offhost_verified:
+    if tier == "COLD" and not offhost_verified:
         blockers.append("offhost_backup_not_verified")
     if tier in {"WARM", "COLD"} and compression not in {"gzip", "zstd"}:
         blockers.append("warm_cold_segment_must_be_compressed")
@@ -154,23 +154,14 @@ def assess_root(
     root: Path,
     *,
     now: datetime | None = None,
-    require_offhost: bool = True,
 ) -> list[SegmentLifecycleAssessment]:
-    return [
-        assess_segment(path, now=now, require_offhost=require_offhost)
-        for path in discover_segments(root)
-    ]
+    return [assess_segment(path, now=now) for path in discover_segments(root)]
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Assess O'Pip archive lifecycle eligibility")
     parser.add_argument("--root", required=True, help="Path containing finalized archive segments")
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
-    parser.add_argument(
-        "--no-require-offhost",
-        action="store_true",
-        help="Do not require off-host verification marker for cleanup eligibility",
-    )
     parser.add_argument(
         "--fail-if-cold-unverified",
         action="store_true",
@@ -179,7 +170,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     root = Path(args.root).expanduser().resolve()
-    assessments = assess_root(root, require_offhost=not args.no_require_offhost)
+    assessments = assess_root(root)
 
     if args.json:
         print(json.dumps([asdict(item) for item in assessments], indent=2))
