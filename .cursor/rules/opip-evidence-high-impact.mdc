@@ -1,0 +1,18 @@
+---
+description: O'Pip evidence vs hypothesis rules and high-impact change safety summary
+alwaysApply: true
+---
+
+# Evidence discipline and high-impact changes
+
+Complement `AGENTS.md`, promotion gates, and production safety contracts.
+
+- Distinguish observed evidence from hypotheses. Do not claim a production root cause without durable evidence. Label assumptions and unresolved risks.
+- Before high-impact work on scoring, ranking, alerts, risk, execution, learning authority, production deployment, or data durability, explicitly summarize:
+  1. Behavioral impact in production vs shadow vs offline learning
+  2. Whether trading authority, risk gates, or execution safeguards change
+  3. Whether durable evidence/stores are written, migrated, or deleted
+  4. Which tests/CI contracts will prove safety
+  5. What remains out of scope
+- Wait for human direction when authorization for high-impact or authority-changing work is unclear.
+- Do not promote shadow/ML findings into production influence without the existing evidence and promotion-gate process.
