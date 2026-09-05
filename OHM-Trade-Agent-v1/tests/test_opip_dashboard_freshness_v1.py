@@ -24,10 +24,16 @@ from app.opip.data_platform.freshness import (
     MaintenanceInput,
     StreamInput,
     classify_freshness,
+    classify_maintenance,
     policy_fingerprint,
     stream_policy_snapshot,
 )
-from app.opip.data_platform.health import build_freshness, main as health_main
+from app.opip.data_platform.health import (
+    _maintenance_input,
+    _validate_policy_sync,
+    build_freshness,
+    main as health_main,
+)
 from app.opip.data_platform.migrations import (
     apply_migrations,
     discover_migrations,
@@ -990,7 +996,7 @@ def test_real_migration_and_sync_round_trip(pg_connection):
         cursor.execute(
             "SELECT max(version) FROM ops.schema_version"
         )
-        assert cursor.fetchone()[0] == 5
+        assert cursor.fetchone()[0] == 6
         cursor.execute("SELECT count(*) FROM ops.required_stream")
         assert cursor.fetchone()[0] == len(STREAM_SPECS)
 
@@ -1120,3 +1126,215 @@ def test_python_raw_watermark_applies_7_day_observed_window(pg_connection):
     assessment = freshness["streams"][stream]
     assert assessment["status"] == "UNAVAILABLE"
     assert assessment["reason"] == "MISSING_STREAM_ROW"
+
+
+# ---------------------------------------------------------------------------
+# Regression: MISSING_POLICY vs CONFIGURATION_DRIFT (review finding 3)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_maintenance_distinguishes_missing_policy_from_configuration_drift():
+    """Pure-Python parity guard: an empty policy and a mutated/invalid
+    policy must never collapse to the identical MaintenanceInput state."""
+    now = _now()
+    missing = classify_maintenance(
+        MaintenanceInput(None, None, False, policy_empty=True), now=now
+    )
+    assert missing.status == "UNAVAILABLE"
+    assert missing.reason == "MISSING_POLICY"
+
+    drifted = classify_maintenance(
+        MaintenanceInput(None, None, True, policy_empty=False), now=now
+    )
+    assert drifted.status == "UNAVAILABLE"
+    assert drifted.reason == "CONFIGURATION_DRIFT"
+
+    assert missing.reason != drifted.reason
+
+
+def test_empty_required_stream_table_is_missing_policy_not_configuration_drift(pg_connection):
+    with pg_connection.cursor() as cursor:
+        cursor.execute("DELETE FROM ops.required_stream")
+    pg_connection.commit()
+
+    maintenance = _maintenance_input(pg_connection)
+    assert maintenance.policy_empty is True
+    assert maintenance.configuration_drift is False
+    result = classify_maintenance(maintenance, now=_now())
+    assert result.reason == "MISSING_POLICY"
+
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical["reason"] == "MISSING_POLICY"
+    # Python and SQL must agree, not merely both fail closed.
+    assert canonical["status"] == result.status == "UNAVAILABLE"
+
+
+def test_mutated_required_stream_row_is_configuration_drift_not_missing_policy(pg_connection):
+    with pg_connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE ops.required_stream SET threshold_seconds = 1 "
+            "WHERE stream_name = 'p1_shadow_outbox'"
+        )
+    pg_connection.commit()
+
+    assert _validate_policy_sync(pg_connection) is False
+    maintenance = _maintenance_input(pg_connection)
+    assert maintenance.policy_empty is False
+    assert maintenance.configuration_drift is True
+    result = classify_maintenance(maintenance, now=_now())
+    assert result.reason == "CONFIGURATION_DRIFT"
+
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical["reason"] == "CONFIGURATION_DRIFT"
+    assert canonical["status"] == result.status == "UNAVAILABLE"
+
+
+def test_valid_policy_with_no_maintenance_run_is_maintenance_never_ran(pg_connection):
+    # pg_connection's fixture already syncs a valid policy and runs no
+    # maintenance cycle, so this is the fixture's default state.
+    maintenance = _maintenance_input(pg_connection)
+    assert maintenance.policy_empty is False
+    assert maintenance.configuration_drift is False
+    result = classify_maintenance(maintenance, now=_now())
+    assert result.reason == "MAINTENANCE_NEVER_RAN"
+
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical["reason"] == "MAINTENANCE_NEVER_RAN"
+
+
+def test_valid_policy_with_current_successful_run_is_normal_classification(pg_connection):
+    from app.opip.data_platform.maintenance import record_maintenance_run
+
+    record_maintenance_run(
+        pg_connection,
+        status="SUCCESS",
+        detail=None,
+        started_at=_now() - timedelta(seconds=30),
+        finished_at=_now(),
+    )
+    pg_connection.commit()
+
+    maintenance = _maintenance_input(pg_connection)
+    assert maintenance.policy_empty is False
+    assert maintenance.configuration_drift is False
+    result = classify_maintenance(maintenance, now=_now())
+    assert result.status == "LIVE"
+    assert result.reason is None
+
+    canonical = _canonical_row(pg_connection, "__maintenance__")
+    assert canonical == {"status": "LIVE", "reason": None}
+
+
+# ---------------------------------------------------------------------------
+# Regression: sync-required-streams refreshes only the freshness projection
+# (review finding 4)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_required_streams_cli_refreshes_only_the_freshness_view(monkeypatch, pg_connection):
+    """`migrations.py sync-required-streams` must call refresh_freshness_view,
+    not the broad refresh_materialized_views (which would also recompute
+    the unrelated intelligence/attrition/rejection-mix/accountability
+    aggregate views for no reason)."""
+    from app.opip.data_platform import migrations as migrations_module
+    import inspect
+
+    main_source = inspect.getsource(migrations_module.main)
+    branch_start = main_source.index(
+        'elif args.command == "sync-required-streams":'
+    )
+    branch_end = main_source.index("\n        else:", branch_start)
+    branch_body = main_source[branch_start:branch_end]
+    assert "refresh_freshness_view(connection)" in branch_body
+    assert "refresh_materialized_views(connection)" not in branch_body
+
+    # Behavioral half of the guard: refresh_freshness_view actually leaves
+    # the unrelated aggregate views alone (they are simply never touched by
+    # this call), while still updating the freshness projection for real.
+    refreshed: list[str] = []
+    monkeypatch.setattr(
+        migrations_module,
+        "refresh_materialized_views",
+        lambda connection: refreshed.append("all"),
+    )
+    migrations_module.sync_required_streams(pg_connection)
+    migrations_module.refresh_freshness_view(pg_connection)
+    assert refreshed == []  # refresh_materialized_views was never called
+
+
+# ---------------------------------------------------------------------------
+# Regression: migration 006 upgrades an already-migrated-to-005 database
+# identically to a fresh 001-006 install (review migration-safety note)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_006_upgrade_matches_fresh_install():
+    from app.opip.data_platform.migrations import MIGRATION_ROOT, apply_migrations
+
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        partial_root = Path(tmp)
+        for path in sorted(MIGRATION_ROOT.glob("*.sql")):
+            if int(path.name[:3]) <= 5:
+                shutil.copy(path, partial_root / path.name)
+
+        with connect(DSN, application_name="opip-freshness-upgrade-test") as connection:
+            _reset_database(connection)
+            # Simulate "005 already registered/applied in production".
+            applied_first = apply_migrations(connection, root=partial_root)
+            assert applied_first == [1, 2, 3, 4, 5]
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT max(version) FROM ops.schema_version")
+                assert cursor.fetchone()[0] == 5
+
+            # Land 006 as a genuine follow-up against the real migrations dir.
+            applied_second = apply_migrations(connection)
+            assert applied_second == [6]
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT max(version) FROM ops.schema_version")
+                assert cursor.fetchone()[0] == 6
+
+            sync_required_streams(connection)
+            _refresh_freshness(connection)
+
+            # Behavioral proof the upgrade actually landed the threshold fix:
+            # an optional stream with a non-default threshold_seconds must
+            # honor it, not the old hard-coded 86400s.
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE ops.required_stream SET threshold_seconds = 30 "
+                    "WHERE stream_name = 'p1_shadow_outbox'"
+                )
+            connection.commit()
+            _insert_checkpoint(
+                connection, "p1_shadow_outbox", updated_at=_now() - timedelta(seconds=60)
+            )
+            row = _canonical_row(connection, "p1_shadow_outbox")
+            assert row["status"] == "STALE"
+            assert row["reason"] == "STALE_DATA"
+
+
+def test_migration_006_fresh_install_matches_upgrade_path():
+    """The mirror image of the upgrade test: applying 001-006 in one pass
+    (a fresh database) must reach the identical function behavior."""
+    with connect(DSN, application_name="opip-freshness-fresh-install-test") as connection:
+        _reset_database(connection)
+        applied = apply_migrations(connection)
+        assert applied == [1, 2, 3, 4, 5, 6]
+        sync_required_streams(connection)
+        _refresh_freshness(connection)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE ops.required_stream SET threshold_seconds = 30 "
+                "WHERE stream_name = 'p1_shadow_outbox'"
+            )
+        connection.commit()
+        _insert_checkpoint(
+            connection, "p1_shadow_outbox", updated_at=_now() - timedelta(seconds=60)
+        )
+        row = _canonical_row(connection, "p1_shadow_outbox")
+        assert row["status"] == "STALE"
+        assert row["reason"] == "STALE_DATA"

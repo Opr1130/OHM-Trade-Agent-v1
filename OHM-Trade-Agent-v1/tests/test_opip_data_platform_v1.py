@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
 
 def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     migrations = discover_migrations()
-    assert [item.version for item in migrations] == [1, 2, 3, 4, 5]
+    assert [item.version for item in migrations] == [1, 2, 3, 4, 5, 6]
     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql

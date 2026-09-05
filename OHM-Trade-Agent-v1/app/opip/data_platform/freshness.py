@@ -112,6 +112,7 @@ class MaintenanceInput:
     latest_finished_at: datetime | None
     configuration_drift: bool
     required: bool = True
+    policy_empty: bool = False
 
 
 def _timestamp_status(
@@ -172,11 +173,16 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
     if not item.required:
         reference = stamps["last_ingested_at"] or stamps["source_updated_at"]
         age = _age_seconds(reference, now)
-        if (
-            reference is not None
-            and age is not None
-            and age <= NON_REQUIRED_MAX_AGE_SECONDS
-        ):
+        # Configured threshold_seconds (part of the synchronized policy and
+        # its fingerprint) takes precedence; 86400s is only the fallback
+        # for a stream whose policy leaves threshold_seconds unset, so
+        # Python and SQL (ops.freshness_reason) apply identical logic.
+        threshold = (
+            item.threshold_seconds
+            if item.threshold_seconds is not None
+            else NON_REQUIRED_MAX_AGE_SECONDS
+        )
+        if reference is not None and age is not None and age <= threshold:
             return StreamAssessment("LIVE", None, reference, age, ())
         return StreamAssessment("STALE", "STALE_DATA", reference, age, ())
 
@@ -222,7 +228,17 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
 def classify_maintenance(
     item: MaintenanceInput, *, now: datetime
 ) -> MaintenanceAssessment:
-    """Classify the latest maintenance evidence."""
+    """Classify the latest maintenance evidence.
+
+    An empty ops.required_stream policy table (MISSING_POLICY) and a
+    nonempty but invalid/mutated policy (CONFIGURATION_DRIFT) are distinct
+    failure modes -- mirrors ops.dashboard_freshness_v's maintenance_eval,
+    which checks `NOT meta.present` (MISSING_POLICY) before
+    `NOT meta.uniform_fingerprint` / `NOT policy_complete`
+    (CONFIGURATION_DRIFT).
+    """
+    if item.policy_empty:
+        return MaintenanceAssessment("UNAVAILABLE", "MISSING_POLICY", True)
     if item.configuration_drift:
         return MaintenanceAssessment("UNAVAILABLE", "CONFIGURATION_DRIFT", True)
 

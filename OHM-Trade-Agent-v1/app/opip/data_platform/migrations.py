@@ -308,7 +308,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("O'Pip dashboard freshness view refreshed")
         elif args.command == "sync-required-streams":
             count = sync_required_streams(connection)
-            refresh_materialized_views(connection)
+            refresh_freshness_view(connection)
             print(f"O'Pip required-stream policy synchronized: {count} streams")
         else:
             provision_login_roles(

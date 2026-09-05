@@ -223,7 +223,7 @@ def _maintenance_input(connection: Any) -> MaintenanceInput:
         policy_count, fingerprint_count, current_fingerprint = cursor.fetchone()
 
     if int(policy_count) == 0:
-        return MaintenanceInput(None, None, True)
+        return MaintenanceInput(None, None, False, policy_empty=True)
 
     # Validate complete policy synchronization
     if not _validate_policy_sync(connection):
