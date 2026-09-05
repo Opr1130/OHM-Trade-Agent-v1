@@ -1,0 +1,18 @@
+---
+description: O'Pip learning evidence must always reach an explicit consumption disposition
+alwaysApply: true
+---
+
+# Learning consumption invariant
+
+Complement `AGENTS.md`, `CLAUDE.md`, and `OHM-Trade-Agent-v1/deploy/learning/README.md`.
+
+- Every eligible persisted learning artifact must reach a traceable consumption disposition.
+- Silent drops or indefinitely orphaned learning evidence are defects.
+- Consumption may be live, advisory, shadow, rejected, quarantined, superseded, or otherwise explicitly governed.
+- Consumption does **not** authorize autonomous policy changes, live ranking influence, threshold mutation, or trading authority.
+- Learning-worker release compatibility is **exact SHA** with production (`CURRENT` / `RELEASE_DRIFT` / `UNVERIFIED`).
+- Capture and outcomes must **fail closed** on release drift; evidence sync may still run for diagnostics.
+- Core `/deploy` does not update the learning worker; every core deploy requires a matching owner-gated `/deploy-learning <40-char-sha>` before compute is healthy.
+- Busy/memory skips and blocked admissions must write durable dispositions (`SKIPPED_*`, `BLOCKED_RELEASE_DRIFT`); never silent exit-0 without a record.
+- Do not place Kraken or Telegram credentials on the learning worker.

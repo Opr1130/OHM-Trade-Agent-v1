@@ -70,17 +70,21 @@ sync/capture/outcomes cannot overlap.
 ## Deployment sequence
 
 1. Merge the reviewed release and obtain the exact main SHA.
-2. Deploy production at that exact SHA.
-3. Create the learning droplet in the production region/VPC.
-4. Run:
+2. Deploy production at that exact SHA (`/deploy <sha>`).
+3. **Matching learning worker deploy is required** before compute is healthy:
+   owner-gated `/deploy-learning <40-char-sha>` on issue 64 (exact `main` +
+   successful `pytest.yml`). Core `/deploy` does **not** update the learning
+   worker.
+4. Create the learning droplet in the production region/VPC (first time only).
+5. Run initial bootstrap (first time only):
 
    ```bash
    sudo bash deploy/learning/bootstrap-opip-learning-worker.sh \
      <EXACT_MAIN_SHA> <PRODUCTION_PRIVATE_IP> opiplearn
    ```
 
-5. Copy the public key printed by bootstrap.
-6. On production, authorize it:
+6. Copy the public key printed by bootstrap.
+7. On production, authorize it:
 
    ```bash
    sudo bash deploy/remote/configure-opip-learning-reader.sh \
@@ -88,9 +92,9 @@ sync/capture/outcomes cannot overlap.
      10.116.0.4/32
    ```
 
-7. On the learning worker, verify the production SSH host fingerprint and add
+8. On the learning worker, verify the production SSH host fingerprint and add
    the private production address to `/root/.ssh/known_hosts`.
-8. Start one-shot validation in order:
+9. Start one-shot validation in order:
 
    ```bash
    sudo systemctl start opip-learning-sync.service
@@ -103,7 +107,7 @@ sync/capture/outcomes cannot overlap.
      opip-learning-outcomes.service
    ```
 
-9. Verify no job containers remain:
+10. Verify no job containers remain:
 
    ```bash
    sudo docker ps -a --filter label=com.opip.learning.job
@@ -111,7 +115,7 @@ sync/capture/outcomes cannot overlap.
 
    Expected: no containers.
 
-10. Enable timers only after all one-shot checks pass:
+11. Enable timers only after all one-shot checks pass:
 
    ```bash
    sudo systemctl enable --now \
@@ -122,9 +126,33 @@ sync/capture/outcomes cannot overlap.
    systemctl list-timers 'opip-learning-*'
    ```
 
+Subsequent exact-SHA updates use `/deploy-learning <sha>` which runs
+`deploy/learning/run-gated-learning-deploy.sh` (rebuild image, refresh
+`OPIP_DEPLOYED_SHA` / `OPIP_LEARNING_IMAGE`, restart enabled timers). Do not
+place Kraken or Telegram credentials on the worker.
+
+## Release compatibility (exact SHA)
+
+Capture and outcomes admit only when worker `OPIP_DEPLOYED_SHA` equals the
+production SHA published in synced `manifest.env` as `production_deployed_sha`
+(`CURRENT`). On `RELEASE_DRIFT` or `UNVERIFIED`, compute fails closed with
+disposition `BLOCKED_RELEASE_DRIFT` (non-zero). Evidence sync may still run
+under drift for diagnostics. Busy/memory skips write durable dispositions
+(`SKIPPED_BUSY` / `SKIPPED_CAPACITY`) and must not be silent.
+
+## Guaranteed consumption (MVP)
+
+Every job invocation records a terminal disposition under
+`/var/lib/opip-learning/state/*.disposition.env`. Outcomes also write
+`data/.learning_consumption/outcomes.json` including accountability pending
+counts. Accountability handoff ack remains the artifact-level checkpoint;
+dispositions make skips/blocks/consumption lag visible in
+`diagnose-opip-learning`.
+
 ## Failure policy
 
 Learning failures are non-authoritative. A failed, skipped, timed-out, or
 OOM-killed learning job must never alter production trading decisions or funded
-exchange authority. The next invocation begins with stale-container cleanup
-and restart-safe local checkpoints.
+exchange authority. Skips and release-drift blocks must leave a durable
+disposition; silent exit-0 capacity skips are defects. The next invocation
+begins with stale-container cleanup and restart-safe local checkpoints.

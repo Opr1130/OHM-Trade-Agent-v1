@@ -37,6 +37,7 @@ Do not overwrite, bypass, or weaken those controls.
 18. **Do not merge PRs or run deployment commands unless explicitly instructed** by the human operator.
 19. **Treat generated artifacts as non-source.** Do not commit `__pycache__/`, `*.pyc`, logs, local databases, caches, virtualenvs, temporary files, or similar build/runtime output.
 20. **Before any high-impact change** involving scoring, ranking, alerts, risk, execution, learning authority, production deployment, or data durability, **explicitly summarize** the proposed behavioral impact and safety implications, then wait for direction if authorization is unclear.
+21. **Every eligible persisted learning artifact must reach a traceable consumption disposition.** Silent drops or indefinitely orphaned learning evidence are defects. Consumption may be live, advisory, shadow, rejected, quarantined, superseded, or otherwise explicitly governed; consumption does **not** authorize autonomous policy or trading changes. Learning-worker release compatibility is exact-SHA with production; capture/outcomes must fail closed on `RELEASE_DRIFT`, and every core `/deploy` requires a matching owner-gated `/deploy-learning` before compute is healthy.
 
 ## Existing controls to preserve (do not weaken)
 
@@ -50,6 +51,7 @@ Do not overwrite, bypass, or weaken those controls.
 | AI engineering gateway has no order authority | `OHM-Trade-Agent-v1/AI_EXECUTION_GATEWAY.md`, `.github/workflows/opip-claude-code.yml` |
 | Analytics/PostgreSQL off trading host; production files remain WAL | `OHM-Trade-Agent-v1/deploy/analytics/README.md` |
 | Shadow/ML non-authority & promotion gates | `OHM-Trade-Agent-v1/OHM_P1_PROMOTION_GATES.md`, ML evidence docs |
+| Learning worker exact-SHA + `/deploy-learning`; fail-closed drift; durable job dispositions | `.github/workflows/deploy-learning.yml`, `OHM-Trade-Agent-v1/deploy/learning/` |
 | Secrets / generated artifacts ignored | `OHM-Trade-Agent-v1/.gitignore` |
 
 ## High-impact change checklist

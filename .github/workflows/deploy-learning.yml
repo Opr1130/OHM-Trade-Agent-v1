@@ -1,0 +1,197 @@
+name: deploy-learning
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: opip-learning
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.issue.number == 64 &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.author_association == 'OWNER' &&
+      startsWith(github.event.comment.body, '/deploy-learning ')
+    runs-on: ubuntu-latest
+    environment: learning-production
+    steps:
+      - name: Resolve exact main SHA
+        id: target
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [[ "$COMMENT_BODY" =~ ^/deploy-learning[[:space:]]+([0-9a-f]{40})[[:space:]]*$ ]]; then
+            TARGET_SHA="${BASH_REMATCH[1]}"
+          else
+            echo "Refusing learning deployment: command format is /deploy-learning <40-char-sha>." >&2
+            exit 64
+          fi
+          echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Require target to equal current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          MAIN_SHA="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          test "$TARGET_SHA" = "$MAIN_SHA" || {
+            echo "Refusing learning deployment: target is not current main." >&2
+            exit 65
+          }
+
+      - name: Require successful exact-SHA CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          RESULT="$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow pytest.yml \
+            --branch main \
+            --commit "$TARGET_SHA" \
+            --limit 1 \
+            --json status,conclusion \
+            --jq '.[0] | [.status,.conclusion] | @tsv')"
+          test "$RESULT" = $'completed\tsuccess' || {
+            echo "Refusing learning deployment: pytest.yml is not successful for the exact SHA." >&2
+            exit 1
+          }
+
+      - name: Check out exact approved release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      - name: Validate learning connection secrets
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$HOST"
+          test -n "$USER"
+          test -n "$SSH_KEY_B64"
+          test -n "$KNOWN_HOSTS"
+
+      - name: Configure pinned SSH identity
+        env:
+          SSH_KEY_B64: ${{ secrets.OPIP_LEARNING_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.OPIP_LEARNING_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > ~/.ssh/opip_learning
+          chmod 600 ~/.ssh/opip_learning
+          ssh-keygen -y -f ~/.ssh/opip_learning >/dev/null
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload exact release tree
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          SSH=(ssh -i ~/.ssh/opip_learning -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -p "$PORT")
+          REMOTE="$USER@$HOST"
+          RELEASE_DIR="/var/tmp/opip-learning-$TARGET_SHA-$GITHUB_RUN_ID"
+          "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
+          git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
+
+      - name: Run exact-SHA learning worker update
+        id: learning_deploy
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set +e
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-learning-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_learning \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n bash '$RELEASE_DIR/OHM-Trade-Agent-v1/deploy/learning/run-gated-learning-deploy.sh' '$TARGET_SHA' '$RELEASE_DIR'" \
+            2>&1 | tee learning-deploy.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [[ "$RC" -eq 0 ]] && grep -q "O'Pip learning deploy succeeded" learning-deploy.log; then
+            echo "result=SUCCESS" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAILED" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Clean remote release
+        if: always() && steps.target.outputs.sha != ''
+        continue-on-error: true
+        env:
+          HOST: ${{ secrets.OPIP_LEARNING_HOST }}
+          USER: ${{ secrets.OPIP_LEARNING_USER }}
+          PORT: ${{ secrets.OPIP_LEARNING_PORT }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PORT="${PORT:-22}"
+          RELEASE_DIR="/var/tmp/opip-learning-$TARGET_SHA-$GITHUB_RUN_ID"
+          ssh \
+            -i ~/.ssh/opip_learning \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -p "$PORT" \
+            "$USER@$HOST" \
+            "sudo -n rm -rf -- '$RELEASE_DIR'"
+
+      - name: Publish learning deployment receipt
+        if: always() && steps.target.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          RESULT: ${{ steps.learning_deploy.outputs.result }}
+          REMOTE_RC: ${{ steps.learning_deploy.outputs.rc }}
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          BODY=$(cat <<EOF
+          ## O'Pip Learning Worker Deployment Receipt
+          - **Result:** ${RESULT:-FAILED BEFORE REMOTE STAGE}
+          - **SHA:** \`$TARGET_SHA\`
+          - **Remote exit code:** ${REMOTE_RC:-N/A}
+          - **Workflow run:** $RUN_URL
+
+          This workflow rebuilds the learning worker image at an exact main SHA.
+          It does not merge, trade, place Kraken/Telegram credentials on the worker,
+          or auto-couple to core \`/deploy\`. After every core deploy, run matching
+          \`/deploy-learning <sha>\` before compute is healthy.
+          EOF
+          )
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/64/comments" -f body="$BODY" >/dev/null
+
+      - name: Fail unless learning deploy succeeded
+        if: always() && steps.learning_deploy.outputs.result != 'SUCCESS'
+        run: exit 1

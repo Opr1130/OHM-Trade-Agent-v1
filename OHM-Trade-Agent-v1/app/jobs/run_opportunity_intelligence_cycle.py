@@ -7,16 +7,25 @@ measurement-only and have no network access or trading authority.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
     build_outcomes_bounded,
     pending_accountability_outcomes,
 )
+from app.opip.learning.job_disposition import (
+    CONSUMED_EMPTY,
+    CONSUMED_OK,
+    write_consumption_summary,
+)
 from app.services.opportunity_accountability import (
     build_incremental_from_outcomes,
     resolved_accountability_outcomes,
 )
+
+# Learning worker mounts DATA_ROOT at /app/data.
+_DEFAULT_DATA_ROOT = Path("/app/data")
 
 
 def main() -> None:
@@ -57,25 +66,32 @@ def main() -> None:
     if accountability_error is not None:
         raise accountability_error
 
-    print(
-        json.dumps(
-            {
-                "status": "OK",
-                "new_outcomes_evaluated": newly_evaluated,
-                "accountability_handoff_rows": len(outcomes),
-                "accountability_handoff_resolved": len(resolved),
-                "accountability_handoff_acknowledged": acknowledged,
-                "replayed_handoff": replayed_handoff,
-                "population": summary.get("population", {}),
-                "opportunity_capture_rate_pct": summary.get(
-                    "opportunity_capture_rate_pct"
-                ),
-                "measurement_only": True,
-                "trade_authority_changed": False,
-            },
-            sort_keys=True,
+    pending_after = pending_accountability_outcomes()
+    empty = newly_evaluated == 0 and not outcomes and not pending_after
+    disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
+    payload = {
+        "status": "OK",
+        "new_outcomes_evaluated": newly_evaluated,
+        "accountability_handoff_rows": len(outcomes),
+        "accountability_handoff_resolved": len(resolved),
+        "accountability_handoff_acknowledged": acknowledged,
+        "accountability_pending_count": len(pending_after),
+        "replayed_handoff": replayed_handoff,
+        "population": summary.get("population", {}),
+        "opportunity_capture_rate_pct": summary.get(
+            "opportunity_capture_rate_pct"
+        ),
+        "measurement_only": True,
+        "trade_authority_changed": False,
+        "policy_change_authorized": False,
+    }
+    data_root = _DEFAULT_DATA_ROOT
+    if data_root.is_dir():
+        write_consumption_summary(
+            data_root, job="outcomes", disposition=disposition, payload=payload
         )
-    )
+
+    print(json.dumps(payload, sort_keys=True))
 
 
 if __name__ == "__main__":
