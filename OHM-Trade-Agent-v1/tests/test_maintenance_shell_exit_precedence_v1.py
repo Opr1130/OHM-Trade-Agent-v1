@@ -147,3 +147,25 @@ def test_command_ordering_is_reconcile_then_refresh_then_health(tmp_path):
     result = _run(tmp_path)
     stages = [_stage(c) for c in result.calls]
     assert stages.index("reconcile") < stages.index("refresh") < stages.index("health")
+
+
+def test_maintenance_nonzero_still_runs_reconcile_refresh_and_health(tmp_path):
+    result = _run(tmp_path, MAINTENANCE_EXIT=7)
+    stages = [_stage(c) for c in result.calls]
+    assert stages == ["maintenance", "reconcile", "refresh", "health"]
+    # All later stages succeeded, so maintenance's own exit code wins.
+    assert result.returncode == 7
+
+
+def test_maintenance_and_reconciliation_failures_together_prefer_reconciliation(tmp_path):
+    result = _run(tmp_path, MAINTENANCE_EXIT=7, RECONCILE_EXIT=2)
+    stages = [_stage(c) for c in result.calls]
+    assert stages == ["maintenance", "reconcile", "refresh", "health"]
+    assert result.returncode == 2
+
+
+def test_maintenance_failure_wins_over_refresh_and_health_when_reconcile_is_clean(tmp_path):
+    result = _run(tmp_path, MAINTENANCE_EXIT=7, REFRESH_EXIT=3, HEALTH_EXIT=2)
+    stages = [_stage(c) for c in result.calls]
+    assert stages == ["maintenance", "reconcile", "refresh", "health"]
+    assert result.returncode == 7
