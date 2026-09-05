@@ -211,5 +211,78 @@ else
   degrade
 fi
 
+# Read-only production runtime evidence for diagnosing a zero-signal state.
+# This deliberately reports only bounded scheduler/operator/scan counters. It
+# does not print credentials, environment variables, candidate payloads, or
+# mutate operator state, ranking, alerting, paper admission, or exchange state.
+if docker inspect ohm-trade-agent >/dev/null 2>&1 \
+   && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
+  runtime_data="$(
+    docker exec ohm-trade-agent python -c '
+import json
+from datetime import datetime, timedelta, timezone
+from app.services.operator_control import status_payload
+from app.services.operations_analytics import SCAN_ACTIVITY_FILE, _read_jsonl
+
+now = datetime.now(timezone.utc)
+operator = status_payload(now)
+rows = _read_jsonl(SCAN_ACTIVITY_FILE)
+
+def parsed(value):
+    if not value:
+        return None
+    try:
+        item = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if item.tzinfo is None:
+        item = item.replace(tzinfo=timezone.utc)
+    return item.astimezone(timezone.utc)
+
+recent = []
+for row in rows:
+    at = parsed(row.get("completed_at_utc") or row.get("timestamp_utc"))
+    if at is not None and at >= now - timedelta(hours=24):
+        recent.append(row)
+latest = rows[-1] if rows else {}
+last_at = parsed(latest.get("completed_at_utc") or latest.get("timestamp_utc"))
+last_age = None if last_at is None else max(0, int((now - last_at).total_seconds()))
+out = {
+    "override_mode": operator.get("override_mode"),
+    "effective_mode": operator.get("effective_mode"),
+    "reason": operator.get("reason"),
+    "quiet_hours": operator.get("quiet_hours"),
+    "search_allowed": operator.get("search_allowed"),
+    "search_due": operator.get("search_due"),
+    "search_interval_seconds": operator.get("search_interval_seconds"),
+    "occupied_slots": operator.get("occupied_slots"),
+    "active_trades": operator.get("active_trades"),
+    "pending_setups": operator.get("pending_setups"),
+    "live_order_intents": operator.get("live_order_intents"),
+    "cooldown_until": operator.get("cooldown_until"),
+    "scan_activity_rows_total": len(rows),
+    "scan_activity_rows_24h": len(recent),
+    "last_broad_scan_utc": (last_at.isoformat() if last_at else None),
+    "last_broad_scan_age_seconds": last_age,
+    "last_broad_scan_requested": latest.get("requested"),
+    "last_broad_scan_analyzed": latest.get("analyzed"),
+    "last_broad_scan_technical_shortlist": latest.get("technical_shortlist"),
+    "last_broad_scan_qualified_survivors": latest.get("qualified_survivors"),
+    "last_broad_scan_notifications_sent": latest.get("notifications_sent"),
+}
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+' 2>/dev/null || true
+  )"
+  if [[ -n "$runtime_data" ]]; then
+    echo "production_runtime_data=$runtime_data"
+  else
+    echo "production_runtime_data=UNAVAILABLE"
+    degrade
+  fi
+else
+  echo "production_runtime_data=CORE_CONTAINER_UNAVAILABLE"
+  degrade
+fi
+
 echo "diagnostics_status=$status"
 [[ "$status" != "FAIL" ]]
