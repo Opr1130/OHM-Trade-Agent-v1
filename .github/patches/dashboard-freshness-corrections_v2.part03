@@ -1,0 +1,185 @@
+th.stat().st_mode | stat.S_IEXEC)
++    return script_path
++
++
++def _fake_docker(tmp_path: Path) -> Path:
++    """A `docker` stand-in that logs the module it was asked to run (for
++    ordering assertions) and exits according to RECONCILE_EXIT /
++    REFRESH_EXIT / HEALTH_EXIT / MAINTENANCE_EXIT env vars."""
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir(exist_ok=True)
++    docker = bin_dir / "docker"
++    docker.write_text(
++        """#!/usr/bin/env bash
++args="$*"
++echo "$args" >> "$CALL_LOG"
++case "$args" in
++  *app.opip.data_platform.reconcile*) exit "${RECONCILE_EXIT:-0}" ;;
++  *refresh-freshness*) exit "${REFRESH_EXIT:-0}" ;;
++  *app.opip.data_platform.health*) exit "${HEALTH_EXIT:-0}" ;;
++  *app.opip.data_platform.maintenance*) exit "${MAINTENANCE_EXIT:-0}" ;;
++  *) exit 0 ;;
++esac
++""",
++        encoding="utf-8",
++    )
++    docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
++    return bin_dir
++
++
++def _run(tmp_path: Path, **exit_codes: int) -> subprocess.CompletedProcess:
++    script_path = _prepare_script(tmp_path)
++    bin_dir = _fake_docker(tmp_path)
++    call_log = tmp_path / "calls.log"
++    call_log.write_text("", encoding="utf-8")
++    env = dict(os.environ)
++    env["PATH"] = f"{bin_dir}:{env['PATH']}"
++    env["CALL_LOG"] = str(call_log)
++    for name, value in exit_codes.items():
++        env[name] = str(value)
++    result = subprocess.run(
++        ["bash", str(script_path)],
++        capture_output=True,
++        text=True,
++        env=env,
++        timeout=30,
++    )
++    result.calls = call_log.read_text(encoding="utf-8").splitlines()
++    return result
++
++
++def _stage(call: str) -> str:
++    if "app.opip.data_platform.reconcile" in call:
++        return "reconcile"
++    if "refresh-freshness" in call:
++        return "refresh"
++    if "app.opip.data_platform.health" in call:
++        return "health"
++    if "app.opip.data_platform.maintenance" in call:
++        return "maintenance"
++    return "unknown"
++
++
++def test_all_stages_succeed_exits_zero(tmp_path):
++    result = _run(tmp_path)
++    assert result.returncode == 0
++    assert [_stage(c) for c in result.calls] == ["maintenance", "reconcile", "refresh", "health"]
++
++
++def test_reconciliation_nonzero_still_runs_refresh_and_health(tmp_path):
++    result = _run(tmp_path, RECONCILE_EXIT=2)
++    stages = [_stage(c) for c in result.calls]
++    assert "refresh" in stages
++    assert "health" in stages
++    assert result.returncode == 2
++
++
++def test_refresh_nonzero_still_runs_health(tmp_path):
++    result = _run(tmp_path, REFRESH_EXIT=1)
++    stages = [_stage(c) for c in result.calls]
++    assert "health" in stages
++    assert result.returncode == 1
++
++
++def test_health_nonzero_is_preserved_when_earlier_stages_succeed(tmp_path):
++    result = _run(tmp_path, HEALTH_EXIT=2)
++    assert result.returncode == 2
++
++
++def test_reconciliation_status_takes_precedence_over_other_failures(tmp_path):
++    result = _run(tmp_path, RECONCILE_EXIT=2, REFRESH_EXIT=1, HEALTH_EXIT=2)
++    stages = [_stage(c) for c in result.calls]
++    # Every stage still ran even though reconciliation already failed.
++    assert stages == ["maintenance", "reconcile", "refresh", "health"]
++    # Reconciliation's exit code wins over the later refresh/health failures.
++    assert result.returncode == 2
++
++
++def test_refresh_failure_takes_precedence_over_health_failure_when_reconcile_is_clean(tmp_path):
++    result = _run(tmp_path, REFRESH_EXIT=3, HEALTH_EXIT=2)
++    assert result.returncode == 3
++
++
++def test_command_ordering_is_reconcile_then_refresh_then_health(tmp_path):
++    result = _run(tmp_path)
++    stages = [_stage(c) for c in result.calls]
++    assert stages.index("reconcile") < stages.index("refresh") < stages.index("health")
+diff --git a/OHM-Trade-Agent-v1/tests/test_opip_dashboard_freshness_v1.py b/OHM-Trade-Agent-v1/tests/test_opip_dashboard_freshness_v1.py
+index d4b6209..35fdcf5 100644
+--- a/OHM-Trade-Agent-v1/tests/test_opip_dashboard_freshness_v1.py
++++ b/OHM-Trade-Agent-v1/tests/test_opip_dashboard_freshness_v1.py
+@@ -24,10 +24,16 @@ from app.opip.data_platform.freshness import (
+     MaintenanceInput,
+     StreamInput,
+     classify_freshness,
++    classify_maintenance,
+     policy_fingerprint,
+     stream_policy_snapshot,
+ )
+-from app.opip.data_platform.health import build_freshness, main as health_main
++from app.opip.data_platform.health import (
++    _maintenance_input,
++    _validate_policy_sync,
++    build_freshness,
++    main as health_main,
++)
+ from app.opip.data_platform.migrations import (
+     apply_migrations,
+     discover_migrations,
+@@ -990,7 +996,7 @@ def test_real_migration_and_sync_round_trip(pg_connection):
+         cursor.execute(
+             "SELECT max(version) FROM ops.schema_version"
+         )
+-        assert cursor.fetchone()[0] == 5
++        assert cursor.fetchone()[0] == 6
+         cursor.execute("SELECT count(*) FROM ops.required_stream")
+         assert cursor.fetchone()[0] == len(STREAM_SPECS)
+ 
+@@ -1120,3 +1126,215 @@ def test_python_raw_watermark_applies_7_day_observed_window(pg_connection):
+     assessment = freshness["streams"][stream]
+     assert assessment["status"] == "UNAVAILABLE"
+     assert assessment["reason"] == "MISSING_STREAM_ROW"
++
++
++# ---------------------------------------------------------------------------
++# Regression: MISSING_POLICY vs CONFIGURATION_DRIFT (review finding 3)
++# ---------------------------------------------------------------------------
++
++
++def test_classify_maintenance_distinguishes_missing_policy_from_configuration_drift():
++    """Pure-Python parity guard: an empty policy and a mutated/invalid
++    policy must never collapse to the identical MaintenanceInput state."""
++    now = _now()
++    missing = classify_maintenance(
++        MaintenanceInput(None, None, False, policy_empty=True), now=now
++    )
++    assert missing.status == "UNAVAILABLE"
++    assert missing.reason == "MISSING_POLICY"
++
++    drifted = classify_maintenance(
++        MaintenanceInput(None, None, True, policy_empty=False), now=now
++    )
++    assert drifted.status == "UNAVAILABLE"
++    assert drifted.reason == "CONFIGURATION_DRIFT"
++
++    assert missing.reason != drifted.reason
++
++
++def test_empty_required_stream_table_is_missing_policy_not_configuration_drift(pg_connection):
++    with pg_connection.cursor() as cursor:
++        cursor.execute("DELETE FROM ops.required_stream")
++    pg_connection.commit()
++
++    maintenance = _maintenance_input(pg_connection)
++    assert maintenance.policy_empty is True
++    assert maintenance.configuration_drift is False
++    result = classify_maintenance(maintenance, now=_now())
++    assert result.reason == "MISSING_POLICY"
++
++    canonical = _canonical_row(pg_connection, "__maintenance__")
++    assert canonical["reason"] == "MISSING_POLICY"
++    # Python and SQL must agree, not merely both fail closed.
++    assert canonical["status"] == result.status == "UNAVAILABLE"
++
++
++def test_mutated_required_stream_row_is_configuration_drift_not

@@ -1,0 +1,138 @@
+ursor() as cursor:
++            cursor.execute(
++                "UPDATE ops.required_stream SET threshold_seconds = 30 "
++                "WHERE stream_name = 'p1_shadow_outbox'"
++            )
++        connection.commit()
++        _insert_checkpoint(
++            connection, "p1_shadow_outbox", updated_at=_now() - timedelta(seconds=60)
++        )
++        row = _canonical_row(connection, "p1_shadow_outbox")
++        assert row["status"] == "STALE"
++        assert row["reason"] == "STALE_DATA"
+diff --git a/OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py b/OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py
+index 4a99e1a..8ed901a 100644
+--- a/OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py
++++ b/OHM-Trade-Agent-v1/tests/test_opip_data_platform_v1.py
+@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
+ 
+ def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
+     migrations = discover_migrations()
+-    assert [item.version for item in migrations] == [1, 2, 3, 4, 5]
++    assert [item.version for item in migrations] == [1, 2, 3, 4, 5, 6]
+     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
+     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
+         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql
+-- 
+2.43.0
+
+
+From 9ca0055a3cec00c9ae2ed6b40d36660205cf6137 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Sat, 5 Sep 2026 00:40:52 +0000
+Subject: [PATCH 2/2] Fix unguarded maintenance/prune call in exit-precedence
+ chain
+
+The prior commit (f1997d4) correctly captured RECONCILE_STATUS,
+REFRESH_STATUS, and HEALTH_STATUS but left the earlier
+'python -m app.opip.data_platform.maintenance --prune' call unguarded.
+Under set -Eeuo pipefail, a nonzero maintenance/prune exit terminated the
+script immediately, so reconcile -> refresh-freshness -> health never
+ran -- the exact defect this branch exists to fix, just one stage
+earlier than previously caught.
+
+- Capture MAINTENANCE_STATUS the same way as the other three stages
+  (|| MAINTENANCE_STATUS=$?) so set -e can never abort the script there.
+- All four stages (maintenance, reconcile, refresh-freshness, health)
+  now always run regardless of any earlier stage's exit code.
+- Updated precedence, documented inline beside the final exit logic:
+  reconciliation failure > maintenance failure > refresh-freshness
+  failure > health failure/non-ready > exit 0.
+- Extended test_maintenance_shell_exit_precedence_v1.py with the three
+  additional scenarios: MAINTENANCE_EXIT alone (later stages still run,
+  its exit code wins), MAINTENANCE_EXIT + RECONCILE_EXIT together
+  (reconciliation wins, all stages still run), and MAINTENANCE_EXIT with
+  REFRESH_EXIT/HEALTH_EXIT while reconciliation is clean (maintenance's
+  exit code wins over the later two). 10/10 pass.
+---
+ .../opip-data-platform-maintenance.sh         | 23 +++++++++++--------
+ ...st_maintenance_shell_exit_precedence_v1.py | 22 ++++++++++++++++++
+ 2 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/OHM-Trade-Agent-v1/deploy/analytics/opip-data-platform-maintenance.sh b/OHM-Trade-Agent-v1/deploy/analytics/opip-data-platform-maintenance.sh
+index 4e473bb..bfb8fdc 100755
+--- a/OHM-Trade-Agent-v1/deploy/analytics/opip-data-platform-maintenance.sh
++++ b/OHM-Trade-Agent-v1/deploy/analytics/opip-data-platform-maintenance.sh
+@@ -23,18 +23,20 @@ export OPIP_DEPLOYED_SHA="${DEPLOYED_SHA:-${OPIP_DEPLOYED_SHA:-}}"
+ exec 9>"$LOCK_FILE"
+ flock -n 9 || exit 0
+ 
+-docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
+-  python -m app.opip.data_platform.maintenance --prune
+-
+ # Explicit exit precedence (documented, deterministic):
+ #   1. a reconciliation failure (e.g. exit 2 for MISMATCH) always wins
+-#   2. otherwise a freshness-view refresh failure wins
+-#   3. otherwise a health failure/non-ready result wins
+-#   4. otherwise exit 0
+-# All three stages always run regardless of an earlier stage's exit status
++#   2. otherwise a maintenance/prune failure wins
++#   3. otherwise a freshness-view refresh failure wins
++#   4. otherwise a health failure/non-ready result wins
++#   5. otherwise exit 0
++# All four stages always run regardless of an earlier stage's exit status
+ # -- `set -e` is suspended around each `|| STATUS=$?` capture so a nonzero
+-# reconciliation or refresh result can never abort the script before health
+-# has had a chance to run.
++# maintenance, reconciliation, or refresh result can never abort the
++# script before the remaining stages have had a chance to run.
++MAINTENANCE_STATUS=0
++docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
++  python -m app.opip.data_platform.maintenance --prune || MAINTENANCE_STATUS=$?
++
+ RECONCILE_STATUS=0
+ docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
+   python -m app.opip.data_platform.reconcile || RECONCILE_STATUS=$?
+@@ -50,6 +52,9 @@ docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
+ if [[ "$RECONCILE_STATUS" -ne 0 ]]; then
+   exit "$RECONCILE_STATUS"
+ fi
++if [[ "$MAINTENANCE_STATUS" -ne 0 ]]; then
++  exit "$MAINTENANCE_STATUS"
++fi
+ if [[ "$REFRESH_STATUS" -ne 0 ]]; then
+   exit "$REFRESH_STATUS"
+ fi
+diff --git a/OHM-Trade-Agent-v1/tests/test_maintenance_shell_exit_precedence_v1.py b/OHM-Trade-Agent-v1/tests/test_maintenance_shell_exit_precedence_v1.py
+index 24e9ace..9f6cfb5 100644
+--- a/OHM-Trade-Agent-v1/tests/test_maintenance_shell_exit_precedence_v1.py
++++ b/OHM-Trade-Agent-v1/tests/test_maintenance_shell_exit_precedence_v1.py
+@@ -147,3 +147,25 @@ def test_command_ordering_is_reconcile_then_refresh_then_health(tmp_path):
+     result = _run(tmp_path)
+     stages = [_stage(c) for c in result.calls]
+     assert stages.index("reconcile") < stages.index("refresh") < stages.index("health")
++
++
++def test_maintenance_nonzero_still_runs_reconcile_refresh_and_health(tmp_path):
++    result = _run(tmp_path, MAINTENANCE_EXIT=7)
++    stages = [_stage(c) for c in result.calls]
++    assert stages == ["maintenance", "reconcile", "refresh", "health"]
++    # All later stages succeeded, so maintenance's own exit code wins.
++    assert result.returncode == 7
++
++
++def test_maintenance_and_reconciliation_failures_together_prefer_reconciliation(tmp_path):
++    result = _run(tmp_path, MAINTENANCE_EXIT=7, RECONCILE_EXIT=2)
++    stages = [_stage(c) for c in result.calls]
++    assert stages == ["maintenance", "reconcile", "refresh", "health"]
++    assert result.returncode == 2
++
++
++def test_maintenance_failure_wins_over_refresh_and_health_when_reconcile_is_clean(tmp_path):
++    result = _run(tmp_path, MAINTENANCE_EXIT=7, REFRESH_EXIT=3, HEALTH_EXIT=2)
++    stages = [_stage(c) for c in result.calls]
++    assert stages == ["maintenance", "reconcile", "refresh", "health"]
++    assert result.returncode == 7
+-- 
+2.43.0
+

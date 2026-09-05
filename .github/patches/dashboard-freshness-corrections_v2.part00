@@ -1,0 +1,134 @@
+From f1997d45b4db6470b9550864a9ab8e954389e7ba Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Sat, 5 Sep 2026 00:28:36 +0000
+Subject: [PATCH 1/2] Fix final dashboard freshness review blockers
+
+1) Maintenance shell exit precedence: reconcile, refresh-freshness, and
+   health now all always run regardless of an earlier stage's exit code
+   (each captured via || STATUS=$? instead of letting set -e abort the
+   script). Explicit precedence: reconciliation failure > refresh-freshness
+   failure > health failure > exit 0, documented inline. 7 new tests
+   execute the real script against a stubbed docker binary to prove
+   ordering and precedence, including the case a MISMATCH previously
+   could have been masked by a later refresh/health failure.
+
+2) Added a direct parity test that parses migration 005's hard-coded
+   expected_policy VALUES block and compares it field-by-field against
+   stream_policy_snapshot(). As of this commit the two already match
+   exactly (verified before writing any fix), so migration 005 is
+   untouched -- the test is a tripwire against future drift, and a
+   meta-test proves it actually detects a missing stream, an extra
+   stream, a required-flag mismatch, a typed-projection mismatch, and a
+   threshold_seconds mismatch (each independently).
+
+3) MaintenanceInput gained a policy_empty field, distinct from
+   configuration_drift. health._maintenance_input() now reports
+   policy_empty=True only for a genuinely empty ops.required_stream
+   table; a nonempty-but-invalid/mutated table still reports
+   configuration_drift=True. classify_maintenance() checks policy_empty
+   first (-> MISSING_POLICY), matching the SQL maintenance_eval CTE's
+   existing NOT meta.present / NOT meta.uniform_fingerprint ordering,
+   which Python had not mirrored. Direct real-Postgres tests cover all
+   four states: empty policy, mutated policy, valid policy with no
+   maintenance run, valid policy with a current successful run.
+
+4) migrations.py's sync-required-streams command now calls
+   refresh_freshness_view() instead of the broad
+   refresh_materialized_views(), which was needlessly recomputing the
+   unrelated intelligence/attrition/rejection-mix/accountability
+   aggregate views on every policy sync.
+
+5) Optional/non-required stream classification now honors the
+   synchronized threshold_seconds (falling back to 86400s only when it
+   is null) in BOTH classify_stream() (Python) and ops.freshness_reason()
+   (SQL) -- both had hard-coded the 86400s bound and ignored the
+   already-plumbed-through threshold_seconds value/parameter.
+
+Migration safety: 005_dashboard_freshness.sql is unmodified (may already
+be applied in real databases; mutating it would break checksum
+validation there). The finding-5 SQL fix instead lands as a new
+006_freshness_threshold_parity.sql doing CREATE OR REPLACE FUNCTION
+ops.freshness_reason(...), which is idempotent. New tests prove a
+database already migrated through 005 and then given 006 as a follow-up
+reaches byte-identical classification behavior to a fresh 001-006
+install.
+
+No trading/ranking/alert/paper-admission/execution logic touched. No
+Grafana files touched.
+---
+ .../app/opip/data_platform/freshness.py       |  28 ++-
+ .../app/opip/data_platform/health.py          |   2 +-
+ .../app/opip/data_platform/migrations.py      |   2 +-
+ .../006_freshness_threshold_parity.sql        |  68 ++++++
+ .../opip-data-platform-maintenance.sh         |  28 ++-
+ ...shboard_freshness_review_regressions_v1.py |  95 ++++++++
+ ...st_maintenance_shell_exit_precedence_v1.py | 149 ++++++++++++
+ .../tests/test_opip_dashboard_freshness_v1.py | 222 +++++++++++++++++-
+ .../tests/test_opip_data_platform_v1.py       |   2 +-
+ 9 files changed, 578 insertions(+), 18 deletions(-)
+ create mode 100644 OHM-Trade-Agent-v1/app/opip/data_platform/migrations/006_freshness_threshold_parity.sql
+ create mode 100644 OHM-Trade-Agent-v1/tests/test_maintenance_shell_exit_precedence_v1.py
+
+diff --git a/OHM-Trade-Agent-v1/app/opip/data_platform/freshness.py b/OHM-Trade-Agent-v1/app/opip/data_platform/freshness.py
+index df991e7..406bf20 100644
+--- a/OHM-Trade-Agent-v1/app/opip/data_platform/freshness.py
++++ b/OHM-Trade-Agent-v1/app/opip/data_platform/freshness.py
+@@ -112,6 +112,7 @@ class MaintenanceInput:
+     latest_finished_at: datetime | None
+     configuration_drift: bool
+     required: bool = True
++    policy_empty: bool = False
+ 
+ 
+ def _timestamp_status(
+@@ -172,11 +173,16 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
+     if not item.required:
+         reference = stamps["last_ingested_at"] or stamps["source_updated_at"]
+         age = _age_seconds(reference, now)
+-        if (
+-            reference is not None
+-            and age is not None
+-            and age <= NON_REQUIRED_MAX_AGE_SECONDS
+-        ):
++        # Configured threshold_seconds (part of the synchronized policy and
++        # its fingerprint) takes precedence; 86400s is only the fallback
++        # for a stream whose policy leaves threshold_seconds unset, so
++        # Python and SQL (ops.freshness_reason) apply identical logic.
++        threshold = (
++            item.threshold_seconds
++            if item.threshold_seconds is not None
++            else NON_REQUIRED_MAX_AGE_SECONDS
++        )
++        if reference is not None and age is not None and age <= threshold:
+             return StreamAssessment("LIVE", None, reference, age, ())
+         return StreamAssessment("STALE", "STALE_DATA", reference, age, ())
+ 
+@@ -222,7 +228,17 @@ def classify_stream(item: StreamInput, *, now: datetime) -> StreamAssessment:
+ def classify_maintenance(
+     item: MaintenanceInput, *, now: datetime
+ ) -> MaintenanceAssessment:
+-    """Classify the latest maintenance evidence."""
++    """Classify the latest maintenance evidence.
++
++    An empty ops.required_stream policy table (MISSING_POLICY) and a
++    nonempty but invalid/mutated policy (CONFIGURATION_DRIFT) are distinct
++    failure modes -- mirrors ops.dashboard_freshness_v's maintenance_eval,
++    which checks `NOT meta.present` (MISSING_POLICY) before
++    `NOT meta.uniform_fingerprint` / `NOT policy_complete`
++    (CONFIGURATION_DRIFT).
++    """
++    if item.policy_empty:
++        return MaintenanceAssessment("UNAVAILABLE", "MISSING_POLICY", True)
+     if item.configuration_drift:
+         return MaintenanceAssessment("UNAVAILABLE", "CONFIGURATION_DRIFT", True)
+ 
+diff --git a/OHM-Trade-Agent-v1/app/opip/data_platform/health.py b/OHM-Trade-Agent-v1/app/opip/data_platform/health.py
+index b9ea3a0..36ee14c 100644
+--- a/OHM-Trade-Agent-v1/app/opip/data_platform/health.py
++++ b/OHM-Trade-Agent-v1/app/opip/data_platform/health.py
+@@ -223,7 +223,7 @@ def _maintenance_input(connection: Any) -> MaintenanceInput:
+         policy_count, fingerprint_count, current_fingerprint = cursor.fetchone()
+ 
+     if int(policy_count) == 0:
+-        return MaintenanceInput(None, None, True)
++        return MaintenanceInput(None, None, F
