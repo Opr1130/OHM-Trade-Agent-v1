@@ -16,7 +16,8 @@ import stat
 import subprocess
 from pathlib import Path
 
-SCRIPT = Path("deploy/analytics/opip-data-platform-maintenance.sh")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
 
 
 def _prepare_script(tmp_path: Path) -> Path:
