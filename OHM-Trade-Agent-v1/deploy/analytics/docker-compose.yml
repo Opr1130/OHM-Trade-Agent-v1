@@ -153,6 +153,7 @@ services:
       - --watch
     volumes:
       - /var/lib/opip-learning/data:/data:ro
+      - /etc/opip-data-platform/tls/postgres-ca.crt:/etc/opip-data-platform/tls/postgres-ca.crt:ro
     networks:
       opip-analytics:
     read_only: true
@@ -189,6 +190,7 @@ services:
     volumes:
       - /var/lib/opip-learning/data:/data:ro
       - /var/backups/opip-postgres:/backups:rw
+      - /etc/opip-data-platform/tls/postgres-ca.crt:/etc/opip-data-platform/tls/postgres-ca.crt:ro
     networks:
       opip-analytics:
     read_only: true
