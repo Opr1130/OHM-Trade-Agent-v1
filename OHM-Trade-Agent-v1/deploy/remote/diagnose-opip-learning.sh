@@ -221,12 +221,35 @@ if docker inspect ohm-trade-agent >/dev/null 2>&1 \
     docker exec ohm-trade-agent python -c '
 import json
 from datetime import datetime, timedelta, timezone
-from app.services.operator_control import status_payload
+from zoneinfo import ZoneInfo
+from app.services.active_trade_registry import get_active_trades
+from app.services.operator_control import (
+    DEFAULT_TIMEZONE,
+    MAX_OCCUPIED_SLOTS,
+    NORMAL_SEARCH_INTERVAL_SECONDS,
+    QUIET_END_HOUR,
+    QUIET_START_HOUR,
+    STATE_FILE,
+    THROTTLE_AT_SLOTS,
+    THROTTLED_SEARCH_INTERVAL_SECONDS,
+    VALID_OVERRIDES,
+)
 from app.services.operations_analytics import SCAN_ACTIVITY_FILE, _read_jsonl
+from app.services.order_intent_registry import get_live_order_intents
+from app.services.pending_setup_registry import get_pending_setups
+from app.services.registry_io import load_json
 
 now = datetime.now(timezone.utc)
-operator = status_payload(now)
-rows = _read_jsonl(SCAN_ACTIVITY_FILE)
+state = load_json(STATE_FILE)
+override = str(state.get("override_mode") or "AUTO").upper()
+if override not in VALID_OVERRIDES:
+    override = "AUTO"
+active_count = len(get_active_trades())
+pending_count = len(get_pending_setups())
+order_count = len(get_live_order_intents())
+occupied = active_count + order_count
+local_hour = now.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).hour
+quiet = local_hour >= QUIET_START_HOUR or local_hour < QUIET_END_HOUR
 
 def parsed(value):
     if not value:
@@ -239,6 +262,52 @@ def parsed(value):
         item = item.replace(tzinfo=timezone.utc)
     return item.astimezone(timezone.utc)
 
+cooldown_until = parsed(state.get("cooldown_until"))
+if override == "MAINTENANCE":
+    effective = "MAINTENANCE"
+    search_allowed = False
+    interval = 0
+    reason = "operator override"
+elif override == "MONITOR":
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "operator override"
+elif override == "SEARCH":
+    effective = "SEARCH"
+    search_allowed = True
+    interval = THROTTLED_SEARCH_INTERVAL_SECONDS if occupied >= THROTTLE_AT_SLOTS else NORMAL_SEARCH_INTERVAL_SECONDS
+    reason = "operator override"
+elif quiet:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "quiet hours 23:00-05:00 America/New_York"
+elif occupied >= MAX_OCCUPIED_SLOTS:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "portfolio capacity reached"
+elif cooldown_until is not None and now < cooldown_until:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "capacity-release cooldown"
+else:
+    effective = "SEARCH"
+    search_allowed = True
+    interval = THROTTLED_SEARCH_INTERVAL_SECONDS if occupied >= THROTTLE_AT_SLOTS else NORMAL_SEARCH_INTERVAL_SECONDS
+    reason = "throttled search: two occupied slots" if occupied >= THROTTLE_AT_SLOTS else "capacity available"
+last_search_started = parsed(state.get("last_search_started_at"))
+search_due = bool(
+    search_allowed
+    and (
+        last_search_started is None
+        or (now - last_search_started).total_seconds() >= interval
+    )
+)
+
+rows = _read_jsonl(SCAN_ACTIVITY_FILE)
 recent = []
 for row in rows:
     at = parsed(row.get("completed_at_utc") or row.get("timestamp_utc"))
@@ -248,18 +317,19 @@ latest = rows[-1] if rows else {}
 last_at = parsed(latest.get("completed_at_utc") or latest.get("timestamp_utc"))
 last_age = None if last_at is None else max(0, int((now - last_at).total_seconds()))
 out = {
-    "override_mode": operator.get("override_mode"),
-    "effective_mode": operator.get("effective_mode"),
-    "reason": operator.get("reason"),
-    "quiet_hours": operator.get("quiet_hours"),
-    "search_allowed": operator.get("search_allowed"),
-    "search_due": operator.get("search_due"),
-    "search_interval_seconds": operator.get("search_interval_seconds"),
-    "occupied_slots": operator.get("occupied_slots"),
-    "active_trades": operator.get("active_trades"),
-    "pending_setups": operator.get("pending_setups"),
-    "live_order_intents": operator.get("live_order_intents"),
-    "cooldown_until": operator.get("cooldown_until"),
+    "override_mode": override,
+    "effective_mode": effective,
+    "reason": reason,
+    "quiet_hours": quiet,
+    "search_allowed": search_allowed,
+    "search_due": search_due,
+    "search_interval_seconds": interval,
+    "occupied_slots": occupied,
+    "active_trades": active_count,
+    "pending_setups": pending_count,
+    "live_order_intents": order_count,
+    "cooldown_until": (cooldown_until.isoformat() if cooldown_until else None),
+    "last_search_started_at": (last_search_started.isoformat() if last_search_started else None),
     "scan_activity_rows_total": len(rows),
     "scan_activity_rows_24h": len(recent),
     "last_broad_scan_utc": (last_at.isoformat() if last_at else None),
