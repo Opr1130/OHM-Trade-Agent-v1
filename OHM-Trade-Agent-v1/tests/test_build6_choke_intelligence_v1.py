@@ -2,6 +2,10 @@
 
 These tests exercise the diagnose-learning aggregation path only. They do not
 change thresholds, ranking, alerts, paper admission, or exchange authority.
+
+Synthetic JSONL scenarios remain as aggregation/edge-case contracts. The
+producer-integration tests below cross the real GateResult → QualificationFunnel
+→ append_funnel_events → build_recent_qualification_funnel boundary.
 """
 
 from __future__ import annotations
@@ -11,9 +15,20 @@ import ast
 import json
 from pathlib import Path
 
+from app.exchanges.kraken import KrakenAPIError
+from app.opip.decision import store
+from app.opip.decision.observer import OPipScanObserver
 from app.opip.decision.summary import (
     build_recent_qualification_funnel,
     render_recent_qualification_funnel,
+)
+from app.scanner.execution_validation import ExecutionValidation
+from app.scanner.margin_eligibility import validate_short_margin_eligibility
+from app.scanner.models import MarketSnapshot
+from app.scanner.reference_market_validation import ReferenceMarketValidation
+from app.services.chief_analyst import (
+    _prefilter_evidence,
+    _quality_by_risk_level,
 )
 
 
@@ -569,3 +584,313 @@ def test_build6_measurement_only_summary_has_no_exchange_authority_imports():
     assert not (imported & forbidden)
     assert "measurement_only" in source
     assert "policy_change_authorized" in source
+
+
+# ---------------------------------------------------------------------------
+# Producer → persistence → diagnostic integration (real GateResult schema)
+# ---------------------------------------------------------------------------
+
+
+class _MarginFailClient:
+    """Kraken margin-pair client that fails closed like a venue outage."""
+
+    def get_asset_pairs(self, execution_venue=None):
+        raise KrakenAPIError("margin discovery unavailable")
+
+
+def _install_funnel_store(monkeypatch, tmp_path):
+    """Point production funnel persistence at an isolated temp tree."""
+    funnel = tmp_path / "funnel_events.jsonl"
+    screening = tmp_path / "screening.jsonl"
+    summaries = tmp_path / "scan_summaries.jsonl"
+    dead = tmp_path / "dead.jsonl"
+    monkeypatch.setattr(store, "FUNNEL_EVENTS_FILE", funnel)
+    monkeypatch.setattr(store, "SCAN_SUMMARIES_FILE", summaries)
+    monkeypatch.setattr(store, "SCREENING_EVALUATIONS_FILE", screening)
+    monkeypatch.setattr(store, "DEAD_LETTER_FILE", dead)
+    monkeypatch.setenv("OPIP_FUNNEL_TELEMETRY_ENABLED", "true")
+    screening.write_text("", encoding="utf-8")
+    return funnel, screening, summaries
+
+
+def _short_snapshot(*, symbol="SHORTUSD", price=90.0):
+    return MarketSnapshot(
+        symbol=symbol,
+        last_price=price,
+        ema20=price * 1.02,
+        ema50=price * 1.05,
+        ema200=price * 1.10,
+        rsi=45.0,
+        macd_line=-2.0,
+        macd_signal=-1.0,
+        macd_histogram=-1.0,
+        atr=price * 0.02,
+        atr_pct=2.0,
+        volume_ratio=1.6,
+        technical_score=85,
+        trend="bearish",
+        recent_24h_high=price * 1.10,
+        recent_24h_low=price * 0.90,
+        recent_72h_high=price * 1.20,
+        recent_72h_low=price * 0.80,
+        momentum_6h_pct=-1.0,
+        momentum_24h_pct=-3.0,
+        momentum_72h_pct=-6.0,
+        underlying_asset=symbol.removesuffix("USD"),
+        primary_pair=symbol,
+        primary_quote_currency="USD",
+        combined_24h_liquidity_usd=1_000_000.0,
+        ticker_last=price,
+        trade_direction="SHORT",
+        kraken_public_symbol=f"{symbol.removesuffix('USD')}/USD",
+    )
+
+
+def _long_no_economic_snapshot(*, symbol="RAYUSD", price=100.0):
+    """Realistic LONG snapshot that fails the deterministic economic prefilter."""
+    snap = MarketSnapshot(
+        symbol=symbol,
+        last_price=price,
+        ema20=price * 0.99,
+        ema50=price * 0.95,
+        ema200=price * 0.90,
+        rsi=55.0,
+        macd_line=1.0,
+        macd_signal=0.5,
+        macd_histogram=0.5,
+        atr=price * 0.0005,
+        atr_pct=0.05,
+        volume_ratio=1.5,
+        technical_score=90,
+        trend="bullish",
+        recent_24h_high=price * 1.20,
+        recent_24h_low=price * 0.94,
+        recent_72h_high=price * 1.30,
+        recent_72h_low=price * 0.88,
+        momentum_6h_pct=1.0,
+        momentum_24h_pct=3.0,
+        momentum_72h_pct=7.0,
+        distance_to_24h_high_pct=16.0,
+        distance_to_72h_high_pct=23.0,
+        realized_range_24h_pct=16.0,
+        realized_range_72h_pct=28.0,
+        average_hourly_range_24h_pct=1.0,
+        average_hourly_range_72h_pct=1.1,
+        rolling_24h_range_median_pct=8.0,
+        rolling_24h_range_p75_pct=10.0,
+        rolling_24h_range_p90_pct=12.0,
+        rolling_72h_range_median_pct=12.0,
+        rolling_72h_range_p75_pct=16.0,
+        rolling_72h_range_p90_pct=20.0,
+        rolling_24h_upside_median_pct=6.0,
+        rolling_24h_upside_p75_pct=8.0,
+        rolling_24h_upside_p90_pct=10.0,
+        rolling_72h_upside_median_pct=10.0,
+        rolling_72h_upside_p75_pct=14.0,
+        rolling_72h_upside_p90_pct=18.0,
+        underlying_asset=symbol.removesuffix("USD"),
+        primary_pair=symbol,
+        primary_quote_currency="USD",
+        combined_24h_liquidity_usd=5_000_000.0,
+        primary_24h_liquidity_usd=5_000_000.0,
+        cross_pair_confirmation_status="CONFIRMED",
+        ticker_last=price,
+        trade_direction="LONG",
+    )
+    snap.execution_validation = ExecutionValidation(
+        status="VALID",
+        book_coverage_status="COMPLETE",
+        warnings=[],
+        validation_notional_usd=2_000.0,
+        spread_bps=6.0,
+        estimated_visible_round_trip_market_drag_pct=0.25,
+        recent_trade_status="FRESH",
+    )
+    snap.independent_market_reference = ReferenceMarketValidation(
+        status="CONFIRMED",
+        available=True,
+        mapping_status="UNIQUE",
+        api_mode="KEYLESS",
+        coingecko_id="asset",
+        coingecko_name="Asset",
+        matched_candidate_count=1,
+        reference_price_usd=price,
+        kraken_normalized_price_usd=price,
+        price_divergence_pct=0.0,
+    )
+    return snap
+
+
+def test_build6_producer_margin_unavailable_through_observer_persistence(
+    monkeypatch, tmp_path
+):
+    """Real margin producer → funnel persistence → diagnose aggregation.
+
+    Boundary under test:
+    validate_short_margin_eligibility
+      → OPipScanObserver.record_margin → evaluate_margin_gate
+      → QualificationFunnel.funnel_events (AdmissionDecision.as_dict)
+      → store.append_funnel_events
+      → build_recent_qualification_funnel / render_recent_qualification_funnel
+    """
+    funnel, screening, summaries = _install_funnel_store(monkeypatch, tmp_path)
+    candidate = _short_snapshot()
+    validate_short_margin_eligibility(
+        [candidate], client=_MarginFailClient()
+    )
+    assert candidate.margin_validation_status == "UNAVAILABLE"
+
+    observer = OPipScanObserver(
+        snapshots=[candidate],
+        decision_at=NOW,
+        account_equity=10_000.0,
+        telemetry_enabled=True,
+    )
+    observer.register_candidates([candidate])
+    observer.record_margin([candidate])
+    observer.finalize(scan_context={}, print_summary=False)
+
+    persisted = store.read_jsonl(funnel)
+    assert len(persisted) == 1
+    assert persisted[0]["first_terminal_gate"] == "MARGIN_ELIGIBILITY"
+    assert persisted[0]["terminal_reason_code"] == "MARGIN_VALIDATION_UNAVAILABLE"
+    assert persisted[0]["decision"] == "OPERATIONAL_FAILURE"
+    # GateResult came from evaluate_margin_gate, not a handcrafted dict.
+    margin_gate = next(
+        gate
+        for gate in persisted[0]["gate_results"]
+        if gate["gate"] == "MARGIN_ELIGIBILITY"
+    )
+    assert margin_gate["status"] == "FAIL"
+    assert margin_gate["reason_code"] == "MARGIN_VALIDATION_UNAVAILABLE"
+    assert margin_gate["reason_class"] == "OPERATIONAL"
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+    rendered = render_recent_qualification_funnel(report)
+
+    assert report["margin_error"] == 1
+    assert report["margin_reject"] == 0
+    assert report["choke_analysis"]["margin_eligibility"]["errors"] == 1
+    assert report["choke_analysis"]["margin_eligibility"][
+        "rejection_reason_counts"
+    ] == {"MARGIN_VALIDATION_UNAVAILABLE": 1}
+    assert report["terminal_gate_counts"] == {"MARGIN_ELIGIBILITY": 1}
+    assert report["funnel_invariant_holds"] is True
+    assert "MARGIN_ERRORS=1" in rendered
+    assert "MARGIN_VALIDATION_UNAVAILABLE" in rendered
+    assert "PRIMARY_OPERATIONAL_CHOKE=MARGIN_ELIGIBILITY" in rendered
+
+
+def test_build6_producer_deterministic_policy_reject_through_observer_persistence(
+    monkeypatch, tmp_path
+):
+    """Real prefilter producer → observer persistence → diagnose aggregation.
+
+    Boundary under test:
+    chief_analyst._quality_by_risk_level + _prefilter_evidence
+      → OPipScanObserver._record_prefilter (production GateResult builder)
+      → QualificationFunnel.funnel_events (AdmissionDecision.as_dict)
+      → store.append_funnel_events
+      → build_recent_qualification_funnel / render_recent_qualification_funnel
+    """
+    funnel, screening, summaries = _install_funnel_store(monkeypatch, tmp_path)
+    candidate = _long_no_economic_snapshot()
+    account_equity = 10_000.0
+    quality_by_risk_level, viable = _quality_by_risk_level(
+        candidate, account_equity
+    )
+    assert viable is False
+    prefilter_row = _prefilter_evidence(candidate, quality_by_risk_level)
+    assert prefilter_row["binding_metric"]
+    assert prefilter_row["binding_measured"] is not None
+    assert prefilter_row["binding_threshold"] is not None
+    assert prefilter_row["risk_levels"]
+
+    observer = OPipScanObserver(
+        snapshots=[candidate],
+        decision_at=NOW,
+        account_equity=account_equity,
+        telemetry_enabled=True,
+    )
+    observer.register_candidates([candidate])
+    # LONG margin gate is SKIPPED (not applicable); deterministic is terminal.
+    observer.record_margin([candidate])
+    observer._record_prefilter([prefilter_row])
+    observer.finalize(scan_context={}, print_summary=False)
+
+    persisted = store.read_jsonl(funnel)
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event["first_terminal_gate"] == "DETERMINISTIC_QUALITY"
+    assert event["terminal_reason_code"] == "DETERMINISTIC_VIABILITY_FAILED"
+    assert event["decision"] == "REJECTED"
+    det_gate = next(
+        gate
+        for gate in event["gate_results"]
+        if gate["gate"] == "DETERMINISTIC_QUALITY"
+    )
+    assert det_gate["status"] == "FAIL"
+    assert det_gate["reason_class"] == "POLICY"
+    assert det_gate["metadata"]["binding_metric"] == prefilter_row["binding_metric"]
+    assert det_gate["measured_value"] == prefilter_row["binding_measured"]
+    assert det_gate["threshold"] == prefilter_row["binding_threshold"]
+    assert set(det_gate["metadata"]["risk_levels"]) == set(
+        prefilter_row["risk_levels"]
+    )
+    assert det_gate["threshold_distance"] is not None
+
+    report = build_recent_qualification_funnel(
+        funnel_events_path=funnel,
+        screening_evaluations_path=screening,
+        scan_summaries_path=summaries,
+        now=NOW,
+    )
+    rendered = render_recent_qualification_funnel(report)
+    deterministic = report["choke_analysis"]["deterministic_viability"]
+    sample = deterministic["policy_reject_samples"][0]
+
+    assert report["deterministic_policy_reject_count"] == 1
+    assert report["deterministic_operational_error_count"] == 0
+    assert deterministic["rejects"] == 1
+    assert deterministic["errors"] == 0
+    assert sample["binding_metric"] == str(
+        prefilter_row["binding_metric"]
+    ).upper()
+    assert sample["measured_value"] == prefilter_row["binding_measured"]
+    assert sample["threshold"] == prefilter_row["binding_threshold"]
+    assert set(sample["risk_levels_evaluated"]) == {
+        str(level).upper() for level in prefilter_row["risk_levels"]
+    }
+    expected_gap_pct = round(abs(float(det_gate["threshold_distance"])) * 100.0, 4)
+    assert deterministic["nearest_threshold_gap_pct"] == expected_gap_pct
+    assert deterministic["median_threshold_gap_pct"] == expected_gap_pct
+    assert "DETERMINISTIC_POLICY_REJECT_COUNT=1" in rendered
+    assert "DETERMINISTIC_OPERATIONAL_ERROR_COUNT=0" in rendered
+    assert sample["binding_metric"] in rendered
+
+
+def test_build6_producer_deterministic_operational_error_is_not_emitted_by_gate():
+    """Document the production boundary for deterministic operational errors.
+
+    ``evaluate_deterministic_quality_gate`` and ``OPipScanObserver._record_prefilter``
+    emit POLICY FAIL / PASS only. Shadow-engine exceptions become
+    ``FINAL_QUALIFICATION`` ERROR, not ``DETERMINISTIC_QUALITY`` ERROR.
+    Aggregation coverage for DETERMINISTIC operational errors therefore remains
+    in the synthetic contract tests above; no alternate production GateResult
+    producer exists for this gate/status pair.
+    """
+    from app.opip.decision.gates import evaluate_deterministic_quality_gate
+    from app.opip.decision.models import GateStatus, ReasonCode
+
+    candidate = _long_no_economic_snapshot()
+    result = evaluate_deterministic_quality_gate(
+        candidate, account_equity=10_000.0, evaluated_at=NOW
+    )
+    assert result.status is GateStatus.FAIL
+    assert result.reason_code is ReasonCode.DETERMINISTIC_VIABILITY_FAILED
+    assert result.status is not GateStatus.ERROR
