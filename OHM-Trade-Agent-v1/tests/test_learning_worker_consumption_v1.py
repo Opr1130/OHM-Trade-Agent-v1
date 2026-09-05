@@ -125,10 +125,22 @@ def test_learning_job_shell_admission_writes_blocked_disposition(tmp_path: Path)
     assert payload["disposition"] == jd.BLOCKED_RELEASE_DRIFT
     assert payload["release_compatibility_status"] == jd.RELEASE_DRIFT
 
+    # Exact SHA clears the release gate. Put stubs ahead of real docker so CI
+    # hosts with docker installed cannot pull a fake image tag.
     (data / "manifest.env").write_bytes(
         f"schema_version=3\nproduction_deployed_sha={worker}\n".encode("utf-8")
     )
-    # Exact SHA admits past release gate; without docker the runner exits 69.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("docker", "timeout"):
+        stub = bin_dir / name
+        stub.write_text(
+            "#!/usr/bin/env bash\nexit 42\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        stub.chmod(0o755)
+    env["PATH"] = f"{bin_dir}{__import__('os').pathsep}{env.get('PATH', '')}"
     ok = subprocess.run(
         ["bash", str(LEARNING / "opip-learning-job.sh"), "capture"],
         check=False,
@@ -136,10 +148,8 @@ def test_learning_job_shell_admission_writes_blocked_disposition(tmp_path: Path)
         text=True,
         env=env,
     )
-    assert ok.returncode == 69, (ok.stdout, ok.stderr)
-    assert "missing learning-runner command: docker" in ok.stderr or (
-        "missing learning-runner command: timeout" in ok.stderr
-    )
+    assert ok.returncode == 42, (ok.stdout, ok.stderr)
+    assert jd.read_disposition_env(state, "capture")["disposition"] == jd.FAILED_TERMINAL
 
 
 def test_export_manifest_includes_production_deployed_sha():
