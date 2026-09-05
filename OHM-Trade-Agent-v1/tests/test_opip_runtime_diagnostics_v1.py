@@ -19,7 +19,9 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
     assert "get_pending_setups()" in runtime
     assert "get_live_order_intents()" in runtime
     assert "SCAN_ACTIVITY_FILE" in runtime
-    assert "_read_jsonl(SCAN_ACTIVITY_FILE)" in runtime
+    assert "bounded_scan_tail" in runtime
+    assert "max_bytes=1048576" in runtime
+    assert 'handle.read(max_bytes)' in runtime
     assert 'timedelta(hours=24)' in runtime
 
     for field in (
@@ -36,8 +38,9 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
         '"live_order_intents"',
         '"cooldown_until"',
         '"last_search_started_at"',
-        '"scan_activity_rows_total"',
+        '"scan_activity_tail_rows"',
         '"scan_activity_rows_24h"',
+        '"scan_activity_read_limit_bytes"',
         '"last_broad_scan_utc"',
         '"last_broad_scan_age_seconds"',
         '"last_broad_scan_requested"',
@@ -57,6 +60,7 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
         "mark_search_started(",
         "set_override_mode(",
         "save_json_atomic(",
+        "_read_jsonl(",
         "scan_market(",
         "scan_main(",
         "send_trade_plan(",
