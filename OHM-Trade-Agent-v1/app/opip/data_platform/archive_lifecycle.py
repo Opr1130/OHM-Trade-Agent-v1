@@ -52,6 +52,13 @@ def _drain_reader(reader: object) -> None:
 def _compression(path: Path) -> str:
     """Return a compression type only after the complete stream validates."""
     name = path.name.lower()
+    compressed_suffix = name.endswith(".gz") or name.endswith(".zst")
+    if compressed_suffix:
+        try:
+            if path.stat().st_size == 0:
+                return "invalid"
+        except OSError:
+            return "invalid"
     if name.endswith(".gz"):
         try:
             with gzip.open(path, "rb") as handle:
@@ -70,19 +77,26 @@ def _compression(path: Path) -> str:
     return "none"
 
 
-def _checksum_sha(path: Path) -> str:
+def _checksum_sha(path: Path) -> str | None:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
     return digest.hexdigest()
 
 
 def _has_manifest_entry(manifest: Path, segment: Path) -> bool:
-    if not manifest.is_file():
+    try:
+        if not manifest.is_file():
+            return False
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
         return False
     token = segment.name
-    for line in manifest.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -95,12 +109,16 @@ def _has_manifest_entry(manifest: Path, segment: Path) -> bool:
 
 def _verify_checksum_sidecar(segment: Path) -> bool:
     checksum_path = segment.with_suffix(segment.suffix + ".sha256")
-    if not checksum_path.is_file():
+    try:
+        if not checksum_path.is_file():
+            return False
+        fields = checksum_path.read_text(encoding="utf-8").strip().split(maxsplit=1)
+    except (OSError, UnicodeDecodeError):
         return False
-    fields = checksum_path.read_text(encoding="utf-8").strip().split(maxsplit=1)
     if not fields or len(fields[0]) != 64:
         return False
-    return fields[0].lower() == _checksum_sha(segment)
+    actual = _checksum_sha(segment)
+    return actual is not None and fields[0].lower() == actual
 
 
 def assess_segment(
