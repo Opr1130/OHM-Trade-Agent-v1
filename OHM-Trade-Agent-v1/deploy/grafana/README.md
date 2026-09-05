@@ -5,15 +5,16 @@ Grafana runs on the isolated analytics droplet and reads O'Pip PostgreSQL with t
 
 ## Security and deployment boundaries
 
-- Use `/etc/opip-data-platform.env` for all secrets and credentials.
+- Use `/etc/opip-data-platform.env` as the sealed source for analytics secrets and Compose interpolation.
+- The analytics bootstrap derives `/etc/opip-grafana.env` from that sealed source using a strict `OPIP_GRAFANA_*` allowlist, writes it as `root:root` mode `0600`, and exposes only Grafana-required settings to the Grafana container. PostgreSQL administrator and shipper credentials must never be present in the Grafana service environment.
 - Keep `OPIP_GRAFANA_BIND_ADDRESS=127.0.0.1` unless a private VPC bind is explicitly required.
 - Front Grafana with a TLS reverse proxy; do not expose unauthenticated Grafana directly.
 - Never grant Grafana a write-capable PostgreSQL role.
-- Require `verify-full` TLS for Grafana's PostgreSQL datasource and mount the trusted
-  PostgreSQL CA certificate at `/etc/grafana/certs/postgres-ca.crt`.
+- Require `verify-full` TLS for Grafana's PostgreSQL datasource. Bootstrap rejects any weaker `OPIP_GRAFANA_DB_SSLMODE` value, including `disable`, `require`, and `verify-ca`.
+- Mount the trusted PostgreSQL CA certificate at `/etc/grafana/certs/postgres-ca.crt`.
 - Keep `OPIP_GRAFANA_POSTGRES_HOST=opip-postgres`; the PostgreSQL server certificate
   must contain `DNS:opip-postgres` in its subjectAltName.
-- Keep persistent state at `/var/lib/opip-data-platform/grafana`.
+- Keep persistent state at `/var/lib/opip-data-platform/grafana`. Bootstrap creates that directory for Grafana UID 472 and keeps the parent state directory traversal-only for non-root users.
 - Do not deploy Grafana or PostgreSQL on the production trading droplet.
 
 ## Canonical freshness contract
@@ -47,8 +48,12 @@ freshness result. Do not bypass or simulate that elapsed-time evidence.
 
 ## Start/upgrade
 
-Compose interpolation requires the sealed analytics environment file as well as
-the service-level `env_file` declaration:
+Run the analytics bootstrap for the target main SHA before starting Grafana. The
+bootstrap validates `verify-full`, provisions the UID-472 Grafana state directory,
+and regenerates `/etc/opip-grafana.env` from the Grafana-only allowlist.
+
+Compose interpolation still uses the sealed analytics environment file, while the
+Grafana service itself reads only `/etc/opip-grafana.env`:
 
 ```bash
 docker compose --env-file /etc/opip-data-platform.env \
