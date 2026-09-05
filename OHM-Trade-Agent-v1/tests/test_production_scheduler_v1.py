@@ -110,14 +110,16 @@ def test_deploy_rollback_restores_installed_remote_ops():
     assert 'cp -a "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"' not in deploy
 
 
-
 def test_learning_diagnostics_reports_unavailable_funnel_when_core_is_down():
     diagnostics = (ROOT / "deploy/remote/diagnose-opip-learning.sh").read_text(
         encoding="utf-8"
     )
     marker = "OPIP_QUALIFICATION_FUNNEL"
     assert diagnostics.count(marker) >= 2
-    qualification_block = diagnostics[diagnostics.rfind(
+    runtime_marker = "# Read-only production runtime evidence for diagnosing a zero-signal state."
+    assert runtime_marker in diagnostics
+    before_runtime = diagnostics[: diagnostics.index(runtime_marker)]
+    qualification_block = before_runtime[before_runtime.rfind(
         "if docker inspect ohm-trade-agent"
     ):]
     assert "else" in qualification_block
