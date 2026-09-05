@@ -244,12 +244,14 @@ def classify_maintenance(
 
     invalid: list[str] = []
     finished = _timestamp_status(item.latest_finished_at, "finished_at", now, invalid)
-    if invalid:
-        return MaintenanceAssessment("UNAVAILABLE", "INVALID_TIMESTAMPS", False)
+    # Keep reason precedence identical to migration 005's maintenance_eval:
+    # missing/failed maintenance evidence is reported before timestamp validity.
     if item.latest_status is None:
         return MaintenanceAssessment("UNAVAILABLE", "MAINTENANCE_NEVER_RAN", False)
     if item.latest_status != "SUCCESS":
         return MaintenanceAssessment("UNAVAILABLE", "MAINTENANCE_FAILED", False)
+    if invalid:
+        return MaintenanceAssessment("UNAVAILABLE", "INVALID_TIMESTAMPS", False)
     if finished is None:
         return MaintenanceAssessment("UNAVAILABLE", "INVALID_TIMESTAMPS", False)
 
