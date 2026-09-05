@@ -14,7 +14,10 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
     runtime = diagnostics[diagnostics.index(marker) :]
 
     assert "production_runtime_data=" in runtime
-    assert "status_payload(now)" in runtime
+    assert "load_json(STATE_FILE)" in runtime
+    assert "get_active_trades()" in runtime
+    assert "get_pending_setups()" in runtime
+    assert "get_live_order_intents()" in runtime
     assert "SCAN_ACTIVITY_FILE" in runtime
     assert "_read_jsonl(SCAN_ACTIVITY_FILE)" in runtime
     assert 'timedelta(hours=24)' in runtime
@@ -32,6 +35,7 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
         '"pending_setups"',
         '"live_order_intents"',
         '"cooldown_until"',
+        '"last_search_started_at"',
         '"scan_activity_rows_total"',
         '"scan_activity_rows_24h"',
         '"last_broad_scan_utc"',
@@ -45,9 +49,14 @@ def test_zero_signal_runtime_diagnostics_are_bounded_and_read_only():
         assert field in runtime
 
     # The added block must stay diagnostic-only. In particular it must never
-    # change the operator mode, run a scanner, send an alert, or mutate trades.
+    # evaluate through a state-mutating status path, change the operator mode,
+    # run a scanner, send an alert, or mutate paper/trade/exchange state.
     for forbidden in (
+        "status_payload(",
+        "get_operator_decision(",
+        "mark_search_started(",
         "set_override_mode(",
+        "save_json_atomic(",
         "scan_market(",
         "scan_main(",
         "send_trade_plan(",
