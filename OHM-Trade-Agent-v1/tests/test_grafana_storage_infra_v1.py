@@ -16,10 +16,10 @@ def test_analytics_compose_adds_private_grafana_with_persistence_and_bounded_log
     assert "grafana/grafana:11.2.2" in compose
     assert "${OPIP_GRAFANA_BIND_ADDRESS:-127.0.0.1}" in compose
     assert "/var/lib/opip-data-platform/grafana:/var/lib/grafana" in compose
-    assert "GF_AUTH_ANONYMOUS_ENABLED: \"false\"" in compose
+    assert 'GF_AUTH_ANONYMOUS_ENABLED: "false"' in compose
     assert "OPIP_GRAFANA_DB_USER: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}" in compose
     assert "cap_drop:" in compose and "- ALL" in compose
-    assert "max-size: 10m" in compose and "max-file: \"5\"" in compose
+    assert "max-size: 10m" in compose and 'max-file: "5"' in compose
 
 
 def test_grafana_provisioning_is_code_driven_and_read_only_datasource():
@@ -85,14 +85,64 @@ def test_intelligence_cockpit_dashboard_contains_required_sections_and_variables
     ):
         assert variable in variable_names
 
-    freshness_sql = next(
-        panel["targets"][0]["rawSql"]
-        for panel in payload["panels"]
-        if panel["title"] == "Freshness Status"
+
+def test_cockpit_uses_canonical_freshness_contract_without_duplicate_thresholds():
+    payload = json.loads(
+        (
+            ROOT
+            / "deploy"
+            / "grafana"
+            / "dashboards"
+            / "opip-intelligence-cockpit-v1.json"
+        ).read_text(encoding="utf-8")
     )
-    assert "shipper_lag_seconds" in freshness_sql
-    assert "db_lag_seconds" in freshness_sql
-    assert "mv_age_seconds" in freshness_sql
+    panels = {panel["id"]: panel for panel in payload["panels"]}
+
+    aggregate_sql = panels[1]["targets"][0]["rawSql"]
+    assert "ops.dashboard_freshness_v" in aggregate_sql
+    assert "status = 'UNAVAILABLE'" in aggregate_sql
+    assert "status = 'STALE'" in aggregate_sql
+    assert "status = 'DEGRADED'" in aggregate_sql
+    assert "raw.ingested_event" not in aggregate_sql
+    assert "platform_health_v" not in aggregate_sql
+    assert "> 300" not in aggregate_sql
+    assert "Grafana refresh/page response time is not data freshness" in panels[1]["description"]
+
+    stream_sql = panels[2]["targets"][0]["rawSql"]
+    assert "ops.dashboard_freshness_v" in stream_sql
+    for field in (
+        "status",
+        "reason",
+        "age_seconds",
+        "threshold_seconds",
+        "reference_at",
+        "last_reconciliation_status",
+        "unresolved_dead_letters",
+        "refresh_view_age_seconds",
+    ):
+        assert field in stream_sql
+    assert "raw.ingested_event" not in stream_sql
+
+    latency_sql = panels[13]["targets"][0]["rawSql"]
+    assert "ops.dashboard_freshness_v" in latency_sql
+    assert "status <> 'LIVE'" in latency_sql
+    assert "stalled_components" in latency_sql
+    assert "platform_health_v" not in latency_sql
+
+    policy_sql = panels[14]["targets"][0]["rawSql"]
+    assert "ops.dashboard_freshness_v" in policy_sql
+    for field in (
+        "required",
+        "requires_typed_projection",
+        "threshold_seconds",
+        "status",
+        "reason",
+        "age_seconds",
+        "reference_at",
+        "refresh_view_age_seconds",
+    ):
+        assert field in policy_sql
+    assert "platform_health_v" not in policy_sql
 
 
 def test_archive_lifecycle_is_fail_closed_for_cold_segment_until_all_evidence_exists(tmp_path):
@@ -123,6 +173,35 @@ def test_archive_lifecycle_is_fail_closed_for_cold_segment_until_all_evidence_ex
     complete = assess_segment(segment)
     assert complete.cleanup_eligible is True
     assert complete.blockers == []
+
+
+def test_archive_lifecycle_cold_cleanup_has_no_offhost_bypass(tmp_path):
+    source = (
+        ROOT / "app" / "opip" / "data_platform" / "archive_lifecycle.py"
+    ).read_text(encoding="utf-8")
+    assert "require_offhost" not in source
+    assert "--no-require-offhost" not in source
+
+    segment = tmp_path / "cold-segment.jsonl.gz"
+    segment.write_bytes(b"payload")
+    import os
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    old = now.timestamp() - 100 * 86400
+    os.utime(segment, (old, old))
+    checksum = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{checksum}  {segment.name}\n", encoding="utf-8"
+    )
+    segment.with_suffix(segment.suffix + ".finalized").write_text("ok\n", encoding="utf-8")
+    segment.with_suffix(segment.suffix + ".archive.verified").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "manifest.env").write_text(f"segment={segment.name}\n", encoding="utf-8")
+
+    assessed = assess_segment(segment, now=now)
+    assert assessed.tier == "COLD"
+    assert assessed.cleanup_eligible is False
+    assert assessed.blockers == ["offhost_backup_not_verified"]
 
 
 def test_archive_lifecycle_manifest_requires_exact_segment_name(tmp_path):
@@ -164,11 +243,11 @@ def test_archive_lifecycle_hot_and_warm_tiers_keep_expected_compression_rules(tm
     warm_age = now.timestamp() - 20 * 86400
     os.utime(warm, (warm_age, warm_age))
 
-    hot_assessed = assess_segment(hot, require_offhost=False)
+    hot_assessed = assess_segment(hot)
     assert hot_assessed.tier == "HOT"
     assert hot_assessed.blockers == []
 
-    warm_assessed = assess_segment(warm, require_offhost=False)
+    warm_assessed = assess_segment(warm)
     assert warm_assessed.tier == "WARM"
     assert "segment_not_finalized" in warm_assessed.blockers
     assert "checksum_missing_or_mismatch" in warm_assessed.blockers
