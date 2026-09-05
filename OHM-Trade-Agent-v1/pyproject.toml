@@ -1,0 +1,17 @@
+# Advisory quality/security tooling for O'Pip (CI only).
+# These settings do not change runtime, trading authority, or production deps.
+
+[tool.ruff]
+target-version = "py312"
+src = ["app", "tools"]
+
+[tool.ruff.lint]
+# Initial advisory surface: pycodestyle (E) + Pyflakes (F) only.
+# Line length (E501) and print bans (T20x) are intentionally not enforced.
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.bandit]
+# Scan application code only. Tests are excluded to avoid assert/fixture noise.
+targets = ["app"]
+exclude_dirs = ["tests", "test", ".venv", "venv"]

@@ -1,0 +1,5 @@
+# Development / security scanners only.
+# Do NOT install these into the production image or requirements.txt.
+ruff==0.15.16
+bandit==1.9.4
+pip-audit==2.10.1
