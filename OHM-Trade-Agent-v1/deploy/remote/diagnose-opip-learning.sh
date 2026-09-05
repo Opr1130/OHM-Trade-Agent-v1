@@ -234,7 +234,7 @@ from app.services.operator_control import (
     THROTTLED_SEARCH_INTERVAL_SECONDS,
     VALID_OVERRIDES,
 )
-from app.services.operations_analytics import SCAN_ACTIVITY_FILE, _read_jsonl
+from app.services.operations_analytics import SCAN_ACTIVITY_FILE
 from app.services.order_intent_registry import get_live_order_intents
 from app.services.pending_setup_registry import get_pending_setups
 from app.services.registry_io import load_json
@@ -261,6 +261,31 @@ def parsed(value):
     if item.tzinfo is None:
         item = item.replace(tzinfo=timezone.utc)
     return item.astimezone(timezone.utc)
+
+def bounded_scan_tail(path, max_bytes=1048576):
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            payload = handle.read(max_bytes)
+    except OSError:
+        return []
+    if start > 0:
+        separator = payload.find(b"\n")
+        payload = b"" if separator < 0 else payload[separator + 1 :]
+    rows = []
+    for raw in payload.splitlines():
+        try:
+            item = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
 
 cooldown_until = parsed(state.get("cooldown_until"))
 if override == "MAINTENANCE":
@@ -307,7 +332,7 @@ search_due = bool(
     )
 )
 
-rows = _read_jsonl(SCAN_ACTIVITY_FILE)
+rows = bounded_scan_tail(SCAN_ACTIVITY_FILE)
 recent = []
 for row in rows:
     at = parsed(row.get("completed_at_utc") or row.get("timestamp_utc"))
@@ -330,8 +355,9 @@ out = {
     "live_order_intents": order_count,
     "cooldown_until": (cooldown_until.isoformat() if cooldown_until else None),
     "last_search_started_at": (last_search_started.isoformat() if last_search_started else None),
-    "scan_activity_rows_total": len(rows),
+    "scan_activity_tail_rows": len(rows),
     "scan_activity_rows_24h": len(recent),
+    "scan_activity_read_limit_bytes": 1048576,
     "last_broad_scan_utc": (last_at.isoformat() if last_at else None),
     "last_broad_scan_age_seconds": last_age,
     "last_broad_scan_requested": latest.get("requested"),
