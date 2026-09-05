@@ -13,16 +13,23 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_analytics_compose_adds_private_grafana_with_persistence_and_bounded_logs():
     compose = (ROOT / "deploy" / "analytics" / "docker-compose.yml").read_text(encoding="utf-8")
     assert "opip-grafana:" in compose
-    assert "grafana/grafana:11.2.2" in compose
+    assert "grafana/grafana:13.2.1" in compose
+    assert "grafana/grafana:11.2.2" not in compose
     assert "${OPIP_GRAFANA_BIND_ADDRESS:-127.0.0.1}" in compose
     assert "/var/lib/opip-data-platform/grafana:/var/lib/grafana" in compose
     assert 'GF_AUTH_ANONYMOUS_ENABLED: "false"' in compose
     assert "OPIP_GRAFANA_DB_USER: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}" in compose
+    assert "OPIP_GRAFANA_DB_SSLMODE: ${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" in compose
+    assert "ssl=on" in compose
+    assert "ssl_min_protocol_version=TLSv1.2" in compose
+    assert "/etc/opip-data-platform/tls/postgres-server.crt:/etc/postgresql/tls/server.crt:ro" in compose
+    assert "/etc/opip-data-platform/tls/postgres-server.key:/etc/postgresql/tls/server.key:ro" in compose
+    assert "/etc/opip-data-platform/tls/postgres-ca.crt:/etc/grafana/certs/postgres-ca.crt:ro" in compose
     assert "cap_drop:" in compose and "- ALL" in compose
     assert "max-size: 10m" in compose and 'max-file: "5"' in compose
 
 
-def test_grafana_provisioning_is_code_driven_and_read_only_datasource():
+def test_grafana_provisioning_is_code_driven_read_only_and_verify_full_tls():
     datasource = (
         ROOT
         / "deploy"
@@ -43,8 +50,36 @@ def test_grafana_provisioning_is_code_driven_and_read_only_datasource():
     assert "uid: opip-analytics-postgres" in datasource
     assert "user: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}" in datasource
     assert "password: ${OPIP_GRAFANA_DB_PASSWORD}" in datasource
+    assert "sslmode: ${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" in datasource
+    assert "tlsConfigurationMethod: file-path" in datasource
+    assert "sslRootCertFile: /etc/grafana/certs/postgres-ca.crt" in datasource
     assert "timescaledb: false" in datasource
     assert "folder: O'Pip Intelligence" in dashboards_provider
+
+
+def test_grafana_tls_contract_and_documented_start_command_match_runtime():
+    env_example = (ROOT / "deploy" / "analytics" / "env.example").read_text(encoding="utf-8")
+    analytics_readme = (ROOT / "deploy" / "analytics" / "README.md").read_text(encoding="utf-8")
+    grafana_readme = (ROOT / "deploy" / "grafana" / "README.md").read_text(encoding="utf-8")
+
+    assert "OPIP_GRAFANA_DB_SSLMODE=verify-full" in env_example
+    assert "OPIP_GRAFANA_POSTGRES_HOST=opip-postgres" in env_example
+    assert "subjectAltName DNS:opip-postgres" in env_example
+    assert "postgres-ca.crt" in analytics_readme
+    assert "postgres-server.crt" in analytics_readme
+    assert "postgres-server.key" in analytics_readme
+    assert "docker compose --env-file /etc/opip-data-platform.env" in analytics_readme
+    assert "docker compose --env-file /etc/opip-data-platform.env" in grafana_readme
+    assert "verify-full" in grafana_readme
+
+
+def test_storage_lifecycle_docs_use_non_overlapping_tier_boundaries():
+    analytics_readme = (ROOT / "deploy" / "analytics" / "README.md").read_text(encoding="utf-8")
+    assert "HOT (0 to <7 days)" in analytics_readme
+    assert "WARM (>=7 to <90 days)" in analytics_readme
+    assert "COLD (>=90 days)" in analytics_readme
+    assert "HOT (0-7 days)" not in analytics_readme
+    assert "WARM (7-90 days)" not in analytics_readme
 
 
 def test_intelligence_cockpit_dashboard_contains_required_sections_and_variables():
