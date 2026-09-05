@@ -88,74 +88,37 @@ def test_learning_job_script_fail_closed_and_records_skips():
     reason="Git Bash fork is unreliable on Windows; Linux CI executes this path",
 )
 def test_learning_job_shell_admission_writes_blocked_disposition(tmp_path: Path):
-    """Real bash path: mismatch → non-zero + BLOCKED_RELEASE_DRIFT file."""
+    """Invoke real opip-learning-job.sh with path overrides under RELEASE_DRIFT."""
     state = tmp_path / "state"
     data = tmp_path / "data"
+    lock = tmp_path / "plane.lock"
+    env_file = tmp_path / "opip-learning.env"
     state.mkdir()
     data.mkdir()
-    (data / "manifest.env").write_bytes(
+    worker = "a" * 40
+    expected = "b" * 40
+    env_file.write_bytes(
         (
-            "schema_version=3\n"
-            "production_deployed_sha=" + ("b" * 40) + "\n"
+            f"OPIP_LEARNING_IMAGE=opip-learning:{worker}\n"
+            f"OPIP_DEPLOYED_SHA={worker}\n"
         ).encode("utf-8")
     )
-    script = tmp_path / "admit.sh"
-    script.write_bytes(
-        b"""#!/usr/bin/env bash
-set -Eeuo pipefail
-STATE_ROOT="$1"
-DATA_ROOT="$2"
-JOB="$3"
-OPIP_DEPLOYED_SHA="$4"
-MANIFEST="$DATA_ROOT/manifest.env"
-manifest_value() {
-  local key="$1"
-  awk -F= -v k="$key" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$MANIFEST" 2>/dev/null || true
-}
-classify_release_compatibility() {
-  local worker="$1"
-  local expected="$2"
-  if [[ ! "$worker" =~ ^[0-9a-f]{40}$ || ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
-    printf 'UNVERIFIED\\n'
-  elif [[ "$worker" == "$expected" ]]; then
-    printf 'CURRENT\\n'
-  else
-    printf 'RELEASE_DRIFT\\n'
-  fi
-}
-write_disposition() {
-  local disposition="$1"
-  local release_status="$2"
-  local expected_sha="$3"
-  local exit_code="${4:-}"
-  local detail="${5:-}"
-  cat > "$STATE_ROOT/$JOB.disposition.env" <<EOF
-job=$JOB
-disposition=$disposition
-release_compatibility_status=$release_status
-worker_sha=$OPIP_DEPLOYED_SHA
-expected_sha=$expected_sha
-exit_code=$exit_code
-detail=$detail
-policy_change_authorized=false
-EOF
-}
-EXPECTED_SHA="$(manifest_value production_deployed_sha)"
-RELEASE_STATUS="$(classify_release_compatibility "$OPIP_DEPLOYED_SHA" "$EXPECTED_SHA")"
-if [[ "$RELEASE_STATUS" != "CURRENT" ]]; then
-  write_disposition "BLOCKED_RELEASE_DRIFT" "$RELEASE_STATUS" "$EXPECTED_SHA" "75" "exact_sha_admission_failed"
-  exit 75
-fi
-write_disposition "CONSUMED_OK" "$RELEASE_STATUS" "$EXPECTED_SHA" "0" "admitted"
-exit 0
-"""
+    (data / "manifest.env").write_bytes(
+        f"schema_version=3\nproduction_deployed_sha={expected}\n".encode("utf-8")
     )
-    worker = "a" * 40
+    env = {
+        **dict(__import__("os").environ),
+        "OPIP_LEARNING_ENV_FILE": str(env_file),
+        "OPIP_LEARNING_LOCK_FILE": str(lock),
+        "OPIP_LEARNING_DATA_ROOT": str(data),
+        "OPIP_LEARNING_STATE_ROOT": str(state),
+    }
     result = subprocess.run(
-        ["bash", str(script), str(state), str(data), "capture", worker],
+        ["bash", str(LEARNING / "opip-learning-job.sh"), "capture"],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
     assert result.returncode == 75, (result.stdout, result.stderr)
     payload = jd.read_disposition_env(state, "capture")
@@ -165,14 +128,18 @@ exit 0
     (data / "manifest.env").write_bytes(
         f"schema_version=3\nproduction_deployed_sha={worker}\n".encode("utf-8")
     )
+    # Exact SHA admits past release gate; without docker the runner exits 69.
     ok = subprocess.run(
-        ["bash", str(script), str(state), str(data), "capture", worker],
+        ["bash", str(LEARNING / "opip-learning-job.sh"), "capture"],
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
-    assert ok.returncode == 0, (ok.stdout, ok.stderr)
-    assert jd.read_disposition_env(state, "capture")["disposition"] == jd.CONSUMED_OK
+    assert ok.returncode == 69, (ok.stdout, ok.stderr)
+    assert "missing learning-runner command: docker" in ok.stderr or (
+        "missing learning-runner command: timeout" in ok.stderr
+    )
 
 
 def test_export_manifest_includes_production_deployed_sha():
@@ -181,6 +148,7 @@ def test_export_manifest_includes_production_deployed_sha():
     ).read_text(encoding="utf-8")
     assert "production_deployed_sha=" in export
     assert "last-good-sha" in export
+    assert "rev-parse HEAD" not in export
 
 
 def test_deploy_learning_workflow_owner_gated_exact_main_pytest():
@@ -194,7 +162,7 @@ def test_deploy_learning_workflow_owner_gated_exact_main_pytest():
     assert "/deploy-learning" in workflow
     assert "run-gated-learning-deploy.sh" in workflow
     assert "does not merge, trade" in workflow
-    assert "OPIP_LEARNING_HOST" in workflow
+    assert "persist-credentials: false" in workflow
     assert "Kraken/Telegram" in workflow or "Kraken or Telegram" in workflow
 
 

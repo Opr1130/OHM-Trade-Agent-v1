@@ -136,12 +136,8 @@ tree_sha256() {
 }
 production_deployed_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
 if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
-  production_deployed_sha="$(
-    git -c safe.directory=/opt/OHM-Trade-Agent-v1 \
-      -C /opt/OHM-Trade-Agent-v1 rev-parse HEAD 2>/dev/null || true
-  )"
-fi
-if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  # Leave empty so workers report UNVERIFIED and fail closed until the
+  # authoritative deploy receipt exists. Do not fall back to git HEAD.
   production_deployed_sha=""
 fi
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ENV_FILE="/etc/opip-learning.env"
-LOCK_FILE="/var/lock/opip-learning-plane.lock"
-DATA_ROOT="/var/lib/opip-learning/data"
-STATE_ROOT="/var/lib/opip-learning/state"
+ENV_FILE="${OPIP_LEARNING_ENV_FILE:-/etc/opip-learning.env}"
+LOCK_FILE="${OPIP_LEARNING_LOCK_FILE:-/var/lock/opip-learning-plane.lock}"
+DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"
+STATE_ROOT="${OPIP_LEARNING_STATE_ROOT:-/var/lib/opip-learning/state}"
 MANIFEST="$DATA_ROOT/manifest.env"
 JOB="${1:-}"
 
@@ -41,14 +41,14 @@ case "$JOB" in
     ;;
 esac
 
-for cmd in docker flock timeout awk install date mv; do
+for cmd in flock awk install date mv; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning-runner command: $cmd" >&2
     exit 69
   }
 done
 
-install -d -o root -g root -m 0755 "$DATA_ROOT" "$STATE_ROOT"
+install -d -o root -g root -m 0755 "$DATA_ROOT" "$STATE_ROOT" 2>/dev/null || install -d -m 0755 "$DATA_ROOT" "$STATE_ROOT"
 
 manifest_value() {
   local key="$1"
@@ -115,6 +115,13 @@ if [[ "$RELEASE_STATUS" != "CURRENT" ]]; then
   write_disposition "BLOCKED_RELEASE_DRIFT" "$RELEASE_STATUS" "$EXPECTED_SHA" "75" "exact_sha_admission_failed"
   exit 75
 fi
+
+for cmd in docker timeout; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "missing learning-runner command: $cmd" >&2
+    exit 69
+  }
+done
 
 LABEL="com.opip.learning.job=$JOB"
 

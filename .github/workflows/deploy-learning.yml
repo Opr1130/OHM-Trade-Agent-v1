@@ -72,6 +72,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.target.outputs.sha }}
+          persist-credentials: false
 
       - name: Validate learning connection secrets
         env:

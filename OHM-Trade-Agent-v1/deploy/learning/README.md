@@ -71,20 +71,16 @@ sync/capture/outcomes cannot overlap.
 
 1. Merge the reviewed release and obtain the exact main SHA.
 2. Deploy production at that exact SHA (`/deploy <sha>`).
-3. **Matching learning worker deploy is required** before compute is healthy:
-   owner-gated `/deploy-learning <40-char-sha>` on issue 64 (exact `main` +
-   successful `pytest.yml`). Core `/deploy` does **not** update the learning
-   worker.
-4. Create the learning droplet in the production region/VPC (first time only).
-5. Run initial bootstrap (first time only):
+3. Create the learning droplet in the production region/VPC (first time only).
+4. Run initial bootstrap (first time only):
 
    ```bash
    sudo bash deploy/learning/bootstrap-opip-learning-worker.sh \
      <EXACT_MAIN_SHA> <PRODUCTION_PRIVATE_IP> opiplearn
    ```
 
-6. Copy the public key printed by bootstrap.
-7. On production, authorize it:
+5. Copy the public key printed by bootstrap.
+6. On production, authorize it:
 
    ```bash
    sudo bash deploy/remote/configure-opip-learning-reader.sh \
@@ -92,9 +88,9 @@ sync/capture/outcomes cannot overlap.
      10.116.0.4/32
    ```
 
-8. On the learning worker, verify the production SSH host fingerprint and add
+7. On the learning worker, verify the production SSH host fingerprint and add
    the private production address to `/root/.ssh/known_hosts`.
-9. Start one-shot validation in order:
+8. Start one-shot validation in order:
 
    ```bash
    sudo systemctl start opip-learning-sync.service
@@ -107,7 +103,7 @@ sync/capture/outcomes cannot overlap.
      opip-learning-outcomes.service
    ```
 
-10. Verify no job containers remain:
+9. Verify no job containers remain:
 
    ```bash
    sudo docker ps -a --filter label=com.opip.learning.job
@@ -115,7 +111,7 @@ sync/capture/outcomes cannot overlap.
 
    Expected: no containers.
 
-11. Enable timers only after all one-shot checks pass:
+10. Enable timers only after all one-shot checks pass:
 
    ```bash
    sudo systemctl enable --now \
@@ -126,8 +122,13 @@ sync/capture/outcomes cannot overlap.
    systemctl list-timers 'opip-learning-*'
    ```
 
-Subsequent exact-SHA updates use `/deploy-learning <sha>` which runs
-`deploy/learning/run-gated-learning-deploy.sh` (rebuild image, refresh
+### Subsequent exact-SHA updates (already bootstrapped)
+
+After every core `/deploy`, run matching owner-gated
+`/deploy-learning <40-char-sha>` on issue 64 (exact `main` + successful
+`pytest.yml`). Core `/deploy` does **not** update the learning worker.
+`/deploy-learning` requires an existing bootstrapped host (`/etc/opip-learning.env`)
+and runs `deploy/learning/run-gated-learning-deploy.sh` (rebuild image, refresh
 `OPIP_DEPLOYED_SHA` / `OPIP_LEARNING_IMAGE`, restart enabled timers). Do not
 place Kraken or Telegram credentials on the worker.
 

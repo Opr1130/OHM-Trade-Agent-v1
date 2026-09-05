@@ -165,7 +165,13 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   if [[ "$protocol" != "2" ]]; then
     echo "worker_compute_status=UNVERIFIED_LEGACY_SYNC_PROTOCOL"
     degrade
-  elif [[ "$release_compatibility_status" == "RELEASE_DRIFT" || "$worker_sha" != "$current_sha" ]]; then
+  elif [[ "$release_compatibility_status" == "RELEASE_DRIFT" ]]; then
+    echo "worker_compute_status=RELEASE_DRIFT"
+    degrade
+  elif [[ "$release_compatibility_status" == "UNVERIFIED" \
+       && "$worker_sha" =~ ^[0-9a-f]{40}$ \
+       && "$current_sha" =~ ^[0-9a-f]{40}$ \
+       && "$worker_sha" != "$current_sha" ]]; then
     echo "worker_compute_status=RELEASE_DRIFT"
     degrade
   elif [[ "$capture_disposition" == "BLOCKED_RELEASE_DRIFT" || "$outcomes_disposition" == "BLOCKED_RELEASE_DRIFT" ]]; then
