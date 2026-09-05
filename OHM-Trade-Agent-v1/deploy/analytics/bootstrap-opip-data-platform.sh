@@ -8,6 +8,7 @@ REPO_ROOT="$ROOT/repo"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
 ENV_FILE="/etc/opip-data-platform.env"
+GRAFANA_ENV_FILE="/etc/opip-grafana.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
@@ -48,6 +49,49 @@ require_uri_unreserved_password() {
 require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD
 require_uri_unreserved_password OPIP_SHIPPER_PASSWORD
 
+require_grafana_verify_full() {
+  if [[ "${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" != "verify-full" ]]; then
+    echo "OPIP_GRAFANA_DB_SSLMODE must be exactly verify-full" >&2
+    exit 78
+  fi
+}
+require_grafana_verify_full
+
+write_grafana_env_file() {
+  local temporary key
+  local -a keys=(
+    OPIP_GRAFANA_ADMIN_USER
+    OPIP_GRAFANA_ADMIN_PASSWORD
+    OPIP_GRAFANA_DB_USER
+    OPIP_GRAFANA_DB_PASSWORD
+    OPIP_GRAFANA_DB_NAME
+    OPIP_GRAFANA_DB_SSLMODE
+    OPIP_GRAFANA_POSTGRES_HOST
+    OPIP_GRAFANA_POSTGRES_PORT
+    OPIP_GRAFANA_BIND_ADDRESS
+    OPIP_GRAFANA_HOST_PORT
+    OPIP_GRAFANA_HTTP_PORT
+    OPIP_GRAFANA_DOMAIN
+    OPIP_GRAFANA_ROOT_URL
+    OPIP_GRAFANA_SERVE_FROM_SUB_PATH
+  )
+
+  temporary="$(mktemp /etc/opip-grafana.env.XXXXXX)"
+  : > "$temporary"
+  for key in "${keys[@]}"; do
+    if ! awk -F= -v key="$key" '$1 == key {print; found=1; exit} END {if (!found) exit 1}' \
+      "$ENV_FILE" >> "$temporary"; then
+      rm -f -- "$temporary"
+      echo "missing required Grafana setting in $ENV_FILE: $key" >&2
+      exit 78
+    fi
+  done
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$GRAFANA_ENV_FILE"
+}
+write_grafana_env_file
+
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
 }
@@ -84,9 +128,11 @@ remote_main="$(git -C "$REPO_ROOT" rev-parse origin/main)"
 git -C "$REPO_ROOT" checkout -f main
 git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
 
+install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \
   "$STATE_ROOT/config" \
   /var/backups/opip-postgres
+install -d -o 472 -g 472 -m 0750 "$STATE_ROOT/grafana"
 # Never reset an initialized bind-mounted PGDATA directory to root:root while
 # PostgreSQL is running. Recover the directory owner from a canonical file so
 # repeat empty deployments remain safe without hard-coding the image UID/GID.
