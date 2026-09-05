@@ -24,8 +24,9 @@ def test_grafana_runtime_env_is_isolated_from_platform_credentials():
     ).read_text(encoding="utf-8")
 
     grafana_block = compose.split("  opip-grafana:\n", 1)[1].split("\n  opip-shipper:\n", 1)[0]
-    assert "/etc/opip-grafana.env" in grafana_block
-    assert "/etc/opip-data-platform.env" not in grafana_block
+    env_file_block = grafana_block.split("    env_file:\n", 1)[1].split("    environment:\n", 1)[0]
+    assert "/etc/opip-grafana.env" in env_file_block
+    assert "/etc/opip-data-platform.env" not in env_file_block
 
     writer = _shell_function(bootstrap, "write_grafana_env_file")
     for required in (
