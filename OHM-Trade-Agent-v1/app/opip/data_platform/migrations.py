@@ -11,6 +11,10 @@ from typing import Any, Iterable
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
+from app.opip.data_platform.freshness import (
+    policy_fingerprint,
+    stream_policy_snapshot,
+)
 
 
 MIGRATION_RE = re.compile(r"^(?P<version>[0-9]{3})_(?P<name>[a-z0-9_]+)\.sql$")
@@ -86,6 +90,18 @@ def apply_migrations(connection: Any, *, root: Path = MIGRATION_ROOT) -> list[in
                     (migration.version, migration.name, migration.sha256),
                 )
                 applied.append(migration.version)
+
+            # Migration 005 creates dashboard_freshness_mv WITH NO DATA. Populate
+            # it before this migration transaction commits so no other session
+            # can ever observe the relation in PostgreSQL's unpopulated 55000
+            # state between `migrate` and the subsequent policy-sync refresh.
+            cursor.execute(
+                "SELECT c.relispopulated FROM pg_class c "
+                "WHERE c.oid = to_regclass('ops.dashboard_freshness_mv')"
+            )
+            freshness_row = cursor.fetchone()
+            if freshness_row is not None and not bool(freshness_row[0]):
+                cursor.execute("REFRESH MATERIALIZED VIEW ops.dashboard_freshness_mv")
     return applied
 
 
@@ -144,6 +160,7 @@ def refresh_materialized_views(connection: Any) -> None:
         ("market", "attrition_daily_mv"),
         ("lifecycle", "rejection_mix_daily_mv"),
         ("learning", "opportunity_accountability_daily_mv"),
+        ("ops", "dashboard_freshness_mv"),
     )
     populated_views: list[tuple[str, str, bool]] = []
     with connection.cursor() as cursor:
@@ -156,12 +173,8 @@ def refresh_materialized_views(connection: Any) -> None:
             row = cursor.fetchone()
             if row is None:
                 continue
-            populated_views.append(
-                (schema_name, view_name, bool(row[0]))
-            )
+            populated_views.append((schema_name, view_name, bool(row[0])))
 
-    # A population-state SELECT starts an implicit transaction on the normal
-    # admin connection. PostgreSQL forbids CONCURRENTLY inside that block.
     connection.commit()
     prior_autocommit = bool(connection.autocommit)
     connection.autocommit = True
@@ -174,6 +187,31 @@ def refresh_materialized_views(connection: Any) -> None:
                         concurrently,
                         sql.Identifier(schema_name),
                         sql.Identifier(view_name),
+                    )
+                )
+    finally:
+        connection.autocommit = prior_autocommit
+
+
+def refresh_freshness_view(connection: Any) -> None:
+    """Refresh only the dashboard freshness materialized view."""
+    from psycopg import sql
+
+    connection.commit()
+    prior_autocommit = bool(connection.autocommit)
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT c.relispopulated FROM pg_class c "
+                "WHERE c.oid = to_regclass('ops.dashboard_freshness_mv')"
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                concurrently = sql.SQL("CONCURRENTLY ") if bool(row[0]) else sql.SQL("")
+                cursor.execute(
+                    sql.SQL("REFRESH MATERIALIZED VIEW {}ops.dashboard_freshness_mv").format(
+                        concurrently
                     )
                 )
     finally:
@@ -199,6 +237,47 @@ def provision_login_roles(connection: Any, passwords: dict[str, str]) -> None:
                 )
 
 
+def sync_required_streams(connection: Any) -> int:
+    """Synchronize protected required-stream policy under an administrative role."""
+    snapshot = stream_policy_snapshot()
+    fingerprint = policy_fingerprint()
+    rows = [
+        (
+            name,
+            bool(policy["required"]),
+            bool(policy["requires_typed_projection"]),
+            policy["threshold_seconds"],
+            fingerprint,
+        )
+        for name, policy in sorted(snapshot.items())
+    ]
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO ops.required_stream(
+                    stream_name, required, requires_typed_projection,
+                    threshold_seconds, sync_fingerprint
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (stream_name) DO UPDATE SET
+                    required = EXCLUDED.required,
+                    requires_typed_projection = EXCLUDED.requires_typed_projection,
+                    threshold_seconds = EXCLUDED.threshold_seconds,
+                    sync_fingerprint = EXCLUDED.sync_fingerprint,
+                    synced_at = now()
+                """,
+                rows,
+            )
+            cursor.execute(
+                """
+                DELETE FROM ops.required_stream policy
+                WHERE NOT (policy.stream_name = ANY(%s))
+                """,
+                ([name for name, *_rest in rows],),
+            )
+    return len(rows)
+
+
 def _admin_dsn() -> str:
     dsn = os.getenv("OPIP_ANALYTICS_ADMIN_DATABASE_URL")
     if not dsn:
@@ -210,7 +289,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the O'Pip analytics schema")
     parser.add_argument(
         "command",
-        choices=("migrate", "partitions", "refresh-views", "provision-roles"),
+        choices=(
+            "migrate",
+            "partitions",
+            "refresh-views",
+            "refresh-freshness",
+            "provision-roles",
+            "sync-required-streams",
+        ),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
     config = DataPlatformConfig.from_env()
@@ -229,6 +315,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif args.command == "refresh-views":
             refresh_materialized_views(connection)
             print("O'Pip materialized views refreshed")
+        elif args.command == "refresh-freshness":
+            refresh_freshness_view(connection)
+            print("O'Pip dashboard freshness view refreshed")
+        elif args.command == "sync-required-streams":
+            count = sync_required_streams(connection)
+            refresh_freshness_view(connection)
+            print(f"O'Pip required-stream policy synchronized: {count} streams")
         else:
             provision_login_roles(
                 connection,

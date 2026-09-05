@@ -39,9 +39,35 @@ the additive schema; `offhost-verified` records an owner attestation only
 after the independent infrastructure copy is verified; `rollback-verified`
 requires two successful empty deployments with a restore drill between them;
 `backfill` requires all of that durable evidence; `shipper` requires a clean
-backfill; and `reads-ready` requires a seven-day shipper soak, clean
-reconciliation, lag below five minutes, and no unresolved dead letters. A
-failed step leaves the production scanner and its file WAL unchanged.
+backfill; and `reads-ready` requires a seven-day shipper soak plus a clean
+canonical freshness result (`ops.dashboard_freshness_v` must be LIVE for every
+required stream and for maintenance). A failed step leaves the production
+scanner and its file WAL unchanged.
+
+## Canonical freshness contract
+
+`ops.dashboard_freshness_v` is the single freshness result consumed by
+Grafana, the production API/dashboard status, stale-data selection, and
+`health --require-ready`. Its classification logic mirrors
+`app/opip/data_platform/freshness.py`; that module is the source of truth and
+any policy change must land there first, then in a new migration, with the
+parity tests proving PostgreSQL and Python agree.
+
+- Streams that require typed projections are declared in `StreamSpec`
+  (`requires_typed_projection`). A missing required typed watermark is
+  `UNAVAILABLE`; ingestion time is never substituted for typed evidence.
+- `health --require-ready` exits nonzero unless the canonical result is LIVE.
+  It fails closed for missing streams, reconciliation ERROR/UNKNOWN, stale
+  typed data, maintenance failure, configuration drift, and invalid
+  timestamps, and it never depends on the dashboard historical-reads flag.
+- Required-stream policy (`ops.required_stream`) is synchronized only by the
+  administrative `migrations sync-required-streams` command. The shipper role
+  holds no write grant on that table, and no code path falls back to shipper
+  credentials for policy mutation.
+- Malformed, naive, or materially future timestamps are treated as invalid
+  and fail closed identically in PostgreSQL and Python.
+- Each canonical row exposes a stable machine-readable `reason`; the aggregate
+  health payload carries `freshness.reason` and `freshness.problems`.
 
 Nightly custom-format dumps are checksummed locally, but the off-host copy is
 an independent infrastructure responsibility. The `offhost-verified` stage

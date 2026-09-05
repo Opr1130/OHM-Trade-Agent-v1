@@ -156,7 +156,7 @@ def test_common_stream_timestamps_are_supported(field):
 
 def test_migrations_are_additive_checksum_ordered_and_architecture_bounded():
     migrations = discover_migrations()
-    assert [item.version for item in migrations] == [1, 2, 3, 4]
+    assert [item.version for item in migrations] == [1, 2, 3, 4, 5, 6]
     sql = "\n".join(item.path.read_text(encoding="utf-8") for item in migrations)
     for schema in ("market", "lifecycle", "signal", "paper", "learning", "ops", "raw"):
         assert f"CREATE SCHEMA IF NOT EXISTS {schema}" in sql
@@ -255,7 +255,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     class Connection:
         def __init__(self):
             self.autocommit = False
-            self.population = [True, False, True, False]
+            self.population = [True, False, True, False, False]
             self.events = []
 
         def cursor(self):
@@ -267,7 +267,7 @@ def test_concurrent_materialized_view_refresh_uses_autocommit():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 4
+    assert len(refreshes) == 5
     assert all(event[1] is True for event in refreshes)
     assert connection.events.index(refreshes[0]) > next(
         index for index, event in enumerate(connection.events) if event[0] == "commit"
@@ -313,7 +313,7 @@ def test_materialized_view_refresh_skips_unapplied_optional_view():
     connection = Connection()
     refresh_materialized_views(connection)
     refreshes = [event for event in connection.events if "REFRESH" in event[2]]
-    assert len(refreshes) == 3
+    assert len(refreshes) == 4
     assert all("opportunity_accountability_daily_mv" not in event[2] for event in refreshes)
 
 
@@ -325,6 +325,8 @@ def test_optional_streams_do_not_block_required_readiness():
             "lag_seconds": 1,
             "unresolved_dead_letters": 0,
             "last_reconciliation_status": "CLEAN",
+            "required": True,
+            "freshness_status": "LIVE",
         }
         for name in required
     ]
@@ -334,6 +336,8 @@ def test_optional_streams_do_not_block_required_readiness():
             "lag_seconds": 99999,
             "unresolved_dead_letters": 4,
             "last_reconciliation_status": "MISMATCH",
+            "required": False,
+            "freshness_status": "STALE",
         }
     )
     required_names, missing, healthy = _required_stream_readiness(
@@ -344,7 +348,9 @@ def test_optional_streams_do_not_block_required_readiness():
     assert missing == []
     assert healthy is True
     assert _stream_health_is_stale(rows, maximum_lag_seconds=300) is False
-    assert _stream_health_is_stale(rows[1:], maximum_lag_seconds=300) is True
+    degraded = [dict(row) for row in rows]
+    degraded[0]["freshness_status"] = "UNAVAILABLE"
+    assert _stream_health_is_stale(degraded, maximum_lag_seconds=300) is True
 
 
 def test_today_historical_trend_excludes_prior_dates():
@@ -437,6 +443,30 @@ def test_rollout_gates_prevent_immediate_cutover():
     assert "opip_restore_drill_" in restore
     assert "ops.schema_version" in restore
     assert "dropdb --if-exists --force" in restore
+
+
+def test_maintenance_always_refreshes_freshness_after_reconcile_mismatch():
+    """Regression: a non-zero reconcile (MISMATCH) must not skip refresh-freshness.
+
+    The maintenance script runs under `set -e`. If reconcile returns non-zero the
+    script must capture that exit status (so it does not abort) and STILL run
+    refresh-freshness and health afterwards, then exit with the preserved
+    reconcile status so callers observe the mismatch.
+    """
+    maintenance = (
+        ROOT / "deploy/analytics/opip-data-platform-maintenance.sh"
+    ).read_text()
+    # Reconcile exit status is captured, not allowed to abort the script.
+    assert "RECONCILE_STATUS=0" in maintenance
+    assert "python -m app.opip.data_platform.reconcile || RECONCILE_STATUS=$?" in maintenance
+    # refresh-freshness and health must appear AFTER the reconcile command so a
+    # MISMATCH/non-zero return cannot skip the freshness refresh.
+    reconcile_pos = maintenance.index("app.opip.data_platform.reconcile")
+    refresh_pos = maintenance.index("refresh-freshness")
+    health_pos = maintenance.index("app.opip.data_platform.health")
+    assert reconcile_pos < refresh_pos < health_pos
+    # The preserved reconcile status is the final exit status.
+    assert 'exit "$RECONCILE_STATUS"' in maintenance
 
 
 def test_config_json_round_trip_has_no_authority_fields():
