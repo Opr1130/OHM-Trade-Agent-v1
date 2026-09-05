@@ -6,7 +6,6 @@ from typing import Any
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
-from app.opip.data_platform.streams import STREAM_SPECS
 
 
 logger = logging.getLogger(__name__)
@@ -17,23 +16,29 @@ def _stream_health_is_stale(
     *,
     maximum_lag_seconds: int = 1800,
 ) -> bool:
-    required_streams = {item.name for item in STREAM_SPECS if item.required}
-    required_health = [
-        item for item in health if str(item["stream_name"]) in required_streams
-    ]
-    present_required = {str(item["stream_name"]) for item in required_health}
+    """Return whether required canonical stream health is stale or unavailable."""
+    required = [item for item in health if item.get("required")]
+    if any("freshness_status" in item for item in health):
+        if not required:
+            return True
+        return any(str(item.get("freshness_status")) != "LIVE" for item in required)
+    present = {str(item["stream_name"]) for item in health}
     maximum_lag = max(
-        (item["lag_seconds"] for item in required_health),
+        (
+            item["lag_seconds"]
+            for item in health
+            if item.get("lag_seconds") is not None
+        ),
         default=0,
     )
     return (
-        bool(required_streams - present_required)
-        or maximum_lag > maximum_lag_seconds
+        maximum_lag > maximum_lag_seconds
         or any(
             item["last_reconciliation_status"] not in {None, "CLEAN"}
             or item["unresolved_dead_letters"] > 0
-            for item in required_health
+            for item in health
         )
+        or not present
     )
 
 
@@ -58,13 +63,19 @@ def _empty(status: str, *, error_type: str | None = None) -> dict[str, Any]:
         "opportunity_accountability_daily": [],
         "opportunity_accountability_all_time": {},
         "stream_health": [],
+        "freshness": {
+            "status": "UNAVAILABLE",
+            "ready": False,
+            "reason": "DISABLED" if status == "DISABLED" else "READ_UNAVAILABLE",
+            "problems": [],
+        },
     }
 
 
 def read_historical_snapshot(
     config: DataPlatformConfig | None = None,
 ) -> dict[str, Any]:
-    """Read only small analytics views, failing soft to local dashboard data."""
+    """Read small analytics views, failing soft to local dashboard data."""
     settings = config or DataPlatformConfig.from_env()
     dsn = settings.dashboard_dsn()
     if not dsn:
@@ -235,7 +246,8 @@ def read_historical_snapshot(
                         SELECT stream_name, source_file, byte_offset,
                                rows_ingested, source_size, updated_at,
                                lag_seconds, unresolved_dead_letters,
-                               last_reconciliation_status, last_reconciled_at
+                               last_reconciliation_status, last_reconciled_at,
+                               freshness_status, freshness_reason, required
                         FROM ops.platform_health_v ORDER BY stream_name
                         """
                     )
@@ -243,25 +255,104 @@ def read_historical_snapshot(
                         {
                             "stream_name": row[0],
                             "source_file": row[1],
-                            "byte_offset": int(row[2]),
-                            "rows_ingested": int(row[3]),
-                            "source_size": int(row[4]),
+                            "byte_offset": int(row[2]) if row[2] is not None else 0,
+                            "rows_ingested": int(row[3]) if row[3] is not None else 0,
+                            "source_size": int(row[4]) if row[4] is not None else 0,
                             "updated_at": _iso(row[5]),
-                            "lag_seconds": int(row[6]),
+                            "lag_seconds": int(row[6]) if row[6] is not None else None,
                             "unresolved_dead_letters": int(row[7]),
                             "last_reconciliation_status": row[8],
                             "last_reconciled_at": _iso(row[9]),
+                            "freshness_status": row[10],
+                            "freshness_reason": row[11],
+                            "required": bool(row[12]),
                         }
                         for row in cursor.fetchall()
                     ]
-        stale = _stream_health_is_stale(health)
+                    cursor.execute(
+                        """
+                        SELECT status, reason
+                        FROM ops.dashboard_freshness_v
+                        WHERE stream_name = '__maintenance__'
+                        """
+                    )
+                    maintenance_row = cursor.fetchone()
+
+        canonical_problems = [
+            {"stream": row["stream_name"], "reason": row["freshness_reason"]}
+            for row in health
+            if row["freshness_reason"]
+        ]
+        if maintenance_row is not None and maintenance_row[1]:
+            canonical_problems.append(
+                {"stream": "__maintenance__", "reason": maintenance_row[1]}
+            )
+
+        blocking_health = [
+            row
+            for row in health
+            if row["required"] or row["freshness_reason"] == "UNKNOWN_STREAM_POLICY"
+        ]
+
+        if not health or maintenance_row is None:
+            canonical_status = "UNAVAILABLE"
+        elif any(
+            row["freshness_status"] == "UNAVAILABLE" for row in blocking_health
+        ) or maintenance_row[0] == "UNAVAILABLE":
+            canonical_status = "UNAVAILABLE"
+        elif any(
+            row["freshness_status"] == "STALE" for row in blocking_health
+        ) or maintenance_row[0] == "STALE":
+            canonical_status = "STALE"
+        elif any(
+            row["freshness_status"] == "DEGRADED" for row in blocking_health
+        ) or maintenance_row[0] == "DEGRADED":
+            canonical_status = "DEGRADED"
+        else:
+            canonical_status = "LIVE"
+
+        component_status = {
+            row["stream_name"]: row["freshness_status"] for row in health
+        }
+        if maintenance_row is not None:
+            component_status["__maintenance__"] = maintenance_row[0]
+
+        blocking_streams = {row["stream_name"] for row in blocking_health}
+        blocking_streams.add("__maintenance__")
+        blocking_problems = [
+            problem
+            for problem in canonical_problems
+            if problem["stream"] in blocking_streams
+        ]
+
+        if canonical_status == "LIVE":
+            canonical_reason = "OK"
+        else:
+            canonical_reason = next(
+                (
+                    problem["reason"]
+                    for problem in blocking_problems
+                    if component_status.get(problem["stream"]) == canonical_status
+                ),
+                blocking_problems[0]["reason"]
+                if blocking_problems
+                else "READ_UNAVAILABLE",
+            )
+
+        stale = canonical_status != "LIVE"
         return {
             "enabled": True,
             "available": True,
-            "status": "STALE" if stale else "OK",
+            "status": "OK" if not stale else "STALE",
             "error_type": None,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "stale": stale,
+            "freshness": {
+                "status": canonical_status,
+                "ready": canonical_status == "LIVE",
+                "reason": canonical_reason,
+                "problems": canonical_problems,
+            },
             "intelligence_daily": list(reversed(intelligence)),
             "attrition_daily": attrition,
             "rejection_mix_daily": rejection_mix,

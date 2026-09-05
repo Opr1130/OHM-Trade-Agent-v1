@@ -211,5 +211,174 @@ else
   degrade
 fi
 
+# Read-only production runtime evidence for diagnosing a zero-signal state.
+# This deliberately reports only bounded scheduler/operator/scan counters. It
+# does not print credentials, environment variables, candidate payloads, or
+# mutate operator state, ranking, alerting, paper admission, or exchange state.
+if docker inspect ohm-trade-agent >/dev/null 2>&1 \
+   && [[ "$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)" == "true" ]]; then
+  runtime_data="$(
+    docker exec ohm-trade-agent python -c '
+import json
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from app.services.active_trade_registry import get_active_trades
+from app.services.operator_control import (
+    DEFAULT_TIMEZONE,
+    MAX_OCCUPIED_SLOTS,
+    NORMAL_SEARCH_INTERVAL_SECONDS,
+    QUIET_END_HOUR,
+    QUIET_START_HOUR,
+    STATE_FILE,
+    THROTTLE_AT_SLOTS,
+    THROTTLED_SEARCH_INTERVAL_SECONDS,
+    VALID_OVERRIDES,
+)
+from app.services.operations_analytics import SCAN_ACTIVITY_FILE
+from app.services.order_intent_registry import get_live_order_intents
+from app.services.pending_setup_registry import get_pending_setups
+from app.services.registry_io import load_json
+
+now = datetime.now(timezone.utc)
+state = load_json(STATE_FILE)
+override = str(state.get("override_mode") or "AUTO").upper()
+if override not in VALID_OVERRIDES:
+    override = "AUTO"
+active_count = len(get_active_trades())
+pending_count = len(get_pending_setups())
+order_count = len(get_live_order_intents())
+occupied = active_count + order_count
+local_hour = now.astimezone(ZoneInfo(DEFAULT_TIMEZONE)).hour
+quiet = local_hour >= QUIET_START_HOUR or local_hour < QUIET_END_HOUR
+
+def parsed(value):
+    if not value:
+        return None
+    try:
+        item = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if item.tzinfo is None:
+        item = item.replace(tzinfo=timezone.utc)
+    return item.astimezone(timezone.utc)
+
+def bounded_scan_tail(path, max_bytes=1048576):
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            payload = handle.read(max_bytes)
+    except OSError:
+        return []
+    if start > 0:
+        separator = payload.find(b"\n")
+        payload = b"" if separator < 0 else payload[separator + 1 :]
+    rows = []
+    for raw in payload.splitlines():
+        try:
+            item = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+cooldown_until = parsed(state.get("cooldown_until"))
+if override == "MAINTENANCE":
+    effective = "MAINTENANCE"
+    search_allowed = False
+    interval = 0
+    reason = "operator override"
+elif override == "MONITOR":
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "operator override"
+elif override == "SEARCH":
+    effective = "SEARCH"
+    search_allowed = True
+    interval = THROTTLED_SEARCH_INTERVAL_SECONDS if occupied >= THROTTLE_AT_SLOTS else NORMAL_SEARCH_INTERVAL_SECONDS
+    reason = "operator override"
+elif quiet:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "quiet hours 23:00-05:00 America/New_York"
+elif occupied >= MAX_OCCUPIED_SLOTS:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "portfolio capacity reached"
+elif cooldown_until is not None and now < cooldown_until:
+    effective = "MONITOR"
+    search_allowed = False
+    interval = 0
+    reason = "capacity-release cooldown"
+else:
+    effective = "SEARCH"
+    search_allowed = True
+    interval = THROTTLED_SEARCH_INTERVAL_SECONDS if occupied >= THROTTLE_AT_SLOTS else NORMAL_SEARCH_INTERVAL_SECONDS
+    reason = "throttled search: two occupied slots" if occupied >= THROTTLE_AT_SLOTS else "capacity available"
+last_search_started = parsed(state.get("last_search_started_at"))
+search_due = bool(
+    search_allowed
+    and (
+        last_search_started is None
+        or (now - last_search_started).total_seconds() >= interval
+    )
+)
+
+rows = bounded_scan_tail(SCAN_ACTIVITY_FILE)
+recent = []
+for row in rows:
+    at = parsed(row.get("completed_at_utc") or row.get("timestamp_utc"))
+    if at is not None and at >= now - timedelta(hours=24):
+        recent.append(row)
+latest = rows[-1] if rows else {}
+last_at = parsed(latest.get("completed_at_utc") or latest.get("timestamp_utc"))
+last_age = None if last_at is None else max(0, int((now - last_at).total_seconds()))
+out = {
+    "override_mode": override,
+    "effective_mode": effective,
+    "reason": reason,
+    "quiet_hours": quiet,
+    "search_allowed": search_allowed,
+    "search_due": search_due,
+    "search_interval_seconds": interval,
+    "occupied_slots": occupied,
+    "active_trades": active_count,
+    "pending_setups": pending_count,
+    "live_order_intents": order_count,
+    "cooldown_until": (cooldown_until.isoformat() if cooldown_until else None),
+    "last_search_started_at": (last_search_started.isoformat() if last_search_started else None),
+    "scan_activity_tail_rows": len(rows),
+    "scan_activity_rows_24h": len(recent),
+    "scan_activity_read_limit_bytes": 1048576,
+    "last_broad_scan_utc": (last_at.isoformat() if last_at else None),
+    "last_broad_scan_age_seconds": last_age,
+    "last_broad_scan_requested": latest.get("requested"),
+    "last_broad_scan_analyzed": latest.get("analyzed"),
+    "last_broad_scan_technical_shortlist": latest.get("technical_shortlist"),
+    "last_broad_scan_qualified_survivors": latest.get("qualified_survivors"),
+    "last_broad_scan_notifications_sent": latest.get("notifications_sent"),
+}
+print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+' 2>/dev/null || true
+  )"
+  if [[ -n "$runtime_data" ]]; then
+    echo "production_runtime_data=$runtime_data"
+  else
+    echo "production_runtime_data=UNAVAILABLE"
+    degrade
+  fi
+else
+  echo "production_runtime_data=CORE_CONTAINER_UNAVAILABLE"
+  degrade
+fi
+
 echo "diagnostics_status=$status"
 [[ "$status" != "FAIL" ]]

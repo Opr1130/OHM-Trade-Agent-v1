@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from app.opip.data_platform.config import DataPlatformConfig
 from app.opip.data_platform.db import connect
+from app.opip.data_platform.freshness import policy_fingerprint
 from app.opip.data_platform.migrations import (
     ensure_monthly_partitions,
     refresh_materialized_views,
@@ -20,6 +21,35 @@ PARTITION_RE = re.compile(
 )
 
 
+def record_maintenance_run(
+    connection: Any,
+    *,
+    status: str,
+    detail: str | None,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    """Record one maintenance cycle as protected freshness evidence."""
+    if status not in {"SUCCESS", "FAILED", "SKIPPED"}:
+        raise ValueError(f"invalid maintenance status: {status}")
+    with connection.transaction():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ops.maintenance_run(
+                    status, detail, policy_fingerprint, started_at, finished_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    status,
+                    (detail or "")[:4000] or None,
+                    policy_fingerprint(),
+                    started_at.astimezone(timezone.utc),
+                    finished_at.astimezone(timezone.utc),
+                ),
+            )
+
+
 def prune_analytical_retention(
     connection: Any,
     *,
@@ -27,10 +57,7 @@ def prune_analytical_retention(
     raw_months: int = 6,
     ops_days: int = 90,
 ) -> list[str]:
-    """Drop only derived DB partitions after rollups and clean reconciliation.
-
-    Source files and verified file archives are never touched here.
-    """
+    """Drop only derived DB partitions after clean reconciliation evidence."""
     from psycopg import sql
 
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -109,14 +136,57 @@ def main(argv: Iterable[str] | None = None) -> int:
     dsn = os.getenv("OPIP_ANALYTICS_ADMIN_DATABASE_URL") or config.database_url
     if not dsn:
         raise RuntimeError("OPIP_ANALYTICS_DATABASE_URL is required")
-    with connect(
-        dsn,
-        connect_timeout_seconds=config.connect_timeout_seconds,
-        application_name="opip-maintenance",
-    ) as connection:
-        ensure_monthly_partitions(connection)
-        refresh_materialized_views(connection)
-        dropped = prune_analytical_retention(connection) if args.prune else []
+
+    started_at = datetime.now(timezone.utc)
+    dropped: list[str] = []
+    try:
+        with connect(
+            dsn,
+            connect_timeout_seconds=config.connect_timeout_seconds,
+            application_name="opip-maintenance",
+        ) as connection:
+            ensure_monthly_partitions(connection)
+            dropped = prune_analytical_retention(connection) if args.prune else []
+            record_maintenance_run(
+                connection,
+                status="SUCCESS",
+                detail=f"dropped_partitions={dropped}",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+            )
+            # Refresh after recording the outcome so freshness consumers see
+            # evidence for the maintenance run that just completed.
+            refresh_materialized_views(connection)
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        try:
+            with connect(
+                dsn,
+                connect_timeout_seconds=config.connect_timeout_seconds,
+                application_name="opip-maintenance",
+            ) as connection:
+                record_maintenance_run(
+                    connection,
+                    status="FAILED",
+                    detail=detail,
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                )
+                try:
+                    refresh_materialized_views(connection)
+                except Exception as refresh_error:
+                    print(
+                        "O'Pip maintenance failure evidence recorded; "
+                        f"freshness refresh also failed: {type(refresh_error).__name__}"
+                    )
+        except Exception as record_error:
+            print(
+                "O'Pip maintenance failure evidence could not be recorded: "
+                f"{type(record_error).__name__}"
+            )
+        print(f"O'Pip maintenance failed: {detail}")
+        return 2
+
     print(f"O'Pip maintenance complete; dropped_partitions={dropped}")
     return 0
 

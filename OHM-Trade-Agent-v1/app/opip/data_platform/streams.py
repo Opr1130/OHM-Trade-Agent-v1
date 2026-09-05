@@ -4,12 +4,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+#: Stream kinds whose rows are projected into typed relational tables.  Their
+#: freshness watermark is the latest projected ``observed_at``; raw ingestion
+#: time must never be substituted for a missing typed projection.
+TYPED_PROJECTION_KINDS = frozenset(
+    {"screening", "funnel", "intelligence", "market_observation", "paper_event"}
+)
+
+
 @dataclass(frozen=True)
 class StreamSpec:
     name: str
     relative_path: Path
     kind: str
     required: bool = False
+
+    @property
+    def requires_typed_projection(self) -> bool:
+        return self.kind in TYPED_PROJECTION_KINDS
 
 
 STREAM_SPECS: tuple[StreamSpec, ...] = (

@@ -23,9 +23,39 @@ export OPIP_DEPLOYED_SHA="${DEPLOYED_SHA:-${OPIP_DEPLOYED_SHA:-}}"
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
 
+# Explicit exit precedence (documented, deterministic):
+#   1. a reconciliation failure (e.g. exit 2 for MISMATCH) always wins
+#   2. otherwise a maintenance/prune failure wins
+#   3. otherwise a freshness-view refresh failure wins
+#   4. otherwise a health failure/non-ready result wins
+#   5. otherwise exit 0
+# All four stages always run regardless of an earlier stage's exit status
+# -- `set -e` is suspended around each `|| STATUS=$?` capture so a nonzero
+# maintenance, reconciliation, or refresh result can never abort the
+# script before the remaining stages have had a chance to run.
+MAINTENANCE_STATUS=0
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
-  python -m app.opip.data_platform.maintenance --prune
+  python -m app.opip.data_platform.maintenance --prune || MAINTENANCE_STATUS=$?
+
+RECONCILE_STATUS=0
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
-  python -m app.opip.data_platform.reconcile
+  python -m app.opip.data_platform.reconcile || RECONCILE_STATUS=$?
+
+REFRESH_STATUS=0
 docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
-  python -m app.opip.data_platform.health
+  python -m app.opip.data_platform.migrations refresh-freshness || REFRESH_STATUS=$?
+
+HEALTH_STATUS=0
+docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin \
+  python -m app.opip.data_platform.health || HEALTH_STATUS=$?
+
+if [[ "$RECONCILE_STATUS" -ne 0 ]]; then
+  exit "$RECONCILE_STATUS"
+fi
+if [[ "$MAINTENANCE_STATUS" -ne 0 ]]; then
+  exit "$MAINTENANCE_STATUS"
+fi
+if [[ "$REFRESH_STATUS" -ne 0 ]]; then
+  exit "$REFRESH_STATUS"
+fi
+exit "$HEALTH_STATUS"

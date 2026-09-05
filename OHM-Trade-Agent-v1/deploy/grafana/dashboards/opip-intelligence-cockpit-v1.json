@@ -1,0 +1,191 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Freshness Status",
+      "description": "Canonical data freshness from ops.dashboard_freshness_v. Grafana refresh/page response time is not data freshness.",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "type": "stat",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT CASE\n         WHEN count(*) = 0 THEN 'UNAVAILABLE'\n         WHEN bool_or(status = 'UNAVAILABLE') THEN 'UNAVAILABLE'\n         WHEN bool_or(status = 'STALE') THEN 'STALE'\n         WHEN bool_or(status = 'DEGRADED') THEN 'DEGRADED'\n         ELSE 'LIVE'\n       END AS status\nFROM ops.dashboard_freshness_v\nWHERE required OR stream_name = '__maintenance__'\n", "editorMode": "code"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "orientation": "auto", "textMode": "value"}
+    },
+    {
+      "id": 2,
+      "title": "System Pulse (freshness and backlog)",
+      "description": "Canonical required-stream and maintenance freshness. Status/reason come directly from the fail-closed freshness contract.",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 5, "w": 10, "x": 4, "y": 0},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT stream_name,\n       status,\n       reason,\n       age_seconds,\n       threshold_seconds,\n       reference_at,\n       last_reconciliation_status,\n       unresolved_dead_letters,\n       refresh_view_age_seconds\nFROM ops.dashboard_freshness_v\nWHERE required OR stream_name = '__maintenance__'\nORDER BY stream_name\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 3,
+      "title": "Deployment Markers (if emitted)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 5, "w": 10, "x": 14, "y": 0},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nWITH latest_marker AS (\n  SELECT observed_at,\n         nullif(payload->>'production_sha', '') AS production_sha,\n         nullif(payload->>'analytics_sha', '') AS analytics_sha\n  FROM raw.ingested_event\n  WHERE observed_at > now() - interval '30 days'\n    AND (\n      nullif(payload->>'production_sha', '') IS NOT NULL\n      OR nullif(payload->>'analytics_sha', '') IS NOT NULL\n    )\n  ORDER BY observed_at DESC, ingested_at DESC, source_generation DESC, source_byte_offset DESC\n  LIMIT 1\n), latest_schema AS (\n  SELECT version, sha256, applied_at\n  FROM ops.schema_version\n  ORDER BY version DESC\n  LIMIT 1\n)\nSELECT marker.observed_at,\n       coalesce(marker.production_sha, 'UNAVAILABLE') AS production_sha,\n       coalesce(marker.analytics_sha, 'UNAVAILABLE') AS analytics_sha,\n       coalesce(schema_row.sha256, 'UNAVAILABLE') AS schema_sha,\n       schema_row.applied_at AS schema_applied_at\nFROM (SELECT 1) AS anchor\nLEFT JOIN latest_marker marker ON true\nLEFT JOIN latest_schema schema_row ON true\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 4,
+      "title": "Qualification Funnel (24h)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 5},
+      "type": "bargauge",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT to_stage AS metric, count(*)::bigint AS value\nFROM lifecycle.stage_transition\nWHERE occurred_at > now() - interval '24 hours'\nGROUP BY to_stage\nORDER BY value DESC\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 5,
+      "title": "Current Chokes by Outcome (7d)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 5},
+      "type": "timeseries",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT day AS time,\n       outcome AS metric,\n       sum(evaluations)::bigint AS value\nFROM market.attrition_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY day, outcome\nORDER BY day\n", "editorMode": "code"}],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 6,
+      "title": "Rejection Reason Mix (7d)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 5},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT now() AS observed_at, gate_name, reason_code, sum(transitions)::bigint AS transitions\nFROM lifecycle.rejection_mix_daily_mv\nWHERE day > now() - interval '7 days'\nGROUP BY gate_name, reason_code\nORDER BY transitions DESC\nLIMIT 40\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 7,
+      "title": "Opportunity Accountability Trend",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 11},
+      "type": "timeseries",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT day AS time,\n       directional_evaluations,\n       captured_winners,\n       executable_false_negatives,\n       threshold_70_79_miss_candidates,\n       ranking_or_cap_miss_candidates,\n       operational_executable_misses\nFROM learning.opportunity_accountability_daily_mv\nWHERE day > now() - interval '60 days'\nORDER BY day\n", "editorMode": "code"}],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 8,
+      "title": "Opportunity Accountability Rollup",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 11},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT now() AS observed_at,\n       coalesce(sum(directional_evaluations), 0)::bigint AS directional_evaluations,\n       coalesce(sum(completed_forward_outcomes), 0)::bigint AS matured_forward_outcomes,\n       coalesce(sum(captured_winners), 0)::bigint AS captured_winners,\n       coalesce(sum(executable_false_negatives), 0)::bigint AS executable_false_negatives,\n       CASE WHEN coalesce(sum(market_winner_candidates), 0) = 0 THEN NULL\n            ELSE round(100.0 * sum(captured_winners) / sum(market_winner_candidates), 2)\n       END AS capture_rate_pct,\n       round(coalesce(sum(estimated_missed_move_pct_sum), 0), 4) AS estimated_missed_move_pct\nFROM learning.opportunity_accountability_daily_mv\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 9,
+      "title": "Paper Trading Performance (30d)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 18},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT now() AS observed_at,\n       count(*) FILTER (WHERE state NOT IN ('CLOSED', 'SETTLED'))::bigint AS open_trades,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED'))::bigint AS closed_trades,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) > 0)::bigint AS wins,\n       count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) <= 0)::bigint AS losses,\n       CASE WHEN count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED')) = 0 THEN NULL\n            ELSE round(100.0 * count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED') AND coalesce(realised_pnl,0) > 0)\n                 / count(*) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 2)\n       END AS win_rate_pct,\n       round(coalesce(sum(realised_pnl) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 0), 8) AS realised_pnl,\n       round(avg(realised_pnl) FILTER (WHERE state IN ('CLOSED', 'SETTLED')), 8) AS average_return\nFROM paper.trade\nWHERE coalesce(closed_at, opened_at, now()) > now() - interval '30 days'\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 10,
+      "title": "Signal Quality Evidence (recent 200)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 18},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       c.direction,\n       c.decision,\n       c.terminal_reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nORDER BY c.decision_at DESC\nLIMIT 200\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 11,
+      "title": "Learning Throughput (30d)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 18},
+      "type": "timeseries",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT date_trunc('day', observed_at) AS time,\n       count(*)::bigint AS feature_snapshots\nFROM learning.feature_snapshot\nWHERE observed_at > now() - interval '30 days'\nGROUP BY 1\nORDER BY 1\n", "editorMode": "code"}],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 12,
+      "title": "Failure Eradication Signals (30d)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 25},
+      "type": "timeseries",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT date_trunc('day', first_seen_at) AS time,\n       stream_name || ':' || error_type AS metric,\n       count(*)::bigint AS value\nFROM ops.dead_letter\nWHERE first_seen_at > now() - interval '30 days'\nGROUP BY 1, 2\nORDER BY 1\n", "editorMode": "code"}],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 13,
+      "title": "Latency (decision trend + current ingest lag)",
+      "description": "Decision latency plus canonical freshness state. Stalled components are derived from canonical status, not a duplicated hard-coded lag threshold.",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 25},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nWITH latest_decision AS (\n  SELECT day,\n         mean_decision_latency_ms,\n         decision_latency_samples\n  FROM learning.opportunity_accountability_daily_mv\n  ORDER BY day DESC\n  LIMIT 1\n), canonical AS (\n  SELECT max(age_seconds) FILTER (WHERE stream_name <> '__maintenance__') AS current_ingest_age_seconds,\n         count(*) FILTER (WHERE status <> 'LIVE')::bigint AS stalled_components,\n         coalesce(sum(unresolved_dead_letters), 0)::bigint AS unresolved_dead_letters,\n         max(refresh_view_age_seconds)::bigint AS refresh_view_age_seconds\n  FROM ops.dashboard_freshness_v\n  WHERE required OR stream_name = '__maintenance__'\n)\nSELECT now() AS observed_at,\n       (SELECT day FROM latest_decision) AS latest_decision_day,\n       (SELECT mean_decision_latency_ms FROM latest_decision) AS latest_mean_decision_latency_ms,\n       (SELECT decision_latency_samples FROM latest_decision) AS latest_decision_samples,\n       canonical.current_ingest_age_seconds,\n       canonical.stalled_components,\n       canonical.unresolved_dead_letters,\n       canonical.refresh_view_age_seconds\nFROM canonical\n", "editorMode": "code"}]
+    },
+    {
+      "id": 14,
+      "title": "Capacity Thresholds and Current State",
+      "description": "Canonical freshness policy and current state. Grafana's own refresh cadence is not evidence that underlying data is fresh.",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 32},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT stream_name,\n       required,\n       requires_typed_projection,\n       threshold_seconds,\n       status,\n       reason,\n       age_seconds,\n       reference_at,\n       refresh_view_age_seconds\nFROM ops.dashboard_freshness_v\nORDER BY required DESC, stream_name\n", "editorMode": "code"}],
+      "options": {}
+    },
+    {
+      "id": 15,
+      "title": "Archive Growth Telemetry (if emitted)",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 32},
+      "type": "timeseries",
+      "targets": [{"refId": "A", "format": "time_series", "rawSql": "\nSELECT date_trunc('day', observed_at) AS time,\n       avg((payload->>'archive_bytes')::numeric) AS archive_bytes\nFROM raw.ingested_event\nWHERE observed_at > now() - interval '30 days'\n  AND coalesce(payload->>'archive_bytes', '') ~ '^[0-9]+$'\nGROUP BY 1\nORDER BY 1\n", "editorMode": "code"}],
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "id": 16,
+      "title": "Per-Asset / Pair Drilldown",
+      "description": "",
+      "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"},
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 38},
+      "type": "table",
+      "targets": [{"refId": "A", "format": "table", "rawSql": "\nSELECT c.decision_at AS observed_at,\n       i.canonical_asset AS symbol,\n       s.scanner_type,\n       c.direction,\n       st.gate_name,\n       st.reason_code,\n       c.strategy_version,\n       c.model_version,\n       c.config_version,\n       c.decision\nFROM lifecycle.candidate c\nLEFT JOIN market.instrument i ON i.instrument_id = c.instrument_id\nLEFT JOIN market.screening s ON s.scan_id = c.scan_id AND s.instrument_id = c.instrument_id\nLEFT JOIN LATERAL (\n  SELECT gate_name, reason_code\n  FROM lifecycle.stage_transition t\n  WHERE t.candidate_id = c.candidate_id\n  ORDER BY t.occurred_at DESC\n  LIMIT 1\n) st ON true\nWHERE ('__all' = ANY(ARRAY[${symbol:sqlstring}]) OR i.canonical_asset IN (${symbol:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${strategy:sqlstring}]) OR c.strategy_version IN (${strategy:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${scanner:sqlstring}]) OR coalesce(s.scanner_type, 'NONE') IN (${scanner:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${direction:sqlstring}]) OR c.direction IN (${direction:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${gate_reason:sqlstring}]) OR coalesce(st.reason_code, 'NONE') IN (${gate_reason:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${model_version:sqlstring}]) OR coalesce(c.model_version, 'NONE') IN (${model_version:sqlstring}))\n  AND ('__all' = ANY(ARRAY[${config_version:sqlstring}]) OR coalesce(c.config_version, 'NONE') IN (${config_version:sqlstring}))\n  AND c.decision_at BETWEEN $__timeFrom() AND $__timeTo()\nORDER BY c.decision_at DESC\nLIMIT 500\n", "editorMode": "code"}],
+      "options": {}
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["opip", "intelligence", "analytics"],
+  "templating": {
+    "list": [
+      {"name": "symbol", "label": "symbol", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT canonical_asset AS __text, canonical_asset AS __value FROM market.instrument ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "strategy", "label": "strategy", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT strategy_version AS __text, strategy_version AS __value FROM lifecycle.candidate WHERE strategy_version IS NOT NULL ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "scanner", "label": "scanner", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT coalesce(scanner_type, 'NONE') AS __text, coalesce(scanner_type, 'NONE') AS __value FROM market.screening ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "direction", "label": "direction", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT direction AS __text, direction AS __value FROM lifecycle.candidate ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "gate_reason", "label": "gate/reason", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT coalesce(reason_code, 'NONE') AS __text, coalesce(reason_code, 'NONE') AS __value FROM lifecycle.stage_transition ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "model_version", "label": "model version", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT coalesce(model_version, 'NONE') AS __text, coalesce(model_version, 'NONE') AS __value FROM lifecycle.candidate ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1},
+      {"name": "config_version", "label": "config/policy version", "type": "query", "datasource": {"type": "postgres", "uid": "opip-analytics-postgres"}, "query": "SELECT DISTINCT coalesce(config_version, 'NONE') AS __text, coalesce(config_version, 'NONE') AS __value FROM lifecycle.candidate ORDER BY 1", "multi": true, "includeAll": true, "allValue": "__all", "refresh": 1}
+    ]
+  },
+  "time": {"from": "now-30d", "to": "now"},
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "O'Pip Intelligence Cockpit v1",
+  "uid": "opip-intelligence-cockpit-v1",
+  "version": 1,
+  "weekStart": ""
+}

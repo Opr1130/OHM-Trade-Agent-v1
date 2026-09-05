@@ -15,8 +15,23 @@ jobs:
     defaults:
       run:
         working-directory: OHM-Trade-Agent-v1
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: opip_test
+          POSTGRES_PASSWORD: test_password_min_20_chars_long
+          POSTGRES_DB: opip_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     env:
       APP_ENV: test
+      OPIP_TEST_DATABASE_URL: postgresql://opip_test:test_password_min_20_chars_long@localhost:5432/opip_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
