@@ -291,6 +291,19 @@ def _first_terminal_gate_from_row(row: Mapping[str, Any]) -> tuple[str | None, s
     return None, None
 
 
+def _finite_float(value: Any) -> float | None:
+    """Return a finite float for diagnostics, otherwise no measurement."""
+    if isinstance(value, bool):
+        return None
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if resolved != resolved or resolved in {float("inf"), float("-inf")}:
+        return None
+    return resolved
+
+
 def build_recent_qualification_funnel(
     *,
     funnel_events_path=None,
@@ -351,6 +364,12 @@ def build_recent_qualification_funnel(
     terminal_gates = Counter()
     policy_terminal_gates = Counter()
     operational_terminal_gates = Counter()
+    margin_rejection_statuses = Counter()
+    margin_rejection_reasons = Counter()
+    deterministic_binding_metrics = Counter()
+    deterministic_risk_levels = Counter()
+    deterministic_threshold_distances: list[float] = []
+    deterministic_reject_samples: list[dict[str, Any]] = []
     # Emit a stable zero-valued schema even when a stage has no observations.
     # This keeps diagnostics machine-readable and avoids absence being confused
     # with "not instrumented" or an aggregation error.
@@ -381,6 +400,7 @@ def build_recent_qualification_funnel(
         "market_intelligence_skipped",
         "deterministic_prefilter_pass",
         "deterministic_prefilter_reject",
+        "deterministic_prefilter_error",
         "chief_eligible",
         "chief_invoked",
         "chief_succeeded",
@@ -469,12 +489,27 @@ def build_recent_qualification_funnel(
                 metadata = {}
 
             if name == "MARGIN_ELIGIBILITY":
+                reason_class = str(gate.get("reason_class") or "").upper()
+                operational_margin_failure = (
+                    status == "ERROR"
+                    or reason_class == "OPERATIONAL"
+                    or reason_code == "MARGIN_VALIDATION_UNAVAILABLE"
+                )
                 if status == "PASS":
                     counts["margin_pass"] += 1
-                elif status == "FAIL":
-                    counts["margin_reject"] += 1
-                elif status == "ERROR":
-                    counts["margin_error"] += 1
+                elif status in {"FAIL", "ERROR"}:
+                    if operational_margin_failure:
+                        counts["margin_error"] += 1
+                    else:
+                        counts["margin_reject"] += 1
+                if status in {"FAIL", "ERROR"}:
+                    margin_status = str(
+                        metadata.get("margin_validation_status")
+                        or reason_code
+                        or "UNKNOWN"
+                    ).upper()
+                    margin_rejection_statuses[margin_status] += 1
+                    margin_rejection_reasons[reason_code or "UNKNOWN"] += 1
             elif name == "EXECUTION_VALIDATION":
                 if status == "PASS":
                     counts["execution_pass"] += 1
@@ -498,10 +533,72 @@ def build_recent_qualification_funnel(
                 elif status == "SKIPPED":
                     counts["market_intelligence_skipped"] += 1
             elif name == "DETERMINISTIC_QUALITY":
+                reason_class = str(gate.get("reason_class") or "").upper()
+                operational_deterministic_failure = (
+                    status == "ERROR"
+                    or reason_class == "OPERATIONAL"
+                    or reason_code == "GATE_EVALUATION_ERROR"
+                )
                 if status == "PASS":
                     counts["deterministic_prefilter_pass"] += 1
-                elif status == "FAIL":
-                    counts["deterministic_prefilter_reject"] += 1
+                elif status in {"FAIL", "ERROR"}:
+                    if operational_deterministic_failure:
+                        counts["deterministic_prefilter_error"] += 1
+                    else:
+                        counts["deterministic_prefilter_reject"] += 1
+                # Policy rejects only: binding metrics, risk levels, and gaps.
+                # Operational/malformed failures must not enter gap statistics
+                # or look like qualification-policy attribution.
+                if status == "FAIL" and not operational_deterministic_failure:
+                    binding_metric = str(
+                        metadata.get("binding_metric") or "UNKNOWN"
+                    ).upper()
+                    deterministic_binding_metrics[binding_metric] += 1
+                    persisted_risk_levels = metadata.get("risk_levels")
+                    if isinstance(persisted_risk_levels, Mapping):
+                        risk_level_names = list(persisted_risk_levels)
+                    else:
+                        risk_level_names = (
+                            metadata.get("risk_levels_evaluated") or []
+                        )
+                    if isinstance(risk_level_names, (list, tuple, set)):
+                        for risk_level in risk_level_names:
+                            label = str(risk_level or "").strip().upper()
+                            if label:
+                                deterministic_risk_levels[label] += 1
+                    distance = _finite_float(gate.get("threshold_distance"))
+                    if distance is not None:
+                        deterministic_threshold_distances.append(abs(distance))
+                    if len(deterministic_reject_samples) < 20:
+                        measured = _finite_float(
+                            gate.get("measured_value")
+                            if gate.get("measured_value") is not None
+                            else metadata.get("binding_measured")
+                        )
+                        threshold = _finite_float(
+                            gate.get("threshold")
+                            if gate.get("threshold") is not None
+                            else metadata.get("binding_threshold")
+                        )
+                        deterministic_reject_samples.append(
+                            {
+                                "binding_metric": binding_metric,
+                                "measured_value": measured,
+                                "threshold": threshold,
+                                "threshold_distance": distance,
+                                "risk_levels_evaluated": [
+                                    str(level).strip().upper()
+                                    for level in (
+                                        risk_level_names
+                                        if isinstance(
+                                            risk_level_names, (list, tuple, set)
+                                        )
+                                        else []
+                                    )
+                                    if str(level or "").strip()
+                                ],
+                            }
+                        )
             elif name == "AI_ELIGIBILITY" and status == "PASS":
                 counts["chief_eligible"] += 1
             elif name == "AI_INVOCATION":
@@ -583,6 +680,34 @@ def build_recent_qualification_funnel(
         + counts["funnel_incomplete"]
     )
 
+    deterministic_threshold_distances.sort()
+    deterministic_nearest_gap_pct = (
+        round(deterministic_threshold_distances[0] * 100.0, 4)
+        if deterministic_threshold_distances
+        else None
+    )
+    deterministic_median_gap_pct = None
+    if deterministic_threshold_distances:
+        midpoint = len(deterministic_threshold_distances) // 2
+        if len(deterministic_threshold_distances) % 2:
+            median_distance = deterministic_threshold_distances[midpoint]
+        else:
+            median_distance = (
+                deterministic_threshold_distances[midpoint - 1]
+                + deterministic_threshold_distances[midpoint]
+            ) / 2.0
+        deterministic_median_gap_pct = round(median_distance * 100.0, 4)
+
+    margin_failure_total = (
+        counts["margin_reject"] + counts["margin_error"]
+    )
+    margin_reason_pct: dict[str, float] = {}
+    if margin_failure_total > 0:
+        for reason, count in margin_rejection_reasons.most_common():
+            margin_reason_pct[reason] = round(
+                (100.0 * float(count)) / float(margin_failure_total), 4
+            )
+
     return {
         "window_hours": effective_window_hours,
         "generated_at_utc": current.isoformat(),
@@ -602,6 +727,56 @@ def build_recent_qualification_funnel(
         ),
         "funnel_invariant_holds": funnel_invariant_holds,
         "top_rejection_reasons": dict(rejections.most_common(10)),
+        # Explicit Build 6 aliases for operator/machine consumers.
+        "deterministic_policy_reject_count": counts[
+            "deterministic_prefilter_reject"
+        ],
+        "deterministic_operational_error_count": counts[
+            "deterministic_prefilter_error"
+        ],
+        "choke_analysis": {
+            "margin_eligibility": {
+                "evaluated": (
+                    counts["margin_pass"]
+                    + counts["margin_reject"]
+                    + counts["margin_error"]
+                ),
+                "passed": counts["margin_pass"],
+                "rejects": counts["margin_reject"],
+                "errors": counts["margin_error"],
+                "rejection_status_counts": dict(
+                    margin_rejection_statuses.most_common()
+                ),
+                "rejection_reason_counts": dict(
+                    margin_rejection_reasons.most_common()
+                ),
+                "rejection_reason_pct": margin_reason_pct,
+            },
+            "deterministic_viability": {
+                "rejects": counts["deterministic_prefilter_reject"],
+                "errors": counts["deterministic_prefilter_error"],
+                "deterministic_policy_reject_count": counts[
+                    "deterministic_prefilter_reject"
+                ],
+                "deterministic_operational_error_count": counts[
+                    "deterministic_prefilter_error"
+                ],
+                "binding_metric_counts": dict(
+                    deterministic_binding_metrics.most_common()
+                ),
+                "risk_level_evaluation_counts": dict(
+                    deterministic_risk_levels.most_common()
+                ),
+                "threshold_distance_samples": len(
+                    deterministic_threshold_distances
+                ),
+                "nearest_threshold_gap_pct": deterministic_nearest_gap_pct,
+                "median_threshold_gap_pct": deterministic_median_gap_pct,
+                "policy_reject_samples": list(deterministic_reject_samples),
+            },
+            "measurement_only": True,
+            "policy_change_authorized": False,
+        },
         "measurement_only": True,
         "affects_trade_authority": False,
     }
@@ -636,6 +811,7 @@ def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
         "market_intelligence_skipped",
         "deterministic_prefilter_pass",
         "deterministic_prefilter_reject",
+        "deterministic_prefilter_error",
         "chief_eligible",
         "chief_invoked",
         "chief_succeeded",
@@ -674,6 +850,65 @@ def render_recent_qualification_funnel(report: Mapping[str, Any]) -> str:
     lines.append(
         "PRIMARY_OPERATIONAL_CHOKE="
         f"{report.get('primary_operational_choke', 'NONE')}"
+    )
+    choke = report.get("choke_analysis") or {}
+    margin = choke.get("margin_eligibility") or {}
+    deterministic = choke.get("deterministic_viability") or {}
+    lines.append("MARGIN_CHOKE_DETAIL")
+    lines.append(f"MARGIN_EVALUATED={margin.get('evaluated', 0)}")
+    lines.append(f"MARGIN_PASSED={margin.get('passed', 0)}")
+    lines.append(f"MARGIN_REJECTS={margin.get('rejects', 0)}")
+    lines.append(f"MARGIN_ERRORS={margin.get('errors', 0)}")
+    margin_statuses = margin.get("rejection_status_counts") or {}
+    if margin_statuses:
+        for status_name, count in margin_statuses.items():
+            lines.append(f"{status_name}={count}")
+    else:
+        lines.append("NONE=0")
+    margin_reason_pct = margin.get("rejection_reason_pct") or {}
+    if margin_reason_pct:
+        lines.append("MARGIN_REJECTION_REASON_PCT")
+        for reason, pct in margin_reason_pct.items():
+            lines.append(f"{reason}={pct}")
+    lines.append("DETERMINISTIC_CHOKE_DETAIL")
+    lines.append(
+        "DETERMINISTIC_REJECTS="
+        f"{deterministic.get('rejects', 0)}"
+    )
+    lines.append(
+        "DETERMINISTIC_ERRORS="
+        f"{deterministic.get('errors', 0)}"
+    )
+    lines.append(
+        "DETERMINISTIC_POLICY_REJECT_COUNT="
+        f"{deterministic.get('deterministic_policy_reject_count', 0)}"
+    )
+    lines.append(
+        "DETERMINISTIC_OPERATIONAL_ERROR_COUNT="
+        f"{deterministic.get('deterministic_operational_error_count', 0)}"
+    )
+    binding_metrics = deterministic.get("binding_metric_counts") or {}
+    if binding_metrics:
+        for metric, count in binding_metrics.items():
+            lines.append(f"{metric}={count}")
+    else:
+        lines.append("NONE=0")
+    risk_levels = deterministic.get("risk_level_evaluation_counts") or {}
+    if risk_levels:
+        lines.append("DETERMINISTIC_RISK_LEVEL_COUNTS")
+        for level, count in risk_levels.items():
+            lines.append(f"{level}={count}")
+    lines.append(
+        "DETERMINISTIC_NEAREST_THRESHOLD_GAP_PCT="
+        f"{deterministic.get('nearest_threshold_gap_pct')}"
+    )
+    lines.append(
+        "DETERMINISTIC_MEDIAN_THRESHOLD_GAP_PCT="
+        f"{deterministic.get('median_threshold_gap_pct')}"
+    )
+    lines.append(
+        "CHOKE_ANALYSIS_POLICY_CHANGE_AUTHORIZED="
+        f"{'YES' if choke.get('policy_change_authorized') else 'NO'}"
     )
     lines.append(
         "FUNNEL_INVARIANT_HOLDS="
