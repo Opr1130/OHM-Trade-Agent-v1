@@ -9,6 +9,10 @@ Grafana runs on the isolated analytics droplet and reads O'Pip PostgreSQL with t
 - Keep `OPIP_GRAFANA_BIND_ADDRESS=127.0.0.1` unless a private VPC bind is explicitly required.
 - Front Grafana with a TLS reverse proxy; do not expose unauthenticated Grafana directly.
 - Never grant Grafana a write-capable PostgreSQL role.
+- Require `verify-full` TLS for Grafana's PostgreSQL datasource and mount the trusted
+  PostgreSQL CA certificate at `/etc/grafana/certs/postgres-ca.crt`.
+- Keep `OPIP_GRAFANA_POSTGRES_HOST=opip-postgres`; the PostgreSQL server certificate
+  must contain `DNS:opip-postgres` in its subjectAltName.
 - Keep persistent state at `/var/lib/opip-data-platform/grafana`.
 - Do not deploy Grafana or PostgreSQL on the production trading droplet.
 
@@ -43,8 +47,13 @@ freshness result. Do not bypass or simulate that elapsed-time evidence.
 
 ## Start/upgrade
 
+Compose interpolation requires the sealed analytics environment file as well as
+the service-level `env_file` declaration:
+
 ```bash
-docker compose -f deploy/analytics/docker-compose.yml up -d opip-grafana
+docker compose --env-file /etc/opip-data-platform.env \
+  -f deploy/analytics/docker-compose.yml \
+  up -d opip-grafana
 ```
 
 ## Reverse proxy
