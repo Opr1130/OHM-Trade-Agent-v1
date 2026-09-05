@@ -57,6 +57,19 @@ require_grafana_verify_full() {
 }
 require_grafana_verify_full
 
+require_analytics_verify_full_dsn() {
+  local name="$1" value="${!1:-}"
+  if [[ -z "$value" \
+    || "$value" != *"@opip-postgres:"* \
+    || "$value" != *"sslmode=verify-full"* \
+    || "$value" != *"sslrootcert=$POSTGRES_TLS_CA"* ]]; then
+    echo "$name must connect to opip-postgres with sslmode=verify-full and sslrootcert=$POSTGRES_TLS_CA" >&2
+    exit 78
+  fi
+}
+require_analytics_verify_full_dsn OPIP_ANALYTICS_ADMIN_DATABASE_URL
+require_analytics_verify_full_dsn OPIP_ANALYTICS_DATABASE_URL
+
 write_grafana_env_file() {
   local temporary key
   local -a keys=(
@@ -158,8 +171,8 @@ EMPTY_DEPLOY_COUNT="${EMPTY_DEPLOY_COUNT:-0}"
 cat > "$STATE_ROOT/config/pg_hba.conf" <<EOF
 local all all scram-sha-256
 host all all 127.0.0.1/32 scram-sha-256
-host all all 172.29.0.0/24 scram-sha-256
-host all opip_dashboard $OPIP_PRODUCTION_PRIVATE_CIDR scram-sha-256
+hostssl all all 172.29.0.0/24 scram-sha-256
+hostssl all opip_dashboard $OPIP_PRODUCTION_PRIVATE_CIDR scram-sha-256
 EOF
 chmod 0644 "$STATE_ROOT/config/pg_hba.conf"
 
