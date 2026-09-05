@@ -90,6 +90,18 @@ def apply_migrations(connection: Any, *, root: Path = MIGRATION_ROOT) -> list[in
                     (migration.version, migration.name, migration.sha256),
                 )
                 applied.append(migration.version)
+
+            # Migration 005 creates dashboard_freshness_mv WITH NO DATA. Populate
+            # it before this migration transaction commits so no other session
+            # can ever observe the relation in PostgreSQL's unpopulated 55000
+            # state between `migrate` and the subsequent policy-sync refresh.
+            cursor.execute(
+                "SELECT c.relispopulated FROM pg_class c "
+                "WHERE c.oid = to_regclass('ops.dashboard_freshness_mv')"
+            )
+            freshness_row = cursor.fetchone()
+            if freshness_row is not None and not bool(freshness_row[0]):
+                cursor.execute("REFRESH MATERIALIZED VIEW ops.dashboard_freshness_mv")
     return applied
 
 
