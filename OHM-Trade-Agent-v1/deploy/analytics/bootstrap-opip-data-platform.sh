@@ -8,11 +8,15 @@ REPO_ROOT="$ROOT/repo"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
 ENV_FILE="/etc/opip-data-platform.env"
+GRAFANA_ENV_FILE="/etc/opip-grafana.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
 RESTORE_EVIDENCE="$STATE_ROOT/last-restore-drill.env"
 ROLLBACK_EVIDENCE="$STATE_ROOT/empty-rollback.env"
+POSTGRES_TLS_CA="/etc/opip-data-platform/tls/postgres-ca.crt"
+POSTGRES_TLS_CERT="/etc/opip-data-platform/tls/postgres-server.crt"
+POSTGRES_TLS_KEY="/etc/opip-data-platform/tls/postgres-server.key"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "usage: $0 <40-char-main-sha> <empty|backfill|shipper|reads-ready>" >&2
@@ -34,6 +38,76 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+require_uri_unreserved_password() {
+  local name="$1" value="${!1:-}"
+  if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    echo "$name must be non-empty and use URI-unreserved characters only (A-Z a-z 0-9 - . _ ~)" >&2
+    exit 78
+  fi
+}
+require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD
+require_uri_unreserved_password OPIP_SHIPPER_PASSWORD
+
+require_grafana_verify_full() {
+  if [[ "${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" != "verify-full" ]]; then
+    echo "OPIP_GRAFANA_DB_SSLMODE must be exactly verify-full" >&2
+    exit 78
+  fi
+}
+require_grafana_verify_full
+
+require_analytics_verify_full_dsn() {
+  local name="$1" value="${!1:-}"
+  if [[ -z "$value" \
+    || "$value" != *"@opip-postgres:"* \
+    || "$value" != *"sslmode=verify-full"* \
+    || "$value" != *"sslrootcert=$POSTGRES_TLS_CA"* ]]; then
+    echo "$name must connect to opip-postgres with sslmode=verify-full and sslrootcert=$POSTGRES_TLS_CA" >&2
+    exit 78
+  fi
+}
+require_analytics_verify_full_dsn OPIP_ANALYTICS_ADMIN_DATABASE_URL
+require_analytics_verify_full_dsn OPIP_ANALYTICS_DATABASE_URL
+
+write_grafana_env_file() {
+  local temporary key
+  local -a keys=(
+    OPIP_GRAFANA_ADMIN_USER
+    OPIP_GRAFANA_ADMIN_PASSWORD
+    OPIP_GRAFANA_DB_USER
+    OPIP_GRAFANA_DB_PASSWORD
+    OPIP_GRAFANA_DB_NAME
+    OPIP_GRAFANA_DB_SSLMODE
+    OPIP_GRAFANA_POSTGRES_HOST
+    OPIP_GRAFANA_POSTGRES_PORT
+    OPIP_GRAFANA_BIND_ADDRESS
+    OPIP_GRAFANA_HOST_PORT
+    OPIP_GRAFANA_HTTP_PORT
+    OPIP_GRAFANA_DOMAIN
+    OPIP_GRAFANA_ROOT_URL
+    OPIP_GRAFANA_SERVE_FROM_SUB_PATH
+  )
+
+  temporary="$(mktemp /etc/opip-grafana.env.XXXXXX)"
+  : > "$temporary"
+  for key in "${keys[@]}"; do
+    if ! awk -F= -v key="$key" '$1 == key {print; found=1; exit} END {if (!found) exit 1}' \
+      "$ENV_FILE" >> "$temporary"; then
+      rm -f -- "$temporary"
+      echo "missing required Grafana setting in $ENV_FILE: $key" >&2
+      exit 78
+    fi
+  done
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$GRAFANA_ENV_FILE"
+}
+write_grafana_env_file
+
+compose() {
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
+}
 
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.
 # Timers use this same lock and will skip rather than compete for RAM or files.
@@ -67,9 +141,11 @@ remote_main="$(git -C "$REPO_ROOT" rev-parse origin/main)"
 git -C "$REPO_ROOT" checkout -f main
 git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
 
+install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \
   "$STATE_ROOT/config" \
   /var/backups/opip-postgres
+install -d -o 472 -g 472 -m 0750 "$STATE_ROOT/grafana"
 # Never reset an initialized bind-mounted PGDATA directory to root:root while
 # PostgreSQL is running. Recover the directory owner from a canonical file so
 # repeat empty deployments remain safe without hard-coding the image UID/GID.
@@ -95,8 +171,8 @@ EMPTY_DEPLOY_COUNT="${EMPTY_DEPLOY_COUNT:-0}"
 cat > "$STATE_ROOT/config/pg_hba.conf" <<EOF
 local all all scram-sha-256
 host all all 127.0.0.1/32 scram-sha-256
-host all all 172.29.0.0/24 scram-sha-256
-host all opip_dashboard $OPIP_PRODUCTION_PRIVATE_CIDR scram-sha-256
+hostssl all all 172.29.0.0/24 scram-sha-256
+hostssl all opip_dashboard $OPIP_PRODUCTION_PRIVATE_CIDR scram-sha-256
 EOF
 chmod 0644 "$STATE_ROOT/config/pg_hba.conf"
 
@@ -110,10 +186,62 @@ write_state() {
   mv -f -- "$temporary" "$STATE_FILE"
 }
 
+validate_postgres_tls_key() {
+  local postgres_image runtime_ids pg_uid pg_gid key_metadata key_mode key_uid key_gid
+
+  [[ -f "$POSTGRES_TLS_CA" && -r "$POSTGRES_TLS_CA" ]] || {
+    echo "missing or unreadable PostgreSQL TLS CA: $POSTGRES_TLS_CA" >&2
+    exit 78
+  }
+  [[ -f "$POSTGRES_TLS_CERT" && -r "$POSTGRES_TLS_CERT" ]] || {
+    echo "missing or unreadable PostgreSQL TLS certificate: $POSTGRES_TLS_CERT" >&2
+    exit 78
+  }
+  [[ -f "$POSTGRES_TLS_KEY" ]] || {
+    echo "missing PostgreSQL TLS private key: $POSTGRES_TLS_KEY" >&2
+    exit 78
+  }
+
+  # Pull the exact Compose image but do not start PostgreSQL. Resolve the
+  # postgres runtime UID/GID from that image rather than hard-coding Alpine IDs.
+  compose pull opip-postgres >/dev/null
+  postgres_image="$(compose config --images | awk '/(^|\/)postgres:/ {print; exit}')"
+  [[ -n "$postgres_image" ]] || {
+    echo "unable to resolve PostgreSQL image for TLS-key preflight" >&2
+    exit 78
+  }
+  runtime_ids="$(
+    docker run --rm --entrypoint sh "$postgres_image" -c \
+      'printf "%s:%s\n" "$(id -u postgres)" "$(id -g postgres)"'
+  )"
+  if [[ ! "$runtime_ids" =~ ^[0-9]+:[0-9]+$ ]]; then
+    echo "unable to resolve PostgreSQL runtime UID/GID from $postgres_image" >&2
+    exit 78
+  fi
+  IFS=: read -r pg_uid pg_gid <<<"$runtime_ids"
+
+  key_metadata="$(stat -Lc '%a:%u:%g' "$POSTGRES_TLS_KEY")"
+  if [[ ! "$key_metadata" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then
+    echo "unable to read PostgreSQL TLS key ownership/mode" >&2
+    exit 78
+  fi
+  IFS=: read -r key_mode key_uid key_gid <<<"$key_metadata"
+
+  if [[ "$key_mode" == "600" && "$key_uid" == "$pg_uid" && "$key_gid" == "$pg_gid" ]]; then
+    return 0
+  fi
+  if [[ "$key_mode" == "640" && "$key_uid" == "0" && "$key_gid" == "$pg_gid" ]]; then
+    return 0
+  fi
+
+  echo "invalid PostgreSQL TLS key ownership/mode: got mode=$key_mode uid=$key_uid gid=$key_gid; expected 0600 owned by $pg_uid:$pg_gid or root:$pg_gid with 0640" >&2
+  exit 78
+}
+
 wait_for_postgres() {
   local ready="false"
   for _ in $(seq 1 30); do
-    if docker compose -f "$COMPOSE" exec -T opip-postgres \
+    if compose exec -T opip-postgres \
       pg_isready -U "${OPIP_POSTGRES_ADMIN_USER:-opip_admin}" -d "${OPIP_POSTGRES_DB:-opip}"; then
       ready="true"
       break
@@ -127,7 +255,7 @@ wait_for_postgres() {
 }
 
 admin_run() {
-  docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin "$@"
+  compose --profile admin run --rm opip-data-admin "$@"
 }
 
 require_stage() {
@@ -190,8 +318,11 @@ validate_promotion_evidence() {
 }
 
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-# Both services share the same immutable image tag; build once to avoid a\n# concurrent BuildKit export race on the identical tag.\ndocker compose -f "$COMPOSE" build opip-shipper
-docker compose -f "$COMPOSE" up -d opip-postgres
+validate_postgres_tls_key
+# Both application services share the same immutable image tag; build once to
+# avoid a concurrent BuildKit export race on the identical tag.
+docker compose -f "$COMPOSE" build opip-shipper
+compose up -d opip-postgres
 wait_for_postgres
 
 # A fresh host may initialize the empty database first. Promotion beyond the
@@ -251,7 +382,7 @@ elif [[ "$STAGE" == "shipper" ]]; then
   admin_run python -m app.opip.data_platform.migrations migrate
   admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
-  docker compose -f "$COMPOSE" up -d opip-shipper
+  compose up -d opip-shipper
   if [[ -z "${SHIPPER_STARTED_AT_UTC:-}" ]]; then
     write_state SHIPPER_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
@@ -299,7 +430,7 @@ if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
   systemctl enable --now opip-data-platform-maintenance.timer
 fi
 
-docker compose -f "$COMPOSE" ps
+compose ps
 echo "O'Pip analytics data-platform stage succeeded"
 echo "stage=$STAGE"
 echo "sha=$TARGET_SHA"

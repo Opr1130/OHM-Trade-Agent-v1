@@ -32,11 +32,21 @@ services:
       - password_encryption=scram-sha-256
       - -c
       - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - ssl=on
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
     ports:
       - "${OPIP_POSTGRES_BIND_ADDRESS:-127.0.0.1}:5432:5432"
     volumes:
       - /var/lib/opip-data-platform/postgres:/var/lib/postgresql/data
       - /var/lib/opip-data-platform/config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - /etc/opip-data-platform/tls/postgres-server.crt:/etc/postgresql/tls/server.crt:ro
+      - /etc/opip-data-platform/tls/postgres-server.key:/etc/postgresql/tls/server.key:ro
     networks:
       opip-analytics:
         ipv4_address: 172.29.0.2
@@ -54,6 +64,67 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  opip-grafana:
+    image: grafana/grafana:13.2.1
+    container_name: opip-grafana
+    restart: unless-stopped
+    depends_on:
+      opip-postgres:
+        condition: service_healthy
+    env_file:
+      - /etc/opip-grafana.env
+    environment:
+      GF_SERVER_HTTP_PORT: ${OPIP_GRAFANA_HTTP_PORT:-3000}
+      GF_SERVER_ROOT_URL: ${OPIP_GRAFANA_ROOT_URL:-https://analytics.example.com/grafana}
+      GF_SERVER_DOMAIN: ${OPIP_GRAFANA_DOMAIN:-analytics.example.com}
+      GF_SERVER_SERVE_FROM_SUB_PATH: ${OPIP_GRAFANA_SERVE_FROM_SUB_PATH:-true}
+      GF_SECURITY_ADMIN_USER: ${OPIP_GRAFANA_ADMIN_USER:?set in /etc/opip-data-platform.env}
+      GF_SECURITY_ADMIN_PASSWORD: ${OPIP_GRAFANA_ADMIN_PASSWORD:?set in /etc/opip-data-platform.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      OPIP_GRAFANA_DB_USER: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}
+      OPIP_GRAFANA_DB_PASSWORD: ${OPIP_GRAFANA_DB_PASSWORD:?set in /etc/opip-data-platform.env}
+      OPIP_GRAFANA_DB_NAME: ${OPIP_GRAFANA_DB_NAME:-opip}
+      OPIP_GRAFANA_DB_SSLMODE: ${OPIP_GRAFANA_DB_SSLMODE:-verify-full}
+      OPIP_GRAFANA_POSTGRES_HOST: ${OPIP_GRAFANA_POSTGRES_HOST:-opip-postgres}
+      OPIP_GRAFANA_POSTGRES_PORT: ${OPIP_GRAFANA_POSTGRES_PORT:-5432}
+    ports:
+      - "${OPIP_GRAFANA_BIND_ADDRESS:-127.0.0.1}:${OPIP_GRAFANA_HOST_PORT:-3000}:${OPIP_GRAFANA_HTTP_PORT:-3000}"
+    volumes:
+      - /var/lib/opip-data-platform/grafana:/var/lib/grafana
+      - /etc/opip-data-platform/tls/postgres-ca.crt:/etc/grafana/certs/postgres-ca.crt:ro
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/etc/grafana/provisioning/dashboards/json:ro
+    networks:
+      opip-analytics:
+    user: "472"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /var/log/grafana:rw,noexec,nosuid,size=64m
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.30"
+    pids_limit: 192
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:${OPIP_GRAFANA_HTTP_PORT:-3000}/api/health | grep -q '"database":"ok"'
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     logging:
       driver: json-file
       options:
@@ -82,6 +153,7 @@ services:
       - --watch
     volumes:
       - /var/lib/opip-learning/data:/data:ro
+      - /etc/opip-data-platform/tls/postgres-ca.crt:/etc/opip-data-platform/tls/postgres-ca.crt:ro
     networks:
       opip-analytics:
     read_only: true
@@ -118,6 +190,7 @@ services:
     volumes:
       - /var/lib/opip-learning/data:/data:ro
       - /var/backups/opip-postgres:/backups:rw
+      - /etc/opip-data-platform/tls/postgres-ca.crt:/etc/opip-data-platform/tls/postgres-ca.crt:ro
     networks:
       opip-analytics:
     read_only: true
@@ -131,6 +204,11 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
 
 networks:
   opip-analytics:
