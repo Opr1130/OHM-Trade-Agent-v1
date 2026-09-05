@@ -1,0 +1,16 @@
+---
+description: O'Pip trading authority, paper/dry-run isolation, and risk-gate safety
+alwaysApply: true
+---
+
+# Trading and execution safety
+
+Complement `AGENTS.md`, `CLAUDE.md`, paper/Freqtrade docs, and runtime risk gates. Coding agents have **no trading authority**.
+
+- Never enable live trading, live exchange execution, or increase trading authority.
+- Do not add or widen Kraken order placement, modification, cancellation, confirmation, or production execution permissions unless the task explicitly scopes and approves that change.
+- Keep paper trading and Freqtrade dry-run isolated from production authority: no Kraken private API writes, no live registry/order-path mutation, no shared production execution authority.
+- AI recommendations are advisory only. They must not override deterministic risk rejection or execution-safety gates. Gates fail closed when external AI is unavailable.
+- Preserve fixed risk sizing, minimum reward-to-risk requirements, position verification, and execution safeguards. Do not loosen these without an explicitly approved contract change.
+- Preserve public contracts unless the task explicitly changes them.
+- Engineering AI (Claude gateway / Cursor) must not gain order, Telegram execution, or exchange authority.

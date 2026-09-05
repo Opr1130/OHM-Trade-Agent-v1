@@ -1,0 +1,18 @@
+---
+description: O'Pip git, CI, PR, and change-size guardrails for all coding agents
+alwaysApply: true
+---
+
+# Git, CI, and change discipline
+
+Complement `AGENTS.md` and `CLAUDE.md`. Do not weaken existing CI or deploy controls.
+
+- Never commit directly to `main`. Use a feature branch; production changes need tests, review, and a PR.
+- Do not create or push commits, merge PRs, or run deployment commands unless the human explicitly instructs you to.
+- Never deploy to production unless explicitly authorized through the existing control plane (exact approved + tested `main` SHA). No alternate deploy paths.
+- Before proposing a commit: run relevant pytest (focused first), and for Python changes `python -m compileall -q app` from `OHM-Trade-Agent-v1/`. Honor touched contract workflows (e.g. Freqtrade).
+- Do not silently edit tests just to clear failures. Do not bypass failing CI, security checks, health checks, deployment locks, or rollback controls.
+- Prefer the smallest change that solves the proven problem. Reuse existing Compose, scheduler, deploy wrappers, telemetry, and data paths.
+- Do not introduce Kubernetes, Redis, a managed DB, a second scheduler, a second deploy plane, or extra droplets unless the task explicitly requires an approved architecture change.
+- Do not commit generated artifacts: `__pycache__/`, `*.pyc`, logs, local DBs, caches, virtualenvs, temp files.
+- Application code lives under `OHM-Trade-Agent-v1/`. Do not bulk-rename legacy `OHM` identifiers in unrelated work.
