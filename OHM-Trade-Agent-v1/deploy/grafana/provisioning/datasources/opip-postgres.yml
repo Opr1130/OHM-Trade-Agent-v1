@@ -7,13 +7,13 @@ datasources:
     access: proxy
     isDefault: true
     editable: false
-    url: ${OPIP_GRAFANA_POSTGRES_HOST:-opip-postgres}:${OPIP_GRAFANA_POSTGRES_PORT:-5432}
-    user: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}
+    url: $OPIP_GRAFANA_POSTGRES_HOST:$OPIP_GRAFANA_POSTGRES_PORT
+    user: $OPIP_GRAFANA_DB_USER
     secureJsonData:
-      password: ${OPIP_GRAFANA_DB_PASSWORD}
+      password: $OPIP_GRAFANA_DB_PASSWORD
     jsonData:
-      database: ${OPIP_GRAFANA_DB_NAME:-opip}
-      sslmode: ${OPIP_GRAFANA_DB_SSLMODE:-verify-full}
+      database: $OPIP_GRAFANA_DB_NAME
+      sslmode: $OPIP_GRAFANA_DB_SSLMODE
       tlsConfigurationMethod: file-path
       sslRootCertFile: /etc/grafana/certs/postgres-ca.crt
       postgresVersion: 1700

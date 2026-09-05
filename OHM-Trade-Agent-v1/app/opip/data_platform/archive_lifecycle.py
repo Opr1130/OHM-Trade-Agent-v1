@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 from pathlib import Path
+import sys
 from typing import Iterable
+
+import zstandard as zstd
 
 
 @dataclass(frozen=True)
@@ -38,12 +42,31 @@ def _tier_for_age(age_days: int) -> str:
     return "COLD"
 
 
+def _drain_reader(reader: object) -> None:
+    while True:
+        chunk = reader.read(1024 * 1024)  # type: ignore[attr-defined]
+        if not chunk:
+            return
+
+
 def _compression(path: Path) -> str:
+    """Return a compression type only after the complete stream validates."""
     name = path.name.lower()
-    if name.endswith(".zst"):
-        return "zstd"
     if name.endswith(".gz"):
+        try:
+            with gzip.open(path, "rb") as handle:
+                _drain_reader(handle)
+        except (EOFError, OSError):
+            return "invalid"
         return "gzip"
+    if name.endswith(".zst"):
+        try:
+            with path.open("rb") as source:
+                with zstd.ZstdDecompressor().stream_reader(source, read_across_frames=True) as reader:
+                    _drain_reader(reader)
+        except (EOFError, OSError, ValueError, zstd.ZstdError):
+            return "invalid"
+        return "zstd"
     return "none"
 
 
@@ -170,6 +193,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        print(f"archive root must be an existing directory: {root}", file=sys.stderr)
+        return 64
     assessments = assess_root(root)
 
     if args.json:

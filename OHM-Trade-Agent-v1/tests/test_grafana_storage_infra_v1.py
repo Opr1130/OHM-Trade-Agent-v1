@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
 
-from app.opip.data_platform.archive_lifecycle import assess_segment, discover_segments
+import zstandard as zstd
+
+from app.opip.data_platform.archive_lifecycle import (
+    assess_segment,
+    discover_segments,
+    main as archive_lifecycle_main,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_gzip(path: Path, payload: bytes = b"payload") -> None:
+    path.write_bytes(gzip.compress(payload))
 
 
 def test_analytics_compose_adds_private_grafana_with_persistence_and_bounded_logs():
@@ -48,9 +59,10 @@ def test_grafana_provisioning_is_code_driven_read_only_and_verify_full_tls():
     ).read_text(encoding="utf-8")
 
     assert "uid: opip-analytics-postgres" in datasource
-    assert "user: ${OPIP_GRAFANA_DB_USER:-opip_dashboard}" in datasource
-    assert "password: ${OPIP_GRAFANA_DB_PASSWORD}" in datasource
-    assert "sslmode: ${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" in datasource
+    assert "user: $OPIP_GRAFANA_DB_USER" in datasource
+    assert "password: $OPIP_GRAFANA_DB_PASSWORD" in datasource
+    assert "password: ${OPIP_GRAFANA_DB_PASSWORD}" not in datasource
+    assert "sslmode: $OPIP_GRAFANA_DB_SSLMODE" in datasource
     assert "tlsConfigurationMethod: file-path" in datasource
     assert "sslRootCertFile: /etc/grafana/certs/postgres-ca.crt" in datasource
     assert "timescaledb: false" in datasource
@@ -71,6 +83,35 @@ def test_grafana_tls_contract_and_documented_start_command_match_runtime():
     assert "docker compose --env-file /etc/opip-data-platform.env" in analytics_readme
     assert "docker compose --env-file /etc/opip-data-platform.env" in grafana_readme
     assert "verify-full" in grafana_readme
+
+
+def test_analytics_dsn_passwords_are_uri_safe_and_bootstrap_enforces_contract():
+    env_example = (ROOT / "deploy" / "analytics" / "env.example").read_text(encoding="utf-8")
+    bootstrap = (
+        ROOT / "deploy" / "analytics" / "bootstrap-opip-data-platform.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "URI-unreserved characters only" in env_example
+    assert "OPIP_POSTGRES_ADMIN_PASSWORD=replace-with-32-plus-uri-unreserved-characters" in env_example
+    assert "OPIP_SHIPPER_PASSWORD=replace-with-independent-32-plus-uri-unreserved-characters" in env_example
+    assert "require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD" in bootstrap
+    assert "require_uri_unreserved_password OPIP_SHIPPER_PASSWORD" in bootstrap
+
+
+def test_postgres_tls_key_preflight_checks_image_runtime_identity_and_modes():
+    bootstrap = (
+        ROOT / "deploy" / "analytics" / "bootstrap-opip-data-platform.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "validate_postgres_tls_key()" in bootstrap
+    assert 'docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"' in bootstrap
+    assert "compose pull opip-postgres" in bootstrap
+    assert "id -u postgres" in bootstrap
+    assert "id -g postgres" in bootstrap
+    assert "stat -Lc '%a:%u:%g'" in bootstrap
+    assert '"$key_mode" == "600"' in bootstrap
+    assert '"$key_mode" == "640"' in bootstrap
+    assert "validate_postgres_tls_key" in bootstrap
 
 
 def test_storage_lifecycle_docs_use_non_overlapping_tier_boundaries():
@@ -119,6 +160,33 @@ def test_intelligence_cockpit_dashboard_contains_required_sections_and_variables
         "config_version",
     ):
         assert variable in variable_names
+
+
+def test_cockpit_multiselect_all_sentinel_uses_sqlstring_arrays():
+    payload = json.loads(
+        (
+            ROOT
+            / "deploy"
+            / "grafana"
+            / "dashboards"
+            / "opip-intelligence-cockpit-v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    panels = {panel["id"]: panel for panel in payload["panels"]}
+    sql = panels[16]["targets"][0]["rawSql"]
+    for variable in (
+        "symbol",
+        "strategy",
+        "scanner",
+        "direction",
+        "gate_reason",
+        "model_version",
+        "config_version",
+    ):
+        sqlstring = "${" + variable + ":sqlstring}"
+        assert f"'__all' = ANY(ARRAY[{sqlstring}])" in sql
+        assert f"IN ({sqlstring})" in sql
+        assert "${" + variable + ":singlequote}" not in sql
 
 
 def test_cockpit_uses_canonical_freshness_contract_without_duplicate_thresholds():
@@ -182,7 +250,7 @@ def test_cockpit_uses_canonical_freshness_contract_without_duplicate_thresholds(
 
 def test_archive_lifecycle_is_fail_closed_for_cold_segment_until_all_evidence_exists(tmp_path):
     segment = tmp_path / "screening-20250101.jsonl.gz"
-    segment.write_bytes(b"payload")
+    _write_gzip(segment)
     old = 1700000000
     segment.touch()
     # force COLD age
@@ -206,8 +274,54 @@ def test_archive_lifecycle_is_fail_closed_for_cold_segment_until_all_evidence_ex
     segment.with_suffix(segment.suffix + ".offhost.verified").write_text("ok\n", encoding="utf-8")
 
     complete = assess_segment(segment)
+    assert complete.compression == "gzip"
     assert complete.cleanup_eligible is True
     assert complete.blockers == []
+
+
+def test_archive_lifecycle_rejects_invalid_compression_even_with_all_evidence(tmp_path):
+    segment = tmp_path / "invalid.jsonl.gz"
+    segment.write_bytes(b"not-a-gzip-stream")
+
+    import os
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    old = now.timestamp() - 100 * 86400
+    os.utime(segment, (old, old))
+    checksum = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{checksum}  {segment.name}\n", encoding="utf-8"
+    )
+    segment.with_suffix(segment.suffix + ".finalized").write_text("ok\n", encoding="utf-8")
+    segment.with_suffix(segment.suffix + ".archive.verified").write_text("ok\n", encoding="utf-8")
+    segment.with_suffix(segment.suffix + ".offhost.verified").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "manifest.env").write_text(f"segment={segment.name}\n", encoding="utf-8")
+
+    assessed = assess_segment(segment, now=now)
+    assert assessed.tier == "COLD"
+    assert assessed.compression == "invalid"
+    assert assessed.cleanup_eligible is False
+    assert assessed.blockers == ["warm_cold_segment_must_be_compressed"]
+
+
+def test_archive_lifecycle_validates_zstd_stream(tmp_path):
+    segment = tmp_path / "segment.jsonl.zst"
+    segment.write_bytes(zstd.ZstdCompressor().compress(b'{"ok":true}\n'))
+    assessed = assess_segment(segment)
+    assert assessed.compression == "zstd"
+
+
+def test_archive_lifecycle_rejects_missing_or_non_directory_root(tmp_path, capsys):
+    missing = tmp_path / "missing"
+    assert archive_lifecycle_main(["--root", str(missing), "--fail-if-cold-unverified"]) == 64
+
+    not_directory = tmp_path / "archive.jsonl"
+    not_directory.write_text("{}\n", encoding="utf-8")
+    assert archive_lifecycle_main(["--root", str(not_directory), "--fail-if-cold-unverified"]) == 64
+
+    captured = capsys.readouterr()
+    assert "archive root must be an existing directory" in captured.err
 
 
 def test_archive_lifecycle_cold_cleanup_has_no_offhost_bypass(tmp_path):
@@ -218,7 +332,7 @@ def test_archive_lifecycle_cold_cleanup_has_no_offhost_bypass(tmp_path):
     assert "--no-require-offhost" not in source
 
     segment = tmp_path / "cold-segment.jsonl.gz"
-    segment.write_bytes(b"payload")
+    _write_gzip(segment)
     import os
     from datetime import datetime, timezone
 
@@ -241,7 +355,7 @@ def test_archive_lifecycle_cold_cleanup_has_no_offhost_bypass(tmp_path):
 
 def test_archive_lifecycle_manifest_requires_exact_segment_name(tmp_path):
     segment = tmp_path / "screening-20250101.jsonl.gz"
-    segment.write_bytes(b"payload")
+    _write_gzip(segment)
     import os
 
     old = 1700000000
@@ -293,7 +407,7 @@ def test_archive_lifecycle_hot_and_warm_tiers_keep_expected_compression_rules(tm
 
 def test_archive_lifecycle_discovery_ignores_sidecar_markers(tmp_path):
     segment = tmp_path / "segment-1.jsonl.gz"
-    segment.write_bytes(b"payload")
+    _write_gzip(segment)
     (tmp_path / "segment-1.jsonl.gz.sha256").write_text("x", encoding="utf-8")
     (tmp_path / "segment-1.jsonl.gz.finalized").write_text("x", encoding="utf-8")
     (tmp_path / "segment-1.jsonl.gz.archive.verified").write_text("x", encoding="utf-8")

@@ -13,6 +13,9 @@ STATE_FILE="$STATE_ROOT/rollout.env"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
 RESTORE_EVIDENCE="$STATE_ROOT/last-restore-drill.env"
 ROLLBACK_EVIDENCE="$STATE_ROOT/empty-rollback.env"
+POSTGRES_TLS_CA="/etc/opip-data-platform/tls/postgres-ca.crt"
+POSTGRES_TLS_CERT="/etc/opip-data-platform/tls/postgres-server.crt"
+POSTGRES_TLS_KEY="/etc/opip-data-platform/tls/postgres-server.key"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "usage: $0 <40-char-main-sha> <empty|backfill|shipper|reads-ready>" >&2
@@ -34,6 +37,20 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+
+require_uri_unreserved_password() {
+  local name="$1" value="${!1:-}"
+  if [[ -z "$value" || ! "$value" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+    echo "$name must be non-empty and use URI-unreserved characters only (A-Z a-z 0-9 - . _ ~)" >&2
+    exit 78
+  fi
+}
+require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD
+require_uri_unreserved_password OPIP_SHIPPER_PASSWORD
+
+compose() {
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
+}
 
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.
 # Timers use this same lock and will skip rather than compete for RAM or files.
@@ -110,10 +127,62 @@ write_state() {
   mv -f -- "$temporary" "$STATE_FILE"
 }
 
+validate_postgres_tls_key() {
+  local postgres_image runtime_ids pg_uid pg_gid key_metadata key_mode key_uid key_gid
+
+  [[ -f "$POSTGRES_TLS_CA" && -r "$POSTGRES_TLS_CA" ]] || {
+    echo "missing or unreadable PostgreSQL TLS CA: $POSTGRES_TLS_CA" >&2
+    exit 78
+  }
+  [[ -f "$POSTGRES_TLS_CERT" && -r "$POSTGRES_TLS_CERT" ]] || {
+    echo "missing or unreadable PostgreSQL TLS certificate: $POSTGRES_TLS_CERT" >&2
+    exit 78
+  }
+  [[ -f "$POSTGRES_TLS_KEY" ]] || {
+    echo "missing PostgreSQL TLS private key: $POSTGRES_TLS_KEY" >&2
+    exit 78
+  }
+
+  # Pull the exact Compose image but do not start PostgreSQL. Resolve the
+  # postgres runtime UID/GID from that image rather than hard-coding Alpine IDs.
+  compose pull opip-postgres >/dev/null
+  postgres_image="$(compose config --images | awk '/(^|\/)postgres:/ {print; exit}')"
+  [[ -n "$postgres_image" ]] || {
+    echo "unable to resolve PostgreSQL image for TLS-key preflight" >&2
+    exit 78
+  }
+  runtime_ids="$(
+    docker run --rm --entrypoint sh "$postgres_image" -c \
+      'printf "%s:%s\n" "$(id -u postgres)" "$(id -g postgres)"'
+  )"
+  if [[ ! "$runtime_ids" =~ ^[0-9]+:[0-9]+$ ]]; then
+    echo "unable to resolve PostgreSQL runtime UID/GID from $postgres_image" >&2
+    exit 78
+  fi
+  IFS=: read -r pg_uid pg_gid <<<"$runtime_ids"
+
+  key_metadata="$(stat -Lc '%a:%u:%g' "$POSTGRES_TLS_KEY")"
+  if [[ ! "$key_metadata" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then
+    echo "unable to read PostgreSQL TLS key ownership/mode" >&2
+    exit 78
+  fi
+  IFS=: read -r key_mode key_uid key_gid <<<"$key_metadata"
+
+  if [[ "$key_mode" == "600" && "$key_uid" == "$pg_uid" && "$key_gid" == "$pg_gid" ]]; then
+    return 0
+  fi
+  if [[ "$key_mode" == "640" && "$key_uid" == "0" && "$key_gid" == "$pg_gid" ]]; then
+    return 0
+  fi
+
+  echo "invalid PostgreSQL TLS key ownership/mode: got mode=$key_mode uid=$key_uid gid=$key_gid; expected 0600 owned by $pg_uid:$pg_gid or root:$pg_gid with 0640" >&2
+  exit 78
+}
+
 wait_for_postgres() {
   local ready="false"
   for _ in $(seq 1 30); do
-    if docker compose -f "$COMPOSE" exec -T opip-postgres \
+    if compose exec -T opip-postgres \
       pg_isready -U "${OPIP_POSTGRES_ADMIN_USER:-opip_admin}" -d "${OPIP_POSTGRES_DB:-opip}"; then
       ready="true"
       break
@@ -127,7 +196,7 @@ wait_for_postgres() {
 }
 
 admin_run() {
-  docker compose -f "$COMPOSE" --profile admin run --rm opip-data-admin "$@"
+  compose --profile admin run --rm opip-data-admin "$@"
 }
 
 require_stage() {
@@ -190,8 +259,11 @@ validate_promotion_evidence() {
 }
 
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-# Both services share the same immutable image tag; build once to avoid a\n# concurrent BuildKit export race on the identical tag.\ndocker compose -f "$COMPOSE" build opip-shipper
-docker compose -f "$COMPOSE" up -d opip-postgres
+validate_postgres_tls_key
+# Both application services share the same immutable image tag; build once to
+# avoid a concurrent BuildKit export race on the identical tag.
+compose build opip-shipper
+compose up -d opip-postgres
 wait_for_postgres
 
 # A fresh host may initialize the empty database first. Promotion beyond the
@@ -246,7 +318,7 @@ elif [[ "$STAGE" == "backfill" ]]; then
 elif [[ "$STAGE" == "shipper" ]]; then
   require_stage BACKFILL_COMPLETED_AT_UTC "clean backfill"
   admin_run python -m app.opip.data_platform.reconcile
-  docker compose -f "$COMPOSE" up -d opip-shipper
+  compose up -d opip-shipper
   if [[ -z "${SHIPPER_STARTED_AT_UTC:-}" ]]; then
     write_state SHIPPER_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
@@ -292,7 +364,7 @@ if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
   systemctl enable --now opip-data-platform-maintenance.timer
 fi
 
-docker compose -f "$COMPOSE" ps
+compose ps
 echo "O'Pip analytics data-platform stage succeeded"
 echo "stage=$STAGE"
 echo "sha=$TARGET_SHA"
