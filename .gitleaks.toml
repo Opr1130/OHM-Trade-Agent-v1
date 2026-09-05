@@ -1,0 +1,9 @@
+# O'Pip Gitleaks configuration (advisory CI).
+# Extends Gitleaks built-in rules. No allowlists yet (full-repo default scan
+# reported zero findings). Add only precise, justified allowlist entries if
+# future false positives appear. Do not add broad path or regex exclusions.
+
+title = "O'Pip advisory gitleaks config"
+
+[extend]
+useDefault = true
