@@ -262,7 +262,7 @@ export OPIP_DEPLOYED_SHA="$TARGET_SHA"
 validate_postgres_tls_key
 # Both application services share the same immutable image tag; build once to
 # avoid a concurrent BuildKit export race on the identical tag.
-compose build opip-shipper
+docker compose -f "$COMPOSE" build opip-shipper
 compose up -d opip-postgres
 wait_for_postgres
 
