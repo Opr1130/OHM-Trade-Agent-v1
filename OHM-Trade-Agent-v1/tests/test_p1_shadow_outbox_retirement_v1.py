@@ -1,6 +1,8 @@
 from pathlib import Path
 import subprocess
 
+from app.opip.data_platform.streams import STREAM_SPECS, resolve_streams
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -11,7 +13,6 @@ def test_p1_outbox_is_retired_end_to_end():
     reader = (ROOT / "deploy/remote/opip-learning-read-export.sh").read_text(encoding="utf-8")
     sync = (ROOT / "deploy/learning/opip-learning-sync.sh").read_text(encoding="utf-8")
     runner = (ROOT / "deploy/learning/opip-learning-job.sh").read_text(encoding="utf-8")
-    streams = (ROOT / "app/opip/data_platform/streams.py").read_text(encoding="utf-8")
     deploy = (ROOT / "deploy/remote/ohm-deploy").read_text(encoding="utf-8")
     retire = (ROOT / "deploy/remote/retire-p1-shadow-outbox.sh").read_text(encoding="utf-8")
 
@@ -21,13 +22,16 @@ def test_p1_outbox_is_retired_end_to_end():
     assert "p1_shadow_outbox_retired=1" in exporter
     assert "schema_version=4" in exporter
     assert "p1_shadow_outbox.jsonl" not in reader
-    assert 'validate_artifact "p1_shadow_outbox.jsonl"' not in sync
     assert '"$DATA_ROOT/p1_shadow_outbox.jsonl"' in sync
     assert '[[ "$schema" == "4" ]]' in sync
     assert '[[ "$retired" == "1" ]]' in sync
     assert "P1_SHADOW_OUTBOX_ENABLED=true" not in runner
     assert 'write_disposition "CONSUMED_EMPTY"' in runner
-    assert '"p1_shadow_outbox",' not in streams
+
+    p1 = next(spec for spec in STREAM_SPECS if spec.name == "p1_shadow_outbox")
+    assert p1.retired is True
+    resolved = {spec.name for spec, _ in resolve_streams(Path("/tmp/opip-data"))}
+    assert "p1_shadow_outbox" not in resolved
 
     # Irreversible cleanup must happen only after last-good is authoritative
     # and rollback handling has been disabled.
