@@ -55,11 +55,8 @@ STREAM_SPECS: tuple[StreamSpec, ...] = (
         "market_observation",
         True,
     ),
-    StreamSpec(
-        "p1_shadow_outbox",
-        Path("p1_shadow_outbox.jsonl"),
-        "generic",
-    ),
+    # The legacy P1 shadow outbox is retired. Historical rows that already
+    # reached the evidence ledger remain available for bounded consumption.
     StreamSpec(
         "p1_evidence_ledger",
         Path("p1_evidence_ledger.jsonl"),
