@@ -116,6 +116,31 @@ if [[ "$RELEASE_STATUS" != "CURRENT" ]]; then
   exit 75
 fi
 
+# The legacy P1 shadow outbox has been owner-retired. A capture timer firing
+# after schema-4 sync is still a governed consumption event: record a durable
+# empty disposition instead of launching a container that expects a deleted
+# source. Historical evidence already in the ledger remains available to the
+# outcomes job and is not discarded here.
+P1_SHADOW_OUTBOX_RETIRED="$(manifest_value p1_shadow_outbox_retired)"
+if [[ "$JOB" == "capture" && "$P1_SHADOW_OUTBOX_RETIRED" == "1" ]]; then
+  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  finished_at="$started_at"
+  cat > "$STATE_ROOT/$JOB.last.env.tmp" <<EOF
+job=$JOB
+module=RETIRED_P1_SHADOW_OUTBOX
+started_at_utc=$started_at
+finished_at_utc=$finished_at
+exit_code=0
+memory_limit=NONE
+cpu_limit=NONE
+release_compatibility_status=$RELEASE_STATUS
+EOF
+  mv -f "$STATE_ROOT/$JOB.last.env.tmp" "$STATE_ROOT/$JOB.last.env"
+  write_disposition "CONSUMED_EMPTY" "$RELEASE_STATUS" "$EXPECTED_SHA" "0" "p1_shadow_outbox_retired"
+  echo "O'Pip learning capture: CONSUMED_EMPTY retired P1 shadow outbox"
+  exit 0
+fi
+
 for cmd in docker timeout; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning-runner command: $cmd" >&2
@@ -140,7 +165,26 @@ trap cleanup EXIT INT TERM
 
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
-timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS"   docker run --rm     --name "$CONTAINER_NAME"     --label "$LABEL"     --network none     --memory "$MEMORY_LIMIT"     --memory-swap "$MEMORY_LIMIT"     --cpus "$CPU_LIMIT"     --pids-limit 128     --oom-score-adj 700     --read-only     --cap-drop ALL     --security-opt no-new-privileges:true     --tmpfs /tmp:rw,noexec,nosuid,size=48m     --tmpfs /var/run:rw,noexec,nosuid,size=16m     -e P1_SHADOW_OUTBOX_ENABLED=true     -e OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true     -e PYTHONDONTWRITEBYTECODE=1     -v "$DATA_ROOT:/app/data"     "$OPIP_LEARNING_IMAGE"     python -m "$MODULE"
+timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS" \
+  docker run --rm \
+    --name "$CONTAINER_NAME" \
+    --label "$LABEL" \
+    --network none \
+    --memory "$MEMORY_LIMIT" \
+    --memory-swap "$MEMORY_LIMIT" \
+    --cpus "$CPU_LIMIT" \
+    --pids-limit 128 \
+    --oom-score-adj 700 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --tmpfs /tmp:rw,noexec,nosuid,size=48m \
+    --tmpfs /var/run:rw,noexec,nosuid,size=16m \
+    -e OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$DATA_ROOT:/app/data" \
+    "$OPIP_LEARNING_IMAGE" \
+    python -m "$MODULE"
 rc=$?
 set -e
 
