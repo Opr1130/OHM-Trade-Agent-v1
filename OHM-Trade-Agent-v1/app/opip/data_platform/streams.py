@@ -18,6 +18,7 @@ class StreamSpec:
     relative_path: Path
     kind: str
     required: bool = False
+    retired: bool = False
 
     @property
     def requires_typed_projection(self) -> bool:
@@ -55,11 +56,19 @@ STREAM_SPECS: tuple[StreamSpec, ...] = (
         "market_observation",
         True,
     ),
+    # Compatibility tombstone only. Migration 005 is already checksum-bound in
+    # deployed databases, so its optional policy row remains in STREAM_SPECS.
+    # `retired=True` excludes this stream from resolve_streams(), therefore the
+    # shipper, backfill, and reconciliation paths perform zero file I/O for it.
     StreamSpec(
         "p1_shadow_outbox",
         Path("p1_shadow_outbox.jsonl"),
         "generic",
+        False,
+        True,
     ),
+    # Historical evidence that already reached the ledger remains eligible for
+    # bounded outcomes/accountability consumption after outbox retirement.
     StreamSpec(
         "p1_evidence_ledger",
         Path("p1_evidence_ledger.jsonl"),
@@ -99,4 +108,14 @@ STREAM_SPECS: tuple[StreamSpec, ...] = (
 
 
 def resolve_streams(data_root: Path) -> list[tuple[StreamSpec, Path]]:
-    return [(spec, data_root / spec.relative_path) for spec in STREAM_SPECS]
+    """Resolve only active file-backed streams.
+
+    Retired policy tombstones remain available to the canonical freshness
+    contract for migration/checksum compatibility but are never opened,
+    shipped, backfilled, or reconciled.
+    """
+    return [
+        (spec, data_root / spec.relative_path)
+        for spec in STREAM_SPECS
+        if not spec.retired
+    ]

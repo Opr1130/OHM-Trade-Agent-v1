@@ -143,7 +143,6 @@ else
 fi
 
 for name in \
-  p1_shadow_outbox.jsonl \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \
   intelligence_learning/events.jsonl \
@@ -172,7 +171,6 @@ done
 exec 8<"$PUBLISH_LOCK"
 flock -s 8
 exec tar -C "$EXPORT_ROOT" -cf - \
-  p1_shadow_outbox.jsonl \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \
   intelligence_learning/events.jsonl \

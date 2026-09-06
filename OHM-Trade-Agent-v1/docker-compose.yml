@@ -47,6 +47,9 @@ services:
       # Stage 0 emission is the durable WAL for the analytics-plane shipper.
       # It remains evidence-only and cannot alter ranking or execution.
       OPIP_FUNNEL_TELEMETRY_ENABLED: "true"
+      # P1 JSONL outbox is retired. This explicit override wins over any stale
+      # .env value so the legacy multi-hundred-MB file cannot be recreated.
+      P1_SHADOW_OUTBOX_ENABLED: "false"
       # Explicit advisory Early Watch channel. Deep-qualified watch cards only;
       # does not re-enable legacy broad-watch/movement alerts or trade authority.
       OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"

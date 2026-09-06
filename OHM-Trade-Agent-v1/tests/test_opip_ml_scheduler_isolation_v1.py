@@ -87,16 +87,18 @@ def test_production_export_is_copy_only_and_locked():
     runner = ROOT / "deploy" / "remote" / "export-opip-learning-evidence.sh"
     source = runner.read_text(encoding="utf-8")
     subprocess.run(["bash", "-n", str(runner)], check=True)
-    assert "p1_shadow_outbox.jsonl" in source
+    assert 'copy_locked_jsonl "$DATA_ROOT/p1_shadow_outbox.jsonl"' not in source
+    assert 'rm -f -- "$EXPORT_ROOT/p1_shadow_outbox.jsonl"' in source
+    assert "p1_shadow_outbox_retired=1" in source
     assert "full_market_observations.jsonl" in source
     assert "flock -x 8" in source
     assert "sha256sum" in source
-    assert "schema_version=3" in source
+    assert "schema_version=4" in source
     assert 'archive_temp="$EXPORT_ROOT/.$archive_name.tmp.$$"' in source
     assert source.count('install -d -o root -g "$READER_GROUP" -m 0750') >= 2
     assert source.count("install -d -o root -g root -m 0700") >= 2
     assert not re.search(
-        r"install\\s+-d\\s+-o\\s+root\\s+-g\\s+root\\s+-m\\s+0750\\b",
+        r"install\s+-d\s+-o\s+root\s+-g\s+root\s+-m\s+0750\b",
         source,
     )
     assert "mv -f" in source
@@ -138,6 +140,8 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert "app.jobs.build_phase3c_forward_outcomes" not in source
     assert 'MEMORY_LIMIT="512m"' not in source
     assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
+    assert 'P1_SHADOW_OUTBOX_RETIRED="$(manifest_value p1_shadow_outbox_retired)"' in source
+    assert 'write_disposition "CONSUMED_EMPTY"' in source
 
 
 def test_opportunity_cycle_acks_only_after_accountability_build():
@@ -196,6 +200,7 @@ def test_learning_sync_and_cleanup_shell_validate():
         LEARNING / "bootstrap-opip-learning-worker.sh",
         ROOT / "deploy" / "remote" / "configure-opip-learning-reader.sh",
         ROOT / "deploy" / "remote" / "opip-learning-read-export.sh",
+        ROOT / "deploy" / "remote" / "retire-p1-shadow-outbox.sh",
     ):
         subprocess.run(["bash", "-n", str(script)], check=True)
 
@@ -211,7 +216,8 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert "KRAKEN" not in runner
     assert '--env-file' not in runner
     assert '$APP_ROOT/.env' not in runner
-    assert "P1_SHADOW_OUTBOX_ENABLED=true" in runner
+    assert "P1_SHADOW_OUTBOX_ENABLED=true" not in runner
+    assert "p1_shadow_outbox_retired" in runner
     assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true" in runner
 
 
@@ -227,6 +233,8 @@ def test_deploy_reconciles_paper_topology_before_marking_last_good():
     assert "snapshot_scheduler_state" in source
     assert "restore_scheduler_state" in source
     assert source.rfind("wait_paper_health") < source.rfind('> "$LAST_GOOD_FILE"')
+    assert source.rfind('> "$LAST_GOOD_FILE"') < source.rfind('bash "$P1_RETIRE_SCRIPT"')
+    assert source.rfind("trap - ERR") < source.rfind('bash "$P1_RETIRE_SCRIPT"')
 
 
 def test_deploy_stops_paper_before_target_build():
@@ -238,7 +246,6 @@ def test_deploy_stops_paper_before_target_build():
     assert section.index("stop_paper_stack") < section.index(
         "docker compose build ohm-trade-agent"
     )
-
 
 
 def test_learning_reader_key_is_forced_read_only_and_source_bound():
@@ -268,19 +275,26 @@ def test_learning_reader_key_is_forced_read_only_and_source_bound():
     assert "last_sync_at_utc" in sync
     assert "capture_at=" in sync
     assert "outcomes_at=" in sync
+    assert "p1_shadow_outbox.jsonl" not in reader
     assert "rsync" not in sync
 
 
 def test_learning_sync_validates_manifest_before_promotion():
     sync = (LEARNING / "opip-learning-sync.sh").read_text(encoding="utf-8")
     assert 'schema="$(manifest_value schema_version)"' in sync
-    assert '[[ "$schema" == "3" ]]' in sync
+    assert '[[ "$schema" == "4" ]]' in sync
+    assert 'retired="$(manifest_value p1_shadow_outbox_retired)"' in sync
+    assert '[[ "$retired" == "1" ]]' in sync
     assert "sha256sum" in sync
     assert "size mismatch" in sync
     assert "checksum mismatch" in sync
-    validation = sync.index('validate_artifact "p1_shadow_outbox.jsonl"')
+    # The exact legacy string remains only as a migration-audit comment so the
+    # old checksum-bound contract is traceable; active validation starts with
+    # full_market_observations.
+    legacy = sync.index('validate_artifact "p1_shadow_outbox.jsonl"')
+    validation = sync.index('validate_artifact "full_market_observations.jsonl"')
     promotion = sync.index("for name in \\")
-    assert validation < promotion
+    assert legacy < validation < promotion
 
 
 def test_learning_bootstrap_keeps_timers_disabled_until_validation():

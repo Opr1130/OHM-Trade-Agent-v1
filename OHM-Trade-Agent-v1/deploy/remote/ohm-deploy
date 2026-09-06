@@ -8,6 +8,8 @@ DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
 LEARNING_DIAGNOSTICS_DST="/usr/local/sbin/diagnose-opip-learning"
+P1_RETIRE_SCRIPT="$APP_ROOT/deploy/remote/retire-p1-shadow-outbox.sh"
+LEARNING_EXPORTER="$APP_ROOT/deploy/remote/export-opip-learning-evidence.sh"
 
 if [[ "$TARGET_SHA" == "diagnose-learning" ]]; then
   [[ -x "$LEARNING_DIAGNOSTICS_DST" ]] || {
@@ -115,7 +117,7 @@ validate_target_resource_budget() {
 
   # Verify the intended hard cgroup ceilings landed on the running target,
   # rather than trusting only the YAML checked into this SHA.
-  local spec name expected_mem expected_swap actual
+  local name expected_mem expected_swap actual
   while IFS='|' read -r name expected_mem expected_swap; do
     actual="$(docker inspect --format='{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}' "$name" 2>/dev/null || true)"
     if [[ "$actual" != "$expected_mem|$expected_swap" ]]; then
@@ -132,7 +134,6 @@ LIMITS
 
   echo "O'Pip resource budget validation: PASS available_kb=$available_kb"
 }
-
 
 replace_file_atomically() {
   local source="$1"
@@ -152,7 +153,7 @@ snapshot_scheduler_state() {
     fi
   done
 
-  local spec source snapshot_name
+  local source snapshot_name
   while IFS='|' read -r source snapshot_name; do
     if [[ -e "$source" ]]; then
       cp -a "$source" "$SCHEDULER_SNAPSHOT/$snapshot_name"
@@ -182,7 +183,7 @@ restore_scheduler_state() {
     fi
   done
 
-  local spec target snapshot_name
+  local target snapshot_name
   while IFS='|' read -r target snapshot_name; do
     if [[ -e "$SCHEDULER_SNAPSHOT/$snapshot_name.present" ]]; then
       replace_file_atomically "$SCHEDULER_SNAPSHOT/$snapshot_name" "$target"
@@ -303,12 +304,30 @@ start_paper_stack
 wait_paper_health
 validate_target_resource_budget
 
-# Learning computation is remote-only. Production performs only the lightweight
-# evidence export installed by reconcile-scheduler.sh.
+# All rollback-sensitive validation is complete. Make the exact SHA
+# authoritative before the owner-authorized irreversible P1 retirement so a
+# cleanup failure can never roll production back to a release that recreates
+# the retired outbox.
 printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
 cleanup_snapshot
 trap - ERR
 
+if [[ ! -s "$P1_RETIRE_SCRIPT" ]]; then
+  echo "P1 shadow outbox retirement helper missing" >&2
+  exit 69
+fi
+bash "$P1_RETIRE_SCRIPT"
+
+# Publish schema-4 evidence immediately so the remote worker stops requesting
+# the retired multi-hundred-MB artifact without waiting for the next cron tick.
+if [[ ! -s "$LEARNING_EXPORTER" ]]; then
+  echo "learning exporter missing after P1 retirement" >&2
+  exit 69
+fi
+bash "$LEARNING_EXPORTER"
+
+# Learning computation is remote-only. Production performs only the lightweight
+# bounded evidence export installed by reconcile-scheduler.sh.
 echo "O'Pip deployment succeeded"
 echo "sha=$TARGET_SHA"
 docker compose ps
