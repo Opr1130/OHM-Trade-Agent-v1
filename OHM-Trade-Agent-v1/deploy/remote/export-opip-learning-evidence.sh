@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Migration audit: the pre-retirement export contract used schema_version=3.
+# Active output below is schema 4 and intentionally excludes the P1 shadow outbox.
+
 APP_ROOT="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
 DATA_ROOT="$APP_ROOT/data"
 EXPORT_ROOT="/var/lib/opip-learning-export"
