@@ -25,13 +25,14 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
 fi
 passwd -l "$USER_NAME" >/dev/null 2>&1 || true
 
-install -o root -g root -m 0755   "$APP_ROOT/deploy/remote/opip-learning-read-export.sh"   "$FORCED_COMMAND"
+install -o root -g root -m 0755 \
+  "$APP_ROOT/deploy/remote/opip-learning-read-export.sh" \
+  "$FORCED_COMMAND"
 
 install -d -o root -g "$USER_NAME" -m 0750 "$EXPORT_ROOT"
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 0750 "$READER_STATE_ROOT"
 for name in \
   .publish.lock \
-  p1_shadow_outbox.jsonl \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \
   intelligence_learning/events.jsonl \
@@ -66,7 +67,8 @@ chmod 0600 "$AUTHORIZED_KEYS"
 
 tmp="$(mktemp)"
 grep -v 'opip-learning-worker' "$AUTHORIZED_KEYS" > "$tmp" || true
-printf 'from="%s",restrict,command="%s" %s\n'   "$SOURCE_CIDR" "$FORCED_COMMAND" "$PUBLIC_KEY" >> "$tmp"
+printf 'from="%s",restrict,command="%s" %s\n' \
+  "$SOURCE_CIDR" "$FORCED_COMMAND" "$PUBLIC_KEY" >> "$tmp"
 install -o "$USER_NAME" -g "$USER_NAME" -m 0600 "$tmp" "$AUTHORIZED_KEYS"
 rm -f "$tmp"
 
