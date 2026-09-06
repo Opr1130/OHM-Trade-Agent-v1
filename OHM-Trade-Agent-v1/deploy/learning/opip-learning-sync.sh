@@ -147,8 +147,13 @@ manifest_value() {
 }
 
 schema="$(manifest_value schema_version)"
-[[ "$schema" == "3" ]] || {
+[[ "$schema" == "4" ]] || {
   echo "O'Pip learning sync: unsupported manifest schema=$schema" >&2
+  exit 65
+}
+retired="$(manifest_value p1_shadow_outbox_retired)"
+[[ "$retired" == "1" ]] || {
+  echo "O'Pip learning sync: schema 4 requires retired P1 shadow outbox" >&2
   exit 65
 }
 
@@ -236,7 +241,6 @@ validate_archive() {
   }
 }
 
-validate_artifact "p1_shadow_outbox.jsonl" "p1_shadow_outbox_jsonl"
 validate_artifact "full_market_observations.jsonl" "full_market_observations_jsonl"
 validate_artifact "p1_evidence_ledger.jsonl" "p1_evidence_ledger_jsonl"
 validate_artifact "intelligence_learning/events.jsonl" "intelligence_learning_events_jsonl"
@@ -252,8 +256,15 @@ validate_archive "opip/qualification/screening_evaluations_archive" "opip_qualif
 validate_archive "opip/qualification/funnel_events_archive" "opip_qualification_funnel_archive"
 validate_archive "opip/qualification/scan_summaries_archive" "opip_qualification_summaries_archive"
 
+# Remove any pre-retirement worker copy/checkpoint so the large artifact cannot
+# consume disk or be accidentally reprocessed. The historic ledger remains
+# available for bounded downstream outcome/accountability completion.
+rm -f -- \
+  "$DATA_ROOT/p1_shadow_outbox.jsonl" \
+  "$DATA_ROOT/p1_shadow_outbox_checkpoint.json" \
+  "$DATA_ROOT/p1_shadow_outbox_dead_letter.jsonl"
+
 for name in \
-  p1_shadow_outbox.jsonl \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \
   intelligence_learning/events.jsonl \
