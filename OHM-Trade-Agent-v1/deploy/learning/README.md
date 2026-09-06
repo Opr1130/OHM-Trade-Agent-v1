@@ -15,9 +15,13 @@ Production MUST NOT schedule:
 - `app.jobs.run_opip_ml_capture`
 - `app.jobs.build_phase3c_forward_outcomes`
 
-Production exports only copy-only, non-authoritative JSONL evidence:
+The legacy `p1_shadow_outbox.jsonl` is retired and MUST NOT be recreated,
+exported, synced, backfilled, or treated as an active learning stream.
+Historical evidence already persisted in `p1_evidence_ledger.jsonl` remains
+eligible for governed outcomes/accountability consumption.
 
-- `p1_shadow_outbox.jsonl`
+Production exports only copy-only, non-authoritative evidence:
+
 - `full_market_observations.jsonl`
 - `p1_evidence_ledger.jsonl`
 - `intelligence_learning/events.jsonl`
@@ -61,11 +65,13 @@ Every compute invocation is:
 ## Timers
 
 - evidence sync: every 2 minutes
-- ML capture: every 5 minutes
+- ML capture disposition: every 5 minutes
 - Phase 3C outcomes: every 10 minutes
 
 Timers are staggered and every service shares the same learning-plane lock, so
-sync/capture/outcomes cannot overlap.
+sync/capture/outcomes cannot overlap. With the P1 shadow outbox retired, the
+capture invocation records governed `CONSUMED_EMPTY` rather than launching a
+container for the deleted source.
 
 ## Deployment sequence
 
@@ -128,9 +134,19 @@ After every core `/deploy`, run matching owner-gated
 `/deploy-learning <40-char-sha>` on issue 64 (exact `main` + successful
 `pytest.yml`). Core `/deploy` does **not** update the learning worker.
 `/deploy-learning` requires an existing bootstrapped host (`/etc/opip-learning.env`)
-and runs `deploy/learning/run-gated-learning-deploy.sh` (rebuild image, refresh
-`OPIP_DEPLOYED_SHA` / `OPIP_LEARNING_IMAGE`, restart enabled timers). Do not
-place Kraken or Telegram credentials on the worker.
+and runs `deploy/learning/run-gated-learning-deploy.sh`.
+
+If all three learning timers are already enabled, the gated deploy rebuilds the
+image, refreshes `OPIP_DEPLOYED_SHA` / `OPIP_LEARNING_IMAGE`, and restarts the
+timers. If the host is bootstrapped but timers were never enabled, the gated
+deploy completes bootstrap fail-closed: it runs sync, verifies the exact
+production SHA and schema-4 P1 retirement marker, requires capture
+`CONSUMED_EMPTY`, requires outcomes `CONSUMED_OK` or `CONSUMED_EMPTY`, syncs
+again to publish the fresh heartbeat, verifies no orphan learning containers,
+and only then enables all three timers. Any failed validation leaves recurring
+compute disabled.
+
+Do not place Kraken or Telegram credentials on the worker.
 
 ## Release compatibility (exact SHA)
 

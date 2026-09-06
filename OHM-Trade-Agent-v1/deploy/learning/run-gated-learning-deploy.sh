@@ -98,12 +98,84 @@ mv -f -- "$normalized" "$ENV_FILE"
 
 systemctl daemon-reload
 
-# Restart timers only if already enabled; first bootstrap still requires manual enable.
-for timer in opip-learning-sync.timer opip-learning-capture.timer opip-learning-outcomes.timer; do
-  if systemctl is-enabled --quiet "$timer" 2>/dev/null; then
-    systemctl restart "$timer"
+state_value() {
+  local file="$1"
+  local key="$2"
+  awk -F= -v k="$key" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true
+}
+
+TIMERS=(
+  opip-learning-sync.timer
+  opip-learning-capture.timer
+  opip-learning-outcomes.timer
+)
+all_enabled=true
+for timer in "${TIMERS[@]}"; do
+  if ! systemctl is-enabled --quiet "$timer" 2>/dev/null; then
+    all_enabled=false
+    break
   fi
 done
+
+if [[ "$all_enabled" == "true" ]]; then
+  # Normal subsequent update: preserve the already-validated scheduling state.
+  for timer in "${TIMERS[@]}"; do
+    systemctl restart "$timer"
+  done
+else
+  # Bootstrap completion is fail-closed. A successful image deployment alone
+  # is not enough to activate compute. Prove sync + exact release compatibility
+  # + governed consumption first, then publish the fresh heartbeat, and only
+  # then enable recurring timers.
+  echo "O'Pip learning timers not fully enabled; running one-shot activation gates"
+  systemctl stop "${TIMERS[@]}" >/dev/null 2>&1 || true
+
+  systemctl start opip-learning-sync.service
+  MANIFEST="$DATA_ROOT/data/manifest.env"
+  production_sha="$(state_value "$MANIFEST" production_deployed_sha)"
+  retired="$(state_value "$MANIFEST" p1_shadow_outbox_retired)"
+  if [[ "$production_sha" != "$TARGET_SHA" || "$retired" != "1" ]]; then
+    echo "refusing learning timer activation: sync did not prove exact schema-4 production release" >&2
+    echo "worker=$TARGET_SHA production=${production_sha:-MISSING} p1_retired=${retired:-MISSING}" >&2
+    exit 75
+  fi
+
+  systemctl start opip-learning-capture.service
+  capture_disposition="$(state_value "$STATE_ROOT/capture.disposition.env" disposition)"
+  capture_release="$(state_value "$STATE_ROOT/capture.disposition.env" release_compatibility_status)"
+  if [[ "$capture_disposition" != "CONSUMED_EMPTY" || "$capture_release" != "CURRENT" ]]; then
+    echo "refusing learning timer activation: capture one-shot was not governed consumed-empty/current" >&2
+    echo "capture_disposition=${capture_disposition:-MISSING} release=${capture_release:-MISSING}" >&2
+    exit 75
+  fi
+
+  systemctl start opip-learning-outcomes.service
+  outcomes_disposition="$(state_value "$STATE_ROOT/outcomes.disposition.env" disposition)"
+  outcomes_release="$(state_value "$STATE_ROOT/outcomes.disposition.env" release_compatibility_status)"
+  if [[ "$outcomes_release" != "CURRENT" \
+     || ( "$outcomes_disposition" != "CONSUMED_OK" && "$outcomes_disposition" != "CONSUMED_EMPTY" ) ]]; then
+    echo "refusing learning timer activation: outcomes one-shot was not governed consumed/current" >&2
+    echo "outcomes_disposition=${outcomes_disposition:-MISSING} release=${outcomes_release:-MISSING}" >&2
+    exit 75
+  fi
+
+  # A second sync publishes the new capture/outcomes dispositions and the
+  # current worker SHA back to the production-side diagnostic heartbeat.
+  systemctl start opip-learning-sync.service
+
+  mapfile -t remaining_jobs < <(docker ps -aq --filter label=com.opip.learning.job)
+  if (( ${#remaining_jobs[@]} > 0 )); then
+    echo "refusing learning timer activation: orphan learning job containers remain" >&2
+    printf 'container=%s\n' "${remaining_jobs[@]}" >&2
+    exit 75
+  fi
+
+  systemctl enable --now "${TIMERS[@]}"
+  for timer in "${TIMERS[@]}"; do
+    systemctl is-enabled --quiet "$timer"
+  done
+  echo "O'Pip learning timers activated after successful one-shot gates"
+fi
 
 recorded="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cat > "$STATUS_FILE.tmp" <<EOF
