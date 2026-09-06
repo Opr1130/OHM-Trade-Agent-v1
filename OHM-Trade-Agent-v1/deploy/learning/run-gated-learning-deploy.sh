@@ -104,6 +104,22 @@ state_value() {
   awk -F= -v k="$key" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$file" 2>/dev/null || true
 }
 
+report_one_shot_failure() {
+  local service="$1"
+  local disposition_file="$2"
+  echo "O'Pip learning activation one-shot failed: service=$service" >&2
+  if [[ -r "$disposition_file" ]]; then
+    echo "--- disposition ---" >&2
+    cat "$disposition_file" >&2
+  else
+    echo "disposition_file=MISSING" >&2
+  fi
+  echo "--- systemd status ---" >&2
+  systemctl status "$service" --no-pager -l >&2 || true
+  echo "--- recent journal ---" >&2
+  journalctl -u "$service" -n 160 --no-pager >&2 || true
+}
+
 TIMERS=(
   opip-learning-sync.timer
   opip-learning-capture.timer
@@ -149,7 +165,12 @@ else
     exit 75
   fi
 
-  systemctl start opip-learning-outcomes.service
+  if ! systemctl start opip-learning-outcomes.service; then
+    report_one_shot_failure \
+      opip-learning-outcomes.service \
+      "$STATE_ROOT/outcomes.disposition.env"
+    exit 75
+  fi
   outcomes_disposition="$(state_value "$STATE_ROOT/outcomes.disposition.env" disposition)"
   outcomes_release="$(state_value "$STATE_ROOT/outcomes.disposition.env" release_compatibility_status)"
   if [[ "$outcomes_release" != "CURRENT" \
