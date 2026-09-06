@@ -102,7 +102,6 @@ if [[ "$release_compatibility" == "NONE" ]]; then
 fi
 pending_ack="$(status_count "$(state_value "$outcomes_disposition_file" accountability_pending_count)")"
 if [[ "$pending_ack" == "NONE" ]]; then
-  # Prefer the JSON consumption summary written by the outcomes job when present.
   pending_ack="$(
     awk -F'[:,]' '
       /"accountability_pending_count"/ {
@@ -118,8 +117,6 @@ if [[ "$pending_ack" == "NONE" ]]; then
   pending_ack="$(status_count "$pending_ack")"
 fi
 
-# Evidence sync may still run under RELEASE_DRIFT so operators retain pull
-# diagnostics; capture/outcomes refuse compute separately (fail closed).
 status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA sync_success_at=$last_sync_at capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc capture_disposition=$capture_disposition outcomes_disposition=$outcomes_disposition release_compatibility=$release_compatibility outcomes_pending_ack=$pending_ack"
 
 rm -rf "$INCOMING"/*
@@ -147,6 +144,8 @@ manifest_value() {
 }
 
 schema="$(manifest_value schema_version)"
+# Migration audit only; this was the pre-retirement admission check:
+# [[ "$schema" == "3" ]]
 [[ "$schema" == "4" ]] || {
   echo "O'Pip learning sync: unsupported manifest schema=$schema" >&2
   exit 65
@@ -157,8 +156,6 @@ retired="$(manifest_value p1_shadow_outbox_retired)"
   exit 65
 }
 
-# Record release compatibility against the synced export for diagnose lag.
-# Sync itself is allowed under drift so evidence pull remains diagnosable.
 production_sha="$(manifest_value production_deployed_sha)"
 release_status="UNVERIFIED"
 if [[ "$OPIP_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ && "$production_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -241,6 +238,8 @@ validate_archive() {
   }
 }
 
+# Migration audit only; the retired legacy validation was:
+# validate_artifact "p1_shadow_outbox.jsonl"
 validate_artifact "full_market_observations.jsonl" "full_market_observations_jsonl"
 validate_artifact "p1_evidence_ledger.jsonl" "p1_evidence_ledger_jsonl"
 validate_artifact "intelligence_learning/events.jsonl" "intelligence_learning_events_jsonl"
@@ -256,9 +255,6 @@ validate_archive "opip/qualification/screening_evaluations_archive" "opip_qualif
 validate_archive "opip/qualification/funnel_events_archive" "opip_qualification_funnel_archive"
 validate_archive "opip/qualification/scan_summaries_archive" "opip_qualification_summaries_archive"
 
-# Remove any pre-retirement worker copy/checkpoint so the large artifact cannot
-# consume disk or be accidentally reprocessed. The historic ledger remains
-# available for bounded downstream outcome/accountability completion.
 rm -f -- \
   "$DATA_ROOT/p1_shadow_outbox.jsonl" \
   "$DATA_ROOT/p1_shadow_outbox_checkpoint.json" \
