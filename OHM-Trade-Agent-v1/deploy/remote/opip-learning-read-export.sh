@@ -22,6 +22,10 @@ write_reader_state() {
   local capture_rc="$5"
   local outcomes_at="$6"
   local outcomes_rc="$7"
+  local capture_disposition="${8:-UNKNOWN}"
+  local outcomes_disposition="${9:-UNKNOWN}"
+  local release_compatibility="${10:-UNKNOWN}"
+  local outcomes_pending_ack="${11:-UNKNOWN}"
 
   [[ -d "$READER_STATE_ROOT" && -w "$READER_STATE_ROOT" ]] || return 0
   local tmp="$READER_STATE_ROOT/.last_sync_request.env.tmp.$$"
@@ -35,6 +39,10 @@ write_reader_state() {
     printf 'capture_exit_code=%s\n' "$capture_rc"
     printf 'outcomes_finished_at_utc=%s\n' "$outcomes_at"
     printf 'outcomes_exit_code=%s\n' "$outcomes_rc"
+    printf 'capture_disposition=%s\n' "$capture_disposition"
+    printf 'outcomes_disposition=%s\n' "$outcomes_disposition"
+    printf 'release_compatibility_status=%s\n' "$release_compatibility"
+    printf 'outcomes_pending_ack=%s\n' "$outcomes_pending_ack"
   } > "$tmp"
   mv -f -- "$tmp" "$READER_STATE_FILE"
 }
@@ -44,9 +52,64 @@ validate_status_value() {
   [[ "$value" == "NONE" || "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 }
 
+validate_disposition_token() {
+  local value="$1"
+  [[ "$value" == "NONE" || "$value" == "UNKNOWN" || "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
+}
+
 if [[ "$ORIGINAL" == "opip-export-v1" ]]; then
   write_reader_state "1" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN" "UNKNOWN"
+elif [[ "$ORIGINAL" =~ ^opip-export-v2[[:space:]]+sha=([0-9a-f]{40})[[:space:]]+sync_success_at=([^[:space:]]+)[[:space:]]+capture_at=([^[:space:]]+)[[:space:]]+capture_rc=([^[:space:]]+)[[:space:]]+outcomes_at=([^[:space:]]+)[[:space:]]+outcomes_rc=([^[:space:]]+)[[:space:]]+capture_disposition=([^[:space:]]+)[[:space:]]+outcomes_disposition=([^[:space:]]+)[[:space:]]+release_compatibility=([^[:space:]]+)[[:space:]]+outcomes_pending_ack=([^[:space:]]+)$ ]]; then
+  worker_sha="${BASH_REMATCH[1]}"
+  sync_success_at="${BASH_REMATCH[2]}"
+  capture_at="${BASH_REMATCH[3]}"
+  capture_rc="${BASH_REMATCH[4]}"
+  outcomes_at="${BASH_REMATCH[5]}"
+  outcomes_rc="${BASH_REMATCH[6]}"
+  capture_disposition="${BASH_REMATCH[7]}"
+  outcomes_disposition="${BASH_REMATCH[8]}"
+  release_compatibility="${BASH_REMATCH[9]}"
+  outcomes_pending_ack="${BASH_REMATCH[10]}"
+  validate_status_value "$sync_success_at" || {
+    echo "O'Pip learning reader: invalid sync-success timestamp" >&2
+    exit 126
+  }
+  validate_status_value "$capture_at" || {
+    echo "O'Pip learning reader: invalid capture timestamp" >&2
+    exit 126
+  }
+  validate_status_value "$outcomes_at" || {
+    echo "O'Pip learning reader: invalid outcomes timestamp" >&2
+    exit 126
+  }
+  [[ "$capture_rc" == "NONE" || "$capture_rc" =~ ^[0-9]{1,3}$ ]] || {
+    echo "O'Pip learning reader: invalid capture rc" >&2
+    exit 126
+  }
+  [[ "$outcomes_rc" == "NONE" || "$outcomes_rc" =~ ^[0-9]{1,3}$ ]] || {
+    echo "O'Pip learning reader: invalid outcomes rc" >&2
+    exit 126
+  }
+  validate_disposition_token "$capture_disposition" || {
+    echo "O'Pip learning reader: invalid capture disposition" >&2
+    exit 126
+  }
+  validate_disposition_token "$outcomes_disposition" || {
+    echo "O'Pip learning reader: invalid outcomes disposition" >&2
+    exit 126
+  }
+  validate_disposition_token "$release_compatibility" || {
+    echo "O'Pip learning reader: invalid release compatibility" >&2
+    exit 126
+  }
+  [[ "$outcomes_pending_ack" == "NONE" || "$outcomes_pending_ack" =~ ^[0-9]{1,9}$ ]] || {
+    echo "O'Pip learning reader: invalid outcomes pending ack" >&2
+    exit 126
+  }
+  write_reader_state "2" "$worker_sha" "$sync_success_at" "$capture_at" "$capture_rc" "$outcomes_at" "$outcomes_rc" \
+    "$capture_disposition" "$outcomes_disposition" "$release_compatibility" "$outcomes_pending_ack"
 elif [[ "$ORIGINAL" =~ ^opip-export-v2[[:space:]]+sha=([0-9a-f]{40})[[:space:]]+sync_success_at=([^[:space:]]+)[[:space:]]+capture_at=([^[:space:]]+)[[:space:]]+capture_rc=([^[:space:]]+)[[:space:]]+outcomes_at=([^[:space:]]+)[[:space:]]+outcomes_rc=([^[:space:]]+)$ ]]; then
+  # Legacy heartbeat without consumption fields (pre-recovery workers).
   worker_sha="${BASH_REMATCH[1]}"
   sync_success_at="${BASH_REMATCH[2]}"
   capture_at="${BASH_REMATCH[3]}"

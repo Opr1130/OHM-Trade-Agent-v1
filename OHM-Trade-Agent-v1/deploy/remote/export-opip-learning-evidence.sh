@@ -134,9 +134,17 @@ tree_sha256() {
     find . -type f -print0 | sort -z | xargs -0 -r sha256sum
   ) | sha256sum | awk '{print $1}'
 }
+production_deployed_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
+if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  # Leave empty so workers report UNVERIFIED and fail closed until the
+  # authoritative deploy receipt exists. Do not fall back to git HEAD.
+  production_deployed_sha=""
+fi
+
 {
   printf 'schema_version=3\n'
   printf 'exported_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'production_deployed_sha=%s\n' "$production_deployed_sha"
   while IFS='|' read -r name key; do
     path="$EXPORT_ROOT/$name"
     printf '%s_bytes=%s\n' "$key" "$(stat -c '%s' "$path")"

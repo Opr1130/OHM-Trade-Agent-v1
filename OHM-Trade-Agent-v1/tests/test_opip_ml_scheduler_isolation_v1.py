@@ -119,7 +119,9 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     runner = LEARNING / "opip-learning-job.sh"
     source = runner.read_text(encoding="utf-8")
     subprocess.run(["bash", "-n", str(runner)], check=True)
-    assert 'LOCK_FILE="/var/lock/opip-learning-plane.lock"' in source
+    assert 'LOCK_FILE="${OPIP_LEARNING_LOCK_FILE:-/var/lock/opip-learning-plane.lock}"' in source
+    assert 'DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"' in source
+    assert 'STATE_ROOT="${OPIP_LEARNING_STATE_ROOT:-/var/lib/opip-learning/state}"' in source
     assert 'docker ps -aq --filter "label=$LABEL"' in source
     assert 'docker rm -f "${stale_ids[@]}"' in source
     assert "timeout --signal=TERM --kill-after=20s" in source

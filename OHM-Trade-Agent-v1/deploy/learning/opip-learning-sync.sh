@@ -32,7 +32,7 @@ for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs; 
   }
 done
 
-install -d -o root -g root -m 0755 "$DATA_ROOT" "$INCOMING"
+install -d -o root -g root -m 0755 "$DATA_ROOT" "$INCOMING" "$STATE_ROOT"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -66,13 +66,61 @@ status_rc() {
 
 capture_file="$STATE_ROOT/capture.last.env"
 outcomes_file="$STATE_ROOT/outcomes.last.env"
+capture_disposition_file="$STATE_ROOT/capture.disposition.env"
+outcomes_disposition_file="$STATE_ROOT/outcomes.disposition.env"
 last_sync_file="$DATA_ROOT/.last_sync"
 last_sync_at="$(status_time "$(state_value "$last_sync_file" last_sync_at_utc)")"
 capture_at="$(status_time "$(state_value "$capture_file" finished_at_utc)")"
 capture_rc="$(status_rc "$(state_value "$capture_file" exit_code)")"
 outcomes_at="$(status_time "$(state_value "$outcomes_file" finished_at_utc)")"
 outcomes_rc="$(status_rc "$(state_value "$outcomes_file" exit_code)")"
-status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA sync_success_at=$last_sync_at capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc"
+
+status_token() {
+  local raw="$1"
+  local fallback="${2:-NONE}"
+  if [[ "$raw" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    printf '%s\n' "$raw"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+status_count() {
+  local raw="$1"
+  if [[ "$raw" =~ ^[0-9]{1,9}$ ]]; then
+    printf '%s\n' "$raw"
+  else
+    printf 'NONE\n'
+  fi
+}
+
+capture_disposition="$(status_token "$(state_value "$capture_disposition_file" disposition)")"
+outcomes_disposition="$(status_token "$(state_value "$outcomes_disposition_file" disposition)")"
+release_compatibility="$(status_token "$(state_value "$outcomes_disposition_file" release_compatibility_status)" NONE)"
+if [[ "$release_compatibility" == "NONE" ]]; then
+  release_compatibility="$(status_token "$(state_value "$capture_disposition_file" release_compatibility_status)" NONE)"
+fi
+pending_ack="$(status_count "$(state_value "$outcomes_disposition_file" accountability_pending_count)")"
+if [[ "$pending_ack" == "NONE" ]]; then
+  # Prefer the JSON consumption summary written by the outcomes job when present.
+  pending_ack="$(
+    awk -F'[:,]' '
+      /"accountability_pending_count"/ {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /accountability_pending_count/) {
+            gsub(/[^0-9]/, "", $(i + 1))
+            if ($(i + 1) != "") { print $(i + 1); exit }
+          }
+        }
+      }
+    ' "$DATA_ROOT/.learning_consumption/outcomes.json" 2>/dev/null || true
+  )"
+  pending_ack="$(status_count "$pending_ack")"
+fi
+
+# Evidence sync may still run under RELEASE_DRIFT so operators retain pull
+# diagnostics; capture/outcomes refuse compute separately (fail closed).
+status_command="opip-export-v2 sha=$OPIP_DEPLOYED_SHA sync_success_at=$last_sync_at capture_at=$capture_at capture_rc=$capture_rc outcomes_at=$outcomes_at outcomes_rc=$outcomes_rc capture_disposition=$capture_disposition outcomes_disposition=$outcomes_disposition release_compatibility=$release_compatibility outcomes_pending_ack=$pending_ack"
 
 rm -rf "$INCOMING"/*
 rm -f "$ARCHIVE"
@@ -103,6 +151,28 @@ schema="$(manifest_value schema_version)"
   echo "O'Pip learning sync: unsupported manifest schema=$schema" >&2
   exit 65
 }
+
+# Record release compatibility against the synced export for diagnose lag.
+# Sync itself is allowed under drift so evidence pull remains diagnosable.
+production_sha="$(manifest_value production_deployed_sha)"
+release_status="UNVERIFIED"
+if [[ "$OPIP_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ && "$production_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  if [[ "$OPIP_DEPLOYED_SHA" == "$production_sha" ]]; then
+    release_status="CURRENT"
+  else
+    release_status="RELEASE_DRIFT"
+  fi
+fi
+printf 'release_compatibility_status=%s\nproduction_deployed_sha=%s\nworker_deployed_sha=%s\nrecorded_at_utc=%s\n' \
+  "$release_status" \
+  "${production_sha:-}" \
+  "$OPIP_DEPLOYED_SHA" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$STATE_ROOT/release_compatibility.env.tmp"
+mv -f -- "$STATE_ROOT/release_compatibility.env.tmp" "$STATE_ROOT/release_compatibility.env"
+if [[ "$release_status" == "RELEASE_DRIFT" ]]; then
+  echo "O'Pip learning sync: RELEASE_DRIFT worker=$OPIP_DEPLOYED_SHA production=$production_sha (sync allowed; compute blocked)" >&2
+fi
 
 validate_artifact() {
   local name="$1"

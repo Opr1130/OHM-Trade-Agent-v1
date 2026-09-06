@@ -28,6 +28,9 @@ done
 
 now_epoch="$(date -u +%s)"
 status="OK"
+export_age=""
+release_compatibility_status=""
+analytics=""
 degrade() {
   if [[ "$status" == "OK" ]]; then
     status="DEGRADED"
@@ -97,6 +100,10 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   capture_rc="$(env_value "$READER_STATE_FILE" capture_exit_code)"
   outcomes_at="$(env_value "$READER_STATE_FILE" outcomes_finished_at_utc)"
   outcomes_rc="$(env_value "$READER_STATE_FILE" outcomes_exit_code)"
+  capture_disposition="$(env_value "$READER_STATE_FILE" capture_disposition)"
+  outcomes_disposition="$(env_value "$READER_STATE_FILE" outcomes_disposition)"
+  release_compat="$(env_value "$READER_STATE_FILE" release_compatibility_status)"
+  outcomes_pending_ack="$(env_value "$READER_STATE_FILE" outcomes_pending_ack)"
   capture_age="$(age_seconds "$capture_at" || true)"
   outcomes_age="$(age_seconds "$outcomes_at" || true)"
   echo "worker_sync_request_observed_at_utc=${sync_seen:-UNKNOWN}"
@@ -111,6 +118,44 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   echo "outcomes_finished_at_utc=${outcomes_at:-UNKNOWN}"
   echo "outcomes_age_seconds=${outcomes_age:-UNKNOWN}"
   echo "outcomes_exit_code=${outcomes_rc:-UNKNOWN}"
+  echo "capture_disposition=${capture_disposition:-UNKNOWN}"
+  echo "outcomes_disposition=${outcomes_disposition:-UNKNOWN}"
+  echo "outcomes_pending_ack=${outcomes_pending_ack:-UNKNOWN}"
+
+  if [[ -n "$release_compat" && "$release_compat" != "NONE" && "$release_compat" != "UNKNOWN" ]]; then
+    release_compatibility_status="$release_compat"
+  elif [[ "$worker_sha" =~ ^[0-9a-f]{40}$ && "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ "$worker_sha" == "$current_sha" ]]; then
+      release_compatibility_status="CURRENT"
+    else
+      release_compatibility_status="RELEASE_DRIFT"
+    fi
+  else
+    release_compatibility_status="UNVERIFIED"
+  fi
+  echo "release_compatibility_status=$release_compatibility_status"
+
+  if [[ "$outcomes_disposition" == "CONSUMED_OK" || "$outcomes_disposition" == "CONSUMED_EMPTY" ]]; then
+    echo "last_successful_outcomes_consumption_at_utc=${outcomes_at:-UNKNOWN}"
+  else
+    echo "last_successful_outcomes_consumption_at_utc=UNKNOWN"
+  fi
+  if [[ "$outcomes_pending_ack" =~ ^[0-9]+$ ]]; then
+    echo "accountability_pending_count=$outcomes_pending_ack"
+  else
+    echo "accountability_pending_count=UNKNOWN"
+  fi
+  if [[ "$outcomes_age" =~ ^[0-9]+$ && "$export_age" =~ ^[0-9]+$ ]]; then
+    # Positive lag means outcomes consumption trails the latest export evidence.
+    if (( outcomes_age > export_age )); then
+      echo "consumption_lag_vs_export_seconds=$((outcomes_age - export_age))"
+    else
+      echo "consumption_lag_vs_export_seconds=0"
+    fi
+  else
+    echo "consumption_lag_vs_export_seconds=UNKNOWN"
+  fi
+
   if [[ ! "$sync_age" =~ ^[0-9]+$ ]] || (( sync_age > MAX_SYNC_AGE_SECONDS )); then
     echo "worker_evidence_sync_status=STALE_OR_UNVERIFIED"
     degrade
@@ -120,8 +165,21 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   if [[ "$protocol" != "2" ]]; then
     echo "worker_compute_status=UNVERIFIED_LEGACY_SYNC_PROTOCOL"
     degrade
-  elif [[ "$worker_sha" != "$current_sha" ]]; then
+  elif [[ "$release_compatibility_status" == "RELEASE_DRIFT" ]]; then
     echo "worker_compute_status=RELEASE_DRIFT"
+    degrade
+  elif [[ "$release_compatibility_status" == "UNVERIFIED" \
+       && "$worker_sha" =~ ^[0-9a-f]{40}$ \
+       && "$current_sha" =~ ^[0-9a-f]{40}$ \
+       && "$worker_sha" != "$current_sha" ]]; then
+    echo "worker_compute_status=RELEASE_DRIFT"
+    degrade
+  elif [[ "$capture_disposition" == "BLOCKED_RELEASE_DRIFT" || "$outcomes_disposition" == "BLOCKED_RELEASE_DRIFT" ]]; then
+    echo "worker_compute_status=BLOCKED_RELEASE_DRIFT"
+    degrade
+  elif [[ "$capture_disposition" == "SKIPPED_BUSY" || "$capture_disposition" == "SKIPPED_CAPACITY" \
+       || "$outcomes_disposition" == "SKIPPED_BUSY" || "$outcomes_disposition" == "SKIPPED_CAPACITY" ]]; then
+    echo "worker_compute_status=SKIPPED_CAPACITY_OR_BUSY"
     degrade
   elif [[ "$capture_rc" != "0" || "$outcomes_rc" != "0" ]]; then
     echo "worker_compute_status=FAILED_OR_INCOMPLETE"
@@ -138,6 +196,13 @@ if [[ -s "$READER_STATE_FILE" ]]; then
 else
   echo "worker_sync_heartbeat=MISSING"
   echo "worker_compute_status=UNVERIFIED"
+  echo "release_compatibility_status=UNVERIFIED"
+  echo "capture_disposition=UNKNOWN"
+  echo "outcomes_disposition=UNKNOWN"
+  echo "outcomes_pending_ack=UNKNOWN"
+  echo "accountability_pending_count=UNKNOWN"
+  echo "last_successful_outcomes_consumption_at_utc=UNKNOWN"
+  echo "consumption_lag_vs_export_seconds=UNKNOWN"
   degrade
 fi
 
@@ -378,6 +443,46 @@ print(json.dumps(out, sort_keys=True, separators=(",", ":")))
 else
   echo "production_runtime_data=CORE_CONTAINER_UNAVAILABLE"
   degrade
+fi
+
+# Phase 18 zero-funnel clarity: Early Watch journeys are not the SEARCH
+# qualification funnel producer. Keep counters distinct; no threshold changes.
+echo "OPIP_ZERO_FUNNEL_CLARITY"
+echo "note=early_watch_journeys_are_not_qualification_funnel_producer"
+if [[ -n "${analytics:-}" ]]; then
+  echo "early_watch_journeys=$(printf '%s' "$analytics" | awk -F'[:,]' '
+    /"early_watch_journeys"/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /early_watch_journeys/) {
+          gsub(/[^0-9]/, "", $(i + 1))
+          if ($(i + 1) != "") { print $(i + 1); exit }
+        }
+      }
+    }
+  ')"
+  echo "qualified_signals=$(printf '%s' "$analytics" | awk -F'[:,]' '
+    /"qualified_signals"/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /qualified_signals/) {
+          gsub(/[^0-9]/, "", $(i + 1))
+          if ($(i + 1) != "") { print $(i + 1); exit }
+        }
+      }
+    }
+  ')"
+else
+  echo "early_watch_journeys=UNKNOWN"
+  echo "qualified_signals=UNKNOWN"
+fi
+echo "funnel_candidates_source=OPIP_QUALIFICATION_FUNNEL"
+echo "search_mode_source=production_runtime_data.effective_mode"
+
+# Export cron alone must not imply healthy learning compute.
+if [[ "$status" == "OK" ]]; then
+  if [[ "${release_compatibility_status:-}" == "RELEASE_DRIFT" \
+     || "${release_compatibility_status:-}" == "UNVERIFIED" ]]; then
+    degrade
+  fi
 fi
 
 echo "diagnostics_status=$status"

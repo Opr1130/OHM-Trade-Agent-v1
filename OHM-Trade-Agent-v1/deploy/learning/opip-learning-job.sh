@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ENV_FILE="/etc/opip-learning.env"
-LOCK_FILE="/var/lock/opip-learning-plane.lock"
-DATA_ROOT="/var/lib/opip-learning/data"
-STATE_ROOT="/var/lib/opip-learning/state"
+ENV_FILE="${OPIP_LEARNING_ENV_FILE:-/etc/opip-learning.env}"
+LOCK_FILE="${OPIP_LEARNING_LOCK_FILE:-/var/lock/opip-learning-plane.lock}"
+DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"
+STATE_ROOT="${OPIP_LEARNING_STATE_ROOT:-/var/lib/opip-learning/state}"
+MANIFEST="$DATA_ROOT/manifest.env"
 JOB="${1:-}"
 
 [[ -r "$ENV_FILE" ]] || {
@@ -15,6 +16,7 @@ JOB="${1:-}"
 source "$ENV_FILE"
 
 : "${OPIP_LEARNING_IMAGE:?OPIP_LEARNING_IMAGE is required}"
+: "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 
 case "$JOB" in
   capture)
@@ -39,26 +41,87 @@ case "$JOB" in
     ;;
 esac
 
-for cmd in docker flock timeout awk install date; do
+for cmd in flock awk install date mv; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning-runner command: $cmd" >&2
     exit 69
   }
 done
 
-install -d -o root -g root -m 0755 "$DATA_ROOT" "$STATE_ROOT"
+install -d -o root -g root -m 0755 "$DATA_ROOT" "$STATE_ROOT" 2>/dev/null || install -d -m 0755 "$DATA_ROOT" "$STATE_ROOT"
+
+manifest_value() {
+  local key="$1"
+  awk -F= -v k="$key" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$MANIFEST" 2>/dev/null || true
+}
+
+# Exact-SHA equality with production last-good / export expected SHA.
+classify_release_compatibility() {
+  local worker="$1"
+  local expected="$2"
+  if [[ ! "$worker" =~ ^[0-9a-f]{40}$ || ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+    printf 'UNVERIFIED\n'
+  elif [[ "$worker" == "$expected" ]]; then
+    printf 'CURRENT\n'
+  else
+    printf 'RELEASE_DRIFT\n'
+  fi
+}
+
+write_disposition() {
+  local disposition="$1"
+  local release_status="$2"
+  local expected_sha="$3"
+  local exit_code="${4:-}"
+  local detail="${5:-}"
+  local recorded
+  recorded="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local tmp="$STATE_ROOT/$JOB.disposition.env.tmp"
+  cat > "$tmp" <<EOF
+job=$JOB
+disposition=$disposition
+recorded_at_utc=$recorded
+release_compatibility_status=$release_status
+worker_sha=$OPIP_DEPLOYED_SHA
+expected_sha=$expected_sha
+exit_code=$exit_code
+detail=$detail
+measurement_only=true
+trade_authority_changed=false
+policy_change_authorized=false
+EOF
+  mv -f "$tmp" "$STATE_ROOT/$JOB.disposition.env"
+}
+
+EXPECTED_SHA="$(manifest_value production_deployed_sha)"
+RELEASE_STATUS="$(classify_release_compatibility "$OPIP_DEPLOYED_SHA" "$EXPECTED_SHA")"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "O'Pip learning plane busy; $JOB skipped"
+  write_disposition "SKIPPED_BUSY" "$RELEASE_STATUS" "$EXPECTED_SHA" "" "learning_plane_lock_busy"
   exit 0
 fi
 
 MEM_AVAILABLE_KB="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
 if [[ ! "$MEM_AVAILABLE_KB" =~ ^[0-9]+$ ]] || (( MEM_AVAILABLE_KB < MIN_AVAILABLE_KB )); then
   echo "O'Pip learning job skipped for memory safety: job=$JOB available_kb=$MEM_AVAILABLE_KB required_kb=$MIN_AVAILABLE_KB" >&2
+  write_disposition "SKIPPED_CAPACITY" "$RELEASE_STATUS" "$EXPECTED_SHA" "" "mem_available_kb=$MEM_AVAILABLE_KB"
   exit 0
 fi
+
+if [[ "$RELEASE_STATUS" != "CURRENT" ]]; then
+  echo "O'Pip learning job blocked for release compatibility: job=$JOB status=$RELEASE_STATUS worker=$OPIP_DEPLOYED_SHA expected=${EXPECTED_SHA:-MISSING}" >&2
+  write_disposition "BLOCKED_RELEASE_DRIFT" "$RELEASE_STATUS" "$EXPECTED_SHA" "75" "exact_sha_admission_failed"
+  exit 75
+fi
+
+for cmd in docker timeout; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "missing learning-runner command: $cmd" >&2
+    exit 69
+  }
+done
 
 LABEL="com.opip.learning.job=$JOB"
 
@@ -100,10 +163,54 @@ finished_at_utc=$finished_at
 exit_code=$rc
 memory_limit=$MEMORY_LIMIT
 cpu_limit=$CPU_LIMIT
+release_compatibility_status=$RELEASE_STATUS
 EOF
 mv -f "$STATE_ROOT/$JOB.last.env.tmp" "$STATE_ROOT/$JOB.last.env"
 
-if [[ "$rc" == "124" || "$rc" == "137" ]]; then
+if [[ "$rc" == "0" ]]; then
+  disposition="CONSUMED_OK"
+  detail="job_completed"
+  if [[ "$JOB" == "outcomes" ]]; then
+    summary_disp="$(
+      awk -F'[:,]' '
+        /"disposition"/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /"disposition"/) {
+              gsub(/[^A-Za-z0-9_]/, "", $(i + 1))
+              if ($(i + 1) != "") { print $(i + 1); exit }
+            }
+          }
+        }
+      ' "$DATA_ROOT/.learning_consumption/outcomes.json" 2>/dev/null || true
+    )"
+    if [[ "$summary_disp" == "CONSUMED_EMPTY" || "$summary_disp" == "CONSUMED_OK" ]]; then
+      disposition="$summary_disp"
+    fi
+    pending_count="$(
+      awk -F'[:,]' '
+        /"accountability_pending_count"/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /accountability_pending_count/) {
+              gsub(/[^0-9]/, "", $(i + 1))
+              if ($(i + 1) != "") { print $(i + 1); exit }
+            }
+          }
+        }
+      ' "$DATA_ROOT/.learning_consumption/outcomes.json" 2>/dev/null || true
+    )"
+    detail="job_completed"
+    write_disposition "$disposition" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "$detail"
+    if [[ "$pending_count" =~ ^[0-9]+$ ]]; then
+      printf 'accountability_pending_count=%s\n' "$pending_count" \
+        >> "$STATE_ROOT/$JOB.disposition.env"
+    fi
+  else
+    write_disposition "$disposition" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "$detail"
+  fi
+elif [[ "$rc" == "124" || "$rc" == "137" ]]; then
   echo "O'Pip learning job exceeded bounded envelope: job=$JOB rc=$rc" >&2
+  write_disposition "FAILED_RETRYABLE" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "timeout_or_oom"
+else
+  write_disposition "FAILED_TERMINAL" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "job_failed"
 fi
 exit "$rc"
