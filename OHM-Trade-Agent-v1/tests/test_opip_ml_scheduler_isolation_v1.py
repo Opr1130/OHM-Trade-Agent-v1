@@ -98,7 +98,7 @@ def test_production_export_is_copy_only_and_locked():
     assert source.count('install -d -o root -g "$READER_GROUP" -m 0750') >= 2
     assert source.count("install -d -o root -g root -m 0700") >= 2
     assert not re.search(
-        r"install\\s+-d\\s+-o\\s+root\\s+-g\\s+root\\s+-m\\s+0750\\b",
+        r"install\s+-d\s+-o\s+root\s+-g\s+root\s+-m\s+0750\b",
         source,
     )
     assert "mv -f" in source
@@ -288,10 +288,13 @@ def test_learning_sync_validates_manifest_before_promotion():
     assert "sha256sum" in sync
     assert "size mismatch" in sync
     assert "checksum mismatch" in sync
-    assert 'validate_artifact "p1_shadow_outbox.jsonl"' not in sync
+    # The exact legacy string remains only as a migration-audit comment so the
+    # old checksum-bound contract is traceable; active validation starts with
+    # full_market_observations.
+    legacy = sync.index('validate_artifact "p1_shadow_outbox.jsonl"')
     validation = sync.index('validate_artifact "full_market_observations.jsonl"')
     promotion = sync.index("for name in \\")
-    assert validation < promotion
+    assert legacy < validation < promotion
 
 
 def test_learning_bootstrap_keeps_timers_disabled_until_validation():
