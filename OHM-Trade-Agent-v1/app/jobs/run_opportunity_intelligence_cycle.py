@@ -7,6 +7,7 @@ measurement-only and have no network access or trading authority.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from app.jobs.build_phase3c_forward_outcomes import (
@@ -19,6 +20,9 @@ from app.opip.learning.job_disposition import (
     CONSUMED_OK,
     write_consumption_summary,
 )
+from app.opip.learning.replica_archive_repair import (
+    reconcile_qualification_replica_archives,
+)
 from app.services.opportunity_accountability import (
     build_incremental_from_outcomes,
     resolved_accountability_outcomes,
@@ -28,7 +32,23 @@ from app.services.opportunity_accountability import (
 _DEFAULT_DATA_ROOT = Path("/app/data")
 
 
+def _replica_archive_repair_enabled() -> bool:
+    return os.getenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def main() -> None:
+    data_root = _DEFAULT_DATA_ROOT
+    replica_archive_repair: dict[str, str] = {}
+    if _replica_archive_repair_enabled() and data_root.is_dir():
+        # The production export remains copy-only. Repair only the isolated
+        # replica after sync has validated the complete exported archive tree.
+        replica_archive_repair = reconcile_qualification_replica_archives(data_root)
+
     # Drain any durable handoff left by an interrupted prior cycle before
     # maturing more snapshots. This bounds backlog growth and gives
     # accountability at-least-once delivery semantics.
@@ -77,6 +97,7 @@ def main() -> None:
         "accountability_handoff_acknowledged": acknowledged,
         "accountability_pending_count": len(pending_after),
         "replayed_handoff": replayed_handoff,
+        "replica_archive_repair": replica_archive_repair,
         "population": summary.get("population", {}),
         "opportunity_capture_rate_pct": summary.get(
             "opportunity_capture_rate_pct"
@@ -85,7 +106,6 @@ def main() -> None:
         "trade_authority_changed": False,
         "policy_change_authorized": False,
     }
-    data_root = _DEFAULT_DATA_ROOT
     if data_root.is_dir():
         write_consumption_summary(
             data_root, job="outcomes", disposition=disposition, payload=payload
