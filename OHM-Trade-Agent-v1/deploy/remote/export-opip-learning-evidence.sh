@@ -111,7 +111,11 @@ copy_locked_jsonl() {
   fi
 }
 
-copy_locked_jsonl "$DATA_ROOT/p1_shadow_outbox.jsonl" "p1_shadow_outbox.jsonl"
+# P1 shadow outbox was retired after it grew large enough to choke the evidence
+# plane. Never republish the legacy artifact; remove any stale exported copy
+# while holding the exclusive publish lock.
+rm -f -- "$EXPORT_ROOT/p1_shadow_outbox.jsonl"
+
 copy_locked_jsonl "$DATA_ROOT/full_market_observations.jsonl" "full_market_observations.jsonl"
 copy_locked_jsonl "$DATA_ROOT/p1_evidence_ledger.jsonl" "p1_evidence_ledger.jsonl"
 copy_locked_jsonl "$DATA_ROOT/intelligence_learning/events.jsonl" "intelligence_learning/events.jsonl"
@@ -142,15 +146,15 @@ if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 {
-  printf 'schema_version=3\n'
+  printf 'schema_version=4\n'
   printf 'exported_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'production_deployed_sha=%s\n' "$production_deployed_sha"
+  printf 'p1_shadow_outbox_retired=1\n'
   while IFS='|' read -r name key; do
     path="$EXPORT_ROOT/$name"
     printf '%s_bytes=%s\n' "$key" "$(stat -c '%s' "$path")"
     printf '%s_sha256=%s\n' "$key" "$(sha256sum "$path" | awk '{print $1}')"
   done <<'ARTIFACTS'
-p1_shadow_outbox.jsonl|p1_shadow_outbox_jsonl
 full_market_observations.jsonl|full_market_observations_jsonl
 p1_evidence_ledger.jsonl|p1_evidence_ledger_jsonl
 intelligence_learning/events.jsonl|intelligence_learning_events_jsonl
