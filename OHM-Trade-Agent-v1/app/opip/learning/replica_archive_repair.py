@@ -82,6 +82,12 @@ def _reconstruct_missing_replica_manifest(archive: BoundedJsonlArchive) -> str:
             raise RuntimeError("existing replica archive manifest is incomplete")
         return "EXISTING_VERIFIED"
 
+    # A signature without its canonical manifest is lineage evidence, not an
+    # invitation to replace the missing manifest. Preserve the ambiguity and
+    # fail closed rather than synthesizing a different document under it.
+    if archive.manifest_signature_file.exists():
+        raise RuntimeError("replica archive manifest missing with signature present")
+
     verified = _verified_segments(archive)
     if not verified:
         if not archive.ensure_window_index_locked():
