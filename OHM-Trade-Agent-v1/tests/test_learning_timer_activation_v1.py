@@ -49,6 +49,20 @@ def test_activation_failure_cannot_enable_timers_early():
         assert "exit 75" in source[pos : pos + 500]
 
 
+def test_failed_outcomes_one_shot_emits_disposition_and_journal_before_exit():
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("if ! systemctl start opip-learning-outcomes.service")
+    report = source.index("report_one_shot_failure", start)
+    failure_exit = source.index("exit 75", report)
+    enable = source.index('systemctl enable --now "${TIMERS[@]}"')
+
+    helper = source[source.index("report_one_shot_failure()") : start]
+    assert 'cat "$disposition_file"' in helper
+    assert 'systemctl status "$service" --no-pager -l' in helper
+    assert 'journalctl -u "$service" -n 160 --no-pager' in helper
+    assert start < report < failure_exit < enable
+
+
 def test_activation_remains_measurement_only_without_trading_credentials():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "measurement_only=true" in source
