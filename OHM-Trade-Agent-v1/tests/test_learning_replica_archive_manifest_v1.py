@@ -92,6 +92,21 @@ def test_existing_unsigned_manifest_is_never_replaced_by_replica_repair(tmp_path
     assert not archive.manifest_signature_file.exists()
 
 
+def test_orphan_manifest_signature_blocks_replica_reconstruction(tmp_path):
+    archive, _segment = _write_verified_screening_segment(tmp_path)
+    archive.manifest_signature_file.write_text(
+        f"{'a' * 64}  {archive.manifest_file.name}\n",
+        encoding="utf-8",
+    )
+    before = archive.manifest_signature_file.read_bytes()
+
+    with pytest.raises(RuntimeError, match="manifest missing with signature present"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+    assert not archive.manifest_file.exists()
+    assert archive.manifest_signature_file.read_bytes() == before
+
+
 def test_outcomes_cycle_repairs_replica_before_reading_pending_handoff():
     source = (
         Path(__file__).resolve().parents[1]
