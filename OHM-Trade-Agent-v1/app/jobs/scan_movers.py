@@ -14,6 +14,15 @@ from app.opip.decision.store import (
     opip_funnel_telemetry_enabled,
     retention_capacity_health,
 )
+from app.opip.early.operator_semantics import (
+    OperatorAssessment,
+    assessment_from_signal,
+    format_operator_watch_message,
+)
+from app.opip.early.shadow_observer import (
+    persist_shadow_rows,
+    record_card_delivery_outcomes,
+)
 from app.opip.identity import resolve_venue_instrument_identity
 from app.services.alert_governor import (
     evaluate_opportunity_alert,
@@ -22,9 +31,6 @@ from app.services.alert_governor import (
 )
 from app.services.asset_display_identity import display_market_label
 from app.services.compact_alerts import (
-    downside_scenario_pct,
-    explosion_band,
-    heuristic_risk_score,
     one_line_reason,
 )
 from app.services.decision_telemetry import (
@@ -196,23 +202,17 @@ def _best_signal_reason(signal) -> str:
     return one_line_reason(" + ".join(reasons), *fallback_reasons)
 
 
+def _signal_assessment(signal) -> OperatorAssessment:
+    """The operator-facing phase/grade/disposition for one signal.
+
+    ``signal.stage`` stays untouched as the alert governor transition token.
+    """
+    return assessment_from_signal(signal)
+
+
 def _compact_card(signal) -> str:
-    low, high = explosion_band(signal.continuation_confidence, extended=signal.extended_move)
-    risk = heuristic_risk_score(
-        signal.continuation_confidence,
-        liquidity_usd=signal.liquidity_24h_usd_approx,
-        extended=signal.extended_move,
-    )
-    downside = downside_scenario_pct(risk)
-    return (
-        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
-        f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
-        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | {signal.momentum_state}\n"
-        f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
-        f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
-        f"Why now: {_best_signal_reason(signal)}\n"
-        f"Entry: {signal.entry_recommendation}\n"
-        "Action: WATCH ONLY — no entry is authorized"
+    return format_operator_watch_message(
+        signal, style="compact", why_now=_best_signal_reason(signal)
     )
 
 
@@ -492,6 +492,34 @@ def main() -> None:
         cohort_id="EARLY_WATCH",
         decision_at=decision_at,
     )
+    # Point-in-time prior-observation / persistence from the existing
+    # full-universe history. Never synthesised: a first sighting stays empty.
+    try:
+        from app.opip.early.observation_context import build_observation_context
+        from app.opip.early.shadow_observer import load_observation_history
+
+        observation_history = load_observation_history()
+        observation_context = build_observation_context(history=observation_history)
+    except Exception as exc:
+        from types import SimpleNamespace
+
+        observation_context = SimpleNamespace(
+            prior_observation_counts={},
+            persistence_scans={},
+        )
+        observation_history = {}
+        logger.warning(
+            "O'Pip early observation context failed open: %s",
+            type(exc).__name__,
+        )
+    # selector_promoted / validation_parity default to their dark flags inside
+    # scan_early_movers. Do not auto-enable either from evaluate_promotion.
+    scan_kwargs = {
+        "decision_at": decision_at,
+        "prior_observation_counts": observation_context.prior_observation_counts,
+        "persistence_scans": observation_context.persistence_scans,
+        "observation_history": observation_history,
+    }
     if screening_enabled:
         screening_callback = _screening_capture_callback(
             rows=screening_rows,
@@ -502,6 +530,7 @@ def main() -> None:
             on_coarse_evaluated=screening_callback,
             on_evaluated=screening_callback,
             scan_id=screening_scan_id,
+            **scan_kwargs,
         )
         append_screening_evaluations(screening_rows, enabled=True)
         observed_universe = next(
@@ -524,8 +553,9 @@ def main() -> None:
                 type(exc).__name__,
             )
     else:
-        # Keep the historical call signature on the default-dark path.
-        coarse, signals = scan_early_movers()
+        # Keep the historical call signature on the default-dark path, but
+        # still pass real observation context so validation parity can use it.
+        coarse, signals = scan_early_movers(**scan_kwargs)
 
     try:
         queue_added, queue_failures = _enqueue_wave9_monitoring(
@@ -699,6 +729,23 @@ def main() -> None:
             else:
                 release_opportunity_alert_reservation(decision.reservation_token)
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
+
+        # Issue #223: record what the operator was actually notified about,
+        # reading the governor's own outcome rather than assuming a card
+        # implies delivery. Measurement only, and dark by default.
+        try:
+            persist_shadow_rows(
+                record_card_delivery_outcomes(
+                    early_mover_delivery,
+                    anchor_prices={
+                        signal.symbol.upper(): float(getattr(signal, "reference_price", 0.0) or 0.0)
+                        for signal in eligible_signals
+                    },
+                    decision_at=decision_at,
+                )
+            )
+        except Exception as exc:
+            print("Early card delivery capture: fail-soft", type(exc).__name__)
 
         broad_feed = (
             _broad_watch_feed(

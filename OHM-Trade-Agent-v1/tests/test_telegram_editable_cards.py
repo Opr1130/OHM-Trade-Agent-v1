@@ -73,17 +73,23 @@ def test_compact_mover_card_is_short_and_decision_focused():
         liquidity_24h_usd_approx=500000.0,
         reference_price=1.2345,
         detection_timeframe="1H",
+        market_phase="EARLY_EXPANSION",
+        evidence_grade="QUALIFIED",
+        operator_disposition="DEEP_REVIEW",
     )
 
     card = _compact_card(signal)
 
-    assert "METUSD — EARLY_EXPANSION" in card
+    # Issue #223 contract change: the header no longer prints the alert
+    # governor's ``stage`` token. Market phase, evidence grade and operator
+    # disposition are rendered as three separate facts instead.
+    assert "Market: EARLY_EXPANSION | Evidence: QUALIFIED" in card
+    assert "Disposition: DEEP REVIEW" in card
     assert "Entry: WAIT_FOR_PULLBACK" in card
     assert "Momentum accelerating" in card
     assert "Volume expanding" in card
     assert "Price: 1.2345 | TF: 1H" in card
-    assert len(card.splitlines()) <= 8
-    assert "Evidence:" not in card
+    assert len(card.splitlines()) <= 9
 
 
 

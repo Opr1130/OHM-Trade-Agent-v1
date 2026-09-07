@@ -141,10 +141,14 @@ def test_detection_snapshot_capture_is_prospective(tmp_path):
 
 
 def test_weak_movement_is_not_promoted():
+    from app.services.movement_discovery_v2 import DeepEvaluationRejection
+
     signal = evaluate_early_mover(
         snapshot(confirmed_price_change_1h_pct=0.1, momentum_6h_pct=0.3,
                  momentum_24h_pct=0.5, movement_volume_ratio=1.0, volume_ratio=1.0,
                  trend="neutral", distance_to_24h_high_pct=5.0),
         coarse(),
     )
-    assert signal is None
+    assert isinstance(signal, DeepEvaluationRejection)
+    assert signal.achieved_score < signal.required_score
+    assert signal.score_margin < 0

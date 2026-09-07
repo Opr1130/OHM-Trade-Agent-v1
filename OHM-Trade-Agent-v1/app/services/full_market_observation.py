@@ -531,6 +531,15 @@ def process_full_market_observations(
     # keys, derives no features and scores nothing - the scan is operationally
     # identical to pre-Phase-1 behaviour.
     signal_quality_enabled = bool(getattr(settings, "signal_quality_v1_enabled", False))
+    # Issue #223: keep the existing bounded history warm even when Signal
+    # Quality v1 is dark. Capture alone never scores, ranks, or alerts.
+    try:
+        from app.opip.early.flags import early_history_capture_enabled
+
+        early_history_enabled = early_history_capture_enabled()
+    except Exception:
+        early_history_enabled = False
+    history_capture_enabled = signal_quality_enabled or early_history_enabled
     history_scans = int(getattr(settings, "signal_quality_history_scans", DEFAULT_HISTORY_SCANS) or DEFAULT_HISTORY_SCANS)
     stale_history_retention_seconds = float(
         getattr(settings, "signal_quality_stale_history_retention_seconds", None)
@@ -546,7 +555,7 @@ def process_full_market_observations(
         latest = state.get("latest_by_symbol") or {}
         if not isinstance(latest, dict):
             raise ValueError("full-market latest_by_symbol state must be an object")
-        if signal_quality_enabled:
+        if history_capture_enabled:
             # First enabled scan seeds from latest_by_symbol; later scans read
             # back the schema-2 block. Both paths are idempotent.
             history = load_history_state(state, history_scans=history_scans)
@@ -559,9 +568,10 @@ def process_full_market_observations(
                 if transition is not None:
                     transitions.append(transition)
 
-                if signal_quality_enabled:
+                if history_capture_enabled:
                     # Feature state advances on every runtime scan, before and
                     # independently of the JSONL persistence decision below.
+                    # Selection is never consulted from this buffer.
                     observed_keys.add(key)
                     _append_history(history, key, _snapshot(observation, now), history_scans=history_scans)
 
@@ -582,7 +592,7 @@ def process_full_market_observations(
                 latest[key] = {**observation.as_dict(), "recorded_at": now.isoformat()}
                 persisted += 1
         state["latest_by_symbol"] = latest
-        if signal_quality_enabled:
+        if history_capture_enabled:
             # Age-based, not presence-based: a symbol missing from this scan
             # because of a fail-soft ticker error keeps its history, while a
             # genuinely delisted market ages out and state stays bounded.
@@ -591,9 +601,11 @@ def process_full_market_observations(
             )
             state["history_by_symbol"] = _serialise_history(history, history_scans=history_scans)
             state["schema_version"] = HISTORY_SCHEMA_VERSION
-        # When disabled, any history written by an earlier enabled run is left
-        # exactly as it is. Dark mode means no new Signal Quality mutation, not
-        # a destructive rollback of state the operator already accumulated.
+            if early_history_enabled and not signal_quality_enabled:
+                state["early_history_capture_enabled"] = True
+        # When both capture paths are disabled, any history written by an
+        # earlier enabled run is left exactly as it is. Dark mode means no
+        # new mutation, not a destructive rollback.
         state["last_scan_at"] = now.isoformat()
         state["observed_markets_last_scan"] = len(observations)
         save_json_atomic(state_target, state)

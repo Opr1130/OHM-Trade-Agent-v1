@@ -10,7 +10,11 @@ from typing import Any
 from app.exchanges.kraken import KrakenClient
 from app.scanner.market_scanner import analyze_symbol
 from app.scanner.universe import TICKER_BATCH_SIZE, _is_excluded_market, _market_symbols
-from app.services.movement_discovery_v2 import CoarseMover, evaluate_early_mover
+from app.services.movement_discovery_v2 import (
+    CoarseMover,
+    DeepEvaluationRejection,
+    evaluate_early_mover,
+)
 from app.services.registry_io import registry_lock
 
 
@@ -238,7 +242,11 @@ def scan_v22_shadow(
             stats["skipped"] += 1
             continue
         stats["analyzed"] += 1
-        signal = evaluate_early_mover(snapshot, row.mover)
+        result = evaluate_early_mover(snapshot, row.mover)
+        if isinstance(result, DeepEvaluationRejection):
+            signal = None
+        else:
+            signal = result
         results.append(
             ShadowChallengerResult(
                 version=VERSION,

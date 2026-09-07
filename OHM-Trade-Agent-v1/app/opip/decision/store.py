@@ -52,6 +52,7 @@ QUALIFICATION_DIR = Path("/app/data/opip/qualification")
 FUNNEL_EVENTS_FILE = QUALIFICATION_DIR / "funnel_events.jsonl"
 SCAN_SUMMARIES_FILE = QUALIFICATION_DIR / "scan_summaries.jsonl"
 SCREENING_EVALUATIONS_FILE = QUALIFICATION_DIR / "screening_evaluations.jsonl"
+EARLY_TIMING_MILESTONES_FILE = QUALIFICATION_DIR / "early_timing_milestones.jsonl"
 DEAD_LETTER_FILE = QUALIFICATION_DIR / "funnel_dead_letter.jsonl"
 
 # Retention. A funnel row carries the candidate's full ordered gate history, so
@@ -72,6 +73,11 @@ SCAN_SUMMARIES_MAX_BYTES = 8 * 1024 * 1024
 SCAN_SUMMARIES_KEEP_LINES = 10_000
 SCREENING_EVALUATIONS_MAX_BYTES = 64 * 1024 * 1024
 SCREENING_EVALUATIONS_KEEP_LINES = 100_000
+# Issue #223 point-in-time milestone ledger. One row per candidate episode per
+# scan that advanced a milestone, so it is far sparser than the screening
+# stream: 8 MB / 20,000 rows covers well beyond the 14-day recovery window.
+EARLY_TIMING_MILESTONES_MAX_BYTES = 8 * 1024 * 1024
+EARLY_TIMING_MILESTONES_KEEP_LINES = 20_000
 DEAD_LETTER_MAX_BYTES = 4 * 1024 * 1024
 DEAD_LETTER_KEEP_LINES = 2_000
 
@@ -253,6 +259,14 @@ def screening_evaluations_archive(path: Path | None = None) -> BoundedJsonlArchi
         path or SCREENING_EVALUATIONS_FILE,
         max_bytes=SCREENING_EVALUATIONS_MAX_BYTES,
         keep_lines=SCREENING_EVALUATIONS_KEEP_LINES,
+    )
+
+
+def early_timing_milestones_archive(path: Path | None = None) -> BoundedJsonlArchive:
+    return _archive_for(
+        path or EARLY_TIMING_MILESTONES_FILE,
+        max_bytes=EARLY_TIMING_MILESTONES_MAX_BYTES,
+        keep_lines=EARLY_TIMING_MILESTONES_KEEP_LINES,
     )
 
 
@@ -455,6 +469,32 @@ def append_screening_evaluations(
         evaluations,
         max_bytes=SCREENING_EVALUATIONS_MAX_BYTES,
         keep_lines=SCREENING_EVALUATIONS_KEEP_LINES,
+        dead_letter_path=dead_letter_path or DEAD_LETTER_FILE,
+    )
+
+
+def append_early_timing_milestones(
+    milestones: Iterable[Mapping[str, Any]],
+    *,
+    path: Path | None = None,
+    dead_letter_path: Path | None = None,
+    enabled: bool | None = None,
+) -> int:
+    """Persist Issue #223 milestone rows into the existing qualification plane.
+
+    Measurement-only, additive, and bounded by the same archive-before-delete
+    machinery as every other stream here. Deliberately a new stream rather
+    than a new evidence plane: it shares the directory, the lock convention,
+    the dead-letter file and the retention model.
+    """
+    active = opip_funnel_telemetry_enabled() if enabled is None else bool(enabled)
+    if not active:
+        return 0
+    return _append_rows(
+        path or EARLY_TIMING_MILESTONES_FILE,
+        milestones,
+        max_bytes=EARLY_TIMING_MILESTONES_MAX_BYTES,
+        keep_lines=EARLY_TIMING_MILESTONES_KEEP_LINES,
         dead_letter_path=dead_letter_path or DEAD_LETTER_FILE,
     )
 

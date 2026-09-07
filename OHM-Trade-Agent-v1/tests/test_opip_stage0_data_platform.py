@@ -28,6 +28,7 @@ from app.opip.storage.bounded_jsonl import (
 )
 from app.scanner.directional_candidates import select_directional_candidates
 from app.scanner.models import MarketSnapshot
+from app.opip.early.stage0_evidence import STAGE0_EVIDENCE_SCHEMA_VERSION
 from app.services.movement_discovery_v2 import discover_coarse_movers
 
 
@@ -177,6 +178,11 @@ def test_coarse_attrition_is_machine_readable_and_counts_actual_universe():
     assert [item.base_asset for item in movers] == ["FAST"]
     by_raw = {row["raw_identifier"]: row for row in rows}
     assert by_raw["MISSUSD"]["outcome"] == "DATA_UNAVAILABLE"
+    assert (
+        by_raw["MISSUSD"]["metadata"]["stage0_evidence_schema_version"]
+        == STAGE0_EVIDENCE_SCHEMA_VERSION
+    )
+    assert by_raw["MISSUSD"]["metadata"]["measurement_only"] is True
     assert by_raw["SLOWUSD"]["outcome"] == "BELOW_COARSE_THRESHOLD"
     assert "maximum_distance_from_24h_high_pct" in (
         by_raw["SLOWUSD"]["metadata"]["failed_predicates"]
