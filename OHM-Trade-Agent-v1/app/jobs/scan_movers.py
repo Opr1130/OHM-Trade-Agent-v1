@@ -14,6 +14,17 @@ from app.opip.decision.store import (
     opip_funnel_telemetry_enabled,
     retention_capacity_health,
 )
+from app.opip.early.operator_semantics import (
+    OperatorAssessment,
+    build_operator_assessment,
+    continuation_score_label,
+    disposition_label,
+)
+from app.opip.early.shadow_observer import (
+    persist_shadow_rows,
+    record_card_delivery_outcomes,
+)
+from app.opip.early.taxonomy import OperatorDisposition
 from app.opip.identity import resolve_venue_instrument_identity
 from app.services.alert_governor import (
     evaluate_opportunity_alert,
@@ -196,6 +207,23 @@ def _best_signal_reason(signal) -> str:
     return one_line_reason(" + ".join(reasons), *fallback_reasons)
 
 
+def _signal_assessment(signal) -> OperatorAssessment:
+    """The operator-facing phase/grade/disposition for one signal.
+
+    ``signal.stage`` stays untouched as the alert governor transition token.
+    These three facts are resolved independently so an already-extended
+    candidate cannot be presented as an early, actionable discovery.
+    """
+    return build_operator_assessment(
+        symbol=signal.symbol,
+        phase=getattr(signal, "market_phase", None),
+        grade=getattr(signal, "evidence_grade", None),
+        disposition=getattr(signal, "operator_disposition", None),
+        why_qualified=getattr(signal, "reasons", ()) or (),
+        why_not_actionable=getattr(signal, "actionability_reasons", ()) or (),
+    )
+
+
 def _compact_card(signal) -> str:
     low, high = explosion_band(signal.continuation_confidence, extended=signal.extended_move)
     risk = heuristic_risk_score(
@@ -204,11 +232,23 @@ def _compact_card(signal) -> str:
         extended=signal.extended_move,
     )
     downside = downside_scenario_pct(risk)
+    assessment = _signal_assessment(signal)
+    # Only a candidate that is genuinely early and genuinely actionable may
+    # use early-discovery wording. Everything else is a market observation.
+    headline = (
+        "🚀 EARLY WATCH"
+        if assessment.claims_early_discovery
+        and assessment.disposition
+        not in {OperatorDisposition.DO_NOT_CHASE, OperatorDisposition.NO_ACTION}
+        else "🔎 MARKET WATCH"
+    )
     return (
-        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"{headline} — {display_market_label(signal.symbol)}\n"
+        f"Market: {assessment.phase.value} | Evidence: {assessment.grade.value} | "
+        f"Disposition: {disposition_label(assessment.disposition)}\n"
         f"Price: {float(getattr(signal, 'reference_price', 0.0)):.8g} | TF: {getattr(signal, 'detection_timeframe', '1H')}\n"
         f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | {signal.momentum_state}\n"
-        f"Potential*: +{low}% to +{high}% | Confidence*: {signal.continuation_confidence}%\n"
+        f"Potential*: +{low}% to +{high}% | {continuation_score_label(signal)}\n"
         f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
         f"Why now: {_best_signal_reason(signal)}\n"
         f"Entry: {signal.entry_recommendation}\n"
@@ -699,6 +739,20 @@ def main() -> None:
             else:
                 release_opportunity_alert_reservation(decision.reservation_token)
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
+
+        # Issue #223: record what the operator was actually notified about,
+        # reading the governor's own outcome rather than assuming a card
+        # implies delivery. Measurement only, and dark by default.
+        persist_shadow_rows(
+            record_card_delivery_outcomes(
+                early_mover_delivery,
+                anchor_prices={
+                    signal.symbol.upper(): float(getattr(signal, "reference_price", 0.0) or 0.0)
+                    for signal in eligible_signals
+                },
+                decision_at=decision_at,
+            )
+        )
 
         broad_feed = (
             _broad_watch_feed(
