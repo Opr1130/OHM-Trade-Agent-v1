@@ -120,8 +120,10 @@ def _qualifying_snapshot(
             spread_pct=0.1,
             book_coverage_status="COMPLETE",
         ),
-        independent_market_reference=SimpleNamespace(status="RESOLVED"),
-        native_flow_metrics=SimpleNamespace(available=True),
+        independent_market_reference=None,
+        native_flow_evidence=SimpleNamespace(available=True, bias="BULLISH", strength=6),
+        native_flow_metrics=SimpleNamespace(available=True, bias="BULLISH"),
+        cross_pair_confirmation_status="CONFIRMED",
         cross_pair_price_status="NORMAL",
     )
 
@@ -646,13 +648,308 @@ def test_validation_layers_actually_executed_for_qualified_candidate():
         prior_observation_count=4,
         duplicate_state_detected=False,
         native_flow_available=True,
-        cross_venue_available=True,
-        depth_slippage_available=True,
+        native_flow_bias="BULLISH",
+        cross_market_status="CONFIRMED",
+        execution_validation=SimpleNamespace(
+            status="VALID", book_coverage_status="COMPLETE"
+        ),
         volatility_regime=40.0,
     )
     for name in MANDATORY_CHECKS:
         assert report.result_for(name) is ValidationResult.PASS
     assert report.evidence_grade is EvidenceGrade.QUALIFIED
-    assert report.result_for("native_flow_evidence") is ValidationResult.PASS
-    assert report.result_for("cross_venue_reference") is ValidationResult.PASS
-    assert report.result_for("depth_and_slippage_estimate") is ValidationResult.PASS
+    assert report.check("native_flow_evidence").counts_toward_qualification is True
+    assert report.check("cross_market_confirmation").counts_toward_qualification is True
+    assert report.check("depth_and_slippage_estimate").counts_toward_qualification is True
+    assert report.check("prior_observation_available").counts_toward_qualification is False
+    assert report.check("relative_strength_percentile").counts_toward_qualification is False
+
+
+def _mandatory_pass_kwargs(**overrides):
+    kwargs = {
+        "market_data_validation": SimpleNamespace(
+            qualified=True, status="PASS", rejection_reasons=[], candle_count=720
+        ),
+        "symbol_identity_resolved": True,
+        "completed_candle_count": 720,
+        "liquidity_24h_usd": 1_500_000.0,
+        "ticker_last": 1.0,
+        "latest_ohlc_close": 1.0,
+        "ticker_bid": 0.999,
+        "ticker_ask": 1.001,
+        "finite_features": True,
+        "persistence_scans": 3,
+        "prior_observation_count": 4,
+        "duplicate_state_detected": False,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_bearish_native_flow_cannot_help_qualify():
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            native_flow_bias="BEARISH",
+            cross_market_status="CONFIRMED",
+            execution_validation=SimpleNamespace(
+                status="VALID", book_coverage_status="COMPLETE"
+            ),
+        )
+    )
+    flow = report.check("native_flow_evidence")
+    assert flow.contradicts_signal is True
+    assert flow.counts_toward_qualification is False
+
+
+def test_material_cross_market_divergence_cannot_help_qualify():
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            native_flow_bias="BULLISH",
+            cross_market_status="MATERIAL_DIVERGENCE",
+            execution_validation=SimpleNamespace(
+                status="VALID", book_coverage_status="COMPLETE"
+            ),
+        )
+    )
+    market = report.check("cross_market_confirmation")
+    assert market.contradicts_signal is True
+    assert market.counts_toward_qualification is False
+    assert market.source == "CROSS_MARKET"
+
+
+def test_invalid_or_insufficient_execution_cannot_help_qualify():
+    invalid = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            native_flow_bias="BULLISH",
+            cross_market_status="CONFIRMED",
+            execution_validation=SimpleNamespace(
+                status="INVALID", book_coverage_status="UNAVAILABLE"
+            ),
+        )
+    )
+    assert invalid.check("depth_and_slippage_estimate").counts_toward_qualification is False
+    assert invalid.check("depth_and_slippage_estimate").contradicts_signal is True
+
+    insufficient = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            native_flow_bias="BULLISH",
+            cross_market_status="CONFIRMED",
+            execution_validation=SimpleNamespace(
+                status="VALID", book_coverage_status="INSUFFICIENT"
+            ),
+        )
+    )
+    assert insufficient.check("depth_and_slippage_estimate").counts_toward_qualification is False
+    assert insufficient.check("depth_and_slippage_estimate").contradicts_signal is True
+
+
+def test_low_relative_strength_and_negative_rank_velocity_cannot_help_qualify():
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            relative_strength_percentile=5.0,
+            rank_velocity=-3.0,
+            volatility_regime=40.0,
+        )
+    )
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+    assert report.check("relative_strength_percentile").counts_toward_qualification is False
+    assert report.check("rank_velocity").counts_toward_qualification is False
+    assert report.check("volatility_regime").counts_toward_qualification is False
+
+
+def test_prior_observation_and_atr_are_not_independent_confirmation():
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            prior_observation_count=8,
+            persistence_scans=4,
+            signal_quality_history_continuous=True,
+            volatility_regime=88.0,
+        )
+    )
+    assert report.check("prior_observation_available").counts_toward_qualification is False
+    assert report.check("signal_quality_history_continuity").counts_toward_qualification is False
+    assert report.check("volatility_regime").counts_toward_qualification is False
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def test_availability_without_verdict_is_not_qualified():
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            cross_venue_available=True,
+            depth_slippage_available=True,
+        )
+    )
+    assert report.check("native_flow_evidence").counts_toward_qualification is False
+    assert report.check("cross_venue_reference").counts_toward_qualification is False
+    assert report.check("depth_and_slippage_estimate").counts_toward_qualification is False
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def _phase_signal(phase: MarketPhase, *, disposition=OperatorDisposition.DEEP_REVIEW):
+    return SimpleNamespace(
+        symbol="RAYUSD",
+        stage="READY",
+        reference_price=1.0,
+        detection_timeframe="1H",
+        momentum_1h_pct=3.0,
+        momentum_6h_pct=5.0,
+        momentum_24h_pct=8.0,
+        momentum_state="ACCELERATING",
+        continuation_confidence=80,
+        continuation_confidence_is_probability=False,
+        entry_quality=70,
+        entry_recommendation="BREAKOUT_ENTRY_POSSIBLE",
+        relative_volume=3.0,
+        distance_to_24h_high_pct=1.0,
+        liquidity_24h_usd_approx=1_000_000.0,
+        extended_move=phase in {MarketPhase.LATE_EXTENSION, MarketPhase.EXHAUSTION_RISK},
+        reasons=("momentum",),
+        warnings=(),
+        market_phase=phase.value,
+        evidence_grade=EvidenceGrade.QUALIFIED.value,
+        operator_disposition=(
+            OperatorDisposition.DO_NOT_CHASE.value
+            if phase in {MarketPhase.LATE_EXTENSION, MarketPhase.EXHAUSTION_RISK}
+            else disposition.value
+        ),
+        actionability_reasons=(),
+    )
+
+
+@pytest.mark.parametrize("phase", list(MarketPhase))
+def test_send_formatter_never_leaks_ready_or_false_early(phase: MarketPhase):
+    from app.opip.early.operator_semantics import misleading_early_language
+    from app.services.movement_discovery_v2 import format_early_mover_message
+
+    signal = _phase_signal(phase)
+    message = format_early_mover_message(signal)
+    assessment = build_operator_assessment(
+        symbol=signal.symbol,
+        phase=phase,
+        grade=EvidenceGrade.QUALIFIED,
+        disposition=signal.operator_disposition,
+    )
+    assert " — READY" not in message
+    assert signal.stage not in message
+    assert misleading_early_language(message, assessment) == ()
+    if is_early_phase(phase) and assessment.disposition not in {
+        OperatorDisposition.DO_NOT_CHASE,
+        OperatorDisposition.NO_ACTION,
+    }:
+        assert "EARLY WATCH" in message
+    else:
+        assert "EARLY WATCH" not in message
+        assert "MARKET WATCH" in message
+        assert "Early movement conditions detected" not in message
+
+
+def test_late_extension_telegram_path_has_neither_early_nor_ready():
+    from app.services.movement_discovery_v2 import format_early_mover_message
+
+    message = format_early_mover_message(_phase_signal(MarketPhase.LATE_EXTENSION))
+    assert "EARLY WATCH" not in message
+    assert " — READY" not in message
+    assert "Market: LATE_EXTENSION" in message
+    assert "Disposition: DO NOT CHASE" in message
+
+
+def test_promoted_selector_has_one_authoritative_outcome_per_instrument(monkeypatch):
+    from app.opip.early.replay import (
+        authoritative_outcomes_by_instrument,
+        verify_forensic_replay_matches_production,
+    )
+
+    ranked = [_mover(base=f"E{i}", lift=18.0, distance=0.3, score=90.0 - i) for i in range(45)]
+    ranked.append(_mover(base="IGN1", lift=2.4, distance=1.5, score=1.0))
+    history = {
+        "IGN1USD": [
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=20)).isoformat(),
+                "last_price": 1.0,
+                "volume_24h": 1_000.0,
+                "lift_from_24h_low_pct": 1.0,
+                "distance_from_24h_high_pct": 3.0,
+            },
+            {
+                "observed_at": DECISION_AT.isoformat(),
+                "last_price": 1.04,
+                "volume_24h": 2_000.0,
+                "lift_from_24h_low_pct": 2.4,
+                "distance_from_24h_high_pct": 1.5,
+            },
+        ]
+    }
+    qualifying = _qualifying_snapshot(symbol="IGN1USD")
+    captured: list[dict] = []
+
+    def fake_discover(*args, **kwargs):
+        on_ranked = kwargs.get("on_ranked")
+        if on_ranked is not None:
+            on_ranked(list(ranked))
+        return ranked[:40]
+
+    def fake_analyze(symbol, *args, **kwargs):
+        if str(symbol).startswith("IGN1"):
+            return "ok", qualifying, None
+        return "skip", None, "not ignition"
+
+    monkeypatch.setattr(discovery, "discover_coarse_movers", fake_discover)
+    monkeypatch.setattr(discovery, "analyze_symbol", fake_analyze)
+    monkeypatch.setattr(discovery, "_enrich_bounded_candidate_evidence", lambda *a, **k: None)
+
+    discovery.scan_early_movers(
+        max_candidates=40,
+        on_coarse_evaluated=captured.append,
+        on_evaluated=captured.append,
+        selector_promoted=True,
+        validation_parity_enabled=True,
+        prior_observation_counts={"IGN1": 4},
+        persistence_scans={"IGN1": 3},
+        observation_history=history,
+        scan_id="promoted-scan",
+    )
+
+    ignition_rows = [row for row in captured if str(row.get("raw_identifier", "")).startswith("IGN1")]
+    outcomes = [row["outcome"] for row in ignition_rows]
+    assert "COARSE_RANK_LIMIT" not in outcomes
+    assert outcomes == ["ADVANCED"]
+    assert ignition_rows[0]["metadata"]["authoritative"] is True
+    assert ignition_rows[0]["metadata"]["selector_comparison"]["legacy_selector"]["selected"] is False
+    assert ignition_rows[0]["metadata"]["selector_comparison"]["promoted_selector"]["selected"] is True
+
+    rejected = [
+        row
+        for row in captured
+        if row.get("outcome") == "COARSE_RANK_LIMIT"
+        and row.get("metadata", {}).get("selector_comparison", {}).get("legacy_selector", {}).get("selected")
+    ]
+    assert rejected
+    assert all(row["metadata"]["authoritative"] is True for row in rejected)
+    assert all(
+        row["metadata"]["selector_comparison"]["promoted_selector"]["selected"] is False
+        for row in rejected
+    )
+
+    mapped = authoritative_outcomes_by_instrument(
+        [
+            {
+                "venue_instrument_id": f"KRAKEN:{row['raw_identifier']}",
+                "outcome": row["outcome"],
+                "scan_id": "promoted-scan",
+                "metadata": row.get("metadata"),
+            }
+            for row in captured
+        ]
+    )
+    assert mapped["KRAKEN:IGN1USD"] == "ADVANCED"
+    assert len(mapped) == len(set(mapped))
+    verification = verify_forensic_replay_matches_production(
+        replayed=mapped,
+        production=mapped,
+    )
+    assert verification["exact_match"] is True

@@ -73,6 +73,20 @@ class ValidationResult(str, Enum):
     NOT_EVALUATED = "NOT_EVALUATED"
 
 
+class EvidenceStance(str, Enum):
+    """Directional stance of one evidence family toward LONG continuation.
+
+    Availability is not confirmation. A family may be present and still be
+    neutral or adverse. Only :attr:`SUPPORTIVE` may corroborate ``QUALIFIED``.
+    """
+
+    SUPPORTIVE = "SUPPORTIVE"
+    NEUTRAL = "NEUTRAL"
+    ADVERSE = "ADVERSE"
+    UNAVAILABLE = "UNAVAILABLE"
+    NOT_EVALUATED = "NOT_EVALUATED"
+
+
 class ValidationClass(str, Enum):
     """How a validation result participates in promotion.
 

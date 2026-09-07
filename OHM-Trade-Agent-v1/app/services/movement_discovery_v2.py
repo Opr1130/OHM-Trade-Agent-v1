@@ -18,11 +18,14 @@ from app.opip.early.shadow_observer import (
 )
 from app.opip.early.cohort_selector import select_early_candidates
 from app.opip.early.stage0_evidence import (
+    SELECTOR_PRODUCTION_COARSE,
+    SELECTOR_PROMOTED_COHORT,
     ScoreComponents,
     Stage0DecisionFeatures,
     build_advanced_metadata,
     build_below_threshold_metadata,
     build_rank_limit_metadata,
+    build_selector_comparison_metadata,
     rank_contexts_for_truncation,
 )
 from app.opip.early.taxonomy import (
@@ -137,6 +140,7 @@ class CoarseMover:
     # previously no-opped because no universe context reached analyze_symbol.
     ticker_bid: float = 0.0
     ticker_ask: float = 0.0
+    secondary_pair: str | None = None
 
 
 @dataclass(frozen=True)
@@ -280,6 +284,7 @@ def discover_coarse_movers(
     scan_id: str | None = None,
     decision_at: datetime | None = None,
     on_ranked: Callable[[list[CoarseMover]], None] | None = None,
+    emit_rank_limit: bool = True,
 ) -> list[CoarseMover]:
     """Cheap, permissive full-universe discovery. Never authorizes a trade."""
     client = client or KrakenClient()
@@ -327,6 +332,7 @@ def discover_coarse_movers(
             continue
 
     by_asset: dict[str, tuple[str, str, str, str, str, dict[str, float]]] = {}
+    secondary_by_asset: dict[str, str] = {}
     for pair_id, altname, display_pair, base, quote in markets:
         ticker = _ticker_for_market(tickers, pair_id, altname, display_pair)
         if ticker is None:
@@ -344,6 +350,8 @@ def discover_coarse_movers(
         current = by_asset.get(base)
         if current is None or (current[4] != "USD" and quote == "USD"):
             if current is not None:
+                if current[4] == "USDT":
+                    secondary_by_asset[base] = current[2]
                 _emit_screening_fail_soft(
                     on_evaluated,
                     {
@@ -356,6 +364,8 @@ def discover_coarse_movers(
                 )
             by_asset[base] = (pair_id, altname, display_pair, base, quote, ticker)
         else:
+            if quote == "USDT":
+                secondary_by_asset[base] = display_pair
             _emit_screening_fail_soft(
                 on_evaluated,
                 {
@@ -480,7 +490,8 @@ def discover_coarse_movers(
             continue
         movers.append(CoarseMover(base, display_pair, f"{base}/{quote}", last, volume, notional,
                                   high, low, lift, distance, round(coarse_score, 4), universe_count,
-                                  ticker_bid=bid, ticker_ask=ask))
+                                  ticker_bid=bid, ticker_ask=ask,
+                                  secondary_pair=secondary_by_asset.get(base)))
 
     movers.sort(key=lambda item: (-item.coarse_score, -item.lift_from_24h_low_pct,
                                   -item.notional_24h_usd_approx, item.base_asset))
@@ -494,6 +505,8 @@ def discover_coarse_movers(
         universe_count=universe_count,
     )
     for mover in movers[max_candidates:]:
+        if not emit_rank_limit:
+            continue
         rank_context = rank_contexts.get(mover.primary_pair)
         _emit_screening_fail_soft(
             on_evaluated,
@@ -547,7 +560,7 @@ def _optional_adjustment(flow: FlowEvidence | None, whale: WhaleEvidence | None,
         status = "UNAVAILABLE"
         if evidence is not None and evidence.available:
             status = evidence.bias
-            strength = max(0, int(evidence.strength))
+            strength = max(0, int(getattr(evidence, "strength", 0) or 0))
             if evidence.bias == "BULLISH":
                 adjustment += min(positive_cap, strength)
                 reasons.append(f"{label} evidence is supportive ({strength}/10)")
@@ -692,6 +705,18 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         bandwidth_percentile=getattr(snapshot, "bollinger_bandwidth_percentile", None),
         atr_percentile=getattr(snapshot, "atr_percentile", None),
     )
+    flow_for_validation = flow_evidence
+    native_available = (
+        native_flow_available
+        if native_flow_available is not None
+        else (flow_for_validation.available if flow_for_validation is not None else _native_flow_available_from_snapshot(snapshot))
+    )
+    native_bias = None
+    if flow_for_validation is not None and flow_for_validation.available:
+        native_bias = flow_for_validation.bias
+    elif getattr(snapshot, "native_flow_evidence", None) is not None:
+        native_bias = getattr(snapshot.native_flow_evidence, "bias", None)
+        native_available = bool(getattr(snapshot.native_flow_evidence, "available", native_available))
     validation = evaluate_early_watch_validations(
         market_data_validation=getattr(snapshot, "market_data_validation", None),
         symbol_identity_resolved=_resolve_symbol_identity(
@@ -715,27 +740,26 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         ticker_bid=coarse.ticker_bid or None,
         ticker_ask=coarse.ticker_ask or None,
         spread_pct=_spread_pct_from_snapshot(snapshot, coarse),
-        # Every value above cleared this function's own math.isfinite guard.
         finite_features=True,
         duplicate_state_detected=duplicate_state_detected,
         persistence_scans=persistence_scans,
         prior_observation_count=prior_observation_count,
-        native_flow_available=(
-            native_flow_available
-            if native_flow_available is not None
-            else _native_flow_available_from_snapshot(snapshot)
-        ),
+        native_flow_available=native_available,
+        native_flow_bias=native_bias,
+        cross_market_status=getattr(snapshot, "cross_pair_confirmation_status", None),
+        cross_venue_status=_cross_venue_status_from_snapshot(snapshot),
         cross_venue_available=(
             cross_venue_available
             if cross_venue_available is not None
-            else _cross_venue_available_from_snapshot(snapshot)
+            else _independent_venue_present(snapshot)
         ),
+        execution_validation=getattr(snapshot, "execution_validation", None),
         depth_slippage_available=(
             depth_slippage_available
             if depth_slippage_available is not None
             else _depth_slippage_available_from_snapshot(snapshot)
         ),
-        relative_strength_percentile=None,
+        relative_strength_percentile=getattr(snapshot, "relative_strength_percentile", None),
         volatility_regime=getattr(snapshot, "atr_percentile", None),
         social_available=social_evidence.available if social_evidence is not None else None,
         whale_available=whale_evidence.available if whale_evidence is not None else None,
@@ -843,22 +867,32 @@ def _spread_pct_from_snapshot(snapshot: MarketSnapshot, coarse: CoarseMover) -> 
 
 
 def _native_flow_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+    evidence = getattr(snapshot, "native_flow_evidence", None)
+    if evidence is not None:
+        return bool(getattr(evidence, "available", True))
     metrics = getattr(snapshot, "native_flow_metrics", None)
     if metrics is None:
         return None
     return bool(getattr(metrics, "available", True))
 
 
-def _cross_venue_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+def _independent_venue_present(snapshot: MarketSnapshot) -> bool | None:
     reference = getattr(snapshot, "independent_market_reference", None)
     if reference is None:
-        # Cross-pair confirmation on the same venue is weaker than an
-        # independent venue, but it is real corroborating evidence when present.
-        status = str(getattr(snapshot, "cross_pair_price_status", "") or "").upper()
-        if status in {"NORMAL", "WARNING", "MATERIAL_DIVERGENCE"}:
-            return True
         return None
     return True
+
+
+def _cross_venue_status_from_snapshot(snapshot: MarketSnapshot) -> str | None:
+    reference = getattr(snapshot, "independent_market_reference", None)
+    if reference is None:
+        return None
+    return getattr(reference, "status", None)
+
+
+def _cross_venue_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+    """Independent venue only. Same-venue USD/USDT is CROSS_MARKET, not this."""
+    return _independent_venue_present(snapshot)
 
 
 def _depth_slippage_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
@@ -882,9 +916,13 @@ def universe_context_for(mover: CoarseMover) -> UniverseAsset:
     quote = str(mover.kraken_public_symbol).rsplit("/", 1)[-1].upper() or "USD"
     usd_notional = mover.notional_24h_usd_approx if quote == "USD" else 0.0
     usdt_notional = mover.notional_24h_usd_approx if quote != "USD" else 0.0
+    secondary = getattr(mover, "secondary_pair", None)
     return UniverseAsset(
         base_asset=mover.base_asset,
         primary_pair=mover.primary_pair,
+        secondary_pair=secondary,
+        usd_pair=mover.primary_pair if quote == "USD" else None,
+        usdt_pair=secondary if quote == "USD" else mover.primary_pair,
         primary_quote_currency=quote,
         usd_24h_notional_usd=usd_notional,
         usdt_24h_notional_usd_equivalent=usdt_notional,
@@ -972,10 +1010,13 @@ def scan_early_movers(
         scan_id=scan_id,
         decision_at=decision_at,
         on_ranked=ranked.extend,
+        emit_rank_limit=not promoted,
     )
     # Authoritative reserved-cohort selection. Dark by default: when the flag
     # is false the legacy top-N list is byte-identical. evaluate_promotion is
     # never consulted here; a human still has to flip the flag.
+    legacy_selected_ids = {item.primary_pair for item in coarse}
+    selector_meta_by_pair: dict[str, dict[str, Any]] = {}
     if promoted and ranked:
         history = (
             observation_history
@@ -987,6 +1028,65 @@ def scan_early_movers(
             max_candidates=max_candidates,
             history=history,
         )
+        promoted_ids = {item.primary_pair for item in coarse}
+        legacy_top = ranked[:max_candidates]
+        legacy_selected_ids = {item.primary_pair for item in legacy_top}
+        rank_contexts = rank_contexts_for_truncation(
+            ranked_scores=[(item.primary_pair, item.coarse_score) for item in ranked],
+            selected_count=len(legacy_top),
+            universe_count=ranked[0].universe_count if ranked else 0,
+        )
+        for mover in ranked:
+            comparison = build_selector_comparison_metadata(
+                legacy_selected=mover.primary_pair in legacy_selected_ids,
+                promoted_selected=mover.primary_pair in promoted_ids,
+                legacy_rank=(
+                    rank_contexts[mover.primary_pair].as_dict()
+                    if mover.primary_pair in rank_contexts
+                    else None
+                ),
+                authoritative_selector=SELECTOR_PROMOTED_COHORT,
+            )
+            selector_meta_by_pair[mover.primary_pair] = comparison
+            if mover.primary_pair in promoted_ids:
+                continue
+            features = Stage0DecisionFeatures(
+                lift_from_24h_low_pct=mover.lift_from_24h_low_pct,
+                distance_from_24h_high_pct=mover.distance_from_24h_high_pct,
+                notional_usd=mover.notional_24h_usd_approx,
+                last_price=mover.last_price,
+                volume_24h=mover.volume_24h,
+                decision_at=decision_at,
+            )
+            rank_context = rank_contexts.get(mover.primary_pair)
+            if rank_context is not None:
+                metadata = build_rank_limit_metadata(
+                    rank_context=rank_context,
+                    features=features,
+                    base_metadata={"universe_count": mover.universe_count},
+                    selector=SELECTOR_PROMOTED_COHORT,
+                )
+            else:
+                metadata = {
+                    "universe_count": mover.universe_count,
+                    "selector": SELECTOR_PROMOTED_COHORT,
+                    "measurement_only": True,
+                    "trade_authority_changed": False,
+                    "production_selection_changed": True,
+                    "decision_features": features.as_dict(),
+                }
+            metadata.update(comparison)
+            _emit_screening_fail_soft(
+                on_coarse_evaluated,
+                {
+                    "raw_identifier": mover.primary_pair,
+                    "outcome": "COARSE_RANK_LIMIT",
+                    "long_score": mover.coarse_score,
+                    "reason": "authoritative reserved-cohort selector did not admit this candidate",
+                    "metadata": metadata,
+                },
+                scan_id=scan_id,
+            )
     signals: list[EarlyMoverSignal] = []
     # A base asset quoted in both USD and USDT yields two coarse movers, so
     # duplicate candidate state is structurally possible. Detecting it here is
@@ -1028,6 +1128,12 @@ def scan_early_movers(
             prior_observation_count=priors.get(mover.base_asset.upper()),
             decision_at=decision_at,
         )
+        selector_extra = selector_meta_by_pair.get(mover.primary_pair, {})
+        deep_selector = SELECTOR_PROMOTED_COHORT if promoted else SELECTOR_PRODUCTION_COARSE
+        def _meta_base() -> dict[str, Any]:
+            payload = {"universe_count": mover.universe_count}
+            payload.update(selector_extra)
+            return payload
         if status != "ok" or snapshot is None:
             _emit_screening_fail_soft(
                 on_evaluated,
@@ -1039,7 +1145,8 @@ def scan_early_movers(
                         universe_count=mover.universe_count,
                         features=features,
                         score=ScoreComponents(blocking_reason=f"deep_analysis_{status}"),
-                        base_metadata={"universe_count": mover.universe_count},
+                        base_metadata=_meta_base(),
+                        selector=deep_selector,
                     ),
                 },
                 scan_id=scan_id,
@@ -1048,6 +1155,7 @@ def scan_early_movers(
         result = evaluate_early_mover(
             snapshot,
             mover,
+            flow_evidence=getattr(snapshot, "native_flow_evidence", None),
             prior_observation_count=priors.get(mover.base_asset.upper()),
             persistence_scans=persistence.get(mover.base_asset.upper()),
             duplicate_state_detected=duplicate_state,
@@ -1065,7 +1173,8 @@ def scan_early_movers(
                         universe_count=mover.universe_count,
                         features=features,
                         score=result.as_score_components(),
-                        base_metadata={"universe_count": mover.universe_count},
+                        base_metadata=_meta_base(),
+                        selector=deep_selector,
                     ),
                 },
                 scan_id=scan_id,
@@ -1085,7 +1194,8 @@ def scan_early_movers(
                             required_score=MIN_DEEP_DISCOVERY_SCORE,
                             blocking_reason="deep_discovery_inputs_malformed",
                         ),
-                        base_metadata={"universe_count": mover.universe_count},
+                        base_metadata=_meta_base(),
+                        selector=deep_selector,
                     ),
                 },
                 scan_id=scan_id,
@@ -1129,7 +1239,8 @@ def scan_early_movers(
                         momentum_24h_pct=signal.momentum_24h_pct,
                         distance_to_24h_high_pct=signal.distance_to_24h_high_pct,
                     ),
-                    base_metadata={"universe_count": mover.universe_count},
+                    base_metadata=_meta_base(),
+                    selector=deep_selector,
                 ),
             },
             scan_id=scan_id,
@@ -1157,36 +1268,74 @@ def _enrich_bounded_candidate_evidence(
     *,
     client: KrakenClient | None,
 ) -> None:
-    """Attach execution/depth evidence for one deep candidate when missing.
+    """Attach execution, native-flow and cross-market evidence for one deep candidate.
 
-    Full-universe observation stays cheap. Expensive PreTrade book reads run
-    only on the already-bounded deep set, fail soft, and never invent a pass.
+    Full-universe observation stays cheap. Expensive PreTrade/PostTrade and
+    secondary-pair OHLC run only on the already-bounded deep set, fail soft,
+    and never invent a supportive pass.
     """
-    if getattr(snapshot, "execution_validation", None) is not None:
-        return
-    try:
-        from app.scanner.execution_validation import evaluate_execution, unavailable_execution
-    except Exception:
-        return
     symbol = mover.kraken_public_symbol or mover.primary_pair
+    book = None
+    trades = None
     try:
         active = client or KrakenClient()
-        book = active.get_pre_trade(symbol)
+    except Exception:
+        active = None
+    if getattr(snapshot, "execution_validation", None) is None:
         try:
-            trades = active.get_post_trade(symbol, count=50)
+            from app.scanner.execution_validation import evaluate_execution, unavailable_execution
         except Exception:
-            trades = None
-        snapshot.execution_validation = evaluate_execution(
-            book=book,
-            validation_notional_usd=max(100.0, min(2_500.0, mover.notional_24h_usd_approx * 0.001)),
-            ticker_last=mover.last_price,
-            quote_to_usd_rate=1.0,
-            trades=trades,
-        )
-    except Exception as exc:
-        snapshot.execution_validation = unavailable_execution(
-            f"PreTrade unavailable: {type(exc).__name__}"
-        )
+            evaluate_execution = None
+            unavailable_execution = None
+        if evaluate_execution is not None and active is not None:
+            try:
+                book = active.get_pre_trade(symbol)
+                try:
+                    trades = active.get_post_trade(symbol, count=50)
+                except Exception:
+                    trades = None
+                snapshot.execution_validation = evaluate_execution(
+                    book=book,
+                    validation_notional_usd=max(100.0, min(2_500.0, mover.notional_24h_usd_approx * 0.001)),
+                    ticker_last=mover.last_price,
+                    quote_to_usd_rate=1.0,
+                    trades=trades,
+                )
+            except Exception as exc:
+                if unavailable_execution is not None:
+                    snapshot.execution_validation = unavailable_execution(
+                        f"PreTrade unavailable: {type(exc).__name__}"
+                    )
+    if getattr(snapshot, "native_flow_evidence", None) is None and active is not None:
+        try:
+            from app.services.native_flow_evidence import evaluate_native_flow_shadow
+
+            flow = evaluate_native_flow_shadow(
+                symbol, client=active, book=book, trades=trades
+            )
+            snapshot.native_flow_evidence = flow.evidence
+        except Exception:
+            snapshot.native_flow_evidence = FlowEvidence(available=False, bias="NEUTRAL")
+    secondary = getattr(mover, "secondary_pair", None) or getattr(snapshot, "secondary_pair", None)
+    try:
+        from app.scanner.cross_pair_confirmation import evaluate_cross_pair_confirmation
+
+        secondary_snapshot = None
+        if secondary:
+            snapshot.secondary_pair = secondary
+            try:
+                status, secondary_snapshot, _ = analyze_symbol(secondary)
+                if status != "ok":
+                    secondary_snapshot = None
+            except Exception:
+                secondary_snapshot = None
+        result = evaluate_cross_pair_confirmation(snapshot, secondary_snapshot)
+        snapshot.cross_pair_confirmation_status = result.status
+        snapshot.cross_pair_strengths = result.strengths
+        snapshot.cross_pair_warnings = result.warnings
+    except Exception:
+        if not getattr(snapshot, "cross_pair_confirmation_status", None):
+            snapshot.cross_pair_confirmation_status = "UNAVAILABLE"
 
 
 def append_detection_snapshots(signals: list[EarlyMoverSignal], *, path: str = DEFAULT_LEARNING_PATH) -> int:
@@ -1204,24 +1353,9 @@ def append_detection_snapshots(signals: list[EarlyMoverSignal], *, path: str = D
 
 
 def format_early_mover_message(signal: EarlyMoverSignal) -> str:
-    warning = "; ".join(str(item) for item in signal.warnings[:2])
-    reason = "; ".join(str(item) for item in signal.reasons[:3]) or "Early movement conditions detected"
-    caution = f" | Caution: {warning}" if warning else ""
-    from app.opip.early.taxonomy import is_early_phase
+    from app.opip.early.operator_semantics import format_operator_watch_message
 
-    early = is_early_phase(signal.market_phase or "")
-    headline = "EARLY WATCH" if early else "MARKET WATCH"
-    action_label = "EARLY WATCH ONLY" if early else "WATCH ONLY"
-    return (
-        f"🚀 {headline} — {display_market_label(signal.symbol)} — {signal.stage}\n"
-        f"Price: {signal.reference_price:.8g} | TF: {signal.detection_timeframe}\n"
-        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | 24h {signal.momentum_24h_pct:+.2f}%\n"
-        f"Continuation*: {signal.continuation_confidence}/100 | Entry quality*: {signal.entry_quality}/100\n"
-        f"Volume: {signal.relative_volume:.2f}x | Liquidity: ${signal.liquidity_24h_usd_approx:,.0f}/24h\n"
-        f"Why now: {reason}{caution}\n"
-        f"Action: {signal.entry_recommendation.replace('_', ' ')} — {action_label}; no entry is authorized\n"
-        "*Heuristic scores, not probabilities."
-    )
+    return format_operator_watch_message(signal, style="telegram")
 
 
 def send_early_mover_update(signal: EarlyMoverSignal, *, bot_token: str, chat_id: str, cooldown_seconds: int = 1800) -> bool:

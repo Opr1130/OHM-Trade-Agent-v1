@@ -28,6 +28,7 @@ from typing import Any, Mapping, Sequence
 
 from app.opip.early.taxonomy import (
     EvidenceGrade,
+    EvidenceStance,
     ValidationClass,
     ValidationResult,
 )
@@ -60,6 +61,7 @@ CHECK_STATE_CONSISTENCY = "duplicate_state_consistency"
 
 # Soft / retry check names.
 CHECK_NATIVE_FLOW = "native_flow_evidence"
+CHECK_CROSS_MARKET = "cross_market_confirmation"
 CHECK_CROSS_VENUE = "cross_venue_reference"
 CHECK_DEPTH_SLIPPAGE = "depth_and_slippage_estimate"
 CHECK_PRIOR_OBSERVATION = "prior_observation_available"
@@ -104,7 +106,12 @@ def _finite_optional(value: Any) -> float | None:
 
 @dataclass(frozen=True)
 class ValidationCheck:
-    """One named validation with an explicit four-state result."""
+    """One named validation with an explicit four-state result.
+
+    Availability is recorded separately from the directional stance.
+    ``PASS`` on a corroborating family requires genuinely supportive
+    evidence, never mere presence of a data object.
+    """
 
     name: str
     result: ValidationResult
@@ -112,6 +119,13 @@ class ValidationCheck:
     detail: str = ""
     observed_value: float | None = None
     threshold: float | None = None
+    available: bool | None = None
+    executed: bool = False
+    stance: EvidenceStance = EvidenceStance.NOT_EVALUATED
+    supports_long_continuation: bool = False
+    contradicts_signal: bool = False
+    source: str | None = None
+    counts_toward_qualification: bool = False
 
     @property
     def blocks_qualification(self) -> bool:
@@ -134,6 +148,13 @@ class ValidationCheck:
             "observed_value": _finite_optional(self.observed_value),
             "threshold": _finite_optional(self.threshold),
             "blocks_qualification": self.blocks_qualification,
+            "available": self.available,
+            "executed": bool(self.executed),
+            "stance": self.stance.value,
+            "supports_long_continuation": bool(self.supports_long_continuation),
+            "contradicts_signal": bool(self.contradicts_signal),
+            "source": self.source,
+            "counts_toward_qualification": bool(self.counts_toward_qualification),
         }
 
 
@@ -171,6 +192,33 @@ class EarlyWatchValidationReport:
         found = self.check(name)
         return found.result if found is not None else ValidationResult.NOT_EVALUATED
 
+    def family_disposition(self, name: str) -> dict[str, Any]:
+        """Executed / supportive / adverse / unavailable for one family."""
+        found = self.check(name)
+        if found is None:
+            return {
+                "name": name,
+                "executed": False,
+                "supportive": False,
+                "adverse": False,
+                "unavailable": True,
+                "result": ValidationResult.NOT_EVALUATED.value,
+                "stance": EvidenceStance.NOT_EVALUATED.value,
+                "counts_toward_qualification": False,
+            }
+        return {
+            "name": name,
+            "executed": bool(found.executed),
+            "supportive": bool(found.supports_long_continuation),
+            "adverse": bool(found.contradicts_signal),
+            "unavailable": found.result is ValidationResult.UNAVAILABLE
+            or found.stance is EvidenceStance.UNAVAILABLE,
+            "result": found.result.value,
+            "stance": found.stance.value,
+            "source": found.source,
+            "counts_toward_qualification": bool(found.counts_toward_qualification),
+        }
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
@@ -180,7 +228,24 @@ class EarlyWatchValidationReport:
             "soft_unavailable": list(self.soft_unavailable),
             "actionability_blocked": self.actionability_blocked,
             "actionability_reasons": list(self.actionability_reasons),
+            "corroborating_family_count": corroborating_family_count(self.checks),
+            "min_corroborating_families_for_qualified": MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED,
+            "corroborating_n_of_m_is_provisional": True,
             "checks": [check.as_dict() for check in self.checks],
+            "families": {
+                name: self.family_disposition(name)
+                for name in (
+                    CHECK_NATIVE_FLOW,
+                    CHECK_CROSS_MARKET,
+                    CHECK_CROSS_VENUE,
+                    CHECK_DEPTH_SLIPPAGE,
+                    CHECK_PRIOR_OBSERVATION,
+                    CHECK_SIGNAL_QUALITY_HISTORY,
+                    CHECK_RELATIVE_STRENGTH,
+                    CHECK_RANK_VELOCITY,
+                    CHECK_VOLATILITY_REGIME,
+                )
+            },
             "trade_authority_changed": False,
         }
 
@@ -381,12 +446,21 @@ def _optional_evidence_check(
     detail_available: str = "",
     detail_missing: str = "",
 ) -> ValidationCheck:
+    """Legacy availability helper. Does **not** treat presence as confirmation.
+
+    ``available=True`` without an explicit supportive verdict is observed /
+    neutral: recorded, never corroborating. Pass ``supportive=True`` only when
+    the underlying validator produced a bullish/confirming result.
+    """
     if available is None:
         return ValidationCheck(
             name,
             ValidationResult.NOT_EVALUATED,
             classification,
             detail_missing or f"{name} was not evaluated",
+            executed=False,
+            available=None,
+            stance=EvidenceStance.NOT_EVALUATED,
         )
     if not bool(available):
         return ValidationCheck(
@@ -394,19 +468,415 @@ def _optional_evidence_check(
             ValidationResult.UNAVAILABLE,
             classification,
             detail_missing or f"{name} is unavailable for this market",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
         )
     if supportive is None:
         return ValidationCheck(
             name,
+            ValidationResult.NOT_EVALUATED,
+            classification,
+            detail_available or f"{name} is available but has no supportive verdict",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.NEUTRAL,
+        )
+    if bool(supportive):
+        return ValidationCheck(
+            name,
             ValidationResult.PASS,
             classification,
-            detail_available or f"{name} is available",
+            detail_available or f"{name} is supportive",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.SUPPORTIVE,
+            supports_long_continuation=True,
+            counts_toward_qualification=name in CORROBORATING_FAMILY_CHECKS,
         )
     return ValidationCheck(
         name,
-        ValidationResult.PASS if bool(supportive) else ValidationResult.FAIL,
+        ValidationResult.FAIL,
         classification,
-        detail_available or f"{name} evaluated",
+        detail_available or f"{name} is adverse",
+        executed=True,
+        available=True,
+        stance=EvidenceStance.ADVERSE,
+        contradicts_signal=True,
+    )
+
+
+def _native_flow_check(
+    *,
+    available: Any = None,
+    bias: Any = None,
+) -> ValidationCheck:
+    """Kraken-native flow: availability is not a bullish confirmation."""
+    if available is None and bias is None:
+        return ValidationCheck(
+            CHECK_NATIVE_FLOW,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "native flow was not evaluated",
+            executed=False,
+            stance=EvidenceStance.NOT_EVALUATED,
+            source="KRAKEN_NATIVE_FLOW",
+        )
+    if available is False:
+        return ValidationCheck(
+            CHECK_NATIVE_FLOW,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.SOFT,
+            "Kraken-native flow evidence is unavailable for this observation",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+            source="KRAKEN_NATIVE_FLOW",
+        )
+    resolved = str(bias or "NEUTRAL").strip().upper()
+    if resolved == "BULLISH":
+        return ValidationCheck(
+            CHECK_NATIVE_FLOW,
+            ValidationResult.PASS,
+            ValidationClass.SOFT,
+            "native flow is bullish and supports LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.SUPPORTIVE,
+            supports_long_continuation=True,
+            source="KRAKEN_NATIVE_FLOW",
+            counts_toward_qualification=True,
+        )
+    if resolved == "BEARISH":
+        return ValidationCheck(
+            CHECK_NATIVE_FLOW,
+            ValidationResult.FAIL,
+            ValidationClass.SOFT,
+            "native flow is bearish and contradicts LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.ADVERSE,
+            contradicts_signal=True,
+            source="KRAKEN_NATIVE_FLOW",
+        )
+    return ValidationCheck(
+        CHECK_NATIVE_FLOW,
+        ValidationResult.NOT_EVALUATED,
+        ValidationClass.SOFT,
+        "native flow is available but neutral; not corroborating",
+        executed=True,
+        available=True,
+        stance=EvidenceStance.NEUTRAL,
+        source="KRAKEN_NATIVE_FLOW",
+    )
+
+
+_CROSS_MARKET_SUPPORTIVE = frozenset({"STRONG_CONFIRMATION", "CONFIRMED"})
+_CROSS_MARKET_ADVERSE = frozenset({"DIVERGENCE", "MATERIAL_DIVERGENCE"})
+_CROSS_MARKET_UNAVAILABLE = frozenset({"SINGLE_MARKET", "UNAVAILABLE"})
+
+
+def _cross_market_check(*, status: Any = None, available: Any = None) -> ValidationCheck:
+    """Same-venue USD/USDT confirmation. Never labelled cross-venue."""
+    if status is None and available is None:
+        return ValidationCheck(
+            CHECK_CROSS_MARKET,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "cross-market confirmation was not evaluated",
+            executed=False,
+            stance=EvidenceStance.NOT_EVALUATED,
+            source="CROSS_MARKET",
+        )
+    resolved = str(status or "").strip().upper()
+    if not resolved:
+        if available is False:
+            resolved = "UNAVAILABLE"
+        elif available is True:
+            # Presence without a confirmation status is observed, not confirmed.
+            return ValidationCheck(
+                CHECK_CROSS_MARKET,
+                ValidationResult.NOT_EVALUATED,
+                ValidationClass.SOFT,
+                "cross-market data is present but has no confirmation status",
+                executed=True,
+                available=True,
+                stance=EvidenceStance.NEUTRAL,
+                source="CROSS_MARKET",
+            )
+        else:
+            return ValidationCheck(
+                CHECK_CROSS_MARKET,
+                ValidationResult.NOT_EVALUATED,
+                ValidationClass.SOFT,
+                "cross-market confirmation was not evaluated",
+                executed=False,
+                stance=EvidenceStance.NOT_EVALUATED,
+                source="CROSS_MARKET",
+            )
+    if resolved in _CROSS_MARKET_SUPPORTIVE:
+        return ValidationCheck(
+            CHECK_CROSS_MARKET,
+            ValidationResult.PASS,
+            ValidationClass.SOFT,
+            f"cross-market status {resolved} supports LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.SUPPORTIVE,
+            supports_long_continuation=True,
+            source="CROSS_MARKET",
+            counts_toward_qualification=True,
+        )
+    if resolved in _CROSS_MARKET_ADVERSE:
+        return ValidationCheck(
+            CHECK_CROSS_MARKET,
+            ValidationResult.FAIL,
+            ValidationClass.SOFT,
+            f"cross-market status {resolved} contradicts LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.ADVERSE,
+            contradicts_signal=True,
+            source="CROSS_MARKET",
+        )
+    if resolved in _CROSS_MARKET_UNAVAILABLE:
+        return ValidationCheck(
+            CHECK_CROSS_MARKET,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.SOFT,
+            f"cross-market status {resolved}; not an independent venue",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+            source="CROSS_MARKET",
+        )
+    # MIXED and any other named status: observed, not corroborating.
+    return ValidationCheck(
+        CHECK_CROSS_MARKET,
+        ValidationResult.NOT_EVALUATED,
+        ValidationClass.SOFT,
+        f"cross-market status {resolved} is mixed/non-supportive",
+        executed=True,
+        available=True,
+        stance=EvidenceStance.NEUTRAL,
+        source="CROSS_MARKET",
+    )
+
+
+_CROSS_VENUE_SUPPORTIVE = frozenset({"CONFIRMED", "RESOLVED", "MATCH", "OK"})
+_CROSS_VENUE_ADVERSE = frozenset({"MATERIAL_DIVERGENCE", "DIVERGENCE", "FAIL", "REJECT"})
+
+
+def _cross_venue_check(*, status: Any = None, available: Any = None) -> ValidationCheck:
+    """Independent-venue reference only. Same-venue USD/USDT is CROSS_MARKET."""
+    if status is None and available is None:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "no independent cross-venue reference was evaluated",
+            executed=False,
+            stance=EvidenceStance.NOT_EVALUATED,
+            source="CROSS_VENUE",
+        )
+    if available is False and status is None:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.SOFT,
+            "no supported independent cross-venue reference feed for this asset",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+            source="CROSS_VENUE",
+        )
+    resolved = str(status or "").strip().upper()
+    if not resolved:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "cross-venue object is present but has no confirmation status",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.NEUTRAL,
+            source="CROSS_VENUE",
+        )
+    if resolved in _CROSS_VENUE_ADVERSE:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.FAIL,
+            ValidationClass.SOFT,
+            f"cross-venue status {resolved} contradicts LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.ADVERSE,
+            contradicts_signal=True,
+            source="CROSS_VENUE",
+        )
+    if resolved in _CROSS_VENUE_SUPPORTIVE:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.PASS,
+            ValidationClass.SOFT,
+            f"independent venue status {resolved} supports LONG continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.SUPPORTIVE,
+            supports_long_continuation=True,
+            source="CROSS_VENUE",
+            counts_toward_qualification=True,
+        )
+    if resolved in {"UNAVAILABLE", "STALE", "AMBIGUOUS"}:
+        return ValidationCheck(
+            CHECK_CROSS_VENUE,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.SOFT,
+            f"cross-venue status {resolved}",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+            source="CROSS_VENUE",
+        )
+    return ValidationCheck(
+        CHECK_CROSS_VENUE,
+        ValidationResult.NOT_EVALUATED,
+        ValidationClass.SOFT,
+        f"cross-venue status {resolved} is non-supportive",
+        executed=True,
+        available=True,
+        stance=EvidenceStance.NEUTRAL,
+        source="CROSS_VENUE",
+    )
+
+
+def _depth_slippage_check(
+    *,
+    execution: Any = None,
+    available: Any = None,
+) -> ValidationCheck:
+    """Reuse ExecutionValidation semantics. Object existence is not confirmation."""
+    if execution is None and available is None:
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "depth and slippage were not evaluated",
+            executed=False,
+            stance=EvidenceStance.NOT_EVALUATED,
+            source="EXECUTION_VALIDATION",
+        )
+    if execution is None:
+        if available is False:
+            return ValidationCheck(
+                CHECK_DEPTH_SLIPPAGE,
+                ValidationResult.UNAVAILABLE,
+                ValidationClass.SOFT,
+                "depth and slippage estimate unavailable",
+                executed=True,
+                available=False,
+                stance=EvidenceStance.UNAVAILABLE,
+                source="EXECUTION_VALIDATION",
+            )
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.NOT_EVALUATED,
+            ValidationClass.SOFT,
+            "execution object missing; availability alone is not confirmation",
+            executed=True,
+            available=bool(available),
+            stance=EvidenceStance.NEUTRAL,
+            source="EXECUTION_VALIDATION",
+        )
+    status = str(getattr(execution, "status", "") or "").upper()
+    coverage = str(getattr(execution, "book_coverage_status", "") or "").upper()
+    if status == "INVALID":
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.FAIL,
+            ValidationClass.SOFT,
+            "execution validation is INVALID",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.ADVERSE,
+            contradicts_signal=True,
+            source="EXECUTION_VALIDATION",
+        )
+    if status == "UNAVAILABLE" or coverage == "UNAVAILABLE":
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.SOFT,
+            "execution validation is unavailable",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+            source="EXECUTION_VALIDATION",
+        )
+    if status == "VALID" and coverage == "INSUFFICIENT":
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.FAIL,
+            ValidationClass.SOFT,
+            "visible book coverage is INSUFFICIENT; not corroborating",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.ADVERSE,
+            contradicts_signal=True,
+            source="EXECUTION_VALIDATION",
+        )
+    if status == "VALID" and coverage in {"COMPLETE", "PARTIAL"}:
+        return ValidationCheck(
+            CHECK_DEPTH_SLIPPAGE,
+            ValidationResult.PASS,
+            ValidationClass.SOFT,
+            f"execution VALID with {coverage} coverage supports continuation",
+            executed=True,
+            available=True,
+            stance=EvidenceStance.SUPPORTIVE,
+            supports_long_continuation=True,
+            source="EXECUTION_VALIDATION",
+            counts_toward_qualification=True,
+        )
+    return ValidationCheck(
+        CHECK_DEPTH_SLIPPAGE,
+        ValidationResult.NOT_EVALUATED,
+        ValidationClass.SOFT,
+        f"execution status {status or 'UNKNOWN'} is not a supportive verdict",
+        executed=True,
+        available=True,
+        stance=EvidenceStance.NEUTRAL,
+        source="EXECUTION_VALIDATION",
+    )
+
+
+def _context_only_numeric_check(
+    name: str,
+    value: Any,
+    *,
+    detail: str,
+) -> ValidationCheck:
+    """Record a finite number as context. Never automatic corroboration."""
+    parsed = _finite_optional(value)
+    if parsed is None:
+        return ValidationCheck(
+            name,
+            ValidationResult.UNAVAILABLE,
+            ValidationClass.CONFIDENCE,
+            f"{name} unavailable",
+            executed=True,
+            available=False,
+            stance=EvidenceStance.UNAVAILABLE,
+        )
+    return ValidationCheck(
+        name,
+        ValidationResult.NOT_EVALUATED,
+        ValidationClass.CONFIDENCE,
+        detail,
+        observed_value=parsed,
+        executed=True,
+        available=True,
+        stance=EvidenceStance.NEUTRAL,
     )
 
 
@@ -428,8 +898,12 @@ def evaluate_early_watch_validations(
     prior_observation_count: Any = None,
     duplicate_state_detected: Any = None,
     native_flow_available: Any = None,
+    native_flow_bias: Any = None,
     cross_venue_available: Any = None,
+    cross_venue_status: Any = None,
+    cross_market_status: Any = None,
     depth_slippage_available: Any = None,
+    execution_validation: Any = None,
     signal_quality_history_continuous: Any = None,
     relative_strength_percentile: Any = None,
     rank_velocity: Any = None,
@@ -586,30 +1060,20 @@ def evaluate_early_watch_validations(
             )
         )
 
-    # Soft / retryable evidence. Missing values never block promotion, but they
-    # never count as corroboration either.
+    # Soft / retryable evidence. Availability is never confirmation.
     checks.append(
-        _optional_evidence_check(
-            CHECK_NATIVE_FLOW,
-            ValidationClass.SOFT,
-            available=native_flow_available,
-            detail_missing="Kraken-native flow evidence is unavailable for this observation",
-        )
+        _native_flow_check(available=native_flow_available, bias=native_flow_bias)
     )
     checks.append(
-        _optional_evidence_check(
-            CHECK_CROSS_VENUE,
-            ValidationClass.SOFT,
-            available=cross_venue_available,
-            detail_missing="no supported cross-venue reference feed for this asset",
-        )
+        _cross_market_check(status=cross_market_status, available=None)
     )
     checks.append(
-        _optional_evidence_check(
-            CHECK_DEPTH_SLIPPAGE,
-            ValidationClass.SOFT,
+        _cross_venue_check(status=cross_venue_status, available=cross_venue_available)
+    )
+    checks.append(
+        _depth_slippage_check(
+            execution=execution_validation,
             available=depth_slippage_available,
-            detail_missing="depth and slippage estimate unavailable",
         )
     )
     prior = _finite_optional(prior_observation_count)
@@ -622,6 +1086,14 @@ def evaluate_early_watch_validations(
             if prior is not None and prior > 0
             else "no prior observation yet; delta features are unavailable on first sighting",
             observed_value=prior,
+            executed=True,
+            available=prior is not None and prior > 0,
+            stance=(
+                EvidenceStance.NEUTRAL
+                if prior is not None and prior > 0
+                else EvidenceStance.UNAVAILABLE
+            ),
+            source="FULL_MARKET_HISTORY",
         )
     )
     checks.append(
@@ -630,25 +1102,33 @@ def evaluate_early_watch_validations(
             ValidationClass.SOFT,
             available=signal_quality_history_continuous,
             detail_missing="Signal Quality history is not yet continuous for this asset",
+            detail_available="Signal Quality history is continuous (prerequisite, not directional confirmation)",
         )
     )
 
-    # Confidence-affecting evidence.
-    for name, value in (
-        (CHECK_RELATIVE_STRENGTH, relative_strength_percentile),
-        (CHECK_RANK_VELOCITY, rank_velocity),
-        (CHECK_VOLATILITY_REGIME, volatility_regime),
-    ):
-        parsed = _finite_optional(value)
-        checks.append(
-            ValidationCheck(
-                name,
-                ValidationResult.PASS if parsed is not None else ValidationResult.UNAVAILABLE,
-                ValidationClass.CONFIDENCE,
-                f"{name} observed" if parsed is not None else f"{name} unavailable",
-                observed_value=parsed,
-            )
+    # Confidence-affecting evidence. Finite values are context only: there is
+    # no proven supportive threshold in-repo that may corroborate QUALIFIED.
+    checks.append(
+        _context_only_numeric_check(
+            CHECK_RELATIVE_STRENGTH,
+            relative_strength_percentile,
+            detail="relative strength percentile recorded as context; no proven supportive threshold",
         )
+    )
+    checks.append(
+        _context_only_numeric_check(
+            CHECK_RANK_VELOCITY,
+            rank_velocity,
+            detail="rank velocity recorded as context; no proven supportive threshold",
+        )
+    )
+    checks.append(
+        _context_only_numeric_check(
+            CHECK_VOLATILITY_REGIME,
+            volatility_regime,
+            detail="ATR/volatility percentile recorded as context; not directional confirmation",
+        )
+    )
 
     # Advisory-only evidence. Cannot promote and cannot block.
     for name, available in (
@@ -661,6 +1141,7 @@ def evaluate_early_watch_validations(
                 name,
                 ValidationClass.ADVISORY,
                 available=available,
+                supportive=True if available else None,
                 detail_missing=f"{name} is unavailable and is advisory only",
                 detail_available=f"{name} is available and is advisory only",
             )
@@ -724,38 +1205,34 @@ def evaluate_early_watch_validations(
     )
 
 
-#: Independent soft/confidence evidence families required, on top of every
-#: mandatory check passing, before a candidate may reach QUALIFIED. Mirrors
-#: the ExplosionPrecursor N-of-M corroboration pattern (evidence >= 3): a
-#: perfect mandatory pass with every optional confirmation missing is not
-#: high-confidence qualification.
+#: Independent directional evidence families required, on top of every
+#: mandatory check passing, before a candidate may reach QUALIFIED.
+#:
+#: This N-of-M count is **provisional**. It reuses the ExplosionPrecursor
+#: pattern of requiring multiple independent clues rather than inventing a
+#: new score, but the specific count has not been cohort-calibrated and must
+#: not be treated as a production-promotion constant. Changing it based on a
+#: single RAY episode is forbidden.
 MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED = 2
 
-#: Soft and confidence checks that count as independent evidence families.
-#: Advisory evidence never participates.
+#: Soft families that may corroborate QUALIFIED, and only when their stance
+#: is genuinely SUPPORTIVE. Prior observation and history continuity are
+#: persistence prerequisites, not directional confirmation. Relative
+#: strength, rank velocity and volatility have no proven supportive
+#: threshold in-repo and are context-only.
 CORROBORATING_FAMILY_CHECKS = frozenset(
     {
         CHECK_NATIVE_FLOW,
+        CHECK_CROSS_MARKET,
         CHECK_CROSS_VENUE,
         CHECK_DEPTH_SLIPPAGE,
-        CHECK_PRIOR_OBSERVATION,
-        CHECK_SIGNAL_QUALITY_HISTORY,
-        CHECK_RELATIVE_STRENGTH,
-        CHECK_RANK_VELOCITY,
-        CHECK_VOLATILITY_REGIME,
     }
 )
 
 
 def corroborating_family_count(checks: Sequence[ValidationCheck]) -> int:
-    """Count independent soft/confidence families that actually passed."""
-    return sum(
-        1
-        for check in checks
-        if check.name in CORROBORATING_FAMILY_CHECKS
-        and check.result is ValidationResult.PASS
-        and check.classification in {ValidationClass.SOFT, ValidationClass.CONFIDENCE}
-    )
+    """Count independent families with genuinely supportive directional evidence."""
+    return sum(1 for check in checks if check.counts_toward_qualification)
 
 
 def resolve_evidence_grade(checks: Sequence[ValidationCheck]) -> EvidenceGrade:
@@ -767,9 +1244,10 @@ def resolve_evidence_grade(checks: Sequence[ValidationCheck]) -> EvidenceGrade:
     ``CORROBORATED`` and can never reach ``QUALIFIED``.
 
     ``QUALIFIED`` additionally requires
-    :data:`MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED` independent soft or
-    confidence families to pass. Mandatory integrity alone is not
-    high-confidence qualification.
+    :data:`MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED` independent families
+    with a genuinely SUPPORTIVE stance. The count is provisional and
+    requires cohort calibration before production promotion. Mandatory
+    integrity alone is not high-confidence qualification.
     """
     mandatory = [
         check for check in checks if check.classification is ValidationClass.MANDATORY
@@ -836,6 +1314,20 @@ def report_from_snapshot(
         else getattr(snapshot, "combined_24h_liquidity_usd", None)
     )
 
+    flow = getattr(snapshot, "native_flow_evidence", None) or getattr(
+        snapshot, "native_flow_metrics", None
+    )
+    flow_available = native_flow_available
+    flow_bias = None
+    if flow is not None:
+        if hasattr(flow, "available"):
+            flow_available = bool(getattr(flow, "available", False))
+        else:
+            flow_available = True if flow_available is None else flow_available
+        flow_bias = getattr(flow, "bias", None)
+    cross_pair_status = getattr(snapshot, "cross_pair_confirmation_status", None)
+    reference_status = getattr(reference, "status", None) if reference is not None else None
+
     kwargs: dict[str, Any] = {
         "market_data_validation": validation,
         "symbol_identity_resolved": symbol_identity_resolved,
@@ -858,10 +1350,13 @@ def report_from_snapshot(
         "finite_features": True,
         "persistence_scans": persistence_scans,
         "prior_observation_count": prior_observation_count,
-        "native_flow_available": native_flow_available,
-        "cross_venue_available": reference is not None,
-        "depth_slippage_available": execution is not None,
-        "relative_strength_percentile": None,
+        "native_flow_available": flow_available,
+        "native_flow_bias": flow_bias,
+        "cross_market_status": cross_pair_status,
+        "cross_venue_status": reference_status,
+        "cross_venue_available": None if reference is None else True,
+        "execution_validation": execution,
+        "relative_strength_percentile": getattr(snapshot, "relative_strength_percentile", None),
         "volatility_regime": getattr(snapshot, "atr_percentile", None),
         "extension_blocked": extension_blocked,
         "entry_geometry_available": entry_geometry_available,

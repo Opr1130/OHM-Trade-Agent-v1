@@ -29,6 +29,8 @@ STAGE0_EVIDENCE_SCHEMA_VERSION = 1
 
 #: Selector identity for the production coarse ranker.
 SELECTOR_PRODUCTION_COARSE = "PRODUCTION_COARSE_V2_1"
+#: Authoritative reserved-cohort selector. Dark unless the human flag is on.
+SELECTOR_PROMOTED_COHORT = "EARLY_RESERVED_COHORT_V1"
 
 #: Invariants asserted on every row this module emits.
 _MEASUREMENT_ONLY = {
@@ -190,11 +192,49 @@ def _envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_selector_comparison_metadata(
+    *,
+    legacy_selected: bool,
+    promoted_selected: bool,
+    legacy_rank: Mapping[str, Any] | None = None,
+    authoritative_selector: str,
+) -> dict[str, Any]:
+    """Measurement-only comparison of legacy rank vs promoted selection.
+
+    Never a second final screening outcome. Forensic replay reads
+    ``authoritative`` to pick exactly one Stage-0 decision per instrument.
+    """
+    legacy_outcome = "SELECTED" if legacy_selected else "COARSE_RANK_LIMIT"
+    promoted_outcome = "SELECTED" if promoted_selected else "REJECTED"
+    return {
+        "selector_comparison": {
+            "legacy_selector": {
+                "selector": SELECTOR_PRODUCTION_COARSE,
+                "selected": bool(legacy_selected),
+                "outcome": legacy_outcome,
+                "rank": dict(legacy_rank) if isinstance(legacy_rank, Mapping) else None,
+            },
+            "promoted_selector": {
+                "selector": SELECTOR_PROMOTED_COHORT,
+                "selected": bool(promoted_selected),
+                "outcome": promoted_outcome,
+            },
+            "authoritative_selector": str(authoritative_selector),
+        },
+        "authoritative": True,
+        "authoritative_selector": str(authoritative_selector),
+        "measurement_only": True,
+        "production_selection_changed": True,
+        "trade_authority_changed": False,
+    }
+
+
 def build_rank_limit_metadata(
     *,
     rank_context: CoarseRankContext,
     features: Stage0DecisionFeatures | None = None,
     base_metadata: Mapping[str, Any] | None = None,
+    selector: str = SELECTOR_PRODUCTION_COARSE,
 ) -> dict[str, Any]:
     """Metadata for a ``COARSE_RANK_LIMIT`` screening row.
 
@@ -204,6 +244,7 @@ def build_rank_limit_metadata(
     """
     payload: dict[str, Any] = dict(base_metadata or {})
     payload["universe_count"] = int(rank_context.universe_count)
+    payload["selector"] = selector
     payload["coarse_rank"] = rank_context.as_dict()
     payload["decision_features"] = (features or Stage0DecisionFeatures()).as_dict()
     return _envelope(payload)

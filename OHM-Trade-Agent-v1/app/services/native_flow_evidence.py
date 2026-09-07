@@ -109,18 +109,27 @@ def evaluate_native_flow_shadow(
     *,
     client: KrakenClient | None = None,
     trade_count: int = 100,
+    book: PreTradeBook | None = None,
+    trades: list[PublicTrade] | None = None,
 ) -> NativeFlowShadowResult:
-    """Compute exchange-native flow evidence without modifying live scoring."""
+    """Compute exchange-native flow evidence without modifying live scoring.
+
+    Optional ``book`` / ``trades`` let a bounded deep path reuse PreTrade
+    already fetched for execution validation. Missing inputs still fail
+    closed as unavailable rather than inventing a bullish pass.
+    """
     client = client or KrakenClient()
     warnings: list[str] = []
     try:
-        book = client.get_pre_trade(symbol)
-        trades = client.get_post_trade(symbol, count=trade_count)
-        midpoint = _midpoint(book)
+        resolved_book = book if book is not None else client.get_pre_trade(symbol)
+        resolved_trades = (
+            list(trades) if trades is not None else client.get_post_trade(symbol, count=trade_count)
+        )
+        midpoint = _midpoint(resolved_book)
         if midpoint <= 0:
             raise ValueError("valid top-of-book midpoint unavailable")
-        buy, sell, neutral, buy_share, large_share = _trade_metrics(trades, midpoint)
-        book_imbalance = _book_imbalance(book)
+        buy, sell, neutral, buy_share, large_share = _trade_metrics(resolved_trades, midpoint)
+        book_imbalance = _book_imbalance(resolved_book)
         try:
             trade_accel, recent_trade_count = _trade_count_acceleration(client, symbol)
         except Exception:
@@ -164,7 +173,7 @@ def evaluate_native_flow_shadow(
         large_print_concentration=round(large_share, 6),
         book_notional_imbalance=round(book_imbalance, 6),
         recent_trade_count=recent_trade_count,
-        sample_trades=len(trades),
+        sample_trades=len(resolved_trades),
     )
     return NativeFlowShadowResult(
         version=VERSION,

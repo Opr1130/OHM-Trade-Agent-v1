@@ -253,3 +253,103 @@ def misleading_confidence_language(text: str, *, is_probability: bool) -> tuple[
         if "CONFIDENCE" in line and "%" in line:
             offenders.append(line.strip())
     return tuple(offenders)
+
+
+def assessment_from_signal(signal: Any) -> OperatorAssessment:
+    """Build the operator assessment from a signal without using ``stage``."""
+    return build_operator_assessment(
+        symbol=getattr(signal, "symbol", "") or "",
+        phase=getattr(signal, "market_phase", None),
+        grade=getattr(signal, "evidence_grade", None),
+        disposition=getattr(signal, "operator_disposition", None),
+        why_qualified=getattr(signal, "reasons", ()) or (),
+        why_not_actionable=getattr(signal, "actionability_reasons", ()) or (),
+    )
+
+
+def operator_headline(assessment: OperatorAssessment) -> str:
+    """Headline allowed for this assessment. Never includes READY."""
+    if assessment.claims_early_discovery and assessment.disposition not in {
+        OperatorDisposition.DO_NOT_CHASE,
+        OperatorDisposition.NO_ACTION,
+    }:
+        return "🚀 EARLY WATCH"
+    return "🔎 MARKET WATCH"
+
+
+def operator_why_now(signal: Any, assessment: OperatorAssessment) -> str:
+    """Phase-aware why-now text. Non-early phases never claim early movement."""
+    reasons = tuple(str(item) for item in (getattr(signal, "reasons", ()) or ()) if str(item).strip())
+    if reasons:
+        return "; ".join(reasons[:3])
+    if assessment.claims_early_discovery:
+        return "Early movement conditions detected"
+    return "Market movement conditions detected"
+
+
+def format_operator_watch_message(
+    signal: Any, *, style: str = "telegram", why_now: str | None = None
+) -> str:
+    """Single operator-facing renderer for Early Watch / Market Watch cards.
+
+    ``signal.stage`` (READY/WATCH) is an alert-governor token and is never
+    rendered. Compact and telegram styles share headline, taxonomy, why-now
+    and action semantics so they cannot diverge again.
+    """
+    from app.services.asset_display_identity import display_market_label
+    from app.services.compact_alerts import (
+        downside_scenario_pct,
+        explosion_band,
+        heuristic_risk_score,
+    )
+
+    assessment = assessment_from_signal(signal)
+    headline = operator_headline(assessment)
+    why_now = why_now or operator_why_now(signal, assessment)
+    warnings = tuple(str(item) for item in (getattr(signal, "warnings", ()) or ())[:2] if str(item).strip())
+    caution = f" | Caution: {'; '.join(warnings)}" if warnings else ""
+    price = float(getattr(signal, "reference_price", 0.0) or 0.0)
+    timeframe = str(getattr(signal, "detection_timeframe", "1H") or "1H")
+    taxonomy = (
+        f"Market: {assessment.phase.value} | Evidence: {assessment.grade.value} | "
+        f"Disposition: {disposition_label(assessment.disposition)}"
+    )
+    action = "Action: WATCH ONLY — no entry is authorized"
+    if style == "compact":
+        low, high = explosion_band(
+            getattr(signal, "continuation_confidence", 0),
+            extended=bool(getattr(signal, "extended_move", False)),
+        )
+        risk = heuristic_risk_score(
+            getattr(signal, "continuation_confidence", 0),
+            liquidity_usd=getattr(signal, "liquidity_24h_usd_approx", 0.0),
+            extended=bool(getattr(signal, "extended_move", False)),
+        )
+        downside = downside_scenario_pct(risk)
+        return (
+            f"{headline} — {display_market_label(getattr(signal, 'symbol', ''))}\n"
+            f"{taxonomy}\n"
+            f"Price: {price:.8g} | TF: {timeframe}\n"
+            f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | "
+            f"{getattr(signal, 'momentum_state', '')}\n"
+            f"Potential*: +{low}% to +{high}% | {continuation_score_label(signal)}\n"
+            f"Risk*: {risk}% | Downside scenario*: up to -{downside}%\n"
+            f"Why now: {why_now}{caution}\n"
+            f"Entry: {getattr(signal, 'entry_recommendation', '')}\n"
+            f"{action}"
+        )
+    return (
+        f"{headline} — {display_market_label(getattr(signal, 'symbol', ''))}\n"
+        f"{taxonomy}\n"
+        f"Price: {price:.8g} | TF: {timeframe}\n"
+        f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | "
+        f"24h {getattr(signal, 'momentum_24h_pct' , 0.0):+.2f}%\n"
+        f"{continuation_score_label(signal)} | Entry quality*: "
+        f"{int(getattr(signal, 'entry_quality', 0) or 0)}/100\n"
+        f"Volume: {float(getattr(signal, 'relative_volume', 0.0) or 0.0):.2f}x | "
+        f"Liquidity: ${float(getattr(signal, 'liquidity_24h_usd_approx', 0.0) or 0.0):,.0f}/24h\n"
+        f"Why now: {why_now}{caution}\n"
+        f"Entry: {str(getattr(signal, 'entry_recommendation', '') or '').replace('_', ' ')}\n"
+        f"{action}\n"
+        "*Heuristic scores, not probabilities."
+    )

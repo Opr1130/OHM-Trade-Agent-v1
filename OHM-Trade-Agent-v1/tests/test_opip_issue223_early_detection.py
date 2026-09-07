@@ -128,8 +128,11 @@ def _fully_valid_validation_kwargs(**overrides):
         "duplicate_state_detected": False,
         # N-of-M corroboration: mandatory integrity alone is not QUALIFIED.
         "native_flow_available": True,
-        "cross_venue_available": True,
-        "depth_slippage_available": True,
+        "native_flow_bias": "BULLISH",
+        "cross_market_status": "CONFIRMED",
+        "execution_validation": SimpleNamespace(
+            status="VALID", book_coverage_status="COMPLETE"
+        ),
         "volatility_regime": 55.0,
     }
     kwargs.update(overrides)
@@ -523,8 +526,11 @@ def test_soft_unavailable_evidence_does_not_terminally_reject():
     report = evaluate_early_watch_validations(
         **_fully_valid_validation_kwargs(
             native_flow_available=False,
-            cross_venue_available=False,
+            native_flow_bias=None,
+            cross_market_status=None,
+            execution_validation=None,
             depth_slippage_available=False,
+            cross_venue_available=False,
             volatility_regime=None,
             prior_observation_count=5,
             signal_quality_history_continuous=True,
@@ -546,8 +552,11 @@ def test_mandatory_pass_without_corroboration_is_not_qualified():
     report = evaluate_early_watch_validations(
         **_fully_valid_validation_kwargs(
             native_flow_available=False,
-            cross_venue_available=False,
+            native_flow_bias=None,
+            cross_market_status=None,
+            execution_validation=None,
             depth_slippage_available=False,
+            cross_venue_available=False,
             volatility_regime=None,
             prior_observation_count=5,
             persistence_scans=3,

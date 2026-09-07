@@ -199,6 +199,33 @@ def forensic_rows(
     return rebuilt
 
 
+def authoritative_outcomes_by_instrument(
+    screening_rows: Iterable[Mapping[str, Any]],
+    *,
+    decision_at: datetime | None = None,
+) -> dict[str, str]:
+    """Exactly one Stage-0 outcome per instrument.
+
+    Prefers rows marked ``metadata.authoritative``. When the selector is not
+    promoted, legacy scans already persist one final outcome per instrument.
+    """
+    rows = forensic_rows(screening_rows, decision_at=decision_at)
+    chosen: dict[str, ForensicRow] = {}
+    for row in rows:
+        key = row.venue_instrument_id
+        if not key:
+            continue
+        existing = chosen.get(key)
+        if existing is None:
+            chosen[key] = row
+            continue
+        existing_auth = bool(dict(existing.metadata).get("authoritative"))
+        new_auth = bool(dict(row.metadata).get("authoritative"))
+        if new_auth and not existing_auth:
+            chosen[key] = row
+    return {key: row.outcome for key, row in chosen.items()}
+
+
 def replay_forensic(
     screening_rows: Iterable[Mapping[str, Any]],
     *,
