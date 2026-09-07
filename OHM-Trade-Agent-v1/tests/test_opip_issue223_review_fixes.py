@@ -1565,3 +1565,29 @@ def test_ledger_from_dict_tolerates_malformed_telemetry_fields():
     assert ledger.delivered_notification_count == 0
 
 
+def test_evaluate_early_mover_does_not_qualify_when_last_price_is_non_finite():
+    kwargs = dict(
+        validation_parity_enabled=True,
+        prior_observation_count=5,
+        persistence_scans=3,
+        native_flow_available=True,
+        duplicate_state_detected=False,
+        symbol_identity_resolved=True,
+    )
+    control = discovery.evaluate_early_mover(_qualifying_snapshot(), _mover(), **kwargs)
+    assert not isinstance(control, discovery.DeepEvaluationRejection)
+    assert control is not None
+    assert control.evidence_grade == EvidenceGrade.QUALIFIED.value
+    assert control.alert_eligible is True
+
+    snapshot = _qualifying_snapshot()
+    snapshot.last_price = float("nan")
+    result = discovery.evaluate_early_mover(snapshot, _mover(), **kwargs)
+
+    assert not isinstance(result, discovery.DeepEvaluationRejection)
+    assert result is not None
+    assert result.evidence_grade != EvidenceGrade.QUALIFIED.value
+    assert CHECK_FINITE_FEATURES in result.qualification_blocking_failures
+    assert result.alert_eligible is False
+
+

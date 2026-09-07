@@ -38,7 +38,10 @@ from app.opip.early.taxonomy import (
     resolve_market_phase,
     resolve_operator_disposition,
 )
-from app.opip.early.validation_parity import evaluate_early_watch_validations
+from app.opip.early.validation_parity import (
+    evaluate_early_watch_validations,
+    finite_features_from_snapshot,
+)
 from app.scanner.market_scanner import analyze_symbol
 from app.scanner.models import MarketSnapshot
 from app.scanner.universe import (
@@ -753,7 +756,7 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         ticker_bid=coarse.ticker_bid or None,
         ticker_ask=coarse.ticker_ask or None,
         spread_pct=_spread_pct_from_snapshot(snapshot, coarse),
-        finite_features=True,
+        finite_features=finite_features_from_snapshot(snapshot),
         duplicate_state_detected=duplicate_state_detected,
         persistence_scans=persistence_scans,
         prior_observation_count=prior_observation_count,
