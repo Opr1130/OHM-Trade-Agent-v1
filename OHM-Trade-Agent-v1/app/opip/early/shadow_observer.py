@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -44,7 +45,6 @@ from app.opip.early.taxonomy import MarketPhase, coerce_market_phase
 from app.opip.early.timeframe_policy import compare_timeframe_policies
 from app.opip.early.timing_ledger import (
     MILESTONE_FIRST_OPERATOR_ALERT,
-    EpisodeTimingLedger,
     ledger_from_dict,
     observe_phase,
     record_card_created,
@@ -53,6 +53,7 @@ from app.opip.early.timing_ledger import (
     record_notification_delivered,
     resolve_episode_ledger,
 )
+from app.services.registry_io import registry_lock
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +350,11 @@ def _latest_milestone_moment(row: Mapping[str, Any]) -> datetime | None:
     return max(parsed) if parsed else None
 
 
+def _ledger_lock(path: Path):
+    """Exclusive lock for one ledger file's read-modify-write cycle."""
+    return registry_lock(path.with_name(f".{path.name}.lock"))
+
+
 def _load_ledger_state(path: Path | None = None) -> dict[str, Any]:
     target = Path(path or TIMING_LEDGER_STATE_FILE)
     try:
@@ -383,25 +389,45 @@ def _save_ledger_state(
             for symbol, episode_id in index.items()
             if str(episode_id) in live_episode_ids
         }
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    descriptor = None
+    temp_name = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(retained, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, target)
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(json.dumps(retained, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+        temp_name = None
     except OSError as exc:
         logger.warning(
             "O'Pip early timing ledger state write failed open path=%s error=%s",
             target,
             type(exc).__name__,
         )
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError as cleanup_exc:
-            logger.warning(
-                "O'Pip early timing ledger temp cleanup failed open path=%s error=%s",
-                tmp,
-                type(cleanup_exc).__name__,
-            )
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                logger.warning(
+                    "O'Pip early timing ledger temp fd close failed open path=%s",
+                    target,
+                )
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError as cleanup_exc:
+                logger.warning(
+                    "O'Pip early timing ledger temp cleanup failed open path=%s error=%s",
+                    temp_name,
+                    type(cleanup_exc).__name__,
+                )
 
 
 def observe_timing_milestones(
@@ -418,6 +444,23 @@ def observe_timing_milestones(
     without ever notifying the operator, and a lead-time claim built on card
     creation would be wrong.
     """
+    target = Path(state_path or TIMING_LEDGER_STATE_FILE)
+    with _ledger_lock(target):
+        return _observe_timing_milestones_locked(
+            signals=signals,
+            scan_id=scan_id,
+            decision_at=decision_at,
+            state_path=target,
+        )
+
+
+def _observe_timing_milestones_locked(
+    *,
+    signals: Sequence[Any],
+    scan_id: str | None,
+    decision_at: datetime,
+    state_path: Path,
+) -> list[dict[str, Any]]:
     state = _load_ledger_state(state_path)
     # Symbol -> current episode_id index, kept alongside ledgers keyed by episode.
     index = state.get("_symbol_episode_index")
@@ -531,6 +574,23 @@ def _record_card_delivery_outcomes(
     state_path: Path | None,
 ) -> list[dict[str, Any]]:
     moment = decision_at or datetime.now(timezone.utc)
+    target = Path(state_path or TIMING_LEDGER_STATE_FILE)
+    with _ledger_lock(target):
+        return _record_card_delivery_outcomes_locked(
+            delivery_by_symbol,
+            anchor_prices=anchor_prices,
+            moment=moment,
+            state_path=target,
+        )
+
+
+def _record_card_delivery_outcomes_locked(
+    delivery_by_symbol: Mapping[str, tuple[str, bool]],
+    *,
+    anchor_prices: Mapping[str, float] | None,
+    moment: datetime,
+    state_path: Path,
+) -> list[dict[str, Any]]:
     prices = dict(anchor_prices or {})
     state = _load_ledger_state(state_path)
     index = state.get("_symbol_episode_index")
@@ -616,34 +676,54 @@ def observe_scan_shadow(
     rows: list[dict[str, Any]] = []
 
     if early_selector_shadow_enabled(environ):
-        resolved_history = (
-            history
-            if history is not None
-            else load_observation_history(observation_state_path)
-        )
-        rows.append(
-            observe_selector_shadow(
-                all_movers=all_movers,
-                production_selection=production_selection,
-                universe_count=universe_count,
-                scan_id=scan_id,
-                decision_at=moment,
-                history=resolved_history,
+        try:
+            resolved_history = (
+                history
+                if history is not None
+                else load_observation_history(observation_state_path)
             )
-        )
+            rows.append(
+                observe_selector_shadow(
+                    all_movers=all_movers,
+                    production_selection=production_selection,
+                    universe_count=universe_count,
+                    scan_id=scan_id,
+                    decision_at=moment,
+                    history=resolved_history,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - measurement must fail soft
+            logger.warning(
+                "O'Pip early selector shadow failed open error=%s",
+                type(exc).__name__,
+            )
 
     if early_timeframe_shadow_enabled(environ):
-        rows.extend(
-            observe_timeframe_shadow(signals=signals, scan_id=scan_id, decision_at=moment)
-        )
+        try:
+            rows.extend(
+                observe_timeframe_shadow(
+                    signals=signals, scan_id=scan_id, decision_at=moment
+                )
+            )
+        except Exception as exc:  # pragma: no cover - measurement must fail soft
+            logger.warning(
+                "O'Pip early timeframe shadow failed open error=%s",
+                type(exc).__name__,
+            )
 
     if early_timing_ledger_enabled(environ):
-        rows.extend(
-            observe_timing_milestones(
-                signals=signals,
-                scan_id=scan_id,
-                decision_at=moment,
-                state_path=ledger_state_path,
+        try:
+            rows.extend(
+                observe_timing_milestones(
+                    signals=signals,
+                    scan_id=scan_id,
+                    decision_at=moment,
+                    state_path=ledger_state_path,
+                )
             )
-        )
+        except Exception as exc:  # pragma: no cover - measurement must fail soft
+            logger.warning(
+                "O'Pip early timing ledger failed open error=%s",
+                type(exc).__name__,
+            )
     return rows

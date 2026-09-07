@@ -192,6 +192,18 @@ def _envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_coarse_status_metadata(
+    *,
+    universe_count: int,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Schema envelope for coarse EXCLUDED_MARKET / DATA_UNAVAILABLE rows."""
+    payload: dict[str, Any] = {"universe_count": int(universe_count)}
+    if extra:
+        payload.update(dict(extra))
+    return _envelope(payload)
+
+
 def build_selector_comparison_metadata(
     *,
     legacy_selected: bool,

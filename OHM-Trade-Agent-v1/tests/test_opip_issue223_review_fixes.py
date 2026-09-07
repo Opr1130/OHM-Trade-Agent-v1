@@ -19,8 +19,10 @@ from app.opip.early.observation_context import build_observation_context
 from app.opip.early.operator_semantics import build_operator_assessment
 from app.opip.early.taxonomy import (
     EvidenceGrade,
+    EvidenceStance,
     MarketPhase,
     OperatorDisposition,
+    ValidationClass,
     is_early_phase,
 )
 from app.opip.early.timing_ledger import (
@@ -29,8 +31,12 @@ from app.opip.early.timing_ledger import (
     should_reset_episode,
 )
 from app.opip.early.validation_parity import (
+    CHECK_NATIVE_FLOW,
+    CHECK_SOCIAL,
     MANDATORY_CHECKS,
+    ValidationCheck,
     ValidationResult,
+    corroborating_family_count,
     evaluate_early_watch_validations,
 )
 from app.scanner.market_data_validation import MarketDataValidation
@@ -1121,4 +1127,73 @@ def test_v22_shadow_handles_deep_evaluation_rejection(monkeypatch):
     assert stats["analyzed"] == 1
     assert results[0].v21_signal_present is False
     assert results[0].v21_stage is None
+
+
+def _supportive_native_flow() -> ValidationCheck:
+    return ValidationCheck(
+        CHECK_NATIVE_FLOW,
+        ValidationResult.PASS,
+        ValidationClass.SOFT,
+        stance=EvidenceStance.SUPPORTIVE,
+        supports_long_continuation=True,
+        counts_toward_qualification=True,
+    )
+
+
+def test_duplicate_family_checks_count_once_toward_qualified():
+    assert corroborating_family_count(
+        [_supportive_native_flow(), _supportive_native_flow()]
+    ) == 1
+
+
+def test_non_family_supportive_flag_does_not_count_toward_qualified():
+    advisory = ValidationCheck(
+        CHECK_SOCIAL,
+        ValidationResult.PASS,
+        ValidationClass.ADVISORY,
+        stance=EvidenceStance.SUPPORTIVE,
+        supports_long_continuation=True,
+        counts_toward_qualification=True,
+    )
+    assert corroborating_family_count([advisory]) == 0
+    assert corroborating_family_count([advisory, _supportive_native_flow()]) == 1
+
+
+def test_coarse_unavailable_rows_carry_stage0_schema_envelope():
+    from app.opip.early.stage0_evidence import (
+        STAGE0_EVIDENCE_SCHEMA_VERSION,
+        build_coarse_status_metadata,
+    )
+
+    metadata = build_coarse_status_metadata(universe_count=9)
+    assert metadata["stage0_evidence_schema_version"] == STAGE0_EVIDENCE_SCHEMA_VERSION
+    assert metadata["universe_count"] == 9
+    assert metadata["measurement_only"] is True
+    assert metadata["trade_authority_changed"] is False
+
+
+def test_timing_ledger_failure_does_not_drop_selector_shadow_rows(monkeypatch):
+    from app.opip.early import shadow_observer
+
+    monkeypatch.setattr(
+        shadow_observer,
+        "observe_timing_milestones",
+        lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("lock")),
+    )
+    rows = shadow_observer.observe_scan_shadow(
+        all_movers=[_mover()],
+        production_selection=[_mover()],
+        signals=[],
+        universe_count=1,
+        scan_id="OPIPS:early",
+        decision_at=DECISION_AT,
+        history={},
+        environ={
+            "OPIP_EARLY_SELECTOR_SHADOW_ENABLED": "true",
+            "OPIP_EARLY_TIMING_LEDGER_ENABLED": "true",
+        },
+    )
+    assert rows
+    assert rows[0]["record_type"] == shadow_observer.RECORD_SELECTOR_COMPARISON
+
 

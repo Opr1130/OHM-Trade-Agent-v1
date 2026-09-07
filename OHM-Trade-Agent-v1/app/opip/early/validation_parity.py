@@ -1231,8 +1231,25 @@ CORROBORATING_FAMILY_CHECKS = frozenset(
 
 
 def corroborating_family_count(checks: Sequence[ValidationCheck]) -> int:
-    """Count independent families with genuinely supportive directional evidence."""
-    return sum(1 for check in checks if check.counts_toward_qualification)
+    """Count distinct approved families with genuinely supportive evidence.
+
+    Availability, duplicate check objects, and non-family flags never satisfy
+    the two-of-M rule. Each approved name is counted at most once.
+    """
+    names: set[str] = set()
+    for check in checks:
+        if check.name not in CORROBORATING_FAMILY_CHECKS:
+            continue
+        if check.result is not ValidationResult.PASS:
+            continue
+        if check.stance is not EvidenceStance.SUPPORTIVE:
+            continue
+        if not check.supports_long_continuation:
+            continue
+        if not check.counts_toward_qualification:
+            continue
+        names.add(check.name)
+    return len(names)
 
 
 def resolve_evidence_grade(checks: Sequence[ValidationCheck]) -> EvidenceGrade:

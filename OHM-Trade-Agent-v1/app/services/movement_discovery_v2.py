@@ -25,6 +25,7 @@ from app.opip.early.stage0_evidence import (
     Stage0DecisionFeatures,
     build_advanced_metadata,
     build_below_threshold_metadata,
+    build_coarse_status_metadata,
     build_rank_limit_metadata,
     build_selector_comparison_metadata,
     rank_contexts_for_ranked,
@@ -303,7 +304,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "EXCLUDED_MARKET",
                     "reason": "market excluded by the production universe policy",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -316,7 +317,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "market symbols could not be resolved",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -344,7 +345,7 @@ def discover_coarse_movers(
                     "raw_identifier": altname or pair_id,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "ticker unavailable",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -360,7 +361,7 @@ def discover_coarse_movers(
                         "raw_identifier": current[1] or current[0],
                         "outcome": "EXCLUDED_MARKET",
                         "reason": "non-primary quote market for canonical asset",
-                        "metadata": {"universe_count": universe_count},
+                        "metadata": build_coarse_status_metadata(universe_count=universe_count),
                     },
                     scan_id=scan_id,
                 )
@@ -374,7 +375,7 @@ def discover_coarse_movers(
                     "raw_identifier": altname or pair_id,
                     "outcome": "EXCLUDED_MARKET",
                     "reason": "non-primary quote market for canonical asset",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -398,7 +399,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "ticker contained a non-numeric field",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -410,7 +411,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "ticker contained a non-finite field",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -422,7 +423,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "ticker failed structural validity checks",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
@@ -437,7 +438,7 @@ def discover_coarse_movers(
                     "raw_identifier": raw_identifier,
                     "outcome": "DATA_UNAVAILABLE",
                     "reason": "derived coarse measurements were non-finite",
-                    "metadata": {"universe_count": universe_count},
+                    "metadata": build_coarse_status_metadata(universe_count=universe_count),
                 },
                 scan_id=scan_id,
             )
