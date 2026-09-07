@@ -41,7 +41,7 @@ class PromotionStatus(str, Enum):
 
 
 class GateVerdict(str, Enum):
-    PASS = "PASS"
+    PASS = "PASS"  # nosec B105 - gate verdict, not a credential
     FAIL = "FAIL"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
 
@@ -148,8 +148,8 @@ def _comparison_gate(
     candidate: Any,
     higher_is_better: bool,
     min_improvement: float = 0.0,
-    detail_pass: str,
-    detail_fail: str,
+    detail_ok: str,
+    detail_not_ok: str,
 ) -> GateResult:
     base = _finite_optional(baseline)
     cand = _finite_optional(candidate)
@@ -167,7 +167,7 @@ def _comparison_gate(
     return GateResult(
         name,
         GateVerdict.PASS if ok else GateVerdict.FAIL,
-        detail_pass if ok else detail_fail,
+        detail_ok if ok else detail_not_ok,
         baseline_value=base,
         candidate_value=cand,
         threshold=min_improvement,
@@ -218,8 +218,8 @@ def evaluate_promotion(
                 baseline=baseline.get("qualified_precision_pct"),
                 candidate=candidate.get("qualified_precision_pct"),
                 higher_is_better=True,
-                detail_pass="qualified precision did not decrease",
-                detail_fail="qualified precision decreased",
+                detail_ok="qualified precision did not decrease",
+                detail_not_ok="qualified precision decreased",
             )
         )
 
@@ -258,8 +258,8 @@ def evaluate_promotion(
             candidate=candidate.get("median_move_consumed_before_alert_pct"),
             higher_is_better=False,
             min_improvement=MIN_MOVE_CONSUMED_IMPROVEMENT_PCT,
-            detail_pass="median move consumed before alert materially improved",
-            detail_fail="median move consumed before alert did not materially improve",
+            detail_ok="median move consumed before alert materially improved",
+            detail_not_ok="median move consumed before alert did not materially improve",
         )
     )
     gates.append(
@@ -268,8 +268,8 @@ def evaluate_promotion(
             baseline=baseline.get("first_observation_early_phase_share_pct"),
             candidate=candidate.get("first_observation_early_phase_share_pct"),
             higher_is_better=True,
-            detail_pass="more eventual movers are first observed early",
-            detail_fail="early first-observation share did not improve",
+            detail_ok="more eventual movers are first observed early",
+            detail_not_ok="early first-observation share did not improve",
         )
     )
     baseline_early = _finite_optional(baseline.get("first_observation_early_phase_share_pct"))
@@ -398,8 +398,8 @@ def evaluate_promotion(
             baseline=baseline.get("median_observation_to_delivery_seconds"),
             candidate=candidate.get("median_observation_to_delivery_seconds"),
             higher_is_better=False,
-            detail_pass="delivered-notification timing improved",
-            detail_fail="delivered-notification timing did not improve",
+            detail_ok="delivered-notification timing improved",
+            detail_not_ok="delivered-notification timing did not improve",
         )
     )
 

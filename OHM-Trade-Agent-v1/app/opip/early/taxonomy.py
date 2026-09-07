@@ -67,7 +67,7 @@ class OperatorDisposition(str, Enum):
 class ValidationResult(str, Enum):
     """Explicit validation semantics. ``UNAVAILABLE`` is never ``PASS``."""
 
-    PASS = "PASS"
+    PASS = "PASS"  # nosec B105 - validation verdict, not a credential
     FAIL = "FAIL"
     UNAVAILABLE = "UNAVAILABLE"
     NOT_EVALUATED = "NOT_EVALUATED"
