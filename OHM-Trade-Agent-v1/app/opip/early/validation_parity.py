@@ -755,7 +755,11 @@ def _depth_slippage_check(
     execution: Any = None,
     available: Any = None,
 ) -> ValidationCheck:
-    """Reuse ExecutionValidation semantics. Object existence is not confirmation."""
+    """Reuse ExecutionValidation semantics. Object existence is not confirmation.
+
+    VALID coverage is tradable context. It never counts toward QUALIFIED:
+    native flow already reads the same PreTrade book on the bounded path.
+    """
     if execution is None and available is None:
         return ValidationCheck(
             CHECK_DEPTH_SLIPPAGE,
@@ -830,13 +834,12 @@ def _depth_slippage_check(
             CHECK_DEPTH_SLIPPAGE,
             ValidationResult.PASS,
             ValidationClass.SOFT,
-            f"execution VALID with {coverage} coverage supports continuation",
+            f"execution VALID with {coverage} coverage is tradable context, not an independent directional family",
             executed=True,
             available=True,
             stance=EvidenceStance.SUPPORTIVE,
             supports_long_continuation=True,
             source="EXECUTION_VALIDATION",
-            counts_toward_qualification=True,
         )
     return ValidationCheck(
         CHECK_DEPTH_SLIPPAGE,
@@ -1220,12 +1223,16 @@ MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED = 2
 #: persistence prerequisites, not directional confirmation. Relative
 #: strength, rank velocity and volatility have no proven supportive
 #: threshold in-repo and are context-only.
+#:
+#: Depth/slippage is recorded as execution-quality context. It is not a
+#: corroborating family: the bounded Early Watch path reuses the same
+#: Kraken PreTrade book that native flow already consumes, so counting both
+#: would let one order-book snapshot satisfy the two-of-M rule.
 CORROBORATING_FAMILY_CHECKS = frozenset(
     {
         CHECK_NATIVE_FLOW,
         CHECK_CROSS_MARKET,
         CHECK_CROSS_VENUE,
-        CHECK_DEPTH_SLIPPAGE,
     }
 )
 

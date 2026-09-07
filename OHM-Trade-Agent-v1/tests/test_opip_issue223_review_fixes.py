@@ -666,7 +666,7 @@ def test_validation_layers_actually_executed_for_qualified_candidate():
     assert report.evidence_grade is EvidenceGrade.QUALIFIED
     assert report.check("native_flow_evidence").counts_toward_qualification is True
     assert report.check("cross_market_confirmation").counts_toward_qualification is True
-    assert report.check("depth_and_slippage_estimate").counts_toward_qualification is True
+    assert report.check("depth_and_slippage_estimate").counts_toward_qualification is False
     assert report.check("prior_observation_available").counts_toward_qualification is False
     assert report.check("relative_strength_percentile").counts_toward_qualification is False
 
@@ -706,6 +706,7 @@ def test_bearish_native_flow_cannot_help_qualify():
     flow = report.check("native_flow_evidence")
     assert flow.contradicts_signal is True
     assert flow.counts_toward_qualification is False
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
 
 
 def test_material_cross_market_divergence_cannot_help_qualify():
@@ -723,6 +724,7 @@ def test_material_cross_market_divergence_cannot_help_qualify():
     assert market.contradicts_signal is True
     assert market.counts_toward_qualification is False
     assert market.source == "CROSS_MARKET"
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
 
 
 def test_invalid_or_insufficient_execution_cannot_help_qualify():
@@ -1010,6 +1012,55 @@ def test_unknown_symbol_identity_status_is_none_and_fails_closed():
     identity = report.check("canonical_symbol_identity")
     assert identity is not None
     assert identity.result is ValidationResult.NOT_EVALUATED
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def test_confirmed_and_warn_reference_identity_are_accepted():
+    coarse = _mover()
+    for status in ("CONFIRMED", "WARN"):
+        snapshot = SimpleNamespace(
+            independent_market_reference=SimpleNamespace(status=status),
+            symbol="IGNUSD",
+        )
+        assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is True
+
+
+def test_stale_reference_identity_is_unknown_and_fails_closed():
+    coarse = _mover()
+    snapshot = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(status="STALE"),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is None
+    report = evaluate_early_watch_validations(symbol_identity_resolved=None)
+    assert report.check("canonical_symbol_identity").result is ValidationResult.NOT_EVALUATED
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def test_material_divergence_reference_identity_is_rejected():
+    coarse = _mover()
+    snapshot = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(status="MATERIAL_DIVERGENCE"),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is False
+
+
+def test_native_flow_plus_depth_does_not_satisfy_two_family_rule():
+    """Native flow and depth share the Kraken PreTrade book on the bounded path."""
+    report = evaluate_early_watch_validations(
+        **_mandatory_pass_kwargs(
+            native_flow_available=True,
+            native_flow_bias="BULLISH",
+            execution_validation=SimpleNamespace(
+                status="VALID", book_coverage_status="COMPLETE"
+            ),
+        )
+    )
+    assert report.check("native_flow_evidence").counts_toward_qualification is True
+    assert report.check("depth_and_slippage_estimate").result is ValidationResult.PASS
+    assert report.check("depth_and_slippage_estimate").counts_toward_qualification is False
+    assert corroborating_family_count(report.checks) == 1
     assert report.evidence_grade is not EvidenceGrade.QUALIFIED
 
 

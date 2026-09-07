@@ -47,7 +47,6 @@ from app.scanner.universe import (
     _is_excluded_market,
     _market_symbols,
 )
-from app.services.asset_display_identity import display_market_label
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_delivery import (
     record_telegram_not_eligible,
@@ -820,6 +819,34 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                             atr_percentile=atr_value)
 
 
+#: Independent-reference statuses that mean the asset was identified.
+#: CoinGecko's accepted producer states are CONFIRMED / WARN; UNIQUE and
+#: PRICE_DISAMBIGUATED are mapping-status tokens kept here so a caller that
+#: forwards them as ``status`` cannot fail-close a resolved identity.
+_IDENTITY_ACCEPTED_STATUSES = frozenset(
+    {
+        "CONFIRMED",
+        "WARN",
+        "RESOLVED",
+        "PASS",
+        "MATCH",
+        "OK",
+        "UNIQUE",
+        "PRICE_DISAMBIGUATED",
+    }
+)
+#: Explicit producer rejections. Identity is False, not unknown.
+_IDENTITY_REJECTED_STATUSES = frozenset(
+    {
+        "AMBIGUOUS",
+        "FAIL",
+        "REJECT",
+        "UNRESOLVED",
+        "MATERIAL_DIVERGENCE",
+    }
+)
+
+
 def _resolve_symbol_identity(
     coarse: CoarseMover,
     snapshot: MarketSnapshot,
@@ -831,15 +858,19 @@ def _resolve_symbol_identity(
     A non-empty base-asset string is necessary but not sufficient. Prefer an
     explicit caller resolution, then the snapshot's independent market
     reference, then a strict primary-pair / base-asset consistency check.
+
+    Accepted reference states resolve to ``True``, explicit rejections to
+    ``False``, and unrecognized / stale / unavailable states to ``None`` so
+    the mandatory identity check stays fail-closed.
     """
     if explicit is not None:
         return bool(explicit)
     reference = getattr(snapshot, "independent_market_reference", None)
     if reference is not None:
         status = str(getattr(reference, "status", "") or "").upper()
-        if status in {"RESOLVED", "PASS", "MATCH", "OK"}:
+        if status in _IDENTITY_ACCEPTED_STATUSES:
             return True
-        if status in {"AMBIGUOUS", "FAIL", "REJECT", "UNRESOLVED"}:
+        if status in _IDENTITY_REJECTED_STATUSES:
             return False
         return None
     base = str(coarse.base_asset or "").strip().upper()
