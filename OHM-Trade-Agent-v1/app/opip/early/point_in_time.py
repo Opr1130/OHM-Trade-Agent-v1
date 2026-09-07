@@ -124,6 +124,9 @@ def parse_timestamp(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        # Naive ISO strings are unusable: assuming UTC would admit a different
+        # instant than a naive datetime object, which parse_timestamp already
+        # rejects. Fail closed so replay cannot change the admitted set.
+        return None
     return parsed.astimezone(timezone.utc)

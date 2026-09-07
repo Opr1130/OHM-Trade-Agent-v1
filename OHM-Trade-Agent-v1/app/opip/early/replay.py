@@ -71,6 +71,13 @@ def _finite_optional(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _optional_int(value: Any) -> int | None:
+    parsed = _finite_optional(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
 def _median(values: Sequence[float]) -> float | None:
     if not values:
         return None
@@ -223,6 +230,19 @@ def authoritative_outcomes_by_instrument(
         new_auth = bool(dict(row.metadata).get("authoritative"))
         if new_auth and not existing_auth:
             chosen[key] = row
+            continue
+        if new_auth != existing_auth:
+            continue
+        existing_at = parse_timestamp(existing.observed_at)
+        new_at = parse_timestamp(row.observed_at)
+        if existing_at is None and new_at is not None:
+            chosen[key] = row
+        elif (
+            existing_at is not None
+            and new_at is not None
+            and new_at > existing_at
+        ):
+            chosen[key] = row
     return {key: row.outcome for key, row in chosen.items()}
 
 
@@ -356,6 +376,8 @@ class CohortMember:
     move_consumed_before_qualification_pct: float | None = None
     detection_delay_seconds: float | None = None
     qualification_delay_seconds: float | None = None
+    observation_to_delivery_seconds: float | None = None
+    card_edit_count: int | None = None
     rejection_gate: str | None = None
     rank_margin: float | None = None
 
@@ -427,6 +449,10 @@ def label_cohort_member(
         qualification_delay_seconds=_finite_optional(
             context.get("qualification_delay_seconds")
         ),
+        observation_to_delivery_seconds=_finite_optional(
+            context.get("observation_to_delivery_seconds")
+        ),
+        card_edit_count=_optional_int(context.get("card_edit_count")),
         rejection_gate=context.get("rejection_gate"),
         rank_margin=_finite_optional(context.get("rank_margin")),
     )
@@ -499,6 +525,14 @@ def evaluate_cohort_metrics(
         ),
         "operator_alert_volume": len(alerted),
         "delivered_notification_volume": len(delivered),
+        "total_card_edits": _total_card_edits(resolved),
+        "median_observation_to_delivery_seconds": _median(
+            [
+                item.observation_to_delivery_seconds
+                for item in delivered
+                if item.observation_to_delivery_seconds is not None
+            ]
+        ),
         "false_alerts_per_day": (
             round(len(false_positives) / days, 6) if days and days > 0 else None
         ),
@@ -547,6 +581,18 @@ def evaluate_cohort_metrics(
         "measurement_only": True,
         "trade_authority_changed": False,
     }
+
+
+def _total_card_edits(members: Sequence[CohortMember]) -> int | None:
+    """Sum recorded card edits. Missing counts stay unmeasured, not zero."""
+    if not members:
+        return None
+    counts: list[int] = []
+    for item in members:
+        if item.card_edit_count is None:
+            return None
+        counts.append(int(item.card_edit_count))
+    return sum(counts)
 
 
 def phase_at_first_observation(members: Sequence[CohortMember]) -> dict[str, int]:

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -38,7 +39,7 @@ from app.opip.early.flags import (
     early_timeframe_shadow_enabled,
     early_timing_ledger_enabled,
 )
-from app.opip.early.point_in_time import assert_point_in_time_safe
+from app.opip.early.point_in_time import assert_point_in_time_safe, parse_timestamp
 from app.opip.early.taxonomy import MarketPhase, coerce_market_phase
 from app.opip.early.timeframe_policy import compare_timeframe_policies
 from app.opip.early.timing_ledger import (
@@ -331,16 +332,20 @@ def observe_timeframe_shadow(
 
 
 def _latest_milestone_moment(row: Mapping[str, Any]) -> datetime | None:
-    """Newest recorded milestone in a persisted ledger row, for retention."""
+    """Newest recorded milestone or card-lifecycle stamp, for retention."""
+    stamps: list[Any] = []
     milestones = row.get("milestones")
-    stamps = list(dict(milestones).values()) if isinstance(milestones, Mapping) else []
+    if isinstance(milestones, Mapping):
+        stamps.extend(dict(milestones).values())
+    for key in ("card_created_at", "card_edited_at", "notification_delivered_at"):
+        value = row.get(key)
+        if value:
+            stamps.append(value)
     parsed: list[datetime] = []
     for stamp in stamps:
-        try:
-            moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        parsed.append(moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc))
+        moment = parse_timestamp(stamp)
+        if moment is not None:
+            parsed.append(moment)
     return max(parsed) if parsed else None
 
 
@@ -378,15 +383,25 @@ def _save_ledger_state(
             for symbol, episode_id in index.items()
             if str(episode_id) in live_episode_ids
         }
+    tmp = target.with_suffix(target.suffix + ".tmp")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(retained, sort_keys=True), encoding="utf-8")
+        tmp.write_text(json.dumps(retained, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, target)
     except OSError as exc:
         logger.warning(
             "O'Pip early timing ledger state write failed open path=%s error=%s",
             target,
             type(exc).__name__,
         )
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            logger.warning(
+                "O'Pip early timing ledger temp cleanup failed open path=%s error=%s",
+                tmp,
+                type(cleanup_exc).__name__,
+            )
 
 
 def observe_timing_milestones(
@@ -493,6 +508,28 @@ def record_card_delivery_outcomes(
     """
     if not early_timing_ledger_enabled(environ) or not delivery_by_symbol:
         return []
+    try:
+        return _record_card_delivery_outcomes(
+            delivery_by_symbol,
+            anchor_prices=anchor_prices,
+            decision_at=decision_at,
+            state_path=state_path,
+        )
+    except Exception as exc:  # pragma: no cover - measurement must fail soft
+        logger.warning(
+            "O'Pip early card delivery capture failed open error=%s",
+            type(exc).__name__,
+        )
+        return []
+
+
+def _record_card_delivery_outcomes(
+    delivery_by_symbol: Mapping[str, tuple[str, bool]],
+    *,
+    anchor_prices: Mapping[str, float] | None,
+    decision_at: datetime | None,
+    state_path: Path | None,
+) -> list[dict[str, Any]]:
     moment = decision_at or datetime.now(timezone.utc)
     prices = dict(anchor_prices or {})
     state = _load_ledger_state(state_path)

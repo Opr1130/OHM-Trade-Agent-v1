@@ -206,27 +206,27 @@ def build_selector_comparison_metadata(
     """
     legacy_outcome = "SELECTED" if legacy_selected else "COARSE_RANK_LIMIT"
     promoted_outcome = "SELECTED" if promoted_selected else "REJECTED"
-    return {
-        "selector_comparison": {
-            "legacy_selector": {
-                "selector": SELECTOR_PRODUCTION_COARSE,
-                "selected": bool(legacy_selected),
-                "outcome": legacy_outcome,
-                "rank": dict(legacy_rank) if isinstance(legacy_rank, Mapping) else None,
+    return _envelope(
+        {
+            "selector_comparison": {
+                "legacy_selector": {
+                    "selector": SELECTOR_PRODUCTION_COARSE,
+                    "selected": bool(legacy_selected),
+                    "outcome": legacy_outcome,
+                    "rank": dict(legacy_rank) if isinstance(legacy_rank, Mapping) else None,
+                },
+                "promoted_selector": {
+                    "selector": SELECTOR_PROMOTED_COHORT,
+                    "selected": bool(promoted_selected),
+                    "outcome": promoted_outcome,
+                },
+                "authoritative_selector": str(authoritative_selector),
             },
-            "promoted_selector": {
-                "selector": SELECTOR_PROMOTED_COHORT,
-                "selected": bool(promoted_selected),
-                "outcome": promoted_outcome,
-            },
+            "authoritative": True,
             "authoritative_selector": str(authoritative_selector),
-        },
-        "authoritative": True,
-        "authoritative_selector": str(authoritative_selector),
-        "measurement_only": True,
-        "production_selection_changed": True,
-        "trade_authority_changed": False,
-    }
+            "production_selection_changed": True,
+        }
+    )
 
 
 def build_rank_limit_metadata(
@@ -299,6 +299,39 @@ def build_advanced_metadata(
     return _envelope(payload)
 
 
+def rank_contexts_for_ranked(
+    *,
+    ranked_scores: list[tuple[str, float]],
+    selected_count: int,
+    universe_count: int,
+    selector: str = SELECTOR_PRODUCTION_COARSE,
+) -> dict[str, CoarseRankContext]:
+    """Build a rank context for every ranked identifier, selected or not.
+
+    Promoted rejection of a legacy-selected name still needs rank, cutoff and
+    margin so the forensic row is reconstructable. Truncation-only maps omit
+    those in-cutoff names.
+    """
+    ranked_count = len(ranked_scores)
+    bounded_selected = max(0, min(int(selected_count), ranked_count))
+    cutoff_score: float | None = None
+    if bounded_selected > 0:
+        cutoff_score = _finite_optional(ranked_scores[bounded_selected - 1][1])
+
+    contexts: dict[str, CoarseRankContext] = {}
+    for index, (identifier, candidate_score) in enumerate(ranked_scores):
+        contexts[str(identifier)] = CoarseRankContext(
+            selector=selector,
+            rank_position=index + 1,
+            selected_count=bounded_selected,
+            universe_count=int(universe_count),
+            ranked_count=ranked_count,
+            candidate_score=_finite_optional(candidate_score),
+            cutoff_score=cutoff_score,
+        )
+    return contexts
+
+
 def rank_contexts_for_truncation(
     *,
     ranked_scores: list[tuple[str, float]],
@@ -313,22 +346,13 @@ def rank_contexts_for_truncation(
     is the score of the last *selected* candidate, which is the value a
     truncated candidate needed to beat.
     """
-    ranked_count = len(ranked_scores)
-    bounded_selected = max(0, min(int(selected_count), ranked_count))
-    cutoff_score: float | None = None
-    if bounded_selected > 0:
-        cutoff_score = _finite_optional(ranked_scores[bounded_selected - 1][1])
-
-    contexts: dict[str, CoarseRankContext] = {}
-    for index in range(bounded_selected, ranked_count):
-        identifier, candidate_score = ranked_scores[index]
-        contexts[str(identifier)] = CoarseRankContext(
+    return {
+        identifier: context
+        for identifier, context in rank_contexts_for_ranked(
+            ranked_scores=ranked_scores,
+            selected_count=selected_count,
+            universe_count=universe_count,
             selector=selector,
-            rank_position=index + 1,
-            selected_count=bounded_selected,
-            universe_count=int(universe_count),
-            ranked_count=ranked_count,
-            candidate_score=_finite_optional(candidate_score),
-            cutoff_score=cutoff_score,
-        )
-    return contexts
+        ).items()
+        if context.rank_position > context.selected_count
+    }

@@ -498,8 +498,8 @@ def main() -> None:
         from app.opip.early.observation_context import build_observation_context
         from app.opip.early.shadow_observer import load_observation_history
 
-        observation_context = build_observation_context()
         observation_history = load_observation_history()
+        observation_context = build_observation_context(history=observation_history)
     except Exception as exc:
         from types import SimpleNamespace
 
@@ -733,16 +733,19 @@ def main() -> None:
         # Issue #223: record what the operator was actually notified about,
         # reading the governor's own outcome rather than assuming a card
         # implies delivery. Measurement only, and dark by default.
-        persist_shadow_rows(
-            record_card_delivery_outcomes(
-                early_mover_delivery,
-                anchor_prices={
-                    signal.symbol.upper(): float(getattr(signal, "reference_price", 0.0) or 0.0)
-                    for signal in eligible_signals
-                },
-                decision_at=decision_at,
+        try:
+            persist_shadow_rows(
+                record_card_delivery_outcomes(
+                    early_mover_delivery,
+                    anchor_prices={
+                        signal.symbol.upper(): float(getattr(signal, "reference_price", 0.0) or 0.0)
+                        for signal in eligible_signals
+                    },
+                    decision_at=decision_at,
+                )
             )
-        )
+        except Exception as exc:
+            print("Early card delivery capture: fail-soft", type(exc).__name__)
 
         broad_feed = (
             _broad_watch_feed(

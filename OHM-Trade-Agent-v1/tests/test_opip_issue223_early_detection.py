@@ -33,6 +33,7 @@ from app.opip.early.point_in_time import (
     LookaheadError,
     PointInTimeWindow,
     assert_point_in_time_safe,
+    parse_timestamp,
 )
 from app.opip.early.promotion import (
     GATE_ORDER,
@@ -42,6 +43,7 @@ from app.opip.early.promotion import (
 )
 from app.opip.early.replay import (
     CohortLabel,
+    evaluate_cohort_metrics,
     label_cohort_member,
     replay_counterfactual,
     replay_forensic,
@@ -771,6 +773,23 @@ def test_point_in_time_window_excludes_later_observations():
     assert [row["id"] for row in admitted] == ["past", "now"]
 
 
+def test_point_in_time_window_rejects_naive_iso_timestamps():
+    window = PointInTimeWindow(DECISION_AT)
+    naive = "2026-03-04T11:50:00"
+    aware = (DECISION_AT - timedelta(minutes=10)).isoformat()
+
+    assert parse_timestamp(naive) is None
+    assert parse_timestamp(datetime(2026, 3, 4, 11, 50)) is None
+    admitted = window.filter(
+        [
+            {"observed_at": naive, "id": "naive"},
+            {"observed_at": aware, "id": "aware"},
+        ]
+    )
+
+    assert [row["id"] for row in admitted] == ["aware"]
+
+
 def test_counterfactual_replay_excludes_future_rows_and_flags_no_lookahead():
     rows = [
         {
@@ -1143,6 +1162,79 @@ def test_authority_change_fails_its_gate_outright():
         if item.name == "no_execution_or_risk_authority_change"
     )
     assert gate.verdict is GateVerdict.FAIL
+
+
+def test_evaluate_cohort_metrics_emits_promotion_timing_and_churn_keys():
+    members = [
+        label_cohort_member(
+            symbol="WINUSD",
+            liquidity_24h_usd=1_000_000.0,
+            forward_max_move_pct=35.0,
+            evidence_grade="QUALIFIED",
+            alerted=True,
+            delivered=True,
+            observation_to_delivery_seconds=600.0,
+            card_edit_count=1,
+        )
+    ]
+
+    metrics = evaluate_cohort_metrics(members)
+
+    assert metrics["delivered_notification_volume"] == 1
+    assert metrics["total_card_edits"] == 1
+    assert metrics["median_observation_to_delivery_seconds"] == 600.0
+
+
+def test_evaluate_cohort_metrics_keeps_missing_card_edits_unmeasured():
+    members = [
+        label_cohort_member(
+            symbol="WINUSD",
+            liquidity_24h_usd=1_000_000.0,
+            forward_max_move_pct=35.0,
+            delivered=True,
+            observation_to_delivery_seconds=600.0,
+        )
+    ]
+
+    metrics = evaluate_cohort_metrics(members)
+
+    assert metrics["total_card_edits"] is None
+
+
+def test_complete_cohort_metrics_can_reach_promotion_eligible():
+    def _arm(*, move_consumed: float, delivery_seconds: float, edits: int):
+        return evaluate_cohort_metrics(
+            [
+                label_cohort_member(
+                    symbol=f"M{i}USD",
+                    liquidity_24h_usd=1_000_000.0,
+                    forward_max_move_pct=35.0,
+                    evidence_grade="QUALIFIED",
+                    first_observed_phase="IGNITION",
+                    alerted=True,
+                    delivered=True,
+                    move_consumed_before_alert_pct=move_consumed,
+                    observation_to_delivery_seconds=delivery_seconds,
+                    card_edit_count=edits,
+                )
+                for i in range(200)
+            ]
+        )
+
+    evaluation = evaluate_promotion(
+        baseline=_arm(move_consumed=18.0, delivery_seconds=1_200.0, edits=1),
+        candidate=_arm(move_consumed=10.0, delivery_seconds=600.0, edits=1),
+        resolved_cohort_members=200,
+        observation_days=21.0,
+        unreconstructable_rejections=0,
+        lookahead_detected=False,
+        authority_changed=False,
+    )
+
+    assert evaluation.status is PromotionStatus.PROMOTION_ELIGIBLE
+    assert evaluation.eligible is True
+    assert evaluation.failing_gates == ()
+    assert evaluation.unproven_gates == ()
 
 
 # ---------------------------------------------------------------------------

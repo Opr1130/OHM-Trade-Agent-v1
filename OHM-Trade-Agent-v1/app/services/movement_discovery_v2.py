@@ -20,12 +20,14 @@ from app.opip.early.cohort_selector import select_early_candidates
 from app.opip.early.stage0_evidence import (
     SELECTOR_PRODUCTION_COARSE,
     SELECTOR_PROMOTED_COHORT,
+    STAGE0_EVIDENCE_SCHEMA_VERSION,
     ScoreComponents,
     Stage0DecisionFeatures,
     build_advanced_metadata,
     build_below_threshold_metadata,
     build_rank_limit_metadata,
     build_selector_comparison_metadata,
+    rank_contexts_for_ranked,
     rank_contexts_for_truncation,
 )
 from app.opip.early.taxonomy import (
@@ -838,7 +840,7 @@ def _resolve_symbol_identity(
             return True
         if status in {"AMBIGUOUS", "FAIL", "REJECT", "UNRESOLVED"}:
             return False
-        return True
+        return None
     base = str(coarse.base_asset or "").strip().upper()
     pair = str(coarse.primary_pair or getattr(snapshot, "symbol", "") or "").strip().upper()
     if not base or not pair:
@@ -1031,7 +1033,7 @@ def scan_early_movers(
         promoted_ids = {item.primary_pair for item in coarse}
         legacy_top = ranked[:max_candidates]
         legacy_selected_ids = {item.primary_pair for item in legacy_top}
-        rank_contexts = rank_contexts_for_truncation(
+        rank_contexts = rank_contexts_for_ranked(
             ranked_scores=[(item.primary_pair, item.coarse_score) for item in ranked],
             selected_count=len(legacy_top),
             universe_count=ranked[0].universe_count if ranked else 0,
@@ -1068,6 +1070,7 @@ def scan_early_movers(
                 )
             else:
                 metadata = {
+                    "stage0_evidence_schema_version": STAGE0_EVIDENCE_SCHEMA_VERSION,
                     "universe_count": mover.universe_count,
                     "selector": SELECTOR_PROMOTED_COHORT,
                     "measurement_only": True,
@@ -1248,17 +1251,23 @@ def scan_early_movers(
     signals.sort(key=lambda item: (-item.continuation_confidence, -item.entry_quality, -item.discovery_score, item.symbol))
     # Shadow observation runs after every production decision is final, so it
     # cannot influence one. Every phase inside is independently flagged dark.
-    persist_shadow_rows(
-        observe_scan_shadow(
-            all_movers=ranked or coarse,
-            production_selection=coarse,
-            signals=signals,
-            universe_count=coarse[0].universe_count if coarse else 0,
-            scan_id=scan_id,
-            decision_at=decision_at,
-            history=observation_history,
+    try:
+        persist_shadow_rows(
+            observe_scan_shadow(
+                all_movers=ranked or coarse,
+                production_selection=coarse,
+                signals=signals,
+                universe_count=coarse[0].universe_count if coarse else 0,
+                scan_id=scan_id,
+                decision_at=decision_at,
+                history=observation_history,
+            )
         )
-    )
+    except Exception as exc:
+        logger.warning(
+            "O'Pip early scan shadow failed open error=%s",
+            type(exc).__name__,
+        )
     return coarse, signals
 
 

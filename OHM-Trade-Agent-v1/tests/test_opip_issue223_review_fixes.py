@@ -931,25 +931,194 @@ def test_promoted_selector_has_one_authoritative_outcome_per_instrument(monkeypa
     assert rejected
     assert all(row["metadata"]["authoritative"] is True for row in rejected)
     assert all(
+        row["metadata"].get("stage0_evidence_schema_version") == 1
+        for row in rejected
+    )
+    assert all(row["metadata"].get("coarse_rank") for row in rejected)
+    assert all(
         row["metadata"]["selector_comparison"]["promoted_selector"]["selected"] is False
         for row in rejected
     )
 
-    mapped = authoritative_outcomes_by_instrument(
-        [
+    production = {}
+    replay_input = []
+    for row in captured:
+        instrument = f"KRAKEN:{row['raw_identifier']}"
+        replay_input.append(
             {
-                "venue_instrument_id": f"KRAKEN:{row['raw_identifier']}",
+                "venue_instrument_id": instrument,
                 "outcome": row["outcome"],
                 "scan_id": "promoted-scan",
+                "observed_at": DECISION_AT.isoformat(),
                 "metadata": row.get("metadata"),
             }
-            for row in captured
-        ]
-    )
+        )
+        if bool((row.get("metadata") or {}).get("authoritative")):
+            assert instrument not in production
+            production[instrument] = row["outcome"]
+
+    mapped = authoritative_outcomes_by_instrument(replay_input)
     assert mapped["KRAKEN:IGN1USD"] == "ADVANCED"
-    assert len(mapped) == len(set(mapped))
+    assert mapped == production
     verification = verify_forensic_replay_matches_production(
         replayed=mapped,
-        production=mapped,
+        production=production,
     )
     assert verification["exact_match"] is True
+
+
+def test_authoritative_outcomes_prefer_latest_same_authority_observation():
+    from app.opip.early.replay import authoritative_outcomes_by_instrument
+
+    earlier = (DECISION_AT - timedelta(minutes=10)).isoformat()
+    later = DECISION_AT.isoformat()
+    rows = [
+        {
+            "venue_instrument_id": "KRAKEN:FOOUSD",
+            "outcome": "BELOW_THRESHOLD",
+            "observed_at": earlier,
+            "metadata": {"authoritative": True},
+        },
+        {
+            "venue_instrument_id": "KRAKEN:FOOUSD",
+            "outcome": "ADVANCED",
+            "observed_at": later,
+            "metadata": {"authoritative": True},
+        },
+    ]
+
+    assert authoritative_outcomes_by_instrument(rows)["KRAKEN:FOOUSD"] == "ADVANCED"
+    assert authoritative_outcomes_by_instrument(list(reversed(rows)))["KRAKEN:FOOUSD"] == "ADVANCED"
+
+
+def test_unknown_symbol_identity_status_is_none_and_fails_closed():
+    coarse = _mover()
+    snapshot = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(status="UNAVAILABLE"),
+        symbol="IGNUSD",
+    )
+
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is None
+
+    report = evaluate_early_watch_validations(symbol_identity_resolved=None)
+    identity = report.check("canonical_symbol_identity")
+    assert identity is not None
+    assert identity.result is ValidationResult.NOT_EVALUATED
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def test_observation_context_does_not_reload_when_history_is_supplied(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_load(*_args, **_kwargs):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(
+        "app.opip.early.observation_context.load_observation_history",
+        fake_load,
+    )
+    build_observation_context(history={"RAYUSD": []})
+    assert calls["n"] == 0
+    build_observation_context()
+    assert calls["n"] == 1
+
+
+def test_ledger_retention_keeps_edit_only_lifecycle_rows(tmp_path):
+    from app.opip.early import shadow_observer
+
+    path = tmp_path / "early_timing_ledger_state.json"
+    edited_at = DECISION_AT.isoformat()
+    state = {
+        "EP:FOOUSD:1": {
+            "symbol": "FOOUSD",
+            "episode_id": "EP:FOOUSD:1",
+            "milestones": {},
+            "card_edited_at": edited_at,
+            "card_edit_count": 1,
+        },
+        "_symbol_episode_index": {"FOOUSD": "EP:FOOUSD:1"},
+    }
+
+    assert shadow_observer._latest_milestone_moment(state["EP:FOOUSD:1"]) is not None
+    shadow_observer._save_ledger_state(state, path=path, now=DECISION_AT)
+    saved = shadow_observer._load_ledger_state(path)
+    assert "EP:FOOUSD:1" in saved
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_card_delivery_capture_fails_soft(monkeypatch, tmp_path):
+    from app.opip.early import shadow_observer
+
+    monkeypatch.setattr(
+        shadow_observer,
+        "_record_card_delivery_outcomes",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+    rows = shadow_observer.record_card_delivery_outcomes(
+        {"FOOUSD": ("CREATED", True)},
+        state_path=tmp_path / "ledger.json",
+        environ={"OPIP_EARLY_TIMING_LEDGER_ENABLED": "true"},
+        decision_at=DECISION_AT,
+    )
+    assert rows == []
+
+
+def test_scan_early_movers_shadow_failure_does_not_drop_signals(monkeypatch):
+    ranked = [_mover(base="IGN1", lift=3.0, distance=1.5, score=90.0)]
+
+    def fake_discover(*args, **kwargs):
+        on_ranked = kwargs.get("on_ranked")
+        if on_ranked is not None:
+            on_ranked(list(ranked))
+        return list(ranked)
+
+    monkeypatch.setattr(discovery, "discover_coarse_movers", fake_discover)
+    monkeypatch.setattr(
+        discovery,
+        "analyze_symbol",
+        lambda *a, **k: ("ok", _qualifying_snapshot(symbol="IGN1USD"), None),
+    )
+    monkeypatch.setattr(discovery, "_enrich_bounded_candidate_evidence", lambda *a, **k: None)
+    monkeypatch.setattr(
+        discovery,
+        "observe_scan_shadow",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("shadow boom")),
+    )
+
+    coarse, signals = discovery.scan_early_movers(
+        max_candidates=1,
+        selector_promoted=False,
+        validation_parity_enabled=False,
+        prior_observation_counts={"IGN1": 4},
+        persistence_scans={"IGN1": 3},
+    )
+    assert coarse
+    assert signals
+
+
+def test_v22_shadow_handles_deep_evaluation_rejection(monkeypatch):
+    from app.services import movement_discovery_v2_2_shadow as v22
+    from app.services.movement_discovery_v2 import DeepEvaluationRejection
+
+    rejection = DeepEvaluationRejection(
+        achieved_score=10.0,
+        required_score=40.0,
+        discovery_score_raw=10.0,
+        components={},
+    )
+    candidate = SimpleNamespace(
+        cohort="CURRENT_MOMENTUM",
+        mover=_mover(base="LOW", pair="LOWUSD"),
+        challenger_score=1.0,
+        lift_today_pct=1.0,
+    )
+    monkeypatch.setattr(v22, "discover_v22_shadow_candidates", lambda *a, **k: [candidate])
+    monkeypatch.setattr(v22, "analyze_symbol", lambda *a, **k: ("ok", _qualifying_snapshot(symbol="LOWUSD"), None))
+    monkeypatch.setattr(v22, "evaluate_early_mover", lambda *a, **k: rejection)
+
+    _candidates, results, stats = v22.scan_v22_shadow(total_candidates=1)
+    assert stats["analyzed"] == 1
+    assert results[0].v21_signal_present is False
+    assert results[0].v21_stage is None
+
