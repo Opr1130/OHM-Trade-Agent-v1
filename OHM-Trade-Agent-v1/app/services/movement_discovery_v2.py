@@ -852,10 +852,9 @@ _IDENTITY_REJECTED_MAPPINGS = frozenset(
 
 
 def _reference_has_identity_fields(reference: Any) -> bool:
-    return bool(
-        str(getattr(reference, "coingecko_id", "") or "").strip()
-        or str(getattr(reference, "coingecko_name", "") or "").strip()
-    )
+    identifier = str(getattr(reference, "coingecko_id", "") or "").strip()
+    name = str(getattr(reference, "coingecko_name", "") or "").strip()
+    return bool(identifier and name)
 
 
 def _resolve_symbol_identity(

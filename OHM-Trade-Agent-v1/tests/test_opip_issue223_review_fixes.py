@@ -1061,6 +1061,26 @@ def test_confirmed_status_without_identity_fields_fails_closed():
         symbol="IGNUSD",
     )
     assert discovery._resolve_symbol_identity(coarse, missing_mapping, explicit=None) is None
+    id_only = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(
+            status="CONFIRMED",
+            mapping_status="UNIQUE",
+            coingecko_id="ignition-token",
+            coingecko_name=None,
+        ),
+        symbol="IGNUSD",
+    )
+    name_only = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(
+            status="CONFIRMED",
+            mapping_status="UNIQUE",
+            coingecko_id=None,
+            coingecko_name="Ignition",
+        ),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, id_only, explicit=None) is None
+    assert discovery._resolve_symbol_identity(coarse, name_only, explicit=None) is None
 
 
 def test_evaluate_reference_market_confirmed_identity_is_accepted():
