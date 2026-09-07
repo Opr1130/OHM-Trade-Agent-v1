@@ -272,30 +272,16 @@ def evaluate_promotion(
             detail_not_ok="early first-observation share did not improve",
         )
     )
-    baseline_early = _finite_optional(baseline.get("first_observation_early_phase_share_pct"))
-    candidate_early = _finite_optional(candidate.get("first_observation_early_phase_share_pct"))
-    if baseline_early is None or candidate_early is None:
-        gates.append(
-            GateResult(
-                GATE_FEWER_LATE_DISCOVERIES,
-                GateVerdict.INSUFFICIENT_EVIDENCE,
-                "late-discovery share was not measured on both arms",
-            )
+    gates.append(
+        _comparison_gate(
+            GATE_FEWER_LATE_DISCOVERIES,
+            baseline=baseline.get("first_observation_late_phase_share_pct"),
+            candidate=candidate.get("first_observation_late_phase_share_pct"),
+            higher_is_better=False,
+            detail_ok="fewer movers are first discovered late",
+            detail_not_ok="more movers are first discovered late",
         )
-    else:
-        # Late discovery is the complement of early first observation.
-        ok = (100.0 - candidate_early) <= (100.0 - baseline_early)
-        gates.append(
-            GateResult(
-                GATE_FEWER_LATE_DISCOVERIES,
-                GateVerdict.PASS if ok else GateVerdict.FAIL,
-                "fewer movers are first discovered late"
-                if ok
-                else "more movers are first discovered late",
-                baseline_value=100.0 - baseline_early,
-                candidate_value=100.0 - candidate_early,
-            )
-        )
+    )
 
     unreconstructable = _finite_optional(unreconstructable_rejections)
     if unreconstructable is None:

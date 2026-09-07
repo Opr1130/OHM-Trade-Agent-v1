@@ -23,6 +23,11 @@ from app.services.signal_features import (
 
 OBSERVATION_CONTEXT_VERSION = "opip-early-observation-context-v1"
 
+#: Fiat and stable quotes that may be stripped to recover a base-asset alias.
+#: Longest first so ``ETHUSDT`` becomes ``ETH``, not ``ETHU``. Crypto quotes
+#: such as ``BTC`` / ``ETH`` are excluded: ``ETHBTC`` is a distinct instrument.
+_FIAT_STABLE_QUOTES = ("USDT", "USDC", "USD", "EUR", "GBP")
+
 
 @dataclass(frozen=True)
 class ObservationContext:
@@ -58,13 +63,23 @@ def _snapshots_for(rows: Sequence[Mapping[str, Any]]) -> list[ObservationSnapsho
 
 
 def _base_asset_key(symbol: str) -> str:
-    """Map a pair like ``RAYUSD`` / history key to a base-asset lookup key.
+    """Uppercase a history or pair key. Quote stripping is not done here.
 
-    Full-market history is keyed by the display pair symbol. Early Watch
-    looks up by ``base_asset``. Prefer the longest non-quote prefix that
-    matches existing history keys when callers pass base assets directly.
+    Full-market history is keyed by the display pair. Base-asset aliases are
+    derived only from the fiat/stable quote set in
+    :func:`build_observation_context`. Crypto quote suffixes are never
+    stripped, so ``ETHBTC`` cannot contaminate persistence for ``ETH``.
     """
     return str(symbol or "").strip().upper()
+
+
+def _aliases_for_history_key(symbol: str) -> set[str]:
+    aliases = {symbol}
+    for quote in _FIAT_STABLE_QUOTES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            aliases.add(symbol[: -len(quote)])
+            break
+    return aliases
 
 
 def build_observation_context(
@@ -87,13 +102,7 @@ def build_observation_context(
     for key, rows in resolved.items():
         symbol = _base_asset_key(key)
         snapshots = _snapshots_for(rows)
-        # History is keyed by the pair symbol (e.g. RAYUSD). Also index by a
-        # naive base prefix so Early Watch's base_asset lookup finds it when
-        # the quote is a known USD/USDT suffix.
-        aliases = {symbol}
-        for quote in ("USD", "USDT", "EUR", "GBP", "BTC", "ETH", "USDC"):
-            if symbol.endswith(quote) and len(symbol) > len(quote):
-                aliases.add(symbol[: -len(quote)])
+        aliases = _aliases_for_history_key(symbol)
         prior_count = max(0, len(snapshots) - 1)
         features = derive_symbol_features(snapshots, config=derivation)
         persistence_count = (

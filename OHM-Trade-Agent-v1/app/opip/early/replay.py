@@ -37,7 +37,7 @@ from app.opip.early.point_in_time import (
     assert_point_in_time_safe,
     parse_timestamp,
 )
-from app.opip.early.taxonomy import EvidenceGrade, MarketPhase, is_early_phase
+from app.opip.early.taxonomy import EvidenceGrade, MarketPhase, is_early_phase, is_extended_phase
 
 REPLAY_VERSION = "opip-early-replay-v1"
 
@@ -76,6 +76,23 @@ def _optional_int(value: Any) -> int | None:
     if parsed is None:
         return None
     return int(parsed)
+
+
+def _venue_instrument_id_from_row(row: Mapping[str, Any]) -> str:
+    """Resolve instrument id without assuming nested venue_instrument is a mapping.
+
+    Precedence: direct ``venue_instrument_id`` → nested mapping id → empty.
+    A persisted string/list/null nested value must not abort forensic replay.
+    """
+    direct = row.get("venue_instrument_id")
+    if direct not in (None, ""):
+        return str(direct)
+    nested = row.get("venue_instrument")
+    if isinstance(nested, Mapping):
+        nested_id = nested.get("venue_instrument_id")
+        if nested_id not in (None, ""):
+            return str(nested_id)
+    return ""
 
 
 def _median(values: Sequence[float]) -> float | None:
@@ -190,11 +207,7 @@ def forensic_rows(
         metadata = row.get("metadata")
         rebuilt.append(
             ForensicRow(
-                venue_instrument_id=str(
-                    row.get("venue_instrument_id")
-                    or (row.get("venue_instrument") or {}).get("venue_instrument_id")
-                    or ""
-                ),
+                venue_instrument_id=_venue_instrument_id_from_row(row),
                 outcome=str(row.get("outcome") or "UNKNOWN"),
                 scan_id=str(row.get("scan_id") or ""),
                 observed_at=observed_at.isoformat() if observed_at is not None else None,
@@ -476,13 +489,19 @@ def evaluate_cohort_metrics(
     qualified_positive = [item for item in qualified if item.label is CohortLabel.POSITIVE]
     delivered = [item for item in resolved if item.delivered]
 
-    def _phase_share(items: Sequence[CohortMember], attribute: str) -> float | None:
+    def _phase_share(
+        items: Sequence[CohortMember], attribute: str, *, late: bool = False
+    ) -> float | None:
         phases = [getattr(item, attribute) for item in items]
         present = [value for value in phases if value]
         if not present:
             return None
-        early = sum(1 for value in present if is_early_phase(value))
-        return round(early / len(present) * 100.0, 4)
+        matched = sum(
+            1
+            for value in present
+            if (is_extended_phase(value) if late else is_early_phase(value))
+        )
+        return round(matched / len(present) * 100.0, 4)
 
     consumed_before_alert = [
         item.move_consumed_before_alert_pct
@@ -542,6 +561,9 @@ def evaluate_cohort_metrics(
         ),
         "first_observation_early_phase_share_pct": _phase_share(
             resolved, "first_observed_phase"
+        ),
+        "first_observation_late_phase_share_pct": _phase_share(
+            resolved, "first_observed_phase", late=True
         ),
         "first_qualification_early_phase_share_pct": _phase_share(
             resolved, "first_qualified_phase"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 import math
 from typing import Any, Mapping
 
@@ -53,6 +54,30 @@ def _finite_optional(value: Any) -> float | None:
 def _iso(value: datetime | str | None) -> str | None:
     parsed = parse_timestamp(value)
     return parsed.isoformat() if parsed is not None else None
+
+
+def _taxonomy_token(value: Any) -> str | None:
+    """Persist canonical taxonomy tokens, never ``str(enum)`` class names.
+
+    ``MarketPhase.IGNITION.value`` is ``IGNITION``. ``str(MarketPhase.IGNITION)``
+    can be ``MarketPhase.IGNITION``, which ``coerce_market_phase`` cannot
+    round-trip and silently falls back to ``DORMANT``. Plain strings are
+    stored as-is (with a defensive strip of an accidental class prefix).
+    """
+    if value is None:
+        return None
+    if isinstance(value, Enum):
+        raw = getattr(value, "value", None)
+        text = str(raw).strip() if raw is not None else ""
+        return text or None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "." in text:
+        prefix, suffix = text.rsplit(".", 1)
+        if prefix in {"MarketPhase", "EvidenceGrade", "OperatorDisposition"} and suffix:
+            return suffix
+    return text
 
 
 @dataclass(frozen=True)
@@ -297,11 +322,9 @@ def build_advanced_metadata(
     payload["universe_count"] = int(universe_count)
     payload["selector"] = selector
     payload["decision_features"] = (features or Stage0DecisionFeatures()).as_dict()
-    payload["market_phase"] = str(market_phase) if market_phase is not None else None
-    payload["evidence_grade"] = str(evidence_grade) if evidence_grade is not None else None
-    payload["operator_disposition"] = (
-        str(operator_disposition) if operator_disposition is not None else None
-    )
+    payload["market_phase"] = _taxonomy_token(market_phase)
+    payload["evidence_grade"] = _taxonomy_token(evidence_grade)
+    payload["operator_disposition"] = _taxonomy_token(operator_disposition)
     if score is not None:
         payload["score_evidence"] = score.as_dict()
     if validation_results is not None:

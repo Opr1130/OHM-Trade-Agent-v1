@@ -173,13 +173,27 @@ class OperatorAssessment:
 
     @property
     def claims_early_discovery(self) -> bool:
-        """Whether this assessment may use early-discovery wording at all.
+        """Whether this assessment is in an early market phase.
 
-        ``EARLY WATCH`` is reserved for :data:`EARLY_PHASES` only
-        (``IGNITION``, ``EARLY_EXPANSION``). ``CONFIRMED_EXPANSION`` is not
-        early merely because it is not yet ``LATE_EXTENSION``.
+        Phase membership alone is not permission to *word* the card as an
+        early discovery. Use :attr:`may_use_early_wording` for renderer and
+        contradiction-guard decisions.
         """
         return is_early_phase(self.phase)
+
+    @property
+    def may_use_early_wording(self) -> bool:
+        """Whether operator text may claim an early discovery.
+
+        ``EARLY WATCH`` is reserved for :data:`EARLY_PHASES` and is forbidden
+        when disposition is ``DO_NOT_CHASE`` or ``NO_ACTION``.
+        ``CONFIRMED_EXPANSION`` is not early merely because it is not yet
+        ``LATE_EXTENSION``.
+        """
+        return self.claims_early_discovery and self.disposition not in {
+            OperatorDisposition.DO_NOT_CHASE,
+            OperatorDisposition.NO_ACTION,
+        }
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -191,6 +205,7 @@ class OperatorAssessment:
             "why_qualified": list(self.why_qualified),
             "why_not_actionable": list(self.why_not_actionable),
             "claims_early_discovery": self.claims_early_discovery,
+            "may_use_early_wording": self.may_use_early_wording,
             "trade_authority_changed": False,
         }
 
@@ -228,10 +243,7 @@ def misleading_early_language(text: str, assessment: OperatorAssessment) -> tupl
     ``DO_NOT_CHASE`` candidate must not contain ``EARLY WATCH`` or ``READY``
     anywhere in its operator text.
     """
-    if assessment.claims_early_discovery and assessment.disposition not in {
-        OperatorDisposition.DO_NOT_CHASE,
-        OperatorDisposition.NO_ACTION,
-    }:
+    if assessment.may_use_early_wording:
         return ()
     upper = str(text or "").upper()
     # Word-bounded so an innocent substring cannot register as a claim:
@@ -269,20 +281,17 @@ def assessment_from_signal(signal: Any) -> OperatorAssessment:
 
 def operator_headline(assessment: OperatorAssessment) -> str:
     """Headline allowed for this assessment. Never includes READY."""
-    if assessment.claims_early_discovery and assessment.disposition not in {
-        OperatorDisposition.DO_NOT_CHASE,
-        OperatorDisposition.NO_ACTION,
-    }:
+    if assessment.may_use_early_wording:
         return "🚀 EARLY WATCH"
     return "🔎 MARKET WATCH"
 
 
 def operator_why_now(signal: Any, assessment: OperatorAssessment) -> str:
-    """Phase-aware why-now text. Non-early phases never claim early movement."""
+    """Phase-aware why-now text. Non-early wording when early claims are forbidden."""
     reasons = tuple(str(item) for item in (getattr(signal, "reasons", ()) or ()) if str(item).strip())
     if reasons:
         return "; ".join(reasons[:3])
-    if assessment.claims_early_discovery:
+    if assessment.may_use_early_wording:
         return "Early movement conditions detected"
     return "Market movement conditions detected"
 

@@ -104,6 +104,49 @@ def _finite_optional(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+#: Snapshot attributes that count as measured Stage-0 / deep-scoring
+#: decision features. Liquidity, spread and integrity have their own
+#: mandatory checks and are not used to invent a finiteness pass.
+_DECISION_FEATURE_ATTRS = (
+    "last_price",
+    "confirmed_price_change_1h_pct",
+    "momentum_6h_pct",
+    "momentum_24h_pct",
+    "distance_to_24h_high_pct",
+    "movement_volume_ratio",
+    "volume_ratio",
+    "lift_from_24h_low_pct",
+)
+
+
+def finite_features_from_snapshot(snapshot: Any) -> bool | None:
+    """Derive mandatory finiteness from measured snapshot evidence.
+
+    ``None`` means no caller asserted the decision features, which the
+    mandatory check records as ``NOT_EVALUATED`` and cannot promote to
+    ``QUALIFIED``. A present non-finite value is ``False``. Hardcoding
+    ``True`` is forbidden.
+    """
+    if snapshot is None:
+        return None
+    explicit = getattr(snapshot, "finite_features", None)
+    if explicit is not None:
+        return bool(explicit)
+    seen = False
+    for name in _DECISION_FEATURE_ATTRS:
+        if not hasattr(snapshot, name):
+            continue
+        raw = getattr(snapshot, name)
+        if raw is None:
+            continue
+        seen = True
+        if _finite_optional(raw) is None:
+            return False
+    if not seen:
+        return None
+    return True
+
+
 @dataclass(frozen=True)
 class ValidationCheck:
     """One named validation with an explicit four-state result.
@@ -1371,7 +1414,7 @@ def report_from_snapshot(
         "ticker_bid": resolved_bid,
         "ticker_ask": resolved_ask,
         "spread_pct": getattr(execution, "spread_pct", None) if execution is not None else None,
-        "finite_features": True,
+        "finite_features": finite_features_from_snapshot(snapshot),
         "persistence_scans": persistence_scans,
         "prior_observation_count": prior_observation_count,
         "native_flow_available": flow_available,

@@ -1237,6 +1237,50 @@ def test_complete_cohort_metrics_can_reach_promotion_eligible():
     assert evaluation.unproven_gates == ()
 
 
+def test_late_discovery_gate_is_independent_of_early_first_observation_share():
+    evaluation = evaluate_promotion(
+        baseline={
+            "qualified_precision_pct": 60.0,
+            "operator_alert_volume": 40,
+            "median_move_consumed_before_alert_pct": 18.0,
+            "first_observation_early_phase_share_pct": 30.0,
+            "first_observation_late_phase_share_pct": 10.0,
+            "total_card_edits": 40,
+            "delivered_notification_volume": 40,
+            "median_observation_to_delivery_seconds": 1_200.0,
+        },
+        candidate={
+            "qualified_precision_pct": 62.0,
+            "operator_alert_volume": 40,
+            "median_move_consumed_before_alert_pct": 10.0,
+            "first_observation_early_phase_share_pct": 60.0,
+            "first_observation_late_phase_share_pct": 40.0,
+            "total_card_edits": 40,
+            "delivered_notification_volume": 40,
+            "median_observation_to_delivery_seconds": 600.0,
+        },
+        resolved_cohort_members=400,
+        observation_days=30.0,
+        unreconstructable_rejections=0,
+        lookahead_detected=False,
+        authority_changed=False,
+    )
+
+    late = next(
+        gate
+        for gate in evaluation.gates
+        if gate.name == "fewer_movers_first_discovered_late"
+    )
+    early = next(
+        gate
+        for gate in evaluation.gates
+        if gate.name == "more_movers_first_observed_early"
+    )
+    assert early.verdict is GateVerdict.PASS
+    assert late.verdict is GateVerdict.FAIL
+    assert evaluation.status is PromotionStatus.BLOCKED
+
+
 # ---------------------------------------------------------------------------
 # Safety: nothing here expands authority, and every flag ships dark
 # ---------------------------------------------------------------------------

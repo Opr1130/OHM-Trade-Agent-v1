@@ -1,4 +1,4 @@
-"""Issue #224 review-fix integration tests.
+"""Issue #223 review-fix integration tests.
 
 These exercise the integrated production paths (scan_early_movers,
 full_market_observation, card rendering, timing ledger), not helper-only
@@ -16,21 +16,31 @@ from app.jobs import scan_movers
 from app.opip.early import flags
 from app.opip.early.cohort_selector import EarlyCandidateFeatures, select_early_candidates
 from app.opip.early.observation_context import build_observation_context
-from app.opip.early.operator_semantics import build_operator_assessment
+from app.opip.early.operator_semantics import (
+    assessment_from_signal,
+    build_operator_assessment,
+    operator_headline,
+    operator_why_now,
+)
 from app.opip.early.taxonomy import (
     EvidenceGrade,
     EvidenceStance,
     MarketPhase,
     OperatorDisposition,
     ValidationClass,
+    coerce_evidence_grade,
+    coerce_market_phase,
+    coerce_operator_disposition,
     is_early_phase,
 )
 from app.opip.early.timing_ledger import (
     early_episode_id,
+    ledger_from_dict,
     resolve_episode_ledger,
     should_reset_episode,
 )
 from app.opip.early.validation_parity import (
+    CHECK_FINITE_FEATURES,
     CHECK_NATIVE_FLOW,
     CHECK_SOCIAL,
     MANDATORY_CHECKS,
@@ -38,6 +48,7 @@ from app.opip.early.validation_parity import (
     ValidationResult,
     corroborating_family_count,
     evaluate_early_watch_validations,
+    report_from_snapshot,
 )
 from app.scanner.market_data_validation import MarketDataValidation
 from app.services import full_market_observation as fmo
@@ -1350,5 +1361,207 @@ def test_timing_ledger_failure_does_not_drop_selector_shadow_rows(monkeypatch):
     )
     assert rows
     assert rows[0]["record_type"] == shadow_observer.RECORD_SELECTOR_COMPARISON
+
+
+def test_report_from_snapshot_cannot_qualify_by_hardcoding_finite_features():
+    snapshot = SimpleNamespace(
+        market_data_validation=SimpleNamespace(
+            qualified=True,
+            status="PASS",
+            rejection_reasons=[],
+            candle_count=720,
+            ticker_last=100.0,
+            latest_ohlc_close=100.2,
+            ticker_vs_ohlc_difference_pct=0.2,
+        ),
+        ticker_bid=99.95,
+        ticker_ask=100.05,
+        combined_24h_liquidity_usd=1_500_000.0,
+        native_flow_evidence=SimpleNamespace(available=True, bias="BULLISH"),
+        cross_pair_confirmation_status="CONFIRMED",
+        execution_validation=SimpleNamespace(status="VALID", book_coverage_status="COMPLETE"),
+        atr_percentile=55.0,
+    )
+    report = report_from_snapshot(
+        snapshot,
+        persistence_scans=3,
+        prior_observation_count=5,
+        symbol_identity_resolved=True,
+        overrides={"duplicate_state_detected": False},
+    )
+
+    assert report.result_for(CHECK_FINITE_FEATURES) is ValidationResult.NOT_EVALUATED
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
+
+
+def test_report_from_snapshot_rejects_non_finite_measured_decision_features():
+    snapshot = SimpleNamespace(
+        last_price=float("nan"),
+        confirmed_price_change_1h_pct=1.0,
+    )
+    report = report_from_snapshot(snapshot)
+
+    assert report.result_for(CHECK_FINITE_FEATURES) is ValidationResult.FAIL
+    assert report.evidence_grade is EvidenceGrade.REJECTED
+
+
+def test_stage0_taxonomy_tokens_round_trip_without_enum_class_prefix():
+    from app.opip.early.stage0_evidence import build_advanced_metadata
+
+    metadata = build_advanced_metadata(
+        universe_count=12,
+        market_phase=MarketPhase.IGNITION,
+        evidence_grade=EvidenceGrade.QUALIFIED,
+        operator_disposition=OperatorDisposition.DEEP_REVIEW,
+    )
+
+    assert metadata["market_phase"] == "IGNITION"
+    assert metadata["evidence_grade"] == "QUALIFIED"
+    assert metadata["operator_disposition"] == "DEEP_REVIEW"
+    assert "MarketPhase." not in str(metadata["market_phase"])
+    assert coerce_market_phase(metadata["market_phase"]) is MarketPhase.IGNITION
+    assert coerce_evidence_grade(metadata["evidence_grade"]) is EvidenceGrade.QUALIFIED
+    assert (
+        coerce_operator_disposition(metadata["operator_disposition"])
+        is OperatorDisposition.DEEP_REVIEW
+    )
+
+    as_strings = build_advanced_metadata(
+        universe_count=12,
+        market_phase="LATE_EXTENSION",
+        evidence_grade="CORROBORATED",
+        operator_disposition="DO_NOT_CHASE",
+    )
+    assert coerce_market_phase(as_strings["market_phase"]) is MarketPhase.LATE_EXTENSION
+    assert coerce_evidence_grade(as_strings["evidence_grade"]) is EvidenceGrade.CORROBORATED
+    assert (
+        coerce_operator_disposition(as_strings["operator_disposition"])
+        is OperatorDisposition.DO_NOT_CHASE
+    )
+
+
+def test_early_do_not_chase_empty_reasons_does_not_claim_early_movement():
+    signal = SimpleNamespace(
+        symbol="IGNUSD",
+        stage="READY",
+        reasons=(),
+        warnings=(),
+        market_phase=MarketPhase.IGNITION.value,
+        evidence_grade=EvidenceGrade.QUALIFIED.value,
+        operator_disposition=OperatorDisposition.DO_NOT_CHASE.value,
+        actionability_reasons=("move is already extended",),
+        reference_price=1.0,
+        detection_timeframe="1H",
+        momentum_1h_pct=2.0,
+        momentum_6h_pct=3.0,
+        momentum_24h_pct=4.0,
+        momentum_state="ACCELERATING",
+        continuation_confidence=80,
+        continuation_confidence_is_probability=False,
+        entry_quality=70,
+        entry_recommendation="WAIT_FOR_PULLBACK",
+        relative_volume=2.0,
+        distance_to_24h_high_pct=1.0,
+        liquidity_24h_usd_approx=1_000_000.0,
+        extended_move=False,
+    )
+    assessment = assessment_from_signal(signal)
+
+    assert assessment.claims_early_discovery is True
+    assert assessment.may_use_early_wording is False
+    assert operator_headline(assessment) == "🔎 MARKET WATCH"
+    assert operator_why_now(signal, assessment) == "Market movement conditions detected"
+    assert "Early movement conditions detected" not in operator_why_now(signal, assessment)
+    card = scan_movers._compact_card(signal)
+    assert "EARLY WATCH" not in card
+    assert "Early movement conditions detected" not in card
+
+
+def _observation_row(*, minutes_ago: int, price: float, volume: float) -> dict[str, float | str]:
+    return {
+        "observed_at": (DECISION_AT - timedelta(minutes=minutes_ago)).isoformat(),
+        "last_price": price,
+        "volume_24h": volume,
+        "notional_24h_usd_approx": volume * price,
+        "high_24h": price * 1.1,
+        "low_24h": price * 0.9,
+        "lift_from_24h_low_pct": 2.0,
+        "distance_from_24h_high_pct": 3.0,
+    }
+
+
+def test_ethbtc_history_does_not_inflate_eth_base_asset_persistence():
+    eth_usd = [
+        _observation_row(minutes_ago=30, price=2_000.0, volume=1_000.0),
+        _observation_row(minutes_ago=20, price=2_010.0, volume=1_200.0),
+        _observation_row(minutes_ago=10, price=2_020.0, volume=1_500.0),
+    ]
+    eth_btc = [
+        _observation_row(minutes_ago=90 - (i * 10), price=0.05 + i * 0.001, volume=500.0 + i)
+        for i in range(10)
+    ]
+    context = build_observation_context(history={"ETHUSD": eth_usd, "ETHBTC": eth_btc})
+
+    assert context.prior_observation_counts["ETH"] == 2
+    assert context.prior_observation_counts["ETHUSD"] == 2
+    assert context.prior_observation_counts["ETHBTC"] == 9
+    assert context.prior_observation_counts["ETH"] < context.prior_observation_counts["ETHBTC"]
+    assert context.persistence_scans.get("ETH", 0) <= context.persistence_scans.get("ETHUSD", 0)
+
+
+def test_forensic_replay_tolerates_malformed_nested_venue_instrument():
+    from app.opip.early.replay import forensic_rows
+
+    rows = forensic_rows(
+        [
+            {"outcome": "ADVANCED", "venue_instrument": "not-a-mapping"},
+            {"outcome": "ADVANCED", "venue_instrument": ["KRAKEN:BAD"]},
+            {
+                "outcome": "SELECTED",
+                "venue_instrument_id": "KRAKEN:FOOUSD",
+                "venue_instrument": "still-not-a-mapping",
+            },
+            {
+                "outcome": "SELECTED",
+                "venue_instrument": {"venue_instrument_id": "KRAKEN:BARUSD"},
+            },
+        ]
+    )
+
+    assert [row.venue_instrument_id for row in rows] == [
+        "",
+        "",
+        "KRAKEN:FOOUSD",
+        "KRAKEN:BARUSD",
+    ]
+
+
+def test_ledger_from_dict_tolerates_malformed_telemetry_fields():
+    ledger = ledger_from_dict(
+        {
+            "symbol": "FOOUSD",
+            "episode_id": "ep-1",
+            "schema_version": "not-an-int",
+            "milestones": "not-a-mapping",
+            "anchor_prices": {
+                "first_observed_at": "bad-price",
+                "first_qualified_at": 1.25,
+            },
+            "card_created_at": "not-a-timestamp",
+            "card_edited_at": "2026-03-04T12:00:00+00:00",
+            "card_edit_count": "x",
+            "delivered_notification_count": object(),
+        }
+    )
+
+    assert ledger.symbol == "FOOUSD"
+    assert ledger.episode_id == "ep-1"
+    assert ledger.schema_version == 1
+    assert ledger.milestones == {}
+    assert ledger.anchor_prices == {"first_qualified_at": 1.25}
+    assert ledger.card_created_at is None
+    assert ledger.card_edited_at is not None
+    assert ledger.card_edit_count == 0
+    assert ledger.delivered_notification_count == 0
 
 

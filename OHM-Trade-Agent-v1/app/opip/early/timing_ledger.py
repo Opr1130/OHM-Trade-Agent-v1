@@ -88,6 +88,27 @@ def _price(value: Any) -> float | None:
     return parsed if parsed > 0 else None
 
 
+def _optional_count(value: Any, default: int = 0) -> int:
+    """Parse a persisted counter without aborting on malformed telemetry."""
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _optional_schema_version(value: Any) -> int:
+    if value is None:
+        return TIMING_LEDGER_SCHEMA_VERSION
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return TIMING_LEDGER_SCHEMA_VERSION
+    return parsed if parsed > 0 else TIMING_LEDGER_SCHEMA_VERSION
+
+
 @dataclass(frozen=True)
 class EpisodeTimingLedger:
     """Monotonic milestone timestamps and anchor prices for one episode."""
@@ -391,29 +412,46 @@ def observe_phase(
 
 
 def ledger_from_dict(payload: Mapping[str, Any]) -> EpisodeTimingLedger:
-    """Rebuild a ledger from a persisted row."""
+    """Rebuild a ledger from a persisted row.
+
+    Malformed telemetry is dropped field-by-field. One bad measurement row
+    must not abort the reader; missing values fall back to empty / default
+    counters so shadow consumption stays fail-soft.
+    """
+    if not isinstance(payload, Mapping):
+        return EpisodeTimingLedger(symbol="", episode_id="")
     milestones = payload.get("milestones")
     anchors = payload.get("anchor_prices")
+    parsed_anchors: dict[str, float] = {}
+    if isinstance(anchors, Mapping):
+        for name, value in anchors.items():
+            if name not in MILESTONE_ORDER:
+                continue
+            price = _price(value)
+            if price is not None:
+                parsed_anchors[str(name)] = price
+    parsed_milestones: dict[str, str] = {}
+    if isinstance(milestones, Mapping):
+        for name, value in milestones.items():
+            if name not in MILESTONE_ORDER:
+                continue
+            stamp = _iso(value)
+            if stamp is not None:
+                parsed_milestones[str(name)] = stamp
     return EpisodeTimingLedger(
         symbol=str(payload.get("symbol") or "").upper(),
         episode_id=str(payload.get("episode_id") or ""),
-        schema_version=int(payload.get("schema_version") or TIMING_LEDGER_SCHEMA_VERSION),
+        schema_version=_optional_schema_version(payload.get("schema_version")),
         version=str(payload.get("version") or TIMING_LEDGER_VERSION),
-        milestones={
-            str(name): str(value)
-            for name, value in dict(milestones if isinstance(milestones, Mapping) else {}).items()
-            if name in MILESTONE_ORDER
-        },
-        anchor_prices={
-            str(name): float(value)
-            for name, value in dict(anchors if isinstance(anchors, Mapping) else {}).items()
-            if name in MILESTONE_ORDER
-        },
-        card_created_at=payload.get(CARD_CREATED),
-        card_edited_at=payload.get(CARD_EDITED),
-        notification_delivered_at=payload.get(NOTIFICATION_DELIVERED),
-        card_edit_count=int(payload.get("card_edit_count") or 0),
-        delivered_notification_count=int(payload.get("delivered_notification_count") or 0),
+        milestones=parsed_milestones,
+        anchor_prices=parsed_anchors,
+        card_created_at=_iso(payload.get(CARD_CREATED)),
+        card_edited_at=_iso(payload.get(CARD_EDITED)),
+        notification_delivered_at=_iso(payload.get(NOTIFICATION_DELIVERED)),
+        card_edit_count=_optional_count(payload.get("card_edit_count")),
+        delivered_notification_count=_optional_count(
+            payload.get("delivered_notification_count")
+        ),
     )
 
 

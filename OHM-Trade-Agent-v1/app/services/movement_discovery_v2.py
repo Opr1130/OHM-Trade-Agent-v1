@@ -611,25 +611,35 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
     components: dict[str, float] = {}
 
     if one_hour >= 2.0:
-        score += 30; reasons.append(f"1h momentum is accelerating at {one_hour:+.2f}%"); components["momentum_1h"] = 30.0
+        score += 30; reasons.append(f"1h momentum is accelerating at {one_hour:+.2f}%")
+        components["momentum_1h"] = 30.0
     elif one_hour >= 0.75:
-        score += 20; reasons.append(f"1h momentum is positive at {one_hour:+.2f}%"); components["momentum_1h"] = 20.0
+        score += 20; reasons.append(f"1h momentum is positive at {one_hour:+.2f}%")
+        components["momentum_1h"] = 20.0
     if six_hour >= 4.0:
-        score += 25; reasons.append(f"6h momentum is strong at {six_hour:+.2f}%"); components["momentum_6h"] = 25.0
+        score += 25; reasons.append(f"6h momentum is strong at {six_hour:+.2f}%")
+        components["momentum_6h"] = 25.0
     elif six_hour >= 2.0:
-        score += 18; reasons.append(f"6h momentum is building at {six_hour:+.2f}%"); components["momentum_6h"] = 18.0
+        score += 18; reasons.append(f"6h momentum is building at {six_hour:+.2f}%")
+        components["momentum_6h"] = 18.0
     if day >= 8.0:
-        score += 20; reasons.append(f"24h momentum is strong at {day:+.2f}%"); components["momentum_24h"] = 20.0
+        score += 20; reasons.append(f"24h momentum is strong at {day:+.2f}%")
+        components["momentum_24h"] = 20.0
     elif day >= 4.0:
-        score += 14; reasons.append(f"24h momentum is positive at {day:+.2f}%"); components["momentum_24h"] = 14.0
+        score += 14; reasons.append(f"24h momentum is positive at {day:+.2f}%")
+        components["momentum_24h"] = 14.0
     if volume >= 2.5:
-        score += 20; reasons.append(f"relative volume expanded to {volume:.2f}x"); components["relative_volume"] = 20.0
+        score += 20; reasons.append(f"relative volume expanded to {volume:.2f}x")
+        components["relative_volume"] = 20.0
     elif volume >= 1.5:
-        score += 14; reasons.append(f"relative volume is elevated at {volume:.2f}x"); components["relative_volume"] = 14.0
+        score += 14; reasons.append(f"relative volume is elevated at {volume:.2f}x")
+        components["relative_volume"] = 14.0
     if near_high <= 2.0:
-        score += 10; reasons.append(f"price is within {near_high:.2f}% of its 24h high"); components["near_high"] = 10.0
+        score += 10; reasons.append(f"price is within {near_high:.2f}% of its 24h high")
+        components["near_high"] = 10.0
     if snapshot.trend == "bullish":
-        score += 8; reasons.append("EMA structure is bullish"); components["trend_bullish"] = 8.0
+        score += 8; reasons.append("EMA structure is bullish")
+        components["trend_bullish"] = 8.0
     # Retain the unclamped additive total before bounding. The bounded value
     # keeps its exact historical meaning; the raw total restores the
     # cross-sectional information that saturation at 100 destroys.
