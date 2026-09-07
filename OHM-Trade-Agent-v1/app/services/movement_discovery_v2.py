@@ -47,6 +47,7 @@ from app.scanner.universe import (
     _is_excluded_market,
     _market_symbols,
 )
+from app.services.asset_display_identity import VERIFIED_MAPPING_STATUSES
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.telegram_delivery import (
     record_telegram_not_eligible,
@@ -819,10 +820,7 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                             atr_percentile=atr_value)
 
 
-#: Independent-reference statuses that mean the asset was identified.
-#: CoinGecko's accepted producer states are CONFIRMED / WARN; UNIQUE and
-#: PRICE_DISAMBIGUATED are mapping-status tokens kept here so a caller that
-#: forwards them as ``status`` cannot fail-close a resolved identity.
+#: CoinGecko price/freshness statuses that may accompany a verified mapping.
 _IDENTITY_ACCEPTED_STATUSES = frozenset(
     {
         "CONFIRMED",
@@ -831,8 +829,6 @@ _IDENTITY_ACCEPTED_STATUSES = frozenset(
         "PASS",
         "MATCH",
         "OK",
-        "UNIQUE",
-        "PRICE_DISAMBIGUATED",
     }
 )
 #: Explicit producer rejections. Identity is False, not unknown.
@@ -845,6 +841,21 @@ _IDENTITY_REJECTED_STATUSES = frozenset(
         "MATERIAL_DIVERGENCE",
     }
 )
+_IDENTITY_REJECTED_MAPPINGS = frozenset(
+    {
+        "AMBIGUOUS",
+        "FAIL",
+        "REJECT",
+        "UNRESOLVED",
+    }
+)
+
+
+def _reference_has_identity_fields(reference: Any) -> bool:
+    return bool(
+        str(getattr(reference, "coingecko_id", "") or "").strip()
+        or str(getattr(reference, "coingecko_name", "") or "").strip()
+    )
 
 
 def _resolve_symbol_identity(
@@ -859,19 +870,24 @@ def _resolve_symbol_identity(
     explicit caller resolution, then the snapshot's independent market
     reference, then a strict primary-pair / base-asset consistency check.
 
-    Accepted reference states resolve to ``True``, explicit rejections to
-    ``False``, and unrecognized / stale / unavailable states to ``None`` so
-    the mandatory identity check stays fail-closed.
+    CoinGecko ``status`` is a price/freshness verdict. Identity is
+    ``mapping_status`` plus CoinGecko identity fields. ``CONFIRMED`` with an
+    ambiguous or missing mapping stays fail-closed.
     """
     if explicit is not None:
         return bool(explicit)
     reference = getattr(snapshot, "independent_market_reference", None)
     if reference is not None:
         status = str(getattr(reference, "status", "") or "").upper()
-        if status in _IDENTITY_ACCEPTED_STATUSES:
-            return True
-        if status in _IDENTITY_REJECTED_STATUSES:
+        mapping = str(getattr(reference, "mapping_status", "") or "").upper()
+        if mapping in _IDENTITY_REJECTED_MAPPINGS or status in _IDENTITY_REJECTED_STATUSES:
             return False
+        if (
+            mapping in VERIFIED_MAPPING_STATUSES
+            and status in _IDENTITY_ACCEPTED_STATUSES
+            and _reference_has_identity_fields(reference)
+        ):
+            return True
         return None
     base = str(coarse.base_asset or "").strip().upper()
     pair = str(coarse.primary_pair or getattr(snapshot, "symbol", "") or "").strip().upper()

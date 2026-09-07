@@ -1019,10 +1019,94 @@ def test_confirmed_and_warn_reference_identity_are_accepted():
     coarse = _mover()
     for status in ("CONFIRMED", "WARN"):
         snapshot = SimpleNamespace(
-            independent_market_reference=SimpleNamespace(status=status),
+            independent_market_reference=SimpleNamespace(
+                status=status,
+                mapping_status="UNIQUE",
+                coingecko_id="ignition-token",
+                coingecko_name="Ignition",
+            ),
             symbol="IGNUSD",
         )
         assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is True
+
+
+def test_confirmed_status_with_ambiguous_mapping_is_rejected():
+    coarse = _mover()
+    snapshot = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(
+            status="CONFIRMED",
+            mapping_status="AMBIGUOUS",
+            coingecko_id="ignition-token",
+            coingecko_name="Ignition",
+        ),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is False
+
+
+def test_confirmed_status_without_identity_fields_fails_closed():
+    coarse = _mover()
+    snapshot = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(
+            status="CONFIRMED",
+            mapping_status="UNIQUE",
+            coingecko_id=None,
+            coingecko_name=None,
+        ),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is None
+    missing_mapping = SimpleNamespace(
+        independent_market_reference=SimpleNamespace(status="CONFIRMED"),
+        symbol="IGNUSD",
+    )
+    assert discovery._resolve_symbol_identity(coarse, missing_mapping, explicit=None) is None
+
+
+def test_evaluate_reference_market_confirmed_identity_is_accepted():
+    from app.scanner.models import MarketSnapshot
+    from app.scanner.reference_market_validation import evaluate_reference_market
+
+    coarse = _mover()
+    snapshot = MarketSnapshot(
+        symbol="IGNUSD",
+        last_price=1.0,
+        ema20=1.0,
+        ema50=1.0,
+        ema200=1.0,
+        rsi=50,
+        macd_line=0.0,
+        macd_signal=0.0,
+        macd_histogram=0.0,
+        atr=0.1,
+        atr_pct=1.0,
+        volume_ratio=1.0,
+        technical_score=50,
+        trend="bullish",
+        ticker_last=1.0,
+        primary_pair="IGNUSD",
+        underlying_asset="IGN",
+        primary_quote_currency="USD",
+    )
+    reference = evaluate_reference_market(
+        snapshot,
+        [
+            {
+                "id": "ignition-token",
+                "symbol": "ign",
+                "name": "Ignition",
+                "current_price": 1.0,
+                "last_updated": DECISION_AT.isoformat(),
+            }
+        ],
+        usdt_usd_rate=None,
+        api_mode="DEMO",
+        now=DECISION_AT,
+    )
+    snapshot.independent_market_reference = reference
+    assert reference.status == "CONFIRMED"
+    assert reference.mapping_status == "UNIQUE"
+    assert discovery._resolve_symbol_identity(coarse, snapshot, explicit=None) is True
 
 
 def test_stale_reference_identity_is_unknown_and_fails_closed():
