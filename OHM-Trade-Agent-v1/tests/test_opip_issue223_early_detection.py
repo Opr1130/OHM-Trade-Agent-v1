@@ -105,7 +105,8 @@ DECISION_AT = datetime(2026, 3, 4, 12, 0, tzinfo=timezone.utc)
 
 
 def _fully_valid_validation_kwargs(**overrides):
-    """Arguments under which every mandatory check passes.
+    """Arguments under which every mandatory check passes and enough
+    independent soft/confidence families corroborate for QUALIFIED.
 
     Each fail-closed test starts from this and breaks exactly one thing, which
     is what proves the gates block independently rather than collectively.
@@ -125,6 +126,11 @@ def _fully_valid_validation_kwargs(**overrides):
         "persistence_scans": 3,
         "prior_observation_count": 5,
         "duplicate_state_detected": False,
+        # N-of-M corroboration: mandatory integrity alone is not QUALIFIED.
+        "native_flow_available": True,
+        "cross_venue_available": True,
+        "depth_slippage_available": True,
+        "volatility_regime": 55.0,
     }
     kwargs.update(overrides)
     return kwargs
@@ -519,12 +525,43 @@ def test_soft_unavailable_evidence_does_not_terminally_reject():
             native_flow_available=False,
             cross_venue_available=False,
             depth_slippage_available=False,
+            volatility_regime=None,
+            prior_observation_count=5,
+            signal_quality_history_continuous=True,
         )
     )
 
-    assert report.evidence_grade is EvidenceGrade.QUALIFIED
+    # Soft unavailable never REJECTS; without enough corroborating families
+    # the grade stops short of QUALIFIED.
+    assert report.evidence_grade is not EvidenceGrade.REJECTED
     assert "native_flow_evidence" in report.soft_unavailable
     assert "native_flow_evidence" not in report.blocking_failures
+
+
+def test_mandatory_pass_without_corroboration_is_not_qualified():
+    from app.opip.early.validation_parity import MANDATORY_CHECKS, ValidationResult
+
+    # Persistence is mandatory and requires a real prior window; keep it
+    # passing while stripping every soft/confidence corroborating family.
+    report = evaluate_early_watch_validations(
+        **_fully_valid_validation_kwargs(
+            native_flow_available=False,
+            cross_venue_available=False,
+            depth_slippage_available=False,
+            volatility_regime=None,
+            prior_observation_count=5,
+            persistence_scans=3,
+            signal_quality_history_continuous=False,
+            relative_strength_percentile=None,
+            rank_velocity=None,
+        )
+    )
+
+    for name in MANDATORY_CHECKS:
+        assert report.result_for(name) is ValidationResult.PASS
+    # At most one soft family (prior_observation) may pass; that is below
+    # MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED.
+    assert report.evidence_grade is not EvidenceGrade.QUALIFIED
 
 
 def test_advisory_evidence_alone_cannot_promote():
@@ -1109,6 +1146,7 @@ def test_every_issue_223_flag_defaults_dark():
     assert state == {
         flags.VALIDATION_PARITY_FLAG: False,
         flags.SELECTOR_PROMOTED_FLAG: False,
+        flags.HISTORY_CAPTURE_FLAG: False,
         flags.SELECTOR_SHADOW_FLAG: False,
         flags.TIMEFRAME_SHADOW_FLAG: False,
         flags.TIMING_LEDGER_FLAG: False,
@@ -1219,6 +1257,8 @@ def test_delta_features_are_unavailable_on_a_first_sighting():
     features = derive_delta_features([{"observed_at": DECISION_AT.isoformat()}])
 
     assert features["relative_volume_change"] is None
+    assert features["rolling_24h_volume_change"] is None
+    assert features["trade_count_acceleration"] is None
     assert features["momentum_acceleration"] is None
     assert features["prior_observation_count"] == 0
 
@@ -1252,10 +1292,12 @@ def test_delta_features_are_derived_from_existing_observation_history():
 
     features = derive_delta_features(rows)
 
-    assert features["relative_volume_change"] == pytest.approx(0.5)
+    # Rolling 24h volume change is an uncalibrated proxy, not true rvol.
+    assert features["relative_volume_change"] is None
+    assert features["trade_count_acceleration"] is None
+    assert features["rolling_24h_volume_change"] == pytest.approx(0.5)
     assert features["base_displacement_velocity_pct"] == pytest.approx(4.0)
     assert features["distance_to_high_velocity_pct"] == pytest.approx(3.0)
-    # Return went from +1.0% to ~+3.96% per interval: genuine acceleration.
     assert features["momentum_acceleration"] > 0
     assert features["prior_observation_count"] == 2
 

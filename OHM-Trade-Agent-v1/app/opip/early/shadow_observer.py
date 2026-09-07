@@ -50,6 +50,7 @@ from app.opip.early.timing_ledger import (
     record_card_edited,
     record_milestone,
     record_notification_delivered,
+    resolve_episode_ledger,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,9 +142,17 @@ def derive_delta_features(
     Returns ``None`` for anything the history cannot support. A first sighting
     yields all-``None``, which the cohort selector treats as non-admission
     rather than as a zero.
+
+    ``rolling_24h_volume_change`` is the scan-to-scan change in Kraken's
+    rolling 24h volume field. It is deliberately *not* named
+    ``relative_volume_change``: that would claim interval relative-volume
+    acceleration the history does not contain. ``trade_count_acceleration``
+    stays ``None`` until a genuine source supplies it.
     """
     empty: dict[str, float | None] = {
         "relative_volume_change": None,
+        "rolling_24h_volume_change": None,
+        "trade_count_acceleration": None,
         "momentum_acceleration": None,
         "distance_to_high_velocity_pct": None,
         "base_displacement_velocity_pct": None,
@@ -163,7 +172,7 @@ def derive_delta_features(
     prior_distance = _finite_optional(prior.get("distance_from_24h_high_pct"))
 
     features: dict[str, float | None] = dict(empty)
-    features["relative_volume_change"] = (
+    features["rolling_24h_volume_change"] = (
         volume_ratio / 100.0 if volume_ratio is not None else None
     )
     if latest_lift is not None and prior_lift is not None:
@@ -180,6 +189,20 @@ def derive_delta_features(
     return features
 
 
+def _history_rows_for(
+    history: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    base_asset: str,
+    primary_pair: str,
+) -> Sequence[Mapping[str, Any]]:
+    """Look up history by pair symbol first, then by base asset."""
+    for key in (primary_pair.upper(), base_asset.upper(), f"{base_asset.upper()}USD"):
+        rows = history.get(key)
+        if rows:
+            return rows
+    return ()
+
+
 def candidate_features_from_movers(
     movers: Iterable[Any],
     *,
@@ -194,11 +217,14 @@ def candidate_features_from_movers(
     rows: list[EarlyCandidateFeatures] = []
     for mover in movers:
         base = str(getattr(mover, "base_asset", "") or "").upper()
-        deltas = derive_delta_features(resolved_history.get(base, ()))
+        pair = str(getattr(mover, "primary_pair", "") or base).upper()
+        deltas = derive_delta_features(
+            _history_rows_for(resolved_history, base_asset=base, primary_pair=pair)
+        )
         assert_point_in_time_safe(deltas)
         rows.append(
             EarlyCandidateFeatures(
-                identifier=str(getattr(mover, "primary_pair", "") or base),
+                identifier=pair or base,
                 base_asset=base,
                 lift_from_24h_low_pct=_finite_optional(
                     getattr(mover, "lift_from_24h_low_pct", None)
@@ -211,6 +237,8 @@ def candidate_features_from_movers(
                 notional_usd=_finite_optional(getattr(mover, "notional_24h_usd_approx", None))
                 or 0.0,
                 relative_volume_change=deltas["relative_volume_change"],
+                rolling_24h_volume_change=deltas["rolling_24h_volume_change"],
+                trade_count_acceleration=deltas["trade_count_acceleration"],
                 momentum_acceleration=deltas["momentum_acceleration"],
                 distance_to_high_velocity_pct=deltas["distance_to_high_velocity_pct"],
                 base_displacement_velocity_pct=deltas["base_displacement_velocity_pct"],
@@ -333,12 +361,23 @@ def _save_ledger_state(
 ) -> None:
     target = Path(path or TIMING_LEDGER_STATE_FILE)
     retained: dict[str, Any] = {}
+    index = state.get("_symbol_episode_index")
+    live_episode_ids: set[str] = set()
     for key, row in state.items():
+        if key == "_symbol_episode_index":
+            continue
         if not isinstance(row, Mapping):
             continue
         seen = _latest_milestone_moment(row)
         if seen is None or (now - seen).total_seconds() <= LEDGER_STATE_RETENTION_SECONDS:
             retained[str(key)] = dict(row)
+            live_episode_ids.add(str(key))
+    if isinstance(index, Mapping):
+        retained["_symbol_episode_index"] = {
+            str(symbol): str(episode_id)
+            for symbol, episode_id in index.items()
+            if str(episode_id) in live_episode_ids
+        }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(retained, sort_keys=True), encoding="utf-8")
@@ -365,22 +404,39 @@ def observe_timing_milestones(
     creation would be wrong.
     """
     state = _load_ledger_state(state_path)
+    # Symbol -> current episode_id index, kept alongside ledgers keyed by episode.
+    index = state.get("_symbol_episode_index")
+    if not isinstance(index, dict):
+        index = {}
     rows: list[dict[str, Any]] = []
     for signal in signals:
         symbol = str(getattr(signal, "symbol", "") or "")
         if not symbol:
             continue
         key = symbol.upper()
-        existing = state.get(key)
-        ledger = (
-            ledger_from_dict(existing)
-            if isinstance(existing, Mapping)
-            else EpisodeTimingLedger(symbol=key, episode_id=key)
+        phase = getattr(signal, "market_phase", None)
+        current_episode_id = str(index.get(key) or "")
+        existing = (
+            ledger_from_dict(state[current_episode_id])
+            if current_episode_id and isinstance(state.get(current_episode_id), Mapping)
+            else None
+        )
+        # Legacy rows keyed by symbol alone are migrated into a real episode id
+        # on first touch so two separate moves cannot keep sharing them.
+        if existing is None and isinstance(state.get(key), Mapping):
+            legacy = ledger_from_dict(state[key])
+            if legacy.episode_id == key or not legacy.episode_id:
+                existing = legacy
+        ledger = resolve_episode_ledger(
+            symbol=key,
+            decision_at=decision_at,
+            phase=phase,
+            existing=existing,
         )
         reference_price = _finite_optional(getattr(signal, "reference_price", None))
         ledger = observe_phase(
             ledger,
-            phase=getattr(signal, "market_phase", None),
+            phase=phase,
             grade=getattr(signal, "evidence_grade", None),
             observed_at=decision_at,
             reference_price=reference_price,
@@ -402,8 +458,13 @@ def observe_timing_milestones(
                 "decision_at": _iso(decision_at),
             }
         )
-        state[key] = ledger.as_dict()
+        state[ledger.episode_id] = ledger.as_dict()
+        index[key] = ledger.episode_id
+        # Drop the legacy symbol-keyed row once migrated.
+        if key in state and key != ledger.episode_id:
+            state.pop(key, None)
         rows.append(payload)
+    state["_symbol_episode_index"] = index
     _save_ledger_state(state, path=state_path, now=decision_at)
     return rows
 
@@ -435,15 +496,18 @@ def record_card_delivery_outcomes(
     moment = decision_at or datetime.now(timezone.utc)
     prices = dict(anchor_prices or {})
     state = _load_ledger_state(state_path)
+    index = state.get("_symbol_episode_index")
+    if not isinstance(index, dict):
+        index = {}
     rows: list[dict[str, Any]] = []
     for symbol, outcome in delivery_by_symbol.items():
         key = str(symbol).upper()
         action = str(outcome[0]) if isinstance(outcome, (tuple, list)) and outcome else ""
-        existing = state.get(key)
-        ledger = (
-            ledger_from_dict(existing)
-            if isinstance(existing, Mapping)
-            else EpisodeTimingLedger(symbol=key, episode_id=key)
+        episode_id = str(index.get(key) or "")
+        existing_row = state.get(episode_id) if episode_id else state.get(key)
+        existing = ledger_from_dict(existing_row) if isinstance(existing_row, Mapping) else None
+        ledger = resolve_episode_ledger(
+            symbol=key, decision_at=moment, existing=existing
         )
         if action in DELIVERED_ACTIONS:
             ledger = record_card_created(ledger, created_at=moment)
@@ -463,8 +527,12 @@ def record_card_delivery_outcomes(
                 "governor_action": action,
             }
         )
-        state[key] = ledger.as_dict()
+        state[ledger.episode_id] = ledger.as_dict()
+        index[key] = ledger.episode_id
+        if key in state and key != ledger.episode_id:
+            state.pop(key, None)
         rows.append(payload)
+    state["_symbol_episode_index"] = index
     _save_ledger_state(state, path=state_path, now=moment)
     return rows
 

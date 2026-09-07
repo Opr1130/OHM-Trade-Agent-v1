@@ -532,6 +532,34 @@ def main() -> None:
         cohort_id="EARLY_WATCH",
         decision_at=decision_at,
     )
+    # Point-in-time prior-observation / persistence from the existing
+    # full-universe history. Never synthesised: a first sighting stays empty.
+    try:
+        from app.opip.early.observation_context import build_observation_context
+        from app.opip.early.shadow_observer import load_observation_history
+
+        observation_context = build_observation_context()
+        observation_history = load_observation_history()
+    except Exception as exc:
+        from types import SimpleNamespace
+
+        observation_context = SimpleNamespace(
+            prior_observation_counts={},
+            persistence_scans={},
+        )
+        observation_history = {}
+        logger.warning(
+            "O'Pip early observation context failed open: %s",
+            type(exc).__name__,
+        )
+    # selector_promoted / validation_parity default to their dark flags inside
+    # scan_early_movers. Do not auto-enable either from evaluate_promotion.
+    scan_kwargs = {
+        "decision_at": decision_at,
+        "prior_observation_counts": observation_context.prior_observation_counts,
+        "persistence_scans": observation_context.persistence_scans,
+        "observation_history": observation_history,
+    }
     if screening_enabled:
         screening_callback = _screening_capture_callback(
             rows=screening_rows,
@@ -542,6 +570,7 @@ def main() -> None:
             on_coarse_evaluated=screening_callback,
             on_evaluated=screening_callback,
             scan_id=screening_scan_id,
+            **scan_kwargs,
         )
         append_screening_evaluations(screening_rows, enabled=True)
         observed_universe = next(
@@ -564,8 +593,9 @@ def main() -> None:
                 type(exc).__name__,
             )
     else:
-        # Keep the historical call signature on the default-dark path.
-        coarse, signals = scan_early_movers()
+        # Keep the historical call signature on the default-dark path, but
+        # still pass real observation context so validation parity can use it.
+        coarse, signals = scan_early_movers(**scan_kwargs)
 
     try:
         queue_added, queue_failures = _enqueue_wave9_monitoring(

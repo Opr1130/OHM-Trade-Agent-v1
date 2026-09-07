@@ -94,6 +94,10 @@ class EarlyCandidateFeatures:
     notional_usd: float
     relative_volume: float | None = None
     relative_volume_change: float | None = None
+    #: Uncalibrated scan-to-scan change in rolling 24h volume. Not interval
+    #: relative-volume acceleration; kept distinct so ignition can use it as a
+    #: proxy without pretending it is true rvol change.
+    rolling_24h_volume_change: float | None = None
     trade_count_acceleration: float | None = None
     momentum_acceleration: float | None = None
     atr_percentile: float | None = None
@@ -121,6 +125,7 @@ class EarlyCandidateFeatures:
             "notional_usd": _finite_optional(self.notional_usd),
             "relative_volume": _finite_optional(self.relative_volume),
             "relative_volume_change": _finite_optional(self.relative_volume_change),
+            "rolling_24h_volume_change": _finite_optional(self.rolling_24h_volume_change),
             "trade_count_acceleration": _finite_optional(self.trade_count_acceleration),
             "momentum_acceleration": _finite_optional(self.momentum_acceleration),
             "atr_percentile_change": _finite_optional(self.atr_percentile_change),
@@ -225,12 +230,21 @@ def _ignition_assignment(row: EarlyCandidateFeatures) -> CohortAssignment | None
     """Earliest cohort: acceleration or volume expansion before the move runs.
 
     Requires at least one delta feature, so it cannot admit a candidate purely
-    because its level is already high.
+    because its level is already high. ``rolling_24h_volume_change`` is an
+    uncalibrated proxy from consecutive full-market scans — not true interval
+    relative-volume acceleration. ``trade_count_acceleration`` and genuine
+    ``relative_volume_change`` stay ``None`` unless a real source populates them.
     """
     acceleration = _finite_optional(row.momentum_acceleration)
     volume_change = _finite_optional(row.relative_volume_change)
+    rolling_volume_change = _finite_optional(row.rolling_24h_volume_change)
     trade_accel = _finite_optional(row.trade_count_acceleration)
-    if acceleration is None and volume_change is None and trade_accel is None:
+    if (
+        acceleration is None
+        and volume_change is None
+        and rolling_volume_change is None
+        and trade_accel is None
+    ):
         return None
     if row.extended:
         return None
@@ -243,6 +257,11 @@ def _ignition_assignment(row: EarlyCandidateFeatures) -> CohortAssignment | None
     if volume_change is not None and volume_change >= 0.20:
         score += min(24.0, volume_change * 24.0)
         reasons.append(f"relative volume change {volume_change:+.2f}x")
+    elif rolling_volume_change is not None and rolling_volume_change >= 0.20:
+        score += min(18.0, rolling_volume_change * 18.0)
+        reasons.append(
+            f"rolling 24h volume change {rolling_volume_change:+.2f}x (uncalibrated proxy)"
+        )
     if trade_accel is not None and trade_accel >= 1.25:
         score += min(20.0, (trade_accel - 1.0) * 16.0)
         reasons.append(f"trade-count acceleration {trade_accel:.2f}x")

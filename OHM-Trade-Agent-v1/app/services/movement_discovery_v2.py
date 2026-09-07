@@ -6,11 +6,17 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from app.exchanges.kraken import KrakenClient
-from app.opip.early.flags import early_validation_parity_enabled
-from app.opip.early.shadow_observer import observe_scan_shadow, persist_shadow_rows
+from app.opip.early.flags import early_selector_promoted, early_validation_parity_enabled
+from app.opip.early.shadow_observer import (
+    candidate_features_from_movers,
+    load_observation_history,
+    observe_scan_shadow,
+    persist_shadow_rows,
+)
+from app.opip.early.cohort_selector import select_early_candidates
 from app.opip.early.stage0_evidence import (
     ScoreComponents,
     Stage0DecisionFeatures,
@@ -177,6 +183,11 @@ class EarlyMoverSignal:
     discovery_score_raw: float = 0.0
     qualification_blocking_failures: tuple[str, ...] = ()
     actionability_reasons: tuple[str, ...] = ()
+    # Decision-time volatility percentiles, retained so the timeframe shadow
+    # experiment compares real values rather than manufacturing an inversion
+    # from None defaults.
+    bollinger_bandwidth_percentile: float | None = None
+    atr_percentile: float | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -188,6 +199,36 @@ class EarlyMoverSignal:
         payload = asdict(self)
         payload["fingerprint"] = self.fingerprint
         return payload
+
+
+@dataclass(frozen=True)
+class DeepEvaluationRejection:
+    """Deep analysis ran but the discovery score did not advance.
+
+    Distinct from ``None`` (malformed inputs): this carries the achieved score
+    and component breakdown so a ``BELOW_THRESHOLD`` screening row can
+    reconstruct the margin without changing the promotion decision.
+    """
+
+    achieved_score: float
+    required_score: float
+    discovery_score_raw: float
+    components: Mapping[str, float]
+    blocking_reason: str = "deep_discovery_score_below_minimum"
+    failed_predicates: tuple[str, ...] = ("deep_discovery_score_below_minimum",)
+
+    @property
+    def score_margin(self) -> float:
+        return float(self.achieved_score) - float(self.required_score)
+
+    def as_score_components(self) -> ScoreComponents:
+        return ScoreComponents(
+            achieved_score=float(self.achieved_score),
+            required_score=float(self.required_score),
+            components=dict(self.components),
+            failed_predicates=self.failed_predicates,
+            blocking_reason=self.blocking_reason,
+        )
 
 
 def _pct(current: float, reference: float) -> float:
@@ -522,9 +563,18 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                          prior_observation_count: int | None = None,
                          persistence_scans: int | None = None,
                          native_flow_available: bool | None = None,
+                         cross_venue_available: bool | None = None,
+                         depth_slippage_available: bool | None = None,
+                         symbol_identity_resolved: bool | None = None,
                          duplicate_state_detected: bool | None = None,
-                         validation_parity_enabled: bool | None = None) -> EarlyMoverSignal | None:
-    """Score discovery separately from continuation and entry quality."""
+                         validation_parity_enabled: bool | None = None,
+                         ) -> EarlyMoverSignal | DeepEvaluationRejection | None:
+    """Score discovery separately from continuation and entry quality.
+
+    Returns ``DeepEvaluationRejection`` (not ``None``) when the deep score is
+    computed but below the advance threshold, so Stage-0 can persist the
+    achieved score and margin. ``None`` remains reserved for malformed inputs.
+    """
     try:
         one_hour = float(snapshot.confirmed_price_change_1h_pct)
         six_hour = float(snapshot.momentum_6h_pct)
@@ -542,34 +592,40 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
     score = 0
     reasons: list[str] = []
     warnings: list[str] = []
+    components: dict[str, float] = {}
 
     if one_hour >= 2.0:
-        score += 30; reasons.append(f"1h momentum is accelerating at {one_hour:+.2f}%")
+        score += 30; reasons.append(f"1h momentum is accelerating at {one_hour:+.2f}%"); components["momentum_1h"] = 30.0
     elif one_hour >= 0.75:
-        score += 20; reasons.append(f"1h momentum is positive at {one_hour:+.2f}%")
+        score += 20; reasons.append(f"1h momentum is positive at {one_hour:+.2f}%"); components["momentum_1h"] = 20.0
     if six_hour >= 4.0:
-        score += 25; reasons.append(f"6h momentum is strong at {six_hour:+.2f}%")
+        score += 25; reasons.append(f"6h momentum is strong at {six_hour:+.2f}%"); components["momentum_6h"] = 25.0
     elif six_hour >= 2.0:
-        score += 18; reasons.append(f"6h momentum is building at {six_hour:+.2f}%")
+        score += 18; reasons.append(f"6h momentum is building at {six_hour:+.2f}%"); components["momentum_6h"] = 18.0
     if day >= 8.0:
-        score += 20; reasons.append(f"24h momentum is strong at {day:+.2f}%")
+        score += 20; reasons.append(f"24h momentum is strong at {day:+.2f}%"); components["momentum_24h"] = 20.0
     elif day >= 4.0:
-        score += 14; reasons.append(f"24h momentum is positive at {day:+.2f}%")
+        score += 14; reasons.append(f"24h momentum is positive at {day:+.2f}%"); components["momentum_24h"] = 14.0
     if volume >= 2.5:
-        score += 20; reasons.append(f"relative volume expanded to {volume:.2f}x")
+        score += 20; reasons.append(f"relative volume expanded to {volume:.2f}x"); components["relative_volume"] = 20.0
     elif volume >= 1.5:
-        score += 14; reasons.append(f"relative volume is elevated at {volume:.2f}x")
+        score += 14; reasons.append(f"relative volume is elevated at {volume:.2f}x"); components["relative_volume"] = 14.0
     if near_high <= 2.0:
-        score += 10; reasons.append(f"price is within {near_high:.2f}% of its 24h high")
+        score += 10; reasons.append(f"price is within {near_high:.2f}% of its 24h high"); components["near_high"] = 10.0
     if snapshot.trend == "bullish":
-        score += 8; reasons.append("EMA structure is bullish")
+        score += 8; reasons.append("EMA structure is bullish"); components["trend_bullish"] = 8.0
     # Retain the unclamped additive total before bounding. The bounded value
     # keeps its exact historical meaning; the raw total restores the
     # cross-sectional information that saturation at 100 destroys.
     discovery_score_raw = float(score)
     score = min(100, score)
     if score < MIN_DEEP_DISCOVERY_SCORE:
-        return None
+        return DeepEvaluationRejection(
+            achieved_score=float(score),
+            required_score=float(MIN_DEEP_DISCOVERY_SCORE),
+            discovery_score_raw=discovery_score_raw,
+            components=components,
+        )
 
     state = _momentum_state(one_hour, six_hour, day)
     continuation = score
@@ -638,7 +694,9 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
     )
     validation = evaluate_early_watch_validations(
         market_data_validation=getattr(snapshot, "market_data_validation", None),
-        symbol_identity_resolved=bool(coarse.base_asset),
+        symbol_identity_resolved=_resolve_symbol_identity(
+            coarse, snapshot, explicit=symbol_identity_resolved
+        ),
         completed_candle_count=getattr(
             getattr(snapshot, "market_data_validation", None), "candle_count", None
         ),
@@ -656,12 +714,27 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         ),
         ticker_bid=coarse.ticker_bid or None,
         ticker_ask=coarse.ticker_ask or None,
+        spread_pct=_spread_pct_from_snapshot(snapshot, coarse),
         # Every value above cleared this function's own math.isfinite guard.
         finite_features=True,
         duplicate_state_detected=duplicate_state_detected,
         persistence_scans=persistence_scans,
         prior_observation_count=prior_observation_count,
-        native_flow_available=native_flow_available,
+        native_flow_available=(
+            native_flow_available
+            if native_flow_available is not None
+            else _native_flow_available_from_snapshot(snapshot)
+        ),
+        cross_venue_available=(
+            cross_venue_available
+            if cross_venue_available is not None
+            else _cross_venue_available_from_snapshot(snapshot)
+        ),
+        depth_slippage_available=(
+            depth_slippage_available
+            if depth_slippage_available is not None
+            else _depth_slippage_available_from_snapshot(snapshot)
+        ),
         relative_strength_percentile=None,
         volatility_regime=getattr(snapshot, "atr_percentile", None),
         social_available=social_evidence.available if social_evidence is not None else None,
@@ -691,6 +764,17 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
         not parity or validation.evidence_grade is EvidenceGrade.QUALIFIED
     )
 
+    bandwidth = getattr(snapshot, "bollinger_bandwidth_percentile", None)
+    atr = getattr(snapshot, "atr_percentile", None)
+    try:
+        bandwidth_value = float(bandwidth) if bandwidth is not None else None
+    except (TypeError, ValueError):
+        bandwidth_value = None
+    try:
+        atr_value = float(atr) if atr is not None else None
+    except (TypeError, ValueError):
+        atr_value = None
+
     return EarlyMoverSignal(VERSION, snapshot.symbol, coarse.base_asset, stage, "LONG", score, False,
                             continuation, False, entry_quality, recommendation, state, round(one_hour, 4),
                             round(six_hour, 4), round(day, 4), round(volume, 4), round(near_high, 4),
@@ -704,7 +788,87 @@ def evaluate_early_mover(snapshot: MarketSnapshot, coarse: CoarseMover, *, flow_
                             continuation_score_raw=round(continuation_score_raw, 4),
                             discovery_score_raw=round(discovery_score_raw, 4),
                             qualification_blocking_failures=validation.blocking_failures,
-                            actionability_reasons=validation.actionability_reasons)
+                            actionability_reasons=validation.actionability_reasons,
+                            bollinger_bandwidth_percentile=bandwidth_value,
+                            atr_percentile=atr_value)
+
+
+def _resolve_symbol_identity(
+    coarse: CoarseMover,
+    snapshot: MarketSnapshot,
+    *,
+    explicit: bool | None,
+) -> bool | None:
+    """Canonical identity for qualification — never ``bool(base_asset)``.
+
+    A non-empty base-asset string is necessary but not sufficient. Prefer an
+    explicit caller resolution, then the snapshot's independent market
+    reference, then a strict primary-pair / base-asset consistency check.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    reference = getattr(snapshot, "independent_market_reference", None)
+    if reference is not None:
+        status = str(getattr(reference, "status", "") or "").upper()
+        if status in {"RESOLVED", "PASS", "MATCH", "OK"}:
+            return True
+        if status in {"AMBIGUOUS", "FAIL", "REJECT", "UNRESOLVED"}:
+            return False
+        return True
+    base = str(coarse.base_asset or "").strip().upper()
+    pair = str(coarse.primary_pair or getattr(snapshot, "symbol", "") or "").strip().upper()
+    if not base or not pair:
+        return None
+    if not pair.startswith(base):
+        return False
+    return True
+
+
+def _spread_pct_from_snapshot(snapshot: MarketSnapshot, coarse: CoarseMover) -> float | None:
+    execution = getattr(snapshot, "execution_validation", None)
+    spread = getattr(execution, "spread_pct", None) if execution is not None else None
+    if spread is not None:
+        try:
+            parsed = float(spread)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and math.isfinite(parsed):
+            return parsed
+    bid = coarse.ticker_bid
+    ask = coarse.ticker_ask
+    if bid > 0 and ask > 0 and ask > bid:
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / mid * 100.0 if mid > 0 else None
+    return None
+
+
+def _native_flow_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+    metrics = getattr(snapshot, "native_flow_metrics", None)
+    if metrics is None:
+        return None
+    return bool(getattr(metrics, "available", True))
+
+
+def _cross_venue_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+    reference = getattr(snapshot, "independent_market_reference", None)
+    if reference is None:
+        # Cross-pair confirmation on the same venue is weaker than an
+        # independent venue, but it is real corroborating evidence when present.
+        status = str(getattr(snapshot, "cross_pair_price_status", "") or "").upper()
+        if status in {"NORMAL", "WARNING", "MATERIAL_DIVERGENCE"}:
+            return True
+        return None
+    return True
+
+
+def _depth_slippage_available_from_snapshot(snapshot: MarketSnapshot) -> bool | None:
+    execution = getattr(snapshot, "execution_validation", None)
+    if execution is None:
+        return None
+    status = str(getattr(execution, "status", "") or "").upper()
+    if status in {"UNAVAILABLE"}:
+        return False
+    return True
 
 
 def universe_context_for(mover: CoarseMover) -> UniverseAsset:
@@ -732,6 +896,47 @@ def universe_context_for(mover: CoarseMover) -> UniverseAsset:
     )
 
 
+def apply_promoted_selector(
+    ranked: Sequence[CoarseMover],
+    *,
+    max_candidates: int,
+    history: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+) -> list[CoarseMover]:
+    """Re-select from the full coarse-passing universe with reserved cohorts.
+
+    Production Stage-0 still runs the legacy ranker first so every truncated
+    candidate retains reconstructable evidence. When the promotion flag is on,
+    this function reallocates the *same* total budget across reserved cohorts
+    so already-extended movers cannot monopolise every slot. It never widens
+    ``max_candidates``.
+    """
+    budget = max(0, int(max_candidates))
+    if not ranked or budget == 0:
+        return []
+    features = candidate_features_from_movers(ranked, history=history)
+    selection = select_early_candidates(
+        features,
+        total_candidates=budget,
+        universe_count=ranked[0].universe_count if ranked else len(ranked),
+    )
+    by_pair = {item.primary_pair: item for item in ranked}
+    by_base = {item.base_asset.upper(): item for item in ranked}
+    selected: list[CoarseMover] = []
+    claimed: set[str] = set()
+    for item in selection.selected:
+        mover = by_pair.get(item.identifier) or by_base.get(item.base_asset.upper())
+        if mover is None:
+            continue
+        key = mover.base_asset.upper()
+        if key in claimed:
+            continue
+        claimed.add(key)
+        selected.append(mover)
+        if len(selected) >= budget:
+            break
+    return selected
+
+
 def scan_early_movers(
     client: KrakenClient | None = None,
     *,
@@ -743,12 +948,19 @@ def scan_early_movers(
     prior_observation_counts: Mapping[str, int] | None = None,
     persistence_scans: Mapping[str, int] | None = None,
     validation_parity_enabled: bool | None = None,
+    selector_promoted: bool | None = None,
+    observation_history: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ):
     decision_at = decision_at or datetime.now(timezone.utc)
     parity = (
         early_validation_parity_enabled()
         if validation_parity_enabled is None
         else bool(validation_parity_enabled)
+    )
+    promoted = (
+        early_selector_promoted()
+        if selector_promoted is None
+        else bool(selector_promoted)
     )
     priors = dict(prior_observation_counts or {})
     persistence = dict(persistence_scans or {})
@@ -761,6 +973,20 @@ def scan_early_movers(
         decision_at=decision_at,
         on_ranked=ranked.extend,
     )
+    # Authoritative reserved-cohort selection. Dark by default: when the flag
+    # is false the legacy top-N list is byte-identical. evaluate_promotion is
+    # never consulted here; a human still has to flip the flag.
+    if promoted and ranked:
+        history = (
+            observation_history
+            if observation_history is not None
+            else load_observation_history()
+        )
+        coarse = apply_promoted_selector(
+            ranked,
+            max_candidates=max_candidates,
+            history=history,
+        )
     signals: list[EarlyMoverSignal] = []
     # A base asset quoted in both USD and USDT yields two coarse movers, so
     # duplicate candidate state is structurally possible. Detecting it here is
@@ -780,6 +1006,8 @@ def scan_early_movers(
             if parity
             else analyze_symbol(mover.primary_pair)
         )
+        if parity and snapshot is not None:
+            _enrich_bounded_candidate_evidence(snapshot, mover, client=client)
         features = Stage0DecisionFeatures(
             lift_from_24h_low_pct=mover.lift_from_24h_low_pct,
             distance_from_24h_high_pct=mover.distance_from_24h_high_pct,
@@ -817,7 +1045,7 @@ def scan_early_movers(
                 scan_id=scan_id,
             )
             continue
-        signal = evaluate_early_mover(
+        result = evaluate_early_mover(
             snapshot,
             mover,
             prior_observation_count=priors.get(mover.base_asset.upper()),
@@ -825,19 +1053,37 @@ def scan_early_movers(
             duplicate_state_detected=duplicate_state,
             validation_parity_enabled=parity,
         )
-        if signal is None:
+        if isinstance(result, DeepEvaluationRejection):
             _emit_screening_fail_soft(
                 on_evaluated,
                 {
                     "raw_identifier": mover.primary_pair,
                     "outcome": "BELOW_THRESHOLD",
+                    "long_score": result.achieved_score,
                     "reason": "deep early-mover score did not advance",
+                    "metadata": build_below_threshold_metadata(
+                        universe_count=mover.universe_count,
+                        features=features,
+                        score=result.as_score_components(),
+                        base_metadata={"universe_count": mover.universe_count},
+                    ),
+                },
+                scan_id=scan_id,
+            )
+            continue
+        if result is None:
+            _emit_screening_fail_soft(
+                on_evaluated,
+                {
+                    "raw_identifier": mover.primary_pair,
+                    "outcome": "BELOW_THRESHOLD",
+                    "reason": "deep early-mover inputs were malformed",
                     "metadata": build_below_threshold_metadata(
                         universe_count=mover.universe_count,
                         features=features,
                         score=ScoreComponents(
                             required_score=MIN_DEEP_DISCOVERY_SCORE,
-                            blocking_reason="deep_discovery_score_below_minimum",
+                            blocking_reason="deep_discovery_inputs_malformed",
                         ),
                         base_metadata={"universe_count": mover.universe_count},
                     ),
@@ -845,6 +1091,7 @@ def scan_early_movers(
                 scan_id=scan_id,
             )
             continue
+        signal = result
         signals.append(signal)
         _emit_screening_fail_soft(
             on_evaluated,
@@ -898,9 +1145,48 @@ def scan_early_movers(
             universe_count=coarse[0].universe_count if coarse else 0,
             scan_id=scan_id,
             decision_at=decision_at,
+            history=observation_history,
         )
     )
     return coarse, signals
+
+
+def _enrich_bounded_candidate_evidence(
+    snapshot: MarketSnapshot,
+    mover: CoarseMover,
+    *,
+    client: KrakenClient | None,
+) -> None:
+    """Attach execution/depth evidence for one deep candidate when missing.
+
+    Full-universe observation stays cheap. Expensive PreTrade book reads run
+    only on the already-bounded deep set, fail soft, and never invent a pass.
+    """
+    if getattr(snapshot, "execution_validation", None) is not None:
+        return
+    try:
+        from app.scanner.execution_validation import evaluate_execution, unavailable_execution
+    except Exception:
+        return
+    symbol = mover.kraken_public_symbol or mover.primary_pair
+    try:
+        active = client or KrakenClient()
+        book = active.get_pre_trade(symbol)
+        try:
+            trades = active.get_post_trade(symbol, count=50)
+        except Exception:
+            trades = None
+        snapshot.execution_validation = evaluate_execution(
+            book=book,
+            validation_notional_usd=max(100.0, min(2_500.0, mover.notional_24h_usd_approx * 0.001)),
+            ticker_last=mover.last_price,
+            quote_to_usd_rate=1.0,
+            trades=trades,
+        )
+    except Exception as exc:
+        snapshot.execution_validation = unavailable_execution(
+            f"PreTrade unavailable: {type(exc).__name__}"
+        )
 
 
 def append_detection_snapshots(signals: list[EarlyMoverSignal], *, path: str = DEFAULT_LEARNING_PATH) -> int:
@@ -921,14 +1207,19 @@ def format_early_mover_message(signal: EarlyMoverSignal) -> str:
     warning = "; ".join(str(item) for item in signal.warnings[:2])
     reason = "; ".join(str(item) for item in signal.reasons[:3]) or "Early movement conditions detected"
     caution = f" | Caution: {warning}" if warning else ""
+    from app.opip.early.taxonomy import is_early_phase
+
+    early = is_early_phase(signal.market_phase or "")
+    headline = "EARLY WATCH" if early else "MARKET WATCH"
+    action_label = "EARLY WATCH ONLY" if early else "WATCH ONLY"
     return (
-        f"🚀 EARLY WATCH — {display_market_label(signal.symbol)} — {signal.stage}\n"
+        f"🚀 {headline} — {display_market_label(signal.symbol)} — {signal.stage}\n"
         f"Price: {signal.reference_price:.8g} | TF: {signal.detection_timeframe}\n"
         f"Momentum: 1h {signal.momentum_1h_pct:+.2f}% | 6h {signal.momentum_6h_pct:+.2f}% | 24h {signal.momentum_24h_pct:+.2f}%\n"
         f"Continuation*: {signal.continuation_confidence}/100 | Entry quality*: {signal.entry_quality}/100\n"
         f"Volume: {signal.relative_volume:.2f}x | Liquidity: ${signal.liquidity_24h_usd_approx:,.0f}/24h\n"
         f"Why now: {reason}{caution}\n"
-        f"Action: {signal.entry_recommendation.replace('_', ' ')} — EARLY WATCH ONLY; no entry is authorized\n"
+        f"Action: {signal.entry_recommendation.replace('_', ' ')} — {action_label}; no entry is authorized\n"
         "*Heuristic scores, not probabilities."
     )
 

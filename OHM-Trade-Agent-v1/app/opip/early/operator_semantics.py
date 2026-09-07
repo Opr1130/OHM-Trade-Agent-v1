@@ -33,7 +33,7 @@ from app.opip.early.taxonomy import (
     coerce_evidence_grade,
     coerce_market_phase,
     coerce_operator_disposition,
-    is_extended_phase,
+    is_early_phase,
 )
 
 OPERATOR_SEMANTICS_VERSION = "opip-early-operator-semantics-v1"
@@ -173,8 +173,13 @@ class OperatorAssessment:
 
     @property
     def claims_early_discovery(self) -> bool:
-        """Whether this assessment may use early-discovery wording at all."""
-        return not is_extended_phase(self.phase)
+        """Whether this assessment may use early-discovery wording at all.
+
+        ``EARLY WATCH`` is reserved for :data:`EARLY_PHASES` only
+        (``IGNITION``, ``EARLY_EXPANSION``). ``CONFIRMED_EXPANSION`` is not
+        early merely because it is not yet ``LATE_EXTENSION``.
+        """
+        return is_early_phase(self.phase)
 
     def as_dict(self) -> dict[str, Any]:
         return {

@@ -1,0 +1,658 @@
+"""Issue #224 review-fix integration tests.
+
+These exercise the integrated production paths (scan_early_movers,
+full_market_observation, card rendering, timing ledger), not helper-only
+builders.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from app.jobs import scan_movers
+from app.opip.early import flags
+from app.opip.early.cohort_selector import EarlyCandidateFeatures, select_early_candidates
+from app.opip.early.observation_context import build_observation_context
+from app.opip.early.operator_semantics import build_operator_assessment
+from app.opip.early.taxonomy import (
+    EvidenceGrade,
+    MarketPhase,
+    OperatorDisposition,
+    is_early_phase,
+)
+from app.opip.early.timing_ledger import (
+    early_episode_id,
+    resolve_episode_ledger,
+    should_reset_episode,
+)
+from app.opip.early.validation_parity import (
+    MANDATORY_CHECKS,
+    ValidationResult,
+    evaluate_early_watch_validations,
+)
+from app.scanner.market_data_validation import MarketDataValidation
+from app.services import full_market_observation as fmo
+from app.services import movement_discovery_v2 as discovery
+from app.services.full_market_observation import MarketObservation
+
+DECISION_AT = datetime(2026, 3, 4, 12, 0, tzinfo=timezone.utc)
+
+
+def _mover(
+    *,
+    base: str = "IGN",
+    pair: str | None = None,
+    lift: float = 3.0,
+    distance: float = 1.5,
+    notional: float = 800_000.0,
+    score: float = 40.0,
+    bid: float = 1.0,
+    ask: float = 1.001,
+) -> discovery.CoarseMover:
+    primary = pair or f"{base}USD"
+    return discovery.CoarseMover(
+        base_asset=base,
+        primary_pair=primary,
+        kraken_public_symbol=f"{base}/USD",
+        last_price=1.0,
+        volume_24h=100_000.0,
+        notional_24h_usd_approx=notional,
+        high_24h=1.02,
+        low_24h=0.95,
+        lift_from_24h_low_pct=lift,
+        distance_from_24h_high_pct=distance,
+        coarse_score=score,
+        universe_count=200,
+        ticker_bid=bid,
+        ticker_ask=ask,
+    )
+
+
+def _qualifying_snapshot(
+    *,
+    symbol: str = "IGNUSD",
+    one_hour: float = 2.5,
+    six_hour: float = 4.5,
+    day: float = 6.0,
+    volume: float = 2.8,
+    near_high: float = 1.0,
+    bandwidth: float = 25.0,
+    atr: float = 30.0,
+    ticker_last: float = 1.0,
+) -> SimpleNamespace:
+    validation = MarketDataValidation(
+        status="PASS",
+        qualified=True,
+        warnings=[],
+        rejection_reasons=[],
+        candle_count=720,
+        latest_candle_timestamp=int(DECISION_AT.timestamp()),
+        latest_candle_age_seconds=60.0,
+        duplicate_timestamp_count=0,
+        gap_count=0,
+        largest_gap_seconds=0.0,
+        invalid_ohlc_count=0,
+        non_finite_value_count=0,
+        ticker_last=ticker_last,
+        latest_ohlc_close=ticker_last,
+        ticker_vs_ohlc_difference_pct=0.1,
+        suspicious_spike_detected=False,
+    )
+    return SimpleNamespace(
+        symbol=symbol,
+        confirmed_price_change_1h_pct=one_hour,
+        momentum_6h_pct=six_hour,
+        momentum_24h_pct=day,
+        movement_volume_ratio=volume,
+        volume_ratio=volume,
+        distance_to_24h_high_pct=near_high,
+        trend="bullish",
+        last_price=ticker_last,
+        movement_timeframe="1H",
+        bollinger_bandwidth_percentile=bandwidth,
+        atr_percentile=atr,
+        market_data_validation=validation,
+        execution_validation=SimpleNamespace(
+            status="VALID",
+            spread_pct=0.1,
+            book_coverage_status="COMPLETE",
+        ),
+        independent_market_reference=SimpleNamespace(status="RESOLVED"),
+        native_flow_metrics=SimpleNamespace(available=True),
+        cross_pair_price_status="NORMAL",
+    )
+
+
+def test_selector_promoted_false_keeps_legacy_top_n_identical():
+    ranked = [
+        _mover(base=f"E{i}", lift=20.0 - i * 0.1, distance=0.2, score=100.0 - i)
+        for i in range(50)
+    ]
+    ranked.append(_mover(base="IGN1", lift=2.5, distance=2.0, score=5.0))
+    ranked.sort(key=lambda item: (-item.coarse_score, item.base_asset))
+    legacy = ranked[:40]
+
+    history = {
+        "IGN1USD": [
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=20)).isoformat(),
+                "last_price": 1.0,
+                "volume_24h": 1_000.0,
+                "lift_from_24h_low_pct": 1.0,
+                "distance_from_24h_high_pct": 3.0,
+            },
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=10)).isoformat(),
+                "last_price": 1.01,
+                "volume_24h": 1_500.0,
+                "lift_from_24h_low_pct": 1.5,
+                "distance_from_24h_high_pct": 2.5,
+            },
+            {
+                "observed_at": DECISION_AT.isoformat(),
+                "last_price": 1.05,
+                "volume_24h": 2_500.0,
+                "lift_from_24h_low_pct": 2.5,
+                "distance_from_24h_high_pct": 2.0,
+            },
+        ]
+    }
+
+    assert flags.early_selector_promoted({}) is False
+    assert [m.primary_pair for m in legacy] == [m.primary_pair for m in ranked[:40]]
+
+    promoted = discovery.apply_promoted_selector(
+        ranked, max_candidates=40, history=history
+    )
+    assert len(promoted) == 40
+    assert any(m.base_asset == "IGN1" for m in promoted)
+    assert all(m.base_asset != "IGN1" for m in legacy)
+
+
+def test_selector_promoted_true_changes_selection_without_widening_budget(monkeypatch):
+    ranked = [_mover(base=f"E{i}", lift=18.0, distance=0.3, score=90.0 - i) for i in range(45)]
+    ranked.append(_mover(base="IGN1", lift=2.4, distance=1.5, score=1.0))
+    history = {
+        "IGN1USD": [
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=20)).isoformat(),
+                "last_price": 1.0,
+                "volume_24h": 1_000.0,
+                "lift_from_24h_low_pct": 1.0,
+                "distance_from_24h_high_pct": 3.0,
+            },
+            {
+                "observed_at": DECISION_AT.isoformat(),
+                "last_price": 1.04,
+                "volume_24h": 2_000.0,
+                "lift_from_24h_low_pct": 2.4,
+                "distance_from_24h_high_pct": 1.5,
+            },
+        ]
+    }
+
+    def fake_discover(*args, **kwargs):
+        on_ranked = kwargs.get("on_ranked")
+        if on_ranked is not None:
+            on_ranked(list(ranked))
+        return ranked[:40]
+
+    monkeypatch.setattr(discovery, "discover_coarse_movers", fake_discover)
+    monkeypatch.setattr(
+        discovery,
+        "analyze_symbol",
+        lambda *a, **k: ("skip", None, "test"),
+    )
+
+    coarse_dark, _ = discovery.scan_early_movers(
+        max_candidates=40,
+        selector_promoted=False,
+        validation_parity_enabled=False,
+        observation_history=history,
+    )
+    coarse_lit, _ = discovery.scan_early_movers(
+        max_candidates=40,
+        selector_promoted=True,
+        validation_parity_enabled=False,
+        observation_history=history,
+    )
+
+    assert len(coarse_dark) == 40
+    assert len(coarse_lit) == 40
+    assert [m.primary_pair for m in coarse_dark] == [m.primary_pair for m in ranked[:40]]
+    assert any(m.base_asset == "IGN1" for m in coarse_lit)
+    assert all(m.base_asset != "IGN1" for m in coarse_dark)
+
+
+def test_evaluate_promotion_never_auto_enables_selector_flag():
+    from app.opip.early.promotion import evaluate_promotion
+
+    evaluation = evaluate_promotion(baseline={}, candidate={})
+    assert evaluation.as_dict()["operator_promotion_requires_human_flag"] is True
+    assert flags.early_selector_promoted({}) is False
+
+
+def test_observation_context_exposes_real_prior_and_persistence_counts():
+    history = {
+        "RAYUSD": [
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=30)).isoformat(),
+                "last_price": 1.0,
+                "volume_24h": 1_000.0,
+                "notional_24h_usd_approx": 100_000.0,
+                "high_24h": 1.1,
+                "low_24h": 0.9,
+                "lift_from_24h_low_pct": 2.0,
+                "distance_from_24h_high_pct": 3.0,
+            },
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=20)).isoformat(),
+                "last_price": 1.02,
+                "volume_24h": 1_200.0,
+                "notional_24h_usd_approx": 120_000.0,
+                "high_24h": 1.1,
+                "low_24h": 0.9,
+                "lift_from_24h_low_pct": 3.0,
+                "distance_from_24h_high_pct": 2.0,
+            },
+            {
+                "observed_at": (DECISION_AT - timedelta(minutes=10)).isoformat(),
+                "last_price": 1.05,
+                "volume_24h": 1_500.0,
+                "notional_24h_usd_approx": 150_000.0,
+                "high_24h": 1.1,
+                "low_24h": 0.9,
+                "lift_from_24h_low_pct": 4.0,
+                "distance_from_24h_high_pct": 1.0,
+            },
+        ]
+    }
+    context = build_observation_context(history=history)
+    assert context.as_dict()["synthesised"] is False
+    assert context.prior_observation_counts["RAY"] == 2
+    assert context.prior_observation_counts["RAYUSD"] == 2
+
+
+def test_scan_early_movers_can_qualify_when_every_mandatory_and_corroboration_passes(
+    monkeypatch,
+):
+    mover = _mover(base="QAL", lift=3.0, distance=1.0, notional=1_500_000.0, score=50.0)
+    snapshot = _qualifying_snapshot(symbol="QALUSD")
+
+    def fake_discover(*args, **kwargs):
+        on_ranked = kwargs.get("on_ranked")
+        if on_ranked is not None:
+            on_ranked([mover])
+        return [mover]
+
+    monkeypatch.setattr(discovery, "discover_coarse_movers", fake_discover)
+    monkeypatch.setattr(
+        discovery,
+        "analyze_symbol",
+        lambda *a, **k: ("ok", snapshot, None),
+    )
+    monkeypatch.setattr(discovery, "_enrich_bounded_candidate_evidence", lambda *a, **k: None)
+
+    coarse, signals = discovery.scan_early_movers(
+        max_candidates=5,
+        validation_parity_enabled=True,
+        selector_promoted=False,
+        prior_observation_counts={"QAL": 4},
+        persistence_scans={"QAL": 3},
+        observation_history={},
+    )
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.evidence_grade == EvidenceGrade.QUALIFIED.value
+    assert signal.qualification_blocking_failures == ()
+    assert signal.alert_eligible is True
+
+
+def test_history_advances_when_signal_quality_off_and_early_history_on(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(flags.HISTORY_CAPTURE_FLAG, "true")
+    observations = [
+        MarketObservation(
+            version=fmo.VERSION,
+            base_asset="AAA",
+            symbol="AAAUSD",
+            kraken_public_symbol="AAA/USD",
+            last_price=1.0,
+            volume_24h=100.0,
+            notional_24h_usd_approx=100_000.0,
+            high_24h=1.1,
+            low_24h=0.9,
+            lift_from_24h_low_pct=2.0,
+            distance_from_24h_high_pct=1.0,
+        )
+    ]
+    monkeypatch.setattr(fmo, "collect_full_market_observations", lambda client=None: observations)
+
+    settings = SimpleNamespace(
+        signal_quality_v1_enabled=False,
+        signal_quality_history_scans=8,
+        signal_quality_stale_history_retention_seconds=3600.0,
+    )
+    result = fmo.process_full_market_observations(
+        observation_file=tmp_path / "obs.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=settings,
+    )
+    state = (tmp_path / "state.json").read_text(encoding="utf-8")
+    assert "history_by_symbol" in state
+    assert "AAAUSD" in state
+    assert result.signal_quality_enabled is False
+    assert result.signal_quality_candidates == ()
+
+
+def test_history_does_not_advance_when_both_capture_flags_are_dark(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(flags.HISTORY_CAPTURE_FLAG, raising=False)
+    observations = [
+        MarketObservation(
+            version=fmo.VERSION,
+            base_asset="BBB",
+            symbol="BBBUSD",
+            kraken_public_symbol="BBB/USD",
+            last_price=1.0,
+            volume_24h=100.0,
+            notional_24h_usd_approx=100_000.0,
+            high_24h=1.1,
+            low_24h=0.9,
+            lift_from_24h_low_pct=2.0,
+            distance_from_24h_high_pct=1.0,
+        )
+    ]
+    monkeypatch.setattr(fmo, "collect_full_market_observations", lambda client=None: observations)
+    settings = SimpleNamespace(
+        signal_quality_v1_enabled=False,
+        signal_quality_history_scans=8,
+        signal_quality_stale_history_retention_seconds=3600.0,
+    )
+    fmo.process_full_market_observations(
+        observation_file=tmp_path / "obs.jsonl",
+        state_file=tmp_path / "state.json",
+        settings=settings,
+    )
+    state = (tmp_path / "state.json").read_text(encoding="utf-8")
+    assert "history_by_symbol" not in state
+
+
+def test_timeframe_shadow_uses_real_percentiles_from_signal():
+    from app.opip.early.shadow_observer import observe_timeframe_shadow
+    from app.opip.early.timeframe_policy import TIMEFRAME_FINE, TIMEFRAME_HOURLY
+
+    compressed = SimpleNamespace(
+        symbol="CMPUSD",
+        market_phase=MarketPhase.COILED.value,
+        bollinger_bandwidth_percentile=20.0,
+        atr_percentile=25.0,
+        detection_timeframe="15M",
+    )
+    ignition = SimpleNamespace(
+        symbol="IGNUSD",
+        market_phase=MarketPhase.IGNITION.value,
+        bollinger_bandwidth_percentile=85.0,
+        atr_percentile=90.0,
+        detection_timeframe="1H",
+    )
+    rows = observe_timeframe_shadow(
+        signals=[compressed, ignition],
+        scan_id="s1",
+        decision_at=DECISION_AT,
+    )
+    by_symbol = {row["symbol"]: row for row in rows}
+
+    assert by_symbol["CMPUSD"]["production"]["timeframe"] == TIMEFRAME_FINE
+    assert by_symbol["CMPUSD"]["inversion_detected"] is False
+    assert by_symbol["IGNUSD"]["production"]["timeframe"] == TIMEFRAME_HOURLY
+    assert by_symbol["IGNUSD"]["candidate"]["timeframe"] == TIMEFRAME_FINE
+    assert by_symbol["IGNUSD"]["inversion_detected"] is True
+
+
+def test_early_mover_signal_retains_decision_time_percentiles():
+    signal = discovery.evaluate_early_mover(
+        _qualifying_snapshot(bandwidth=22.0, atr=33.0),
+        _mover(),
+        validation_parity_enabled=False,
+        prior_observation_count=3,
+        persistence_scans=2,
+        native_flow_available=True,
+        cross_venue_available=True,
+        depth_slippage_available=True,
+    )
+    assert not isinstance(signal, discovery.DeepEvaluationRejection)
+    assert signal.bollinger_bandwidth_percentile == pytest.approx(22.0)
+    assert signal.atr_percentile == pytest.approx(33.0)
+
+
+def test_below_threshold_scan_persists_achieved_score_and_margin(monkeypatch):
+    mover = _mover(base="WEAK", lift=2.5, score=20.0)
+    # Fire some score components (1h + near_high) but stay below the 45 floor.
+    weak = _qualifying_snapshot(
+        symbol="WEAKUSD",
+        one_hour=0.8,
+        six_hour=0.3,
+        day=0.4,
+        volume=1.0,
+        near_high=1.5,
+    )
+    weak.trend = "neutral"
+    captured: list[dict] = []
+
+    def fake_discover(*args, **kwargs):
+        on_ranked = kwargs.get("on_ranked")
+        if on_ranked is not None:
+            on_ranked([mover])
+        return [mover]
+
+    monkeypatch.setattr(discovery, "discover_coarse_movers", fake_discover)
+    monkeypatch.setattr(
+        discovery, "analyze_symbol", lambda *a, **k: ("ok", weak, None)
+    )
+    monkeypatch.setattr(discovery, "_enrich_bounded_candidate_evidence", lambda *a, **k: None)
+
+    coarse, signals = discovery.scan_early_movers(
+        max_candidates=5,
+        on_evaluated=captured.append,
+        validation_parity_enabled=False,
+        selector_promoted=False,
+    )
+
+    assert signals == []
+    below = [row for row in captured if row.get("outcome") == "BELOW_THRESHOLD"]
+    assert below
+    evidence = below[0]["metadata"]["score_evidence"]
+    assert evidence["achieved_score"] is not None
+    assert evidence["required_score"] == discovery.MIN_DEEP_DISCOVERY_SCORE
+    assert evidence["score_margin"] == pytest.approx(
+        evidence["achieved_score"] - evidence["required_score"]
+    )
+    assert evidence["score_margin"] < 0
+    assert evidence["blocking_reason"] == "deep_discovery_score_below_minimum"
+    assert evidence["components"]
+
+
+@pytest.mark.parametrize("phase", list(MarketPhase))
+def test_early_watch_headline_only_for_early_phases(phase: MarketPhase):
+    assessment = build_operator_assessment(
+        symbol="XUSD",
+        phase=phase,
+        grade=EvidenceGrade.QUALIFIED,
+        disposition=OperatorDisposition.DEEP_REVIEW,
+    )
+    signal = SimpleNamespace(
+        symbol="XUSD",
+        stage="READY",
+        reference_price=1.0,
+        detection_timeframe="1H",
+        momentum_1h_pct=2.0,
+        momentum_6h_pct=3.0,
+        momentum_state="ACCELERATING",
+        continuation_confidence=70,
+        continuation_confidence_is_probability=False,
+        entry_quality=70,
+        entry_recommendation="BREAKOUT_ENTRY_POSSIBLE",
+        relative_volume=2.0,
+        distance_to_24h_high_pct=1.0,
+        liquidity_24h_usd_approx=1_000_000.0,
+        extended_move=False,
+        reasons=("momentum",),
+        market_phase=phase.value,
+        evidence_grade=EvidenceGrade.QUALIFIED.value,
+        operator_disposition=OperatorDisposition.DEEP_REVIEW.value,
+        actionability_reasons=(),
+    )
+    card = scan_movers._compact_card(signal)
+    if is_early_phase(phase):
+        assert assessment.claims_early_discovery is True
+        assert "EARLY WATCH" in card
+    else:
+        assert assessment.claims_early_discovery is False
+        assert "EARLY WATCH" not in card
+        assert "MARKET WATCH" in card
+
+
+def test_confirmed_expansion_never_renders_early_watch():
+    signal = SimpleNamespace(
+        symbol="XUSD",
+        stage="READY",
+        reference_price=1.0,
+        detection_timeframe="1H",
+        momentum_1h_pct=3.0,
+        momentum_6h_pct=5.0,
+        momentum_state="ACCELERATING",
+        continuation_confidence=80,
+        continuation_confidence_is_probability=False,
+        entry_quality=70,
+        entry_recommendation="BREAKOUT_ENTRY_POSSIBLE",
+        relative_volume=3.0,
+        distance_to_24h_high_pct=1.0,
+        liquidity_24h_usd_approx=1_000_000.0,
+        extended_move=False,
+        reasons=("momentum",),
+        market_phase=MarketPhase.CONFIRMED_EXPANSION.value,
+        evidence_grade=EvidenceGrade.QUALIFIED.value,
+        operator_disposition=OperatorDisposition.DEEP_REVIEW.value,
+        actionability_reasons=(),
+    )
+    card = scan_movers._compact_card(signal)
+    assert "EARLY WATCH" not in card
+    assert "MARKET WATCH" in card
+
+
+def test_two_episodes_for_same_symbol_cannot_share_episode_id():
+    from app.opip.early.timing_ledger import (
+        MILESTONE_EXHAUSTION,
+        MILESTONE_FIRST_OBSERVED,
+        record_milestone,
+    )
+
+    first = resolve_episode_ledger(
+        symbol="RAYUSD",
+        decision_at=DECISION_AT,
+        phase=MarketPhase.IGNITION,
+    )
+    exhausted = record_milestone(
+        first,
+        milestone=MILESTONE_FIRST_OBSERVED,
+        observed_at=DECISION_AT,
+        anchor_price=1.0,
+    )
+    exhausted = record_milestone(
+        exhausted,
+        milestone=MILESTONE_EXHAUSTION,
+        observed_at=DECISION_AT + timedelta(hours=1),
+        anchor_price=1.5,
+    )
+    later = DECISION_AT + timedelta(hours=50)
+    second = resolve_episode_ledger(
+        symbol="RAYUSD",
+        decision_at=later,
+        phase=MarketPhase.IGNITION,
+        existing=exhausted,
+    )
+    assert first.episode_id != second.episode_id
+    assert first.episode_id != "RAYUSD"
+    assert second.episode_id != "RAYUSD"
+    assert should_reset_episode(exhausted, decision_at=later, phase=MarketPhase.IGNITION)
+    assert early_episode_id(symbol="RAYUSD", episode_started_at=DECISION_AT).startswith(
+        "EP:RAYUSD:"
+    )
+
+
+def test_rolling_volume_change_is_not_labelled_relative_volume_change():
+    from app.opip.early.shadow_observer import derive_delta_features
+
+    features = derive_delta_features(
+        [
+            {
+                "observed_at": "2026-03-04T11:00:00+00:00",
+                "volume_24h": 100.0,
+                "last_price": 1.0,
+                "lift_from_24h_low_pct": 1.0,
+                "distance_from_24h_high_pct": 2.0,
+            },
+            {
+                "observed_at": "2026-03-04T12:00:00+00:00",
+                "volume_24h": 150.0,
+                "last_price": 1.1,
+                "lift_from_24h_low_pct": 2.0,
+                "distance_from_24h_high_pct": 1.0,
+            },
+        ]
+    )
+    assert features["relative_volume_change"] is None
+    assert features["trade_count_acceleration"] is None
+    assert features["rolling_24h_volume_change"] == pytest.approx(0.5)
+
+
+def test_ignition_cohort_accepts_rolling_volume_proxy_without_fake_rvol():
+    row = EarlyCandidateFeatures(
+        identifier="IGNUSD",
+        base_asset="IGN",
+        lift_from_24h_low_pct=2.5,
+        distance_from_24h_high_pct=1.5,
+        notional_usd=200_000.0,
+        rolling_24h_volume_change=0.5,
+        relative_volume_change=None,
+        trade_count_acceleration=None,
+        momentum_acceleration=None,
+    )
+    selection = select_early_candidates([row], total_candidates=8)
+    assert "IGNUSD" in selection.cohort_members("IGNITION")
+
+
+def test_validation_layers_actually_executed_for_qualified_candidate():
+    report = evaluate_early_watch_validations(
+        market_data_validation=SimpleNamespace(
+            qualified=True, status="PASS", rejection_reasons=[], candle_count=720
+        ),
+        symbol_identity_resolved=True,
+        completed_candle_count=720,
+        liquidity_24h_usd=1_500_000.0,
+        ticker_last=1.0,
+        latest_ohlc_close=1.0,
+        ticker_bid=0.999,
+        ticker_ask=1.001,
+        finite_features=True,
+        persistence_scans=3,
+        prior_observation_count=4,
+        duplicate_state_detected=False,
+        native_flow_available=True,
+        cross_venue_available=True,
+        depth_slippage_available=True,
+        volatility_regime=40.0,
+    )
+    for name in MANDATORY_CHECKS:
+        assert report.result_for(name) is ValidationResult.PASS
+    assert report.evidence_grade is EvidenceGrade.QUALIFIED
+    assert report.result_for("native_flow_evidence") is ValidationResult.PASS
+    assert report.result_for("cross_venue_reference") is ValidationResult.PASS
+    assert report.result_for("depth_and_slippage_estimate") is ValidationResult.PASS

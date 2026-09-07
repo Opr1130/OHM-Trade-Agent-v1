@@ -724,6 +724,40 @@ def evaluate_early_watch_validations(
     )
 
 
+#: Independent soft/confidence evidence families required, on top of every
+#: mandatory check passing, before a candidate may reach QUALIFIED. Mirrors
+#: the ExplosionPrecursor N-of-M corroboration pattern (evidence >= 3): a
+#: perfect mandatory pass with every optional confirmation missing is not
+#: high-confidence qualification.
+MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED = 2
+
+#: Soft and confidence checks that count as independent evidence families.
+#: Advisory evidence never participates.
+CORROBORATING_FAMILY_CHECKS = frozenset(
+    {
+        CHECK_NATIVE_FLOW,
+        CHECK_CROSS_VENUE,
+        CHECK_DEPTH_SLIPPAGE,
+        CHECK_PRIOR_OBSERVATION,
+        CHECK_SIGNAL_QUALITY_HISTORY,
+        CHECK_RELATIVE_STRENGTH,
+        CHECK_RANK_VELOCITY,
+        CHECK_VOLATILITY_REGIME,
+    }
+)
+
+
+def corroborating_family_count(checks: Sequence[ValidationCheck]) -> int:
+    """Count independent soft/confidence families that actually passed."""
+    return sum(
+        1
+        for check in checks
+        if check.name in CORROBORATING_FAMILY_CHECKS
+        and check.result is ValidationResult.PASS
+        and check.classification in {ValidationClass.SOFT, ValidationClass.CONFIDENCE}
+    )
+
+
 def resolve_evidence_grade(checks: Sequence[ValidationCheck]) -> EvidenceGrade:
     """Map validation results onto an :class:`EvidenceGrade`.
 
@@ -731,22 +765,29 @@ def resolve_evidence_grade(checks: Sequence[ValidationCheck]) -> EvidenceGrade:
     measurement is not adverse evidence, it is merely insufficient. Anything
     unresolved on a mandatory check therefore stops at ``OBSERVED`` or
     ``CORROBORATED`` and can never reach ``QUALIFIED``.
+
+    ``QUALIFIED`` additionally requires
+    :data:`MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED` independent soft or
+    confidence families to pass. Mandatory integrity alone is not
+    high-confidence qualification.
     """
     mandatory = [
         check for check in checks if check.classification is ValidationClass.MANDATORY
     ]
     if any(check.result is ValidationResult.FAIL for check in mandatory):
         return EvidenceGrade.REJECTED
-    if mandatory and all(check.result is ValidationResult.PASS for check in mandatory):
+
+    corroborating = corroborating_family_count(checks)
+    if (
+        mandatory
+        and all(check.result is ValidationResult.PASS for check in mandatory)
+        and corroborating >= MIN_CORROBORATING_FAMILIES_FOR_QUALIFIED
+    ):
         return EvidenceGrade.QUALIFIED
 
-    corroborating = [
-        check
-        for check in checks
-        if check.classification in {ValidationClass.SOFT, ValidationClass.CONFIDENCE}
-        and check.result is ValidationResult.PASS
-    ]
-    return EvidenceGrade.CORROBORATED if corroborating else EvidenceGrade.OBSERVED
+    if corroborating > 0:
+        return EvidenceGrade.CORROBORATED
+    return EvidenceGrade.OBSERVED
 
 
 def advisory_only_promotion_attempt(checks: Sequence[ValidationCheck]) -> bool:

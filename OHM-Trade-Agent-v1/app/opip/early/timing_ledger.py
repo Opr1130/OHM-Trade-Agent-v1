@@ -21,7 +21,7 @@ MAE, final result) are structurally excluded — attempting to record one raises
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 from app.opip.early.point_in_time import (
@@ -33,10 +33,16 @@ from app.opip.early.taxonomy import (
     MarketPhase,
     coerce_evidence_grade,
     coerce_market_phase,
+    is_early_phase,
 )
 
 TIMING_LEDGER_SCHEMA_VERSION = 1
 TIMING_LEDGER_VERSION = "opip-early-timing-ledger-v1"
+
+#: Quiet gap after which a new episode is opened for the same symbol.
+#: Matches the intelligence_journey active-window convention so two separate
+#: RAY moves cannot share first_observed / first_qualified / delivery stamps.
+EPISODE_RESET_GAP_SECONDS = 48 * 60 * 60
 
 MILESTONE_FIRST_OBSERVED = "first_observed_at"
 MILESTONE_FIRST_IGNITION = "first_ignition_at"
@@ -166,6 +172,77 @@ class EpisodeTimingLedger:
 
 def new_ledger(*, symbol: str, episode_id: str) -> EpisodeTimingLedger:
     return EpisodeTimingLedger(symbol=str(symbol).upper(), episode_id=str(episode_id))
+
+
+def early_episode_id(*, symbol: str, episode_started_at: datetime | str) -> str:
+    """Deterministic episode identity: symbol + episode start, never symbol alone.
+
+    Two separate moves for the same symbol therefore cannot share
+    ``first_observed_at``, ``first_qualified_at``, delivery stamps or anchors.
+    """
+    stamp = parse_timestamp(episode_started_at)
+    if stamp is None:
+        raise ValueError("episode_started_at must be a timezone-aware datetime")
+    started = stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"EP:{str(symbol).strip().upper()}:{started}"
+
+
+def should_reset_episode(
+    existing: EpisodeTimingLedger | None,
+    *,
+    decision_at: datetime | str,
+    phase: MarketPhase | str | None = None,
+) -> bool:
+    """Whether a new episode must open for this symbol.
+
+    Reset when:
+    - no prior episode exists; or
+    - quiet gap since the last recorded milestone exceeds
+      :data:`EPISODE_RESET_GAP_SECONDS`; or
+    - the prior episode already reached LATE_EXTENSION / EXHAUSTION and the
+      current observation is again early (IGNITION / EARLY_EXPANSION).
+    """
+    if existing is None:
+        return True
+    moment = parse_timestamp(decision_at)
+    if moment is None:
+        return False
+    last_stamps = [
+        parse_timestamp(value)
+        for value in dict(existing.milestones).values()
+    ]
+    last_stamps = [item for item in last_stamps if item is not None]
+    if not last_stamps:
+        return True
+    newest = max(last_stamps)
+    if (moment - newest).total_seconds() > EPISODE_RESET_GAP_SECONDS:
+        return True
+    prior_extended = bool(
+        existing.milestone(MILESTONE_LATE_EXTENSION)
+        or existing.milestone(MILESTONE_EXHAUSTION)
+    )
+    if prior_extended and phase is not None and is_early_phase(phase):
+        return True
+    return False
+
+
+def resolve_episode_ledger(
+    *,
+    symbol: str,
+    decision_at: datetime | str,
+    phase: MarketPhase | str | None = None,
+    existing: EpisodeTimingLedger | None = None,
+) -> EpisodeTimingLedger:
+    """Return the ledger for the current episode, opening a new one when needed."""
+    key = str(symbol).strip().upper()
+    if existing is not None and not should_reset_episode(
+        existing, decision_at=decision_at, phase=phase
+    ):
+        return existing
+    return new_ledger(
+        symbol=key,
+        episode_id=early_episode_id(symbol=key, episode_started_at=decision_at),
+    )
 
 
 def record_milestone(
