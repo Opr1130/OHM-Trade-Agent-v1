@@ -303,11 +303,14 @@ def test_stale_attestation_fails_closed_when_hot_jsonl_is_present(tmp_path):
     _plant_empty_export_attestation(archive, hot_bytes=0)
     before = archive.window_index_state_file.read_bytes()
 
-    with pytest.raises(RuntimeError, match="could not be certified"):
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
         reconcile_qualification_replica_archives(tmp_path)
 
     assert archive.window_index_state_file.read_bytes() == before
     assert archive.ensure_window_index_locked() is False
+    # Must not enter empty-attestation certification for HOT-present legacy state.
+    assert not archive._window_index_state_proves_empty_archive_without_manifest()
+
 
 
 def test_mismatched_attestation_prefix_fails_closed(tmp_path):

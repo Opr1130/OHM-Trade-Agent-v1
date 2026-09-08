@@ -210,6 +210,8 @@ def test_diagnose_surfaces_release_consumption_and_zero_funnel():
     assert "unified_cycle_host_lock=" in diagnostics
     assert "unified_cycle_host_lock=HELD" in diagnostics
     assert "Never delete the lock file" in diagnostics
+    assert "lock_owner_pid=" in diagnostics
+    assert "learning_coverage_epoch_status=" in diagnostics
     assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in diagnostics
     assert 'print("UNAVAILABLE:" + type(exc).__name__)' in diagnostics
     assert "UNAVAILABLE:TIMEOUT_OR_EXEC" in diagnostics

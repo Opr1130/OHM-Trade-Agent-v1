@@ -95,12 +95,15 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in diagnostics
     assert "UNAVAILABLE:TIMEOUT_OR_EXEC" in diagnostics
     assert "unified_cycle_host_lock=" in diagnostics
+    assert "lock_owner_pid=" in diagnostics
+    assert "learning_coverage_epoch_status=" in diagnostics
     assert "{{.State.Running}}" in diagnostics
     assert "CORE_CONTAINER_STOPPED" in diagnostics
     assert 'status="FAIL"' in diagnostics
     assert "docker rm" not in diagnostics
     assert "docker stop" not in diagnostics
     assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
+    assert "Never kill the owner" in diagnostics
 
 
 def test_deploy_rollback_restores_installed_remote_ops():

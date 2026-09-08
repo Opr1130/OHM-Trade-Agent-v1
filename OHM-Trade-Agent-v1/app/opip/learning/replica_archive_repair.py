@@ -14,6 +14,10 @@ leftover only when export-time ``empty_export_attestation_v1.json`` is
 present and consistent with canonical replica files. Missing, stale, or
 mismatched proof stays fail-closed.
 
+When HOT evidence is present with no archive segments and a legacy
+``complete=false`` index, empty attestation is never attempted. That condition
+requires an explicitly authorized learning-side coverage discontinuity epoch.
+
 Existing manifests are never replaced or repaired here. Any checksum, path,
 manifest, or index ambiguity raises and keeps learning compute fail-closed.
 """
@@ -30,7 +34,14 @@ from app.opip.decision.store import (
     scan_summaries_archive,
     screening_evaluations_archive,
 )
+from app.opip.learning.coverage_discontinuity import (
+    DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY,
+    archive_matches_legacy_ambiguous_hot_condition,
+    maybe_establish_oneshot_coverage_discontinuity,
+    resolve_discontinuity_for_archive,
+)
 from app.opip.learning.empty_export_attestation import (
+    inspect_canonical_archive_files,
     verify_replica_empty_export_attestation,
 )
 from app.opip.storage.bounded_jsonl import (
@@ -84,7 +95,11 @@ def _verified_segments(archive: BoundedJsonlArchive):
     return verified
 
 
-def _reconstruct_missing_replica_manifest(archive: BoundedJsonlArchive) -> str:
+def _reconstruct_missing_replica_manifest(
+    archive: BoundedJsonlArchive,
+    *,
+    data_root: Path,
+) -> str:
     """Reconstruct only an absent replica manifest from verified segments."""
     if archive.manifest_file.exists():
         rebuilt = archive.rebuild_window_index_from_verified_manifest_locked()
@@ -100,12 +115,31 @@ def _reconstruct_missing_replica_manifest(archive: BoundedJsonlArchive) -> str:
 
     verified = _verified_segments(archive)
     if not verified:
+        facts = inspect_canonical_archive_files(archive)
+        # Condition C: HOT present + no segments + legacy complete=false index.
+        # Never conflate with true-empty attestation (condition A).
+        if archive_matches_legacy_ambiguous_hot_condition(archive):
+            epoch = resolve_discontinuity_for_archive(data_root, archive)
+            if epoch is None:
+                raise RuntimeError(
+                    "LEGACY_COVERAGE_DISCONTINUITY_REQUIRED:"
+                    f"{archive.archive_prefix}:hot_bytes={facts.hot_bytes}"
+                )
+            return DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY
+
+        if facts.hot_bytes > 0 and archive._window_index_state_is_orphan_incomplete_empty_without_manifest():
+            # Defensive: matches helper should have caught this; fail closed.
+            raise RuntimeError(
+                "LEGACY_COVERAGE_DISCONTINUITY_REQUIRED:"
+                f"{archive.archive_prefix}:hot_bytes={facts.hot_bytes}"
+            )
+
         if archive.ensure_window_index_locked():
             return "EMPTY_CERTIFIED"
-        # Leftover incomplete derived index is not proof the export was
-        # empty. Recertify only when hashed export-time attestation is
-        # present and matches canonical replica files. Production
-        # archives are never touched; this runs only on the replica.
+        # Condition A: leftover incomplete derived index with no HOT/segments.
+        # Recertify only when hashed export-time attestation is present and
+        # matches canonical replica files. Production archives are never
+        # touched; this runs only on the replica.
         try:
             verify_replica_empty_export_attestation(archive)
             archive.certify_empty_replica_window_index_locked()
@@ -175,7 +209,8 @@ def reconcile_qualification_replica_archives(
             qualification / "scan_summaries.jsonl"
         ),
     }
+    maybe_establish_oneshot_coverage_discontinuity(data_root, archives)
     return {
-        name: _reconstruct_missing_replica_manifest(archive)
+        name: _reconstruct_missing_replica_manifest(archive, data_root=data_root)
         for name, archive in archives.items()
     }
