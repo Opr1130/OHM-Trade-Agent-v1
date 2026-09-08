@@ -7,6 +7,12 @@ the complete tree checksum before promotion, and may then reconstruct only the
 missing *replica* manifest from immutable gzip segments whose own checksum
 sidecars and JSONL contents verify.
 
+An incomplete zero-coverage derived index is not proof that the authoritative
+export was empty. Replica repair recertifies that leftover only when
+export-time ``empty_export_attestation_v1.json`` is present and consistent
+with canonical replica files. Missing, stale, or mismatched proof stays
+fail-closed.
+
 Existing manifests are never replaced or repaired here. Any checksum, path,
 manifest, or index ambiguity raises and keeps learning compute fail-closed.
 """
@@ -22,6 +28,9 @@ from app.opip.decision.store import (
     funnel_events_archive,
     scan_summaries_archive,
     screening_evaluations_archive,
+)
+from app.opip.learning.empty_export_attestation import (
+    verify_replica_empty_export_attestation,
 )
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
@@ -92,17 +101,18 @@ def _reconstruct_missing_replica_manifest(archive: BoundedJsonlArchive) -> str:
     if not verified:
         if archive.ensure_window_index_locked():
             return "EMPTY_CERTIFIED"
-        # Inherited derived window-index (incomplete empty / vanished
-        # manifest) must not permanently block learning compute when no
-        # canonical gzip, manifest, or signature remains. Production
+        # Leftover incomplete derived index is not proof the export was
+        # empty. Recertify only when hashed export-time attestation is
+        # present and matches canonical replica files. Production
         # archives are never touched; this runs only on the replica.
         try:
+            verify_replica_empty_export_attestation(archive)
             archive.certify_empty_replica_window_index_locked()
         except RuntimeError as exc:
             raise RuntimeError("empty replica archive could not be certified") from exc
         if not archive.ensure_window_index_locked():
             raise RuntimeError("empty replica archive could not be certified")
-        return "EMPTY_CERTIFIED_FROM_ORPHAN_INDEX"
+        return "EMPTY_CERTIFIED_FROM_EXPORT_ATTESTATION"
 
     recorded = datetime.now(timezone.utc).isoformat()
     manifest: dict[str, Any] = {

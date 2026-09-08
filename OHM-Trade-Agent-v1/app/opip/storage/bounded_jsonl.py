@@ -331,9 +331,10 @@ class BoundedJsonlArchive:
         """True only for leftover incomplete zero-coverage derived index state.
 
         Production ``ensure_window_index_locked`` never promotes this index
-        form to complete. Replica recovery may recertify it as empty when no
-        canonical files remain. Any prior-manifest, coverage, shard, or extra
-        index evidence stays fail-closed.
+        form to complete. Replica repair may recertify it as empty only when
+        export-time empty attestation is present and canonical files remain
+        empty. Any prior-manifest, coverage, shard, or extra index evidence
+        stays fail-closed.
         """
         return self._window_index_state_matches_empty_without_manifest(complete=False)
 
@@ -628,10 +629,11 @@ class BoundedJsonlArchive:
 
         Production callers must keep using ``ensure_window_index_locked``,
         which never reclassifies an incomplete zero-coverage state as
-        complete. This recovery does not delete locks, manifests, signatures,
-        gzip segments, or HOT JSONL. It refuses unless the existing derived
-        index is the incomplete empty leftover form and no canonical files
-        remain.
+        complete. Replica repair may call this only after export-time empty
+        attestation is present and consistent. This recovery does not delete
+        locks, manifests, signatures, gzip segments, or HOT JSONL. It refuses
+        unless the existing derived index is the incomplete empty leftover
+        form and no canonical files remain.
         """
         if self.manifest_file.exists():
             raise RuntimeError(

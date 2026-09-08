@@ -103,6 +103,16 @@ def test_production_export_is_copy_only_and_locked():
     )
     assert "mv -f" in source
     assert "python" not in source
+    assert "write_empty_export_attestation_if_canonical" in source
+    assert "empty_export_attestation_v1.json" in source
+    assert 'write_empty_export_attestation_if_canonical \\\n      "$temp" \\\n      "$archive_temp"' in source
+    assert "$archive_dir/empty_export_attestation_v1.json" in source
+    assert '-name "${prefix}-*.jsonl.gz"' in source
+    assert '"manifest_present":[[:space:]]*true' in source
+    assert source.index("write_empty_export_attestation_if_canonical") < source.index(
+        "tree_sha256()"
+    )
+    assert "xargs awk grep" in source
     assert "docker" not in source
     assert "kraken" not in source.lower()
 
