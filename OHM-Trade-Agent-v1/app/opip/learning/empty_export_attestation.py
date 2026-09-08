@@ -3,9 +3,17 @@
 Production export remains copy-only of durable files. After that copy, the
 export tree may gain ``empty_export_attestation_v1.json`` at the archive-dir
 root (sibling of ``window_index_v1``, never inside it). The file is bound by
-the existing tree SHA. Replica repair may recertify a leftover incomplete
-derived index only when this proof is present and consistent with replica
-canonical files. Missing, stale, or mismatched proof stays fail-closed.
+the existing tree SHA.
+
+Production/export trust and replica-recovery trust are separate:
+
+* Production may attest empty only when canonical files are empty AND the
+  source index is absent or already certified complete-empty. A
+  ``complete=false`` index is ambiguous production lineage and never mints
+  empty proof.
+* Replica repair may recertify a leftover incomplete empty index only when
+  that hashed export attestation is present and consistent. Missing, stale,
+  or mismatched proof stays fail-closed.
 """
 
 from __future__ import annotations
@@ -84,12 +92,41 @@ def inspect_canonical_archive_files(
     )
 
 
-def leftover_index_blocks_empty_attestation(archive: BoundedJsonlArchive) -> bool:
-    """True when leftover derived index still records prior canonical lineage.
+def production_source_index_allows_empty_attestation(
+    archive: BoundedJsonlArchive,
+) -> bool:
+    """True only for absent index or already-certified complete empty index.
 
-    Incomplete zero-coverage leftover and a previously certified empty index
-    do not block attestation. Extra index files, prior-manifest coverage,
-    shards, or an unreadable/ambiguous index do.
+    Any ``complete=false``, extra index files, prior-manifest coverage,
+    shards, or malformed/unreadable index blocks production attestation.
+    """
+    if not archive.window_index_dir.exists():
+        return True
+    return archive._window_index_state_proves_empty_archive_without_manifest()
+
+
+def production_empty_export_attestation_eligible(
+    archive: BoundedJsonlArchive,
+) -> bool:
+    """Production/export may mint empty proof only from trusted source state."""
+    try:
+        facts = inspect_canonical_archive_files(archive)
+    except RuntimeError:
+        return False
+    if not facts.is_empty:
+        return False
+    return production_source_index_allows_empty_attestation(archive)
+
+
+def replica_leftover_index_blocks_empty_recovery(
+    archive: BoundedJsonlArchive,
+) -> bool:
+    """Replica leftover blocks recovery unless it is empty-certified or incomplete empty.
+
+    Unlike production attestation, an incomplete zero-coverage leftover may
+    be recovered when hashed export-time proof is present and consistent.
+    Extra index files, prior-manifest coverage, shards, or an unreadable
+    index still fail closed.
     """
     if not archive.window_index_dir.exists():
         return False
@@ -100,31 +137,16 @@ def leftover_index_blocks_empty_attestation(archive: BoundedJsonlArchive) -> boo
     return True
 
 
-def empty_export_attestation_eligible(archive: BoundedJsonlArchive) -> bool:
-    """True only from canonical files plus a leftover index that is not lineage."""
-    try:
-        facts = inspect_canonical_archive_files(archive)
-    except RuntimeError:
-        return False
-    if not facts.is_empty:
-        return False
-    if leftover_index_blocks_empty_attestation(archive):
-        return False
-    return True
-
-
 def build_empty_export_attestation_payload(
     archive: BoundedJsonlArchive,
     *,
     exported_at_utc: str,
     production_deployed_sha: str = "",
 ) -> dict[str, Any]:
-    facts = inspect_canonical_archive_files(archive)
-    if not facts.is_empty:
-        raise RuntimeError("refusing empty export attestation; canonical files remain")
-    if leftover_index_blocks_empty_attestation(archive):
+    if not production_empty_export_attestation_eligible(archive):
         raise RuntimeError(
-            "refusing empty export attestation; leftover index records prior lineage"
+            "refusing empty export attestation; production source is not "
+            "a trusted empty archive"
         )
     if production_deployed_sha and _PRODUCTION_SHA_RE.fullmatch(
         production_deployed_sha
@@ -196,7 +218,7 @@ def verify_replica_empty_export_attestation(
         raise RuntimeError("empty export attestation kind is unexpected")
     if raw.get("archive_prefix") != archive.archive_prefix:
         raise RuntimeError("empty export attestation archive prefix is mismatched")
-    if leftover_index_blocks_empty_attestation(archive):
+    if replica_leftover_index_blocks_empty_recovery(archive):
         raise RuntimeError(
             "empty export attestation conflicts with leftover index lineage"
         )

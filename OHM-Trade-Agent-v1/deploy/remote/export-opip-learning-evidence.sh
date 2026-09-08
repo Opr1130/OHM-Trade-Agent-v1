@@ -51,9 +51,9 @@ flock -x 8
 
 # Write export-tree empty attestation from canonical copied files only.
 # Never writes into DATA_ROOT. Eligibility must match
-# empty_export_attestation_eligible() in
-# app/opip/learning/empty_export_attestation.py. Incomplete leftover
-# window-index completeness is not sufficient proof.
+# production_empty_export_attestation_eligible() in
+# app/opip/learning/empty_export_attestation.py. A complete=false
+# window-index is ambiguous production lineage and never mints proof.
 write_empty_export_attestation_if_canonical() {
   local hot_file="$1"
   local archive_dir="$2"
@@ -92,6 +92,12 @@ write_empty_export_attestation_if_canonical() {
     fi
     local state="$index_dir/state.json"
     if [[ ! -f "$state" ]]; then
+      return 0
+    fi
+    if grep -Eq '"complete":[[:space:]]*false' "$state"; then
+      return 0
+    fi
+    if ! grep -Eq '"complete":[[:space:]]*true' "$state"; then
       return 0
     fi
     if grep -Eq '"manifest_present":[[:space:]]*true' "$state"; then

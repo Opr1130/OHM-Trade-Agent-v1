@@ -11,8 +11,8 @@ import pytest
 from app.opip.decision.store import screening_evaluations_archive
 from app.opip.learning.empty_export_attestation import (
     EMPTY_EXPORT_ATTESTATION_FILENAME,
-    empty_export_attestation_eligible,
-    leftover_index_blocks_empty_attestation,
+    production_empty_export_attestation_eligible,
+    replica_leftover_index_blocks_empty_recovery,
     write_empty_export_attestation,
 )
 from app.opip.learning.replica_archive_repair import (
@@ -221,7 +221,7 @@ def test_orphan_incomplete_empty_index_without_attestation_fails_closed(tmp_path
     _write_orphan_incomplete_empty_index(archive)
     before = archive.window_index_state_file.read_bytes()
     assert archive.ensure_window_index_locked() is False
-    assert empty_export_attestation_eligible(archive) is True
+    assert production_empty_export_attestation_eligible(archive) is False
 
     with pytest.raises(RuntimeError, match="could not be certified"):
         reconcile_qualification_replica_archives(tmp_path)
@@ -238,8 +238,9 @@ def test_orphan_incomplete_empty_index_is_certified_with_export_attestation(
         tmp_path / "opip/qualification/screening_evaluations.jsonl"
     )
     _write_orphan_incomplete_empty_index(archive)
-    _write_matching_empty_export_attestation(archive)
+    _plant_empty_export_attestation(archive)
     assert archive.ensure_window_index_locked() is False
+    assert production_empty_export_attestation_eligible(archive) is False
 
     result = reconcile_qualification_replica_archives(tmp_path)
 
@@ -263,8 +264,8 @@ def test_prior_lineage_later_absent_fails_closed_without_attestation(tmp_path):
     )
     _write_prior_manifest_index_without_canonical_files(archive)
     before = archive.window_index_state_file.read_bytes()
-    assert leftover_index_blocks_empty_attestation(archive) is True
-    assert empty_export_attestation_eligible(archive) is False
+    assert replica_leftover_index_blocks_empty_recovery(archive) is True
+    assert production_empty_export_attestation_eligible(archive) is False
     assert archive.ensure_window_index_locked() is False
 
     with pytest.raises(RuntimeError, match="could not be certified"):
@@ -392,8 +393,8 @@ def test_replica_empty_certify_refuses_extra_window_index_files(tmp_path):
     with pytest.raises(RuntimeError, match="orphan incomplete empty leftover"):
         archive.certify_empty_replica_window_index_locked()
     assert archive.ensure_window_index_locked() is False
-    assert leftover_index_blocks_empty_attestation(archive) is True
-    assert empty_export_attestation_eligible(archive) is False
+    assert replica_leftover_index_blocks_empty_recovery(archive) is True
+    assert production_empty_export_attestation_eligible(archive) is False
 
 
 def test_leftover_index_day_file_fails_closed_even_with_planted_attestation(
@@ -431,7 +432,7 @@ def test_attestation_with_unexpected_keys_fails_closed(tmp_path):
 
 def test_empty_export_attestation_is_not_eligible_when_segments_remain(tmp_path):
     archive, _segment = _write_verified_screening_segment(tmp_path)
-    assert empty_export_attestation_eligible(archive) is False
+    assert production_empty_export_attestation_eligible(archive) is False
 
 
 def test_write_empty_export_attestation_refuses_prior_manifest_lineage(tmp_path):
@@ -439,5 +440,72 @@ def test_write_empty_export_attestation_refuses_prior_manifest_lineage(tmp_path)
         tmp_path / "opip/qualification/screening_evaluations.jsonl"
     )
     _write_prior_manifest_index_without_canonical_files(archive)
-    with pytest.raises(RuntimeError, match="prior lineage"):
+    with pytest.raises(RuntimeError, match="trusted empty archive"):
         _write_matching_empty_export_attestation(archive)
+
+
+def test_replica_attestation_invalid_schema_fails_closed(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    _plant_empty_export_attestation(archive, schema_version=2)
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError, match="could not be certified"):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == before
+
+
+def test_replica_attestation_invalid_kind_fails_closed(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    _plant_empty_export_attestation(archive, kind="empty_export_attestation_v0")
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError, match="could not be certified"):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == before
+
+
+def test_replica_attestation_fails_closed_when_gzip_appears(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    _plant_empty_export_attestation(archive)
+    (archive.archive_dir / "screening_evaluations-late.jsonl.gz").write_bytes(b"late")
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == before
+    assert archive.ensure_window_index_locked() is False
+
+
+def test_replica_attestation_fails_closed_when_signature_appears(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    _plant_empty_export_attestation(archive)
+    archive.manifest_signature_file.write_text(
+        f"{'a' * 64}  {archive.manifest_file.name}\n",
+        encoding="utf-8",
+    )
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError, match="manifest missing with signature present"):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == before
+
+
+def test_replica_attestation_fails_closed_when_manifest_appears(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    _plant_empty_export_attestation(archive)
+    archive.manifest_file.write_text("{}\n", encoding="utf-8")
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == before

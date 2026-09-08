@@ -8,10 +8,11 @@ missing *replica* manifest from immutable gzip segments whose own checksum
 sidecars and JSONL contents verify.
 
 An incomplete zero-coverage derived index is not proof that the authoritative
-export was empty. Replica repair recertifies that leftover only when
-export-time ``empty_export_attestation_v1.json`` is present and consistent
-with canonical replica files. Missing, stale, or mismatched proof stays
-fail-closed.
+export was empty. Production export never attests empty while a
+``complete=false`` source index exists. Replica repair recertifies that
+leftover only when export-time ``empty_export_attestation_v1.json`` is
+present and consistent with canonical replica files. Missing, stale, or
+mismatched proof stays fail-closed.
 
 Existing manifests are never replaced or repaired here. Any checksum, path,
 manifest, or index ambiguity raises and keeps learning compute fail-closed.
