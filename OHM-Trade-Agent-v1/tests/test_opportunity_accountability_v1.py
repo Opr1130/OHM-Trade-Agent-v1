@@ -477,6 +477,7 @@ def test_incremental_join_splits_archive_ceiling_batches(monkeypatch, tmp_path):
     assert summary["batch_disposition"] == {
         "accepted": 2,
         "terminal_rejected": 0,
+        "unresolved_coverage_discontinuity": 0,
         "unresolved": 0,
     }
     assert len(
@@ -811,6 +812,7 @@ def test_invalid_directional_evidence_gets_durable_terminal_disposition(
     assert summary["batch_disposition"] == {
         "accepted": 0,
         "terminal_rejected": 1,
+        "unresolved_coverage_discontinuity": 0,
         "unresolved": 0,
     }
     resolved = resolved_accountability_outcomes(
@@ -869,6 +871,7 @@ def test_valid_incremental_outcome_gets_durable_accepted_disposition(tmp_path):
     assert summary["batch_disposition"] == {
         "accepted": 1,
         "terminal_rejected": 0,
+        "unresolved_coverage_discontinuity": 0,
         "unresolved": 0,
     }
     assert len(

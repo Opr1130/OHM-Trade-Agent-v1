@@ -222,17 +222,140 @@ fi
 HOST_CYCLE_LOCK="/var/run/ohm-unified-cycle.lock"
 # Read-only liveness probe. Never delete the lock file. flock -n fails when
 # the canonical cron still holds the exclusive lock.
+# Never kill the owner or restart services from diagnostics.
+_report_lock_owner() {
+  local lock_path="$1"
+  local pid=""
+  local ppid=""
+  local start_time=""
+  local elapsed=""
+  local command=""
+
+  if command -v lslocks >/dev/null 2>&1; then
+    pid="$(
+      lslocks -n -o PID,PATH 2>/dev/null \
+        | awk -v p="$lock_path" '$2 == p {print $1; exit}'
+    )"
+  fi
+  if [[ -z "$pid" ]] && command -v fuser >/dev/null 2>&1; then
+    pid="$(fuser "$lock_path" 2>/dev/null | awk '{print $1; exit}')"
+  fi
+  if [[ -z "$pid" ]] && command -v lsof >/dev/null 2>&1; then
+    pid="$(lsof -t "$lock_path" 2>/dev/null | head -n 1)"
+  fi
+  if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]]; then
+    # proc/<pid>/stat: field 4=ppid, field 22=starttime (clock ticks)
+    ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+    local start_ticks
+    start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+    if [[ "$start_ticks" =~ ^[0-9]+$ ]]; then
+      local btime hz
+      btime="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null || true)"
+      hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+      if [[ "$btime" =~ ^[0-9]+$ && "$hz" =~ ^[0-9]+$ && "$hz" -gt 0 ]]; then
+        local start_epoch=$((btime + start_ticks / hz))
+        start_time="$(date -u -d "@$start_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+        if [[ "$start_epoch" =~ ^[0-9]+$ && "$now_epoch" =~ ^[0-9]+$ ]]; then
+          elapsed="$((now_epoch - start_epoch))"
+        fi
+      fi
+    fi
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+      command="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')"
+    fi
+    if [[ -z "$command" ]] && command -v ps >/dev/null 2>&1; then
+      command="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    fi
+  fi
+
+  echo "lock_owner_pid=${pid:-UNKNOWN}"
+  echo "lock_owner_ppid=${ppid:-UNKNOWN}"
+  echo "lock_owner_start_time=${start_time:-UNKNOWN}"
+  echo "lock_owner_elapsed=${elapsed:-UNKNOWN}"
+  echo "lock_owner_command=${command:-UNKNOWN}"
+}
+
 if [[ -e "$HOST_CYCLE_LOCK" ]]; then
   exec {cycle_lock_fd}<>"$HOST_CYCLE_LOCK"
   if flock -n "$cycle_lock_fd"; then
     echo "unified_cycle_host_lock=IDLE"
+    echo "lock_owner_pid=NONE"
+    echo "lock_owner_ppid=NONE"
+    echo "lock_owner_start_time=NONE"
+    echo "lock_owner_elapsed=NONE"
+    echo "lock_owner_command=NONE"
     flock -u "$cycle_lock_fd"
   else
     echo "unified_cycle_host_lock=HELD"
+    _report_lock_owner "$HOST_CYCLE_LOCK"
   fi
   eval "exec ${cycle_lock_fd}>&-"
 else
   echo "unified_cycle_host_lock=ABSENT"
+  echo "lock_owner_pid=ABSENT"
+  echo "lock_owner_ppid=ABSENT"
+  echo "lock_owner_start_time=ABSENT"
+  echo "lock_owner_elapsed=ABSENT"
+  echo "lock_owner_command=ABSENT"
+fi
+
+# Learning coverage epoch is learning-worker local. When this diagnose host
+# also mounts the replica data root, report it read-only; otherwise UNKNOWN.
+LEARNING_DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"
+COVERAGE_EPOCH_FILE="$LEARNING_DATA_ROOT/.learning_coverage/legacy_coverage_discontinuity_v1.json"
+if [[ -s "$COVERAGE_EPOCH_FILE" ]]; then
+  epoch_probe="$(
+    python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    payload = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+required = (
+    "schema_version",
+    "kind",
+    "archive_prefix",
+    "boundary_at_utc",
+    "reason",
+    "measurement_only",
+    "trade_authority_changed",
+    "policy_change_authorized",
+)
+if not isinstance(payload, dict) or any(k not in payload for k in required):
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+if (
+    payload.get("schema_version") != 1
+    or payload.get("kind") != "legacy_coverage_discontinuity_v1"
+    or payload.get("reason") != "LEGACY_ARCHIVE_CONTINUITY_UNPROVEN"
+    or payload.get("measurement_only") is not True
+    or payload.get("trade_authority_changed") is not False
+    or payload.get("policy_change_authorized") is not False
+):
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+print(
+    "VALID|%s|%s|%s"
+    % (
+        payload.get("boundary_at_utc") or "UNKNOWN",
+        payload.get("archive_prefix") or "UNKNOWN",
+        payload.get("reason") or "UNKNOWN",
+    )
+)
+' "$COVERAGE_EPOCH_FILE" 2>/dev/null || echo "INVALID|INVALID|INVALID|INVALID"
+  )"
+  IFS='|' read -r learning_coverage_epoch_status learning_coverage_epoch_boundary_utc learning_coverage_epoch_archive learning_coverage_epoch_reason <<<"$epoch_probe"
+  echo "learning_coverage_epoch_status=${learning_coverage_epoch_status:-INVALID}"
+  echo "learning_coverage_epoch_boundary_utc=${learning_coverage_epoch_boundary_utc:-INVALID}"
+  echo "learning_coverage_epoch_archive=${learning_coverage_epoch_archive:-INVALID}"
+  echo "learning_coverage_epoch_reason=${learning_coverage_epoch_reason:-INVALID}"
+else
+  echo "learning_coverage_epoch_status=ABSENT_OR_UNAVAILABLE"
+  echo "learning_coverage_epoch_boundary_utc=UNKNOWN"
+  echo "learning_coverage_epoch_archive=UNKNOWN"
+  echo "learning_coverage_epoch_reason=UNKNOWN"
 fi
 
 if docker inspect ohm-trade-agent >/dev/null 2>&1; then

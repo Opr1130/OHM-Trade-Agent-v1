@@ -29,6 +29,20 @@ from app.opip.decision.store import (
     funnel_events_archive,
     screening_evaluations_archive,
 )
+from app.opip.learning.coverage_discontinuity import (
+    OUTCOME_DISPOSITION_UNRESOLVED,
+    WARNING_EPOCH_INVALID,
+    WARNING_POST_BOUNDARY,
+    WARNING_PRE_BOUNDARY,
+    epoch_allows_post_boundary_hot_only,
+    load_applicable_coverage_epoch,
+    load_coverage_epoch,
+    outcome_window_crosses_discontinuity,
+    resolve_discontinuity_for_archive,
+    row_allowed_for_post_boundary_learning,
+)
+from app.opip.storage.bounded_jsonl import ArchiveWindowSelection
+
 
 
 DEFAULT_SCREENING_FILE = Path("/app/data/opip/qualification/screening_evaluations.jsonl")
@@ -1272,7 +1286,12 @@ def _persist_outcome_dispositions(
             if (
                 not record_id
                 or not snapshot_id
-                or disposition not in {"ACCEPTED", "TERMINAL_REJECTED"}
+                or disposition
+                not in {
+                    "ACCEPTED",
+                    "TERMINAL_REJECTED",
+                    OUTCOME_DISPOSITION_UNRESOLVED,
+                }
                 or not reason
             ):
                 continue
@@ -1338,12 +1357,16 @@ def resolved_accountability_outcomes(
             chunk = record_ids[start : start + 400]
             placeholders = ",".join("?" for _ in chunk)
             rows = connection.execute(
-                f"""
+                """
                 SELECT outcome_record_id
                 FROM outcome_disposition
                 WHERE outcome_record_id IN ({placeholders})
-                  AND disposition IN ('ACCEPTED', 'TERMINAL_REJECTED')
-                """,
+                  AND disposition IN (
+                      'ACCEPTED',
+                      'TERMINAL_REJECTED',
+                      'UNRESOLVED_COVERAGE_DISCONTINUITY'
+                  )
+                """.format(placeholders=placeholders),
                 tuple(chunk),
             ).fetchall()
             resolved_ids.update(str(row[0]) for row in rows)
@@ -1712,6 +1735,60 @@ def _window_archive_selection(
         os.getenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    data_root = path.parents[2] if len(path.parents) >= 3 else path.parent
+    if replica_mode:
+        # Finding 1: a persistent coverage epoch is permanent provenance and
+        # MUST be evaluated before any normal archive/index selection, even
+        # after HOT rotation, valid gzip segments, manifest/signature, or a
+        # complete window index have appeared for newer (post-boundary)
+        # evidence. Future coverage never repairs pre-boundary uncertainty.
+        # This governance is deliberately independent of the archive-repair
+        # toggle: it must not become bypassable if OPIP_LEARNING_REPLICA_
+        # ARCHIVE_REPAIR is ever unset while replica_mode is active.
+        try:
+            applicable = load_applicable_coverage_epoch(data_root, archive)
+        except RuntimeError:
+            # Epoch file exists but is unparseable/invalid: never silently
+            # revert to normal complete-history semantics. Fail closed.
+            return archive, ArchiveWindowSelection(
+                paths=(),
+                complete=False,
+                truncated=False,
+                warnings=(WARNING_EPOCH_INVALID,),
+            )
+        if applicable is not None:
+            start_utc = start.astimezone(timezone.utc)
+            # Any window that begins before the boundary (pure pre-boundary or
+            # straddling) is governed-incomplete regardless of current archive
+            # health.
+            if start_utc < applicable.boundary_at_utc:
+                return archive, ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=(WARNING_PRE_BOUNDARY,),
+                )
+            # Entirely post-boundary: if the archive is still condition C
+            # (no verified segments yet), synthesize HOT-only coverage. If the
+            # archive has since rotated to real segments/manifest, fall through
+            # to normal completeness checks below.
+            if (
+                not selection.complete
+                and "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in selection.warnings
+            ):
+                try:
+                    epoch = resolve_discontinuity_for_archive(data_root, archive)
+                except RuntimeError:
+                    epoch = None
+                if epoch is not None:
+                    discontinuity = epoch_allows_post_boundary_hot_only(
+                        epoch,
+                        archive,
+                        start=start,
+                        through=through,
+                    )
+                    if discontinuity is not None:
+                        return archive, discontinuity
     if (
         replica_mode
         and replica_repair_enabled
@@ -1763,7 +1840,121 @@ def _iter_windowed_jsonl_sources(
         selection.paths,
         strict=True,
     )
-    yield from _iter_jsonl_sources(path)
+    post_boundary = WARNING_POST_BOUNDARY in selection.warnings
+    boundary = None
+    if post_boundary:
+        data_root = path.parents[2] if len(path.parents) >= 3 else path.parent
+        epoch = load_coverage_epoch(data_root)
+        if epoch is None:
+            # The selection was authorized as post-boundary from a governing
+            # epoch; if the epoch is no longer resolvable, fail closed rather
+            # than leak unfiltered (possibly pre-boundary) HOT rows.
+            raise RuntimeError(
+                "ACCOUNTABILITY_ARCHIVE_WINDOW_INCOMPLETE:"
+                f"{kind}:{WARNING_EPOCH_INVALID}"
+            )
+        boundary = epoch.boundary_at_utc
+    for row in _iter_jsonl_sources(path):
+        if boundary is not None:
+            if not row_allowed_for_post_boundary_learning(
+                row,
+                kind=kind,
+                start=start,
+                through=through,
+                boundary=boundary,
+            ):
+                continue
+        else:
+            # No-lookahead: never consume HOT rows after the requested through.
+            visible = None
+            if kind == "screening":
+                visible = _parse_utc(row.get("observed_at"))
+            elif kind == "funnel":
+                visible = _parse_utc(
+                    row.get("decision_at_utc")
+                    or row.get("decided_at")
+                    or row.get("observed_at")
+                )
+            if visible is not None and visible > through.astimezone(timezone.utc):
+                continue
+        yield row
+
+
+def _discontinuity_unresolved_dispositions(
+    outcomes: Iterable[Mapping[str, Any]],
+    *,
+    boundary: datetime,
+) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    for row in outcomes:
+        record_id = str(row.get("outcome_record_id") or "")
+        snapshot_id = str(row.get("snapshot_id") or "")
+        reference = _parse_utc(row.get("reference_at"))
+        if not record_id or not snapshot_id or reference is None:
+            continue
+        if not outcome_window_crosses_discontinuity(
+            reference,
+            boundary,
+            pad=ACCOUNTABILITY_ARCHIVE_WINDOW_PAD,
+        ):
+            continue
+        pending.append(
+            {
+                "outcome_record_id": record_id,
+                "snapshot_id": snapshot_id,
+                "disposition": OUTCOME_DISPOSITION_UNRESOLVED,
+                "reason": OUTCOME_DISPOSITION_UNRESOLVED,
+                "accountability_rows": 0,
+                "measurement_only": True,
+                "affects_trade_authority": False,
+            }
+        )
+    return pending
+
+
+def _filter_outcomes_for_discontinuity(
+    outcomes: list[dict[str, Any]],
+    *,
+    screening_path: Path,
+    replica_mode: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], datetime | None]:
+    """Split outcomes that cross a validated discontinuity from processable ones.
+
+    Epoch governance is independent of the archive-repair toggle (Finding 1):
+    a persisted epoch must split pre-boundary outcomes whenever replica_mode is
+    active, and a present-but-invalid epoch must fail closed exactly as the
+    window-selection path does (never fall through to normal acceptance).
+    """
+    if not replica_mode:
+        return outcomes, [], None
+    archive = screening_evaluations_archive(screening_path)
+    data_root = (
+        screening_path.parents[2]
+        if len(screening_path.parents) >= 3
+        else screening_path.parent
+    )
+    try:
+        epoch = load_applicable_coverage_epoch(data_root, archive)
+    except RuntimeError as exc:
+        # Present-but-invalid epoch: fail closed, consistent with
+        # _window_archive_selection's WARNING_EPOCH_INVALID handling.
+        raise RuntimeError(
+            "ACCOUNTABILITY_OUTCOME_DISCONTINUITY_EPOCH_INVALID:"
+            f"screening:{WARNING_EPOCH_INVALID}"
+        ) from exc
+    if epoch is None:
+        return outcomes, [], None
+    unresolved = _discontinuity_unresolved_dispositions(
+        outcomes,
+        boundary=epoch.boundary_at_utc,
+    )
+    unresolved_ids = {row["outcome_record_id"] for row in unresolved}
+    processable = [
+        row
+        for row in outcomes
+        if str(row.get("outcome_record_id") or "") not in unresolved_ids
+    ]
+    return processable, unresolved, epoch.boundary_at_utc
 
 
 def build_incremental_from_outcomes(
@@ -1782,6 +1973,43 @@ def build_incremental_from_outcomes(
 ) -> dict[str, Any]:
     """Join only the outcome rows matured by the current bounded learning cycle."""
     outcomes = [dict(row) for row in outcome_rows if isinstance(row, Mapping)]
+    discontinuity_unresolved: list[dict[str, Any]] = []
+    outcomes, discontinuity_unresolved, _boundary = _filter_outcomes_for_discontinuity(
+        outcomes,
+        screening_path=screening_path,
+        replica_mode=replica_mode,
+    )
+    # Persist the pre-boundary UNRESOLVED_COVERAGE_DISCONTINUITY rows exactly
+    # once, before any path branching, so every early-return path (all-
+    # unresolved, malformed identity, ceiling split, ceiling terminal, normal
+    # tail) yields a durable disposition. Reporting the count without a durable
+    # row would orphan the evidence and force re-splitting on every cycle
+    # (learning-consumption invariant).
+    if discontinuity_unresolved:
+        _persist_outcome_dispositions(
+            discontinuity_unresolved,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+    if discontinuity_unresolved and not outcomes:
+        reconcile_paper_events(
+            intelligence_event_path=intelligence_event_path,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        summary = build_accountability_summary_from_state(
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+        summary["batch_disposition"] = {
+            "accepted": 0,
+            "terminal_rejected": 0,
+            "unresolved_coverage_discontinuity": len(discontinuity_unresolved),
+            "unresolved": 0,
+        }
+        write_summary(summary, path=summary_path)
+        return summary
+
     target_keys = {
         (_iso(row.get("reference_at")), _normalize_symbol(row.get("symbol")))
         for row in outcomes
@@ -1824,6 +2052,7 @@ def build_incremental_from_outcomes(
         summary["batch_disposition"] = {
             "accepted": 0,
             "terminal_rejected": len(terminal),
+            "unresolved_coverage_discontinuity": len(discontinuity_unresolved),
             "unresolved": max(0, len(outcomes) - len(terminal)),
         }
         write_summary(summary, path=summary_path)
@@ -1869,7 +2098,12 @@ def build_incremental_from_outcomes(
         )
         midpoint = max(1, len(ordered) // 2)
         parts = (ordered[:midpoint], ordered[midpoint:])
-        batch_counts = {"accepted": 0, "terminal_rejected": 0, "unresolved": 0}
+        batch_counts = {
+            "accepted": 0,
+            "terminal_rejected": 0,
+            "unresolved_coverage_discontinuity": len(discontinuity_unresolved),
+            "unresolved": 0,
+        }
         for part in parts:
             if not part:
                 continue
@@ -1930,6 +2164,7 @@ def build_incremental_from_outcomes(
         summary["batch_disposition"] = {
             "accepted": 0,
             "terminal_rejected": len(terminal),
+            "unresolved_coverage_discontinuity": len(discontinuity_unresolved),
             "unresolved": max(0, len(outcomes) - len(terminal)),
         }
         write_summary(summary, path=summary_path)
@@ -2019,6 +2254,8 @@ def build_incremental_from_outcomes(
         screening,
         accountability_rows,
     )
+    # discontinuity_unresolved was already persisted once at the top of this
+    # call; do not re-append it here or it would write duplicate ledger rows.
     _persist_outcome_dispositions(
         dispositions,
         ledger_path=ledger_path,
@@ -2041,12 +2278,20 @@ def build_incremental_from_outcomes(
         row.get("disposition") == "TERMINAL_REJECTED"
         for row in dispositions
     )
+    # The unresolved-coverage rows are the ones persisted once at the top; the
+    # tail `dispositions` cover only processable (accepted/terminal) outcomes.
+    unresolved_coverage = len(discontinuity_unresolved)
     summary["batch_disposition"] = {
         "accepted": accepted,
         "terminal_rejected": terminal_rejected,
+        "unresolved_coverage_discontinuity": unresolved_coverage,
         "unresolved": max(
             0,
-            len(outcomes) - accepted - terminal_rejected,
+            len(outcomes)
+            + len(discontinuity_unresolved)
+            - accepted
+            - terminal_rejected
+            - unresolved_coverage,
         ),
     }
     write_summary(summary, path=summary_path)

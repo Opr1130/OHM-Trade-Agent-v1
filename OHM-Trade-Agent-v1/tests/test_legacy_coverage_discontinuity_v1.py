@@ -1,0 +1,911 @@
+"""Legacy coverage discontinuity + post-boundary HOT-only learning regressions."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import gzip
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from app.opip.decision.store import screening_evaluations_archive
+from app.opip.learning.coverage_discontinuity import (
+    DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY,
+    WARNING_EPOCH_INVALID,
+    WARNING_POST_BOUNDARY,
+    WARNING_PRE_BOUNDARY,
+    archive_matches_legacy_ambiguous_hot_condition,
+    coverage_epoch_path,
+    establish_coverage_discontinuity_epoch,
+    load_coverage_epoch,
+    maybe_establish_oneshot_coverage_discontinuity,
+    oneshot_consumed_path,
+)
+from app.opip.learning.empty_export_attestation import (
+    EMPTY_EXPORT_ATTESTATION_FILENAME,
+)
+from app.opip.learning.replica_archive_repair import (
+    reconcile_qualification_replica_archives,
+)
+from app.services.opportunity_accountability import (
+    ACCOUNTABILITY_ARCHIVE_WINDOW_PAD,
+    _filter_outcomes_for_discontinuity,
+    _iter_windowed_jsonl_sources,
+    _window_archive_selection,
+    build_incremental_from_outcomes,
+    resolved_accountability_outcomes,
+)
+
+
+NOW = datetime(2026, 9, 8, 14, 44, 43, tzinfo=timezone.utc)
+BOUNDARY = NOW
+PRE = BOUNDARY - timedelta(hours=2)
+POST = BOUNDARY + timedelta(hours=2)
+PROD_SHA = "75c469f1d84d2963e89c7d7c76b538ca8cfedd74"
+
+
+def _orphan_incomplete_empty_index_state() -> dict:
+    return {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": False,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": "2026-09-03T05:14:33.012395+00:00",
+    }
+
+
+def _write_orphan_incomplete_empty_index(archive) -> bytes:
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(_orphan_incomplete_empty_index_state(), sort_keys=True) + "\n"
+    archive.window_index_state_file.write_text(payload, encoding="utf-8")
+    return archive.window_index_state_file.read_bytes()
+
+
+def _write_manifest_env(data_root: Path, *, exported_at: str = NOW.isoformat()) -> None:
+    (data_root / "manifest.env").write_text(
+        f"production_deployed_sha={PROD_SHA}\n"
+        f"exported_at_utc={exported_at}\n"
+        "schema_version=4\n",
+        encoding="utf-8",
+    )
+
+
+def _plant_condition_c(tmp_path: Path, *, hot_text: str = "{}\n"):
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    archive = screening_evaluations_archive(hot)
+    archive.data_file.parent.mkdir(parents=True, exist_ok=True)
+    archive.data_file.write_text(hot_text, encoding="utf-8")
+    state_bytes = _write_orphan_incomplete_empty_index(archive)
+    _write_manifest_env(tmp_path)
+    return archive, state_bytes
+
+
+def _establish(tmp_path: Path, archive, state_bytes: bytes):
+    return establish_coverage_discontinuity_epoch(
+        tmp_path,
+        archive,
+        expected_legacy_state_sha256=hashlib.sha256(state_bytes).hexdigest(),
+        boundary_at_utc=BOUNDARY,
+        production_deployed_sha=PROD_SHA,
+        exported_at_utc=NOW.isoformat(),
+    )
+
+
+def test_hot_present_complete_false_without_epoch_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, before = _plant_condition_c(tmp_path)
+
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+    assert archive.window_index_state_file.read_bytes() == before
+    assert not coverage_epoch_path(tmp_path).exists()
+
+
+def test_hot_present_complete_false_must_not_enter_empty_attestation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, before = _plant_condition_c(tmp_path)
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    planted = {
+        "schema_version": 1,
+        "kind": "empty_export_attestation_v1",
+        "archive_prefix": archive.archive_prefix,
+        "hot_bytes": 0,
+        "segment_count": 0,
+        "manifest_present": False,
+        "signature_present": False,
+        "exported_at_utc": NOW.isoformat(),
+        "production_deployed_sha": PROD_SHA,
+    }
+    (archive.archive_dir / EMPTY_EXPORT_ATTESTATION_FILENAME).write_text(
+        json.dumps(planted, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+    assert archive.window_index_state_file.read_bytes() == before
+    assert not archive._window_index_state_proves_empty_archive_without_manifest()
+
+
+def test_valid_epoch_returns_discontinuity_without_mutating_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, before = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, before)
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+
+    assert result["screening"] == DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY
+    assert archive.window_index_state_file.read_bytes() == before
+    assert not archive.manifest_file.exists()
+    assert not archive.manifest_signature_file.exists()
+
+
+def test_legacy_state_bytes_unchanged_before_and_after_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, before = _plant_condition_c(tmp_path)
+    digest_before = hashlib.sha256(before).hexdigest()
+    _establish(tmp_path, archive, before)
+    reconcile_qualification_replica_archives(tmp_path)
+    after = archive.window_index_state_file.read_bytes()
+    assert after == before
+    assert hashlib.sha256(after).hexdigest() == digest_before
+
+
+def test_window_entirely_after_epoch_allows_hot_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    post_row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-post",
+        "long_score": 81.0,
+    }
+    archive, state = _plant_condition_c(
+        tmp_path, hot_text=json.dumps(post_row) + "\n"
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=POST - timedelta(minutes=5),
+        through=POST + timedelta(minutes=5),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is True
+    assert selection.paths == ()
+    assert WARNING_POST_BOUNDARY in selection.warnings
+
+    rows = list(
+        _iter_windowed_jsonl_sources(
+            archive.data_file,
+            archive_dir=archive.archive_dir,
+            start=POST - timedelta(minutes=5),
+            through=POST + timedelta(minutes=5),
+            kind="screening",
+            replica_mode=True,
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0]["scan_id"] == "scan-post"
+
+
+def test_window_starts_before_epoch_is_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=PRE,
+        through=PRE + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_window_straddling_epoch_is_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=BOUNDARY - timedelta(minutes=30),
+        through=BOUNDARY + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_pre_boundary_hot_row_never_becomes_post_boundary_learning_evidence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    pre_row = {
+        "observed_at": PRE.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "ETHUSD",
+        "scan_id": "scan-pre",
+        "long_score": 90.0,
+    }
+    post_row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-post",
+        "long_score": 88.0,
+    }
+    archive, state = _plant_condition_c(
+        tmp_path,
+        hot_text=json.dumps(pre_row) + "\n" + json.dumps(post_row) + "\n",
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    rows = list(
+        _iter_windowed_jsonl_sources(
+            archive.data_file,
+            archive_dir=archive.archive_dir,
+            start=POST - timedelta(minutes=5),
+            through=POST + timedelta(minutes=5),
+            kind="screening",
+            replica_mode=True,
+        )
+    )
+    assert [row["scan_id"] for row in rows] == ["scan-post"]
+
+
+def test_no_lookahead_row_after_through_is_not_consumed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    through = POST + timedelta(minutes=10)
+    in_window = {
+        "observed_at": (through - timedelta(minutes=1)).isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-in",
+    }
+    after = {
+        "observed_at": (through + timedelta(minutes=1)).isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-after",
+    }
+    archive, state = _plant_condition_c(
+        tmp_path,
+        hot_text=json.dumps(in_window) + "\n" + json.dumps(after) + "\n",
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    rows = list(
+        _iter_windowed_jsonl_sources(
+            archive.data_file,
+            archive_dir=archive.archive_dir,
+            start=POST,
+            through=through,
+            kind="screening",
+            replica_mode=True,
+        )
+    )
+    assert [row["scan_id"] for row in rows] == ["scan-in"]
+
+
+def test_pre_boundary_outcomes_unresolved_no_accepted_learning(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    # Funnel archive must also reconcile under replica mode defaults.
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("", encoding="utf-8")
+
+    reference = PRE + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    outcomes = [
+        {
+            "outcome_record_id": "out-pre",
+            "snapshot_id": "snap-pre",
+            "symbol": "BTCUSD",
+            "reference_at": reference.isoformat(),
+            "reference_price": 100.0,
+            "canonical_episode_id": "ep-pre",
+        }
+    ]
+    summary = build_incremental_from_outcomes(
+        outcomes,
+        screening_path=archive.data_file,
+        screening_archive=archive.archive_dir,
+        funnel_path=funnel_hot,
+        funnel_archive=funnel_hot.parent / "funnel_events_archive",
+        intelligence_event_path=tmp_path / "intelligence_learning/events.jsonl",
+        ledger_path=tmp_path / "opip/opportunity_accountability.jsonl",
+        summary_path=tmp_path / "opip/opportunity_accountability_summary.json",
+        state_path=tmp_path / "opip/opportunity_accountability.state.sqlite3",
+        replica_mode=True,
+    )
+    batch = summary["batch_disposition"]
+    assert batch["accepted"] == 0
+    assert batch["unresolved_coverage_discontinuity"] == 1
+
+
+def test_post_boundary_outcomes_process_normally(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    reference = POST + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    screening_row = {
+        "observed_at": reference.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-post",
+        "long_score": 85.0,
+        "snapshot_id": "snap-post",
+    }
+    archive, state = _plant_condition_c(
+        tmp_path, hot_text=json.dumps(screening_row) + "\n"
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("", encoding="utf-8")
+    (funnel_hot.parent / "funnel_events_archive").mkdir(parents=True, exist_ok=True)
+
+    outcomes = [
+        {
+            "outcome_record_id": "out-post",
+            "snapshot_id": "snap-post",
+            "symbol": "BTCUSD",
+            "reference_at": reference.isoformat(),
+            "reference_price": 100.0,
+            "canonical_episode_id": "ep-post",
+        }
+    ]
+    summary = build_incremental_from_outcomes(
+        outcomes,
+        screening_path=archive.data_file,
+        screening_archive=archive.archive_dir,
+        funnel_path=funnel_hot,
+        funnel_archive=funnel_hot.parent / "funnel_events_archive",
+        intelligence_event_path=tmp_path / "intelligence_learning/events.jsonl",
+        ledger_path=tmp_path / "opip/opportunity_accountability.jsonl",
+        summary_path=tmp_path / "opip/opportunity_accountability_summary.json",
+        state_path=tmp_path / "opip/opportunity_accountability.state.sqlite3",
+        replica_mode=True,
+    )
+    batch = summary["batch_disposition"]
+    assert batch.get("unresolved_coverage_discontinuity", 0) == 0
+    assert batch["accepted"] + batch["terminal_rejected"] >= 1
+
+
+def test_mixed_batch_persists_unresolved_durably_on_tail_path(tmp_path, monkeypatch):
+    """CodeRabbit P1: unresolved rows reported on the normal-tail path must be
+    durably persisted (so resolved_accountability_outcomes returns them and the
+    learning cycle never re-reads/re-splits them)."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    post_ref = POST + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    screening_row = {
+        "observed_at": post_ref.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-post",
+        "long_score": 85.0,
+        "snapshot_id": "snap-post",
+    }
+    archive, state = _plant_condition_c(
+        tmp_path, hot_text=json.dumps(screening_row) + "\n"
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("", encoding="utf-8")
+    (funnel_hot.parent / "funnel_events_archive").mkdir(parents=True, exist_ok=True)
+
+    pre_outcome = {
+        "outcome_record_id": "out-pre",
+        "snapshot_id": "snap-pre",
+        "symbol": "BTCUSD",
+        "reference_at": (PRE + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD).isoformat(),
+        "reference_price": 100.0,
+        "canonical_episode_id": "ep-pre",
+    }
+    post_outcome = {
+        "outcome_record_id": "out-post",
+        "snapshot_id": "snap-post",
+        "symbol": "BTCUSD",
+        "reference_at": post_ref.isoformat(),
+        "reference_price": 100.0,
+        "canonical_episode_id": "ep-post",
+    }
+    ledger = tmp_path / "opip/opportunity_accountability.jsonl"
+    state_db = tmp_path / "opip/opportunity_accountability.state.sqlite3"
+    summary = build_incremental_from_outcomes(
+        [pre_outcome, post_outcome],
+        screening_path=archive.data_file,
+        screening_archive=archive.archive_dir,
+        funnel_path=funnel_hot,
+        funnel_archive=funnel_hot.parent / "funnel_events_archive",
+        intelligence_event_path=tmp_path / "intelligence_learning/events.jsonl",
+        ledger_path=ledger,
+        summary_path=tmp_path / "opip/opportunity_accountability_summary.json",
+        state_path=state_db,
+        replica_mode=True,
+    )
+    assert summary["batch_disposition"]["unresolved_coverage_discontinuity"] == 1
+
+    # The pre-boundary outcome must have a durable disposition (not orphaned).
+    resolved = resolved_accountability_outcomes(
+        [pre_outcome],
+        ledger_path=ledger,
+        state_path=state_db,
+    )
+    assert {r.get("outcome_record_id") for r in resolved} == {"out-pre"}
+
+
+def test_epoch_for_screening_allows_empty_sibling_archives(tmp_path, monkeypatch):
+    """Screening discontinuity must not break empty funnel/summaries reconcile."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    screening, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, screening, state)
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.write_text("", encoding="utf-8")
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] == DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY
+    assert result["funnel"] in {
+        "EMPTY_CERTIFIED",
+        "EMPTY_CERTIFIED_FROM_EXPORT_ATTESTATION",
+    }
+    assert result["summaries"] in {
+        "EMPTY_CERTIFIED",
+        "EMPTY_CERTIFIED_FROM_EXPORT_ATTESTATION",
+    }
+
+
+def test_sibling_condition_c_without_matching_epoch_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    screening, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, screening, state)
+
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("{}\n", encoding="utf-8")
+    from app.opip.decision.store import funnel_events_archive
+
+    funnel = funnel_events_archive(funnel_hot)
+    _write_orphan_incomplete_empty_index(funnel)
+    (tmp_path / "opip/qualification/scan_summaries.jsonl").write_text(
+        "", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+
+def test_epoch_wrong_prefix_on_target_archive_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    epoch = _establish(tmp_path, archive, state)
+    payload = epoch.to_dict()
+    payload["archive_prefix"] = "funnel_events"
+    coverage_epoch_path(tmp_path).write_text(
+        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.write_text("", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+
+def test_invalid_epoch_wrong_legacy_sha_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    epoch = _establish(tmp_path, archive, state)
+    payload = epoch.to_dict()
+    payload["legacy_window_index_state_sha256"] = "0" * 64
+    coverage_epoch_path(tmp_path).write_text(
+        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError):
+        reconcile_qualification_replica_archives(tmp_path)
+
+
+def test_malformed_epoch_schema_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    coverage_epoch_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    coverage_epoch_path(tmp_path).write_text(
+        json.dumps({"schema_version": 99, "kind": "nope"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError):
+        reconcile_qualification_replica_archives(tmp_path)
+    assert archive.window_index_state_file.read_bytes() == state
+
+
+def test_epoch_boundary_does_not_move_on_later_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    first = _establish(tmp_path, archive, state)
+    later_export = (NOW + timedelta(days=1)).isoformat()
+    _write_manifest_env(tmp_path, exported_at=later_export)
+    second = establish_coverage_discontinuity_epoch(
+        tmp_path,
+        archive,
+        expected_legacy_state_sha256=hashlib.sha256(state).hexdigest(),
+        boundary_at_utc=NOW + timedelta(days=1),
+        production_deployed_sha=PROD_SHA,
+        exported_at_utc=later_export,
+    )
+    assert second.boundary_at_utc == first.boundary_at_utc
+    loaded = load_coverage_epoch(tmp_path)
+    assert loaded is not None
+    assert loaded.boundary_at_utc == first.boundary_at_utc
+
+
+def test_epoch_still_governs_pre_boundary_after_archive_rotation(
+    tmp_path, monkeypatch
+):
+    """After post-boundary segments exist, pre-boundary windows stay discontinuous."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    for name in ("funnel_events", "scan_summaries"):
+        (tmp_path / f"opip/qualification/{name}.jsonl").write_text(
+            "", encoding="utf-8"
+        )
+    reconcile_qualification_replica_archives(tmp_path)
+
+    # Simulate future post-boundary rotation: verified segment + reconstructed index.
+    segment = archive.archive_dir / "screening_evaluations-post.jsonl.gz"
+    row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+    }
+    with gzip.open(segment, "wb") as handle:
+        handle.write((json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+    digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{digest}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    # Drop orphan incomplete so condition C no longer holds; rebuild from segments.
+    if archive.window_index_state_file.exists():
+        archive.window_index_state_file.unlink()
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] in {
+        "RECONSTRUCTED_VERIFIED",
+        "EXISTING_VERIFIED",
+    }
+    assert coverage_epoch_path(tmp_path).is_file()
+    assert not archive_matches_legacy_ambiguous_hot_condition(archive)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=PRE,
+        through=PRE + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_future_valid_archive_segment_uses_normal_manifest_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    archive = screening_evaluations_archive(hot)
+    archive.data_file.parent.mkdir(parents=True, exist_ok=True)
+    archive.data_file.write_text("", encoding="utf-8")
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    segment = archive.archive_dir / "screening_evaluations-post.jsonl.gz"
+    row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+    }
+    with gzip.open(segment, "wb") as handle:
+        handle.write((json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+    digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{digest}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    # Also plant funnel/summaries empty so reconcile returns for all.
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] == "RECONSTRUCTED_VERIFIED"
+    assert archive.manifest_file.exists()
+    assert archive.manifest_signature_file.exists()
+    selection = archive.archive_paths_for_visible_window(
+        start=POST - timedelta(minutes=1),
+        through=POST + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == (segment,)
+
+
+def test_oneshot_env_establishes_epoch_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    expected = hashlib.sha256(state).hexdigest()
+    monkeypatch.setenv("OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY", "1")
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX",
+        "screening_evaluations",
+    )
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA",
+        expected,
+    )
+    # Funnel/summaries empty certified path.
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.write_text("", encoding="utf-8")
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] == DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY
+    assert coverage_epoch_path(tmp_path).is_file()
+    assert oneshot_consumed_path(tmp_path).is_file()
+    assert archive.window_index_state_file.read_bytes() == state
+
+
+def test_diagnose_script_exposes_lock_owner_and_epoch_fields():
+    root = Path(__file__).resolve().parents[1]
+    diagnostics = (root / "deploy/remote/diagnose-opip-learning.sh").read_text(
+        encoding="utf-8"
+    )
+    for needle in (
+        "lock_owner_pid=",
+        "lock_owner_ppid=",
+        "lock_owner_start_time=",
+        "lock_owner_elapsed=",
+        "lock_owner_command=",
+        "learning_coverage_epoch_status=",
+        "learning_coverage_epoch_boundary_utc=",
+        "learning_coverage_epoch_archive=",
+        "learning_coverage_epoch_reason=",
+        "Never kill the owner",
+    ):
+        assert needle in diagnostics
+    assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
+    # Strip the benign `timeout --kill-after=...` option so it cannot mask a
+    # real signal-sending command added later.
+    signal_scan = diagnostics.replace("--kill-after", "")
+    for forbidden in ("kill $pid", "kill -", "pkill", "killall"):
+        assert forbidden not in signal_scan
+
+
+def _rotate_post_boundary_segment(archive) -> Path:
+    """Create a verified post-boundary gzip segment and drop condition C."""
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    segment = archive.archive_dir / "screening_evaluations-post.jsonl.gz"
+    row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+    }
+    with gzip.open(segment, "wb") as handle:
+        handle.write((json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+    digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{digest}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    if archive.window_index_state_file.exists():
+        archive.window_index_state_file.unlink()
+    return segment
+
+
+def _plant_empty_siblings(tmp_path: Path) -> None:
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def test_invalid_epoch_file_fails_closed_in_window_selection(tmp_path, monkeypatch):
+    """Finding 1 #9: a present-but-corrupt epoch never reverts to normal history."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    # Corrupt the durable epoch on the replica.
+    coverage_epoch_path(tmp_path).write_text("{not-json", encoding="utf-8")
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=POST - timedelta(minutes=5),
+        through=POST + timedelta(minutes=5),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_EPOCH_INVALID in selection.warnings
+
+
+def test_post_boundary_window_after_rotation_uses_normal_archive(tmp_path, monkeypatch):
+    """Finding 1 #2: post-boundary window may use future verified segments."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    _plant_empty_siblings(tmp_path)
+    reconcile_qualification_replica_archives(tmp_path)
+    _rotate_post_boundary_segment(archive)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=POST - timedelta(minutes=1),
+        through=POST + timedelta(minutes=1),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    # Normal completeness path is used for the allowed post-boundary window.
+    assert selection.complete is True
+    assert WARNING_PRE_BOUNDARY not in selection.warnings
+    assert coverage_epoch_path(tmp_path).is_file()
+
+
+def test_straddling_window_after_rotation_is_discontinuous(tmp_path, monkeypatch):
+    """Finding 1 #3: a straddling window fails even with a complete future archive."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    _plant_empty_siblings(tmp_path)
+    reconcile_qualification_replica_archives(tmp_path)
+    _rotate_post_boundary_segment(archive)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=BOUNDARY - timedelta(minutes=30),
+        through=BOUNDARY + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_recurring_job_without_oneshot_cannot_create_epoch(tmp_path, monkeypatch):
+    """Finding 2 #7: without one-shot authorization no epoch is ever minted."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    monkeypatch.delenv("OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY", raising=False)
+    archive, _state = _plant_condition_c(tmp_path)
+    assert (
+        maybe_establish_oneshot_coverage_discontinuity(
+            tmp_path, {"screening": archive}
+        )
+        is None
+    )
+    assert not coverage_epoch_path(tmp_path).is_file()
+
+
+def test_epoch_governs_pre_boundary_without_repair_flag(tmp_path, monkeypatch):
+    """P1: epoch enforcement must not depend on OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR.
+
+    The learning cycle calls the builder with replica_mode=True unconditionally,
+    so a persisted epoch must still fail pre-boundary windows closed even when
+    the (unrelated) archive-repair toggle is absent.
+    """
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    monkeypatch.delenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", raising=False)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=PRE,
+        through=PRE + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_outcome_splitter_fails_closed_on_invalid_epoch(tmp_path, monkeypatch):
+    """P2-1: a present-but-invalid epoch fails the outcome split closed."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    coverage_epoch_path(tmp_path).write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=WARNING_EPOCH_INVALID):
+        _filter_outcomes_for_discontinuity(
+            [{"outcome_record_id": "o1", "snapshot_id": "s1",
+              "reference_at": PRE.isoformat()}],
+            screening_path=archive.data_file,
+            replica_mode=True,
+        )
+
+
+def test_recurring_env_after_rotation_is_idempotent(tmp_path, monkeypatch):
+    """Finding 2 #8/#9: a persisted epoch stays fixed even if env remains set and
+    the archive has rotated out of condition C on a later run."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    expected = hashlib.sha256(state).hexdigest()
+    monkeypatch.setenv("OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY", "1")
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX",
+        "screening_evaluations",
+    )
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA",
+        expected,
+    )
+    first = maybe_establish_oneshot_coverage_discontinuity(
+        tmp_path, {"screening": archive}
+    )
+    assert first is not None
+    epoch_bytes = coverage_epoch_path(tmp_path).read_bytes()
+
+    # Later run: archive has rotated to real segments (condition C now false),
+    # but the one-shot env is still present. Must not raise, advance, or rewrite.
+    _rotate_post_boundary_segment(archive)
+    assert not archive_matches_legacy_ambiguous_hot_condition(archive)
+    second = maybe_establish_oneshot_coverage_discontinuity(
+        tmp_path, {"screening": archive}
+    )
+    assert second is not None
+    assert second.boundary_at_utc == first.boundary_at_utc
+    assert coverage_epoch_path(tmp_path).read_bytes() == epoch_bytes
