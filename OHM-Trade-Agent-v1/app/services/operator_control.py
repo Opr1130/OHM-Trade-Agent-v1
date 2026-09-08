@@ -151,6 +151,25 @@ def mark_search_started(now: datetime | None = None) -> None:
     with registry_lock(LOCK_FILE):
         state = _load_state()
         state["last_search_started_at"] = now.isoformat()
+        state["last_search_status"] = "STARTED"
+        _save_state(state)
+
+
+def mark_search_finished(status: str = "COMPLETED", now: datetime | None = None) -> None:
+    """Record that a started broad search returned. Does not change cadence.
+
+    A process kill/timeout leaves ``last_search_status=STARTED`` so diagnostics
+    can distinguish a hung scan from a completed or failed return. Cadence
+    still uses ``last_search_started_at`` only.
+    """
+    normalized = str(status or "").strip().upper()
+    if normalized not in {"COMPLETED", "FAILED"}:
+        normalized = "FAILED"
+    now = now or _now()
+    with registry_lock(LOCK_FILE):
+        state = _load_state()
+        state["last_search_finished_at"] = now.isoformat()
+        state["last_search_status"] = normalized
         _save_state(state)
 
 

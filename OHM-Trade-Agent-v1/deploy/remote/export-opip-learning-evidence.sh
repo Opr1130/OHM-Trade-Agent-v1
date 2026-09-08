@@ -16,7 +16,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk; do
+for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required export command: $cmd" >&2
     exit 69
@@ -48,6 +48,80 @@ fi
 # the complete publish guarantees they can never receive mixed generations.
 exec 8>"$PUBLISH_LOCK"
 flock -x 8
+
+# Write export-tree empty attestation from canonical copied files only.
+# Never writes into DATA_ROOT. Eligibility must match
+# production_empty_export_attestation_eligible() in
+# app/opip/learning/empty_export_attestation.py. A complete=false
+# window-index is ambiguous production lineage and never mints proof.
+# When state.json exists it must match the exact certified-empty schema
+# (same keys/values as _window_index_state_proves_empty_archive_without_manifest).
+state_json_is_certified_empty_without_manifest() {
+  local state="$1"
+  [[ -f "$state" ]] || return 1
+  local compact
+  # Production writers emit compact sorted JSON. Strip insignificant
+  # whitespace so a pretty-printed certified-empty state still matches.
+  # Fail closed on any other key set, value, or malformed fragment.
+  compact="$(tr -d '[:space:]' <"$state")"
+  [[ -n "$compact" ]] || return 1
+  [[ "$compact" =~ ^\{\"complete\":true,\"coverage_day_count\":0,\"coverage_start_day\":null,\"coverage_through_day\":null,\"manifest_mtime_ns\":0,\"manifest_present\":false,\"manifest_sha256\":\"\",\"manifest_size\":0,\"schema_version\":1,\"shard_sha256\":\{\},\"updated_at_utc\":\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})\"\}$ ]]
+}
+
+write_empty_export_attestation_if_canonical() {
+  local hot_file="$1"
+  local archive_dir="$2"
+  local prefix="$3"
+  [[ -n "$archive_dir" && -d "$archive_dir" && -n "$prefix" ]] || return 0
+
+  local hot_bytes=0
+  if [[ -f "$hot_file" ]]; then
+    hot_bytes="$(stat -c '%s' "$hot_file")"
+  fi
+  if [[ "$hot_bytes" != "0" ]]; then
+    return 0
+  fi
+  if [[ -f "$archive_dir/manifest.json" || -f "$archive_dir/manifest.json.sha256" ]]; then
+    return 0
+  fi
+
+  local segment_count=0
+  local segment
+  while IFS= read -r -d '' segment; do
+    segment_count=$((segment_count + 1))
+  done < <(find "$archive_dir" -type f -name "${prefix}-*.jsonl.gz" -print0)
+  if (( segment_count > 0 )); then
+    return 0
+  fi
+
+  local index_dir="$archive_dir/window_index_v1"
+  if [[ -d "$index_dir" ]]; then
+    local extra_index=0
+    local extra
+    while IFS= read -r -d '' extra; do
+      extra_index=$((extra_index + 1))
+    done < <(find "$index_dir" -mindepth 1 ! -name 'state.json' -print0)
+    if (( extra_index > 0 )); then
+      return 0
+    fi
+    local state="$index_dir/state.json"
+    if [[ ! -f "$state" ]]; then
+      return 0
+    fi
+    if ! state_json_is_certified_empty_without_manifest "$state"; then
+      return 0
+    fi
+  fi
+
+  local sha
+  sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
+  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    sha=""
+  fi
+  local exported_at
+  exported_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '%s\n' "{\"archive_prefix\":\"${prefix}\",\"exported_at_utc\":\"${exported_at}\",\"hot_bytes\":0,\"kind\":\"empty_export_attestation_v1\",\"manifest_present\":false,\"production_deployed_sha\":\"${sha}\",\"schema_version\":1,\"segment_count\":0,\"signature_present\":false}" > "$archive_dir/empty_export_attestation_v1.json"
+}
 
 copy_locked_jsonl() {
   local source="$1"
@@ -90,6 +164,13 @@ copy_locked_jsonl() {
   fi
   flock -u "$source_fd"
   eval "exec ${source_fd}>&-"
+
+  if [[ -n "$archive_name" ]]; then
+    write_empty_export_attestation_if_canonical \
+      "$temp" \
+      "$archive_temp" \
+      "$(basename "$source" .jsonl)"
+  fi
 
   if getent group "$READER_GROUP" >/dev/null 2>&1; then
     chown root:"$READER_GROUP" "$temp"

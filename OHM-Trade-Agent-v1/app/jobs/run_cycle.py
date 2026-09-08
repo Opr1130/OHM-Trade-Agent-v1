@@ -13,7 +13,12 @@ from app.services.external_order_review import ExternalOrderReviewSummary, revie
 from app.services.kraken_reconciliation import ReconciliationSummary, reconcile_kraken_account
 from app.services.learning_scheduler import run_learning_cycle
 from app.services.operations_analytics import run_scan_with_telemetry
-from app.services.operator_control import get_operator_decision, mark_search_started, search_due
+from app.services.operator_control import (
+    get_operator_decision,
+    mark_search_finished,
+    mark_search_started,
+    search_due,
+)
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 
@@ -449,8 +454,14 @@ def _run_cycle_once() -> None:
     mark_search_started()
     # Capture the scanner's existing console report into structured telemetry
     # while teeing it unchanged to stdout. Telemetry is fail-open and does not
-    # participate in trade decisions.
-    run_scan_with_telemetry(scan_main)
+    # participate in trade decisions. A kill/timeout leaves STARTED so
+    # diagnostics can see a hung scan without deleting the cycle lock.
+    try:
+        run_scan_with_telemetry(scan_main)
+    except Exception:
+        mark_search_finished("FAILED")
+        raise
+    mark_search_finished("COMPLETED")
 
 
 def main() -> None:

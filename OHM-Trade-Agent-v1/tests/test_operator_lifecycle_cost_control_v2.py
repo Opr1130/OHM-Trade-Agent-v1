@@ -190,6 +190,73 @@ def test_operator_manual_maintenance_override(tmp_path, monkeypatch):
     assert decision.effective_mode == "MAINTENANCE"
 
 
+def test_search_started_without_finish_is_in_progress_and_does_not_change_cadence(
+    tmp_path, monkeypatch
+):
+    import app.services.operator_control as control
+    import app.services.order_intent_registry as orders
+
+    monkeypatch.setattr(control, "STATE_FILE", tmp_path / "operator.json")
+    monkeypatch.setattr(control, "LOCK_FILE", tmp_path / ".operator.lock")
+    monkeypatch.setattr(control, "get_active_trades", lambda: [])
+    monkeypatch.setattr(control, "get_pending_setups", lambda: [])
+    monkeypatch.setattr(orders, "get_live_order_intents", lambda: [])
+
+    started = datetime(2026, 8, 11, 16, 0, tzinfo=timezone.utc)
+    control.mark_search_started(started)
+    state = control._load_state()
+    assert state["last_search_status"] == "STARTED"
+    assert "last_search_finished_at" not in state
+
+    decision = control.get_operator_decision(
+        datetime(2026, 8, 11, 16, 1, tzinfo=timezone.utc)
+    )
+    assert (
+        control.search_due(
+            decision, datetime(2026, 8, 11, 16, 1, tzinfo=timezone.utc)
+        )
+        is False
+    )
+    assert (
+        control.search_due(
+            decision, datetime(2026, 8, 11, 16, 6, tzinfo=timezone.utc)
+        )
+        is True
+    )
+
+    control.mark_search_finished(
+        "COMPLETED", datetime(2026, 8, 11, 16, 2, tzinfo=timezone.utc)
+    )
+    state = control._load_state()
+    assert state["last_search_status"] == "COMPLETED"
+    assert state["last_search_finished_at"].startswith("2026-08-11T16:02:00")
+    # Cadence still keys off started_at, not finished_at.
+    assert (
+        control.search_due(
+            decision, datetime(2026, 8, 11, 16, 4, tzinfo=timezone.utc)
+        )
+        is False
+    )
+    assert (
+        control.search_due(
+            decision, datetime(2026, 8, 11, 16, 6, tzinfo=timezone.utc)
+        )
+        is True
+    )
+
+
+def test_search_finished_rejects_unknown_status_as_failed(tmp_path, monkeypatch):
+    import app.services.operator_control as control
+
+    monkeypatch.setattr(control, "STATE_FILE", tmp_path / "operator.json")
+    monkeypatch.setattr(control, "LOCK_FILE", tmp_path / ".operator.lock")
+    control.mark_search_started(datetime(2026, 8, 11, 16, tzinfo=timezone.utc))
+    control.mark_search_finished(
+        "READY", datetime(2026, 8, 11, 16, 1, tzinfo=timezone.utc)
+    )
+    assert control._load_state()["last_search_status"] == "FAILED"
+
+
 def test_notification_policy_suppresses_same_fingerprint(tmp_path, monkeypatch):
     import app.services.notification_policy as policy
 
