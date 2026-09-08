@@ -93,6 +93,7 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "OUTCOMES_STALE" in diagnostics
     assert "docker exec ohm-trade-agent" in diagnostics
     assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in diagnostics
+    assert "UNAVAILABLE:TIMEOUT_OR_EXEC" in diagnostics
     assert "unified_cycle_host_lock=" in diagnostics
     assert "{{.State.Running}}" in diagnostics
     assert "CORE_CONTAINER_STOPPED" in diagnostics

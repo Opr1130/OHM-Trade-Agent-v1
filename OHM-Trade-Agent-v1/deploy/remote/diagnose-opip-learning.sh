@@ -237,10 +237,11 @@ fi
 
 if docker inspect ohm-trade-agent >/dev/null 2>&1; then
   core_running="$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)"
+  analytics=""
+  analytics_rc=0
   if [[ "$core_running" != "true" ]]; then
     echo "production_validation_data=CORE_CONTAINER_STOPPED"
     status="FAIL"
-    analytics=""
   else
     analytics="$(
     timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent python -c '
@@ -278,17 +279,17 @@ try:
 except Exception as exc:
     print("UNAVAILABLE:" + type(exc).__name__)
     sys.exit(1)
-' 2>/dev/null || true
-    )"
+' 2>/dev/null
+    )" || analytics_rc=$?
   fi
   if [[ "$core_running" == "true" && "$analytics" == UNAVAILABLE:* ]]; then
     echo "production_validation_data=$analytics"
     degrade
-  elif [[ "$core_running" == "true" && -n "$analytics" ]]; then
-    echo "production_validation_data=$analytics"
-  elif [[ "$core_running" == "true" ]]; then
-    echo "production_validation_data=UNAVAILABLE"
+  elif [[ "$core_running" == "true" && ( "$analytics_rc" -ne 0 || -z "$analytics" ) ]]; then
+    echo "production_validation_data=UNAVAILABLE:TIMEOUT_OR_EXEC"
     degrade
+  elif [[ "$core_running" == "true" ]]; then
+    echo "production_validation_data=$analytics"
   fi
 else
   echo "production_validation_data=CORE_CONTAINER_MISSING"
