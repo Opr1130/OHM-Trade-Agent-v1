@@ -17,6 +17,30 @@ from app.opip.learning.replica_archive_repair import (
 NOW = datetime(2026, 9, 6, 6, 0, tzinfo=timezone.utc)
 
 
+def _orphan_incomplete_empty_index_state() -> dict:
+    return {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": False,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": NOW.isoformat(),
+    }
+
+
+def _write_orphan_incomplete_empty_index(archive) -> None:
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    archive.window_index_state_file.write_text(
+        json.dumps(_orphan_incomplete_empty_index_state(), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_verified_screening_segment(data_root: Path):
     hot = data_root / "opip/qualification/screening_evaluations.jsonl"
     archive = screening_evaluations_archive(hot)
@@ -136,24 +160,7 @@ def test_orphan_incomplete_empty_index_is_certified_on_replica_only(tmp_path):
     archive = screening_evaluations_archive(
         tmp_path / "opip/qualification/screening_evaluations.jsonl"
     )
-    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
-    prior_state = {
-        "schema_version": 1,
-        "manifest_present": False,
-        "manifest_size": 0,
-        "manifest_mtime_ns": 0,
-        "manifest_sha256": "",
-        "complete": False,
-        "coverage_start_day": None,
-        "coverage_through_day": None,
-        "coverage_day_count": 0,
-        "shard_sha256": {},
-        "updated_at_utc": NOW.isoformat(),
-    }
-    archive.window_index_state_file.write_text(
-        json.dumps(prior_state, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    _write_orphan_incomplete_empty_index(archive)
     assert archive.ensure_window_index_locked() is False
 
     result = reconcile_qualification_replica_archives(tmp_path)
@@ -188,3 +195,44 @@ def test_replica_empty_certify_refuses_gzip_segments(tmp_path):
     archive, _segment = _write_verified_screening_segment(tmp_path)
     with pytest.raises(RuntimeError, match="archive segments are present"):
         archive.certify_empty_replica_window_index_locked()
+
+
+def test_replica_empty_certify_refuses_hot_jsonl(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    archive.data_file.parent.mkdir(parents=True, exist_ok=True)
+    archive.data_file.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="hot JSONL is present"):
+        archive.certify_empty_replica_window_index_locked()
+    assert archive.ensure_window_index_locked() is False
+
+
+def test_replica_empty_certify_refuses_prior_manifest_index(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    prior_state = {
+        "schema_version": 1,
+        "manifest_present": True,
+        "manifest_size": 123,
+        "manifest_mtime_ns": 456,
+        "manifest_sha256": "a" * 64,
+        "complete": True,
+        "coverage_start_day": "2026-09-01",
+        "coverage_through_day": "2026-09-02",
+        "coverage_day_count": 2,
+        "shard_sha256": {"2026-09-01": "b" * 64, "2026-09-02": "c" * 64},
+        "updated_at_utc": NOW.isoformat(),
+    }
+    archive.window_index_state_file.write_text(
+        json.dumps(prior_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    before = archive.window_index_state_file.read_bytes()
+    with pytest.raises(RuntimeError, match="orphan incomplete empty leftover"):
+        archive.certify_empty_replica_window_index_locked()
+    assert archive.window_index_state_file.read_bytes() == before
+    assert archive.ensure_window_index_locked() is False

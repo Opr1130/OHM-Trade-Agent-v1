@@ -261,8 +261,10 @@ class BoundedJsonlArchive:
     def manifest_signature_file(self) -> Path:
         return self.manifest_file.with_suffix(self.manifest_file.suffix + ".sha256")
 
-    def _window_index_state_proves_empty_archive_without_manifest(self) -> bool:
-        """Return true only for a previously certified, zero-coverage empty index."""
+    def _window_index_state_matches_empty_without_manifest(
+        self, *, complete: bool
+    ) -> bool:
+        """Match a zero-coverage no-manifest index with the expected complete flag."""
         if not self.window_index_state_file.exists():
             return False
         try:
@@ -303,7 +305,7 @@ class BoundedJsonlArchive:
             )
             or type(state.get("manifest_sha256")) is not str
             or state.get("manifest_sha256") != ""
-            or state.get("complete") is not True
+            or state.get("complete") is not complete
             or state.get("coverage_start_day") is not None
             or state.get("coverage_through_day") is not None
             or not isinstance(shard_digests, dict)
@@ -320,6 +322,20 @@ class BoundedJsonlArchive:
         except OSError:
             return False
         return not unexpected_index_entries
+
+    def _window_index_state_proves_empty_archive_without_manifest(self) -> bool:
+        """Return true only for a previously certified, zero-coverage empty index."""
+        return self._window_index_state_matches_empty_without_manifest(complete=True)
+
+    def _window_index_state_is_orphan_incomplete_empty_without_manifest(self) -> bool:
+        """True only for leftover incomplete zero-coverage derived index state.
+
+        Production ``ensure_window_index_locked`` never promotes this shape to
+        complete. Replica recovery may recertify it as empty when no canonical
+        files remain. Any prior-manifest, coverage, shard, or extra index
+        evidence stays fail-closed.
+        """
+        return self._window_index_state_matches_empty_without_manifest(complete=False)
 
     def _read_manifest_signature(self) -> str | None:
         try:
@@ -608,12 +624,14 @@ class BoundedJsonlArchive:
         return True, new_start, new_through, shard_digests
 
     def certify_empty_replica_window_index_locked(self) -> None:
-        """Replica-only: certify empty when no canonical archive files remain.
+        """Replica-only: certify leftover incomplete empty derived index.
 
         Production callers must keep using ``ensure_window_index_locked``,
         which never reclassifies an incomplete zero-coverage state as
         complete. This recovery does not delete locks, manifests, signatures,
-        or gzip segments. It refuses if any of those canonical files exist.
+        gzip segments, or HOT JSONL. It refuses unless the existing derived
+        index is the incomplete empty leftover shape and no canonical files
+        remain.
         """
         if self.manifest_file.exists():
             raise RuntimeError(
@@ -628,6 +646,23 @@ class BoundedJsonlArchive:
         ):
             raise RuntimeError(
                 "refusing empty replica certification; archive segments are present"
+            )
+        try:
+            hot_bytes = (
+                self.data_file.stat().st_size if self.data_file.exists() else 0
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "refusing empty replica certification; hot JSONL is unreadable"
+            ) from exc
+        if hot_bytes > 0:
+            raise RuntimeError(
+                "refusing empty replica certification; hot JSONL is present"
+            )
+        if not self._window_index_state_is_orphan_incomplete_empty_without_manifest():
+            raise RuntimeError(
+                "refusing empty replica certification; index is not an "
+                "orphan incomplete empty leftover"
             )
         self._write_window_index_state_locked(complete=True)
 
