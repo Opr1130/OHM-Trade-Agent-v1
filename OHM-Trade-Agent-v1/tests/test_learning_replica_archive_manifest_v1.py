@@ -236,3 +236,14 @@ def test_replica_empty_certify_refuses_prior_manifest_index(tmp_path):
         archive.certify_empty_replica_window_index_locked()
     assert archive.window_index_state_file.read_bytes() == before
     assert archive.ensure_window_index_locked() is False
+
+
+def test_replica_empty_certify_refuses_extra_window_index_files(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    _write_orphan_incomplete_empty_index(archive)
+    (archive.window_index_dir / "2026-09-01.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="orphan incomplete empty leftover"):
+        archive.certify_empty_replica_window_index_locked()
+    assert archive.ensure_window_index_locked() is False

@@ -62,10 +62,16 @@ echo "OPIP_LEARNING_DIAGNOSTICS"
 echo "checked_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 current_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
+production_sha_source="LAST_GOOD"
 if [[ ! "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
   current_sha="$(git -c safe.directory="$REPO_ROOT" -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+  production_sha_source="CHECKOUT_HEAD"
+fi
+if [[ ! "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  production_sha_source="UNKNOWN"
 fi
 echo "production_sha=${current_sha:-UNKNOWN}"
+echo "production_sha_source=$production_sha_source"
 
 if [[ -s "$EXPORT_CRON" ]]; then
   echo "production_export_cron=PRESENT"
@@ -123,9 +129,12 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   echo "outcomes_pending_ack=${outcomes_pending_ack:-UNKNOWN}"
 
   echo "worker_reported_release_compatibility_status=${release_compat:-UNKNOWN}"
-  # Live SHA comparison is authoritative. A stale worker heartbeat that still
-  # says CURRENT after production moved must not hide RELEASE_DRIFT.
-  if [[ "$worker_sha" =~ ^[0-9a-f]{40}$ && "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  # Live SHA comparison outranks a stale heartbeat only when production_sha
+  # came from the deploy receipt. Checkout HEAD is not an authoritative
+  # deployed SHA and must not hide UNVERIFIED or invent CURRENT/DRIFT.
+  if [[ "$production_sha_source" == "LAST_GOOD" \
+     && "$worker_sha" =~ ^[0-9a-f]{40}$ \
+     && "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
     if [[ "$worker_sha" == "$current_sha" ]]; then
       release_compatibility_status="CURRENT"
     else
@@ -172,6 +181,7 @@ if [[ -s "$READER_STATE_FILE" ]]; then
     echo "worker_compute_status=RELEASE_DRIFT"
     degrade
   elif [[ "$release_compatibility_status" == "UNVERIFIED" \
+       && "$production_sha_source" == "LAST_GOOD" \
        && "$worker_sha" =~ ^[0-9a-f]{40}$ \
        && "$current_sha" =~ ^[0-9a-f]{40}$ \
        && "$worker_sha" != "$current_sha" ]]; then

@@ -197,11 +197,16 @@ def test_diagnose_surfaces_release_consumption_and_zero_funnel():
     )
     assert "release_compatibility_status=" in diagnostics
     assert "worker_reported_release_compatibility_status=" in diagnostics
-    # Live SHA comparison must outrank a stale worker-reported CURRENT token.
+    assert "production_sha_source=" in diagnostics
+    assert 'production_sha_source="LAST_GOOD"' in diagnostics
+    assert 'production_sha_source="CHECKOUT_HEAD"' in diagnostics
+    # Live SHA comparison must outrank a stale worker-reported CURRENT token
+    # only when the production SHA came from last-good-sha, not checkout HEAD.
     reported = diagnostics.index("worker_reported_release_compatibility_status=")
-    live = diagnostics.index('worker_sha" == "$current_sha"', reported)
+    last_good = diagnostics.index('production_sha_source" == "LAST_GOOD"', reported)
+    live = diagnostics.index('worker_sha" == "$current_sha"', last_good)
     fallback = diagnostics.index('elif [[ -n "$release_compat"', live)
-    assert reported < live < fallback
+    assert reported < last_good < live < fallback
     assert "unified_cycle_host_lock=" in diagnostics
     assert "unified_cycle_host_lock=HELD" in diagnostics
     assert "Never delete the lock file" in diagnostics
