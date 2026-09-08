@@ -583,14 +583,19 @@ def resolve_discontinuity_for_archive(
     data_root: Path | str,
     archive: BoundedJsonlArchive,
 ) -> CoverageEpoch | None:
-    """Return a validated epoch for condition C, or None if epoch absent.
+    """Return a validated epoch for condition C, or None if epoch absent/inapplicable.
 
-    Raises when an epoch exists but is invalid for this archive.
+    Raises when an epoch exists for this archive prefix but fails validation
+    (wrong legacy state SHA, malformed live condition, etc.). A durable epoch
+    for a *different* archive prefix does not apply and returns None so other
+    qualification archives can still reconcile.
     """
     if not archive_matches_legacy_ambiguous_hot_condition(archive):
         return None
     epoch = load_coverage_epoch(data_root)
     if epoch is None:
+        return None
+    if epoch.archive_prefix != archive.archive_prefix:
         return None
     validate_epoch_against_archive(epoch, archive, require_live_hot_match=False)
     return epoch

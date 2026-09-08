@@ -404,7 +404,49 @@ def test_post_boundary_outcomes_process_normally(tmp_path, monkeypatch):
     assert batch["accepted"] + batch["terminal_rejected"] >= 1
 
 
-def test_invalid_epoch_wrong_prefix_fails_closed(tmp_path, monkeypatch):
+def test_epoch_for_screening_allows_empty_sibling_archives(tmp_path, monkeypatch):
+    """Screening discontinuity must not break empty funnel/summaries reconcile."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    screening, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, screening, state)
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.write_text("", encoding="utf-8")
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] == DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY
+    assert result["funnel"] in {
+        "EMPTY_CERTIFIED",
+        "EMPTY_CERTIFIED_FROM_EXPORT_ATTESTATION",
+    }
+    assert result["summaries"] in {
+        "EMPTY_CERTIFIED",
+        "EMPTY_CERTIFIED_FROM_EXPORT_ATTESTATION",
+    }
+
+
+def test_sibling_condition_c_without_matching_epoch_fails_closed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    screening, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, screening, state)
+
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("{}\n", encoding="utf-8")
+    from app.opip.decision.store import funnel_events_archive
+
+    funnel = funnel_events_archive(funnel_hot)
+    _write_orphan_incomplete_empty_index(funnel)
+    (tmp_path / "opip/qualification/scan_summaries.jsonl").write_text(
+        "", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
+        reconcile_qualification_replica_archives(tmp_path)
+
+
+def test_epoch_wrong_prefix_on_target_archive_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
     archive, state = _plant_condition_c(tmp_path)
     epoch = _establish(tmp_path, archive, state)
@@ -413,8 +455,11 @@ def test_invalid_epoch_wrong_prefix_fails_closed(tmp_path, monkeypatch):
     coverage_epoch_path(tmp_path).write_text(
         json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
     )
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.write_text("", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED|archive_prefix"):
+    with pytest.raises(RuntimeError, match="LEGACY_COVERAGE_DISCONTINUITY_REQUIRED"):
         reconcile_qualification_replica_archives(tmp_path)
 
 
