@@ -37,6 +37,9 @@ ONESHOT_CONSUMED_FILENAME = "oneshot_consumed.env"
 DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY = "LEGACY_COVERAGE_DISCONTINUITY"
 WARNING_POST_BOUNDARY = "LEGACY_COVERAGE_DISCONTINUITY_POST_BOUNDARY"
 WARNING_PRE_BOUNDARY = "LEGACY_COVERAGE_DISCONTINUITY"
+# A present-but-unparseable/invalid epoch must fail closed, never silently
+# revert to normal complete-history semantics (Finding 1, regression #9).
+WARNING_EPOCH_INVALID = "LEGACY_COVERAGE_EPOCH_INVALID"
 OUTCOME_DISPOSITION_UNRESOLVED = "UNRESOLVED_COVERAGE_DISCONTINUITY"
 
 STATUS_ABSENT = "ABSENT"
@@ -465,11 +468,42 @@ def establish_coverage_discontinuity_epoch(
     production_deployed_sha: str | None = None,
     exported_at_utc: str | None = None,
 ) -> CoverageEpoch:
-    """One-shot create the durable epoch after verifying legacy condition C."""
+    """One-shot create the durable epoch after verifying legacy condition C.
+
+    Idempotency contract (Finding 2): a matching epoch that already exists is
+    returned unchanged **before** any live condition-C / HOT check. This lets a
+    recurring job (or a restart) that still carries the one-shot authorization
+    env re-observe the completed migration without advancing the boundary, and
+    without failing merely because the archive has since rotated out of
+    condition C. Establishing a *new* epoch still requires live condition C and
+    an exact legacy-state SHA match.
+    """
     root = Path(data_root)
     expected = expected_legacy_state_sha256.strip().lower()
     if not _SHA256_RE.fullmatch(expected):
         raise RuntimeError("expected legacy state SHA is invalid")
+
+    # Present-but-invalid epoch is a fail-closed defect, never a fresh mint.
+    try:
+        existing = load_coverage_epoch(root)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "refusing coverage discontinuity; existing epoch invalid"
+        ) from exc
+    if existing is not None:
+        # Immutable provenance: never advance boundary / rewrite identity.
+        if existing.archive_prefix != archive.archive_prefix:
+            raise RuntimeError(
+                "refusing coverage discontinuity; existing epoch archive differs"
+            )
+        if existing.legacy_window_index_state_sha256 != expected:
+            raise RuntimeError(
+                "refusing coverage discontinuity; existing epoch SHA differs"
+            )
+        return existing
+
+    # No epoch yet: establishing a new one requires the live legacy condition C
+    # and an exact legacy-state SHA match.
     if not archive_matches_legacy_ambiguous_hot_condition(archive):
         raise RuntimeError(
             "refusing coverage discontinuity; archive is not HOT-present "
@@ -480,23 +514,6 @@ def establish_coverage_discontinuity_epoch(
         raise RuntimeError(
             "refusing coverage discontinuity; legacy state SHA mismatch"
         )
-    existing = None
-    try:
-        existing = load_coverage_epoch(root)
-    except RuntimeError as exc:
-        raise RuntimeError("refusing coverage discontinuity; existing epoch invalid") from exc
-    if existing is not None:
-        # Boundary is fixed after first approval; later syncs must not move it.
-        validate_epoch_against_archive(existing, archive, require_live_hot_match=False)
-        if existing.archive_prefix != archive.archive_prefix:
-            raise RuntimeError(
-                "refusing coverage discontinuity; existing epoch archive differs"
-            )
-        if existing.legacy_window_index_state_sha256 != expected:
-            raise RuntimeError(
-                "refusing coverage discontinuity; existing epoch SHA differs"
-            )
-        return existing
 
     if oneshot_consumed_path(root).is_file():
         raise RuntimeError(
@@ -577,6 +594,32 @@ def maybe_establish_oneshot_coverage_discontinuity(
         target,
         expected_legacy_state_sha256=expected_sha,
     )
+
+
+def load_applicable_coverage_epoch(
+    data_root: Path | str,
+    archive: BoundedJsonlArchive,
+) -> CoverageEpoch | None:
+    """Return epoch when present and bound to this archive prefix.
+
+    Unlike ``resolve_discontinuity_for_archive``, this does **not** require
+    live condition C. After post-boundary archive rotation, the epoch remains
+    provenance and still governs pre-boundary / straddling windows.
+    """
+    epoch = load_coverage_epoch(data_root)
+    if epoch is None:
+        return None
+    if epoch.archive_prefix != archive.archive_prefix:
+        return None
+    if epoch.reason != COVERAGE_EPOCH_REASON:
+        raise RuntimeError("coverage epoch reason is unsupported")
+    if epoch.measurement_only is not True:
+        raise RuntimeError("coverage epoch measurement_only must be true")
+    if epoch.trade_authority_changed is not False:
+        raise RuntimeError("coverage epoch trade_authority_changed must be false")
+    if epoch.policy_change_authorized is not False:
+        raise RuntimeError("coverage epoch policy_change_authorized must be false")
+    return epoch
 
 
 def resolve_discontinuity_for_archive(

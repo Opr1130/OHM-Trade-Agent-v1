@@ -233,6 +233,9 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert "P1_SHADOW_OUTBOX_ENABLED=true" not in runner
     assert "p1_shadow_outbox_retired" in runner
     assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true" in runner
+    assert "OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY" in runner
+    assert "OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX" in runner
+    assert "OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA" in runner
 
 
 def test_deploy_reconciles_paper_topology_before_marking_last_good():

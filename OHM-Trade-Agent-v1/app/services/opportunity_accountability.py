@@ -31,13 +31,18 @@ from app.opip.decision.store import (
 )
 from app.opip.learning.coverage_discontinuity import (
     OUTCOME_DISPOSITION_UNRESOLVED,
+    WARNING_EPOCH_INVALID,
     WARNING_POST_BOUNDARY,
+    WARNING_PRE_BOUNDARY,
     epoch_allows_post_boundary_hot_only,
+    load_applicable_coverage_epoch,
     load_coverage_epoch,
     outcome_window_crosses_discontinuity,
     resolve_discontinuity_for_archive,
     row_allowed_for_post_boundary_learning,
 )
+from app.opip.storage.bounded_jsonl import ArchiveWindowSelection
+
 
 
 DEFAULT_SCREENING_FILE = Path("/app/data/opip/qualification/screening_evaluations.jsonl")
@@ -1730,26 +1735,60 @@ def _window_archive_selection(
         os.getenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "").strip().lower()
         in {"1", "true", "yes", "on"}
     )
-    if (
-        replica_mode
-        and replica_repair_enabled
-        and not selection.complete
-        and "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in selection.warnings
-    ):
-        data_root = path.parents[2] if len(path.parents) >= 3 else path.parent
+    data_root = path.parents[2] if len(path.parents) >= 3 else path.parent
+    if replica_mode:
+        # Finding 1: a persistent coverage epoch is permanent provenance and
+        # MUST be evaluated before any normal archive/index selection, even
+        # after HOT rotation, valid gzip segments, manifest/signature, or a
+        # complete window index have appeared for newer (post-boundary)
+        # evidence. Future coverage never repairs pre-boundary uncertainty.
+        # This governance is deliberately independent of the archive-repair
+        # toggle: it must not become bypassable if OPIP_LEARNING_REPLICA_
+        # ARCHIVE_REPAIR is ever unset while replica_mode is active.
         try:
-            epoch = resolve_discontinuity_for_archive(data_root, archive)
+            applicable = load_applicable_coverage_epoch(data_root, archive)
         except RuntimeError:
-            epoch = None
-        if epoch is not None:
-            discontinuity = epoch_allows_post_boundary_hot_only(
-                epoch,
-                archive,
-                start=start,
-                through=through,
+            # Epoch file exists but is unparseable/invalid: never silently
+            # revert to normal complete-history semantics. Fail closed.
+            return archive, ArchiveWindowSelection(
+                paths=(),
+                complete=False,
+                truncated=False,
+                warnings=(WARNING_EPOCH_INVALID,),
             )
-            if discontinuity is not None:
-                return archive, discontinuity
+        if applicable is not None:
+            start_utc = start.astimezone(timezone.utc)
+            # Any window that begins before the boundary (pure pre-boundary or
+            # straddling) is governed-incomplete regardless of current archive
+            # health.
+            if start_utc < applicable.boundary_at_utc:
+                return archive, ArchiveWindowSelection(
+                    paths=(),
+                    complete=False,
+                    truncated=False,
+                    warnings=(WARNING_PRE_BOUNDARY,),
+                )
+            # Entirely post-boundary: if the archive is still condition C
+            # (no verified segments yet), synthesize HOT-only coverage. If the
+            # archive has since rotated to real segments/manifest, fall through
+            # to normal completeness checks below.
+            if (
+                not selection.complete
+                and "ARCHIVE_WINDOW_INDEX_INCOMPLETE" in selection.warnings
+            ):
+                try:
+                    epoch = resolve_discontinuity_for_archive(data_root, archive)
+                except RuntimeError:
+                    epoch = None
+                if epoch is not None:
+                    discontinuity = epoch_allows_post_boundary_hot_only(
+                        epoch,
+                        archive,
+                        start=start,
+                        through=through,
+                    )
+                    if discontinuity is not None:
+                        return archive, discontinuity
     if (
         replica_mode
         and replica_repair_enabled
@@ -1806,8 +1845,15 @@ def _iter_windowed_jsonl_sources(
     if post_boundary:
         data_root = path.parents[2] if len(path.parents) >= 3 else path.parent
         epoch = load_coverage_epoch(data_root)
-        if epoch is not None:
-            boundary = epoch.boundary_at_utc
+        if epoch is None:
+            # The selection was authorized as post-boundary from a governing
+            # epoch; if the epoch is no longer resolvable, fail closed rather
+            # than leak unfiltered (possibly pre-boundary) HOT rows.
+            raise RuntimeError(
+                "ACCOUNTABILITY_ARCHIVE_WINDOW_INCOMPLETE:"
+                f"{kind}:{WARNING_EPOCH_INVALID}"
+            )
+        boundary = epoch.boundary_at_utc
     for row in _iter_jsonl_sources(path):
         if boundary is not None:
             if not row_allowed_for_post_boundary_learning(
@@ -1872,14 +1918,14 @@ def _filter_outcomes_for_discontinuity(
     screening_path: Path,
     replica_mode: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], datetime | None]:
-    """Split outcomes that cross a validated discontinuity from processable ones."""
+    """Split outcomes that cross a validated discontinuity from processable ones.
+
+    Epoch governance is independent of the archive-repair toggle (Finding 1):
+    a persisted epoch must split pre-boundary outcomes whenever replica_mode is
+    active, and a present-but-invalid epoch must fail closed exactly as the
+    window-selection path does (never fall through to normal acceptance).
+    """
     if not replica_mode:
-        return outcomes, [], None
-    replica_repair_enabled = (
-        os.getenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
-    if not replica_repair_enabled:
         return outcomes, [], None
     archive = screening_evaluations_archive(screening_path)
     data_root = (
@@ -1888,9 +1934,14 @@ def _filter_outcomes_for_discontinuity(
         else screening_path.parent
     )
     try:
-        epoch = resolve_discontinuity_for_archive(data_root, archive)
-    except RuntimeError:
-        return outcomes, [], None
+        epoch = load_applicable_coverage_epoch(data_root, archive)
+    except RuntimeError as exc:
+        # Present-but-invalid epoch: fail closed, consistent with
+        # _window_archive_selection's WARNING_EPOCH_INVALID handling.
+        raise RuntimeError(
+            "ACCOUNTABILITY_OUTCOME_DISCONTINUITY_EPOCH_INVALID:"
+            f"screening:{WARNING_EPOCH_INVALID}"
+        ) from exc
     if epoch is None:
         return outcomes, [], None
     unresolved = _discontinuity_unresolved_dispositions(

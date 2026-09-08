@@ -13,11 +13,14 @@ import pytest
 from app.opip.decision.store import screening_evaluations_archive
 from app.opip.learning.coverage_discontinuity import (
     DISPOSITION_LEGACY_COVERAGE_DISCONTINUITY,
+    WARNING_EPOCH_INVALID,
     WARNING_POST_BOUNDARY,
     WARNING_PRE_BOUNDARY,
+    archive_matches_legacy_ambiguous_hot_condition,
     coverage_epoch_path,
     establish_coverage_discontinuity_epoch,
     load_coverage_epoch,
+    maybe_establish_oneshot_coverage_discontinuity,
     oneshot_consumed_path,
 )
 from app.opip.learning.empty_export_attestation import (
@@ -28,6 +31,7 @@ from app.opip.learning.replica_archive_repair import (
 )
 from app.services.opportunity_accountability import (
     ACCOUNTABILITY_ARCHIVE_WINDOW_PAD,
+    _filter_outcomes_for_discontinuity,
     _iter_windowed_jsonl_sources,
     _window_archive_selection,
     build_incremental_from_outcomes,
@@ -511,6 +515,58 @@ def test_epoch_boundary_does_not_move_on_later_sync(tmp_path, monkeypatch):
     assert loaded.boundary_at_utc == first.boundary_at_utc
 
 
+def test_epoch_still_governs_pre_boundary_after_archive_rotation(
+    tmp_path, monkeypatch
+):
+    """After post-boundary segments exist, pre-boundary windows stay discontinuous."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    for name in ("funnel_events", "scan_summaries"):
+        (tmp_path / f"opip/qualification/{name}.jsonl").write_text(
+            "", encoding="utf-8"
+        )
+    reconcile_qualification_replica_archives(tmp_path)
+
+    # Simulate future post-boundary rotation: verified segment + reconstructed index.
+    segment = archive.archive_dir / "screening_evaluations-post.jsonl.gz"
+    row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+    }
+    with gzip.open(segment, "wb") as handle:
+        handle.write((json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+    digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{digest}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    # Drop orphan incomplete so condition C no longer holds; rebuild from segments.
+    if archive.window_index_state_file.exists():
+        archive.window_index_state_file.unlink()
+    result = reconcile_qualification_replica_archives(tmp_path)
+    assert result["screening"] in {
+        "RECONSTRUCTED_VERIFIED",
+        "EXISTING_VERIFIED",
+    }
+    assert coverage_epoch_path(tmp_path).is_file()
+    assert not archive_matches_legacy_ambiguous_hot_condition(archive)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=PRE,
+        through=PRE + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
 def test_future_valid_archive_segment_uses_normal_manifest_path(tmp_path, monkeypatch):
     monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
     hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
@@ -596,3 +652,192 @@ def test_diagnose_script_exposes_lock_owner_and_epoch_fields():
     assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
     assert "kill $pid" not in diagnostics
     assert "kill -" not in diagnostics or "kill-after" in diagnostics
+
+
+def _rotate_post_boundary_segment(archive) -> Path:
+    """Create a verified post-boundary gzip segment and drop condition C."""
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    segment = archive.archive_dir / "screening_evaluations-post.jsonl.gz"
+    row = {
+        "observed_at": POST.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+    }
+    with gzip.open(segment, "wb") as handle:
+        handle.write((json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+    digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+    segment.with_suffix(segment.suffix + ".sha256").write_text(
+        f"{digest}  {segment.name}\n",
+        encoding="utf-8",
+    )
+    if archive.window_index_state_file.exists():
+        archive.window_index_state_file.unlink()
+    return segment
+
+
+def _plant_empty_siblings(tmp_path: Path) -> None:
+    for name in ("funnel_events", "scan_summaries"):
+        path = tmp_path / f"opip/qualification/{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def test_invalid_epoch_file_fails_closed_in_window_selection(tmp_path, monkeypatch):
+    """Finding 1 #9: a present-but-corrupt epoch never reverts to normal history."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    # Corrupt the durable epoch on the replica.
+    coverage_epoch_path(tmp_path).write_text("{not-json", encoding="utf-8")
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=POST - timedelta(minutes=5),
+        through=POST + timedelta(minutes=5),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_EPOCH_INVALID in selection.warnings
+
+
+def test_post_boundary_window_after_rotation_uses_normal_archive(tmp_path, monkeypatch):
+    """Finding 1 #2: post-boundary window may use future verified segments."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    _plant_empty_siblings(tmp_path)
+    reconcile_qualification_replica_archives(tmp_path)
+    _rotate_post_boundary_segment(archive)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=POST - timedelta(minutes=1),
+        through=POST + timedelta(minutes=1),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    # Normal completeness path is used for the allowed post-boundary window.
+    assert selection.complete is True
+    assert WARNING_PRE_BOUNDARY not in selection.warnings
+    assert coverage_epoch_path(tmp_path).is_file()
+
+
+def test_straddling_window_after_rotation_is_discontinuous(tmp_path, monkeypatch):
+    """Finding 1 #3: a straddling window fails even with a complete future archive."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    _plant_empty_siblings(tmp_path)
+    reconcile_qualification_replica_archives(tmp_path)
+    _rotate_post_boundary_segment(archive)
+    reconcile_qualification_replica_archives(tmp_path)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=BOUNDARY - timedelta(minutes=30),
+        through=BOUNDARY + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_recurring_job_without_oneshot_cannot_create_epoch(tmp_path, monkeypatch):
+    """Finding 2 #7: without one-shot authorization no epoch is ever minted."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    monkeypatch.delenv("OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY", raising=False)
+    archive, _state = _plant_condition_c(tmp_path)
+    assert (
+        maybe_establish_oneshot_coverage_discontinuity(
+            tmp_path, {"screening": archive}
+        )
+        is None
+    )
+    assert not coverage_epoch_path(tmp_path).is_file()
+
+
+def test_epoch_governs_pre_boundary_without_repair_flag(tmp_path, monkeypatch):
+    """P1: epoch enforcement must not depend on OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR.
+
+    The learning cycle calls the builder with replica_mode=True unconditionally,
+    so a persisted epoch must still fail pre-boundary windows closed even when
+    the (unrelated) archive-repair toggle is absent.
+    """
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    monkeypatch.delenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", raising=False)
+
+    selected = _window_archive_selection(
+        archive.data_file,
+        archive_dir=archive.archive_dir,
+        start=PRE,
+        through=PRE + timedelta(minutes=30),
+        kind="screening",
+        replica_mode=True,
+    )
+    assert selected is not None
+    _archive, selection = selected
+    assert selection.complete is False
+    assert WARNING_PRE_BOUNDARY in selection.warnings
+
+
+def test_outcome_splitter_fails_closed_on_invalid_epoch(tmp_path, monkeypatch):
+    """P2-1: a present-but-invalid epoch fails the outcome split closed."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    _establish(tmp_path, archive, state)
+    coverage_epoch_path(tmp_path).write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=WARNING_EPOCH_INVALID):
+        _filter_outcomes_for_discontinuity(
+            [{"outcome_record_id": "o1", "snapshot_id": "s1",
+              "reference_at": PRE.isoformat()}],
+            screening_path=archive.data_file,
+            replica_mode=True,
+        )
+
+
+def test_recurring_env_after_rotation_is_idempotent(tmp_path, monkeypatch):
+    """Finding 2 #8/#9: a persisted epoch stays fixed even if env remains set and
+    the archive has rotated out of condition C on a later run."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    archive, state = _plant_condition_c(tmp_path)
+    expected = hashlib.sha256(state).hexdigest()
+    monkeypatch.setenv("OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY", "1")
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX",
+        "screening_evaluations",
+    )
+    monkeypatch.setenv(
+        "OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA",
+        expected,
+    )
+    first = maybe_establish_oneshot_coverage_discontinuity(
+        tmp_path, {"screening": archive}
+    )
+    assert first is not None
+    epoch_bytes = coverage_epoch_path(tmp_path).read_bytes()
+
+    # Later run: archive has rotated to real segments (condition C now false),
+    # but the one-shot env is still present. Must not raise, advance, or rewrite.
+    _rotate_post_boundary_segment(archive)
+    assert not archive_matches_legacy_ambiguous_hot_condition(archive)
+    second = maybe_establish_oneshot_coverage_discontinuity(
+        tmp_path, {"screening": archive}
+    )
+    assert second is not None
+    assert second.boundary_at_utc == first.boundary_at_utc
+    assert coverage_epoch_path(tmp_path).read_bytes() == epoch_bytes

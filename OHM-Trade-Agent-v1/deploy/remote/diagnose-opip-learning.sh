@@ -304,23 +304,53 @@ fi
 LEARNING_DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"
 COVERAGE_EPOCH_FILE="$LEARNING_DATA_ROOT/.learning_coverage/legacy_coverage_discontinuity_v1.json"
 if [[ -s "$COVERAGE_EPOCH_FILE" ]]; then
-  learning_coverage_epoch_status="VALID"
-  learning_coverage_epoch_boundary_utc="$(
-    python3 -c 'import json,sys; p=json.load(open(sys.argv[1],encoding="utf-8")); print(p.get("boundary_at_utc") or "UNKNOWN")' \
-      "$COVERAGE_EPOCH_FILE" 2>/dev/null || echo "UNKNOWN"
+  epoch_probe="$(
+    python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    payload = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+required = (
+    "schema_version",
+    "kind",
+    "archive_prefix",
+    "boundary_at_utc",
+    "reason",
+    "measurement_only",
+    "trade_authority_changed",
+    "policy_change_authorized",
+)
+if not isinstance(payload, dict) or any(k not in payload for k in required):
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+if (
+    payload.get("schema_version") != 1
+    or payload.get("kind") != "legacy_coverage_discontinuity_v1"
+    or payload.get("reason") != "LEGACY_ARCHIVE_CONTINUITY_UNPROVEN"
+    or payload.get("measurement_only") is not True
+    or payload.get("trade_authority_changed") is not False
+    or payload.get("policy_change_authorized") is not False
+):
+    print("INVALID|INVALID|INVALID|INVALID")
+    raise SystemExit(0)
+print(
+    "VALID|%s|%s|%s"
+    % (
+        payload.get("boundary_at_utc") or "UNKNOWN",
+        payload.get("archive_prefix") or "UNKNOWN",
+        payload.get("reason") or "UNKNOWN",
+    )
+)
+' "$COVERAGE_EPOCH_FILE" 2>/dev/null || echo "INVALID|INVALID|INVALID|INVALID"
   )"
-  learning_coverage_epoch_archive="$(
-    python3 -c 'import json,sys; p=json.load(open(sys.argv[1],encoding="utf-8")); print(p.get("archive_prefix") or "UNKNOWN")' \
-      "$COVERAGE_EPOCH_FILE" 2>/dev/null || echo "UNKNOWN"
-  )"
-  learning_coverage_epoch_reason="$(
-    python3 -c 'import json,sys; p=json.load(open(sys.argv[1],encoding="utf-8")); print(p.get("reason") or "UNKNOWN")' \
-      "$COVERAGE_EPOCH_FILE" 2>/dev/null || echo "UNKNOWN"
-  )"
-  echo "learning_coverage_epoch_status=$learning_coverage_epoch_status"
-  echo "learning_coverage_epoch_boundary_utc=$learning_coverage_epoch_boundary_utc"
-  echo "learning_coverage_epoch_archive=$learning_coverage_epoch_archive"
-  echo "learning_coverage_epoch_reason=$learning_coverage_epoch_reason"
+  IFS='|' read -r learning_coverage_epoch_status learning_coverage_epoch_boundary_utc learning_coverage_epoch_archive learning_coverage_epoch_reason <<<"$epoch_probe"
+  echo "learning_coverage_epoch_status=${learning_coverage_epoch_status:-INVALID}"
+  echo "learning_coverage_epoch_boundary_utc=${learning_coverage_epoch_boundary_utc:-INVALID}"
+  echo "learning_coverage_epoch_archive=${learning_coverage_epoch_archive:-INVALID}"
+  echo "learning_coverage_epoch_reason=${learning_coverage_epoch_reason:-INVALID}"
 else
   echo "learning_coverage_epoch_status=ABSENT_OR_UNAVAILABLE"
   echo "learning_coverage_epoch_boundary_utc=UNKNOWN"

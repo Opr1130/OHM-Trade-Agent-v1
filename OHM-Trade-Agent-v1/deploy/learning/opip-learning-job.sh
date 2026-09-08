@@ -181,6 +181,9 @@ timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS" \
     --tmpfs /tmp:rw,noexec,nosuid,size=48m \
     --tmpfs /var/run:rw,noexec,nosuid,size=16m \
     -e OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR=true \
+    -e OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY \
+    -e OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX \
+    -e OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -v "$DATA_ROOT:/app/data" \
     "$OPIP_LEARNING_IMAGE" \
