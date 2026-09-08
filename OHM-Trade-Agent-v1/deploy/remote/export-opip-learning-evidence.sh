@@ -16,7 +16,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep; do
+for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required export command: $cmd" >&2
     exit 69
@@ -54,6 +54,20 @@ flock -x 8
 # production_empty_export_attestation_eligible() in
 # app/opip/learning/empty_export_attestation.py. A complete=false
 # window-index is ambiguous production lineage and never mints proof.
+# When state.json exists it must match the exact certified-empty schema
+# (same keys/values as _window_index_state_proves_empty_archive_without_manifest).
+state_json_is_certified_empty_without_manifest() {
+  local state="$1"
+  [[ -f "$state" ]] || return 1
+  local compact
+  # Production writers emit compact sorted JSON. Strip insignificant
+  # whitespace so a pretty-printed certified-empty state still matches.
+  # Fail closed on any other key set, value, or malformed fragment.
+  compact="$(tr -d '[:space:]' <"$state")"
+  [[ -n "$compact" ]] || return 1
+  [[ "$compact" =~ ^\{\"complete\":true,\"coverage_day_count\":0,\"coverage_start_day\":null,\"coverage_through_day\":null,\"manifest_mtime_ns\":0,\"manifest_present\":false,\"manifest_sha256\":\"\",\"manifest_size\":0,\"schema_version\":1,\"shard_sha256\":\{\},\"updated_at_utc\":\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})\"\}$ ]]
+}
+
 write_empty_export_attestation_if_canonical() {
   local hot_file="$1"
   local archive_dir="$2"
@@ -94,28 +108,7 @@ write_empty_export_attestation_if_canonical() {
     if [[ ! -f "$state" ]]; then
       return 0
     fi
-    if grep -Eq '"complete":[[:space:]]*false' "$state"; then
-      return 0
-    fi
-    if ! grep -Eq '"complete":[[:space:]]*true' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"manifest_present":[[:space:]]*true' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"coverage_day_count":[[:space:]]*[1-9]' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"manifest_sha256":[[:space:]]*"[^"]+"' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"coverage_start_day":[[:space:]]*"' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"coverage_through_day":[[:space:]]*"' "$state"; then
-      return 0
-    fi
-    if grep -Eq '"shard_sha256":[[:space:]]*\{[[:space:]]*"' "$state"; then
+    if ! state_json_is_certified_empty_without_manifest "$state"; then
       return 0
     fi
   fi

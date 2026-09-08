@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -14,6 +17,8 @@ from app.opip.learning.empty_export_attestation import (
 
 NOW = datetime(2026, 9, 6, 6, 0, tzinfo=timezone.utc)
 _PRODUCTION_SHA = "a" * 40
+ROOT = Path(__file__).resolve().parents[1]
+EXPORT_SCRIPT = ROOT / "deploy" / "remote" / "export-opip-learning-evidence.sh"
 
 
 def _archive(tmp_path):
@@ -124,6 +129,20 @@ def test_malformed_index_blocks_production_empty_attestation(tmp_path):
         _write_attestation(archive)
 
 
+def test_incomplete_complete_true_fragment_blocks_production_empty_attestation(
+    tmp_path,
+):
+    """A bare complete=true fragment must not mint hashed empty proof."""
+    archive = _archive(tmp_path)
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    archive.window_index_state_file.write_text(
+        '{"complete":true}\n', encoding="utf-8"
+    )
+    assert production_empty_export_attestation_eligible(archive) is False
+    with pytest.raises(RuntimeError, match="trusted empty archive"):
+        _write_attestation(archive)
+
+
 def test_extra_window_index_files_block_production_empty_attestation(tmp_path):
     archive = _archive(tmp_path)
     _write_state(archive, _incomplete_zero_coverage_state(complete=True))
@@ -157,3 +176,38 @@ def test_prior_manifest_coverage_index_blocks_production_empty_attestation(
     with pytest.raises(RuntimeError, match="trusted empty archive"):
         _write_attestation(archive)
     assert archive.ensure_window_index_locked() is False
+
+
+def _extract_state_json_validator_bash() -> str:
+    source = EXPORT_SCRIPT.read_text(encoding="utf-8")
+    start = source.index("state_json_is_certified_empty_without_manifest()")
+    end = source.index("\nwrite_empty_export_attestation_if_canonical()")
+    return source[start:end]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_export_shell_rejects_incomplete_complete_true_fragment(tmp_path):
+    """Bash exporter must refuse the same incomplete fragment Python refuses."""
+    validator = _extract_state_json_validator_bash()
+    good = tmp_path / "good.json"
+    bad = tmp_path / "bad.json"
+    good.write_text(
+        json.dumps(_incomplete_zero_coverage_state(complete=True), sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    bad.write_text('{"complete":true}\n', encoding="utf-8")
+    script = f"""
+set -Eeuo pipefail
+{validator}
+state_json_is_certified_empty_without_manifest "{good.as_posix()}"
+! state_json_is_certified_empty_without_manifest "{bad.as_posix()}"
+! state_json_is_certified_empty_without_manifest "{tmp_path.as_posix()}/missing.json"
+"""
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
