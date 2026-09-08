@@ -35,6 +35,7 @@ from app.services.opportunity_accountability import (
     _iter_windowed_jsonl_sources,
     _window_archive_selection,
     build_incremental_from_outcomes,
+    resolved_accountability_outcomes,
 )
 
 
@@ -408,6 +409,70 @@ def test_post_boundary_outcomes_process_normally(tmp_path, monkeypatch):
     assert batch["accepted"] + batch["terminal_rejected"] >= 1
 
 
+def test_mixed_batch_persists_unresolved_durably_on_tail_path(tmp_path, monkeypatch):
+    """CodeRabbit P1: unresolved rows reported on the normal-tail path must be
+    durably persisted (so resolved_accountability_outcomes returns them and the
+    learning cycle never re-reads/re-splits them)."""
+    monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
+    post_ref = POST + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    screening_row = {
+        "observed_at": post_ref.isoformat(),
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": "BTCUSD",
+        "scan_id": "scan-post",
+        "long_score": 85.0,
+        "snapshot_id": "snap-post",
+    }
+    archive, state = _plant_condition_c(
+        tmp_path, hot_text=json.dumps(screening_row) + "\n"
+    )
+    _establish(tmp_path, archive, state)
+    reconcile_qualification_replica_archives(tmp_path)
+    funnel_hot = tmp_path / "opip/qualification/funnel_events.jsonl"
+    funnel_hot.write_text("", encoding="utf-8")
+    (funnel_hot.parent / "funnel_events_archive").mkdir(parents=True, exist_ok=True)
+
+    pre_outcome = {
+        "outcome_record_id": "out-pre",
+        "snapshot_id": "snap-pre",
+        "symbol": "BTCUSD",
+        "reference_at": (PRE + ACCOUNTABILITY_ARCHIVE_WINDOW_PAD).isoformat(),
+        "reference_price": 100.0,
+        "canonical_episode_id": "ep-pre",
+    }
+    post_outcome = {
+        "outcome_record_id": "out-post",
+        "snapshot_id": "snap-post",
+        "symbol": "BTCUSD",
+        "reference_at": post_ref.isoformat(),
+        "reference_price": 100.0,
+        "canonical_episode_id": "ep-post",
+    }
+    ledger = tmp_path / "opip/opportunity_accountability.jsonl"
+    state_db = tmp_path / "opip/opportunity_accountability.state.sqlite3"
+    summary = build_incremental_from_outcomes(
+        [pre_outcome, post_outcome],
+        screening_path=archive.data_file,
+        screening_archive=archive.archive_dir,
+        funnel_path=funnel_hot,
+        funnel_archive=funnel_hot.parent / "funnel_events_archive",
+        intelligence_event_path=tmp_path / "intelligence_learning/events.jsonl",
+        ledger_path=ledger,
+        summary_path=tmp_path / "opip/opportunity_accountability_summary.json",
+        state_path=state_db,
+        replica_mode=True,
+    )
+    assert summary["batch_disposition"]["unresolved_coverage_discontinuity"] == 1
+
+    # The pre-boundary outcome must have a durable disposition (not orphaned).
+    resolved = resolved_accountability_outcomes(
+        [pre_outcome],
+        ledger_path=ledger,
+        state_path=state_db,
+    )
+    assert {r.get("outcome_record_id") for r in resolved} == {"out-pre"}
+
+
 def test_epoch_for_screening_allows_empty_sibling_archives(tmp_path, monkeypatch):
     """Screening discontinuity must not break empty funnel/summaries reconcile."""
     monkeypatch.setenv("OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR", "true")
@@ -650,8 +715,11 @@ def test_diagnose_script_exposes_lock_owner_and_epoch_fields():
     ):
         assert needle in diagnostics
     assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
-    assert "kill $pid" not in diagnostics
-    assert "kill -" not in diagnostics or "kill-after" in diagnostics
+    # Strip the benign `timeout --kill-after=...` option so it cannot mask a
+    # real signal-sending command added later.
+    signal_scan = diagnostics.replace("--kill-after", "")
+    for forbidden in ("kill $pid", "kill -", "pkill", "killall"):
+        assert forbidden not in signal_scan
 
 
 def _rotate_post_boundary_segment(archive) -> Path:

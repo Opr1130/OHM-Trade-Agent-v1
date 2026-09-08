@@ -1979,12 +1979,19 @@ def build_incremental_from_outcomes(
         screening_path=screening_path,
         replica_mode=replica_mode,
     )
-    if discontinuity_unresolved and not outcomes:
+    # Persist the pre-boundary UNRESOLVED_COVERAGE_DISCONTINUITY rows exactly
+    # once, before any path branching, so every early-return path (all-
+    # unresolved, malformed identity, ceiling split, ceiling terminal, normal
+    # tail) yields a durable disposition. Reporting the count without a durable
+    # row would orphan the evidence and force re-splitting on every cycle
+    # (learning-consumption invariant).
+    if discontinuity_unresolved:
         _persist_outcome_dispositions(
             discontinuity_unresolved,
             ledger_path=ledger_path,
             state_path=state_path,
         )
+    if discontinuity_unresolved and not outcomes:
         reconcile_paper_events(
             intelligence_event_path=intelligence_event_path,
             ledger_path=ledger_path,
@@ -2247,8 +2254,8 @@ def build_incremental_from_outcomes(
         screening,
         accountability_rows,
     )
-    if discontinuity_unresolved:
-        dispositions = list(dispositions) + list(discontinuity_unresolved)
+    # discontinuity_unresolved was already persisted once at the top of this
+    # call; do not re-append it here or it would write duplicate ledger rows.
     _persist_outcome_dispositions(
         dispositions,
         ledger_path=ledger_path,
@@ -2271,10 +2278,9 @@ def build_incremental_from_outcomes(
         row.get("disposition") == "TERMINAL_REJECTED"
         for row in dispositions
     )
-    unresolved_coverage = sum(
-        row.get("disposition") == OUTCOME_DISPOSITION_UNRESOLVED
-        for row in dispositions
-    )
+    # The unresolved-coverage rows are the ones persisted once at the top; the
+    # tail `dispositions` cover only processable (accepted/terminal) outcomes.
+    unresolved_coverage = len(discontinuity_unresolved)
     summary["batch_disposition"] = {
         "accepted": accepted,
         "terminal_rejected": terminal_rejected,
