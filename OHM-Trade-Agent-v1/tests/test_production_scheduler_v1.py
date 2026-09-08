@@ -12,6 +12,7 @@ def test_canonical_unified_scheduler_is_single_entrypoint():
     cron = (ROOT / "deploy/cron.d/ohm-unified-cycle").read_text(encoding="utf-8")
     assert "* * * * * root" in cron
     assert "flock -n /var/run/ohm-unified-cycle.lock" in cron
+    assert "timeout --signal=TERM --kill-after=30s 3600" in cron
     assert "python -m app.jobs.run_cycle" in cron
     assert "app.jobs.scan_movers" not in cron
     assert "app.jobs.scan_opportunities" not in cron
@@ -89,11 +90,14 @@ def test_remote_gateway_keeps_diagnostics_bounded_and_read_only():
     assert "CAPTURE_STALE" in diagnostics
     assert "OUTCOMES_STALE" in diagnostics
     assert "docker exec ohm-trade-agent" in diagnostics
+    assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in diagnostics
+    assert "unified_cycle_host_lock=" in diagnostics
     assert "{{.State.Running}}" in diagnostics
     assert "CORE_CONTAINER_STOPPED" in diagnostics
     assert 'status="FAIL"' in diagnostics
     assert "docker rm" not in diagnostics
     assert "docker stop" not in diagnostics
+    assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
 
 
 def test_deploy_rollback_restores_installed_remote_ops():

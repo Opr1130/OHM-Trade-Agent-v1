@@ -119,3 +119,72 @@ def test_outcomes_cycle_repairs_replica_before_reading_pending_handoff():
     assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR" in source
     assert '"trade_authority_changed": False' in source
     assert '"policy_change_authorized": False' in source
+
+
+def test_empty_replica_archives_certify_without_segments(tmp_path):
+    result = reconcile_qualification_replica_archives(tmp_path)
+
+    assert result == {
+        "screening": "EMPTY_CERTIFIED",
+        "funnel": "EMPTY_CERTIFIED",
+        "summaries": "EMPTY_CERTIFIED",
+    }
+
+
+def test_orphan_incomplete_empty_index_is_certified_on_replica_only(tmp_path):
+    """Leftover derived index after P1-empty export must not block outcomes."""
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    archive.window_index_dir.mkdir(parents=True, exist_ok=True)
+    prior_state = {
+        "schema_version": 1,
+        "manifest_present": False,
+        "manifest_size": 0,
+        "manifest_mtime_ns": 0,
+        "manifest_sha256": "",
+        "complete": False,
+        "coverage_start_day": None,
+        "coverage_through_day": None,
+        "coverage_day_count": 0,
+        "shard_sha256": {},
+        "updated_at_utc": NOW.isoformat(),
+    }
+    archive.window_index_state_file.write_text(
+        json.dumps(prior_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert archive.ensure_window_index_locked() is False
+
+    result = reconcile_qualification_replica_archives(tmp_path)
+
+    assert result["screening"] == "EMPTY_CERTIFIED_FROM_ORPHAN_INDEX"
+    assert result["funnel"] == "EMPTY_CERTIFIED"
+    assert result["summaries"] == "EMPTY_CERTIFIED"
+    assert archive.ensure_window_index_locked() is True
+    selection = archive.archive_paths_for_visible_window(
+        start=NOW - timedelta(minutes=1),
+        through=NOW + timedelta(minutes=1),
+        max_segments=8,
+    )
+    assert selection.complete is True
+    assert selection.paths == ()
+
+
+def test_replica_empty_certify_refuses_canonical_signature(tmp_path):
+    archive = screening_evaluations_archive(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    )
+    archive.archive_dir.mkdir(parents=True, exist_ok=True)
+    archive.manifest_signature_file.write_text(
+        f"{'a' * 64}  {archive.manifest_file.name}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="signature is present"):
+        archive.certify_empty_replica_window_index_locked()
+
+
+def test_replica_empty_certify_refuses_gzip_segments(tmp_path):
+    archive, _segment = _write_verified_screening_segment(tmp_path)
+    with pytest.raises(RuntimeError, match="archive segments are present"):
+        archive.certify_empty_replica_window_index_locked()

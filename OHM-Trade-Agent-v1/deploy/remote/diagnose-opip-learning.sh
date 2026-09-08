@@ -19,7 +19,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in date stat awk git docker; do
+for cmd in date stat awk git docker flock timeout; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing diagnostics command: $cmd" >&2
     exit 69
@@ -122,14 +122,17 @@ if [[ -s "$READER_STATE_FILE" ]]; then
   echo "outcomes_disposition=${outcomes_disposition:-UNKNOWN}"
   echo "outcomes_pending_ack=${outcomes_pending_ack:-UNKNOWN}"
 
-  if [[ -n "$release_compat" && "$release_compat" != "NONE" && "$release_compat" != "UNKNOWN" ]]; then
-    release_compatibility_status="$release_compat"
-  elif [[ "$worker_sha" =~ ^[0-9a-f]{40}$ && "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "worker_reported_release_compatibility_status=${release_compat:-UNKNOWN}"
+  # Live SHA comparison is authoritative. A stale worker heartbeat that still
+  # says CURRENT after production moved must not hide RELEASE_DRIFT.
+  if [[ "$worker_sha" =~ ^[0-9a-f]{40}$ && "$current_sha" =~ ^[0-9a-f]{40}$ ]]; then
     if [[ "$worker_sha" == "$current_sha" ]]; then
       release_compatibility_status="CURRENT"
     else
       release_compatibility_status="RELEASE_DRIFT"
     fi
+  elif [[ -n "$release_compat" && "$release_compat" != "NONE" && "$release_compat" != "UNKNOWN" ]]; then
+    release_compatibility_status="$release_compat"
   else
     release_compatibility_status="UNVERIFIED"
   fi
@@ -206,6 +209,22 @@ else
   degrade
 fi
 
+HOST_CYCLE_LOCK="/var/run/ohm-unified-cycle.lock"
+# Read-only liveness probe. Never delete the lock file. flock -n fails when
+# the canonical cron still holds the exclusive lock.
+if [[ -e "$HOST_CYCLE_LOCK" ]]; then
+  exec {cycle_lock_fd}<>"$HOST_CYCLE_LOCK"
+  if flock -n "$cycle_lock_fd"; then
+    echo "unified_cycle_host_lock=IDLE"
+    flock -u "$cycle_lock_fd"
+  else
+    echo "unified_cycle_host_lock=HELD"
+  fi
+  eval "exec ${cycle_lock_fd}>&-"
+else
+  echo "unified_cycle_host_lock=ABSENT"
+fi
+
 if docker inspect ohm-trade-agent >/dev/null 2>&1; then
   core_running="$(docker inspect --format='{{.State.Running}}' ohm-trade-agent 2>/dev/null || true)"
   if [[ "$core_running" != "true" ]]; then
@@ -214,40 +233,48 @@ if docker inspect ohm-trade-agent >/dev/null 2>&1; then
     analytics=""
   else
     analytics="$(
-    docker exec ohm-trade-agent python -c '
+    timeout --signal=TERM --kill-after=5s 45 docker exec ohm-trade-agent python -c '
 import json
-from app.services.dashboard_read_model import build_dashboard_read_model
-d = build_dashboard_read_model(scope="all")
-i = d.get("intelligence") or {}
-p = i.get("paper_performance") or {}
-pe = d.get("paper_engine") or {}
-ps = pe.get("status") or {}
-recent = d.get("recent_events") or []
-out = {
-    "generated_at_utc": d.get("generated_at_utc"),
-    "evidence_state": i.get("evidence_state"),
-    "events_considered": i.get("events_considered"),
-    "early_watch_journeys": i.get("early_watch_journeys"),
-    "qualified_signals": i.get("qualified_signals"),
-    "paper_requested_signals": i.get("paper_requested_signals"),
-    "paper_outcome_signals": i.get("paper_outcome_signals"),
-    "paper_outcomes": p.get("count"),
-    "paper_wins": p.get("wins"),
-    "paper_losses": p.get("losses"),
-    "paper_win_rate_pct": p.get("win_rate_pct"),
-    "paper_avg_return_pct": p.get("avg_return_pct"),
-    "calibration_samples": i.get("calibration_samples"),
-    "paper_engine_status": ps.get("status"),
-    "paper_open_trades": ps.get("open_trades"),
-    "paper_closed_trades": ps.get("closed_trades"),
-    "paper_realized_pnl_by_currency": ps.get("realized_pnl_by_currency"),
-    "latest_intelligence_event_at": (recent[0].get("observed_at") if recent else None),
-}
-print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+import sys
+try:
+    from app.services.dashboard_read_model import build_dashboard_read_model
+    d = build_dashboard_read_model(scope="all")
+    i = d.get("intelligence") or {}
+    p = i.get("paper_performance") or {}
+    pe = d.get("paper_engine") or {}
+    ps = pe.get("status") or {}
+    recent = d.get("recent_events") or []
+    out = {
+        "generated_at_utc": d.get("generated_at_utc"),
+        "evidence_state": i.get("evidence_state"),
+        "events_considered": i.get("events_considered"),
+        "early_watch_journeys": i.get("early_watch_journeys"),
+        "qualified_signals": i.get("qualified_signals"),
+        "paper_requested_signals": i.get("paper_requested_signals"),
+        "paper_outcome_signals": i.get("paper_outcome_signals"),
+        "paper_outcomes": p.get("count"),
+        "paper_wins": p.get("wins"),
+        "paper_losses": p.get("losses"),
+        "paper_win_rate_pct": p.get("win_rate_pct"),
+        "paper_avg_return_pct": p.get("avg_return_pct"),
+        "calibration_samples": i.get("calibration_samples"),
+        "paper_engine_status": ps.get("status"),
+        "paper_open_trades": ps.get("open_trades"),
+        "paper_closed_trades": ps.get("closed_trades"),
+        "paper_realized_pnl_by_currency": ps.get("realized_pnl_by_currency"),
+        "latest_intelligence_event_at": (recent[0].get("observed_at") if recent else None),
+    }
+    print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+except Exception as exc:
+    print("UNAVAILABLE:" + type(exc).__name__)
+    sys.exit(1)
 ' 2>/dev/null || true
     )"
   fi
-  if [[ "$core_running" == "true" && -n "$analytics" ]]; then
+  if [[ "$core_running" == "true" && "$analytics" == UNAVAILABLE:* ]]; then
+    echo "production_validation_data=$analytics"
+    degrade
+  elif [[ "$core_running" == "true" && -n "$analytics" ]]; then
     echo "production_validation_data=$analytics"
   elif [[ "$core_running" == "true" ]]; then
     echo "production_validation_data=UNAVAILABLE"
@@ -389,6 +416,9 @@ else:
     interval = THROTTLED_SEARCH_INTERVAL_SECONDS if occupied >= THROTTLE_AT_SLOTS else NORMAL_SEARCH_INTERVAL_SECONDS
     reason = "throttled search: two occupied slots" if occupied >= THROTTLE_AT_SLOTS else "capacity available"
 last_search_started = parsed(state.get("last_search_started_at"))
+last_search_finished = parsed(state.get("last_search_finished_at"))
+last_search_status = str(state.get("last_search_status") or "").strip().upper() or None
+search_in_progress = last_search_status == "STARTED"
 search_due = bool(
     search_allowed
     and (
@@ -420,6 +450,9 @@ out = {
     "live_order_intents": order_count,
     "cooldown_until": (cooldown_until.isoformat() if cooldown_until else None),
     "last_search_started_at": (last_search_started.isoformat() if last_search_started else None),
+    "last_search_finished_at": (last_search_finished.isoformat() if last_search_finished else None),
+    "last_search_status": last_search_status,
+    "search_in_progress": search_in_progress,
     "scan_activity_tail_rows": len(rows),
     "scan_activity_rows_24h": len(recent),
     "scan_activity_read_limit_bytes": 1048576,
@@ -449,7 +482,7 @@ fi
 # qualification funnel producer. Keep counters distinct; no threshold changes.
 echo "OPIP_ZERO_FUNNEL_CLARITY"
 echo "note=early_watch_journeys_are_not_qualification_funnel_producer"
-if [[ -n "${analytics:-}" ]]; then
+if [[ -n "${analytics:-}" && "$analytics" != UNAVAILABLE:* ]]; then
   echo "early_watch_journeys=$(printf '%s' "$analytics" | awk -F'[:,]' '
     /"early_watch_journeys"/ {
       for (i = 1; i <= NF; i++) {

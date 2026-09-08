@@ -196,6 +196,17 @@ def test_diagnose_surfaces_release_consumption_and_zero_funnel():
         check=True,
     )
     assert "release_compatibility_status=" in diagnostics
+    assert "worker_reported_release_compatibility_status=" in diagnostics
+    # Live SHA comparison must outrank a stale worker-reported CURRENT token.
+    reported = diagnostics.index("worker_reported_release_compatibility_status=")
+    live = diagnostics.index('worker_sha" == "$current_sha"', reported)
+    fallback = diagnostics.index('elif [[ -n "$release_compat"', live)
+    assert reported < live < fallback
+    assert "unified_cycle_host_lock=" in diagnostics
+    assert "unified_cycle_host_lock=HELD" in diagnostics
+    assert "Never delete the lock file" in diagnostics
+    assert "timeout --signal=TERM --kill-after=5s 45 docker exec" in diagnostics
+    assert 'print("UNAVAILABLE:" + type(exc).__name__)' in diagnostics
     assert "capture_disposition=" in diagnostics
     assert "outcomes_disposition=" in diagnostics
     assert "accountability_pending_count=" in diagnostics

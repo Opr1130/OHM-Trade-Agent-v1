@@ -96,6 +96,7 @@ def _patch_cycle(monkeypatch, *, entry_ready: bool, search_due: bool):
         lambda **kwargs: None,
     )
     monkeypatch.setattr(run_cycle, "search_due", lambda decision: search_due)
+    monkeypatch.setattr(run_cycle, "mark_search_finished", lambda status="COMPLETED": None)
     return settings
 
 
@@ -108,10 +109,15 @@ def test_entry_watch_ready_forces_full_scan_when_normal_cadence_not_due(monkeypa
         "run_scan_with_telemetry",
         lambda fn: calls.append("scan"),
     )
+    monkeypatch.setattr(
+        run_cycle,
+        "mark_search_finished",
+        lambda status="COMPLETED": calls.append(("finish", status)),
+    )
 
     run_cycle._run_cycle_once()
 
-    assert calls == ["mark", "scan"]
+    assert calls == ["mark", "scan", ("finish", "COMPLETED")]
 
 
 def test_not_ready_does_not_bypass_normal_scan_cadence(monkeypatch):

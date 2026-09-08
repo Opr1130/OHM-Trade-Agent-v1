@@ -90,9 +90,19 @@ def _reconstruct_missing_replica_manifest(archive: BoundedJsonlArchive) -> str:
 
     verified = _verified_segments(archive)
     if not verified:
+        if archive.ensure_window_index_locked():
+            return "EMPTY_CERTIFIED"
+        # Inherited derived window-index (incomplete empty / vanished
+        # manifest) must not permanently block learning compute when no
+        # canonical gzip, manifest, or signature remains. Production
+        # archives are never touched; this runs only on the replica.
+        try:
+            archive.certify_empty_replica_window_index_locked()
+        except RuntimeError as exc:
+            raise RuntimeError("empty replica archive could not be certified") from exc
         if not archive.ensure_window_index_locked():
             raise RuntimeError("empty replica archive could not be certified")
-        return "EMPTY_CERTIFIED"
+        return "EMPTY_CERTIFIED_FROM_ORPHAN_INDEX"
 
     recorded = datetime.now(timezone.utc).isoformat()
     manifest: dict[str, Any] = {

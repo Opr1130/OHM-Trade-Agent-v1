@@ -607,6 +607,29 @@ class BoundedJsonlArchive:
 
         return True, new_start, new_through, shard_digests
 
+    def certify_empty_replica_window_index_locked(self) -> None:
+        """Replica-only: certify empty when no canonical archive files remain.
+
+        Production callers must keep using ``ensure_window_index_locked``,
+        which never reclassifies an incomplete zero-coverage state as
+        complete. This recovery does not delete locks, manifests, signatures,
+        or gzip segments. It refuses if any of those canonical files exist.
+        """
+        if self.manifest_file.exists():
+            raise RuntimeError(
+                "refusing empty replica certification; manifest is present"
+            )
+        if self.manifest_signature_file.exists():
+            raise RuntimeError(
+                "refusing empty replica certification; signature is present"
+            )
+        if self.archive_dir.exists() and any(
+            self.archive_dir.rglob(self.archive_glob)
+        ):
+            raise RuntimeError(
+                "refusing empty replica certification; archive segments are present"
+            )
+        self._write_window_index_state_locked(complete=True)
 
     def ensure_window_index_locked(self) -> bool:
         """Backfill/repair the day-sharded manifest index once per manifest version.
