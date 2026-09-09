@@ -483,8 +483,9 @@ def _advance_accountability_handoff_backfill_locked(
     )
 
     # Classify the bounded batch without mutating. Under a coverage boundary,
-    # every processable row must expose a trustworthy timestamp before any
-    # handoff enqueue or migration-cursor advancement can commit.
+    # every processable row must expose a trustworthy identity and timestamp
+    # before any handoff enqueue or migration-cursor advancement can commit.
+    skipped_without_cursor = 0
     for (
         snapshot_id,
         outcome_record_id,
@@ -495,20 +496,56 @@ def _advance_accountability_handoff_backfill_locked(
         raw_snapshot_id = str(snapshot_id or "")
         snapshot_id = raw_snapshot_id.strip()
         outcome_record_id = str(outcome_record_id or "").strip()
-        last_reference = str(sort_reference_at or "")
-        last_snapshot_id = raw_snapshot_id
         if not snapshot_id or not outcome_record_id:
+            # Do not advance the migration cursor past identity-less rows:
+            # otherwise they are permanently excluded without handoff or
+            # durable terminal evidence.
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_IDENTITY:"
+                    f"snapshot_id={raw_snapshot_id!r}:"
+                    f"outcome_record_id={outcome_record_id!r}"
+                )
+            skipped_without_cursor += 1
             continue
         try:
             revision = int(outcome_revision)
         except (TypeError, ValueError):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_REVISION:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}:"
+                    f"outcome_revision={outcome_revision!r}"
+                ) from None
+            skipped_without_cursor += 1
             continue
         try:
             parsed = json.loads(row_json)
         except (TypeError, json.JSONDecodeError):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_ROW_JSON:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}"
+                ) from None
+            skipped_without_cursor += 1
             continue
         if not isinstance(parsed, dict):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_ROW_JSON:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}"
+                )
+            skipped_without_cursor += 1
             continue
+
+        # Cursor markers advance only for rows that passed identity/structure
+        # validation.
+        last_reference = str(sort_reference_at or "")
+        last_snapshot_id = raw_snapshot_id
+
         reference_at = str(
             parsed.get("reference_at") or parsed.get("decision_at_utc") or ""
         )
@@ -542,6 +579,7 @@ def _advance_accountability_handoff_backfill_locked(
                 continue
         elif not reference_at:
             # No coverage epoch: preserve legacy skip-empty semantics.
+            # Cursor already advanced for this validated identity row.
             continue
 
         enqueue_plan.append(
@@ -554,7 +592,19 @@ def _advance_accountability_handoff_backfill_locked(
             )
         )
 
-    complete = len(legacy_rows) < batch_size
+    # A short batch only means "no further rows" when every selected row was
+    # cursor-accounted for. Identity-less skips must not flip completion on.
+    # Under no-epoch, any identity/structure skip also suppresses partial
+    # progress so a later valid row cannot advance the cursor past a skipped
+    # identity-less neighbor in the same bounded batch.
+    if skipped_without_cursor > 0:
+        enqueue_plan.clear()
+        coverage_terminal_candidates.clear()
+        last_reference = cursor_reference
+        last_snapshot_id = cursor_snapshot
+        complete = False
+    else:
+        complete = len(legacy_rows) < batch_size
     if dry_run:
         return {
             "batch_rows": len(legacy_rows),
@@ -599,7 +649,9 @@ def _advance_accountability_handoff_backfill_locked(
         )
         enqueued += 1
 
-    if legacy_rows:
+    # Persist cursor/completion only when every selected row was
+    # identity-accounted for. Identity-less skips leave metadata untouched.
+    if legacy_rows and skipped_without_cursor == 0:
         connection.execute(
             """
             INSERT INTO metadata(key, value)

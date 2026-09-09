@@ -563,6 +563,62 @@ def test_valid_timestamps_still_terminalize_and_enqueue(tmp_path):
     assert {"VALID-PRE", "VALID-POST"} <= _latest_ids(state)
 
 
+def test_identity_less_row_with_coverage_boundary_fails_closed(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _establish_epoch(data_root)
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    ledger = tmp_path / "accountability.jsonl"
+    acct_state = tmp_path / "accountability.state.sqlite3"
+
+    valid = _outcome_row("ID-VALID", POST)
+    bad = _outcome_row("ID-BAD", PRE + timedelta(minutes=1))
+    bad["outcome_record_id"] = ""
+    _seed_latest_outcomes(state, [valid, bad])
+
+    with pytest.raises(
+        RuntimeError, match="ACCOUNTABILITY_BACKFILL_INVALID_IDENTITY"
+    ):
+        advance_accountability_handoff_backfill(
+            output_path=output,
+            state_path=state,
+            data_root=data_root,
+            ledger_path=ledger,
+            accountability_state_path=acct_state,
+        )
+
+    assert _handoff_ids(state) == []
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+    assert {"ID-VALID", "ID-BAD"} <= _latest_ids(state)
+    assert not acct_state.exists() or _disposition_count(acct_state) == 0
+
+
+def test_no_epoch_identity_less_row_does_not_advance_cursor(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    bad = _outcome_row("NOID", PRE)
+    bad["outcome_record_id"] = ""
+    _seed_latest_outcomes(state, [bad])
+
+    result = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        data_root=data_root,
+    )
+    assert result["enqueued_handoff"] == 0
+    assert result["complete"] is False
+    assert _handoff_ids(state) == []
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+    assert "NOID" in _latest_ids(state)
+
+
 def test_invalid_epoch_fails_closed(tmp_path):
     data_root = tmp_path / "data"
     data_root.mkdir()
