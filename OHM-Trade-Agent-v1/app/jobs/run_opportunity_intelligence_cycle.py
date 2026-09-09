@@ -53,9 +53,24 @@ def main() -> None:
     # Exactly one bounded legacy handoff migration batch per logical cycle.
     # Must not run inside every SQLite open (pending/ack/maturation), or
     # historical enqueue outpaces terminal retirement under a coverage epoch.
-    handoff_backfill = advance_accountability_handoff_backfill(
-        data_root=data_root if data_root.is_dir() else None,
-    )
+    # Invalid coverage epoch fails closed, but deferred until after pending
+    # drain + durable consumption summary so operational evidence remains.
+    handoff_backfill: dict = {}
+    backfill_error: Exception | None = None
+    try:
+        handoff_backfill = advance_accountability_handoff_backfill(
+            data_root=data_root if data_root.is_dir() else None,
+        )
+    except Exception as exc:
+        backfill_error = exc
+        handoff_backfill = {
+            "error": str(exc),
+            "batch_rows": 0,
+            "enqueued_handoff": 0,
+            "terminalized_coverage_discontinuity": 0,
+            "complete": False,
+            "already_complete": False,
+        }
 
     # Drain any durable handoff left by an interrupted prior cycle before
     # maturing more snapshots. This bounds backlog growth and gives
@@ -91,9 +106,6 @@ def main() -> None:
                 raise accountability_error from maturation_error
             raise
 
-    if accountability_error is not None:
-        raise accountability_error
-
     pending_after = pending_accountability_outcomes()
     terminalized_backfill = int(
         (handoff_backfill or {}).get("terminalized_coverage_discontinuity") or 0
@@ -105,10 +117,11 @@ def main() -> None:
         and not outcomes
         and not pending_after
         and terminalized_backfill == 0
+        and backfill_error is None
     )
     disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
-        "status": "OK",
+        "status": "OK" if backfill_error is None and accountability_error is None else "ERROR",
         "new_outcomes_evaluated": newly_evaluated,
         "accountability_handoff_rows": len(outcomes),
         "accountability_handoff_resolved": len(resolved),
@@ -131,6 +144,13 @@ def main() -> None:
         )
 
     print(json.dumps(payload, sort_keys=True))
+
+    if backfill_error is not None:
+        if accountability_error is not None:
+            raise backfill_error from accountability_error
+        raise backfill_error
+    if accountability_error is not None:
+        raise accountability_error
 
 
 if __name__ == "__main__":

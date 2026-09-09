@@ -515,7 +515,13 @@ def _advance_accountability_handoff_backfill_locked(
             ):
                 # Keep latest_outcomes untouched; durable terminal disposition
                 # must be persisted by the caller before dry_run=False applies.
-                coverage_terminal_candidates.append(dict(parsed))
+                # Prefer validated SQLite identities over optional row_json keys.
+                candidate = dict(parsed)
+                candidate["snapshot_id"] = snapshot_id
+                candidate["outcome_record_id"] = outcome_record_id
+                if "reference_at" not in candidate or not candidate.get("reference_at"):
+                    candidate["reference_at"] = reference_at
+                coverage_terminal_candidates.append(candidate)
                 continue
 
         if dry_run:
@@ -658,13 +664,14 @@ def advance_accountability_handoff_backfill(
     ``_open_bounded_state`` so pending/ack/maturation re-opens cannot multiply
     historical enqueue work.
 
-    Crash ordering under a coverage epoch:
+    Crash ordering under a coverage epoch (single registry lock):
     1. classify the next bounded batch (read-only);
     2. persist durable ``UNRESOLVED_COVERAGE_DISCONTINUITY`` for governed rows;
     3. only then advance the migration cursor / enqueue post-boundary handoff.
 
-    That prevents cursor advancement past pre-boundary rows without durable
-    terminal evidence. ``latest_outcomes`` / outcome JSONL are never deleted.
+    Holding one lock across classify→persist→apply prevents reconcile from
+    inserting newly visible pre-boundary rows between phases that would then be
+    cursor-skipped without a durable disposition.
     """
     size = (
         ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE
@@ -678,7 +685,6 @@ def advance_accountability_handoff_backfill(
         screening_path=screening_path,
     )
 
-    # Phase 1 — classify without mutating migration metadata.
     with registry_lock(lock):
         connection = _open_bounded_state(state_db)
         try:
@@ -697,28 +703,23 @@ def advance_accountability_handoff_backfill(
                 coverage_pad=coverage_pad,
                 dry_run=True,
             )
-        finally:
-            connection.close()
+            terminal_candidates = list(
+                preview.get("coverage_terminal_candidates") or []
+            )
+            terminalized = 0
+            if terminal_candidates:
+                from app.services.opportunity_accountability import (
+                    DEFAULT_LEDGER_FILE,
+                    persist_coverage_discontinuity_dispositions,
+                )
 
-    terminal_candidates = list(preview.get("coverage_terminal_candidates") or [])
-    terminalized = 0
-    if terminal_candidates:
-        from app.services.opportunity_accountability import (
-            DEFAULT_LEDGER_FILE,
-            persist_coverage_discontinuity_dispositions,
-        )
+                persisted = persist_coverage_discontinuity_dispositions(
+                    terminal_candidates,
+                    ledger_path=ledger_path or DEFAULT_LEDGER_FILE,
+                    state_path=accountability_state_path,
+                )
+                terminalized = len(persisted)
 
-        persist_coverage_discontinuity_dispositions(
-            terminal_candidates,
-            ledger_path=ledger_path or DEFAULT_LEDGER_FILE,
-            state_path=accountability_state_path,
-        )
-        terminalized = len(terminal_candidates)
-
-    # Phase 2 — advance cursor / enqueue only after durable terminal evidence.
-    with registry_lock(lock):
-        connection = _open_bounded_state(state_db)
-        try:
             result = _advance_accountability_handoff_backfill_locked(
                 connection,
                 batch_size=size,

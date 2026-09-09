@@ -727,3 +727,37 @@ def test_terminalized_backfill_only_cycle_is_consumed_ok(tmp_path, monkeypatch):
     assert summary["measurement_only"] is True
     assert summary["trade_authority_changed"] is False
     assert summary["policy_change_authorized"] is False
+
+
+def test_invalid_epoch_backfill_error_still_writes_summary(tmp_path, monkeypatch):
+    import app.jobs.run_opportunity_intelligence_cycle as cycle
+    import app.opip.learning.job_disposition as jd
+
+    monkeypatch.setattr(cycle, "_DEFAULT_DATA_ROOT", tmp_path)
+
+    def _advance(**kwargs):
+        raise RuntimeError("coverage epoch reason is unsupported")
+
+    monkeypatch.setattr(cycle, "advance_accountability_handoff_backfill", _advance)
+    monkeypatch.setattr(cycle, "pending_accountability_outcomes", lambda: [])
+    monkeypatch.setattr(cycle, "build_outcomes_bounded", lambda: [])
+    monkeypatch.setattr(
+        cycle,
+        "build_incremental_from_outcomes",
+        lambda outcomes, replica_mode=True: {
+            "population": {},
+            "opportunity_capture_rate_pct": None,
+        },
+    )
+    monkeypatch.setattr(cycle, "resolved_accountability_outcomes", lambda outcomes: [])
+    monkeypatch.setattr(cycle, "acknowledge_accountability_outcomes", lambda resolved: 0)
+
+    with pytest.raises(RuntimeError, match="coverage epoch"):
+        cycle.main()
+    summary = jd.read_consumption_summary(tmp_path, "outcomes")
+    assert summary is not None
+    assert summary["status"] == "ERROR"
+    assert "coverage epoch" in summary["accountability_handoff_backfill"]["error"]
+    assert summary["measurement_only"] is True
+    assert summary["trade_authority_changed"] is False
+    assert summary["policy_change_authorized"] is False
