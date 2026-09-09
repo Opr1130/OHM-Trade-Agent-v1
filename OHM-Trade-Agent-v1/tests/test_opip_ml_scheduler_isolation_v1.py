@@ -236,6 +236,16 @@ def test_learning_worker_deploy_is_exact_sha_and_no_trading_credentials():
     assert "OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY" in runner
     assert "OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX" in runner
     assert "OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA" in runner
+    # Bare docker -e NAME requires export after source; do not --env-file.
+    assert 'source "$ENV_FILE"' in runner
+    assert "for _opip_oneshot_var in" in runner
+    assert 'export "${_opip_oneshot_var}"' in runner
+    assert runner.index('source "$ENV_FILE"') < runner.index(
+        "for _opip_oneshot_var in"
+    )
+    assert runner.index("for _opip_oneshot_var in") < runner.index(
+        "-e OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY"
+    )
 
 
 def test_deploy_reconciles_paper_topology_before_marking_last_good():

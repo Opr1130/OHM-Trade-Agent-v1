@@ -15,6 +15,24 @@ JOB="${1:-}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+# Bare `docker run -e NAME` (no `=value`) only forwards *exported* process
+# environment variables. systemd learning units do not EnvironmentFile= the
+# learning env, so plain KEY=VALUE lines in ENV_FILE are shell-local after
+# `source` and would otherwise be silently dropped from the container.
+# Export ONLY the one-shot coverage-discontinuity authorization trio when
+# present. Do not export the rest of the env file (credentials / unrelated
+# production secrets must stay host-local).
+for _opip_oneshot_var in \
+  OPIP_LEARNING_ESTABLISH_COVERAGE_DISCONTINUITY \
+  OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX \
+  OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA
+do
+  if [[ -n "${!_opip_oneshot_var+x}" ]]; then
+    export "${_opip_oneshot_var}"
+  fi
+done
+unset -v _opip_oneshot_var
+
 : "${OPIP_LEARNING_IMAGE:?OPIP_LEARNING_IMAGE is required}"
 : "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 
