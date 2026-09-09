@@ -105,6 +105,7 @@ def _outcome_row(
         "cohort_id": "C1",
         "cohort_size": 1,
         "pair": "XBT/USD",
+        "symbol": "XBT/USD",
         "decision_at_utc": reference_at.isoformat(),
         "reference_at": reference_at.isoformat(),
         "outcome_record_id": f"OUT:{snapshot_id}",
@@ -558,14 +559,23 @@ def test_ack_only_after_durable_disposition_for_existing_handoff_debt(tmp_path):
     )
 
     screening = data_root / "opip/qualification/screening_evaluations.jsonl"
+    funnel = data_root / "opip/qualification/funnel_events.jsonl"
+    funnel.parent.mkdir(parents=True, exist_ok=True)
+    funnel.write_text("", encoding="utf-8")
     summary = build_incremental_from_outcomes(
         pending,
         ledger_path=ledger,
         state_path=acct_state,
         screening_path=screening,
+        screening_archive=screening.parent / "screening_evaluations_archive",
+        funnel_path=funnel,
+        funnel_archive=funnel.parent / "funnel_events_archive",
+        intelligence_event_path=tmp_path / "intelligence_learning/events.jsonl",
+        summary_path=tmp_path / "opip/opportunity_accountability_summary.json",
         replica_mode=True,
     )
     assert summary.get("measurement_only", True) is True
+    assert summary["batch_disposition"]["unresolved_coverage_discontinuity"] == 1
 
     resolved = resolved_accountability_outcomes(
         pending, ledger_path=ledger, state_path=acct_state
