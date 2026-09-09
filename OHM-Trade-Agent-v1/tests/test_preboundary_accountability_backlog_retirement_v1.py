@@ -613,6 +613,7 @@ def test_no_epoch_identity_less_row_does_not_advance_cursor(tmp_path):
     )
     assert result["enqueued_handoff"] == 0
     assert result["complete"] is False
+    assert result["skipped_without_cursor"] == 1
     assert _handoff_ids(state) == []
     assert _backfill_cursor(state) is None
     assert _backfill_complete_flag(state) is False

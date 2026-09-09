@@ -426,6 +426,7 @@ def _advance_accountability_handoff_backfill_locked(
             "batch_rows": 0,
             "enqueued_handoff": 0,
             "coverage_terminal_candidates": [],
+            "skipped_without_cursor": 0,
             "complete": True,
             "already_complete": True,
         }
@@ -610,6 +611,7 @@ def _advance_accountability_handoff_backfill_locked(
             "batch_rows": len(legacy_rows),
             "enqueued_handoff": 0,
             "coverage_terminal_candidates": coverage_terminal_candidates,
+            "skipped_without_cursor": skipped_without_cursor,
             "complete": complete,
             "already_complete": False,
         }
@@ -687,6 +689,7 @@ def _advance_accountability_handoff_backfill_locked(
         "batch_rows": len(legacy_rows),
         "enqueued_handoff": enqueued,
         "coverage_terminal_candidates": coverage_terminal_candidates,
+        "skipped_without_cursor": skipped_without_cursor,
         "complete": complete,
         "already_complete": False,
     }
@@ -712,22 +715,15 @@ def _resolve_backfill_coverage_boundary(
     )
     from app.services.opportunity_accountability import (
         ACCOUNTABILITY_ARCHIVE_WINDOW_PAD,
-        DEFAULT_SCREENING_FILE,
     )
 
     coverage_pad = ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
-    screen = Path(screening_path) if screening_path else DEFAULT_SCREENING_FILE
     replica_screen = (
         Path(data_root) / "opip" / "qualification" / "screening_evaluations.jsonl"
     )
-    if screening_path is not None:
-        screen = Path(screening_path)
-    elif replica_screen.is_file():
-        screen = replica_screen
-    else:
-        # Archive prefix still resolves from the conventional replica path so an
-        # established epoch remains applicable even when HOT was rotated away.
-        screen = replica_screen
+    # Prefer an explicit screening path; otherwise resolve archive prefix from
+    # the conventional replica location even when HOT was rotated away.
+    screen = Path(screening_path) if screening_path is not None else replica_screen
     archive = screening_evaluations_archive(screen)
     epoch = load_applicable_coverage_epoch(data_root, archive)
     if epoch is None:
@@ -780,6 +776,7 @@ def advance_accountability_handoff_backfill(
                     "batch_rows": 0,
                     "enqueued_handoff": 0,
                     "terminalized_coverage_discontinuity": 0,
+                    "skipped_without_cursor": 0,
                     "complete": True,
                     "already_complete": True,
                 }

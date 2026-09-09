@@ -68,6 +68,7 @@ def main() -> None:
             "batch_rows": 0,
             "enqueued_handoff": 0,
             "terminalized_coverage_discontinuity": 0,
+            "skipped_without_cursor": 0,
             "complete": False,
             "already_complete": False,
         }
