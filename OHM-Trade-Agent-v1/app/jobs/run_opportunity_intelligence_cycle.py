@@ -95,7 +95,17 @@ def main() -> None:
         raise accountability_error
 
     pending_after = pending_accountability_outcomes()
-    empty = newly_evaluated == 0 and not outcomes and not pending_after
+    terminalized_backfill = int(
+        (handoff_backfill or {}).get("terminalized_coverage_discontinuity") or 0
+    )
+    # Retirement-only cycles that persist UNRESOLVED_COVERAGE_DISCONTINUITY via
+    # bounded backfill are real consumption work, not empty no-ops.
+    empty = (
+        newly_evaluated == 0
+        and not outcomes
+        and not pending_after
+        and terminalized_backfill == 0
+    )
     disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
         "status": "OK",

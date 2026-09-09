@@ -651,9 +651,6 @@ def test_normal_post_boundary_cycle_measurement_flags(tmp_path, monkeypatch):
             "already_complete": True,
         }
 
-    def _pending():
-        return []
-
     def _build():
         return [{"snapshot_id": "POST-NEW"}]
 
@@ -667,7 +664,6 @@ def test_normal_post_boundary_cycle_measurement_flags(tmp_path, monkeypatch):
         return len(resolved)
 
     monkeypatch.setattr(cycle, "advance_accountability_handoff_backfill", _advance)
-    monkeypatch.setattr(cycle, "pending_accountability_outcomes", _pending)
     monkeypatch.setattr(cycle, "build_outcomes_bounded", _build)
     monkeypatch.setattr(cycle, "build_incremental_from_outcomes", _incremental)
     monkeypatch.setattr(cycle, "resolved_accountability_outcomes", _resolved)
@@ -690,3 +686,44 @@ def test_normal_post_boundary_cycle_measurement_flags(tmp_path, monkeypatch):
     assert summary["trade_authority_changed"] is False
     assert summary["policy_change_authorized"] is False
     assert "accountability_handoff_backfill" in summary
+
+
+def test_terminalized_backfill_only_cycle_is_consumed_ok(tmp_path, monkeypatch):
+    """Coverage retirement without pending handoff is not CONSUMED_EMPTY."""
+    import app.jobs.run_opportunity_intelligence_cycle as cycle
+    import app.opip.learning.job_disposition as jd
+
+    monkeypatch.setattr(cycle, "_DEFAULT_DATA_ROOT", tmp_path)
+
+    def _advance(**kwargs):
+        return {
+            "batch_rows": 3,
+            "enqueued_handoff": 0,
+            "terminalized_coverage_discontinuity": 3,
+            "complete": False,
+            "already_complete": False,
+        }
+
+    monkeypatch.setattr(cycle, "advance_accountability_handoff_backfill", _advance)
+    monkeypatch.setattr(cycle, "pending_accountability_outcomes", lambda: [])
+    monkeypatch.setattr(cycle, "build_outcomes_bounded", lambda: [])
+    monkeypatch.setattr(
+        cycle,
+        "build_incremental_from_outcomes",
+        lambda outcomes, replica_mode=True: {
+            "population": {},
+            "opportunity_capture_rate_pct": None,
+        },
+    )
+    monkeypatch.setattr(cycle, "resolved_accountability_outcomes", lambda outcomes: [])
+    monkeypatch.setattr(cycle, "acknowledge_accountability_outcomes", lambda resolved: 0)
+
+    cycle.main()
+    summary = jd.read_consumption_summary(tmp_path, "outcomes")
+    assert summary["disposition"] == jd.CONSUMED_OK
+    assert summary["accountability_handoff_backfill"][
+        "terminalized_coverage_discontinuity"
+    ] == 3
+    assert summary["measurement_only"] is True
+    assert summary["trade_authority_changed"] is False
+    assert summary["policy_change_authorized"] is False
