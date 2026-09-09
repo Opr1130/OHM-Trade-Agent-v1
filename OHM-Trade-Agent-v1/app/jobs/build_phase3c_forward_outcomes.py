@@ -411,6 +411,11 @@ def _advance_accountability_handoff_backfill_locked(
     *before* invoking with ``dry_run=False`` so cursor advancement cannot race
     ahead of durable terminal evidence.
 
+    Under a coverage boundary, missing/empty/unparsable ``reference_at`` values
+    fail closed for the entire bounded batch before any handoff or migration
+    metadata mutation. Do not fabricate discontinuity dispositions from
+    untrustworthy timestamps.
+
     When ``dry_run=True``, classify the next batch only — no metadata or handoff
     mutations are committed.
     """
@@ -469,6 +474,7 @@ def _advance_accountability_handoff_backfill_locked(
     last_snapshot_id = cursor_snapshot
     enqueued = 0
     coverage_terminal_candidates: list[dict[str, Any]] = []
+    enqueue_plan: list[tuple[str, str, int, str, str]] = []
 
     # Local import keeps coverage helpers off the hot path for callers that
     # only open state without migrating.
@@ -476,6 +482,9 @@ def _advance_accountability_handoff_backfill_locked(
         outcome_window_crosses_discontinuity,
     )
 
+    # Classify the bounded batch without mutating. Under a coverage boundary,
+    # every processable row must expose a trustworthy timestamp before any
+    # handoff enqueue or migration-cursor advancement can commit.
     for (
         snapshot_id,
         outcome_record_id,
@@ -503,12 +512,20 @@ def _advance_accountability_handoff_backfill_locked(
         reference_at = str(
             parsed.get("reference_at") or parsed.get("decision_at_utc") or ""
         )
-        if not reference_at:
-            continue
 
         if coverage_boundary is not None:
-            reference_dt = _parse_utc(reference_at)
-            if reference_dt is not None and outcome_window_crosses_discontinuity(
+            reference_dt = _parse_utc(reference_at) if reference_at else None
+            if not reference_at or reference_dt is None:
+                # Fail closed for the entire batch: do not enqueue, do not
+                # advance the cursor, and do not fabricate discontinuity
+                # dispositions from an untrustworthy timestamp.
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_REFERENCE_AT:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}:"
+                    f"reference_at={reference_at!r}"
+                )
+            if outcome_window_crosses_discontinuity(
                 reference_dt,
                 coverage_boundary,
                 pad=coverage_pad,
@@ -523,10 +540,38 @@ def _advance_accountability_handoff_backfill_locked(
                     candidate["reference_at"] = reference_at
                 coverage_terminal_candidates.append(candidate)
                 continue
-
-        if dry_run:
+        elif not reference_at:
+            # No coverage epoch: preserve legacy skip-empty semantics.
             continue
 
+        enqueue_plan.append(
+            (
+                snapshot_id,
+                outcome_record_id,
+                revision,
+                reference_at,
+                str(row_json),
+            )
+        )
+
+    complete = len(legacy_rows) < batch_size
+    if dry_run:
+        return {
+            "batch_rows": len(legacy_rows),
+            "enqueued_handoff": 0,
+            "coverage_terminal_candidates": coverage_terminal_candidates,
+            "complete": complete,
+            "already_complete": False,
+        }
+
+    # Mutations begin only after the full bounded batch classified successfully.
+    for (
+        snapshot_id,
+        outcome_record_id,
+        revision,
+        reference_at,
+        row_json,
+    ) in enqueue_plan:
         connection.execute(
             """
             INSERT INTO accountability_handoff(
@@ -553,16 +598,6 @@ def _advance_accountability_handoff_backfill_locked(
             ),
         )
         enqueued += 1
-
-    complete = len(legacy_rows) < batch_size
-    if dry_run:
-        return {
-            "batch_rows": len(legacy_rows),
-            "enqueued_handoff": 0,
-            "coverage_terminal_candidates": coverage_terminal_candidates,
-            "complete": complete,
-            "already_complete": False,
-        }
 
     if legacy_rows:
         connection.execute(

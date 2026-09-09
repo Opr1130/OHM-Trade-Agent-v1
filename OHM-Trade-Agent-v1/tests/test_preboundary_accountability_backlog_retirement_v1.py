@@ -247,6 +247,31 @@ def _disposition_count(
         connection.close()
 
 
+def _metadata_value(state: Path, key: str) -> str | None:
+    connection = sqlite3.connect(state)
+    try:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+    finally:
+        connection.close()
+
+
+def _backfill_cursor(state: Path) -> dict | None:
+    raw = _metadata_value(state, "accountability_handoff_backfill_cursor_v2")
+    if raw is None:
+        return None
+    payload = json.loads(raw)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _backfill_complete_flag(state: Path) -> bool:
+    return _metadata_value(state, "accountability_handoff_backfill_v2") == "1"
+
+
 def test_preboundary_upgrade_terminalizes_without_active_queue_debt(tmp_path):
     data_root = tmp_path / "data"
     data_root.mkdir()
@@ -380,6 +405,162 @@ def test_no_epoch_preserves_legacy_enqueue_semantics(tmp_path):
     assert result["enqueued_handoff"] == 1
     assert result["terminalized_coverage_discontinuity"] == 0
     assert _handoff_ids(state) == ["LEGACY-NO-EPOCH"]
+
+
+def test_missing_reference_at_with_coverage_boundary_fails_closed(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _establish_epoch(data_root)
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    ledger = tmp_path / "accountability.jsonl"
+    acct_state = tmp_path / "accountability.state.sqlite3"
+
+    missing = _outcome_row("MISS-REF", PRE)
+    missing["reference_at"] = ""
+    missing["decision_at_utc"] = ""
+    _seed_latest_outcomes(state, [missing])
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+
+    with pytest.raises(
+        RuntimeError, match="ACCOUNTABILITY_BACKFILL_INVALID_REFERENCE_AT"
+    ):
+        advance_accountability_handoff_backfill(
+            output_path=output,
+            state_path=state,
+            data_root=data_root,
+            ledger_path=ledger,
+            accountability_state_path=acct_state,
+        )
+
+    assert _handoff_ids(state) == []
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+    assert "MISS-REF" in _latest_ids(state)
+    assert not acct_state.exists() or _disposition_count(acct_state) == 0
+
+
+def test_malformed_reference_at_with_coverage_boundary_fails_closed(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _establish_epoch(data_root)
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    ledger = tmp_path / "accountability.jsonl"
+    acct_state = tmp_path / "accountability.state.sqlite3"
+
+    bad = _outcome_row("BAD-REF", PRE)
+    bad["reference_at"] = "not-a-timestamp"
+    bad["decision_at_utc"] = "not-a-timestamp"
+    _seed_latest_outcomes(state, [bad])
+
+    with pytest.raises(
+        RuntimeError, match="ACCOUNTABILITY_BACKFILL_INVALID_REFERENCE_AT"
+    ):
+        advance_accountability_handoff_backfill(
+            output_path=output,
+            state_path=state,
+            data_root=data_root,
+            ledger_path=ledger,
+            accountability_state_path=acct_state,
+        )
+
+    assert _handoff_ids(state) == []
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+    assert "BAD-REF" in _latest_ids(state)
+    assert not acct_state.exists() or _disposition_count(acct_state) == 0
+
+
+def test_mixed_batch_invalid_timestamp_is_atomic(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _establish_epoch(data_root)
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    ledger = tmp_path / "accountability.jsonl"
+    acct_state = tmp_path / "accountability.state.sqlite3"
+
+    valid = _outcome_row("VALID-MIX", POST)
+    bad = _outcome_row("BAD-MIX", PRE + timedelta(minutes=1))
+    bad["reference_at"] = "not-a-timestamp"
+    bad["decision_at_utc"] = "not-a-timestamp"
+    # Sort key places valid post-boundary row before malformed row so a
+    # non-atomic implementation would enqueue VALID-MIX first.
+    _seed_latest_outcomes(state, [valid, bad])
+
+    with pytest.raises(
+        RuntimeError, match="ACCOUNTABILITY_BACKFILL_INVALID_REFERENCE_AT"
+    ):
+        advance_accountability_handoff_backfill(
+            output_path=output,
+            state_path=state,
+            data_root=data_root,
+            ledger_path=ledger,
+            accountability_state_path=acct_state,
+        )
+
+    assert _handoff_ids(state) == []
+    assert _backfill_cursor(state) is None
+    assert _backfill_complete_flag(state) is False
+    assert {"VALID-MIX", "BAD-MIX"} <= _latest_ids(state)
+    assert not acct_state.exists() or _disposition_count(acct_state) == 0
+
+
+def test_no_epoch_empty_reference_at_preserves_skip_semantics(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    empty = _outcome_row("EMPTY-NO-EPOCH", PRE)
+    empty["reference_at"] = ""
+    empty["decision_at_utc"] = ""
+    _seed_latest_outcomes(state, [empty])
+
+    result = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        data_root=data_root,
+    )
+    assert result["enqueued_handoff"] == 0
+    assert result["terminalized_coverage_discontinuity"] == 0
+    assert result["complete"] is True
+    assert _handoff_ids(state) == []
+    assert "EMPTY-NO-EPOCH" in _latest_ids(state)
+    assert _backfill_complete_flag(state) is True
+
+
+def test_valid_timestamps_still_terminalize_and_enqueue(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _establish_epoch(data_root)
+
+    output = tmp_path / "outcomes.jsonl"
+    state = tmp_path / "outcomes.state.sqlite3"
+    ledger = tmp_path / "accountability.jsonl"
+    acct_state = tmp_path / "accountability.state.sqlite3"
+
+    pre = _outcome_row("VALID-PRE", PRE)
+    post = _outcome_row("VALID-POST", POST)
+    _seed_latest_outcomes(state, [pre, post])
+
+    result = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        data_root=data_root,
+        ledger_path=ledger,
+        accountability_state_path=acct_state,
+    )
+    assert result["enqueued_handoff"] == 1
+    assert result["terminalized_coverage_discontinuity"] == 1
+    assert _handoff_ids(state) == ["VALID-POST"]
+    assert _disposition_count(acct_state) == 1
+    assert {"VALID-PRE", "VALID-POST"} <= _latest_ids(state)
 
 
 def test_invalid_epoch_fails_closed(tmp_path):
