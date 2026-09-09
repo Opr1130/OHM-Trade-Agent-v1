@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from app.jobs import build_phase3c_forward_outcomes as outcomes_job
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
+    advance_accountability_handoff_backfill,
     build_outcomes,
     build_outcomes_bounded,
     pending_accountability_outcomes,
@@ -494,6 +495,21 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
     finally:
         connection.close()
 
+    # Explicit bounded maintenance — pending/open alone must not migrate.
+    assert pending_accountability_outcomes(
+        output_path=output,
+        state_path=state,
+    ) == []
+
+    first_advance = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        batch_size=2,
+    )
+    assert first_advance["batch_rows"] == 2
+    assert first_advance["enqueued_handoff"] == 2
+    assert first_advance["complete"] is False
+
     first = pending_accountability_outcomes(
         output_path=output,
         state_path=state,
@@ -525,6 +541,15 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         state_path=state,
     ) == 2
 
+    second_advance = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        batch_size=2,
+    )
+    assert second_advance["batch_rows"] == 1
+    assert second_advance["complete"] is True
+    assert second_advance["already_complete"] is False
+
     second = pending_accountability_outcomes(
         output_path=output,
         state_path=state,
@@ -540,6 +565,15 @@ def test_legacy_handoff_backfill_is_bounded_and_resumable(tmp_path, monkeypatch)
         assert "accountability_handoff_backfill_cursor_v2" not in metadata
     finally:
         connection.close()
+
+    # Completion marker sticks; repeated advances are no-ops.
+    third = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+        batch_size=2,
+    )
+    assert third["already_complete"] is True
+    assert third["batch_rows"] == 0
 
 
 def test_existing_outcome_state_backfills_accountability_handoff_on_upgrade(tmp_path):
@@ -626,6 +660,18 @@ def test_existing_outcome_state_backfills_accountability_handoff_on_upgrade(tmp_
         connection.commit()
     finally:
         connection.close()
+
+    assert pending_accountability_outcomes(
+        output_path=output,
+        state_path=state,
+    ) == []
+
+    advance = advance_accountability_handoff_backfill(
+        output_path=output,
+        state_path=state,
+    )
+    assert advance["enqueued_handoff"] == 1
+    assert advance["complete"] is True
 
     pending = pending_accountability_outcomes(
         output_path=output,

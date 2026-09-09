@@ -374,149 +374,449 @@ def _open_bounded_state(path: Path) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_snapshot_queue_due "
         "ON snapshot_queue(next_due_at, decision_at)"
     )
+    # Schema/open only. Legacy latest_outcomes -> accountability_handoff
+    # migration is an explicit bounded maintenance operation
+    # (advance_accountability_handoff_backfill). Opening the DB repeatedly
+    # during one outcomes cycle must not silently advance multiple batches.
+    connection.commit()
+    return connection
 
-    backfill_marker = connection.execute(
+
+def _accountability_handoff_backfill_complete(
+    connection: sqlite3.Connection,
+) -> bool:
+    row = connection.execute(
         "SELECT value FROM metadata "
         "WHERE key = 'accountability_handoff_backfill_v2'"
     ).fetchone()
-    if backfill_marker is None:
-        cursor_row = connection.execute(
-            "SELECT value FROM metadata "
-            "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
-        ).fetchone()
-        cursor_reference = ""
-        cursor_snapshot = ""
-        if cursor_row is not None:
-            try:
-                cursor_payload = json.loads(str(cursor_row[0]))
-            except (TypeError, json.JSONDecodeError):
-                cursor_payload = {}
-            if isinstance(cursor_payload, dict):
-                cursor_reference = str(
-                    cursor_payload.get("reference_at") or ""
-                )
-                cursor_snapshot = str(
-                    cursor_payload.get("snapshot_id") or ""
-                )
+    return row is not None
 
-        legacy_rows = connection.execute(
-            """
-            SELECT
-                snapshot_id,
-                outcome_record_id,
-                outcome_revision,
-                row_json,
-                reference_at
-            FROM latest_outcomes
-            WHERE reference_at > ?
-               OR (
-                    reference_at = ?
-                    AND snapshot_id > ?
-               )
-            ORDER BY reference_at, snapshot_id
-            LIMIT ?
-            """,
-            (
-                cursor_reference,
-                cursor_reference,
-                cursor_snapshot,
-                ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE,
-            ),
-        ).fetchall()
 
-        last_reference = cursor_reference
-        last_snapshot_id = cursor_snapshot
-        for (
+def _advance_accountability_handoff_backfill_locked(
+    connection: sqlite3.Connection,
+    *,
+    batch_size: int,
+    coverage_boundary: datetime | None,
+    coverage_pad: timedelta,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Advance at most one bounded legacy handoff batch on an open connection.
+
+    Active ``accountability_handoff`` is a work queue, not the historical system
+    of record. ``latest_outcomes`` / outcome JSONL remain durable evidence.
+
+    When a coverage-discontinuity boundary applies, rows whose required evidence
+    window starts before the boundary are NOT enqueued into the active handoff.
+    Callers must persist ``UNRESOLVED_COVERAGE_DISCONTINUITY`` for those rows
+    *before* invoking with ``dry_run=False`` so cursor advancement cannot race
+    ahead of durable terminal evidence.
+
+    Under a coverage boundary, missing/empty/unparsable ``reference_at`` values
+    fail closed for the entire bounded batch before any handoff or migration
+    metadata mutation. Do not fabricate discontinuity dispositions from
+    untrustworthy timestamps.
+
+    When ``dry_run=True``, classify the next batch only — no metadata or handoff
+    mutations are committed.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if _accountability_handoff_backfill_complete(connection):
+        return {
+            "batch_rows": 0,
+            "enqueued_handoff": 0,
+            "coverage_terminal_candidates": [],
+            "skipped_without_cursor": 0,
+            "complete": True,
+            "already_complete": True,
+        }
+
+    cursor_row = connection.execute(
+        "SELECT value FROM metadata "
+        "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
+    ).fetchone()
+    cursor_reference = ""
+    cursor_snapshot = ""
+    if cursor_row is not None:
+        try:
+            cursor_payload = json.loads(str(cursor_row[0]))
+        except (TypeError, json.JSONDecodeError):
+            cursor_payload = {}
+        if isinstance(cursor_payload, dict):
+            cursor_reference = str(cursor_payload.get("reference_at") or "")
+            cursor_snapshot = str(cursor_payload.get("snapshot_id") or "")
+
+    legacy_rows = connection.execute(
+        """
+        SELECT
             snapshot_id,
             outcome_record_id,
             outcome_revision,
             row_json,
-            sort_reference_at,
-        ) in legacy_rows:
-            raw_snapshot_id = str(snapshot_id or "")
-            snapshot_id = raw_snapshot_id.strip()
-            outcome_record_id = str(outcome_record_id or "").strip()
-            last_reference = str(sort_reference_at or "")
-            last_snapshot_id = raw_snapshot_id
-            if not snapshot_id or not outcome_record_id:
-                continue
-            try:
-                revision = int(outcome_revision)
-            except (TypeError, ValueError):
-                continue
-            try:
-                parsed = json.loads(row_json)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            reference_at = str(
-                parsed.get("reference_at")
-                or parsed.get("decision_at_utc")
-                or ""
-            )
-            if not reference_at:
-                continue
-            connection.execute(
-                """
-                INSERT INTO accountability_handoff(
-                    snapshot_id,
-                    outcome_record_id,
-                    outcome_revision,
-                    reference_at,
-                    row_json
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(snapshot_id) DO UPDATE SET
-                    outcome_record_id = excluded.outcome_record_id,
-                    outcome_revision = excluded.outcome_revision,
-                    reference_at = excluded.reference_at,
-                    row_json = excluded.row_json
-                WHERE excluded.outcome_revision
-                      >= accountability_handoff.outcome_revision
-                """,
-                (
-                    snapshot_id,
-                    outcome_record_id,
-                    revision,
-                    reference_at,
-                    row_json,
-                ),
-            )
+            reference_at
+        FROM latest_outcomes
+        WHERE reference_at > ?
+           OR (
+                reference_at = ?
+                AND snapshot_id > ?
+           )
+        ORDER BY reference_at, snapshot_id
+        LIMIT ?
+        """,
+        (
+            cursor_reference,
+            cursor_reference,
+            cursor_snapshot,
+            batch_size,
+        ),
+    ).fetchall()
 
-        if legacy_rows:
-            connection.execute(
-                """
-                INSERT INTO metadata(key, value)
-                VALUES ('accountability_handoff_backfill_cursor_v2', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (
-                    json.dumps(
-                        {
-                            "reference_at": last_reference,
-                            "snapshot_id": last_snapshot_id,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                ),
-            )
-            connection.commit()
+    last_reference = cursor_reference
+    last_snapshot_id = cursor_snapshot
+    enqueued = 0
+    coverage_terminal_candidates: list[dict[str, Any]] = []
+    enqueue_plan: list[tuple[str, str, int, str, str]] = []
 
-        if len(legacy_rows) < ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE:
-            connection.execute(
-                """
-                INSERT INTO metadata(key, value)
-                VALUES ('accountability_handoff_backfill_v2', '1')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """
+    # Local import keeps coverage helpers off the hot path for callers that
+    # only open state without migrating.
+    from app.opip.learning.coverage_discontinuity import (
+        outcome_window_crosses_discontinuity,
+    )
+
+    # Classify the bounded batch without mutating. Under a coverage boundary,
+    # every processable row must expose a trustworthy identity and timestamp
+    # before any handoff enqueue or migration-cursor advancement can commit.
+    skipped_without_cursor = 0
+    for (
+        snapshot_id,
+        outcome_record_id,
+        outcome_revision,
+        row_json,
+        sort_reference_at,
+    ) in legacy_rows:
+        raw_snapshot_id = str(snapshot_id or "")
+        snapshot_id = raw_snapshot_id.strip()
+        outcome_record_id = str(outcome_record_id or "").strip()
+        if not snapshot_id or not outcome_record_id:
+            # Do not advance the migration cursor past identity-less rows:
+            # otherwise they are permanently excluded without handoff or
+            # durable terminal evidence.
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_IDENTITY:"
+                    f"snapshot_id={raw_snapshot_id!r}:"
+                    f"outcome_record_id={outcome_record_id!r}"
+                )
+            skipped_without_cursor += 1
+            continue
+        try:
+            revision = int(outcome_revision)
+        except (TypeError, ValueError):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_REVISION:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}:"
+                    f"outcome_revision={outcome_revision!r}"
+                ) from None
+            skipped_without_cursor += 1
+            continue
+        try:
+            parsed = json.loads(row_json)
+        except (TypeError, json.JSONDecodeError):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_ROW_JSON:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}"
+                ) from None
+            skipped_without_cursor += 1
+            continue
+        if not isinstance(parsed, dict):
+            if coverage_boundary is not None:
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_ROW_JSON:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}"
+                )
+            skipped_without_cursor += 1
+            continue
+
+        # Cursor markers advance only for rows that passed identity/structure
+        # validation.
+        last_reference = str(sort_reference_at or "")
+        last_snapshot_id = raw_snapshot_id
+
+        reference_at = str(
+            parsed.get("reference_at") or parsed.get("decision_at_utc") or ""
+        )
+
+        if coverage_boundary is not None:
+            reference_dt = _parse_utc(reference_at) if reference_at else None
+            if not reference_at or reference_dt is None:
+                # Fail closed for the entire batch: do not enqueue, do not
+                # advance the cursor, and do not fabricate discontinuity
+                # dispositions from an untrustworthy timestamp.
+                raise RuntimeError(
+                    "ACCOUNTABILITY_BACKFILL_INVALID_REFERENCE_AT:"
+                    f"snapshot_id={snapshot_id}:"
+                    f"outcome_record_id={outcome_record_id}:"
+                    f"reference_at={reference_at!r}"
+                )
+            if outcome_window_crosses_discontinuity(
+                reference_dt,
+                coverage_boundary,
+                pad=coverage_pad,
+            ):
+                # Keep latest_outcomes untouched; durable terminal disposition
+                # must be persisted by the caller before dry_run=False applies.
+                # Prefer validated SQLite identities over optional row_json keys.
+                candidate = dict(parsed)
+                candidate["snapshot_id"] = snapshot_id
+                candidate["outcome_record_id"] = outcome_record_id
+                if "reference_at" not in candidate or not candidate.get("reference_at"):
+                    candidate["reference_at"] = reference_at
+                coverage_terminal_candidates.append(candidate)
+                continue
+        elif not reference_at:
+            # No coverage epoch: preserve legacy skip-empty semantics.
+            # Cursor already advanced for this validated identity row.
+            continue
+
+        enqueue_plan.append(
+            (
+                snapshot_id,
+                outcome_record_id,
+                revision,
+                reference_at,
+                str(row_json),
             )
-            connection.execute(
-                "DELETE FROM metadata "
-                "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
-            )
+        )
+
+    # A short batch only means "no further rows" when every selected row was
+    # cursor-accounted for. Identity-less skips must not flip completion on.
+    # Under no-epoch, any identity/structure skip also suppresses partial
+    # progress so a later valid row cannot advance the cursor past a skipped
+    # identity-less neighbor in the same bounded batch.
+    if skipped_without_cursor > 0:
+        enqueue_plan.clear()
+        coverage_terminal_candidates.clear()
+        last_reference = cursor_reference
+        last_snapshot_id = cursor_snapshot
+        complete = False
+    else:
+        complete = len(legacy_rows) < batch_size
+    if dry_run:
+        return {
+            "batch_rows": len(legacy_rows),
+            "enqueued_handoff": 0,
+            "coverage_terminal_candidates": coverage_terminal_candidates,
+            "skipped_without_cursor": skipped_without_cursor,
+            "complete": complete,
+            "already_complete": False,
+        }
+
+    # Mutations begin only after the full bounded batch classified successfully.
+    for (
+        snapshot_id,
+        outcome_record_id,
+        revision,
+        reference_at,
+        row_json,
+    ) in enqueue_plan:
+        connection.execute(
+            """
+            INSERT INTO accountability_handoff(
+                snapshot_id,
+                outcome_record_id,
+                outcome_revision,
+                reference_at,
+                row_json
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_id) DO UPDATE SET
+                outcome_record_id = excluded.outcome_record_id,
+                outcome_revision = excluded.outcome_revision,
+                reference_at = excluded.reference_at,
+                row_json = excluded.row_json
+            WHERE excluded.outcome_revision
+                  >= accountability_handoff.outcome_revision
+            """,
+            (
+                snapshot_id,
+                outcome_record_id,
+                revision,
+                reference_at,
+                row_json,
+            ),
+        )
+        enqueued += 1
+
+    # Persist cursor/completion only when every selected row was
+    # identity-accounted for. Identity-less skips leave metadata untouched.
+    if legacy_rows and skipped_without_cursor == 0:
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('accountability_handoff_backfill_cursor_v2', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (
+                json.dumps(
+                    {
+                        "reference_at": last_reference,
+                        "snapshot_id": last_snapshot_id,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+
+    if complete:
+        connection.execute(
+            """
+            INSERT INTO metadata(key, value)
+            VALUES ('accountability_handoff_backfill_v2', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+        connection.execute(
+            "DELETE FROM metadata "
+            "WHERE key = 'accountability_handoff_backfill_cursor_v2'"
+        )
     connection.commit()
-    return connection
+    return {
+        "batch_rows": len(legacy_rows),
+        "enqueued_handoff": enqueued,
+        "coverage_terminal_candidates": coverage_terminal_candidates,
+        "skipped_without_cursor": skipped_without_cursor,
+        "complete": complete,
+        "already_complete": False,
+    }
+
+
+def _resolve_backfill_coverage_boundary(
+    *,
+    data_root: Path | None,
+    screening_path: Path | None,
+) -> tuple[datetime | None, timedelta]:
+    """Load coverage boundary for legacy handoff migration, or (None, default pad).
+
+    Absent epoch → ``None`` boundary (legacy enqueue-all semantics).
+    Present but invalid epoch → fail closed via ``load_applicable_coverage_epoch``.
+    """
+    coverage_pad = timedelta(minutes=15)
+    if data_root is None or not Path(data_root).is_dir():
+        return None, coverage_pad
+
+    from app.opip.decision.store import screening_evaluations_archive
+    from app.opip.learning.coverage_discontinuity import (
+        load_applicable_coverage_epoch,
+    )
+    from app.services.opportunity_accountability import (
+        ACCOUNTABILITY_ARCHIVE_WINDOW_PAD,
+    )
+
+    coverage_pad = ACCOUNTABILITY_ARCHIVE_WINDOW_PAD
+    replica_screen = (
+        Path(data_root) / "opip" / "qualification" / "screening_evaluations.jsonl"
+    )
+    # Prefer an explicit screening path; otherwise resolve archive prefix from
+    # the conventional replica location even when HOT was rotated away.
+    screen = Path(screening_path) if screening_path is not None else replica_screen
+    archive = screening_evaluations_archive(screen)
+    epoch = load_applicable_coverage_epoch(data_root, archive)
+    if epoch is None:
+        return None, coverage_pad
+    return epoch.boundary_at_utc, coverage_pad
+
+
+def advance_accountability_handoff_backfill(
+    *,
+    output_path: Path = DEFAULT_OUTPUT,
+    state_path: Path | None = None,
+    data_root: Path | None = None,
+    screening_path: Path | None = None,
+    ledger_path: Path | None = None,
+    accountability_state_path: Path | None = None,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Explicit one-batch legacy handoff migration for a logical outcomes cycle.
+
+    Call at most once per outcomes invocation. Does not run on ordinary
+    ``_open_bounded_state`` so pending/ack/maturation re-opens cannot multiply
+    historical enqueue work.
+
+    Crash ordering under a coverage epoch (single registry lock):
+    1. classify the next bounded batch (read-only);
+    2. persist durable ``UNRESOLVED_COVERAGE_DISCONTINUITY`` for governed rows;
+    3. only then advance the migration cursor / enqueue post-boundary handoff.
+
+    Holding one lock across classify→persist→apply prevents reconcile from
+    inserting newly visible pre-boundary rows between phases that would then be
+    cursor-skipped without a durable disposition.
+    """
+    size = (
+        ACCOUNTABILITY_HANDOFF_BACKFILL_BATCH_SIZE
+        if batch_size is None
+        else int(batch_size)
+    )
+    state_db = state_path or _bounded_state_path(output_path)
+    lock = output_path.parent / f".{output_path.name}.lock"
+    coverage_boundary, coverage_pad = _resolve_backfill_coverage_boundary(
+        data_root=data_root,
+        screening_path=screening_path,
+    )
+
+    with registry_lock(lock):
+        connection = _open_bounded_state(state_db)
+        try:
+            if _accountability_handoff_backfill_complete(connection):
+                return {
+                    "batch_rows": 0,
+                    "enqueued_handoff": 0,
+                    "terminalized_coverage_discontinuity": 0,
+                    "skipped_without_cursor": 0,
+                    "complete": True,
+                    "already_complete": True,
+                }
+            preview = _advance_accountability_handoff_backfill_locked(
+                connection,
+                batch_size=size,
+                coverage_boundary=coverage_boundary,
+                coverage_pad=coverage_pad,
+                dry_run=True,
+            )
+            terminal_candidates = list(
+                preview.get("coverage_terminal_candidates") or []
+            )
+            terminalized = 0
+            if terminal_candidates:
+                from app.services.opportunity_accountability import (
+                    DEFAULT_LEDGER_FILE,
+                    persist_coverage_discontinuity_dispositions,
+                )
+
+                persisted = persist_coverage_discontinuity_dispositions(
+                    terminal_candidates,
+                    ledger_path=ledger_path or DEFAULT_LEDGER_FILE,
+                    state_path=accountability_state_path,
+                )
+                terminalized = len(persisted)
+
+            result = _advance_accountability_handoff_backfill_locked(
+                connection,
+                batch_size=size,
+                coverage_boundary=coverage_boundary,
+                coverage_pad=coverage_pad,
+                dry_run=False,
+            )
+        finally:
+            connection.close()
+
+    result.pop("coverage_terminal_candidates", None)
+    result["terminalized_coverage_discontinuity"] = terminalized
+    return result
 
 
 def _state_int(connection: sqlite3.Connection, key: str, default: int = 0) -> int:

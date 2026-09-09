@@ -195,9 +195,10 @@ def test_outcomes_cycle_repairs_replica_before_reading_pending_handoff():
         / "app/jobs/run_opportunity_intelligence_cycle.py"
     ).read_text(encoding="utf-8")
     repair = source.index("reconcile_qualification_replica_archives(data_root)")
+    advance = source.index("advance_accountability_handoff_backfill(")
     pending = source.index("pending_accountability_outcomes()")
 
-    assert repair < pending
+    assert repair < advance < pending
     assert "OPIP_LEARNING_REPLICA_ARCHIVE_REPAIR" in source
     assert '"trade_authority_changed": False' in source
     assert '"policy_change_authorized": False' in source

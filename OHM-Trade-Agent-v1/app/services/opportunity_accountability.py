@@ -1912,6 +1912,52 @@ def _discontinuity_unresolved_dispositions(
     return pending
 
 
+def persist_coverage_discontinuity_dispositions(
+    outcomes: Iterable[Mapping[str, Any]],
+    *,
+    ledger_path: Path = DEFAULT_LEDGER_FILE,
+    state_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Persist UNRESOLVED_COVERAGE_DISCONTINUITY for provided outcome rows.
+
+    Used by the bounded legacy handoff migrator when a coverage epoch governs
+    pre-boundary / straddling records so they receive durable terminal evidence
+    without circulating forever in the active accountability_handoff queue.
+
+    Idempotent: ON CONFLICT updates the same outcome_record_id. Does not delete
+    latest_outcomes / JSONL history. Does not acknowledge handoff rows — the
+    outcomes cycle must only ack after resolved_accountability_outcomes sees
+    the durable disposition.
+    """
+    pending = [dict(row) for row in outcomes if isinstance(row, Mapping)]
+    if not pending:
+        return []
+    dispositions: list[dict[str, Any]] = []
+    for row in pending:
+        record_id = str(row.get("outcome_record_id") or "")
+        snapshot_id = str(row.get("snapshot_id") or "")
+        if not record_id or not snapshot_id:
+            continue
+        dispositions.append(
+            {
+                "outcome_record_id": record_id,
+                "snapshot_id": snapshot_id,
+                "disposition": OUTCOME_DISPOSITION_UNRESOLVED,
+                "reason": OUTCOME_DISPOSITION_UNRESOLVED,
+                "accountability_rows": 0,
+                "measurement_only": True,
+                "affects_trade_authority": False,
+            }
+        )
+    if dispositions:
+        _persist_outcome_dispositions(
+            dispositions,
+            ledger_path=ledger_path,
+            state_path=state_path,
+        )
+    return dispositions
+
+
 def _filter_outcomes_for_discontinuity(
     outcomes: list[dict[str, Any]],
     *,
