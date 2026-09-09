@@ -162,17 +162,19 @@ def test_opportunity_cycle_acks_only_after_accountability_build():
     source = (
         ROOT / "app" / "jobs" / "run_opportunity_intelligence_cycle.py"
     ).read_text(encoding="utf-8")
+    advance = source.index("advance_accountability_handoff_backfill(")
     pending = source.index("pending_accountability_outcomes()")
     build = source.index(
         "build_incremental_from_outcomes(outcomes, replica_mode=True)"
     )
     resolved = source.index("resolved_accountability_outcomes(outcomes)")
     ack = source.index("acknowledge_accountability_outcomes(resolved)")
-    assert pending < build < resolved < ack
+    assert advance < pending < build < resolved < ack
     assert "acknowledge_accountability_outcomes(outcomes)" not in source
     assert "if not outcomes:" in source
     assert "if replayed_handoff:" in source
     assert source.rindex("build_outcomes_bounded()") > ack
+    assert source.count("advance_accountability_handoff_backfill(") == 1
 
 
 def test_learning_systemd_services_enforce_post_run_cleanup():

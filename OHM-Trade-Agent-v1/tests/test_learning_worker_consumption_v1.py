@@ -248,6 +248,15 @@ def test_outcomes_cycle_writes_consumption_summary(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(cycle, "_DEFAULT_DATA_ROOT", tmp_path)
 
+    def _advance(**kwargs):
+        return {
+            "batch_rows": 0,
+            "enqueued_handoff": 0,
+            "terminalized_coverage_discontinuity": 0,
+            "complete": True,
+            "already_complete": True,
+        }
+
     def _pending():
         return []
 
@@ -263,6 +272,7 @@ def test_outcomes_cycle_writes_consumption_summary(tmp_path: Path, monkeypatch):
     def _ack(resolved):
         return 0
 
+    monkeypatch.setattr(cycle, "advance_accountability_handoff_backfill", _advance)
     monkeypatch.setattr(cycle, "pending_accountability_outcomes", _pending)
     monkeypatch.setattr(cycle, "build_outcomes_bounded", _build)
     monkeypatch.setattr(cycle, "build_incremental_from_outcomes", _incremental)
@@ -284,6 +294,15 @@ def test_outcomes_handoff_ack_idempotent_on_replay(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cycle, "_DEFAULT_DATA_ROOT", tmp_path)
     calls = {"ack": 0, "pending_rounds": 0}
     handoff = [{"snapshot_id": "s1", "outcome_revision": 1}]
+
+    def _advance(**kwargs):
+        return {
+            "batch_rows": 0,
+            "enqueued_handoff": 0,
+            "terminalized_coverage_discontinuity": 0,
+            "complete": True,
+            "already_complete": True,
+        }
 
     def _pending():
         calls["pending_rounds"] += 1
@@ -307,6 +326,7 @@ def test_outcomes_handoff_ack_idempotent_on_replay(tmp_path: Path, monkeypatch):
         assert resolved == handoff
         return len(resolved)
 
+    monkeypatch.setattr(cycle, "advance_accountability_handoff_backfill", _advance)
     monkeypatch.setattr(cycle, "pending_accountability_outcomes", _pending)
     monkeypatch.setattr(cycle, "build_outcomes_bounded", _build)
     monkeypatch.setattr(cycle, "build_incremental_from_outcomes", _incremental)

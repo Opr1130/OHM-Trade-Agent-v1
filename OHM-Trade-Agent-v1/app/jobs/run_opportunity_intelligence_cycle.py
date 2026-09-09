@@ -12,6 +12,7 @@ from pathlib import Path
 
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
+    advance_accountability_handoff_backfill,
     build_outcomes_bounded,
     pending_accountability_outcomes,
 )
@@ -48,6 +49,13 @@ def main() -> None:
         # The production export remains copy-only. Repair only the isolated
         # replica after sync has validated the complete exported archive tree.
         replica_archive_repair = reconcile_qualification_replica_archives(data_root)
+
+    # Exactly one bounded legacy handoff migration batch per logical cycle.
+    # Must not run inside every SQLite open (pending/ack/maturation), or
+    # historical enqueue outpaces terminal retirement under a coverage epoch.
+    handoff_backfill = advance_accountability_handoff_backfill(
+        data_root=data_root if data_root.is_dir() else None,
+    )
 
     # Drain any durable handoff left by an interrupted prior cycle before
     # maturing more snapshots. This bounds backlog growth and gives
@@ -96,6 +104,7 @@ def main() -> None:
         "accountability_handoff_resolved": len(resolved),
         "accountability_handoff_acknowledged": acknowledged,
         "accountability_pending_count": len(pending_after),
+        "accountability_handoff_backfill": handoff_backfill,
         "replayed_handoff": replayed_handoff,
         "replica_archive_repair": replica_archive_repair,
         "population": summary.get("population", {}),
