@@ -83,20 +83,6 @@ def append_discovery_attributions(
     path: Path | None = None,
 ) -> int:
     return _append_rows(
-        path or FORWARD_OUTCOMES_FILE,
-        rows,
-        max_bytes=FORWARD_OUTCOMES_MAX_BYTES,
-        keep_lines=FORWARD_OUTCOMES_KEEP_LINES,
-        dead_letter_path=DEAD_LETTER_FILE,
-    )
-
-
-def append_discovery_attributions(
-    rows: Iterable[Mapping[str, Any]],
-    *,
-    path: Path | None = None,
-) -> int:
-    return _append_rows(
         path or ATTRIBUTIONS_FILE,
         rows,
         max_bytes=ATTRIBUTIONS_MAX_BYTES,
