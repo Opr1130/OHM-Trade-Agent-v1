@@ -80,7 +80,6 @@ def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
         )
 
 
-
 def _run_qualified_alert_retry_fail_open(*, settings) -> None:
     """Retry already-qualified actions after real-position protection.
 
@@ -269,6 +268,102 @@ def _run_event_intelligence_fail_open(*, settings) -> None:
         )
 
 
+def _run_external_order_review_fail_open() -> None:
+    """Review unmatched Kraken orders without delaying critical discovery."""
+    try:
+        external_review = review_external_open_orders()
+    except Exception as exc:
+        external_review = ExternalOrderReviewSummary(
+            status="UNAVAILABLE",
+            reason=f"external order review failed open: {type(exc).__name__}: {exc}",
+        )
+    print("OHM External Order Review")
+    print("Status:", external_review.status)
+    print("Unmatched orders:", external_review.unmatched_orders_seen)
+    print("New reviews:", external_review.new_reviews)
+    print("Notifications sent:", external_review.notifications_sent)
+    if external_review.reason:
+        print("External review reason:", external_review.reason)
+
+
+def _run_learning_fail_open() -> None:
+    """Run non-authoritative learning only after critical production work."""
+    try:
+        learning = run_learning_cycle()
+    except Exception as exc:
+        learning = {
+            "status": "UNAVAILABLE",
+            "paid_ai_calls": 0,
+            "shadow": {"status": "UNAVAILABLE", "observations_added": 0},
+            "price_movement": {"status": "UNAVAILABLE", "observations_added": 0},
+            "profile_refreshed": False,
+            "profile_status": "UNAVAILABLE",
+            "reason": str(exc),
+        }
+    shadow = learning.get("shadow") or {}
+    movement_learning = learning.get("price_movement") or {}
+    print("OHM Self-Learning")
+    print("Status:", learning.get("status"))
+    print("Paid AI calls:", learning.get("paid_ai_calls", 0))
+    print("Shadow status:", shadow.get("status"))
+    print("Shadow observations added:", shadow.get("observations_added", 0))
+    print("Movement learning status:", movement_learning.get("status"))
+    print("Movement observations added:", movement_learning.get("observations_added", 0))
+    print("Profile refreshed:", learning.get("profile_refreshed"))
+    print("Profile status:", learning.get("profile_status"))
+    if learning.get("reason"):
+        print("Learning reason:", learning.get("reason"))
+
+
+def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) -> bool:
+    """Run the authoritative broad discovery pass before optional workloads."""
+    if decision.effective_mode != "SEARCH":
+        print("Broad opportunity scan skipped: effective mode is", decision.effective_mode)
+        return False
+
+    normal_search_due = search_due(decision)
+    if not normal_search_due and not entry_watch_ready:
+        print("Broad opportunity scan skipped: search cadence not due.")
+        return False
+    if entry_watch_ready and not normal_search_due:
+        print(
+            "Broad opportunity scan accelerated by entry-watch readiness; "
+            "full qualification remains mandatory."
+        )
+
+    # Optional candidate evidence is processed only immediately before a due
+    # native scan. The bridge remains fail-open and cannot change qualification.
+    if settings.tradingview_v2_enabled:
+        try:
+            from app.services.tradingview_inbox import process_queued_events
+
+            tradingview_summary = process_queued_events()
+        except Exception as exc:
+            tradingview_summary = {"status": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
+            print("TradingView v2 inbox processing failed open:", tradingview_summary["reason"])
+        else:
+            print("OHM TradingView v2 Inbox")
+            print("Checked:", tradingview_summary.get("checked", 0))
+            print("Processed:", tradingview_summary.get("processed", 0))
+            print("Qualified:", tradingview_summary.get("qualified", 0))
+            print("Rejected:", tradingview_summary.get("rejected", 0))
+            print("Retried:", tradingview_summary.get("retried", 0))
+            print("Poisoned:", tradingview_summary.get("poisoned", 0))
+
+    mark_search_started()
+    # Capture the scanner's existing console report into structured telemetry
+    # while teeing it unchanged to stdout. Telemetry is fail-open and does not
+    # participate in trade decisions. A kill/timeout leaves STARTED so
+    # diagnostics can see a hung scan without deleting the cycle lock.
+    try:
+        run_scan_with_telemetry(scan_main)
+    except Exception:
+        mark_search_finished("FAILED")
+        raise
+    mark_search_finished("COMPLETED")
+    return True
+
+
 def _run_cycle_once() -> None:
     # Reconcile the exchange first so stale OHM lifecycle state cannot drive
     # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
@@ -295,53 +390,6 @@ def _run_cycle_once() -> None:
     print("Filled:", len(reconciliation.filled))
     if reconciliation.reason:
         print("Reconciliation reason:", reconciliation.reason)
-
-    # Unmatched Kraken orders are informational. A failure in this optional
-    # review must not block learning, operator-state evaluation, or active risk
-    # protection.
-    try:
-        external_review = review_external_open_orders()
-    except Exception as exc:
-        external_review = ExternalOrderReviewSummary(
-            status="UNAVAILABLE",
-            reason=f"external order review failed open: {type(exc).__name__}: {exc}",
-        )
-    print("OHM External Order Review")
-    print("Status:", external_review.status)
-    print("Unmatched orders:", external_review.unmatched_orders_seen)
-    print("New reviews:", external_review.new_reviews)
-    print("Notifications sent:", external_review.notifications_sent)
-    if external_review.reason:
-        print("External review reason:", external_review.reason)
-
-    # Learning is telemetry/adaptation, never a dependency for risk protection
-    # or scanning. Fail open if local storage/public market observation is not
-    # available so production lifecycle behavior is never blocked.
-    try:
-        learning = run_learning_cycle()
-    except Exception as exc:
-        learning = {
-            "status": "UNAVAILABLE",
-            "paid_ai_calls": 0,
-            "shadow": {"status": "UNAVAILABLE", "observations_added": 0},
-            "price_movement": {"status": "UNAVAILABLE", "observations_added": 0},
-            "profile_refreshed": False,
-            "profile_status": "UNAVAILABLE",
-            "reason": str(exc),
-        }
-    shadow = learning.get("shadow") or {}
-    movement_learning = learning.get("price_movement") or {}
-    print("OHM Self-Learning")
-    print("Status:", learning.get("status"))
-    print("Paid AI calls:", learning.get("paid_ai_calls", 0))
-    print("Shadow status:", shadow.get("status"))
-    print("Shadow observations added:", shadow.get("observations_added", 0))
-    print("Movement learning status:", movement_learning.get("status"))
-    print("Movement observations added:", movement_learning.get("observations_added", 0))
-    print("Profile refreshed:", learning.get("profile_refreshed"))
-    print("Profile status:", learning.get("profile_status"))
-    if learning.get("reason"):
-        print("Learning reason:", learning.get("reason"))
 
     # Operator/capacity state reads span several registries. If any of them are
     # quarantined or temporarily unavailable, do not let that abort the cycle
@@ -375,15 +423,15 @@ def _run_cycle_once() -> None:
     monitor_active_main()
 
     if decision.effective_mode == "MAINTENANCE":
+        # Preserve the existing informational/learning side work in maintenance,
+        # but only after verified-position protection has completed.
+        _run_external_order_review_fail_open()
+        _run_learning_fail_open()
         print(
             "Maintenance mode: discovery/tracking workflows skipped; "
             "verified-position protection completed."
         )
         return
-
-    # Recover previously qualified but operationally undelivered actions only
-    # after existing positions have received their protection pass.
-    _run_qualified_alert_retry_fail_open(settings=get_settings())
 
     # Fast entry-watch is still non-authoritative: it can only accelerate a
     # complete SEARCH-mode qualification pass when entry geometry turns valid.
@@ -397,71 +445,43 @@ def _run_cycle_once() -> None:
     else:
         monitor_pending_main()
 
-    # Early Watch runs 24/7 after real active/pending protection and on its own
-    # cadence. Alert governance/dedup controls noise during quiet hours. Its
-    # failure cannot suppress the production opportunity scanner.
+    settings = get_settings()
+
+    # P0 liveness invariant: when broad discovery is due, execute it before
+    # non-critical notification recovery, Early Watch, paper simulation, event
+    # evidence, unmatched-order review, or local learning. This prevents those
+    # workloads from starving the authoritative market-discovery path.
+    _run_broad_discovery_if_due(
+        decision=decision,
+        entry_watch_ready=entry_watch_ready,
+        settings=settings,
+    )
+
+    # Recover previously qualified but operationally undelivered actions only
+    # after existing positions and any due broad discovery have completed.
+    _run_qualified_alert_retry_fail_open(settings=settings)
+
+    # Early Watch remains 24/7 on its own cadence. It is intentionally after a
+    # due broad scan so a slow selective lane cannot starve authoritative broad
+    # discovery. Alert governance/dedup behavior is unchanged.
     _run_early_watch_if_due(
-        settings=get_settings(),
+        settings=settings,
         quiet_hours=decision.quiet_hours,
     )
 
-    # Shadow paper simulation is lower priority than every real lifecycle
-    # workflow. Authoritative Freqtrade runs in a separate Compose stack.
+    # Shadow paper simulation is lower priority than every real lifecycle and
+    # discovery workflow. Authoritative Freqtrade runs in a separate Compose stack.
     _run_paper_monitor_fail_open()
 
-    # Sequence 2 event evidence is also lower priority than every real
-    # lifecycle workflow, but unlike broad discovery it runs independently of
-    # SEARCH mode/finalist selection on its own bounded cadence.
-    _run_event_intelligence_fail_open(settings=get_settings())
+    # Sequence 2 event evidence is lower priority than every real lifecycle and
+    # discovery workflow and cannot influence qualification/ranking authority.
+    _run_event_intelligence_fail_open(settings=settings)
 
-    # Broad discovery is state/capacity/time gated. This is the only branch
-    # that can reach the paid Chief analysis path.
-    if decision.effective_mode != "SEARCH":
-        print("Broad opportunity scan skipped: effective mode is", decision.effective_mode)
-        return
-    normal_search_due = search_due(decision)
-    if not normal_search_due and not entry_watch_ready:
-        print("Broad opportunity scan skipped: search cadence not due.")
-        return
-    if entry_watch_ready and not normal_search_due:
-        print(
-            "Broad opportunity scan accelerated by entry-watch readiness; "
-            "full qualification remains mandatory."
-        )
-
-    # Optional candidate evidence is processed only after active-trade and
-    # pending-setup protection has completed, and only immediately before a
-    # due native scan. The small bounded batch and Kraken timeout cap prevent
-    # the bridge from delaying risk protection or monopolizing a cycle.
-    settings = get_settings()
-    if settings.tradingview_v2_enabled:
-        try:
-            from app.services.tradingview_inbox import process_queued_events
-
-            tradingview_summary = process_queued_events()
-        except Exception as exc:
-            tradingview_summary = {"status": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
-            print("TradingView v2 inbox processing failed open:", tradingview_summary["reason"])
-        else:
-            print("OHM TradingView v2 Inbox")
-            print("Checked:", tradingview_summary.get("checked", 0))
-            print("Processed:", tradingview_summary.get("processed", 0))
-            print("Qualified:", tradingview_summary.get("qualified", 0))
-            print("Rejected:", tradingview_summary.get("rejected", 0))
-            print("Retried:", tradingview_summary.get("retried", 0))
-            print("Poisoned:", tradingview_summary.get("poisoned", 0))
-
-    mark_search_started()
-    # Capture the scanner's existing console report into structured telemetry
-    # while teeing it unchanged to stdout. Telemetry is fail-open and does not
-    # participate in trade decisions. A kill/timeout leaves STARTED so
-    # diagnostics can see a hung scan without deleting the cycle lock.
-    try:
-        run_scan_with_telemetry(scan_main)
-    except Exception:
-        mark_search_finished("FAILED")
-        raise
-    mark_search_finished("COMPLETED")
+    # Unmatched Kraken orders are informational and local learning is telemetry
+    # only. Both execute last so neither can suppress a due market scan. In
+    # production run_learning_cycle is additionally REMOTE_ONLY/no-op.
+    _run_external_order_review_fail_open()
+    _run_learning_fail_open()
 
 
 def main() -> None:
