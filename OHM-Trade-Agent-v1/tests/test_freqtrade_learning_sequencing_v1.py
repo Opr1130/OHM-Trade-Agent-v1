@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from app.jobs import run_cycle, scan_movers, scan_opportunities
 
 
-
 def test_qualified_signal_lineage_is_created_before_telegram_delivery():
     source = inspect.getsource(scan_opportunities.main)
     lineage = source.index("_prepare_qualified_lineage(")
@@ -54,19 +53,20 @@ def test_journey_capture_is_fail_soft_and_measurement_only():
     assert "production unaffected" in helper_source
 
 
-
-def test_unified_cycle_orders_real_risk_and_due_broad_discovery_before_optional_work():
+def test_unified_cycle_orders_due_broad_discovery_immediately_after_active_protection():
     source = inspect.getsource(run_cycle._run_cycle_once)
     active = source.index("monitor_active_main()")
-    pending = source.index("monitor_pending_main()")
-    broad = source.index("_run_broad_discovery_if_due(")
+    normal_due = source.index("normal_search_due =", active)
+    broad = source.index("_run_broad_discovery_if_due(", normal_due)
     retry = source.index("_run_qualified_alert_retry_fail_open(", broad)
-    early = source.index("_run_early_watch_if_due(", broad)
-    paper = source.index("_run_paper_monitor_fail_open()", broad)
-    event = source.index("_run_event_intelligence_fail_open(", broad)
-    external = source.index("_run_external_order_review_fail_open()", broad)
-    learning = source.index("_run_learning_fail_open()", broad)
-    assert active < pending < broad < retry < early < paper < event < external < learning
+    recheck = source.index("_run_entry_watch_recheck_fail_open()", retry)
+    pending = source.index("monitor_pending_main()", recheck)
+    early = source.index("_run_early_watch_if_due(", pending)
+    paper = source.index("_run_paper_monitor_fail_open()", early)
+    event = source.index("_run_event_intelligence_fail_open(", paper)
+    external = source.index("_run_external_order_review_fail_open()", event)
+    learning = source.index("_run_learning_fail_open()", external)
+    assert active < normal_due < broad < retry < recheck < pending < early < paper < event < external < learning
 
     broad_source = inspect.getsource(run_cycle._run_broad_discovery_if_due)
     started = broad_source.index("mark_search_started()")
@@ -105,17 +105,12 @@ def test_early_watch_does_not_create_new_quiet_hour_alert_path(tmp_path, monkeyp
     calls = []
     monkeypatch.setattr(run_cycle, "scan_movers_main", lambda: calls.append(True))
 
-    # Quiet hours must not create an overnight blind spot: the first call is
-    # cadence-due and must still run Early Watch.
     run_cycle._run_early_watch_if_due(
         settings=SimpleNamespace(signal_quality_scan_interval_seconds=600),
         quiet_hours=True,
     )
     assert calls == [True]
 
-    # A rapid repeat invocation within the cadence window must not create a
-    # second, duplicate scan path. This must hold deterministically on a
-    # fresh checkout, not merely when another test happened to run first.
     calls.clear()
     run_cycle._run_early_watch_if_due(
         settings=SimpleNamespace(signal_quality_scan_interval_seconds=600),
