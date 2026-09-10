@@ -26,6 +26,7 @@ def _use_temp_cycle_lock(cycle, monkeypatch, tmp_path):
 
 
 def _stub_cycle_dependencies(cycle, monkeypatch):
+    monkeypatch.setattr(cycle, "recover_interrupted_search", lambda: False)
     monkeypatch.setattr(
         cycle,
         "get_settings",
@@ -95,7 +96,7 @@ def test_quiet_hours_keep_risk_and_selective_early_watch_active(monkeypatch, tmp
     assert calls == ["active", ("early", True)]
 
 
-def test_search_cycle_runs_monitors_then_scan_when_due(monkeypatch, tmp_path):
+def test_search_cycle_runs_due_scan_before_pending_monitor(monkeypatch, tmp_path):
     import app.jobs.run_cycle as cycle
 
     _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
@@ -114,7 +115,7 @@ def test_search_cycle_runs_monitors_then_scan_when_due(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(cycle, "scan_main", lambda: calls.append("scan"))
     cycle.main()
-    assert calls == ["active", "pending", "mark", "scan", ("finish", "COMPLETED")]
+    assert calls == ["active", "mark", "scan", ("finish", "COMPLETED"), "pending"]
 
 
 def test_due_broad_scan_runs_before_noncritical_work(monkeypatch, tmp_path):
@@ -141,11 +142,11 @@ def test_due_broad_scan_runs_before_noncritical_work(monkeypatch, tmp_path):
 
     assert calls == [
         "active",
-        "pending",
         "scan_started",
         "scan",
         "scan_finished",
         "retry",
+        "pending",
         "early",
         "paper",
         "events",
@@ -178,3 +179,16 @@ def test_search_cycle_marks_finished_failed_when_scan_raises(monkeypatch, tmp_pa
     with pytest.raises(RuntimeError, match="scan hung"):
         cycle._run_cycle_once()
     assert calls == ["mark", ("finish", "FAILED")]
+
+
+def test_main_recovers_interrupted_search_before_cycle(monkeypatch, tmp_path):
+    import app.jobs.run_cycle as cycle
+
+    _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cycle, "recover_interrupted_search", lambda: calls.append("recover") or True)
+    monkeypatch.setattr(cycle, "_run_cycle_once", lambda: calls.append("cycle"))
+
+    cycle.main()
+
+    assert calls == ["recover", "cycle"]
