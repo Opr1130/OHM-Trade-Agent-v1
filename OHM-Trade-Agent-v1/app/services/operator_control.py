@@ -146,20 +146,40 @@ def search_due(decision: OperatorDecision, now: datetime | None = None) -> bool:
     return last is None or (now - last).total_seconds() >= decision.search_interval_seconds
 
 
+def recover_interrupted_search(now: datetime | None = None) -> bool:
+    """Close a stale STARTED lifecycle after the prior canonical cycle ended.
+
+    The unified-cycle lock is process-scoped. Call this only after acquiring that
+    lock: if the persisted state is still STARTED, the process that owned that
+    search no longer exists and the prior attempt was interrupted.
+    """
+    now = now or _now()
+    with registry_lock(LOCK_FILE):
+        state = _load_state()
+        if str(state.get("last_search_status") or "").strip().upper() != "STARTED":
+            return False
+        state["last_search_finished_at"] = now.isoformat()
+        state["last_search_status"] = "FAILED"
+        state["last_search_failure_reason"] = "INTERRUPTED_PREVIOUS_CYCLE"
+        _save_state(state)
+        return True
+
+
 def mark_search_started(now: datetime | None = None) -> None:
     now = now or _now()
     with registry_lock(LOCK_FILE):
         state = _load_state()
         state["last_search_started_at"] = now.isoformat()
         state["last_search_status"] = "STARTED"
+        state.pop("last_search_failure_reason", None)
         _save_state(state)
 
 
 def mark_search_finished(status: str = "COMPLETED", now: datetime | None = None) -> None:
     """Record that a started broad search returned. Does not change cadence.
 
-    A process kill/timeout leaves ``last_search_status=STARTED`` so diagnostics
-    can distinguish a hung scan from a completed or failed return. Cadence
+    A process kill/timeout leaves ``last_search_status=STARTED`` so the next
+    canonical cycle can classify that prior attempt as interrupted. Cadence
     still uses ``last_search_started_at`` only.
     """
     normalized = str(status or "").strip().upper()
@@ -170,6 +190,8 @@ def mark_search_finished(status: str = "COMPLETED", now: datetime | None = None)
         state = _load_state()
         state["last_search_finished_at"] = now.isoformat()
         state["last_search_status"] = normalized
+        if normalized == "COMPLETED":
+            state.pop("last_search_failure_reason", None)
         _save_state(state)
 
 
@@ -195,6 +217,12 @@ def status_payload(now: datetime | None = None) -> dict:
     decision = get_operator_decision(now)
     payload = asdict(decision)
     payload["search_due"] = search_due(decision, now)
+    with registry_lock(LOCK_FILE):
+        state = _load_state()
+        payload["last_search_started_at"] = state.get("last_search_started_at")
+        payload["last_search_finished_at"] = state.get("last_search_finished_at")
+        payload["last_search_status"] = state.get("last_search_status")
+        payload["last_search_failure_reason"] = state.get("last_search_failure_reason")
     tradingview_v2 = _tradingview_v2_status()
     if tradingview_v2 is not None:
         payload["tradingview_v2"] = tradingview_v2
