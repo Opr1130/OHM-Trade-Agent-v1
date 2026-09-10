@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +36,37 @@ def _parse(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
-    """Run free/local learning work with no paid AI calls.
+def _remote_only_result() -> dict[str, Any]:
+    """Return a stable no-op payload when production learning is remote-only."""
+    return {
+        "status": "REMOTE_ONLY",
+        "paid_ai_calls": 0,
+        "shadow": {"status": "REMOTE_ONLY", "observations_added": 0},
+        "price_movement": {"status": "REMOTE_ONLY", "observations_added": 0},
+        "movement_discovery_v2_1": {"status": "REMOTE_ONLY", "observations_added": 0},
+        "wave5_explosion_learning": {"status": "REMOTE_ONLY", "outcomes_added": 0},
+        "freqtrade_dry_run": {"status": "REMOTE_ONLY", "outcomes_added": 0},
+        "intelligence_journey_profile": {
+            "status": "REMOTE_ONLY",
+            "population": "FREQTRADE_DRY_RUN_V1",
+        },
+        "profile_refreshed": False,
+        "profile_status": "REMOTE_ONLY",
+        "reason": "production learning compute is isolated to the remote learning worker",
+    }
 
-    Every observer is telemetry-only and fail-open. Wave 5 explosion-state
-    outcomes are labeled prospectively after their fixed horizon is due; they
-    never feed live qualification, execution, risk or notification authority.
+
+def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
+    """Run free/local learning work outside the production core hot path.
+
+    Production deployment reconciliation declares learning compute REMOTE_ONLY.
+    Keep this legacy local scheduler available for tests/development, but make
+    production invocation an immediate no-op so large learning stores or remote
+    observation calls can never starve active protection or discovery.
     """
+    if str(os.getenv("APP_ENV") or "").strip().lower() == "production":
+        return _remote_only_result()
+
     now = now or _now()
     shadow = observe_due_shadows(now=now)
     try:
