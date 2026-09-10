@@ -829,16 +829,16 @@ def test_attribution_persist_failure_retries_on_reused_outcome(tmp_path, monkeyp
     )
 
     calls = {"n": 0}
-    real_append = maturation_mod.append_discovery_attributions
+    real_persist = maturation_mod.persist_discovery_attributions
 
-    def flaky_append(rows, **kwargs):
+    def flaky_persist(rows, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return 0
-        return real_append(rows, **kwargs)
+            return set(), 0
+        return real_persist(rows, **kwargs)
 
     monkeypatch.setattr(
-        maturation_mod, "append_discovery_attributions", flaky_append
+        maturation_mod, "persist_discovery_attributions", flaky_persist
     )
     first = build_discovery_outcomes_bounded(
         screening_path=screening_path,
@@ -1251,3 +1251,190 @@ def test_pending_finalization_is_not_a_terminal_attribution():
     assert record["stage0_attribution"] == PENDING_FINALIZATION
     assert record["exclusive"] is False
     assert record["canonical_terminal"] is False
+
+
+
+def test_attribution_persistence_is_idempotent_per_observation(tmp_path, monkeypatch):
+    import app.opip.discovery.store as store_mod
+
+    first_row = _finalize_snapshot(
+        _snapshot(
+            symbol="ATTR1USD",
+            primary_pair="ATTR1USD",
+            underlying_asset="ATTR1",
+        ),
+        scan_id="ATTR1",
+    )
+    second_row = _finalize_snapshot(
+        _snapshot(
+            symbol="ATTR2USD",
+            primary_pair="ATTR2USD",
+            underlying_asset="ATTR2",
+        ),
+        scan_id="ATTR2",
+    )
+    first = attribution_record(first_row, labeled_at=NOW)
+    first_retry = attribution_record(
+        first_row, labeled_at=NOW + timedelta(minutes=10)
+    )
+    second = attribution_record(second_row, labeled_at=NOW)
+    assert first["attribution_record_id"] == first_retry["attribution_record_id"]
+    assert first["attribution_record_id"] != second["attribution_record_id"]
+
+    target = tmp_path / "attributions.jsonl"
+    real_append = store_mod.append_discovery_attributions
+    calls = {"n": 0}
+
+    def partial_once(rows, **kwargs):
+        materialized = list(rows)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_append(materialized[:1], **kwargs)
+        return real_append(materialized, **kwargs)
+
+    monkeypatch.setattr(
+        store_mod, "append_discovery_attributions", partial_once
+    )
+    persisted, written = store_mod.persist_discovery_attributions(
+        [first, second], path=target
+    )
+    assert persisted == {first["attribution_record_id"]}
+    assert written == 1
+
+    persisted_retry, written_retry = store_mod.persist_discovery_attributions(
+        [first_retry, second], path=target
+    )
+    assert persisted_retry == {
+        first["attribution_record_id"],
+        second["attribution_record_id"],
+    }
+    assert written_retry == 1
+    logical = store_mod.read_discovery_attributions(path=target)
+    assert len(logical) == 2
+    assert {
+        row["attribution_record_id"] for row in logical
+    } == persisted_retry
+
+
+def test_locked_outcome_append_isolates_invalid_rows(tmp_path):
+    from app.opip.discovery.store import (
+        append_discovery_forward_outcomes_locked,
+    )
+
+    target = tmp_path / "forward_outcomes.jsonl"
+    rejected = set()
+    rows = [
+        {
+            "observation_id": "OBS:GOOD",
+            "outcome_record_id": "DOUT:GOOD",
+            "outcome_revision": 1,
+            "value": 1.0,
+        },
+        {
+            "observation_id": "OBS:BAD",
+            "outcome_record_id": "DOUT:BAD",
+            "outcome_revision": 1,
+            "value": float("nan"),
+        },
+    ]
+    written = append_discovery_forward_outcomes_locked(
+        rows,
+        path=target,
+        rejected_observation_ids=rejected,
+    )
+    assert written == 1
+    assert rejected == {"OBS:BAD"}
+    stored = [
+        json.loads(line)
+        for line in target.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["observation_id"] for row in stored] == ["OBS:GOOD"]
+    dead = tmp_path / "discovery_dead_letter.jsonl"
+    assert dead.exists()
+    assert "OBS:BAD" in dead.read_text(encoding="utf-8")
+
+
+def test_invalid_outcome_does_not_block_valid_maturation_batch(
+    tmp_path, monkeypatch
+):
+    import app.opip.discovery.maturation as maturation_mod
+    from app.jobs.build_discovery_forward_outcomes import (
+        build_discovery_outcomes_bounded,
+    )
+
+    good = _finalize_snapshot(
+        _snapshot(
+            symbol="GOODUSD",
+            primary_pair="GOODUSD",
+            underlying_asset="GOOD",
+        ),
+        scan_id="GOOD",
+    )
+    bad = _finalize_snapshot(
+        _snapshot(
+            symbol="BADUSD",
+            primary_pair="BADUSD",
+            underlying_asset="BAD",
+        ),
+        scan_id="BAD",
+    )
+    screening_path = tmp_path / "screening_evaluations.jsonl"
+    observation_path = tmp_path / "full_market_observations.jsonl"
+    output_dir = tmp_path / "discovery"
+    _write_jsonl(screening_path, [good, bad])
+    observations = []
+    for row in (good, bad):
+        venue_id = row["venue_instrument_id"]
+        observations.extend(
+            [
+                _observation(
+                    venue_id, NOW + timedelta(minutes=30), 104.0
+                ),
+                _observation(
+                    venue_id, NOW + timedelta(hours=12), 105.0
+                ),
+                _observation(
+                    venue_id, NOW + timedelta(hours=13), 105.0
+                ),
+            ]
+        )
+    _write_jsonl(observation_path, observations)
+
+    real_label = maturation_mod.label_screening_observation
+
+    def label_with_one_bad(row, timeline, *, labeled_at=None):
+        payload = real_label(row, timeline, labeled_at=labeled_at)
+        if row["venue_instrument_id"] == bad["venue_instrument_id"]:
+            payload["mfe_pct"] = float("nan")
+        return payload
+
+    monkeypatch.setattr(
+        maturation_mod, "label_screening_observation", label_with_one_bad
+    )
+    summary = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13),
+    )
+    assert summary["evaluated"] == 2
+    assert summary["invalid_outcomes_dead_lettered"] == 1
+    stored = [
+        json.loads(line)
+        for line in (
+            output_dir / "forward_outcomes.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["observation_id"] for row in stored} == {
+        good["metadata"]["observation_id"]
+    }
+
+    rerun = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13, minutes=10),
+    )
+    assert rerun["evaluated"] == 0
