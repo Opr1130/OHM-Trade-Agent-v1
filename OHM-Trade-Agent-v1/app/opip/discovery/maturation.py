@@ -904,14 +904,10 @@ def mature_discovery_outcomes_bounded(
                         connection, observation_id, due_at=labeled_at
                     )
 
-            summary["written_outcomes"] = written
-            summary["written_attributions"] = written_attr
-            if attribution_incomplete:
-                summary["attribution_persist_incomplete"] = True
             summary["evaluated"] = len(pending)
             summary["written_outcomes"] = written
             summary["written_attributions"] = written_attr
-            if not attributions_ok:
+            if attribution_incomplete:
                 summary["attribution_persist_incomplete"] = True
             connection.commit()
             return summary
