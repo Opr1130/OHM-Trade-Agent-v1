@@ -1,0 +1,85 @@
+"""Versioned constants for Discovery V2-01 evaluation labels.
+
+MEASUREMENT ONLY — NO PRODUCTION DECISION AUTHORITY.
+
+These numbers define a retrospective evaluation label. They do not gate
+admission, alerts, paper enrollment, or live trading.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+# Admission evidence captured beside ScreeningEvaluation.metadata.
+DISCOVERY_ADMISSION_SCHEMA_VERSION = 1
+DISCOVERY_FEATURE_SCHEMA_VERSION = "OPIP-DISCOVERY-FEATURES-V1"
+PRODUCTION_SELECTOR_VERSION = "PRODUCTION_COARSE_V2_1"
+DISCOVERY_VENUE = "KRAKEN"
+
+# Offline forward-outcome payload (structurally separate from decision metadata).
+DISCOVERY_FORWARD_OUTCOME_SCHEMA_VERSION = 1
+DISCOVERY_ATTRIBUTION_SCHEMA_VERSION = 1
+DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION = "DISCOVERY_ATTRIBUTION_V1"
+DISCOVERY_EARLINESS_SCHEMA_VERSION = 1
+
+DISCOVERY_OUTCOME_DEFINITION = "DISCOVERY_OUTCOME_V1"
+DISCOVERY_OUTCOME_LABEL_SCHEMA_VERSION = 1
+
+# Initial horizons for V2-01. Labels are explicit durations, not scan counts.
+DISCOVERY_HORIZONS = {
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "12h": timedelta(hours=12),
+}
+DISCOVERY_PRIMARY_HORIZON = "12h"
+# Offline ingestion window after the latest decision time. Must exceed the
+# primary horizon so MFE/MAE can be computed; it is not a production delay.
+DISCOVERY_FORWARD_READ_GRACE = DISCOVERY_HORIZONS[DISCOVERY_PRIMARY_HORIZON] + timedelta(
+    hours=1
+)
+
+# Volatility-normalized winner barriers for DISCOVERY_OUTCOME_V1.
+# Favorable barrier = max(min percent, ATR% * multiple).
+# Adverse barrier = -max(min percent, ATR% * multiple).
+DISCOVERY_V1_ATR_FAVORABLE_MULTIPLE = 1.5
+DISCOVERY_V1_ATR_ADVERSE_MULTIPLE = 1.0
+DISCOVERY_V1_MIN_FAVORABLE_PCT = 3.0
+DISCOVERY_V1_MIN_ADVERSE_PCT = 2.0
+
+# Exclusive Stage-0 attribution categories. Later V2 PRs add forecasting /
+# pair-selection / AI / execution regret without reusing these names.
+ATTRIBUTION_NOT_OBSERVED = "NOT_OBSERVED"
+ATTRIBUTION_DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
+ATTRIBUTION_EXCLUDED_MARKET = "EXCLUDED_MARKET"
+ATTRIBUTION_BELOW_THRESHOLD = "BELOW_THRESHOLD"
+ATTRIBUTION_RANKED_OUTSIDE_BUDGET = "RANKED_OUTSIDE_BUDGET"
+ATTRIBUTION_ADMITTED = "ADMITTED"
+
+STAGE0_ATTRIBUTION_CATEGORIES = (
+    ATTRIBUTION_NOT_OBSERVED,
+    ATTRIBUTION_DATA_UNAVAILABLE,
+    ATTRIBUTION_EXCLUDED_MARKET,
+    ATTRIBUTION_BELOW_THRESHOLD,
+    ATTRIBUTION_RANKED_OUTSIDE_BUDGET,
+    ATTRIBUTION_ADMITTED,
+)
+
+# ScreeningOutcome → exclusive discovery attribution for an observed row.
+# Downstream funnel/risk/execution rejections stay ADMITTED at Stage-0.
+SCREENING_TO_ATTRIBUTION = {
+    "ADVANCED": ATTRIBUTION_ADMITTED,
+    "COARSE_RANK_LIMIT": ATTRIBUTION_RANKED_OUTSIDE_BUDGET,
+    "BELOW_THRESHOLD": ATTRIBUTION_BELOW_THRESHOLD,
+    "BELOW_COARSE_THRESHOLD": ATTRIBUTION_BELOW_THRESHOLD,
+    "DATA_UNAVAILABLE": ATTRIBUTION_DATA_UNAVAILABLE,
+    "EXCLUDED_MARKET": ATTRIBUTION_EXCLUDED_MARKET,
+}
+
+WINNER_INCOMPLETE = "INCOMPLETE"
+WINNER_WINNER = "WINNER"
+WINNER_NON_WINNER = "NON_WINNER"
+
+MATURATION_NO_FORWARD_DATA = "NO_FORWARD_DATA"
+MATURATION_INCOMPLETE = "INCOMPLETE_HORIZON"
+MATURATION_PARTIAL = "PARTIAL_FORWARD_WINDOW"
+MATURATION_COMPLETE = "COMPLETE_HORIZON"

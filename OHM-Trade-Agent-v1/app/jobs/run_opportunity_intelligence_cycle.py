@@ -10,6 +10,9 @@ import json
 import os
 from pathlib import Path
 
+from app.jobs.build_discovery_forward_outcomes import (
+    build_discovery_outcomes_bounded,
+)
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
     advance_accountability_handoff_backfill,
@@ -107,23 +110,41 @@ def main() -> None:
                 raise accountability_error from maturation_error
             raise
 
+    discovery_summary: dict = {}
+    try:
+        discovery_summary = build_discovery_outcomes_bounded(
+            screening_path=data_root / "opip" / "qualification" / "screening_evaluations.jsonl",
+            observation_path=data_root / "full_market_observations.jsonl",
+            output_dir=data_root / "opip" / "discovery",
+        )
+    except Exception as exc:
+        discovery_summary = {
+            "error": str(exc),
+            "evaluated": 0,
+            "measurement_only": True,
+            "trade_authority_changed": False,
+        }
+
     pending_after = pending_accountability_outcomes()
     terminalized_backfill = int(
         (handoff_backfill or {}).get("terminalized_coverage_discontinuity") or 0
     )
     # Retirement-only cycles that persist UNRESOLVED_COVERAGE_DISCONTINUITY via
     # bounded backfill are real consumption work, not empty no-ops.
+    discovery_evaluated = int((discovery_summary or {}).get("evaluated") or 0)
     empty = (
         newly_evaluated == 0
         and not outcomes
         and not pending_after
         and terminalized_backfill == 0
         and backfill_error is None
+        and discovery_evaluated == 0
     )
     disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
         "status": "OK" if backfill_error is None and accountability_error is None else "ERROR",
         "new_outcomes_evaluated": newly_evaluated,
+        "discovery_outcomes": discovery_summary,
         "accountability_handoff_rows": len(outcomes),
         "accountability_handoff_resolved": len(resolved),
         "accountability_handoff_acknowledged": acknowledged,

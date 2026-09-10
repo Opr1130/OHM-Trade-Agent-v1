@@ -95,7 +95,9 @@ EARLY_WATCH_SCANS_PER_DAY = 144
 # while the newly opened slots are refilled with independently qualified LONG
 # recovery candidates. Capacity must retain both states: 8 + 5 = 13 rows.
 MAX_FUNNEL_CANDIDATES_PER_SCAN = 13
-SCREENING_P95_ROW_BYTES = 750
+# V2-01 admission forensics adds rank/cutoff/feature evidence to each row.
+# 2 KB is a conservative p95 for the enriched measurement payload.
+SCREENING_P95_ROW_BYTES = 2_000
 FUNNEL_P95_ROW_BYTES = 9_700
 SUMMARY_P95_ROW_BYTES = 1_900
 
