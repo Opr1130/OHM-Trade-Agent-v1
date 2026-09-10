@@ -45,3 +45,18 @@ def test_new_search_clears_prior_interruption_reason(tmp_path, monkeypatch):
     assert state["last_search_status"] == "COMPLETED"
     assert state["last_search_finished_at"] == finish.isoformat()
     assert "last_search_failure_reason" not in state
+
+
+def test_interrupted_search_recovery_storage_failure_is_fail_open(tmp_path, monkeypatch):
+    import app.services.operator_control as control
+
+    monkeypatch.setattr(control, "LOCK_FILE", tmp_path / ".operator.lock")
+
+    def unavailable():
+        raise RuntimeError("operator state unavailable")
+
+    monkeypatch.setattr(control, "_load_state", unavailable)
+
+    # Recovery is diagnostic repair. It must never abort the canonical cycle
+    # before normal operator-state handling and active-position protection.
+    assert control.recover_interrupted_search() is False
