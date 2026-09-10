@@ -192,3 +192,20 @@ def test_main_recovers_interrupted_search_before_cycle(monkeypatch, tmp_path):
     cycle.main()
 
     assert calls == ["recover", "cycle"]
+
+
+def test_main_does_not_misclassify_workload_timeout_as_lock_contention(monkeypatch, tmp_path, capsys):
+    import app.jobs.run_cycle as cycle
+
+    _use_temp_cycle_lock(cycle, monkeypatch, tmp_path)
+    monkeypatch.setattr(cycle, "recover_interrupted_search", lambda: False)
+    monkeypatch.setattr(
+        cycle,
+        "_run_cycle_once",
+        lambda: (_ for _ in ()).throw(TimeoutError("workload timed out")),
+    )
+
+    with pytest.raises(TimeoutError, match="workload timed out"):
+        cycle.main()
+
+    assert "previous cycle still running" not in capsys.readouterr().out
