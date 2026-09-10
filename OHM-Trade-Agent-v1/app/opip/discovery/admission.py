@@ -448,10 +448,14 @@ def finalize_broad_search_evaluations(
 
         admitted = venue_id in selected_ids
         candidate_score = _candidate_score(long_score, short_score)
-        if passed and candidate_score is not None:
-            identity_map = row.get("venue_instrument") if isinstance(row.get("venue_instrument"), Mapping) else {}
+        venue_instrument = row.get("venue_instrument")
+        if (
+            passed
+            and candidate_score is not None
+            and isinstance(venue_instrument, Mapping)
+        ):
             sort_symbol = str(
-                (identity_map or {}).get("raw_identifier") or venue_id
+                venue_instrument.get("raw_identifier") or venue_id
             )
             qualifying.append(
                 (
@@ -611,7 +615,13 @@ def finalize_broad_search_evaluations(
         metadata["ranked_count"] = context.ranked_count
         if cutoff_score is not None:
             rank_payload["cutoff_score"] = cutoff_score
-            rank_payload["margin_to_cutoff"] = context.margin_to_cutoff
+            candidate = rank_payload.get("candidate_score")
+            if candidate is not None:
+                rank_payload["margin_to_cutoff"] = float(candidate) - float(
+                    cutoff_score
+                )
+            else:
+                rank_payload["margin_to_cutoff"] = None
         assert_point_in_time_safe(metadata)
         row["metadata"] = metadata
 

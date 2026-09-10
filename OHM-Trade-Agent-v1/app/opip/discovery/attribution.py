@@ -93,6 +93,7 @@ def attribution_record(
         and isinstance(screening_row.get("metadata"), Mapping)
         else {}
     )
+    terminal = category in STAGE0_ATTRIBUTION_CATEGORIES
     return {
         "schema_version": DISCOVERY_ATTRIBUTION_SCHEMA_VERSION,
         "taxonomy_version": DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION,
@@ -104,7 +105,8 @@ def attribution_record(
         "venue_instrument_id": venue_instrument_id
         or _optional_text(screening_row, "venue_instrument_id"),
         "stage0_attribution": category,
-        "exclusive": True,
+        "exclusive": terminal,
+        "canonical_terminal": terminal,
         "downstream_rejection_ignored": downstream_rejection,
         "labeled_at": (labeled_at or datetime.now(timezone.utc)).isoformat(),
         "valid_categories": list(STAGE0_ATTRIBUTION_CATEGORIES),

@@ -177,9 +177,9 @@ Measured encoded V2-01 screening rows (representative fixture):
 median 2918 bytes, p95 3097 bytes. Budgeted `SCREENING_P95_ROW_BYTES = 4096`
 (~1.32× p95) with the existing 1.5× capacity safety factor.
 
-- 288 scans/day × 200 instruments × 4096 B ≈ **225 MB/day** screening
-  (**337 MB/day** after 1.5× safety; **4.95 GB** over 14 days).
-- 288 scans/day × 250 instruments × 4096 B ≈ **281 MB/day** screening
+- 288 scans/day × 200 instruments × 4096 B ≈ **236 MB/day** screening
+  (**354 MB/day** after 1.5× safety; **4.95 GB** over 14 days).
+- 288 scans/day × 250 instruments × 4096 B ≈ **295 MB/day** screening
   (**442 MB/day** after 1.5× safety; **6.19 GB** over 14 days).
 
 Current droplet capacity remains sufficient; no storage redesign.

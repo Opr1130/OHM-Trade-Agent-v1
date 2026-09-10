@@ -661,21 +661,28 @@ def mature_discovery_outcomes_bounded(
                 primary = (outcome.get("horizons") or {}).get(
                     DISCOVERY_PRIMARY_HORIZON
                 ) or {}
-                favorable_at = primary.get("favorable_barrier_at") or primary.get(
-                    "mfe_at"
+                direction = str(
+                    outcome.get("realized_opportunity_direction")
+                    or outcome.get("production_preferred_direction")
+                    or "LONG"
+                )
+                directional_prefix = "long_" if direction == "LONG" else "short_"
+                favorable_at = (
+                    primary.get(f"{directional_prefix}favorable_barrier_at")
+                    or primary.get(f"{directional_prefix}mfe_at")
+                    or primary.get("favorable_barrier_at")
+                    or primary.get("mfe_at")
                 )
                 favorable_price = None
-                last_forward = primary.get("last_forward_price")
-                if primary.get("mfe_pct") is not None and outcome.get(
-                    "reference_price"
-                ):
-                    direction = str(
-                        outcome.get("realized_opportunity_direction")
-                        or outcome.get("production_preferred_direction")
-                        or "LONG"
-                    )
+                last_forward = primary.get(
+                    f"{directional_prefix}last_forward_price"
+                ) or primary.get("last_forward_price")
+                directional_mfe = primary.get(f"{directional_prefix}mfe_pct")
+                if directional_mfe is None:
+                    directional_mfe = primary.get("mfe_pct")
+                if directional_mfe is not None and outcome.get("reference_price"):
                     ref = float(outcome["reference_price"])
-                    mfe = float(primary["mfe_pct"])
+                    mfe = float(directional_mfe)
                     if direction == "SHORT":
                         favorable_price = ref * (1.0 - mfe / 100.0)
                     else:
@@ -684,11 +691,7 @@ def mature_discovery_outcomes_bounded(
                     by_instrument.get(
                         str(row.get("venue_instrument_id") or ""), []
                     ),
-                    direction=str(
-                        outcome.get("realized_opportunity_direction")
-                        or outcome.get("production_preferred_direction")
-                        or "LONG"
-                    ),
+                    direction=direction,
                     favorable_price=favorable_price or last_forward,
                     favorable_at=favorable_at,
                 )
@@ -701,13 +704,22 @@ def mature_discovery_outcomes_bounded(
                 ):
                     summary["reused_current_revision"] += 1
                     if _attribution_is_pending(connection, observation_id):
-                        attribution_retries.append(
-                            attribution_record(row, labeled_at=labeled_at)
+                        pending_attr = attribution_record(
+                            row, labeled_at=labeled_at
                         )
-                        # Keep the queue row until attribution succeeds.
-                        _requeue_immediately(
-                            connection, observation_id, due_at=labeled_at
-                        )
+                        if pending_attr.get("canonical_terminal"):
+                            attribution_retries.append(pending_attr)
+                            # Keep the queue row until attribution succeeds.
+                            _requeue_immediately(
+                                connection, observation_id, due_at=labeled_at
+                            )
+                        else:
+                            _set_attribution_pending(
+                                connection, observation_id, False
+                            )
+                            _schedule_after_evaluation(
+                                connection, prior, evaluated_at=labeled_at
+                            )
                     else:
                         _schedule_after_evaluation(
                             connection, prior, evaluated_at=labeled_at
@@ -752,6 +764,11 @@ def mature_discovery_outcomes_bounded(
                     attribution_record(row, labeled_at=labeled_at)
                     for row in pending
                     if _observation_id_from_screening(row) in new_ids
+                ]
+                attribution_rows = [
+                    row
+                    for row in attribution_rows
+                    if bool(row.get("canonical_terminal"))
                 ]
             pending_attributions = attribution_rows + attribution_retries
             if pending_attributions:

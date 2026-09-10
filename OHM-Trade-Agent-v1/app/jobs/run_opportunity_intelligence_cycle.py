@@ -26,6 +26,7 @@ from app.opip.decision.store import (
 from app.opip.learning.job_disposition import (
     CONSUMED_EMPTY,
     CONSUMED_OK,
+    FAILED_RETRYABLE,
     write_consumption_summary,
 )
 from app.opip.learning.replica_archive_repair import (
@@ -150,9 +151,17 @@ def main() -> None:
         and discovery_evaluated == 0
         and not discovery_error
     )
-    disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
+    cycle_error = (
+        backfill_error is not None
+        or accountability_error is not None
+        or discovery_error
+    )
+    if discovery_error and backfill_error is None and accountability_error is None:
+        disposition = FAILED_RETRYABLE
+    else:
+        disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
-        "status": "OK" if backfill_error is None and accountability_error is None else "ERROR",
+        "status": "ERROR" if cycle_error else "OK",
         "discovery_job_status": "ERROR" if discovery_error else "OK",
         "new_outcomes_evaluated": newly_evaluated,
         "discovery_outcomes": discovery_summary,

@@ -1247,3 +1247,7 @@ def test_pending_finalization_is_not_a_terminal_attribution():
     assert attribute_stage0_observation(row) == PENDING_FINALIZATION
     assert PENDING_FINALIZATION not in STAGE0_ATTRIBUTION_CATEGORIES
     assert not attributions_are_exclusive([PENDING_FINALIZATION])
+    record = attribution_record(row, labeled_at=NOW)
+    assert record["stage0_attribution"] == PENDING_FINALIZATION
+    assert record["exclusive"] is False
+    assert record["canonical_terminal"] is False

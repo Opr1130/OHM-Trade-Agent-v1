@@ -30,8 +30,11 @@ def forensic_admission_report(
     screening_rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Explain Stage-0 admissions from persisted rows without changing them."""
-    forensic = replay_forensic(screening_rows)
-    rows = forensic_rows(screening_rows)
+    materialized = [
+        dict(row) if isinstance(row, Mapping) else row for row in screening_rows
+    ]
+    forensic = replay_forensic(materialized)
+    rows = forensic_rows(materialized)
     attributions = {}
     for row in rows:
         if not row.venue_instrument_id:

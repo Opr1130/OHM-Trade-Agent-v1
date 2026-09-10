@@ -109,10 +109,10 @@ class ScanComputeTracker:
                 end_cpu = process_cpu_seconds()
             except Exception:
                 end_cpu = None
-            peak_rss = None
+            peak_sampled_rss = None
             samples = [item for item in (self.start_rss_bytes, end_rss) if item is not None]
             if samples:
-                peak_rss = max(samples)
+                peak_sampled_rss = max(samples)
             cpu_delta = None
             if self.start_cpu_seconds is not None and end_cpu is not None:
                 cpu_delta = round(end_cpu - self.start_cpu_seconds, 6)
@@ -151,7 +151,9 @@ class ScanComputeTracker:
                 },
                 "queue_backlog_age_seconds": None,
                 "rss_bytes": end_rss,
-                "peak_rss_bytes": peak_rss,
+                "max_sampled_rss_bytes": peak_sampled_rss,
+                "peak_rss_bytes": peak_sampled_rss,
+                "rss_sample_basis": "START_AND_END_SAMPLES",
                 "cpu_seconds": cpu_delta,
                 "rss_status": "OK" if end_rss is not None else "UNAVAILABLE",
                 "cpu_status": "OK" if cpu_delta is not None else "UNAVAILABLE",

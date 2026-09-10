@@ -152,6 +152,14 @@ def _horizon_payload(
             "long_mae_pct": None,
             "short_mfe_pct": None,
             "short_mae_pct": None,
+            "long_mfe_at": None,
+            "long_mae_at": None,
+            "short_mfe_at": None,
+            "short_mae_at": None,
+            "long_favorable_barrier_at": None,
+            "short_favorable_barrier_at": None,
+            "long_last_forward_price": None,
+            "short_last_forward_price": None,
             "long_target_before_stop": None,
             "short_target_before_stop": None,
             "long_discovery_outcome_v1": WINNER_INCOMPLETE,
@@ -370,6 +378,14 @@ def label_screening_observation(
         "long_mae_pct": None,
         "short_mfe_pct": None,
         "short_mae_pct": None,
+        "long_mfe_at": None,
+        "long_mae_at": None,
+        "short_mfe_at": None,
+        "short_mae_at": None,
+        "long_favorable_barrier_at": None,
+        "short_favorable_barrier_at": None,
+        "long_last_forward_price": None,
+        "short_last_forward_price": None,
         "long_discovery_outcome_v1": WINNER_INCOMPLETE,
         "short_discovery_outcome_v1": WINNER_INCOMPLETE,
     }
@@ -418,6 +434,20 @@ def label_screening_observation(
         merged["long_mae_pct"] = long_payload["mae_pct"]
         merged["short_mfe_pct"] = short_payload["mfe_pct"]
         merged["short_mae_pct"] = short_payload["mae_pct"]
+        merged["long_mfe_at"] = long_payload.get("mfe_at")
+        merged["long_mae_at"] = long_payload.get("mae_at")
+        merged["short_mfe_at"] = short_payload.get("mfe_at")
+        merged["short_mae_at"] = short_payload.get("mae_at")
+        merged["long_favorable_barrier_at"] = long_payload.get(
+            "favorable_barrier_at"
+        )
+        merged["short_favorable_barrier_at"] = short_payload.get(
+            "favorable_barrier_at"
+        )
+        merged["long_last_forward_price"] = long_payload.get("last_forward_price")
+        merged["short_last_forward_price"] = short_payload.get(
+            "last_forward_price"
+        )
         merged["long_target_before_stop"] = long_payload.get("target_before_stop")
         merged["short_target_before_stop"] = short_payload.get("target_before_stop")
         merged["long_discovery_outcome_v1"] = discovery_v1_winner_label(long_payload)

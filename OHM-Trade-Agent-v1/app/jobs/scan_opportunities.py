@@ -246,7 +246,19 @@ def _persist_broad_screening_fail_open(
             )
         )
         canonical = _canonical_screening_rows(finalized)
-        append_screening_evaluations(canonical, enabled=telemetry_enabled)
+        written = append_screening_evaluations(
+            canonical, enabled=telemetry_enabled
+        )
+        if len(canonical) > 0 and written != len(canonical):
+            _record_screening_measurement_failure(
+                scan_id=scan_id,
+                operation="append_screening_short_write",
+                error=RuntimeError(
+                    f"screening_write_short expected={len(canonical)} written={written}"
+                ),
+                provisional_row_count=len(list(rows) or []),
+                telemetry_enabled=telemetry_enabled,
+            )
     except Exception as exc:
         logger.warning(
             "O'Pip screening persist failed open scanner_type=BROAD_SEARCH "
