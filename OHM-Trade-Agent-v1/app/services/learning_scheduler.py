@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import os
 from pathlib import Path
 from typing import Any
 
+from app.core.runtime_environment import conservative_runtime
 from app.services.explosion_learning import observe_due_explosion_outcomes
 from app.services.freqtrade_result_ingest import ingest_freqtrade_dry_run
 from app.services.intelligence_learning_profile import build_intelligence_learning_profile
@@ -60,11 +60,11 @@ def run_learning_cycle(*, now: datetime | None = None) -> dict[str, Any]:
     """Run free/local learning work outside the production core hot path.
 
     Production deployment reconciliation declares learning compute REMOTE_ONLY.
-    Keep this legacy local scheduler available for tests/development, but make
-    production invocation an immediate no-op so large learning stores or remote
-    observation calls can never starve active protection or discovery.
+    Keep this legacy local scheduler available for explicit development/test
+    runtimes, but conservatively treat missing or unknown runtime identity as
+    production so local learning can never accidentally starve the trading host.
     """
-    if str(os.getenv("APP_ENV") or "").strip().lower() == "production":
+    if conservative_runtime():
         return _remote_only_result()
 
     now = now or _now()
