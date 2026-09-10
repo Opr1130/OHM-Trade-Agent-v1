@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,8 @@ from app.services.active_trade_registry import get_active_trades
 from app.services.pending_setup_registry import get_pending_setups
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
+
+logger = logging.getLogger(__name__)
 
 STATE_FILE = Path("/app/data/operator_control.json")
 LOCK_FILE = STATE_FILE.parent / ".operator_control.lock"
@@ -149,20 +152,29 @@ def search_due(decision: OperatorDecision, now: datetime | None = None) -> bool:
 def recover_interrupted_search(now: datetime | None = None) -> bool:
     """Close a stale STARTED lifecycle after the prior canonical cycle ended.
 
-    The unified-cycle lock is process-scoped. Call this only after acquiring that
-    lock: if the persisted state is still STARTED, the process that owned that
-    search no longer exists and the prior attempt was interrupted.
+    Recovery is best-effort and must never outrank active-position protection.
+    The caller holds the canonical cycle lock, so a persisted STARTED state can
+    only belong to an interrupted prior process. Storage/lock failures are
+    logged and allowed to fall through to the normal operator-state safety path.
     """
     now = now or _now()
-    with registry_lock(LOCK_FILE):
-        state = _load_state()
-        if str(state.get("last_search_status") or "").strip().upper() != "STARTED":
-            return False
-        state["last_search_finished_at"] = now.isoformat()
-        state["last_search_status"] = "FAILED"
-        state["last_search_failure_reason"] = "INTERRUPTED_PREVIOUS_CYCLE"
-        _save_state(state)
-        return True
+    try:
+        with registry_lock(LOCK_FILE):
+            state = _load_state()
+            if str(state.get("last_search_status") or "").strip().upper() != "STARTED":
+                return False
+            state["last_search_finished_at"] = now.isoformat()
+            state["last_search_status"] = "FAILED"
+            state["last_search_failure_reason"] = "INTERRUPTED_PREVIOUS_CYCLE"
+            _save_state(state)
+            return True
+    except Exception as exc:
+        logger.error(
+            "Interrupted-search recovery unavailable; continuing canonical cycle: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
 def mark_search_started(now: datetime | None = None) -> None:
