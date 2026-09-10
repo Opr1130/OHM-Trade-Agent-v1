@@ -464,13 +464,20 @@ def _run_cycle_once() -> None:
 
 
 def main() -> None:
+    """Run one canonical cycle, distinguishing lock contention from workload failure."""
+    cycle_lock = registry_lock(CYCLE_LOCK_FILE, timeout=0.0)
     try:
-        with registry_lock(CYCLE_LOCK_FILE, timeout=0.0):
-            if recover_interrupted_search():
-                print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
-            _run_cycle_once()
+        cycle_lock.__enter__()
     except TimeoutError:
         print("OHM Unified Cycle skipped: previous cycle still running.")
+        return
+
+    try:
+        if recover_interrupted_search():
+            print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
+        _run_cycle_once()
+    finally:
+        cycle_lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
