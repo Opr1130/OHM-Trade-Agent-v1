@@ -55,14 +55,24 @@ def test_journey_capture_is_fail_soft_and_measurement_only():
 
 
 
-def test_unified_cycle_orders_real_risk_before_early_watch_and_paper():
+def test_unified_cycle_orders_real_risk_and_due_broad_discovery_before_optional_work():
     source = inspect.getsource(run_cycle._run_cycle_once)
     active = source.index("monitor_active_main()")
     pending = source.index("monitor_pending_main()")
-    early = source.index("_run_early_watch_if_due(")
-    paper = source.index("_run_paper_monitor_fail_open()")
-    broad = source.index("run_scan_with_telemetry(scan_main)")
-    assert active < pending < early < paper < broad
+    broad = source.index("_run_broad_discovery_if_due(")
+    retry = source.index("_run_qualified_alert_retry_fail_open(", broad)
+    early = source.index("_run_early_watch_if_due(", broad)
+    paper = source.index("_run_paper_monitor_fail_open()", broad)
+    event = source.index("_run_event_intelligence_fail_open(", broad)
+    external = source.index("_run_external_order_review_fail_open()", broad)
+    learning = source.index("_run_learning_fail_open()", broad)
+    assert active < pending < broad < retry < early < paper < event < external < learning
+
+    broad_source = inspect.getsource(run_cycle._run_broad_discovery_if_due)
+    started = broad_source.index("mark_search_started()")
+    scanner = broad_source.index("run_scan_with_telemetry(scan_main)")
+    finished = broad_source.index('mark_search_finished("COMPLETED")')
+    assert started < scanner < finished
 
 
 def test_early_watch_cadence_runs_once_then_waits(tmp_path, monkeypatch):
