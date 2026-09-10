@@ -105,15 +105,18 @@ def test_event_foundation_files_do_not_reference_order_or_notification_actions()
         assert token not in text
 
 
-def test_event_capture_runs_after_real_protection_and_before_search_gate():
+def test_event_capture_runs_after_real_protection_and_critical_discovery():
     source = (ROOT / "app" / "jobs" / "run_cycle.py").read_text(encoding="utf-8")
-    active = source.rindex("monitor_active_main()")
-    pending = source.index("monitor_pending_main()", active)
-    early = source.index("_run_early_watch_if_due(", pending)
-    paper = source.index("_run_paper_monitor_fail_open()", early)
-    event = source.index("_run_event_intelligence_fail_open(settings=get_settings())", paper)
-    search_gate = source.index('if decision.effective_mode != "SEARCH":', event)
-    assert active < pending < early < paper < event < search_gate
+    cycle_source = source[source.index("def _run_cycle_once()") : source.index("def main()")]
+    active = cycle_source.index("monitor_active_main()")
+    broad = cycle_source.index("_run_broad_discovery_if_due(", active)
+    retry = cycle_source.index("_run_qualified_alert_retry_fail_open(", broad)
+    recheck = cycle_source.index("_run_entry_watch_recheck_fail_open()", retry)
+    pending = cycle_source.index("monitor_pending_main()", recheck)
+    early = cycle_source.index("_run_early_watch_if_due(", pending)
+    paper = cycle_source.index("_run_paper_monitor_fail_open()", early)
+    event = cycle_source.index("_run_event_intelligence_fail_open(settings=settings)", paper)
+    assert active < broad < retry < recheck < pending < early < paper < event
 
 
 def test_current_opportunity_scanner_does_not_consume_event_store():
@@ -135,12 +138,9 @@ def test_existing_news_and_catalyst_modules_do_not_depend_on_event_store():
         assert "get_visible_events(" not in source
 
 
-
 def test_production_compose_enables_event_intelligence_shadow_only():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     core = compose.split("  ohm-trade-agent:", 1)[1]
     assert 'OPIP_EVENT_STORE_ENABLED: "true"' in core
-    # Activation is operational only. Code-level default remains dark so
-    # non-production/test contexts do not silently collect provider evidence.
     settings = Settings(webhook_secret="123456789012")
     assert settings.opip_event_store_enabled is False
