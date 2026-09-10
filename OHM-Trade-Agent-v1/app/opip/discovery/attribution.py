@@ -10,6 +10,7 @@ discovery miss: an admitted instrument stays ADMITTED.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from typing import Any, Mapping
 
 from app.opip.discovery.constants import (
@@ -74,6 +75,32 @@ def _optional_text(row: Mapping[str, Any] | None, key: str) -> str | None:
     return str(value) if value is not None else None
 
 
+def attribution_record_id(
+    *,
+    observation_id: str | None,
+    scan_id: str | None,
+    venue_instrument_id: str | None,
+    category: str,
+) -> str:
+    """Stable idempotency key for one terminal Stage-0 attribution."""
+    identity = str(observation_id or "").strip()
+    if not identity:
+        identity = "|".join(
+            (
+                str(scan_id or "").strip(),
+                str(venue_instrument_id or "").strip(),
+            )
+        )
+    raw = "|".join(
+        (
+            DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION,
+            identity,
+            str(category or "").strip(),
+        )
+    )
+    return "DATTR:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 def attribution_record(
     screening_row: Mapping[str, Any] | None,
     *,
@@ -94,16 +121,32 @@ def attribution_record(
         else {}
     )
     terminal = category in STAGE0_ATTRIBUTION_CATEGORIES
+    resolved_observation_id = observation_id or (
+        metadata.get("observation_id") if isinstance(metadata, Mapping) else None
+    )
+    resolved_scan_id = scan_id or _optional_text(screening_row, "scan_id")
+    resolved_venue_id = venue_instrument_id or _optional_text(
+        screening_row, "venue_instrument_id"
+    )
+    record_id = attribution_record_id(
+        observation_id=(
+            str(resolved_observation_id)
+            if resolved_observation_id is not None
+            else None
+        ),
+        scan_id=resolved_scan_id,
+        venue_instrument_id=resolved_venue_id,
+        category=category,
+    )
     return {
         "schema_version": DISCOVERY_ATTRIBUTION_SCHEMA_VERSION,
         "taxonomy_version": DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION,
         "measurement_only": True,
         "trade_authority_changed": False,
-        "observation_id": observation_id
-        or (metadata.get("observation_id") if isinstance(metadata, Mapping) else None),
-        "scan_id": scan_id or _optional_text(screening_row, "scan_id"),
-        "venue_instrument_id": venue_instrument_id
-        or _optional_text(screening_row, "venue_instrument_id"),
+        "attribution_record_id": record_id,
+        "observation_id": resolved_observation_id,
+        "scan_id": resolved_scan_id,
+        "venue_instrument_id": resolved_venue_id,
         "stage0_attribution": category,
         "exclusive": terminal,
         "canonical_terminal": terminal,
