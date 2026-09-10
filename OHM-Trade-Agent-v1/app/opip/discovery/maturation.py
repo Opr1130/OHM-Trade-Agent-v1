@@ -30,8 +30,10 @@ from app.opip.discovery.attribution import attribution_record
 from app.opip.discovery.earliness import earliness_metrics
 from app.opip.discovery.outcomes import label_screening_observation
 from app.opip.discovery.store import (
-    append_discovery_attributions,
     append_discovery_forward_outcomes_locked,
+    dead_letter_discovery_row,
+    persist_discovery_attributions,
+    read_discovery_forward_outcomes,
 )
 from app.opip.early.point_in_time import parse_timestamp
 from app.opip.storage.bounded_jsonl import repair_truncated_tail
@@ -583,6 +585,7 @@ def mature_discovery_outcomes_bounded(
         "completed": 0,
         "still_incomplete": 0,
         "written_attributions": 0,
+        "invalid_outcomes_dead_lettered": 0,
     }
     if max_rows < 1:
         return summary
@@ -696,7 +699,20 @@ def mature_discovery_outcomes_bounded(
                     favorable_at=favorable_at,
                 )
                 outcome["window_complete"] = discovery_window_complete(outcome)
-                record_id = discovery_outcome_record_id(outcome)
+                try:
+                    record_id = discovery_outcome_record_id(outcome)
+                except (TypeError, ValueError) as exc:
+                    dead_letter_discovery_row(
+                        outcome,
+                        path=outcomes_path,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                    connection.execute(
+                        "DELETE FROM observation_queue WHERE observation_id = ?",
+                        (observation_id,),
+                    )
+                    summary["invalid_outcomes_dead_lettered"] += 1
+                    continue
                 prior = latest_discovery_outcome_row(connection, observation_id)
                 if (
                     prior is not None
@@ -742,77 +758,156 @@ def mature_discovery_outcomes_bounded(
                     "append_only": True,
                 }
                 new_rows.append(stamped)
-                _upsert_latest_outcome(connection, stamped)
-                if discovery_window_complete(stamped):
-                    summary["completed"] += 1
-                else:
-                    summary["still_incomplete"] += 1
 
             written = 0
             written_attr = 0
+            persisted_new_rows: list[dict[str, Any]] = []
             attribution_rows: list[dict[str, Any]] = []
+            rejected_outcome_ids: set[str] = set()
             if new_rows:
                 written = append_discovery_forward_outcomes_locked(
-                    new_rows, path=outcomes_path
+                    new_rows,
+                    path=outcomes_path,
+                    rejected_observation_ids=rejected_outcome_ids,
                 )
-                new_ids = {
-                    str(item.get("observation_id") or "")
+                for observation_id in rejected_outcome_ids:
+                    connection.execute(
+                        "DELETE FROM observation_queue WHERE observation_id = ?",
+                        (observation_id,),
+                    )
+                summary["invalid_outcomes_dead_lettered"] += len(
+                    rejected_outcome_ids
+                )
+
+                # Resolve which logical rows are actually durable before
+                # advancing SQLite state. This also tolerates a prior crash
+                # after JSONL append but before the state commit.
+                persisted_record_ids = {
+                    str(item.get("outcome_record_id") or "")
+                    for item in read_discovery_forward_outcomes(
+                        path=outcomes_path,
+                        limit=max(2_000, len(new_rows) * 4),
+                    )
+                    if item.get("outcome_record_id")
+                }
+                persisted_new_rows = [
+                    item
                     for item in new_rows
+                    if str(item.get("observation_id") or "")
+                    not in rejected_outcome_ids
+                    and str(item.get("outcome_record_id") or "")
+                    in persisted_record_ids
+                ]
+                for stamped in persisted_new_rows:
+                    _upsert_latest_outcome(connection, stamped)
+                    if discovery_window_complete(stamped):
+                        summary["completed"] += 1
+                    else:
+                        summary["still_incomplete"] += 1
+
+                persisted_ids = {
+                    str(item.get("observation_id") or "")
+                    for item in persisted_new_rows
                     if item.get("observation_id")
                 }
                 attribution_rows = [
                     attribution_record(row, labeled_at=labeled_at)
                     for row in pending
-                    if _observation_id_from_screening(row) in new_ids
+                    if _observation_id_from_screening(row) in persisted_ids
                 ]
                 attribution_rows = [
                     row
                     for row in attribution_rows
                     if bool(row.get("canonical_terminal"))
                 ]
+
             pending_attributions = attribution_rows + attribution_retries
+            persisted_attr_ids: set[str] = set()
             if pending_attributions:
-                written_attr = append_discovery_attributions(
-                    pending_attributions,
-                    path=attributions_path,
-                )
-            attributions_ok = (not pending_attributions) or written_attr == len(
-                pending_attributions
-            )
-            retry_ids = {
-                str(item.get("observation_id") or "")
-                for item in attribution_retries
+                try:
+                    persisted_attr_ids, written_attr = (
+                        persist_discovery_attributions(
+                            pending_attributions,
+                            path=attributions_path,
+                        )
+                    )
+                except Exception as exc:
+                    summary["attribution_persist_error"] = type(exc).__name__
+                    persisted_attr_ids = set()
+                    written_attr = 0
+
+            attr_by_observation = {
+                str(item.get("observation_id") or ""): item
+                for item in pending_attributions
                 if item.get("observation_id")
+                and bool(item.get("canonical_terminal"))
             }
-            for stamped in new_rows:
+            attribution_incomplete = False
+
+            for stamped in persisted_new_rows:
                 observation_id = str(stamped.get("observation_id") or "")
                 if not observation_id:
                     continue
-                if attributions_ok:
+                required = attr_by_observation.get(observation_id)
+                required_id = (
+                    str(required.get("attribution_record_id") or "")
+                    if required is not None
+                    else ""
+                )
+                attr_ok = required is None or (
+                    bool(required_id) and required_id in persisted_attr_ids
+                )
+                if attr_ok:
                     _set_attribution_pending(connection, observation_id, False)
                     _schedule_after_evaluation(
                         connection, stamped, evaluated_at=labeled_at
                     )
                 else:
+                    attribution_incomplete = True
                     _set_attribution_pending(connection, observation_id, True)
                     _requeue_immediately(
                         connection, observation_id, due_at=labeled_at
                     )
-            if attributions_ok:
-                for observation_id in retry_ids:
-                    prior = latest_discovery_outcome_row(connection, observation_id)
-                    if prior is None:
-                        continue
-                    _set_attribution_pending(connection, observation_id, False)
-                    _schedule_after_evaluation(
-                        connection, prior, evaluated_at=labeled_at
+
+            retry_ids = {
+                str(item.get("observation_id") or "")
+                for item in attribution_retries
+                if item.get("observation_id")
+            }
+            for observation_id in retry_ids:
+                required = attr_by_observation.get(observation_id)
+                required_id = (
+                    str(required.get("attribution_record_id") or "")
+                    if required is not None
+                    else ""
+                )
+                attr_ok = required is not None and bool(required_id) and (
+                    required_id in persisted_attr_ids
+                )
+                if attr_ok:
+                    prior = latest_discovery_outcome_row(
+                        connection, observation_id
                     )
-            else:
-                for observation_id in retry_ids:
-                    _set_attribution_pending(connection, observation_id, True)
+                    if prior is not None:
+                        _set_attribution_pending(
+                            connection, observation_id, False
+                        )
+                        _schedule_after_evaluation(
+                            connection, prior, evaluated_at=labeled_at
+                        )
+                else:
+                    attribution_incomplete = True
+                    _set_attribution_pending(
+                        connection, observation_id, True
+                    )
                     _requeue_immediately(
                         connection, observation_id, due_at=labeled_at
                     )
+
+            summary["written_outcomes"] = written
+            summary["written_attributions"] = written_attr
+            if attribution_incomplete:
+                summary["attribution_persist_incomplete"] = True
             summary["evaluated"] = len(pending)
             summary["written_outcomes"] = written
             summary["written_attributions"] = written_attr
