@@ -145,6 +145,7 @@ def _record_screening_measurement_failure(
     operation: str,
     error: BaseException,
     provisional_row_count: int,
+    telemetry_enabled: bool,
 ) -> None:
     try:
         append_qualification_dead_letter(
@@ -159,7 +160,8 @@ def _record_screening_measurement_failure(
                     "provisional_row_count": int(provisional_row_count),
                     "persisted_canonical_rows": 0,
                 }
-            ]
+            ],
+            enabled=telemetry_enabled,
         )
     except Exception as dead_exc:
         logger.warning(
@@ -215,6 +217,7 @@ def _persist_broad_screening_fail_open(
     observed_at,
     scan_id,
     universe_count,
+    telemetry_enabled: bool,
 ) -> None:
     """Finalise rank/threshold evidence and persist. Never raises."""
     try:
@@ -243,7 +246,7 @@ def _persist_broad_screening_fail_open(
             )
         )
         canonical = _canonical_screening_rows(finalized)
-        append_screening_evaluations(canonical, enabled=True)
+        append_screening_evaluations(canonical, enabled=telemetry_enabled)
     except Exception as exc:
         logger.warning(
             "O'Pip screening persist failed open scanner_type=BROAD_SEARCH "
@@ -256,6 +259,7 @@ def _persist_broad_screening_fail_open(
             operation="finalize_or_append",
             error=exc,
             provisional_row_count=len(list(rows) or []),
+            telemetry_enabled=telemetry_enabled,
         )
 
 
@@ -1007,6 +1011,7 @@ def main():
             observed_at=decision_at,
             scan_id=screening_scan_id,
             universe_count=len(scan.snapshots),
+            telemetry_enabled=True,
         )
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can

@@ -67,6 +67,13 @@ def attribute_stage0_observation(
     return ATTRIBUTION_DATA_UNAVAILABLE
 
 
+def _optional_text(row: Mapping[str, Any] | None, key: str) -> str | None:
+    if row is None:
+        return None
+    value = row.get(key)
+    return str(value) if value is not None else None
+
+
 def attribution_record(
     screening_row: Mapping[str, Any] | None,
     *,
@@ -93,14 +100,9 @@ def attribution_record(
         "trade_authority_changed": False,
         "observation_id": observation_id
         or (metadata.get("observation_id") if isinstance(metadata, Mapping) else None),
-        "scan_id": scan_id
-        or (str(screening_row.get("scan_id")) if screening_row else None),
+        "scan_id": scan_id or _optional_text(screening_row, "scan_id"),
         "venue_instrument_id": venue_instrument_id
-        or (
-            str(screening_row.get("venue_instrument_id"))
-            if screening_row
-            else None
-        ),
+        or _optional_text(screening_row, "venue_instrument_id"),
         "stage0_attribution": category,
         "exclusive": True,
         "downstream_rejection_ignored": downstream_rejection,

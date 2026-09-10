@@ -19,6 +19,10 @@ from app.jobs.build_phase3c_forward_outcomes import (
     build_outcomes_bounded,
     pending_accountability_outcomes,
 )
+from app.opip.decision.store import (
+    QUALIFICATION_DIR,
+    SCREENING_EVALUATIONS_FILE,
+)
 from app.opip.learning.job_disposition import (
     CONSUMED_EMPTY,
     CONSUMED_OK,
@@ -113,7 +117,11 @@ def main() -> None:
     discovery_summary: dict = {}
     try:
         discovery_summary = build_discovery_outcomes_bounded(
-            screening_path=data_root / "opip" / "qualification" / "screening_evaluations.jsonl",
+            screening_path=(
+                data_root
+                / Path(*QUALIFICATION_DIR.parts[-2:])
+                / SCREENING_EVALUATIONS_FILE.name
+            ),
             observation_path=data_root / "full_market_observations.jsonl",
             output_dir=data_root / "opip" / "discovery",
         )

@@ -379,8 +379,15 @@ def label_screening_observation(
         payload["production_discovery_outcome_v1"] = WINNER_INCOMPLETE
         payload["market_discovery_opportunity_v1"] = WINNER_INCOMPLETE
         payload["realized_opportunity_direction"] = None
+        payload["target_before_stop"] = None
         payload["long_target_before_stop"] = None
         payload["short_target_before_stop"] = None
+        payload["mfe_pct"] = None
+        payload["mae_pct"] = None
+        payload["long_mfe_pct"] = None
+        payload["long_mae_pct"] = None
+        payload["short_mfe_pct"] = None
+        payload["short_mae_pct"] = None
         payload["window_complete"] = False
         payload["horizons"] = {label: dict(empty_horizon) for label in DISCOVERY_HORIZONS}
         return payload

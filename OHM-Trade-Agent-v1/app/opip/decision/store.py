@@ -459,8 +459,12 @@ def append_qualification_dead_letter(
     rows: Iterable[Mapping[str, Any]],
     *,
     path: Path | None = None,
+    enabled: bool | None = None,
 ) -> int:
     """Persist scan-level measurement diagnostics. Never changes production."""
+    active = opip_funnel_telemetry_enabled() if enabled is None else bool(enabled)
+    if not active:
+        return 0
     return _append_rows(
         path or DEAD_LETTER_FILE,
         rows,

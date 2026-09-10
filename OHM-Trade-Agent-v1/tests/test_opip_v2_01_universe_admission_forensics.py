@@ -195,6 +195,7 @@ def test_persist_exception_does_not_alter_candidates(monkeypatch):
         observed_at=NOW,
         scan_id="OPIPS:test",
         universe_count=1,
+        telemetry_enabled=True,
     )
     assert selected[0].technical_score == captured[0].technical_score
     assert selected[0].symbol == captured[0].symbol
@@ -340,10 +341,9 @@ def test_incomplete_horizon_is_not_zero_return():
     labeled = label_screening_observation(row, timeline, labeled_at=NOW)
     twelve = labeled["horizons"]["12h"]
     assert twelve["window_complete"] is False
-    assert labeled["discovery_outcome_v1"] in {WINNER_INCOMPLETE, WINNER_WINNER, WINNER_NON_WINNER}
-    if twelve["horizon_return_pct"] is None:
-        assert twelve["maturation_status"] != "ZERO_FILL"
-    assert twelve["horizon_return_pct"] != 0 or twelve["horizon_observed"] is True
+    assert labeled["discovery_outcome_v1"] == WINNER_INCOMPLETE
+    assert twelve["horizon_observed"] is True
+    assert twelve["horizon_return_pct"] == pytest.approx(0.5)
 
 
 def test_no_lookahead_from_future_sample():
@@ -528,6 +528,7 @@ def test_telemetry_storage_failure_cannot_fail_production_scan(monkeypatch, capl
         observed_at=NOW,
         scan_id="S1",
         universe_count=1,
+        telemetry_enabled=True,
     )
     assert selected[0].technical_score >= MIN_TECHNICAL_SCORE
     assert "failed open" in caplog.text
@@ -804,6 +805,77 @@ def test_incomplete_outcome_matures_to_completed_revision(tmp_path):
     ] == 2
 
 
+def test_attribution_persist_failure_retries_on_reused_outcome(tmp_path, monkeypatch):
+    from app.jobs.build_discovery_forward_outcomes import build_discovery_outcomes_bounded
+    import app.opip.discovery.maturation as maturation_mod
+
+    snapshot = _snapshot()
+    finalized = _finalize_snapshot(snapshot)
+    observation_id = finalized["metadata"]["observation_id"]
+    venue_id = finalized["venue_instrument_id"]
+    screening_path = tmp_path / "screening_evaluations.jsonl"
+    observation_path = tmp_path / "full_market_observations.jsonl"
+    output_dir = tmp_path / "discovery"
+    _write_jsonl(screening_path, [finalized])
+    _write_jsonl(
+        observation_path,
+        [
+            _observation(venue_id, NOW + timedelta(minutes=30), 102.0),
+            _observation(venue_id, NOW + timedelta(hours=2), 108.0),
+            _observation(venue_id, NOW + timedelta(hours=5), 107.0),
+            _observation(venue_id, NOW + timedelta(hours=12), 106.0),
+            _observation(venue_id, NOW + timedelta(hours=13), 106.0),
+        ],
+    )
+
+    calls = {"n": 0}
+    real_append = maturation_mod.append_discovery_attributions
+
+    def flaky_append(rows, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 0
+        return real_append(rows, **kwargs)
+
+    monkeypatch.setattr(
+        maturation_mod, "append_discovery_attributions", flaky_append
+    )
+    first = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13),
+    )
+    assert first["completed"] == 1
+    assert first.get("attribution_persist_incomplete") is True
+    attr_path = output_dir / "attributions.jsonl"
+    assert not attr_path.exists() or not attr_path.read_text(encoding="utf-8").strip()
+
+    second = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13, minutes=10),
+    )
+    assert second["reused_current_revision"] == 1
+    assert second.get("attribution_persist_incomplete") is not True
+    assert second["written_attributions"] == 1
+    attrs = [
+        json.loads(line)
+        for line in attr_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(row.get("observation_id") == observation_id for row in attrs)
+
+    third = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13, minutes=20),
+    )
+    assert third["evaluated"] == 0
+
+
 def _counted_selector(real, calls):
     def counted(
         snapshots,
@@ -945,6 +1017,7 @@ def test_finalize_failure_does_not_persist_provisional_rows(monkeypatch):
         observed_at=NOW,
         scan_id="S1",
         universe_count=1,
+        telemetry_enabled=True,
     )
     assert selected[0].technical_score == captured[0].technical_score
     assert persisted == []

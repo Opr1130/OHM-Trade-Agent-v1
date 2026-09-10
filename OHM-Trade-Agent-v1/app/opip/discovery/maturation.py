@@ -15,7 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.opip.discovery.constants import (
     DISCOVERY_BOUNDED_CHECKPOINT_ANCHOR_BYTES,
@@ -132,6 +132,7 @@ def open_discovery_state(path: Path) -> sqlite3.Connection:
             observed_at TEXT NOT NULL,
             next_due_at TEXT NOT NULL,
             venue_instrument_id TEXT NOT NULL DEFAULT '',
+            attribution_pending INTEGER NOT NULL DEFAULT 0,
             row_json TEXT NOT NULL
         )
         """
@@ -144,6 +145,11 @@ def open_discovery_state(path: Path) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE observation_queue "
             "ADD COLUMN venue_instrument_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "attribution_pending" not in queue_columns:
+        connection.execute(
+            "ALTER TABLE observation_queue "
+            "ADD COLUMN attribution_pending INTEGER NOT NULL DEFAULT 0"
         )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_discovery_queue_due "
@@ -357,6 +363,79 @@ def _schedule_after_evaluation(
     )
 
 
+def _set_attribution_pending(
+    connection: sqlite3.Connection,
+    observation_id: str,
+    pending: bool,
+) -> None:
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        return
+    connection.execute(
+        "UPDATE observation_queue SET attribution_pending = ? "
+        "WHERE observation_id = ?",
+        (1 if pending else 0, observation_id),
+    )
+
+
+def _attribution_is_pending(
+    connection: sqlite3.Connection,
+    observation_id: str,
+) -> bool:
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        return False
+    row = connection.execute(
+        "SELECT attribution_pending FROM observation_queue "
+        "WHERE observation_id = ?",
+        (observation_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        return int(row[0] or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _requeue_immediately(
+    connection: sqlite3.Connection,
+    observation_id: str,
+    *,
+    due_at: datetime,
+) -> None:
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        return
+    connection.execute(
+        "UPDATE observation_queue SET next_due_at = ? WHERE observation_id = ?",
+        (due_at.isoformat(), observation_id),
+    )
+
+
+_SQLITE_IN_CHUNK = 400
+
+
+def _queue_rows_for_venues(
+    connection: sqlite3.Connection,
+    venues: Sequence[str],
+) -> list[tuple[Any, ...]]:
+    """Fetch queue JSON for venues without exceeding SQLite variable limits."""
+    rows: list[tuple[Any, ...]] = []
+    needed = tuple(venues)
+    for start in range(0, len(needed), _SQLITE_IN_CHUNK):
+        chunk = needed[start : start + _SQLITE_IN_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows.extend(
+            connection.execute(
+                "SELECT row_json FROM observation_queue "
+                f"WHERE venue_instrument_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
+    return rows
+
+
 def _observation_id_from_screening(row: Mapping[str, Any]) -> str:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     return str((metadata or {}).get("observation_id") or "").strip()
@@ -557,12 +636,7 @@ def mature_discovery_outcomes_bounded(
                 if venue
             )
             if needed:
-                placeholders = ",".join("?" * len(needed))
-                queued = connection.execute(
-                    "SELECT row_json FROM observation_queue "
-                    f"WHERE venue_instrument_id IN ({placeholders})",
-                    needed,
-                ).fetchall()
+                queued = _queue_rows_for_venues(connection, needed)
                 for (raw,) in queued:
                     try:
                         item = json.loads(raw)
@@ -575,6 +649,8 @@ def mature_discovery_outcomes_bounded(
                         by_instrument.setdefault(venue_id, []).append(item)
 
             new_rows: list[dict[str, Any]] = []
+            attribution_retries: list[dict[str, Any]] = []
+            attributions_path = output_dir / "attributions.jsonl"
             for row in pending:
                 observation_id = _observation_id_from_screening(row)
                 venue_id = str(row.get("venue_instrument_id") or "").upper()
@@ -624,9 +700,18 @@ def mature_discovery_outcomes_bounded(
                     and str(prior.get("outcome_record_id") or "") == record_id
                 ):
                     summary["reused_current_revision"] += 1
-                    _schedule_after_evaluation(
-                        connection, prior, evaluated_at=labeled_at
-                    )
+                    if _attribution_is_pending(connection, observation_id):
+                        attribution_retries.append(
+                            attribution_record(row, labeled_at=labeled_at)
+                        )
+                        # Keep the queue row until attribution succeeds.
+                        _requeue_immediately(
+                            connection, observation_id, due_at=labeled_at
+                        )
+                    else:
+                        _schedule_after_evaluation(
+                            connection, prior, evaluated_at=labeled_at
+                        )
                     if discovery_window_complete(prior):
                         summary["completed"] += 1
                     else:
@@ -668,27 +753,49 @@ def mature_discovery_outcomes_bounded(
                     for row in pending
                     if _observation_id_from_screening(row) in new_ids
                 ]
-                if attribution_rows:
-                    written_attr = append_discovery_attributions(
-                        attribution_rows,
-                        path=output_dir / "attributions.jsonl",
-                    )
-            attributions_ok = (not attribution_rows) or written_attr == len(
-                attribution_rows
+            pending_attributions = attribution_rows + attribution_retries
+            if pending_attributions:
+                written_attr = append_discovery_attributions(
+                    pending_attributions,
+                    path=attributions_path,
+                )
+            attributions_ok = (not pending_attributions) or written_attr == len(
+                pending_attributions
             )
+            retry_ids = {
+                str(item.get("observation_id") or "")
+                for item in attribution_retries
+                if item.get("observation_id")
+            }
             for stamped in new_rows:
+                observation_id = str(stamped.get("observation_id") or "")
+                if not observation_id:
+                    continue
                 if attributions_ok:
+                    _set_attribution_pending(connection, observation_id, False)
                     _schedule_after_evaluation(
                         connection, stamped, evaluated_at=labeled_at
                     )
                 else:
-                    observation_id = str(stamped.get("observation_id") or "")
-                    if observation_id:
-                        connection.execute(
-                            "UPDATE observation_queue SET next_due_at = ? "
-                            "WHERE observation_id = ?",
-                            (labeled_at.isoformat(), observation_id),
-                        )
+                    _set_attribution_pending(connection, observation_id, True)
+                    _requeue_immediately(
+                        connection, observation_id, due_at=labeled_at
+                    )
+            if attributions_ok:
+                for observation_id in retry_ids:
+                    prior = latest_discovery_outcome_row(connection, observation_id)
+                    if prior is None:
+                        continue
+                    _set_attribution_pending(connection, observation_id, False)
+                    _schedule_after_evaluation(
+                        connection, prior, evaluated_at=labeled_at
+                    )
+            else:
+                for observation_id in retry_ids:
+                    _set_attribution_pending(connection, observation_id, True)
+                    _requeue_immediately(
+                        connection, observation_id, due_at=labeled_at
+                    )
             summary["evaluated"] = len(pending)
             summary["written_outcomes"] = written
             summary["written_attributions"] = written_attr

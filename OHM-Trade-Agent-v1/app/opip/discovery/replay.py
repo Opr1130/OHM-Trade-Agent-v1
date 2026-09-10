@@ -38,7 +38,7 @@ def forensic_admission_report(
             continue
         metadata = dict(row.metadata) if isinstance(row.metadata, Mapping) else {}
         observation_id = str(metadata.get("observation_id") or "").strip()
-        key = observation_id or (row.scan_id, row.venue_instrument_id)
+        key = observation_id or f"{row.scan_id}|{row.venue_instrument_id}"
         attributions[key] = attribute_stage0_observation(
             {
                 "outcome": row.outcome,
