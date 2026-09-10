@@ -17,6 +17,7 @@ from app.services.operator_control import (
     get_operator_decision,
     mark_search_finished,
     mark_search_started,
+    recover_interrupted_search,
     search_due,
 )
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
@@ -78,7 +79,6 @@ def _run_early_watch_if_due(*, settings, quiet_hours: bool) -> None:
             "OHM Early Watch failed open; production unaffected:",
             f"{type(exc).__name__}: {exc}",
         )
-
 
 
 def _run_qualified_alert_retry_fail_open(*, settings) -> None:
@@ -269,36 +269,8 @@ def _run_event_intelligence_fail_open(*, settings) -> None:
         )
 
 
-def _run_cycle_once() -> None:
-    # Reconcile the exchange first so stale OHM lifecycle state cannot drive
-    # monitoring, capacity decisions, or duplicate alerts. Reconciliation is
-    # important, but a local lock/storage failure must never prevent the active
-    # risk monitor from running later in this cycle.
-    try:
-        reconciliation = reconcile_kraken_account()
-    except Exception as exc:
-        reconciliation = ReconciliationSummary(
-            status="UNAVAILABLE",
-            mode="observe",
-            reason=f"reconciliation failed open: {type(exc).__name__}: {exc}",
-        )
-    print("OHM Kraken Reconciliation")
-    print("Status:", reconciliation.status)
-    print("Mode:", reconciliation.mode)
-    print("Active checked:", reconciliation.active_checked)
-    print("Order intents checked:", reconciliation.order_intents_checked)
-    print("Open orders seen:", reconciliation.open_orders_seen)
-    print("Fills seen:", reconciliation.fills_seen)
-    print("Would close:", len(reconciliation.would_close))
-    print("Closed:", len(reconciliation.closed))
-    print("Would fill:", len(reconciliation.would_fill))
-    print("Filled:", len(reconciliation.filled))
-    if reconciliation.reason:
-        print("Reconciliation reason:", reconciliation.reason)
-
-    # Unmatched Kraken orders are informational. A failure in this optional
-    # review must not block learning, operator-state evaluation, or active risk
-    # protection.
+def _run_external_order_review_fail_open() -> None:
+    """Review unmatched Kraken orders without delaying critical discovery."""
     try:
         external_review = review_external_open_orders()
     except Exception as exc:
@@ -314,9 +286,9 @@ def _run_cycle_once() -> None:
     if external_review.reason:
         print("External review reason:", external_review.reason)
 
-    # Learning is telemetry/adaptation, never a dependency for risk protection
-    # or scanning. Fail open if local storage/public market observation is not
-    # available so production lifecycle behavior is never blocked.
+
+def _run_learning_fail_open() -> None:
+    """Run non-authoritative learning only after critical production work."""
     try:
         learning = run_learning_cycle()
     except Exception as exc:
@@ -343,9 +315,73 @@ def _run_cycle_once() -> None:
     if learning.get("reason"):
         print("Learning reason:", learning.get("reason"))
 
-    # Operator/capacity state reads span several registries. If any of them are
-    # quarantined or temporarily unavailable, do not let that abort the cycle
-    # before active positions receive their independent risk monitor pass.
+
+def _run_broad_discovery_if_due(*, decision, entry_watch_ready: bool, settings) -> bool:
+    """Run the authoritative broad discovery pass before optional workloads."""
+    if decision.effective_mode != "SEARCH":
+        print("Broad opportunity scan skipped: effective mode is", decision.effective_mode)
+        return False
+
+    normal_search_due = search_due(decision)
+    if not normal_search_due and not entry_watch_ready:
+        print("Broad opportunity scan skipped: search cadence not due.")
+        return False
+    if entry_watch_ready and not normal_search_due:
+        print(
+            "Broad opportunity scan accelerated by entry-watch readiness; "
+            "full qualification remains mandatory."
+        )
+
+    if settings.tradingview_v2_enabled:
+        try:
+            from app.services.tradingview_inbox import process_queued_events
+
+            tradingview_summary = process_queued_events()
+        except Exception as exc:
+            tradingview_summary = {"status": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
+            print("TradingView v2 inbox processing failed open:", tradingview_summary["reason"])
+        else:
+            print("OHM TradingView v2 Inbox")
+            print("Checked:", tradingview_summary.get("checked", 0))
+            print("Processed:", tradingview_summary.get("processed", 0))
+            print("Qualified:", tradingview_summary.get("qualified", 0))
+            print("Rejected:", tradingview_summary.get("rejected", 0))
+            print("Retried:", tradingview_summary.get("retried", 0))
+            print("Poisoned:", tradingview_summary.get("poisoned", 0))
+
+    mark_search_started()
+    try:
+        run_scan_with_telemetry(scan_main)
+    except Exception:
+        mark_search_finished("FAILED")
+        raise
+    mark_search_finished("COMPLETED")
+    return True
+
+
+def _run_cycle_once() -> None:
+    try:
+        reconciliation = reconcile_kraken_account()
+    except Exception as exc:
+        reconciliation = ReconciliationSummary(
+            status="UNAVAILABLE",
+            mode="observe",
+            reason=f"reconciliation failed open: {type(exc).__name__}: {exc}",
+        )
+    print("OHM Kraken Reconciliation")
+    print("Status:", reconciliation.status)
+    print("Mode:", reconciliation.mode)
+    print("Active checked:", reconciliation.active_checked)
+    print("Order intents checked:", reconciliation.order_intents_checked)
+    print("Open orders seen:", reconciliation.open_orders_seen)
+    print("Fills seen:", reconciliation.fills_seen)
+    print("Would close:", len(reconciliation.would_close))
+    print("Closed:", len(reconciliation.closed))
+    print("Would fill:", len(reconciliation.would_fill))
+    print("Filled:", len(reconciliation.filled))
+    if reconciliation.reason:
+        print("Reconciliation reason:", reconciliation.reason)
+
     try:
         decision = get_operator_decision()
     except Exception as exc:
@@ -369,110 +405,79 @@ def _run_cycle_once() -> None:
     print("Quiet hours:", decision.quiet_hours)
     print("Reason:", decision.reason)
 
-    # Active positions always receive deterministic protection, including
-    # MAINTENANCE and overnight quiet hours. Maintenance disables discovery and
-    # lifecycle expansion; it must not blind O'Pip to risk on verified holdings.
+    # Active-position protection is the only production workload permitted
+    # ahead of a normally due broad discovery pass.
     monitor_active_main()
 
     if decision.effective_mode == "MAINTENANCE":
+        _run_external_order_review_fail_open()
+        _run_learning_fail_open()
         print(
             "Maintenance mode: discovery/tracking workflows skipped; "
             "verified-position protection completed."
         )
         return
 
-    # Recover previously qualified but operationally undelivered actions only
-    # after existing positions have received their protection pass.
-    _run_qualified_alert_retry_fail_open(settings=get_settings())
+    settings = get_settings()
+    normal_search_due = (
+        decision.effective_mode == "SEARCH" and search_due(decision)
+    )
 
-    # Fast entry-watch is still non-authoritative: it can only accelerate a
-    # complete SEARCH-mode qualification pass when entry geometry turns valid.
+    # P0 liveness invariant: a normally due broad scan is executed immediately
+    # after active-position protection, before all candidate lifecycle and
+    # non-authoritative workloads. This prevents pending/recheck/AI-supporting
+    # side work from starving market discovery.
+    if normal_search_due:
+        _run_broad_discovery_if_due(
+            decision=decision,
+            entry_watch_ready=False,
+            settings=settings,
+        )
+
+    # Previously qualified alert recovery remains ahead of pending lifecycle
+    # work when there was no due scan, preserving its reliability priority.
+    _run_qualified_alert_retry_fail_open(settings=settings)
+
+    # Entry Watch may accelerate a full scan only when normal cadence was not
+    # already due. A normal due scan must never wait for this recheck.
     entry_watch_ready = _run_entry_watch_recheck_fail_open()
+    if not normal_search_due:
+        _run_broad_discovery_if_due(
+            decision=decision,
+            entry_watch_ready=entry_watch_ready,
+            settings=settings,
+        )
 
-    # Pending opportunities are routine discovery/lifecycle noise while the
-    # operator is asleep. They resume after 05:00 ET; active risk protection
-    # remains live throughout quiet hours.
     if decision.quiet_hours:
         print("Pending setup monitor skipped during quiet hours.")
     else:
         monitor_pending_main()
 
-    # Early Watch runs 24/7 after real active/pending protection and on its own
-    # cadence. Alert governance/dedup controls noise during quiet hours. Its
-    # failure cannot suppress the production opportunity scanner.
     _run_early_watch_if_due(
-        settings=get_settings(),
+        settings=settings,
         quiet_hours=decision.quiet_hours,
     )
-
-    # Shadow paper simulation is lower priority than every real lifecycle
-    # workflow. Authoritative Freqtrade runs in a separate Compose stack.
     _run_paper_monitor_fail_open()
-
-    # Sequence 2 event evidence is also lower priority than every real
-    # lifecycle workflow, but unlike broad discovery it runs independently of
-    # SEARCH mode/finalist selection on its own bounded cadence.
-    _run_event_intelligence_fail_open(settings=get_settings())
-
-    # Broad discovery is state/capacity/time gated. This is the only branch
-    # that can reach the paid Chief analysis path.
-    if decision.effective_mode != "SEARCH":
-        print("Broad opportunity scan skipped: effective mode is", decision.effective_mode)
-        return
-    normal_search_due = search_due(decision)
-    if not normal_search_due and not entry_watch_ready:
-        print("Broad opportunity scan skipped: search cadence not due.")
-        return
-    if entry_watch_ready and not normal_search_due:
-        print(
-            "Broad opportunity scan accelerated by entry-watch readiness; "
-            "full qualification remains mandatory."
-        )
-
-    # Optional candidate evidence is processed only after active-trade and
-    # pending-setup protection has completed, and only immediately before a
-    # due native scan. The small bounded batch and Kraken timeout cap prevent
-    # the bridge from delaying risk protection or monopolizing a cycle.
-    settings = get_settings()
-    if settings.tradingview_v2_enabled:
-        try:
-            from app.services.tradingview_inbox import process_queued_events
-
-            tradingview_summary = process_queued_events()
-        except Exception as exc:
-            tradingview_summary = {"status": "UNAVAILABLE", "reason": f"{type(exc).__name__}: {exc}"}
-            print("TradingView v2 inbox processing failed open:", tradingview_summary["reason"])
-        else:
-            print("OHM TradingView v2 Inbox")
-            print("Checked:", tradingview_summary.get("checked", 0))
-            print("Processed:", tradingview_summary.get("processed", 0))
-            print("Qualified:", tradingview_summary.get("qualified", 0))
-            print("Rejected:", tradingview_summary.get("rejected", 0))
-            print("Retried:", tradingview_summary.get("retried", 0))
-            print("Poisoned:", tradingview_summary.get("poisoned", 0))
-
-    mark_search_started()
-    # Capture the scanner's existing console report into structured telemetry
-    # while teeing it unchanged to stdout. Telemetry is fail-open and does not
-    # participate in trade decisions. A kill/timeout leaves STARTED so
-    # diagnostics can see a hung scan without deleting the cycle lock.
-    try:
-        run_scan_with_telemetry(scan_main)
-    except Exception:
-        mark_search_finished("FAILED")
-        raise
-    mark_search_finished("COMPLETED")
+    _run_event_intelligence_fail_open(settings=settings)
+    _run_external_order_review_fail_open()
+    _run_learning_fail_open()
 
 
 def main() -> None:
-    # The unified cycle has cross-registry sequencing assumptions. Never allow
-    # two scheduled invocations to interleave. This is deliberately
-    # non-blocking: if a previous cycle is still running, skip the new one.
+    """Run one canonical cycle, distinguishing lock contention from workload failure."""
+    cycle_lock = registry_lock(CYCLE_LOCK_FILE, timeout=0.0)
     try:
-        with registry_lock(CYCLE_LOCK_FILE, timeout=0.0):
-            _run_cycle_once()
+        cycle_lock.__enter__()
     except TimeoutError:
         print("OHM Unified Cycle skipped: previous cycle still running.")
+        return
+
+    try:
+        if recover_interrupted_search():
+            print("O'Pip recovered interrupted broad-search lifecycle as FAILED.")
+        _run_cycle_once()
+    finally:
+        cycle_lock.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

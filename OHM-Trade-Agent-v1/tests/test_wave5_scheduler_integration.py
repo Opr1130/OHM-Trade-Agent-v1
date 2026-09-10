@@ -7,6 +7,7 @@ from app.services import learning_scheduler
 
 
 def test_learning_cycle_includes_wave5_outcomes_without_paid_ai(monkeypatch):
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: False)
     now = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
@@ -54,6 +55,7 @@ def test_learning_cycle_includes_wave5_outcomes_without_paid_ai(monkeypatch):
 
 
 def test_wave5_outcome_failure_is_fail_open(monkeypatch):
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: False)
     now = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
@@ -92,3 +94,25 @@ def test_wave5_outcome_failure_is_fail_open(monkeypatch):
     assert result["wave5_explosion_learning"]["status"] == "UNAVAILABLE"
     assert result["wave5_explosion_learning"]["outcomes_added"] == 0
     assert "RuntimeError" in result["wave5_explosion_learning"]["reason"]
+
+
+def test_conservative_production_runtime_is_remote_only_and_does_not_touch_local_observers(monkeypatch):
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: True)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("production core must not execute local learning compute")
+
+    monkeypatch.setattr(learning_scheduler, "observe_due_shadows", forbidden)
+    monkeypatch.setattr(learning_scheduler, "observe_due_price_movements", forbidden)
+    monkeypatch.setattr(learning_scheduler, "observe_due_movement_discovery_outcomes", forbidden)
+    monkeypatch.setattr(learning_scheduler, "observe_due_explosion_outcomes", forbidden)
+    monkeypatch.setattr(learning_scheduler, "ingest_freqtrade_dry_run", forbidden)
+    monkeypatch.setattr(learning_scheduler, "build_intelligence_learning_profile", forbidden)
+    monkeypatch.setattr(learning_scheduler, "build_profitability_profile", forbidden)
+
+    result = learning_scheduler.run_learning_cycle()
+
+    assert result["status"] == "REMOTE_ONLY"
+    assert result["paid_ai_calls"] == 0
+    assert result["profile_refreshed"] is False
+    assert result["reason"] == "production learning compute is isolated to the remote learning worker"
