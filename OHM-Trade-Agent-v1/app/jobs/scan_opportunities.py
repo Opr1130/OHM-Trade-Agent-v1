@@ -6,13 +6,14 @@ from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
-from app.opip.decision.screening import (
-    ScannerType,
-    ScreeningEvaluation,
-    ScreeningOutcome,
+from app.opip.decision.store import append_screening_evaluations, append_qualification_dead_letter
+from app.opip.discovery.admission import (
+    build_callback_evaluation,
+    finalize_broad_search_evaluations,
+    unavailable_instrument_evaluations,
 )
-from app.opip.decision.store import append_screening_evaluations
-from app.opip.identity import resolve_venue_instrument_identity
+from app.opip.discovery.constants import PENDING_FINALIZATION
+from app.opip.discovery.telemetry import ScanComputeTracker
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
 from app.scanner.directional_candidates import (
@@ -96,57 +97,19 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
             or getattr(snapshot, "symbol", "")
         )
         try:
-            rows.append(
-                ScreeningEvaluation(
-                    observed_at=observed_at,
-                    scan_id=scan_id,
-                    scanner_type=ScannerType.BROAD_SEARCH,
-                    venue_instrument=resolve_venue_instrument_identity(
-                        raw,
-                        canonicalize_asset=canonicalize_asset,
-                        split_canonical_pair=split_canonical_pair,
-                        resolved_at_utc=observed_at,
-                    ),
-                    outcome=(
-                        ScreeningOutcome.ADVANCED
-                        if advanced_direction is not None
-                        else ScreeningOutcome.BELOW_THRESHOLD
-                    ),
-                    long_score=long_score,
-                    short_score=short_score,
-                    advanced_direction=advanced_direction,
-                    reason=(
-                        "directional technical threshold cleared"
-                        if advanced_direction is not None
-                        else "neither directional technical score cleared the threshold"
-                    ),
-                    metadata={
-                        "universe_count": int(universe_count),
-                        "reference_price": (
-                            getattr(snapshot, "ticker_last", None)
-                            or getattr(snapshot, "last_price", None)
-                        ),
-                        "recent_24h_high": getattr(
-                            snapshot, "recent_24h_high", None
-                        ),
-                        "recent_24h_low": getattr(
-                            snapshot, "recent_24h_low", None
-                        ),
-                        "momentum_6h_pct": getattr(
-                            snapshot, "momentum_6h_pct", None
-                        ),
-                        "momentum_24h_pct": getattr(
-                            snapshot, "momentum_24h_pct", None
-                        ),
-                        "momentum_72h_pct": getattr(
-                            snapshot, "momentum_72h_pct", None
-                        ),
-                        "measurement_only": True,
-                        "affects_ranking": False,
-                        "affects_trade_authority": False,
-                    },
-                ).to_dict()
+            row = build_callback_evaluation(
+                snapshot,
+                long_score,
+                short_score,
+                advanced_direction,
+                observed_at=observed_at,
+                scan_id=scan_id,
+                universe_count=universe_count,
+                canonicalize_asset=canonicalize_asset,
+                split_canonical_pair=split_canonical_pair,
             )
+            if row is not None:
+                rows.append(row)
         except Exception as exc:
             logger.warning(
                 "O'Pip screening capture failed open scanner_type=BROAD_SEARCH "
@@ -159,9 +122,168 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
     return capture
 
 
+def _canonical_screening_rows(rows: list) -> list:
+    canonical: list = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        outcome = str(row.get("outcome") or "")
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if outcome == PENDING_FINALIZATION:
+            continue
+        if str(metadata.get("production_admission_result") or "") == PENDING_FINALIZATION:
+            continue
+        if str(metadata.get("finalization_status") or "") == PENDING_FINALIZATION:
+            continue
+        canonical.append(row)
+    return canonical
+
+
+def _record_screening_measurement_failure(
+    *,
+    scan_id: str,
+    operation: str,
+    error: BaseException,
+    provisional_row_count: int,
+    telemetry_enabled: bool,
+) -> None:
+    try:
+        append_qualification_dead_letter(
+            [
+                {
+                    "record_type": "SCREENING_FINALIZATION_FAILED",
+                    "measurement_only": True,
+                    "trade_authority_changed": False,
+                    "scan_id": scan_id,
+                    "operation": operation,
+                    "error": type(error).__name__,
+                    "provisional_row_count": int(provisional_row_count),
+                    "persisted_canonical_rows": 0,
+                }
+            ],
+            enabled=telemetry_enabled,
+        )
+    except Exception as dead_exc:
+        logger.warning(
+            "O'Pip screening diagnostic persist failed open scan_id=%s error=%s",
+            scan_id,
+            type(dead_exc).__name__,
+        )
+
+
+def _select_production_candidates(
+    snapshots,
+    *,
+    telemetry_enabled: bool,
+    screening_rows: list,
+    observed_at,
+    scan_id: str,
+    universe_count: int,
+):
+    """Invoke the production selector exactly once.
+
+    Telemetry construction may fail soft. The selector call itself is never
+    retried and never swallowed.
+    """
+    kwargs = {}
+    if telemetry_enabled:
+        try:
+            callback = _broad_screening_callback(
+                rows=screening_rows,
+                observed_at=observed_at,
+                scan_id=scan_id,
+                universe_count=universe_count,
+            )
+            parameters = inspect.signature(select_candidates).parameters
+            if "on_evaluated" in parameters:
+                kwargs["on_evaluated"] = callback
+            if "scan_id" in parameters:
+                kwargs["scan_id"] = scan_id
+        except Exception as exc:
+            logger.warning(
+                "O'Pip screening callback construction failed open scan_id=%s error=%s",
+                scan_id,
+                type(exc).__name__,
+            )
+            kwargs = {}
+    return select_candidates(snapshots, **kwargs)
+
+
+def _persist_broad_screening_fail_open(
+    *,
+    rows,
+    selected,
+    scan,
+    observed_at,
+    scan_id,
+    universe_count,
+    telemetry_enabled: bool,
+) -> None:
+    """Finalise rank/threshold evidence and persist. Never raises."""
+    try:
+        finalized = finalize_broad_search_evaluations(
+            list(rows),
+            selected=selected,
+            observed_at=observed_at,
+            universe_count=universe_count,
+            canonicalize_asset=canonicalize_asset,
+            split_canonical_pair=split_canonical_pair,
+        )
+        known = [
+            str(row.get("venue_instrument_id") or "")
+            for row in finalized
+            if row.get("venue_instrument_id")
+        ]
+        finalized.extend(
+            unavailable_instrument_evaluations(
+                scan=scan,
+                observed_at=observed_at,
+                scan_id=scan_id,
+                universe_count=universe_count,
+                already_recorded=known,
+                canonicalize_asset=canonicalize_asset,
+                split_canonical_pair=split_canonical_pair,
+            )
+        )
+        canonical = _canonical_screening_rows(finalized)
+        written = append_screening_evaluations(
+            canonical, enabled=telemetry_enabled
+        )
+        if len(canonical) > 0 and written != len(canonical):
+            _record_screening_measurement_failure(
+                scan_id=scan_id,
+                operation="append_screening_short_write",
+                error=RuntimeError(
+                    f"screening_write_short expected={len(canonical)} written={written}"
+                ),
+                provisional_row_count=len(list(rows) or []),
+                telemetry_enabled=telemetry_enabled,
+            )
+    except Exception as exc:
+        logger.warning(
+            "O'Pip screening persist failed open scanner_type=BROAD_SEARCH "
+            "scan_id=%s operation=finalize_or_append error=%s",
+            scan_id,
+            type(exc).__name__,
+        )
+        _record_screening_measurement_failure(
+            scan_id=scan_id,
+            operation="finalize_or_append",
+            error=exc,
+            provisional_row_count=len(list(rows) or []),
+            telemetry_enabled=telemetry_enabled,
+        )
+
+
 def _screening_scan_id(observer) -> str:
     """Read the observer identity only for joining measurement rows."""
-    return str(observer.funnel.scan_id)
+    try:
+        funnel = getattr(observer, "funnel", None)
+        scan_id = getattr(funnel, "scan_id", None) if funnel is not None else None
+        text = str(scan_id or "").strip()
+        return text or "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
 
 
 def _record_coingecko_health_fail_open(settings, reference_summary, global_context) -> None:
@@ -243,7 +365,7 @@ def _record_coingecko_health_fail_open(settings, reference_summary, global_conte
         logger.exception("O'Pip CoinGecko health persistence failed open")
 
 
-def _opip_scan_context(scan, technical_candidates: int) -> dict:
+def _opip_scan_context(scan, technical_candidates: int, extra=None) -> dict:
     """Return the scan-level counters the O'Pip funnel summary reports.
 
     ``technical_candidates`` is the size of the directional shortlist as
@@ -251,13 +373,16 @@ def _opip_scan_context(scan, technical_candidates: int) -> dict:
     the funnel's own counters already describe attrition, and reporting the
     survivor count here would understate how many candidates were considered.
     """
-    return {
+    payload = {
         "requested": getattr(scan, "requested", None),
         "analyzed": getattr(scan, "analyzed", None),
         "skipped": getattr(scan, "skipped", None),
         "failed": getattr(scan, "failed", None),
         "technical_candidates": int(technical_candidates),
     }
+    if extra:
+        payload.update(dict(extra))
+    return payload
 
 
 def _paper_trade_enabled_safe() -> bool:
@@ -851,6 +976,7 @@ def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None):
 
 def main():
     settings = get_settings()
+    compute = ScanComputeTracker.start()
     scan = scan_market(limit=DEFAULT_UNIQUE_ASSET_LIMIT)
     decision_at = datetime.now(timezone.utc)
     market_regime = evaluate_market_regime(scan.snapshots)
@@ -871,25 +997,34 @@ def main():
         decision_at=decision_at,
         account_equity=getattr(settings, "account_equity", None),
     )
+    screening_rows: list[dict] = []
+    screening_scan_id = _screening_scan_id(opip)
+    candidates = _select_production_candidates(
+        scan.snapshots,
+        telemetry_enabled=bool(opip.telemetry_enabled),
+        screening_rows=screening_rows,
+        observed_at=decision_at,
+        scan_id=screening_scan_id,
+        universe_count=len(scan.snapshots),
+    )
+    try:
+        scan_compute_context = compute.finish(
+            scan=scan,
+            shortlist=candidates,
+            scan_id=screening_scan_id,
+        )
+    except Exception:
+        scan_compute_context = {}
     if opip.telemetry_enabled:
-        screening_rows: list[dict] = []
-        screening_scan_id = _screening_scan_id(opip)
-        screening_callback = _broad_screening_callback(
+        _persist_broad_screening_fail_open(
             rows=screening_rows,
+            selected=candidates,
+            scan=scan,
             observed_at=decision_at,
             scan_id=screening_scan_id,
             universe_count=len(scan.snapshots),
+            telemetry_enabled=True,
         )
-        selector_kwargs = {}
-        selector_parameters = inspect.signature(select_candidates).parameters
-        if "on_evaluated" in selector_parameters:
-            selector_kwargs["on_evaluated"] = screening_callback
-        if "scan_id" in selector_parameters:
-            selector_kwargs["scan_id"] = screening_scan_id
-        candidates = select_candidates(scan.snapshots, **selector_kwargs)
-        append_screening_evaluations(screening_rows, enabled=True)
-    else:
-        candidates = select_candidates(scan.snapshots)
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
     # tag existing native candidates with corroborating evidence. It cannot
@@ -964,7 +1099,7 @@ def main():
 
     if not candidates:
         print("No technical candidates.")
-        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -1038,7 +1173,7 @@ def main():
             )
     if not candidates:
         print("No directionally tradeable candidates after margin eligibility.")
-        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -1117,7 +1252,7 @@ def main():
     print("Execution structural/short-quality rejects:", execution_requested - len(candidates))
     if not candidates:
         print("No candidates survived execution quality validation.")
-        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count))
+        opip.finalize(scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context))
         _capture_native_scan_cohort(scan, decision_at=decision_at)
         return
 
@@ -1705,7 +1840,7 @@ def main():
         paper_enabled=_paper_trade_enabled_safe(),
     )
     opip.finalize(
-        scan_context=_opip_scan_context(scan, technical_candidate_count),
+        scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context),
         paper_admission_eligible=paper_admission_eligible,
     )
     _capture_native_scan_cohort(scan, decision_at=decision_at)

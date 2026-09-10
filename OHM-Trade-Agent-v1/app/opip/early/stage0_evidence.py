@@ -94,17 +94,26 @@ class Stage0DecisionFeatures:
     distance_from_24h_high_pct: float | None = None
     notional_usd: float | None = None
     last_price: float | None = None
+    high_24h: float | None = None
+    low_24h: float | None = None
     volume_24h: float | None = None
     relative_volume: float | None = None
     relative_volume_change: float | None = None
     trade_count_acceleration: float | None = None
+    momentum_6h_pct: float | None = None
+    momentum_24h_pct: float | None = None
+    momentum_72h_pct: float | None = None
     momentum_acceleration: float | None = None
+    atr: float | None = None
+    atr_pct: float | None = None
+    bandwidth_pct: float | None = None
     bandwidth_percentile: float | None = None
     atr_percentile: float | None = None
     prior_observation_at: str | None = None
     observed_at: str | None = None
     decision_at: str | None = None
     prior_observation_count: int | None = None
+    market_phase: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Serialise with explicit unavailability, never fabricated values."""
@@ -113,11 +122,19 @@ class Stage0DecisionFeatures:
             "distance_from_24h_high_pct": _finite_optional(self.distance_from_24h_high_pct),
             "notional_usd": _finite_optional(self.notional_usd),
             "last_price": _finite_optional(self.last_price),
+            "high_24h": _finite_optional(self.high_24h),
+            "low_24h": _finite_optional(self.low_24h),
             "volume_24h": _finite_optional(self.volume_24h),
             "relative_volume": _finite_optional(self.relative_volume),
             "relative_volume_change": _finite_optional(self.relative_volume_change),
             "trade_count_acceleration": _finite_optional(self.trade_count_acceleration),
+            "momentum_6h_pct": _finite_optional(self.momentum_6h_pct),
+            "momentum_24h_pct": _finite_optional(self.momentum_24h_pct),
+            "momentum_72h_pct": _finite_optional(self.momentum_72h_pct),
             "momentum_acceleration": _finite_optional(self.momentum_acceleration),
+            "atr": _finite_optional(self.atr),
+            "atr_pct": _finite_optional(self.atr_pct),
+            "bandwidth_pct": _finite_optional(self.bandwidth_pct),
             "bandwidth_percentile": _finite_optional(self.bandwidth_percentile),
             "atr_percentile": _finite_optional(self.atr_percentile),
         }
@@ -133,7 +150,8 @@ class Stage0DecisionFeatures:
                 else None
             ),
         }
-        payload: dict[str, Any] = {**numeric, **timestamps, **counts}
+        taxonomy = {"market_phase": _taxonomy_token(self.market_phase)}
+        payload: dict[str, Any] = {**numeric, **timestamps, **counts, **taxonomy}
         assert_point_in_time_safe(payload)
         payload["unavailable_features"] = sorted(
             name for name, value in payload.items() if value is None

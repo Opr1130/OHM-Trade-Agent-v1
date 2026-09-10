@@ -29,6 +29,9 @@ class ScreeningOutcome(str, Enum):
     COARSE_RANK_LIMIT = "COARSE_RANK_LIMIT"
     DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
     EXCLUDED_MARKET = "EXCLUDED_MARKET"
+    # Observational callback only. Must never be persisted as a terminal
+    # Stage-0 admission result.
+    PENDING_FINALIZATION = "PENDING_FINALIZATION"
 
 
 def _score(value: Any) -> float | None:

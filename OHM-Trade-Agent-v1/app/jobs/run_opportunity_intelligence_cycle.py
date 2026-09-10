@@ -10,15 +10,23 @@ import json
 import os
 from pathlib import Path
 
+from app.jobs.build_discovery_forward_outcomes import (
+    build_discovery_outcomes_bounded,
+)
 from app.jobs.build_phase3c_forward_outcomes import (
     acknowledge_accountability_outcomes,
     advance_accountability_handoff_backfill,
     build_outcomes_bounded,
     pending_accountability_outcomes,
 )
+from app.opip.decision.store import (
+    QUALIFICATION_DIR,
+    SCREENING_EVALUATIONS_FILE,
+)
 from app.opip.learning.job_disposition import (
     CONSUMED_EMPTY,
     CONSUMED_OK,
+    FAILED_RETRYABLE,
     write_consumption_summary,
 )
 from app.opip.learning.replica_archive_repair import (
@@ -107,23 +115,56 @@ def main() -> None:
                 raise accountability_error from maturation_error
             raise
 
+    discovery_summary: dict = {}
+    try:
+        discovery_summary = build_discovery_outcomes_bounded(
+            screening_path=(
+                data_root
+                / Path(*QUALIFICATION_DIR.parts[-2:])
+                / SCREENING_EVALUATIONS_FILE.name
+            ),
+            observation_path=data_root / "full_market_observations.jsonl",
+            output_dir=data_root / "opip" / "discovery",
+        )
+    except Exception as exc:
+        discovery_summary = {
+            "error": str(exc),
+            "evaluated": 0,
+            "measurement_only": True,
+            "trade_authority_changed": False,
+        }
+
     pending_after = pending_accountability_outcomes()
     terminalized_backfill = int(
         (handoff_backfill or {}).get("terminalized_coverage_discontinuity") or 0
     )
     # Retirement-only cycles that persist UNRESOLVED_COVERAGE_DISCONTINUITY via
     # bounded backfill are real consumption work, not empty no-ops.
+    discovery_error = bool((discovery_summary or {}).get("error"))
+    discovery_evaluated = int((discovery_summary or {}).get("evaluated") or 0)
     empty = (
         newly_evaluated == 0
         and not outcomes
         and not pending_after
         and terminalized_backfill == 0
         and backfill_error is None
+        and discovery_evaluated == 0
+        and not discovery_error
     )
-    disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
+    cycle_error = (
+        backfill_error is not None
+        or accountability_error is not None
+        or discovery_error
+    )
+    if discovery_error and backfill_error is None and accountability_error is None:
+        disposition = FAILED_RETRYABLE
+    else:
+        disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
-        "status": "OK" if backfill_error is None and accountability_error is None else "ERROR",
+        "status": "ERROR" if cycle_error else "OK",
+        "discovery_job_status": "ERROR" if discovery_error else "OK",
         "new_outcomes_evaluated": newly_evaluated,
+        "discovery_outcomes": discovery_summary,
         "accountability_handoff_rows": len(outcomes),
         "accountability_handoff_resolved": len(resolved),
         "accountability_handoff_acknowledged": acknowledged,
