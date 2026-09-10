@@ -13,7 +13,7 @@ Consumers resolve the latest revision per observation_id.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +42,6 @@ def build_discovery_outcomes_bounded(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Label a bounded due queue. Ledger truncation fails closed, not silent."""
-    labeled_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     root = output_dir or Path("/app/data/opip/discovery")
     try:
         return mature_discovery_outcomes_bounded(
@@ -50,7 +49,7 @@ def build_discovery_outcomes_bounded(
             observation_path=observation_path,
             output_dir=root,
             max_rows=max_rows,
-            now=labeled_at,
+            now=now,
         )
     except RuntimeError as exc:
         message = str(exc)

@@ -170,6 +170,11 @@ def _selected_instrument_ids(
     return ids
 
 
+def _production_rank_key(score: float, symbol: str, direction: str) -> tuple:
+    """Match ``select_directional_candidates`` ordering. Explanation only."""
+    return (-float(score), str(symbol or ""), str(direction or ""))
+
+
 def reconstruct_selector_exclusion_reasons(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -218,7 +223,7 @@ def reconstruct_selector_exclusion_reasons(
 
     ranked = sorted(
         best_by_asset.values(),
-        key=lambda item: (-item[1], item[3], item[2]),
+        key=lambda item: _production_rank_key(item[1], item[3], item[2]),
     )
     counts = {"LONG": 0, "SHORT": 0}
     taken = 0
@@ -414,7 +419,7 @@ def finalize_broad_search_evaluations(
         except (TypeError, ValueError, AttributeError):
             cutoff_score = None
 
-    qualifying: list[tuple[str, float, str, dict[str, Any]]] = []
+    qualifying: list[tuple[str, float, str, str, dict[str, Any]]] = []
     finalized: list[dict[str, Any]] = []
 
     for raw_row in rows:
@@ -444,7 +449,19 @@ def finalize_broad_search_evaluations(
         admitted = venue_id in selected_ids
         candidate_score = _candidate_score(long_score, short_score)
         if passed and candidate_score is not None:
-            qualifying.append((venue_id, float(candidate_score), stronger or "LONG", row))
+            identity_map = row.get("venue_instrument") if isinstance(row.get("venue_instrument"), Mapping) else {}
+            sort_symbol = str(
+                (identity_map or {}).get("raw_identifier") or venue_id
+            )
+            qualifying.append(
+                (
+                    venue_id,
+                    float(candidate_score),
+                    stronger or "LONG",
+                    sort_symbol,
+                    row,
+                )
+            )
 
         if admitted:
             outcome = ScreeningOutcome.ADVANCED
@@ -567,9 +584,9 @@ def finalize_broad_search_evaluations(
 
     rank_inputs = [
         (venue_id, score)
-        for venue_id, score, _direction, _row in sorted(
+        for venue_id, score, direction, sort_symbol, _row in sorted(
             qualifying,
-            key=lambda item: (-item[1], item[0], item[2]),
+            key=lambda item: _production_rank_key(item[1], item[3], item[2]),
         )
     ]
     contexts = rank_contexts_for_ranked(

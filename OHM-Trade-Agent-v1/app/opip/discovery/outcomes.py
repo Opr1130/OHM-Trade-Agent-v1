@@ -124,10 +124,9 @@ def _horizon_payload(
     adverse_barrier_pct: float,
 ) -> dict[str, Any]:
     observed = timeline.has_forward_observation(reference_at, horizon)
-    complete = timeline.has_complete_window(reference_at, horizon)
     if not observed:
         return {
-            "window_complete": complete,
+            "window_complete": False,
             "horizon_observed": False,
             "horizon_return_pct": None,
             "mfe_pct": None,
@@ -146,14 +145,23 @@ def _horizon_payload(
             "time_to_adverse_barrier_seconds": None,
             "favorable_barrier_at": None,
             "adverse_barrier_at": None,
-            "maturation_status": (
-                MATURATION_COMPLETE if complete else MATURATION_NO_FORWARD_DATA
-            ),
+            "maturation_status": MATURATION_NO_FORWARD_DATA,
+            "last_forward_price": None,
+            "last_forward_at": None,
+            "long_mfe_pct": None,
+            "long_mae_pct": None,
+            "short_mfe_pct": None,
+            "short_mae_pct": None,
+            "long_target_before_stop": None,
+            "short_target_before_stop": None,
+            "long_discovery_outcome_v1": WINNER_INCOMPLETE,
+            "short_discovery_outcome_v1": WINNER_INCOMPLETE,
         }
 
     points = _window_points(
         timeline, reference_at=reference_at, horizon=horizon
     )
+    complete = timeline.has_complete_window(reference_at, horizon)
     mfe_pct = mae_pct = None
     mfe_at = mae_at = None
     favorable_at = adverse_at = None
@@ -362,6 +370,8 @@ def label_screening_observation(
         "long_mae_pct": None,
         "short_mfe_pct": None,
         "short_mae_pct": None,
+        "long_discovery_outcome_v1": WINNER_INCOMPLETE,
+        "short_discovery_outcome_v1": WINNER_INCOMPLETE,
     }
     if observed_at is None or reference_price is None or timeline is None or len(timeline) == 0:
         payload["maturation_status"] = MATURATION_NO_FORWARD_DATA

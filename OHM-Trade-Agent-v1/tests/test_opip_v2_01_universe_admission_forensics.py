@@ -463,10 +463,10 @@ def test_each_observation_has_exactly_one_stage0_attribution():
     assert ATTRIBUTION_ADMITTED in by_id.values()
     for row in finalized:
         result = row["metadata"]["production_admission_result"]
-        if result == ATTRIBUTION_BELOW_THRESHOLD:
-            assert result != ATTRIBUTION_RANKED_OUTSIDE_BUDGET
-        if result == ATTRIBUTION_RANKED_OUTSIDE_BUDGET:
-            assert result != ATTRIBUTION_BELOW_THRESHOLD
+        category = attribute_stage0_observation(row)
+        assert result in STAGE0_ATTRIBUTION_CATEGORIES
+        assert category == result
+        assert attributions_are_exclusive([category])
 
 
 def test_downstream_safety_rejection_is_not_an_admission_miss():
@@ -600,7 +600,7 @@ def test_synthetic_universe_attribution_for_three_winner_classes():
     assert attribute_stage0_observation(admitted) == ATTRIBUTION_ADMITTED
     assert attribute_stage0_observation(capped) == ATTRIBUTION_RANKED_OUTSIDE_BUDGET
     assert attribute_stage0_observation(below) == ATTRIBUTION_BELOW_THRESHOLD
-    assert report["stage0_attributions"]["U000USD"] == ATTRIBUTION_ADMITTED
+    assert report["stage0_attributions"][admitted["metadata"]["observation_id"]] == ATTRIBUTION_ADMITTED
     assert MIN_TECHNICAL_SCORE == 80
 
 

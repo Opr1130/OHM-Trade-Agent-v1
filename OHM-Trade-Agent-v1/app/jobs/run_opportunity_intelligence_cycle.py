@@ -131,6 +131,7 @@ def main() -> None:
     )
     # Retirement-only cycles that persist UNRESOLVED_COVERAGE_DISCONTINUITY via
     # bounded backfill are real consumption work, not empty no-ops.
+    discovery_error = bool((discovery_summary or {}).get("error"))
     discovery_evaluated = int((discovery_summary or {}).get("evaluated") or 0)
     empty = (
         newly_evaluated == 0
@@ -139,10 +140,12 @@ def main() -> None:
         and terminalized_backfill == 0
         and backfill_error is None
         and discovery_evaluated == 0
+        and not discovery_error
     )
     disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {
         "status": "OK" if backfill_error is None and accountability_error is None else "ERROR",
+        "discovery_job_status": "ERROR" if discovery_error else "OK",
         "new_outcomes_evaluated": newly_evaluated,
         "discovery_outcomes": discovery_summary,
         "accountability_handoff_rows": len(outcomes),

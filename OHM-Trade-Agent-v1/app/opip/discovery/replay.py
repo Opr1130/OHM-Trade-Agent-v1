@@ -32,18 +32,21 @@ def forensic_admission_report(
     """Explain Stage-0 admissions from persisted rows without changing them."""
     forensic = replay_forensic(screening_rows)
     rows = forensic_rows(screening_rows)
-    attributions = {
-        row.venue_instrument_id: attribute_stage0_observation(
+    attributions = {}
+    for row in rows:
+        if not row.venue_instrument_id:
+            continue
+        metadata = dict(row.metadata) if isinstance(row.metadata, Mapping) else {}
+        observation_id = str(metadata.get("observation_id") or "").strip()
+        key = observation_id or (row.scan_id, row.venue_instrument_id)
+        attributions[key] = attribute_stage0_observation(
             {
                 "outcome": row.outcome,
-                "metadata": dict(row.metadata),
+                "metadata": metadata,
                 "scan_id": row.scan_id,
                 "venue_instrument_id": row.venue_instrument_id,
             }
         )
-        for row in rows
-        if row.venue_instrument_id
-    }
     forensic["stage0_attributions"] = attributions
     forensic["measurement_only"] = True
     forensic["trade_authority_changed"] = False

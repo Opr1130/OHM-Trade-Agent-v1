@@ -646,9 +646,6 @@ def mature_discovery_outcomes_bounded(
                 }
                 new_rows.append(stamped)
                 _upsert_latest_outcome(connection, stamped)
-                _schedule_after_evaluation(
-                    connection, stamped, evaluated_at=labeled_at
-                )
                 if discovery_window_complete(stamped):
                     summary["completed"] += 1
                 else:
@@ -656,6 +653,7 @@ def mature_discovery_outcomes_bounded(
 
             written = 0
             written_attr = 0
+            attribution_rows: list[dict[str, Any]] = []
             if new_rows:
                 written = append_discovery_forward_outcomes_locked(
                     new_rows, path=outcomes_path
@@ -675,9 +673,27 @@ def mature_discovery_outcomes_bounded(
                         attribution_rows,
                         path=output_dir / "attributions.jsonl",
                     )
+            attributions_ok = (not attribution_rows) or written_attr == len(
+                attribution_rows
+            )
+            for stamped in new_rows:
+                if attributions_ok:
+                    _schedule_after_evaluation(
+                        connection, stamped, evaluated_at=labeled_at
+                    )
+                else:
+                    observation_id = str(stamped.get("observation_id") or "")
+                    if observation_id:
+                        connection.execute(
+                            "UPDATE observation_queue SET next_due_at = ? "
+                            "WHERE observation_id = ?",
+                            (labeled_at.isoformat(), observation_id),
+                        )
             summary["evaluated"] = len(pending)
             summary["written_outcomes"] = written
             summary["written_attributions"] = written_attr
+            if not attributions_ok:
+                summary["attribution_persist_incomplete"] = True
             connection.commit()
             return summary
         finally:

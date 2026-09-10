@@ -991,6 +991,14 @@ def main():
         scan_id=screening_scan_id,
         universe_count=len(scan.snapshots),
     )
+    try:
+        scan_compute_context = compute.finish(
+            scan=scan,
+            shortlist=candidates,
+            scan_id=screening_scan_id,
+        )
+    except Exception:
+        scan_compute_context = {}
     if opip.telemetry_enabled:
         _persist_broad_screening_fail_open(
             rows=screening_rows,
@@ -1000,14 +1008,6 @@ def main():
             scan_id=screening_scan_id,
             universe_count=len(scan.snapshots),
         )
-    try:
-        scan_compute_context = compute.finish(
-            scan=scan,
-            shortlist=candidates,
-            scan_id=screening_scan_id,
-        )
-    except Exception:
-        scan_compute_context = {}
 
     # Wave 8.2 TradingView Intelligence Bridge: augmentation only. This can
     # tag existing native candidates with corroborating evidence. It cannot
