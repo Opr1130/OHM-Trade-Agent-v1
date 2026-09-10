@@ -21,6 +21,7 @@ from app.opip.discovery.constants import (
     ATTRIBUTION_RANKED_OUTSIDE_BUDGET,
     DISCOVERY_ATTRIBUTION_SCHEMA_VERSION,
     DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION,
+    PENDING_FINALIZATION,
     SCREENING_TO_ATTRIBUTION,
     STAGE0_ATTRIBUTION_CATEGORIES,
 )
@@ -48,11 +49,18 @@ def attribute_stage0_observation(
     if screening_row is None:
         return ATTRIBUTION_NOT_OBSERVED
     metadata = screening_row.get("metadata")
+    outcome = str(screening_row.get("outcome") or "").strip()
+    recorded = ""
     if isinstance(metadata, Mapping):
         recorded = str(metadata.get("production_admission_result") or "").strip()
-        if recorded in _OBSERVED_RESULTS:
-            return recorded
-    outcome = str(screening_row.get("outcome") or "").strip()
+        if str(metadata.get("finalization_status") or "") == PENDING_FINALIZATION:
+            return PENDING_FINALIZATION
+        if recorded == PENDING_FINALIZATION:
+            return PENDING_FINALIZATION
+    if outcome == PENDING_FINALIZATION:
+        return PENDING_FINALIZATION
+    if recorded in _OBSERVED_RESULTS:
+        return recorded
     mapped = SCREENING_TO_ATTRIBUTION.get(outcome)
     if mapped:
         return mapped

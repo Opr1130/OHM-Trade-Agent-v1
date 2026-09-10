@@ -30,6 +30,10 @@ from app.opip.discovery.constants import (
     DISCOVERY_ADMISSION_SCHEMA_VERSION,
     DISCOVERY_FEATURE_SCHEMA_VERSION,
     DISCOVERY_VENUE,
+    EXCLUSION_GLOBAL_CAP,
+    EXCLUSION_PER_DIRECTION_CAP,
+    EXCLUSION_UNDERLYING_DEDUP,
+    PENDING_FINALIZATION,
     PRODUCTION_SELECTOR_VERSION,
 )
 from app.opip.discovery.features import decision_features_from_snapshot
@@ -166,6 +170,74 @@ def _selected_instrument_ids(
     return ids
 
 
+def reconstruct_selector_exclusion_reasons(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    selected_ids: set[str],
+    min_score: int,
+    limit: int,
+    max_per_direction: int = MAX_PER_DIRECTION,
+) -> dict[str, str]:
+    """Replay production selector rules for explanation only.
+
+    Mirrors ``select_directional_candidates``: stronger direction per
+    underlying asset, then per-direction cap, then mixed global cap.
+    """
+    best_by_asset: dict[str, tuple[str, float, str, str]] = {}
+    reasons: dict[str, str] = {}
+    for row in rows:
+        venue_id = str(row.get("venue_instrument_id") or "")
+        if not venue_id:
+            continue
+        long_score = row.get("long_score")
+        short_score = row.get("short_score")
+        if not _threshold_passed(long_score, short_score, min_score):
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+        identity = row.get("venue_instrument") if isinstance(row.get("venue_instrument"), Mapping) else {}
+        asset = str(
+            (metadata or {}).get("canonical_underlying_asset")
+            or (identity or {}).get("canonical_asset_id")
+            or venue_id
+        )
+        stronger = _stronger_direction(long_score, short_score) or "LONG"
+        score = _candidate_score(long_score, short_score)
+        if score is None:
+            continue
+        sort_symbol = str(
+            (identity or {}).get("raw_identifier")
+            or venue_id
+        )
+        previous = best_by_asset.get(asset)
+        if previous is None or score > previous[1]:
+            if previous is not None:
+                reasons[previous[0]] = EXCLUSION_UNDERLYING_DEDUP
+            best_by_asset[asset] = (venue_id, float(score), stronger, sort_symbol)
+        else:
+            reasons[venue_id] = EXCLUSION_UNDERLYING_DEDUP
+
+    ranked = sorted(
+        best_by_asset.values(),
+        key=lambda item: (-item[1], item[3], item[2]),
+    )
+    counts = {"LONG": 0, "SHORT": 0}
+    taken = 0
+    for venue_id, _score, direction, _symbol in ranked:
+        if venue_id in reasons:
+            continue
+        if counts.get(direction, 0) >= max_per_direction:
+            if venue_id not in selected_ids:
+                reasons[venue_id] = EXCLUSION_PER_DIRECTION_CAP
+            continue
+        if taken >= limit:
+            if venue_id not in selected_ids:
+                reasons[venue_id] = EXCLUSION_GLOBAL_CAP
+            continue
+        counts[direction] = counts.get(direction, 0) + 1
+        taken += 1
+    return reasons
+
+
 def _symbol_from_scan_message(message: str) -> str | None:
     text = str(message or "").strip()
     if not text or ":" not in text:
@@ -275,10 +347,13 @@ def build_callback_evaluation(
         base_metadata={
             **_base_identity_metadata(identity, analysis_pair=raw or None),
             "stronger_direction": stronger,
+            "production_preferred_direction": stronger,
             "threshold_passed": passed,
             "applicable_technical_threshold": int(min_score),
             "shortlist_selected": False,
-            "production_admission_result": "BELOW_THRESHOLD",
+            "production_admission_result": PENDING_FINALIZATION,
+            "finalization_status": PENDING_FINALIZATION,
+            "canonical_stage0": False,
             "reference_price": features.last_price,
             "recent_24h_high": features.high_24h,
             "recent_24h_low": features.low_24h,
@@ -289,25 +364,16 @@ def build_callback_evaluation(
             "affects_trade_authority": False,
         },
     )
-    # Provisional outcome: ADVANCED only means "threshold cleared" until
-    # finalize_broad_search_evaluations applies the actual shortlist.
-    outcome = (
-        ScreeningOutcome.ADVANCED if passed else ScreeningOutcome.BELOW_THRESHOLD
-    )
     row = ScreeningEvaluation(
         observed_at=observed_at,
         scan_id=scan_id,
         scanner_type=ScannerType.BROAD_SEARCH,
         venue_instrument=identity,
-        outcome=outcome,
+        outcome=ScreeningOutcome.PENDING_FINALIZATION,
         long_score=long_score,
         short_score=short_score,
-        advanced_direction=stronger if outcome is ScreeningOutcome.ADVANCED else None,
-        reason=(
-            "directional technical threshold cleared"
-            if passed
-            else "neither directional technical score cleared the threshold"
-        ),
+        advanced_direction=None,
+        reason="pending shortlist finalization",
         metadata=metadata,
     )
     return _attach_observation_id(row.to_dict())
@@ -335,6 +401,12 @@ def finalize_broad_search_evaluations(
         canonicalize_asset=canonicalize_asset,
         split_canonical_pair=split_canonical_pair,
     )
+    exclusion_reasons = reconstruct_selector_exclusion_reasons(
+        rows,
+        selected_ids=selected_ids,
+        min_score=min_score,
+        limit=limit,
+    )
     cutoff_score: float | None = None
     if selected:
         try:
@@ -354,6 +426,7 @@ def finalize_broad_search_evaluations(
         stronger = _stronger_direction(long_score, short_score)
         metadata = dict(row.get("metadata") or {})
         metadata["stronger_direction"] = stronger
+        metadata["production_preferred_direction"] = stronger
         metadata["threshold_passed"] = passed
         metadata["applicable_technical_threshold"] = int(min_score)
         metadata["selected_count"] = len(selected)
@@ -364,6 +437,9 @@ def finalize_broad_search_evaluations(
         metadata["affects_ranking"] = False
         metadata["affects_trade_authority"] = False
         metadata["v2_01_admission_schema_version"] = DISCOVERY_ADMISSION_SCHEMA_VERSION
+        metadata["canonical_stage0"] = True
+        metadata["finalization_status"] = "FINALIZED"
+        metadata.pop("production_admission_result", None)
 
         admitted = venue_id in selected_ids
         candidate_score = _candidate_score(long_score, short_score)
@@ -375,16 +451,23 @@ def finalize_broad_search_evaluations(
             admission = "ADMITTED"
             reason = "admitted into production shortlist"
             direction = stronger
+            metadata["production_exclusion_reason"] = None
         elif passed:
             outcome = ScreeningOutcome.COARSE_RANK_LIMIT
             admission = "RANKED_OUTSIDE_BUDGET"
-            reason = "passed directional threshold but ranked outside available budget/cap"
+            exclusion = exclusion_reasons.get(venue_id) or EXCLUSION_GLOBAL_CAP
+            reason = (
+                "passed directional threshold but ranked outside available "
+                f"budget/cap ({exclusion})"
+            )
             direction = None
+            metadata["production_exclusion_reason"] = exclusion
         else:
             outcome = ScreeningOutcome.BELOW_THRESHOLD
             admission = "BELOW_THRESHOLD"
             reason = "neither directional technical score cleared the threshold"
             direction = None
+            metadata["production_exclusion_reason"] = None
 
         metadata["shortlist_selected"] = admitted
         metadata["production_admission_result"] = admission
@@ -419,13 +502,17 @@ def finalize_broad_search_evaluations(
                 "momentum_24h_pct",
                 "momentum_72h_pct",
                 "stronger_direction",
+                "production_preferred_direction",
                 "threshold_passed",
                 "applicable_technical_threshold",
                 "shortlist_selected",
                 "production_admission_result",
+                "production_exclusion_reason",
                 "selected_count",
                 "cutoff_score",
                 "margin_to_cutoff",
+                "canonical_stage0",
+                "finalization_status",
                 "affects_ranking",
                 "affects_trade_authority",
             )
@@ -556,6 +643,8 @@ def unavailable_instrument_evaluations(
                     if outcome is ScreeningOutcome.EXCLUDED_MARKET
                     else "DATA_UNAVAILABLE"
                 ),
+                "canonical_stage0": True,
+                "finalization_status": "FINALIZED",
                 "affects_ranking": False,
                 "affects_trade_authority": False,
             },

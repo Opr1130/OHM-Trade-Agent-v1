@@ -15,6 +15,8 @@ from pathlib import Path
 import time
 from typing import Any
 
+from app.opip.discovery.constants import COMPUTE_MEASUREMENT_SCOPE
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -132,6 +134,8 @@ class ScanComputeTracker:
                 "scan_id": scan_id,
                 "scan_started_at": self.started_at.isoformat(),
                 "scan_ended_at": ended_at.isoformat(),
+                "measurement_scope": COMPUTE_MEASUREMENT_SCOPE,
+                "broad_discovery_and_selection_duration_ms": duration_ms,
                 "duration_ms": duration_ms,
                 "universe_requested": requested,
                 "instruments_analyzed": analyzed,

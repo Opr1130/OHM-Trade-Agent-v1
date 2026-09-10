@@ -96,8 +96,8 @@ EARLY_WATCH_SCANS_PER_DAY = 144
 # recovery candidates. Capacity must retain both states: 8 + 5 = 13 rows.
 MAX_FUNNEL_CANDIDATES_PER_SCAN = 13
 # V2-01 admission forensics adds rank/cutoff/feature evidence to each row.
-# 2 KB is a conservative p95 for the enriched measurement payload.
-SCREENING_P95_ROW_BYTES = 2_000
+# Measured representative p95 is ~3.1 KB; 4096 is a conservative budget.
+SCREENING_P95_ROW_BYTES = 4_096
 FUNNEL_P95_ROW_BYTES = 9_700
 SUMMARY_P95_ROW_BYTES = 1_900
 
@@ -452,6 +452,21 @@ def append_scan_summary(
         max_bytes=SCAN_SUMMARIES_MAX_BYTES,
         keep_lines=SCAN_SUMMARIES_KEEP_LINES,
         dead_letter_path=dead_letter_path or DEAD_LETTER_FILE,
+    )
+
+
+def append_qualification_dead_letter(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    path: Path | None = None,
+) -> int:
+    """Persist scan-level measurement diagnostics. Never changes production."""
+    return _append_rows(
+        path or DEAD_LETTER_FILE,
+        rows,
+        max_bytes=DEAD_LETTER_MAX_BYTES,
+        keep_lines=DEAD_LETTER_KEEP_LINES,
+        dead_letter_path=path or DEAD_LETTER_FILE,
     )
 
 

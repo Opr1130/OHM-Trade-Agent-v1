@@ -5,34 +5,46 @@ MEASUREMENT ONLY — NO PRODUCTION DECISION AUTHORITY.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from app.jobs.scan_opportunities import _persist_broad_screening_fail_open
+from app.jobs.scan_opportunities import (
+    _persist_broad_screening_fail_open,
+    _select_production_candidates,
+)
 from app.opip.discovery.admission import (
     build_callback_evaluation,
     finalize_broad_search_evaluations,
     observation_join_id,
     unavailable_instrument_evaluations,
 )
-from app.opip.discovery.attribution import attribute_stage0_observation, attribution_record
+from app.opip.discovery.attribution import (
+    attribute_stage0_observation,
+    attribution_record,
+    attributions_are_exclusive,
+)
 from app.opip.discovery.constants import (
     ATTRIBUTION_ADMITTED,
     ATTRIBUTION_BELOW_THRESHOLD,
     ATTRIBUTION_NOT_OBSERVED,
     ATTRIBUTION_RANKED_OUTSIDE_BUDGET,
+    DISCOVERY_MARKET_OPPORTUNITY_DEFINITION,
     DISCOVERY_OUTCOME_DEFINITION,
     DISCOVERY_V1_MIN_ADVERSE_PCT,
     DISCOVERY_V1_MIN_FAVORABLE_PCT,
+    EXCLUSION_PER_DIRECTION_CAP,
+    PENDING_FINALIZATION,
+    STAGE0_ATTRIBUTION_CATEGORIES,
     WINNER_INCOMPLETE,
     WINNER_NON_WINNER,
     WINNER_WINNER,
 )
 from app.opip.discovery.earliness import earliness_metrics
 from app.opip.discovery.features import decision_features_from_snapshot
+from app.opip.discovery.maturation import latest_discovery_outcomes_by_observation
 from app.opip.discovery.outcomes import (
     directional_return_pct,
     discovery_v1_barriers,
@@ -483,6 +495,8 @@ def test_scan_compute_envelope_and_soft_process_metrics(monkeypatch):
     scan = SimpleNamespace(requested=200, analyzed=197, skipped=2, failed=1, data_quality_rejected=0, universe=None)
     envelope = tracker.finish(scan=scan, shortlist=[_snapshot()], scan_id="S1")["compute_envelope"]
     assert envelope["duration_ms"] >= 0
+    assert envelope["measurement_scope"] == "BROAD_DISCOVERY_AND_SELECTION"
+    assert envelope["broad_discovery_and_selection_duration_ms"] == envelope["duration_ms"]
     assert envelope["universe_requested"] == 200
     assert envelope["instruments_analyzed"] == 197
     assert envelope["shortlist_count"] == 1
@@ -652,3 +666,511 @@ def test_discovery_job_loads_forward_observations_past_decision_time(tmp_path):
     assert labeled["horizons"]["12h"]["horizon_observed"] is True
     assert labeled["horizons"]["12h"]["mfe_pct"] == pytest.approx(8.0)
     assert "mfe_pct" not in (finalized[0]["metadata"] or {})
+
+
+def _observation(venue_id: str, at: datetime, price: float) -> dict:
+    return {
+        "record_type": "FULL_MARKET_OBSERVATION",
+        "observed_at": at.isoformat(),
+        "symbol": venue_id,
+        "last_price": price,
+        "volume_24h": 1000.0,
+        "notional_24h_usd_approx": price * 1000.0,
+        "high_24h": price,
+        "low_24h": price,
+        "lift_from_24h_low_pct": 0.0,
+        "distance_from_24h_high_pct": 0.0,
+    }
+
+
+def _write_jsonl(path, rows) -> None:
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _append_jsonl(path, rows) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _finalize_snapshot(snapshot, *, scan_id: str = "S1") -> dict:
+    rows = []
+    selected = select_directional_candidates(
+        [snapshot],
+        on_evaluated=lambda snap, long_s, short_s, direction: rows.append(
+            build_callback_evaluation(
+                snap,
+                long_s,
+                short_s,
+                direction,
+                observed_at=NOW,
+                scan_id=scan_id,
+                universe_count=1,
+            )
+        ),
+    )
+    return finalize_broad_search_evaluations(
+        rows, selected=selected, observed_at=NOW, universe_count=1
+    )[0]
+
+
+def test_incomplete_outcome_matures_to_completed_revision(tmp_path):
+    from app.jobs.build_discovery_forward_outcomes import build_discovery_outcomes_bounded
+
+    snapshot = _snapshot()
+    finalized = _finalize_snapshot(snapshot)
+    observation_id = finalized["metadata"]["observation_id"]
+    venue_id = finalized["venue_instrument_id"]
+    screening_path = tmp_path / "screening_evaluations.jsonl"
+    observation_path = tmp_path / "full_market_observations.jsonl"
+    output_dir = tmp_path / "discovery"
+    _write_jsonl(screening_path, [finalized])
+    _write_jsonl(observation_path, [_observation(venue_id, NOW + timedelta(minutes=5), 101.0)])
+
+    early = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(minutes=10),
+    )
+    assert early["evaluated"] == 1
+    assert early["still_incomplete"] == 1
+    first_rows = [
+        json.loads(line)
+        for line in (output_dir / "forward_outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    first = first_rows[0]
+    assert first["observation_id"] == observation_id
+    assert first["window_complete"] is False
+    assert first["horizons"]["12h"]["window_complete"] is False
+    assert first["outcome_revision"] == 1
+
+    _append_jsonl(
+        observation_path,
+        [
+            _observation(venue_id, NOW + timedelta(minutes=30), 102.0),
+            _observation(venue_id, NOW + timedelta(hours=2), 108.0),
+            _observation(venue_id, NOW + timedelta(hours=5), 107.0),
+            _observation(venue_id, NOW + timedelta(hours=12), 106.0),
+            _observation(venue_id, NOW + timedelta(hours=13), 106.0),
+        ],
+    )
+    later = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13),
+    )
+    assert later["evaluated"] == 1
+    assert later["completed"] == 1
+    all_rows = [
+        json.loads(line)
+        for line in (output_dir / "forward_outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    latest = latest_discovery_outcomes_by_observation(all_rows)[observation_id]
+    assert latest["outcome_revision"] == 2
+    assert latest["window_complete"] is True
+    assert latest["horizons"]["1h"]["window_complete"] is True
+    assert latest["horizons"]["4h"]["window_complete"] is True
+    assert latest["horizons"]["12h"]["window_complete"] is True
+    assert latest["horizons"]["1h"]["mfe_pct"] == pytest.approx(2.0)
+    assert latest["horizons"]["4h"]["mfe_pct"] == pytest.approx(8.0)
+    assert latest["horizons"]["12h"]["mfe_pct"] == pytest.approx(8.0)
+    assert latest["horizons"]["12h"]["mae_pct"] is not None
+    incomplete = [row for row in all_rows if int(row.get("outcome_revision") or 0) == 1][0]
+    assert incomplete["window_complete"] is False
+    assert latest["outcome_record_id"] != incomplete["outcome_record_id"]
+
+    rerun = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        now=NOW + timedelta(hours=13, minutes=10),
+    )
+    assert rerun["evaluated"] == 0
+    rerun_rows = [
+        json.loads(line)
+        for line in (output_dir / "forward_outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rerun_rows) == len(all_rows)
+    assert latest_discovery_outcomes_by_observation(rerun_rows)[observation_id][
+        "outcome_revision"
+    ] == 2
+
+
+def _counted_selector(real, calls):
+    def counted(
+        snapshots,
+        *,
+        min_score=MIN_TECHNICAL_SCORE,
+        limit=MAX_CANDIDATES,
+        on_evaluated=None,
+        scan_id=None,
+    ):
+        calls.append({"on_evaluated": on_evaluated is not None, "scan_id": scan_id})
+        return real(
+            snapshots,
+            min_score=min_score,
+            limit=limit,
+            on_evaluated=on_evaluated,
+            scan_id=scan_id,
+        )
+
+    return counted
+
+
+def test_selector_called_exactly_once_telemetry_off(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.select_candidates",
+        _counted_selector(select_directional_candidates, calls),
+    )
+    selected = _select_production_candidates(
+        [_snapshot(technical_score=91)],
+        telemetry_enabled=False,
+        screening_rows=[],
+        observed_at=NOW,
+        scan_id="S1",
+        universe_count=1,
+    )
+    assert len(calls) == 1
+    assert calls[0]["on_evaluated"] is False
+    assert len(selected) == 1
+
+
+def test_selector_called_exactly_once_telemetry_on(monkeypatch):
+    calls = []
+    rows = []
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.select_candidates",
+        _counted_selector(select_directional_candidates, calls),
+    )
+    selected = _select_production_candidates(
+        [_snapshot(technical_score=91)],
+        telemetry_enabled=True,
+        screening_rows=rows,
+        observed_at=NOW,
+        scan_id="S1",
+        universe_count=1,
+    )
+    assert len(calls) == 1
+    assert calls[0]["on_evaluated"] is True
+    assert len(selected) == 1
+    assert rows
+    assert rows[0]["outcome"] == PENDING_FINALIZATION
+
+
+def test_hostile_callback_selector_called_once_same_shortlist(monkeypatch):
+    snapshots = [
+        _snapshot(technical_score=91),
+        _snapshot(symbol="ETHUSD", primary_pair="ETHUSD", underlying_asset="ETH", technical_score=70),
+    ]
+    calls = []
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.select_candidates",
+        _counted_selector(select_directional_candidates, calls),
+    )
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("telemetry down")
+
+    monkeypatch.setattr("app.jobs.scan_opportunities.build_callback_evaluation", boom)
+    selected = _select_production_candidates(
+        list(snapshots),
+        telemetry_enabled=True,
+        screening_rows=[],
+        observed_at=NOW,
+        scan_id="S1",
+        universe_count=2,
+    )
+    control = select_directional_candidates(list(snapshots))
+    assert len(calls) == 1
+    assert [(item.symbol, item.technical_score, item.trade_direction) for item in selected] == [
+        (item.symbol, item.technical_score, item.trade_direction) for item in control
+    ]
+
+
+def test_selector_exception_parity_telemetry_on_and_off(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("selector defect")
+
+    monkeypatch.setattr("app.jobs.scan_opportunities.select_candidates", boom)
+    for enabled in (False, True):
+        with pytest.raises(RuntimeError, match="selector defect"):
+            _select_production_candidates(
+                [_snapshot()],
+                telemetry_enabled=enabled,
+                screening_rows=[],
+                observed_at=NOW,
+                scan_id="S1",
+                universe_count=1,
+            )
+
+
+def test_finalize_failure_does_not_persist_provisional_rows(monkeypatch):
+    selected = [_snapshot(technical_score=91)]
+    captured = list(selected)
+    provisional = build_callback_evaluation(
+        selected[0], 91, 10, "LONG", observed_at=NOW, scan_id="S1", universe_count=1
+    )
+    assert provisional["outcome"] == PENDING_FINALIZATION
+    persisted = []
+    dead = []
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("finalize exploded")
+
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.finalize_broad_search_evaluations",
+        boom,
+    )
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.append_screening_evaluations",
+        lambda rows, **_kwargs: persisted.extend(list(rows)) or len(list(rows)),
+    )
+    monkeypatch.setattr(
+        "app.jobs.scan_opportunities.append_qualification_dead_letter",
+        lambda rows, **_kwargs: dead.extend(list(rows)) or len(list(rows)),
+    )
+    _persist_broad_screening_fail_open(
+        rows=[provisional],
+        selected=selected,
+        scan=SimpleNamespace(failures=[], skips=[], data_quality_rejections=[]),
+        observed_at=NOW,
+        scan_id="S1",
+        universe_count=1,
+    )
+    assert selected[0].technical_score == captured[0].technical_score
+    assert persisted == []
+    assert any(row.get("record_type") == "SCREENING_FINALIZATION_FAILED" for row in dead)
+    assert attribute_stage0_observation(provisional) == PENDING_FINALIZATION
+    assert PENDING_FINALIZATION not in STAGE0_ATTRIBUTION_CATEGORIES
+    assert not attributions_are_exclusive([PENDING_FINALIZATION])
+
+
+def test_below_threshold_wrong_direction_market_winner():
+    snapshot = _snapshot(technical_score=60, rsi=20, trend="bearish", macd_line=-1, volume_ratio=0.4)
+    row = build_callback_evaluation(
+        snapshot, 60, 59, "LONG", observed_at=NOW, scan_id="S1", universe_count=1
+    )
+    finalized = finalize_broad_search_evaluations(
+        [row], selected=[], observed_at=NOW, universe_count=1
+    )[0]
+    assert finalized["metadata"]["production_preferred_direction"] == "LONG"
+    assert finalized["metadata"]["production_admission_result"] == "BELOW_THRESHOLD"
+    timeline = _timeline(
+        finalized["venue_instrument_id"],
+        [(15, 90.0), (60, 89.0), (240, 88.0), (720, 87.0), (780, 87.0)],
+    )
+    labeled = label_screening_observation(finalized, timeline, labeled_at=NOW + timedelta(hours=13))
+    assert labeled["production_preferred_direction"] == "LONG"
+    assert labeled["production_discovery_outcome_v1"] == WINNER_NON_WINNER
+    assert labeled["market_discovery_opportunity_v1"] == WINNER_WINNER
+    assert labeled["discovery_outcome_v1"] == WINNER_WINNER
+    assert labeled["realized_opportunity_direction"] == "SHORT"
+    assert labeled["long_target_before_stop"] is False
+    assert labeled["short_target_before_stop"] is True
+    assert labeled["short_mfe_pct"] == pytest.approx(13.0)
+    assert labeled["market_opportunity_definition"] == DISCOVERY_MARKET_OPPORTUNITY_DEFINITION
+    assert labeled["outcome_definition"] == DISCOVERY_OUTCOME_DEFINITION
+
+
+def test_skipped_worker_backlog_recovers_all_observation_ids(tmp_path):
+    from app.jobs.build_discovery_forward_outcomes import build_discovery_outcomes_bounded
+
+    screening_path = tmp_path / "screening_evaluations.jsonl"
+    observation_path = tmp_path / "full_market_observations.jsonl"
+    output_dir = tmp_path / "discovery"
+    screening_path.write_text("", encoding="utf-8")
+    observation_path.write_text("", encoding="utf-8")
+
+    def arrive(start: int, count: int) -> list[str]:
+        ids = []
+        rows = []
+        observations = []
+        for index in range(start, start + count):
+            snapshot = _snapshot(
+                symbol=f"B{index:03d}USD",
+                primary_pair=f"B{index:03d}USD",
+                underlying_asset=f"B{index:03d}",
+                technical_score=90,
+            )
+            finalized = _finalize_snapshot(snapshot, scan_id=f"SCAN{index}")
+            rows.append(finalized)
+            ids.append(finalized["metadata"]["observation_id"])
+            venue_id = finalized["venue_instrument_id"]
+            observations.extend(
+                [
+                    _observation(venue_id, NOW + timedelta(minutes=30), 104.0),
+                    _observation(venue_id, NOW + timedelta(hours=12), 105.0),
+                    _observation(venue_id, NOW + timedelta(hours=13), 105.0),
+                ]
+            )
+        _append_jsonl(screening_path, rows)
+        _append_jsonl(observation_path, observations)
+        return ids
+
+    first_wave = arrive(0, 5)
+    first = build_discovery_outcomes_bounded(
+        screening_path=screening_path,
+        observation_path=observation_path,
+        output_dir=output_dir,
+        max_rows=3,
+        now=NOW + timedelta(hours=13),
+    )
+    assert first["evaluated"] == 3
+    skipped_wave = arrive(5, 5)
+    # One outcomes cycle is skipped here on purpose.
+    for _ in range(8):
+        summary = build_discovery_outcomes_bounded(
+            screening_path=screening_path,
+            observation_path=observation_path,
+            output_dir=output_dir,
+            max_rows=3,
+            now=NOW + timedelta(hours=13, minutes=20),
+        )
+        if summary["evaluated"] == 0:
+            break
+    all_rows = [
+        json.loads(line)
+        for line in (output_dir / "forward_outcomes.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    latest = latest_discovery_outcomes_by_observation(all_rows)
+    expected = set(first_wave + skipped_wave)
+    assert set(latest) == expected
+    assert all(row["window_complete"] is True for row in latest.values())
+    assert all(int(row["outcome_revision"] or 0) >= 1 for row in latest.values())
+
+
+def test_per_direction_cap_exclusion_is_not_global_cutoff():
+    longs = [
+        _snapshot(
+            symbol=f"L{i}USD",
+            primary_pair=f"L{i}USD",
+            underlying_asset=f"L{i}",
+            technical_score=99 - i,
+        )
+        for i in range(6)
+    ]
+    shorts = [
+        _snapshot(
+            symbol=f"S{i}USD",
+            primary_pair=f"S{i}USD",
+            underlying_asset=f"S{i}",
+            technical_score=40,
+            last_price=80.0,
+            ema20=85.0,
+            ema50=90.0,
+            ema200=100.0,
+            rsi=60.0,
+            macd_line=-1.0,
+            macd_signal=0.0,
+            macd_histogram=-1.0,
+            volume_ratio=2.0,
+            atr_pct=2.0,
+            trend="bearish",
+        )
+        for i in range(3)
+    ]
+    snapshots = longs + shorts
+    rows = []
+    selected = select_directional_candidates(
+        snapshots,
+        on_evaluated=lambda snap, long_s, short_s, direction: rows.append(
+            build_callback_evaluation(
+                snap, long_s, short_s, direction, observed_at=NOW, scan_id="MIX", universe_count=9
+            )
+        ),
+    )
+    selected_ids = {item.symbol for item in selected}
+    assert "L5USD" not in selected_ids
+    assert any(item.symbol.startswith("S") for item in selected)
+    assert any(item.trade_direction == "SHORT" for item in selected)
+    long5 = next(item for item in selected if item.symbol == "L0USD")
+    assert long5.technical_score > 90
+    finalized = finalize_broad_search_evaluations(
+        rows, selected=selected, observed_at=NOW, universe_count=9
+    )
+    by_id = {row["venue_instrument_id"]: row for row in finalized}
+    excluded = by_id["L5USD"]
+    admitted_short = next(
+        row for row in finalized if row["venue_instrument_id"].startswith("S") and row["outcome"] == "ADVANCED"
+    )
+    assert excluded["metadata"]["production_admission_result"] == "RANKED_OUTSIDE_BUDGET"
+    assert excluded["metadata"]["production_exclusion_reason"] == EXCLUSION_PER_DIRECTION_CAP
+    assert excluded["long_score"] > admitted_short["short_score"]
+    assert admitted_short["metadata"]["production_admission_result"] == "ADMITTED"
+
+
+def test_measured_v2_01_screening_row_bytes_keep_conservative_budget():
+    from app.opip.decision.store import (
+        BROAD_SEARCH_SCANS_PER_DAY,
+        SCREENING_P95_ROW_BYTES,
+        STAGE0_CAPACITY_SAFETY_FACTOR,
+        STAGE0_REQUIRED_RECOVERY_DAYS,
+    )
+
+    snapshots = []
+    for i in range(12):
+        score = 99 - i if i < 9 else 40
+        snapshots.append(
+            _snapshot(
+                symbol=f"Z{i:02d}USD",
+                primary_pair=f"Z{i:02d}USD",
+                underlying_asset=f"Z{i:02d}",
+                technical_score=score,
+                rsi=20 if score < 80 else 60,
+                trend="bearish" if score < 80 else "bullish",
+            )
+        )
+    rows = []
+    selected = select_directional_candidates(
+        snapshots,
+        on_evaluated=lambda snap, long_s, short_s, direction: rows.append(
+            build_callback_evaluation(
+                snap, long_s, short_s, direction, observed_at=NOW, scan_id="SIZE", universe_count=12
+            )
+        ),
+    )
+    finalized = finalize_broad_search_evaluations(
+        rows, selected=selected, observed_at=NOW, universe_count=12
+    )
+    encoded = [
+        len(json.dumps(row, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        for row in finalized
+    ]
+    encoded.sort()
+    median = encoded[len(encoded) // 2]
+    p95_index = max(0, int(round(0.95 * (len(encoded) - 1))))
+    p95 = encoded[p95_index]
+    assert median > 0
+    assert p95 >= median
+    assert SCREENING_P95_ROW_BYTES >= p95
+    daily_200 = 200 * BROAD_SEARCH_SCANS_PER_DAY * SCREENING_P95_ROW_BYTES
+    daily_250 = 250 * BROAD_SEARCH_SCANS_PER_DAY * SCREENING_P95_ROW_BYTES
+    footprint_14d_200 = int(
+        STAGE0_CAPACITY_SAFETY_FACTOR * daily_200 * STAGE0_REQUIRED_RECOVERY_DAYS
+    )
+    footprint_14d_250 = int(
+        STAGE0_CAPACITY_SAFETY_FACTOR * daily_250 * STAGE0_REQUIRED_RECOVERY_DAYS
+    )
+    assert footprint_14d_250 >= footprint_14d_200
+    assert footprint_14d_200 > 0
+
+
+def test_pending_finalization_is_not_a_terminal_attribution():
+    from app.opip.discovery.attribution import attributions_are_exclusive
+
+    row = build_callback_evaluation(
+        _snapshot(), 91, 10, "LONG", observed_at=NOW, scan_id="S1", universe_count=1
+    )
+    assert attribute_stage0_observation(row) == PENDING_FINALIZATION
+    assert PENDING_FINALIZATION not in STAGE0_ATTRIBUTION_CATEGORIES
+    assert not attributions_are_exclusive([PENDING_FINALIZATION])

@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from app.opip.discovery.constants import (
     DISCOVERY_FORWARD_OUTCOME_SCHEMA_VERSION,
     DISCOVERY_HORIZONS,
+    DISCOVERY_MARKET_OPPORTUNITY_DEFINITION,
     DISCOVERY_OUTCOME_DEFINITION,
     DISCOVERY_OUTCOME_LABEL_SCHEMA_VERSION,
     DISCOVERY_PRIMARY_HORIZON,
@@ -259,6 +260,37 @@ def discovery_v1_winner_label(primary: Mapping[str, Any]) -> str:
     return WINNER_INCOMPLETE
 
 
+def _prefer_opportunity_direction(
+    long_label: str,
+    short_label: str,
+    long_mfe: float | None,
+    short_mfe: float | None,
+) -> str | None:
+    """Choose the realized opportunity direction. Tie-break LONG. Evaluation only."""
+    long_win = long_label == WINNER_WINNER
+    short_win = short_label == WINNER_WINNER
+    if long_win and not short_win:
+        return "LONG"
+    if short_win and not long_win:
+        return "SHORT"
+    if long_win and short_win:
+        long_val = long_mfe if long_mfe is not None else float("-inf")
+        short_val = short_mfe if short_mfe is not None else float("-inf")
+        if short_val > long_val:
+            return "SHORT"
+        return "LONG"
+    return None
+
+
+def market_opportunity_label(long_label: str, short_label: str) -> str:
+    """Whether a qualifying directional opportunity occurred, ignoring scorer preference."""
+    if long_label == WINNER_WINNER or short_label == WINNER_WINNER:
+        return WINNER_WINNER
+    if long_label == WINNER_INCOMPLETE or short_label == WINNER_INCOMPLETE:
+        return WINNER_INCOMPLETE
+    return WINNER_NON_WINNER
+
+
 def label_screening_observation(
     row: Mapping[str, Any],
     timeline: SymbolTimeline | None,
@@ -279,7 +311,12 @@ def label_screening_observation(
     ) or _positive((features or {}).get("last_price"))
     atr_pct = _finite((features or {}).get("atr_pct")) if features else None
 
-    stronger = str((metadata or {}).get("stronger_direction") or row.get("advanced_direction") or "LONG")
+    stronger = str(
+        (metadata or {}).get("production_preferred_direction")
+        or (metadata or {}).get("stronger_direction")
+        or row.get("advanced_direction")
+        or "LONG"
+    )
     if stronger not in {"LONG", "SHORT"}:
         stronger = "LONG"
     favorable, adverse, barrier_basis = discovery_v1_barriers(atr_pct=atr_pct)
@@ -290,6 +327,7 @@ def label_screening_observation(
         "schema_version": DISCOVERY_FORWARD_OUTCOME_SCHEMA_VERSION,
         "label_schema_version": DISCOVERY_OUTCOME_LABEL_SCHEMA_VERSION,
         "outcome_definition": DISCOVERY_OUTCOME_DEFINITION,
+        "market_opportunity_definition": DISCOVERY_MARKET_OPPORTUNITY_DEFINITION,
         "measurement_only": True,
         "offline_label_only": True,
         "trade_authority_changed": False,
@@ -304,6 +342,7 @@ def label_screening_observation(
         "observed_at": observed_at.isoformat() if observed_at is not None else None,
         "reference_at": observed_at.isoformat() if observed_at is not None else None,
         "reference_price": reference_price,
+        "production_preferred_direction": stronger,
         "direction": stronger,
         "labeled_at": (labeled_at or datetime.now(timezone.utc)).isoformat(),
         "barrier_basis": barrier_basis,
@@ -311,54 +350,88 @@ def label_screening_observation(
         "adverse_barrier_pct": adverse,
         "horizons": {},
     }
+    empty_horizon = {
+        "horizon_observed": False,
+        "horizon_return_pct": None,
+        "window_complete": False,
+        "maturation_status": MATURATION_NO_FORWARD_DATA,
+        "target_before_stop": None,
+        "long_target_before_stop": None,
+        "short_target_before_stop": None,
+        "long_mfe_pct": None,
+        "long_mae_pct": None,
+        "short_mfe_pct": None,
+        "short_mae_pct": None,
+    }
     if observed_at is None or reference_price is None or timeline is None or len(timeline) == 0:
         payload["maturation_status"] = MATURATION_NO_FORWARD_DATA
         payload["discovery_outcome_v1"] = WINNER_INCOMPLETE
-        payload["horizons"] = {
-            label: {
-                "horizon_observed": False,
-                "horizon_return_pct": None,
-                "window_complete": False,
-                "maturation_status": MATURATION_NO_FORWARD_DATA,
-                "target_before_stop": None,
-            }
-            for label in DISCOVERY_HORIZONS
-        }
+        payload["production_discovery_outcome_v1"] = WINNER_INCOMPLETE
+        payload["market_discovery_opportunity_v1"] = WINNER_INCOMPLETE
+        payload["realized_opportunity_direction"] = None
+        payload["long_target_before_stop"] = None
+        payload["short_target_before_stop"] = None
+        payload["window_complete"] = False
+        payload["horizons"] = {label: dict(empty_horizon) for label in DISCOVERY_HORIZONS}
         return payload
 
     horizons: dict[str, Any] = {}
     for label, delta in DISCOVERY_HORIZONS.items():
-        horizons[label] = _horizon_payload(
+        long_payload = _horizon_payload(
             timeline,
             reference_at=observed_at,
             reference_price=reference_price,
-            direction=stronger,
+            direction="LONG",
             horizon=delta,
             favorable_barrier_pct=favorable,
             adverse_barrier_pct=adverse,
         )
-        # Dual-direction raw path so a later definition can recompute without
-        # destroying LONG/SHORT evidence.
-        opposite = "SHORT" if stronger == "LONG" else "LONG"
-        horizons[label][f"{stronger.lower()}_mfe_pct"] = horizons[label]["mfe_pct"]
-        horizons[label][f"{stronger.lower()}_mae_pct"] = horizons[label]["mae_pct"]
-        opposite_payload = _horizon_payload(
+        short_payload = _horizon_payload(
             timeline,
             reference_at=observed_at,
             reference_price=reference_price,
-            direction=opposite,
+            direction="SHORT",
             horizon=delta,
             favorable_barrier_pct=favorable,
             adverse_barrier_pct=adverse,
         )
-        horizons[label][f"{opposite.lower()}_mfe_pct"] = opposite_payload["mfe_pct"]
-        horizons[label][f"{opposite.lower()}_mae_pct"] = opposite_payload["mae_pct"]
+        preferred = long_payload if stronger == "LONG" else short_payload
+        merged = dict(preferred)
+        merged["long_mfe_pct"] = long_payload["mfe_pct"]
+        merged["long_mae_pct"] = long_payload["mae_pct"]
+        merged["short_mfe_pct"] = short_payload["mfe_pct"]
+        merged["short_mae_pct"] = short_payload["mae_pct"]
+        merged["long_target_before_stop"] = long_payload.get("target_before_stop")
+        merged["short_target_before_stop"] = short_payload.get("target_before_stop")
+        merged["long_discovery_outcome_v1"] = discovery_v1_winner_label(long_payload)
+        merged["short_discovery_outcome_v1"] = discovery_v1_winner_label(short_payload)
+        horizons[label] = merged
 
     payload["horizons"] = horizons
     primary = horizons[DISCOVERY_PRIMARY_HORIZON]
+    long_label = str(primary.get("long_discovery_outcome_v1") or WINNER_INCOMPLETE)
+    short_label = str(primary.get("short_discovery_outcome_v1") or WINNER_INCOMPLETE)
+    production_label = long_label if stronger == "LONG" else short_label
+    market_label = market_opportunity_label(long_label, short_label)
+    realized = _prefer_opportunity_direction(
+        long_label,
+        short_label,
+        primary.get("long_mfe_pct"),
+        primary.get("short_mfe_pct"),
+    )
     payload["maturation_status"] = primary["maturation_status"]
-    payload["discovery_outcome_v1"] = discovery_v1_winner_label(primary)
+    payload["window_complete"] = bool(primary.get("window_complete"))
+    payload["discovery_outcome_v1"] = market_label
+    payload["production_discovery_outcome_v1"] = production_label
+    payload["market_discovery_opportunity_v1"] = market_label
+    payload["realized_opportunity_direction"] = realized
     payload["target_before_stop"] = primary.get("target_before_stop")
+    payload["long_target_before_stop"] = primary.get("long_target_before_stop")
+    payload["short_target_before_stop"] = primary.get("short_target_before_stop")
     payload["mfe_pct"] = primary.get("mfe_pct")
     payload["mae_pct"] = primary.get("mae_pct")
+    payload["long_mfe_pct"] = primary.get("long_mfe_pct")
+    payload["long_mae_pct"] = primary.get("long_mae_pct")
+    payload["short_mfe_pct"] = primary.get("short_mfe_pct")
+    payload["short_mae_pct"] = primary.get("short_mae_pct")
     return payload

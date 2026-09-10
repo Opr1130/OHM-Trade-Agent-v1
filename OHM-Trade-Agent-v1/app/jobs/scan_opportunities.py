@@ -6,12 +6,13 @@ from types import SimpleNamespace
 
 from app.core.config import get_settings
 from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
-from app.opip.decision.store import append_screening_evaluations
+from app.opip.decision.store import append_screening_evaluations, append_qualification_dead_letter
 from app.opip.discovery.admission import (
     build_callback_evaluation,
     finalize_broad_search_evaluations,
     unavailable_instrument_evaluations,
 )
+from app.opip.discovery.constants import PENDING_FINALIZATION
 from app.opip.discovery.telemetry import ScanComputeTracker
 from app.opip.decision.observer import build_scan_observer
 from app.opip.events.provider_health import ProviderHealthStore
@@ -121,6 +122,91 @@ def _broad_screening_callback(*, rows, observed_at, scan_id, universe_count):
     return capture
 
 
+def _canonical_screening_rows(rows: list) -> list:
+    canonical: list = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        outcome = str(row.get("outcome") or "")
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if outcome == PENDING_FINALIZATION:
+            continue
+        if str(metadata.get("production_admission_result") or "") == PENDING_FINALIZATION:
+            continue
+        if str(metadata.get("finalization_status") or "") == PENDING_FINALIZATION:
+            continue
+        canonical.append(row)
+    return canonical
+
+
+def _record_screening_measurement_failure(
+    *,
+    scan_id: str,
+    operation: str,
+    error: BaseException,
+    provisional_row_count: int,
+) -> None:
+    try:
+        append_qualification_dead_letter(
+            [
+                {
+                    "record_type": "SCREENING_FINALIZATION_FAILED",
+                    "measurement_only": True,
+                    "trade_authority_changed": False,
+                    "scan_id": scan_id,
+                    "operation": operation,
+                    "error": type(error).__name__,
+                    "provisional_row_count": int(provisional_row_count),
+                    "persisted_canonical_rows": 0,
+                }
+            ]
+        )
+    except Exception as dead_exc:
+        logger.warning(
+            "O'Pip screening diagnostic persist failed open scan_id=%s error=%s",
+            scan_id,
+            type(dead_exc).__name__,
+        )
+
+
+def _select_production_candidates(
+    snapshots,
+    *,
+    telemetry_enabled: bool,
+    screening_rows: list,
+    observed_at,
+    scan_id: str,
+    universe_count: int,
+):
+    """Invoke the production selector exactly once.
+
+    Telemetry construction may fail soft. The selector call itself is never
+    retried and never swallowed.
+    """
+    kwargs = {}
+    if telemetry_enabled:
+        try:
+            callback = _broad_screening_callback(
+                rows=screening_rows,
+                observed_at=observed_at,
+                scan_id=scan_id,
+                universe_count=universe_count,
+            )
+            parameters = inspect.signature(select_candidates).parameters
+            if "on_evaluated" in parameters:
+                kwargs["on_evaluated"] = callback
+            if "scan_id" in parameters:
+                kwargs["scan_id"] = scan_id
+        except Exception as exc:
+            logger.warning(
+                "O'Pip screening callback construction failed open scan_id=%s error=%s",
+                scan_id,
+                type(exc).__name__,
+            )
+            kwargs = {}
+    return select_candidates(snapshots, **kwargs)
+
+
 def _persist_broad_screening_fail_open(
     *,
     rows,
@@ -156,7 +242,8 @@ def _persist_broad_screening_fail_open(
                 split_canonical_pair=split_canonical_pair,
             )
         )
-        append_screening_evaluations(finalized, enabled=True)
+        canonical = _canonical_screening_rows(finalized)
+        append_screening_evaluations(canonical, enabled=True)
     except Exception as exc:
         logger.warning(
             "O'Pip screening persist failed open scanner_type=BROAD_SEARCH "
@@ -164,14 +251,12 @@ def _persist_broad_screening_fail_open(
             scan_id,
             type(exc).__name__,
         )
-        try:
-            append_screening_evaluations(list(rows), enabled=True)
-        except Exception as fallback_exc:
-            logger.warning(
-                "O'Pip screening persist fallback failed open scan_id=%s error=%s",
-                scan_id,
-                type(fallback_exc).__name__,
-            )
+        _record_screening_measurement_failure(
+            scan_id=scan_id,
+            operation="finalize_or_append",
+            error=exc,
+            provisional_row_count=len(list(rows) or []),
+        )
 
 
 def _screening_scan_id(observer) -> str:
@@ -898,31 +983,14 @@ def main():
     )
     screening_rows: list[dict] = []
     screening_scan_id = _screening_scan_id(opip)
-    candidates = None
-    if opip.telemetry_enabled:
-        try:
-            screening_callback = _broad_screening_callback(
-                rows=screening_rows,
-                observed_at=decision_at,
-                scan_id=screening_scan_id,
-                universe_count=len(scan.snapshots),
-            )
-            selector_kwargs = {}
-            selector_parameters = inspect.signature(select_candidates).parameters
-            if "on_evaluated" in selector_parameters:
-                selector_kwargs["on_evaluated"] = screening_callback
-            if "scan_id" in selector_parameters:
-                selector_kwargs["scan_id"] = screening_scan_id
-            candidates = select_candidates(scan.snapshots, **selector_kwargs)
-        except Exception as exc:
-            logger.warning(
-                "O'Pip screening callback path failed open scan_id=%s error=%s",
-                screening_scan_id,
-                type(exc).__name__,
-            )
-            candidates = None
-    if candidates is None:
-        candidates = select_candidates(scan.snapshots)
+    candidates = _select_production_candidates(
+        scan.snapshots,
+        telemetry_enabled=bool(opip.telemetry_enabled),
+        screening_rows=screening_rows,
+        observed_at=decision_at,
+        scan_id=screening_scan_id,
+        universe_count=len(scan.snapshots),
+    )
     if opip.telemetry_enabled:
         _persist_broad_screening_fail_open(
             rows=screening_rows,

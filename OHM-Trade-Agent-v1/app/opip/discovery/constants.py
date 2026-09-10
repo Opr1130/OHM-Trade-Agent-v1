@@ -23,7 +23,32 @@ DISCOVERY_ATTRIBUTION_TAXONOMY_VERSION = "DISCOVERY_ATTRIBUTION_V1"
 DISCOVERY_EARLINESS_SCHEMA_VERSION = 1
 
 DISCOVERY_OUTCOME_DEFINITION = "DISCOVERY_OUTCOME_V1"
+DISCOVERY_MARKET_OPPORTUNITY_DEFINITION = "DISCOVERY_MARKET_OPPORTUNITY_V1"
 DISCOVERY_OUTCOME_LABEL_SCHEMA_VERSION = 1
+
+# Internal callback status. Never a terminal Stage-0 admission classification.
+PENDING_FINALIZATION = "PENDING_FINALIZATION"
+
+# Explanatory production-selector exclusion reasons. Not ranking authority.
+EXCLUSION_GLOBAL_CAP = "GLOBAL_CAP"
+EXCLUSION_PER_DIRECTION_CAP = "PER_DIRECTION_CAP"
+EXCLUSION_UNDERLYING_DEDUP = "UNDERLYING_DEDUP"
+
+# Catch-up batch: Broad Search ~200 rows / 5 min; outcomes worker every 10 min
+# arrives ~400 rows/cycle. 1000 exceeds one skipped cycle (800) with headroom.
+DISCOVERY_BOUNDED_MAX_ROWS = 1000
+DISCOVERY_BOUNDED_RETRY_DELAY = timedelta(hours=1)
+DISCOVERY_BOUNDED_CHECKPOINT_ANCHOR_BYTES = 4096
+DISCOVERY_MATURATION_MILESTONES = (
+    timedelta(minutes=5),
+    timedelta(minutes=15),
+    timedelta(minutes=30),
+    timedelta(hours=1),
+    timedelta(hours=4),
+    timedelta(hours=8),
+    timedelta(hours=12),
+    timedelta(hours=13),
+)
 
 # Initial horizons for V2-01. Labels are explicit durations, not scan counts.
 DISCOVERY_HORIZONS = {
@@ -74,6 +99,8 @@ SCREENING_TO_ATTRIBUTION = {
     "DATA_UNAVAILABLE": ATTRIBUTION_DATA_UNAVAILABLE,
     "EXCLUDED_MARKET": ATTRIBUTION_EXCLUDED_MARKET,
 }
+
+COMPUTE_MEASUREMENT_SCOPE = "BROAD_DISCOVERY_AND_SELECTION"
 
 WINNER_INCOMPLETE = "INCOMPLETE"
 WINNER_WINNER = "WINNER"
