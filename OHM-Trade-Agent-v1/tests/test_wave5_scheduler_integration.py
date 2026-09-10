@@ -7,7 +7,7 @@ from app.services import learning_scheduler
 
 
 def test_learning_cycle_includes_wave5_outcomes_without_paid_ai(monkeypatch):
-    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: False)
     now = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
@@ -55,7 +55,7 @@ def test_learning_cycle_includes_wave5_outcomes_without_paid_ai(monkeypatch):
 
 
 def test_wave5_outcome_failure_is_fail_open(monkeypatch):
-    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: False)
     now = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
@@ -96,8 +96,8 @@ def test_wave5_outcome_failure_is_fail_open(monkeypatch):
     assert "RuntimeError" in result["wave5_explosion_learning"]["reason"]
 
 
-def test_production_learning_is_remote_only_and_does_not_touch_local_observers(monkeypatch):
-    monkeypatch.setenv("APP_ENV", "production")
+def test_conservative_production_runtime_is_remote_only_and_does_not_touch_local_observers(monkeypatch):
+    monkeypatch.setattr(learning_scheduler, "conservative_runtime", lambda: True)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("production core must not execute local learning compute")
