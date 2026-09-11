@@ -1,0 +1,21 @@
+{
+  "record_type": "FeatureSnapshot",
+  "schema_version": 1,
+  "snapshot_id": "FS:1:solusd:2026-09-11T15:01:00Z:features-v1",
+  "feature_version": "features-v1",
+  "evaluation_cutoff": "2026-09-11T15:01:00Z",
+  "consumed_input_watermark": {
+    "history_epoch": 1,
+    "local_sequence": 1042
+  },
+  "evaluation_grid_seconds": 60,
+  "missingness": {
+    "book_depth": "PRESENT",
+    "trade_tape": "NOT_RETAINED"
+  },
+  "values": {
+    "return_1m": 0.0012,
+    "range_15m": 0.0084
+  },
+  "notes": "15-minute range is a feature input only; IGNITION evaluation_cutoff is 1-minute."
+}

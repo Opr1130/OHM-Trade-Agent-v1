@@ -1,0 +1,21 @@
+{
+  "record_type": "DatasetExportManifest",
+  "schema_version": 1,
+  "manifest_id": "EXPORT:7df7d6e588a6ff8e9ecade7cc7220548d187a45d:2026-09-11T15:02:00Z",
+  "source_release_sha": "7df7d6e588a6ff8e9ecade7cc7220548d187a45d",
+  "published_and_verified_before_commit": true,
+  "consumers_read_committed_manifest_only": true,
+  "objects": [
+    {
+      "path": "full_market_observations.jsonl",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "complete": true
+    }
+  ],
+  "watermark": {
+    "history_epoch": 1,
+    "local_sequence": 1042
+  },
+  "rpo_seconds_provisional": 300,
+  "rto_seconds_provisional": 1800
+}

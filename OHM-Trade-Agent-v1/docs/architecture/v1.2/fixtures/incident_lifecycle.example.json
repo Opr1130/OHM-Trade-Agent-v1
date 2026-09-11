@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "lifecycle": ["OPEN", "CHANGED", "ESCALATED", "RECOVERED"],
+  "bounded_reminder_policy": {
+    "no_per_cycle_duplicates": true,
+    "source_as_built": "alert_governor",
+    "pr2_boundary": {
+      "file": "app/services/alert_governor.py",
+      "evaluate": "evaluate_opportunity_alert",
+      "commit": "record_opportunity_alert",
+      "rollback": "release_opportunity_alert_reservation"
+    }
+  },
+  "example": {
+    "incident_id": "INC:alert:EARLY_MOVER:SOLUSD:2026-09-11T15:01:00Z",
+    "identity": "EARLY_MOVER:SOLUSD",
+    "states": [
+      {"at": "2026-09-11T15:01:00Z", "state": "OPEN", "governor_action": "CREATE"},
+      {"at": "2026-09-11T15:18:00Z", "state": "CHANGED", "governor_action": "EDIT", "reason": "MEANINGFUL_TRANSITION"},
+      {"at": "2026-09-11T16:05:00Z", "state": "RECOVERED", "governor_action": "EDIT", "reason": "RECOVERED"}
+    ]
+  }
+}

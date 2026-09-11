@@ -1,0 +1,15 @@
+{
+  "record_type": "CoverageIncident",
+  "schema_version": 1,
+  "incident_id": "COV:kraken:ohlc-1m:2026-09-11T15:00:00Z",
+  "stream": "fixed_interval_aggregate:60s",
+  "gap_start": "2026-09-11T15:00:00Z",
+  "gap_end": "2026-09-11T15:03:00Z",
+  "affected_instruments": ["SOLUSD"],
+  "affected_open_positions": [],
+  "new_entry_policy": "FAIL_CLOSED",
+  "open_position_policy": "PRESERVE_STATE_MARK_UNCERTAINTY",
+  "fidelity_impact": "C",
+  "provenance": "feed-gap-detector",
+  "resolution": null
+}

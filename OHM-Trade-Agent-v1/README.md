@@ -22,6 +22,12 @@ A conservative, **alert-only** trade-signal service designed for someone who wor
 - AI disabled until explicitly enabled
 - No broker or Kraken secret required for v1
 
+## Architecture contracts (v1.2)
+
+PR 1 documentation, repository mapping, and validation fixtures live in
+[`docs/architecture/v1.2/`](docs/architecture/v1.2/README.md).
+They do not change runtime behavior, thresholds, or trading authority.
+
 ## Windows setup
 
 ```powershell
