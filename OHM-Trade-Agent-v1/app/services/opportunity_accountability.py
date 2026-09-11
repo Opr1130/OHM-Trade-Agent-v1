@@ -205,6 +205,65 @@ def _preferred_production_direction(row: Mapping[str, Any]) -> str:
     return ""
 
 
+_STAGE0_ADMISSION_FROM_OUTCOME = {
+    "ADVANCED": "ADMITTED",
+    "COARSE_RANK_LIMIT": "RANKED_OUTSIDE_BUDGET",
+    "BELOW_THRESHOLD": "BELOW_THRESHOLD",
+    "DATA_UNAVAILABLE": "DATA_UNAVAILABLE",
+    "EXCLUDED_MARKET": "EXCLUDED_MARKET",
+}
+
+
+def stage0_fields_from_screening(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonical Stage-0 admission fields. Screening is the authority.
+
+    ``shortlist_admitted`` is True only when Stage-0 admitted the candidate.
+    It is never inferred from funnel presence.
+    """
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+    outcome = str(row.get("outcome") or "").strip().upper()
+    admission = str(
+        (metadata or {}).get("production_admission_result") or ""
+    ).strip().upper()
+    if admission in {"", "PENDING_FINALIZATION"}:
+        admission = _STAGE0_ADMISSION_FROM_OUTCOME.get(outcome, admission or "UNKNOWN")
+    shortlist_selected = bool((metadata or {}).get("shortlist_selected"))
+    if admission == "ADMITTED":
+        shortlist_selected = True
+    shortlist_admitted = admission == "ADMITTED" or (
+        shortlist_selected and admission not in {
+            "RANKED_OUTSIDE_BUDGET",
+            "BELOW_THRESHOLD",
+            "DATA_UNAVAILABLE",
+            "EXCLUDED_MARKET",
+        }
+    )
+    preferred = _preferred_production_direction(row)
+    exclusion = (metadata or {}).get("production_exclusion_reason")
+    exclusion_text = str(exclusion).strip() if exclusion not in {None, ""} else None
+    threshold_passed = (metadata or {}).get("threshold_passed")
+    if threshold_passed is None:
+        threshold_passed = admission in {"ADMITTED", "RANKED_OUTSIDE_BUDGET"}
+    long_score = _finite(row.get("long_score"))
+    short_score = _finite(row.get("short_score"))
+    technical = _finite(row.get("technical_score"))
+    if technical is None:
+        scores = [value for value in (long_score, short_score) if value is not None]
+        technical = max(scores) if scores else None
+    return {
+        "production_admission_result": admission,
+        "shortlist_selected": bool(shortlist_selected),
+        "shortlist_admitted": bool(shortlist_admitted),
+        "production_preferred_direction": preferred or None,
+        "production_exclusion_reason": exclusion_text,
+        "threshold_passed": bool(threshold_passed),
+        "long_score": long_score,
+        "short_score": short_score,
+        "technical_score": technical,
+        "screening_outcome": outcome or "UNKNOWN",
+    }
+
+
 def _observation_id_from_screening(row: Mapping[str, Any]) -> str | None:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     existing = str((metadata or {}).get("observation_id") or "").strip()
@@ -517,6 +576,7 @@ def build_accountability_rows(
         preferred_direction = _preferred_production_direction(screening)
         screening_outcome = str(screening.get("outcome") or "UNKNOWN").upper()
         observation_id = _observation_id_from_screening(screening)
+        stage0 = stage0_fields_from_screening(screening)
 
         for direction, score_field in (("LONG", "long_score"), ("SHORT", "short_score")):
             score = _finite(screening.get(score_field))
@@ -558,8 +618,14 @@ def build_accountability_rows(
                 "direction": direction,
                 "screening_outcome": screening_outcome,
                 "technical_score": score,
+                "shortlist_admitted": bool(stage0["shortlist_admitted"]),
+                "production_admission_result": stage0["production_admission_result"],
                 "production_preferred_direction": preferred_direction or None,
+                "production_exclusion_reason": stage0["production_exclusion_reason"],
+                "funnel_evidence_present": funnel is not None,
                 "production_direction": preferred_direction == direction,
+                # LEGACY: means funnel_evidence_present, not Stage-0 admission.
+                # Future Signal Quality must ignore this field.
                 "production_selected": funnel is not None,
                 "production_threshold": config.production_threshold,
                 "shadow_threshold": config.shadow_threshold,

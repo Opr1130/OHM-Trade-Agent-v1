@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 from app.jobs.reconcile_discovery_accountability_evidence import main as reconcile_main
+from app.opip.discovery import reconciliation as reconciliation_mod
 from app.opip.discovery.admission import (
     finalize_broad_search_evaluations,
     observation_join_id,
@@ -17,11 +19,16 @@ from app.opip.discovery.reconciliation import (
     reconstructed_join_key,
     threshold_authority_report,
 )
-from app.scanner.candidates import MIN_TECHNICAL_SCORE
+from app.scanner.candidates import MAX_CANDIDATES, MIN_TECHNICAL_SCORE, select_candidates
+from app.scanner.directional_candidates import (
+    MAX_PER_DIRECTION,
+    select_directional_candidates,
+)
 from app.scanner.models import MarketSnapshot
 from app.services.opportunity_accountability import (
     ACCOUNTABILITY_WINNER_DEFINITION,
     AccountabilityPolicy,
+    append_accountability_rows,
     build_accountability_rows,
 )
 
@@ -232,3 +239,468 @@ def test_learning_job_script_exposes_one_shot_reconcile_without_new_timer():
 def test_ef_01_does_not_introduce_signal_quality_scorer():
     quality_score = Path(__file__).resolve().parents[1] / "app" / "opip" / "quality" / "score.py"
     assert not quality_score.exists()
+
+
+def test_production_selection_constants_are_unchanged():
+    assert MIN_TECHNICAL_SCORE == 80
+    assert MAX_CANDIDATES == 8
+    assert MAX_PER_DIRECTION == 5
+    assert callable(select_candidates)
+    assert callable(select_directional_candidates)
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _stage0_row(
+    *,
+    scan_id: str,
+    symbol: str,
+    admission: str,
+    long_score: int = 85,
+    short_score: int = 12,
+    exclusion: str | None = None,
+):
+    observed_at = "2026-09-10T12:00:00+00:00"
+    observation_id = observation_join_id(
+        scan_id=scan_id,
+        scanner_type="BROAD_SEARCH",
+        venue_instrument_id=symbol,
+        observed_at=observed_at,
+    )
+    outcome = {
+        "ADMITTED": "ADVANCED",
+        "RANKED_OUTSIDE_BUDGET": "COARSE_RANK_LIMIT",
+        "BELOW_THRESHOLD": "BELOW_THRESHOLD",
+        "DATA_UNAVAILABLE": "DATA_UNAVAILABLE",
+        "EXCLUDED_MARKET": "EXCLUDED_MARKET",
+    }[admission]
+    return {
+        "observed_at": observed_at,
+        "scan_id": scan_id,
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument_id": symbol,
+        "venue_instrument": {"venue_instrument_symbol": symbol},
+        "outcome": outcome,
+        "long_score": long_score,
+        "short_score": short_score,
+        "advanced_direction": "LONG" if admission == "ADMITTED" else None,
+        "metadata": {
+            "observation_id": observation_id,
+            "production_admission_result": admission,
+            "shortlist_selected": admission == "ADMITTED",
+            "production_preferred_direction": "LONG",
+            "production_exclusion_reason": exclusion,
+            "threshold_passed": admission in {"ADMITTED", "RANKED_OUTSIDE_BUDGET"},
+        },
+    }
+
+
+def test_shortlist_admission_is_not_inferred_from_funnel():
+    finalized = finalize_broad_search_evaluations(
+        [_callback(_snapshot(technical_score=85), "SCAN:EF01:SEP", 85, 12)],
+        selected=[],
+        observed_at=NOW,
+        universe_count=8,
+    )[0]
+    rows = build_accountability_rows(
+        screening_rows=[finalized],
+        funnel_rows=[],
+        snapshot_rows=[
+            {
+                "snapshot_id": "SNAP:SEP",
+                "decision_at_utc": finalized["observed_at"],
+                "symbol": "XXBTZUSD",
+                "reference_price": 100.0,
+            }
+        ],
+        outcome_rows=[
+            {
+                "snapshot_id": "SNAP:SEP",
+                "symbol": "XXBTZUSD",
+                "mfe_pct": 6.0,
+                "mae_pct": -1.0,
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+        policy=AccountabilityPolicy(),
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    assert long_row["shortlist_admitted"] is False
+    assert long_row["production_admission_result"] == "RANKED_OUTSIDE_BUDGET"
+    assert long_row["funnel_evidence_present"] is False
+    assert long_row["production_selected"] is False
+
+
+def test_admitted_with_funnel_keeps_legacy_production_selected():
+    screening = {
+        "observed_at": NOW.isoformat(),
+        "scan_id": "SCAN:EF01:FUNNEL",
+        "scanner_type": "BROAD_SEARCH",
+        "venue_instrument": {"venue_instrument_symbol": "TESTUSD"},
+        "outcome": "ADVANCED",
+        "long_score": 90,
+        "short_score": 20,
+        "advanced_direction": "LONG",
+        "metadata": {
+            "observation_id": observation_join_id(
+                scan_id="SCAN:EF01:FUNNEL",
+                scanner_type="BROAD_SEARCH",
+                venue_instrument_id="TESTUSD",
+                observed_at=NOW.isoformat(),
+            ),
+            "production_admission_result": "ADMITTED",
+            "shortlist_selected": True,
+            "production_preferred_direction": "LONG",
+            "reference_price": 100.0,
+            "recent_24h_high": 110.0,
+            "recent_24h_low": 90.0,
+        },
+    }
+    rows = build_accountability_rows(
+        screening_rows=[screening],
+        funnel_rows=[
+            {
+                "scan_id": "SCAN:EF01:FUNNEL",
+                "pair": "TESTUSD",
+                "direction": "LONG",
+                "decision": "QUALIFIED",
+                "terminal_reason_class": "POLICY",
+            }
+        ],
+        snapshot_rows=[
+            {
+                "snapshot_id": "SNAP:FUNNEL",
+                "decision_at_utc": NOW.isoformat(),
+                "symbol": "TESTUSD",
+                "reference_price": 100.0,
+            }
+        ],
+        outcome_rows=[
+            {
+                "snapshot_id": "SNAP:FUNNEL",
+                "symbol": "TESTUSD",
+                "mfe_pct": 6.0,
+                "mae_pct": -1.0,
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+        policy=AccountabilityPolicy(),
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    assert long_row["shortlist_admitted"] is True
+    assert long_row["funnel_evidence_present"] is True
+    assert long_row["production_selected"] is True
+    assert long_row["opportunity_classification"] == "CAPTURED_WINNER"
+
+
+def test_accountability_id_stable_across_ef01_semantic_revision(tmp_path):
+    snapshot = _snapshot(technical_score=85)
+    finalized = finalize_broad_search_evaluations(
+        [_callback(snapshot, "SCAN:EF01:REV", 85, 12)],
+        selected=[],
+        observed_at=NOW,
+        universe_count=8,
+    )[0]
+    rows = build_accountability_rows(
+        screening_rows=[finalized],
+        funnel_rows=[],
+        snapshot_rows=[
+            {
+                "snapshot_id": "SNAP:REV",
+                "decision_at_utc": finalized["observed_at"],
+                "symbol": "XXBTZUSD",
+                "reference_price": 100.0,
+            }
+        ],
+        outcome_rows=[
+            {
+                "snapshot_id": "SNAP:REV",
+                "symbol": "XXBTZUSD",
+                "mfe_pct": 6.0,
+                "mae_pct": -1.0,
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+        policy=AccountabilityPolicy(),
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    accountability_id = long_row["accountability_id"]
+    legacy = {
+        key: value
+        for key, value in long_row.items()
+        if key
+        not in {
+            "shortlist_admitted",
+            "production_admission_result",
+            "production_exclusion_reason",
+            "funnel_evidence_present",
+        }
+    }
+    ledger = tmp_path / "accountability.jsonl"
+    state = tmp_path / "state.sqlite3"
+    first = append_accountability_rows([legacy], path=ledger, state_path=state)
+    second = append_accountability_rows([long_row], path=ledger, state_path=state)
+    assert first[0]["accountability_id"] == accountability_id
+    assert second[0]["accountability_id"] == accountability_id
+    assert first[0]["revision"] == 1
+    assert second[0]["revision"] == 2
+    assert second[0]["shortlist_admitted"] is False
+    assert second[0]["funnel_evidence_present"] is False
+    history = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [row["accountability_id"] for row in history] == [
+        accountability_id,
+        accountability_id,
+    ]
+    assert len({row["accountability_id"] for row in history}) == 1
+
+
+def test_reconcile_rows_reports_stage0_counts_and_mismatches():
+    admitted = _stage0_row(scan_id="SCAN:A", symbol="AAAUSD", admission="ADMITTED")
+    ranked = _stage0_row(
+        scan_id="SCAN:R",
+        symbol="BBBUSD",
+        admission="RANKED_OUTSIDE_BUDGET",
+        exclusion="GLOBAL_CAP",
+    )
+    below = _stage0_row(
+        scan_id="SCAN:B",
+        symbol="CCCUSD",
+        admission="BELOW_THRESHOLD",
+        long_score=65,
+    )
+    unavailable = _stage0_row(
+        scan_id="SCAN:U",
+        symbol="DDDUSD",
+        admission="DATA_UNAVAILABLE",
+        long_score=0,
+    )
+    excluded = _stage0_row(
+        scan_id="SCAN:E",
+        symbol="EEEUSD",
+        admission="EXCLUDED_MARKET",
+        long_score=0,
+    )
+    ranked_obs = ranked["metadata"]["observation_id"]
+    admitted_obs = admitted["metadata"]["observation_id"]
+    report = reconcile_rows(
+        screening_rows=[admitted, ranked, below, unavailable, excluded],
+        discovery_rows=[
+            {
+                "observation_id": ranked_obs,
+                "scan_id": "SCAN:R",
+                "venue_instrument_id": "BBBUSD",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "production_preferred_direction": "LONG",
+                "realized_opportunity_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+                "horizons": {"12h": {"long_mfe_pct": 6.0, "window_complete": True}},
+            }
+        ],
+        accountability_rows=[
+            {
+                "accountability_id": "OA:ranked",
+                "observation_id": ranked_obs,
+                "scan_id": "SCAN:R",
+                "symbol": "BBBUSD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "RANKING_OR_CAP_MISS_CANDIDATE",
+                "market_winner": True,
+                "outcome_complete": True,
+                "funnel_evidence_present": False,
+                "revision": 1,
+            },
+            {
+                "accountability_id": "OA:admitted-miss",
+                "observation_id": admitted_obs,
+                "scan_id": "SCAN:A",
+                "symbol": "AAAUSD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "RANKING_OR_CAP_MISS_CANDIDATE",
+                "market_winner": True,
+                "outcome_complete": True,
+                "funnel_evidence_present": False,
+                "revision": 1,
+            },
+        ],
+    )
+    population = report["stage0_reconciliation"]["population"]
+    assert population["ADMITTED"] == 1
+    assert population["RANKED_OUTSIDE_BUDGET"] == 1
+    assert population["BELOW_THRESHOLD"] == 1
+    assert population["DATA_UNAVAILABLE"] == 1
+    assert population["EXCLUDED_MARKET"] == 1
+    mapping = report["admission_mapping"]
+    assert mapping["ranked_out_preferred_winner_correct_rank_cap_miss"] == 1
+    assert mapping["admitted_missing_funnel"] == 1
+    assert mapping["admitted_incorrectly_mapped_to_rank_cap_miss"] == 1
+    assert mapping["admitted_incorrectly_mapped_to_rank_cap_miss_expected"] == 0
+    assert report["classification_mismatches"]["count"] >= 1
+    assert report["classification_mismatches"]["sample"]
+    assert report["overlap_sample"][0]["stage0"] is not None
+    assert report["identity_reconciliation"]["shared_observation_id_joins"] >= 1
+    assert "resource_usage" in report
+    assert report["winner_definitions"]["unifiable"] is False
+    assert report["maturity_reconciliation"]["equivalence"] == "DIFFERENT_SCOPE_EXPECTED"
+
+
+def test_reconcile_rows_fallback_reconstructed_join():
+    observation_id = observation_join_id(
+        scan_id="SCAN:FB",
+        scanner_type="BROAD_SEARCH",
+        venue_instrument_id="ETHUSD",
+        observed_at="2026-09-10T12:00:00+00:00",
+    )
+    screening = _stage0_row(
+        scan_id="SCAN:FB",
+        symbol="ETHUSD",
+        admission="RANKED_OUTSIDE_BUDGET",
+    )
+    report = reconcile_rows(
+        screening_rows=[screening],
+        discovery_rows=[
+            {
+                "observation_id": observation_id,
+                "scan_id": "SCAN:FB",
+                "venue_instrument_id": "ETHUSD",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "production_preferred_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+        accountability_rows=[
+            {
+                "accountability_id": "OA:fallback",
+                "scan_id": "SCAN:FB",
+                "symbol": "ETH-USD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "RANKING_OR_CAP_MISS_CANDIDATE",
+                "market_winner": True,
+                "outcome_complete": True,
+                "funnel_evidence_present": False,
+                "revision": 1,
+            }
+        ],
+    )
+    assert report["identity_reconciliation"]["fallback_reconstructed_joins"] == 1
+    assert report["identity_reconciliation"]["shared_observation_id_joins"] == 0
+
+
+def test_inspect_replica_streams_large_jsonl_without_read_text(tmp_path, monkeypatch):
+    source = Path(reconciliation_mod.__file__).read_text(encoding="utf-8")
+    assert "read_text(encoding=\"utf-8\").splitlines()" not in source
+    assert ".read_bytes(" not in source
+    assert "def iter_jsonl_dicts(" in source
+
+    original = Path.read_text
+
+    def guarded(self, *args, **kwargs):
+        name = str(self)
+        if name.endswith(".jsonl") or name.endswith(".jsonl.gz"):
+            raise AssertionError(f"unbounded Path.read_text for JSONL: {self}")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+    screening_rows = []
+    discovery_rows = []
+    oa_rows = []
+    for index in range(400):
+        admission = (
+            "ADMITTED"
+            if index % 5 == 0
+            else "RANKED_OUTSIDE_BUDGET"
+            if index % 5 == 1
+            else "BELOW_THRESHOLD"
+            if index % 5 == 2
+            else "DATA_UNAVAILABLE"
+            if index % 5 == 3
+            else "EXCLUDED_MARKET"
+        )
+        row = _stage0_row(
+            scan_id=f"SCAN:BIG:{index}",
+            symbol=f"S{index:04d}USD",
+            admission=admission,
+            long_score=82 if admission != "BELOW_THRESHOLD" else 65,
+        )
+        screening_rows.append(row)
+        observation_id = row["metadata"]["observation_id"]
+        discovery_rows.append(
+            {
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "venue_instrument_id": row["venue_instrument_id"],
+                "observed_at": row["observed_at"],
+                "production_preferred_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        )
+        oa_rows.append(
+            {
+                "accountability_id": f"OA:BIG:{index}",
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "symbol": row["venue_instrument_id"],
+                "direction": "LONG",
+                "observed_at": row["observed_at"],
+                "opportunity_classification": (
+                    "RANKING_OR_CAP_MISS_CANDIDATE"
+                    if admission == "RANKED_OUTSIDE_BUDGET"
+                    else "MARKET_WINNER_UNVERIFIED_EXECUTABILITY"
+                ),
+                "market_winner": True,
+                "outcome_complete": True,
+                "funnel_evidence_present": False,
+                "revision": 1,
+            }
+        )
+
+    _write_jsonl(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl",
+        screening_rows,
+    )
+    _write_jsonl(tmp_path / "opip/discovery/forward_outcomes.jsonl", discovery_rows)
+    _write_jsonl(tmp_path / "opip/opportunity_accountability.jsonl", oa_rows)
+
+    report = inspect_replica(tmp_path)
+    assert report["replica_available"] is True
+    assert report["stage0_reconciliation"]["population"]["total"] == 400
+    assert report["stage0_reconciliation"]["population"]["ADMITTED"] == 80
+    assert report["resource_usage"]["used_path_read_text_for_jsonl"] is False
+    assert report["resource_usage"]["jsonl_ingestion"] == "streaming_line_iterator"
+    assert report["resource_usage"]["processed_physical_rows"]["stage0"] == 400
+    assert report["identity_reconciliation"]["shared_observation_id_joins"] == 400
+
+
+def test_inspect_replica_skips_truncated_and_malformed_jsonl(tmp_path):
+    path = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    valid = _stage0_row(scan_id="SCAN:OK", symbol="OKUSD", admission="ADMITTED")
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(valid) + "\n")
+        handle.write("{not-json\n")
+        handle.write('{"scan_id":"SCAN:TRUNC"')
+    report = inspect_replica(tmp_path)
+    assert report["stage0_reconciliation"]["population"]["ADMITTED"] == 1
+    assert report["resource_usage"]["ingest_stats"]["stage0"]["malformed_rows"] == 1
+    assert report["resource_usage"]["ingest_stats"]["stage0"]["truncated_tail_skipped"] == 1

@@ -515,6 +515,25 @@ def test_from_env_uses_min_technical_score_and_fails_closed_on_drift(monkeypatch
         AccountabilityPolicy.from_env()
 
 
+def test_below_70_winner_is_visible_without_changing_production():
+    rows = _rows(
+        [
+            _screening(
+                score_long=65,
+                score_short=20,
+                outcome="BELOW_THRESHOLD",
+                advanced_direction=None,
+            )
+        ]
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    assert long_row["opportunity_classification"] == "BELOW_THRESHOLD_MARKET_WINNER"
+    assert long_row["market_winner"] is True
+    assert long_row["shortlist_admitted"] is False
+    assert long_row["production_admission_result"] == "BELOW_THRESHOLD"
+    assert long_row["affects_trade_authority"] is False
+
+
 def test_threshold_70_79_winner_is_visible_without_changing_production():
     rows = _rows(
         [
@@ -559,6 +578,9 @@ def test_ranked_outside_budget_winner_is_ranking_or_cap_miss():
     assert long_row["opportunity_classification"] == "RANKING_OR_CAP_MISS_CANDIDATE"
     assert long_row["production_preferred_direction"] == "LONG"
     assert long_row["production_direction"] is True
+    assert long_row["shortlist_admitted"] is False
+    assert long_row["production_admission_result"] == "RANKED_OUTSIDE_BUDGET"
+    assert long_row["funnel_evidence_present"] is False
     assert long_row["winner_definition"] == ACCOUNTABILITY_WINNER_DEFINITION
     assert long_row["counterfactuals"]["expanded_cap_shadow"] is True
     assert long_row["executable_false_negative"] is False
@@ -572,6 +594,35 @@ def test_admitted_without_funnel_is_not_ranking_or_cap_miss():
     )
     assert long_row["counterfactuals"]["expanded_cap_shadow"] is False
     assert long_row["observation_id"]
+    assert long_row["shortlist_admitted"] is True
+    assert long_row["production_admission_result"] == "ADMITTED"
+    assert long_row["funnel_evidence_present"] is False
+    assert long_row["production_selected"] is False
+
+
+def test_ranked_out_opposite_direction_winner_is_not_preferred_cap_miss():
+    rows = _rows(
+        [
+            _screening(
+                outcome="COARSE_RANK_LIMIT",
+                advanced_direction=None,
+                score_long=85,
+                score_short=20,
+            )
+        ],
+        [],
+        outcome=_outcome(mfe=0.4, mae=-6.0),
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    short_row = next(row for row in rows if row["direction"] == "SHORT")
+    assert long_row["production_preferred_direction"] == "LONG"
+    assert long_row["opportunity_classification"] == (
+        "CORRECT_REJECT_OR_NO_MEANINGFUL_MOVE"
+    )
+    assert short_row["market_winner"] is True
+    assert short_row["opportunity_classification"] != "RANKING_OR_CAP_MISS_CANDIDATE"
+    assert short_row["shortlist_admitted"] is False
+    assert short_row["funnel_evidence_present"] is False
 
 
 def test_qualified_signal_paper_outcome_joins_same_accountability_record():
