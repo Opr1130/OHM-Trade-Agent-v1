@@ -1,0 +1,17 @@
+{
+  "record_type": "Observation",
+  "schema_version": 1,
+  "instrument_version_id": "INSTR:kraken:SOL:USD:1",
+  "venue": "kraken",
+  "venue_instrument_id": "SOLUSD",
+  "source_event_time": "2026-09-11T15:01:00Z",
+  "receipt_time": "2026-09-11T15:01:00.220Z",
+  "ingestion_order": 1042,
+  "source_sequence": "kraken-ohlc-1m-1842212460",
+  "history_epoch": 1,
+  "local_sequence": 1042,
+  "aggregate_interval_seconds": 60,
+  "payload_kind": "fixed_interval_aggregate",
+  "coverage": "COMPLETE",
+  "supersedes": null
+}

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "accounts": {
+    "research_simulation": {
+      "starting_equity": 10000,
+      "max_positions": 3
+    },
+    "approved_allocation": {
+      "starting_equity": 10000,
+      "max_positions": 2,
+      "ledger": "logically_separate"
+    }
+  },
+  "entry_outcomes": ["NO_FILL", "PARTIAL_FILL", "FULL_FILL"],
+  "path_outcomes": ["TARGET", "STOP", "TIMEOUT", "RISK_EXIT"],
+  "other_states": ["UNRESOLVED", "INCOMPLETE_COVERAGE", "INSUFFICIENT_EVIDENCE"],
+  "horizon": {
+    "anchor": "first_fill",
+    "additional_fills_restart_horizon": false,
+    "residual_entry_orders_have_own_deadline": true
+  },
+  "example": {
+    "intent_id": "PINTENT:research:solusd:2026-09-11T15:01:00Z",
+    "account": "research_simulation",
+    "entry_outcome": "FULL_FILL",
+    "first_fill_at": "2026-09-11T15:02:12Z",
+    "path_outcome": "TIMEOUT",
+    "fidelity_grade": "B",
+    "mfe": 0.012,
+    "mae": 0.006,
+    "clean_exact_label": false,
+    "reason": "within-bar target/stop order ambiguous; timeout uses declared executable exit policy"
+  }
+}

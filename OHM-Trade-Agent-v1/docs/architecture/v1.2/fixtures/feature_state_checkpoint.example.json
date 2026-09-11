@@ -1,0 +1,19 @@
+{
+  "record_type": "FeatureStateCheckpoint",
+  "schema_version": 1,
+  "checkpoint_id": "FSC:1:solusd:features-v1:1042",
+  "feature_version": "features-v1",
+  "instrument_version_id": "INSTR:kraken:SOL:USD:1",
+  "consumed_input_watermark": {
+    "history_epoch": 1,
+    "local_sequence": 1042
+  },
+  "reconstruction_dependencies": [
+    "fixed_interval_aggregate:60s"
+  ],
+  "rolling_state": {
+    "ema_fast": 147.21,
+    "window_complete": false
+  },
+  "restart_state": "RESTART_WARMUP"
+}
