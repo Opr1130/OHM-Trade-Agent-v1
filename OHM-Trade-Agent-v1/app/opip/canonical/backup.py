@@ -5,11 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.opip.canonical.schema import connect
+from app.opip.canonical.schema import (
+    connect,
+    fsync_directory,
+    fsync_path,
+    remove_sqlite_sidecars,
+    validate_canonical_sqlite,
+)
 
 
 def _utc_now() -> str:
@@ -17,22 +25,46 @@ def _utc_now() -> str:
 
 
 def backup_database(source_db: Path, dest_db: Path) -> Path:
-    """Consistent snapshot via the SQLite backup API (not VACUUM INTO)."""
-    import sqlite3
+    """
+    Consistent snapshot via the SQLite backup API (not VACUUM INTO / file copy).
 
+    Never deletes the last known-good final backup until a staged snapshot has
+    been written, closed, validated, and atomically published.
+    """
+    dest_db = Path(dest_db)
+    source_db = Path(source_db)
     dest_db.parent.mkdir(parents=True, exist_ok=True)
-    if dest_db.exists():
-        dest_db.unlink()
-    source = connect(source_db, read_only=True)
+    staged = dest_db.with_name(
+        f".{dest_db.name}.staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
+    )
     try:
-        dest = sqlite3.connect(str(dest_db))
+        if staged.exists():
+            staged.unlink()
+        remove_sqlite_sidecars(staged)
+
+        source = connect(source_db, read_only=True)
         try:
-            source.backup(dest)
-            dest.commit()
+            dest = sqlite3.connect(str(staged))
+            try:
+                source.backup(dest)
+                dest.commit()
+            finally:
+                dest.close()
         finally:
-            dest.close()
-    finally:
-        source.close()
+            source.close()
+
+        validate_canonical_sqlite(staged)
+        fsync_path(staged)
+        os.replace(str(staged), str(dest_db))
+        fsync_directory(dest_db.parent)
+    except Exception:
+        if staged.exists():
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        remove_sqlite_sidecars(staged)
+        raise
     return dest_db
 
 
@@ -53,7 +85,8 @@ def build_backup_manifest(
         meta = conn.execute(
             "SELECT history_epoch, next_local_sequence FROM meta WHERE id = 1"
         ).fetchone()
-        assert meta is not None
+        if meta is None:
+            raise RuntimeError("backup meta missing")
         history_epoch = int(meta["history_epoch"])
         count_row = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()
         max_seq = conn.execute(

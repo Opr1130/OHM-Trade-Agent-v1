@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from app.opip.canonical.backup import backup_database, build_backup_manifest, write_backup_manifest
+from app.opip.canonical.schema import (
+    fsync_directory,
+    fsync_path,
+    remove_sqlite_sidecars,
+    validate_canonical_sqlite,
+)
 from app.opip.canonical.writer import CanonicalWriter
 
 
@@ -18,27 +26,53 @@ def restore_from_backup(
     advance_epoch: bool = True,
 ) -> dict[str, Any]:
     """
-    Restore an older snapshot into the live path.
+    Restore an older snapshot into the live path without destroying live on failure.
 
-    When the snapshot is older than current history, callers must advance
-    history_epoch before accepting new writes (default: advance).
+    Requires exclusive restore context: the canonical writer process must be
+    stopped and no live SQLite writer may own ``live_db``.
     """
     started = time.perf_counter()
+    backup_db = Path(backup_db)
+    live_db = Path(live_db)
     live_db.parent.mkdir(parents=True, exist_ok=True)
-    if live_db.exists():
-        live_db.unlink()
-    for suffix in ("-wal", "-shm"):
-        side = Path(str(live_db) + suffix)
-        if side.exists():
-            side.unlink()
-    shutil.copy2(backup_db, live_db)
+
+    staged = live_db.with_name(
+        f".{live_db.name}.restore-staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
+    )
     epoch = None
-    if advance_epoch:
-        writer = CanonicalWriter(live_db)
-        try:
-            epoch = writer.advance_history_epoch_for_restore()
-        finally:
-            writer.close()
+    try:
+        if staged.exists():
+            staged.unlink()
+        remove_sqlite_sidecars(staged)
+
+        shutil.copy2(backup_db, staged)
+        validate_canonical_sqlite(staged)
+
+        if advance_epoch:
+            writer = CanonicalWriter(staged)
+            try:
+                epoch = writer.advance_history_epoch_for_restore()
+                writer.checkpoint_wal()
+            finally:
+                writer.close()
+            validate_canonical_sqlite(staged)
+
+        fsync_path(staged)
+
+        # Exclusive cutover: drop stale live sidecars, then atomic install.
+        remove_sqlite_sidecars(live_db)
+        os.replace(str(staged), str(live_db))
+        remove_sqlite_sidecars(staged)
+        fsync_directory(live_db.parent)
+    except Exception:
+        if staged.exists():
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        remove_sqlite_sidecars(staged)
+        raise
+
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return {
         "restored_path": str(live_db),
@@ -85,6 +119,7 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
             )
             ack = writer.submit(intent)
             assert ack.status == "OK", ack
+        writer.checkpoint_wal()
     finally:
         writer.close()
 

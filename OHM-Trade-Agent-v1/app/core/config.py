@@ -62,7 +62,11 @@ class Settings(BaseSettings):
     # PR 2 canonical writer capture. Default off. "shadow" records Early Watch
     # governor transitions into SQLite evidence only; it does not grant trading
     # authority, ranking influence, or production activation.
-    opip_canonical_writer_mode: str = Field(default="off")
+    # Invalid env values must fail Settings parsing (never silently become off).
+    opip_canonical_writer_mode: str = Field(
+        default="off",
+        pattern=r"^(off|shadow)$",
+    )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).

@@ -40,7 +40,17 @@ class CanonicalWriter:
 
     def close(self) -> None:
         with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
             self._conn.close()
+
+    def checkpoint_wal(self) -> None:
+        """Flush WAL into the main DB file (required before atomic file cutover)."""
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.commit()
 
     def submit(self, intent: WriterIntent) -> WriterAck:
         with self._lock:
@@ -163,22 +173,37 @@ class CanonicalWriter:
         """Required before accepting writes after restoring an older snapshot."""
         now = _utc_now()
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            meta = self._conn.execute(
-                "SELECT history_epoch FROM meta WHERE id = 1"
-            ).fetchone()
-            assert meta is not None
-            new_epoch = int(meta["history_epoch"]) + 1
-            self._conn.execute(
-                """
-                UPDATE meta
-                SET history_epoch = ?, next_local_sequence = 1, updated_at = ?
-                WHERE id = 1
-                """,
-                (new_epoch, now),
-            )
-            self._conn.commit()
-            return new_epoch
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                meta = self._conn.execute(
+                    "SELECT history_epoch FROM meta WHERE id = 1"
+                ).fetchone()
+                if meta is None:
+                    self._conn.rollback()
+                    raise RuntimeError("canonical meta row missing")
+                new_epoch = int(meta["history_epoch"]) + 1
+                self._conn.execute(
+                    """
+                    UPDATE meta
+                    SET history_epoch = ?, next_local_sequence = 1, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (new_epoch, now),
+                )
+                self._conn.commit()
+                return new_epoch
+            except sqlite3.Error:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
     def _lookup_idempotency(self, key: str) -> WriterAck | None:
         existing = self._conn.execute(

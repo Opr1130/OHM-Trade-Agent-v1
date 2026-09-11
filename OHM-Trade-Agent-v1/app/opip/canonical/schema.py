@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -81,6 +82,14 @@ CREATE INDEX IF NOT EXISTS idx_handoffs_pending
 """
 
 
+class SchemaVersionError(RuntimeError):
+    """Canonical DB schema_version does not match this code build."""
+
+
+class CanonicalDbValidationError(RuntimeError):
+    """Staged/canonical SQLite file failed open/schema/integrity validation."""
+
+
 def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if read_only:
@@ -105,7 +114,9 @@ def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
 
 def initialize_schema(connection: sqlite3.Connection, *, now_iso: str) -> None:
     connection.executescript(DDL)
-    row = connection.execute("SELECT id FROM meta WHERE id = 1").fetchone()
+    row = connection.execute(
+        "SELECT id, schema_version FROM meta WHERE id = 1"
+    ).fetchone()
     if row is None:
         connection.execute(
             """
@@ -116,4 +127,90 @@ def initialize_schema(connection: sqlite3.Connection, *, now_iso: str) -> None:
             """,
             (SCHEMA_VERSION, now_iso, now_iso),
         )
+        connection.commit()
+        return
+    existing = int(row["schema_version"])
+    if existing != SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"canonical schema_version={existing} incompatible with "
+            f"code SCHEMA_VERSION={SCHEMA_VERSION}"
+        )
     connection.commit()
+
+
+def validate_canonical_sqlite(db_path: Path) -> None:
+    """Fail-closed open + schema + integrity validation for a SQLite file."""
+    target = Path(db_path)
+    if not target.is_file():
+        raise CanonicalDbValidationError(f"database missing: {target}")
+    try:
+        conn = connect(target, read_only=True)
+    except sqlite3.Error as exc:
+        raise CanonicalDbValidationError(f"cannot open database: {exc}") from exc
+    try:
+        try:
+            row = conn.execute(
+                "SELECT schema_version FROM meta WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise CanonicalDbValidationError(f"meta unreadable: {exc}") from exc
+        if row is None:
+            raise CanonicalDbValidationError("meta row missing")
+        existing = int(row["schema_version"])
+        if existing != SCHEMA_VERSION:
+            raise SchemaVersionError(
+                f"canonical schema_version={existing} incompatible with "
+                f"code SCHEMA_VERSION={SCHEMA_VERSION}"
+            )
+        try:
+            check = conn.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.Error as exc:
+            raise CanonicalDbValidationError(f"integrity_check failed: {exc}") from exc
+        if check is None or str(check[0]).lower() != "ok":
+            raise CanonicalDbValidationError(f"integrity_check={check!r}")
+    finally:
+        conn.close()
+
+
+def fsync_path(path: Path) -> None:
+    """Best-effort fsync of a file for durability before replace."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Windows and some filesystems reject fsync on read-only fds.
+            return
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def fsync_directory(path: Path) -> None:
+    """Best-effort directory fsync (may be unsupported on some platforms)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            return
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def remove_sqlite_sidecars(db_path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        side = Path(str(db_path) + suffix)
+        if side.exists():
+            side.unlink()
