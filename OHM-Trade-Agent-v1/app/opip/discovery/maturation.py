@@ -564,17 +564,49 @@ def _set_state_json_object(
     )
 
 
-def _hot_generation_fingerprint(path: Path) -> tuple[int, str]:
-    if not path.exists():
+@dataclass(frozen=True)
+class ScreeningReconcileResult:
+    """Typed screening ingest result — callers must inspect recovery_pending."""
+
+    recovery_pending: bool
+    continuity_proven: bool
+    archive_stats: dict[str, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "recovery_pending": self.recovery_pending,
+            "continuity_proven": self.continuity_proven,
+            **dict(self.archive_stats),
+        }
+
+
+def _manifest_head_sha(manifest_rows: Sequence[Mapping[str, Any]]) -> str:
+    if not manifest_rows:
+        return ""
+    return str(manifest_rows[-1]["sha256"])
+
+
+def _hot_generation_fingerprint(
+    path: Path, *, durable_offset: int
+) -> tuple[int, str]:
+    """Fingerprint only complete-line checkpointed bytes (never the open tail)."""
+    if not path.exists() or int(durable_offset) <= 0:
         return 0, ""
     size = path.stat().st_size
-    take = min(size, DISCOVERY_HOT_GENERATION_PREFIX_BYTES)
+    take = min(size, int(durable_offset), DISCOVERY_HOT_GENERATION_PREFIX_BYTES)
+    if take <= 0:
+        return 0, ""
     with path.open("rb") as handle:
         payload = handle.read(take)
     return take, hashlib.sha256(payload).hexdigest()
 
 
-def _hot_generation_matches(connection: sqlite3.Connection, path: Path) -> bool:
+def _hot_generation_matches(
+    connection: sqlite3.Connection,
+    path: Path,
+    *,
+    manifest_head_sha: str,
+) -> bool:
     expected = _state_text(connection, "screening_hot_generation_sha256") or ""
     expected_bytes = _state_int(connection, "screening_hot_generation_bytes", 0)
     if not expected or expected_bytes <= 0:
@@ -585,16 +617,36 @@ def _hot_generation_matches(connection: sqlite3.Connection, path: Path) -> bool:
         return False
     with path.open("rb") as handle:
         payload = handle.read(expected_bytes)
-    return (
+    content_ok = (
         len(payload) == expected_bytes
         and hashlib.sha256(payload).hexdigest() == expected
     )
+    if not content_ok:
+        return False
+    # Durable compaction lineage: physical HOT replacement publishes a new
+    # archive SHA as the manifest head. Inode/mtime are not replica-stable.
+    stored_head = _state_text(connection, "screening_hot_generation_manifest_head_sha")
+    if stored_head is None:
+        # Pre-lineage checkpoints: content bound only until next successful set.
+        return True
+    return stored_head == str(manifest_head_sha)
 
 
-def _set_hot_generation(connection: sqlite3.Connection, path: Path) -> None:
-    nbytes, digest = _hot_generation_fingerprint(path)
+def _set_hot_generation(
+    connection: sqlite3.Connection,
+    path: Path,
+    *,
+    durable_offset: int,
+    manifest_head_sha: str = "",
+) -> None:
+    nbytes, digest = _hot_generation_fingerprint(path, durable_offset=durable_offset)
     _set_state_int(connection, "screening_hot_generation_bytes", nbytes)
     _set_state_text(connection, "screening_hot_generation_sha256", digest)
+    _set_state_text(
+        connection,
+        "screening_hot_generation_manifest_head_sha",
+        str(manifest_head_sha or ""),
+    )
 
 
 def _skip_exact(handle: BinaryIO, nbytes: int) -> None:
@@ -649,11 +701,11 @@ def _list_manifest_segment_rows(
         sha = str(row.get("sha256") or digest or "").strip()
         if not relative or not sha:
             continue
-        generation_timestamp = (
-            _generation_timestamp_from_name(relative)
-            or str(row.get("first_visible_at_utc") or "")
-            or str(row.get("verified_at_utc") or "")
-        )
+        generation_timestamp = _generation_timestamp_from_name(relative)
+        if not generation_timestamp:
+            raise RuntimeError(
+                f"DISCOVERY_SCREENING_ARCHIVE_GENERATION_AMBIGUOUS:{relative}"
+            )
         rows.append(
             {
                 "relative_path": relative,
@@ -915,7 +967,15 @@ def _index_hot_from_offset(
             connection, handle, now=now, start_offset=start_offset
         )
     _set_state_checkpoint(connection, screening_path, "screening", last_complete)
-    _set_hot_generation(connection, screening_path)
+    manifest_rows = _list_manifest_segment_rows(
+        screening_evaluations_archive(screening_path)
+    )
+    _set_hot_generation(
+        connection,
+        screening_path,
+        durable_offset=last_complete,
+        manifest_head_sha=_manifest_head_sha(manifest_rows),
+    )
     _set_state_int(connection, "screening_hot_offset", last_complete)
     connection.commit()
     return last_complete
@@ -1014,7 +1074,21 @@ def _migrate_screening_checkpoint_state(
         if offset <= 0 or _state_checkpoint_matches(
             connection, screening_path, "screening", offset
         ):
-            _set_hot_generation(connection, screening_path)
+            head = ""
+            try:
+                head = _manifest_head_sha(
+                    _list_manifest_segment_rows(
+                        screening_evaluations_archive(screening_path)
+                    )
+                )
+            except RuntimeError:
+                head = ""
+            _set_hot_generation(
+                connection,
+                screening_path,
+                durable_offset=offset,
+                manifest_head_sha=head,
+            )
     _set_state_text(connection, "screening_checkpoint_schema", "generation_v2")
     connection.commit()
 
@@ -1216,7 +1290,7 @@ def reconcile_screening_queue(
     screening_path: Path,
     *,
     now: datetime,
-) -> dict[str, Any]:
+) -> ScreeningReconcileResult:
     """Index BROAD_SEARCH screening rows across verified archives + HOT.
 
     Contract:
@@ -1226,6 +1300,8 @@ def reconcile_screening_queue(
     * Archive identity is content SHA (WARM→COLD safe).
     * Per-cycle unique expensive archive touches stay within budget.
     * Queue upserts are idempotent on ``observation_id``.
+    * Incomplete bounded recovery returns ``recovery_pending=True`` — callers
+      must not treat that as a healthy completed ingest.
     """
     _migrate_screening_checkpoint_state(connection, screening_path)
     budget = _ArchiveCycleBudget(limit=DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE)
@@ -1234,20 +1310,36 @@ def reconcile_screening_queue(
     consumed = set(_state_json_list(connection, "screening_consumed_archives"))
     known = set(_state_json_list(connection, "screening_known_archive_shas"))
     indexed_offset = _state_int(connection, "screening_indexed_offset", 0)
+    manifest_head = _manifest_head_sha(manifest_rows)
+
+    def _done(
+        *, recovery_pending: bool, continuity_proven: bool
+    ) -> ScreeningReconcileResult:
+        stats = budget.as_dict()
+        _set_state_json_object(connection, "screening_archive_cycle_stats", stats)
+        _set_state_text(
+            connection,
+            "screening_rotation_recovery_pending",
+            "1" if recovery_pending else "0",
+        )
+        connection.commit()
+        return ScreeningReconcileResult(
+            recovery_pending=recovery_pending,
+            continuity_proven=continuity_proven,
+            archive_stats=stats,
+        )
 
     if not screening_path.exists():
         if indexed_offset and not any(
             str(row["sha256"]) not in consumed for row in manifest_rows
         ):
             raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
-        _set_state_json_object(
-            connection, "screening_archive_cycle_stats", budget.as_dict()
-        )
-        connection.commit()
-        return budget.as_dict()
+        return _done(recovery_pending=False, continuity_proven=indexed_offset <= 0)
 
     size = screening_path.stat().st_size
-    generation_ok = _hot_generation_matches(connection, screening_path)
+    generation_ok = _hot_generation_matches(
+        connection, screening_path, manifest_head_sha=manifest_head
+    )
     anchor_ok = _state_checkpoint_matches(
         connection, screening_path, "screening", indexed_offset
     )
@@ -1286,11 +1378,7 @@ def reconcile_screening_queue(
             [str(row["sha256"]) for row in manifest_rows],
         )
         _clear_recovery_cursor(connection)
-        _set_state_json_object(
-            connection, "screening_archive_cycle_stats", budget.as_dict()
-        )
-        connection.commit()
-        return budget.as_dict()
+        return _done(recovery_pending=False, continuity_proven=True)
 
     if indexed_offset <= size and generation_ok and not anchor_ok:
         raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
@@ -1308,12 +1396,8 @@ def reconcile_screening_queue(
         unconsumed = [
             row for row in manifest_rows if str(row["sha256"]) not in consumed
         ]
-        _set_state_json_object(
-            connection, "screening_archive_cycle_stats", budget.as_dict()
-        )
-        connection.commit()
         if unconsumed or _load_recovery_cursor(connection).get("sequence"):
-            return budget.as_dict()
+            return _done(recovery_pending=True, continuity_proven=False)
         if indexed_offset > size:
             raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
         raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
@@ -1343,11 +1427,7 @@ def reconcile_screening_queue(
         if segment.sha256 not in consumed:
             if local_start < seg_size:
                 if not budget.can_touch(segment.sha256):
-                    _set_state_json_object(
-                        connection, "screening_archive_cycle_stats", budget.as_dict()
-                    )
-                    connection.commit()
-                    return budget.as_dict()
+                    return _done(recovery_pending=True, continuity_proven=False)
                 _index_archive_segment(
                     connection,
                     segment,
@@ -1365,16 +1445,12 @@ def reconcile_screening_queue(
         "screening_known_archive_shas",
         [str(row["sha256"]) for row in manifest_rows],
     )
-    _clear_recovery_cursor(connection)
+    # Remap HOT before clearing recovery cursor so a crash mid-remap can resume.
     _index_hot_from_offset(
         connection, screening_path, now=now, start_offset=hot_offset
     )
-    _set_state_json_object(
-        connection, "screening_archive_cycle_stats", budget.as_dict()
-    )
-    connection.commit()
-    return budget.as_dict()
-
+    _clear_recovery_cursor(connection)
+    return _done(recovery_pending=False, continuity_proven=True)
 
 
 def due_observation_batch(
@@ -1435,11 +1511,23 @@ def mature_discovery_outcomes_bounded(
     lock = output_dir / ".forward_outcomes.jsonl.lock"
     with registry_lock(lock):
         repair_truncated_tail(outcomes_path)
+        repair_truncated_tail(screening_path)
         connection = open_discovery_state(state_path)
         try:
-            reconcile_screening_queue(
+            reconcile = reconcile_screening_queue(
                 connection, screening_path, now=labeled_at
             )
+            if reconcile.recovery_pending:
+                summary.update(
+                    {
+                        "error": "DISCOVERY_SCREENING_ROTATION_RECOVERY_PENDING",
+                        "rotation_recovery_pending": True,
+                        "continuity_proven": False,
+                        "archive_stats": dict(reconcile.archive_stats),
+                    }
+                )
+                connection.commit()
+                return summary
             pending = due_observation_batch(
                 connection, now=labeled_at, limit=max_rows
             )

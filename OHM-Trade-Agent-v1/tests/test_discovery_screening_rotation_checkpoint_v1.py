@@ -19,11 +19,11 @@ from app.opip.discovery.constants import DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PE
 from app.opip.discovery.maturation import (
     open_discovery_state,
     reconcile_screening_queue,
+    mature_discovery_outcomes_bounded,
     _list_manifest_segment_rows,
     _load_recovery_cursor,
     _state_int,
     _state_json_list,
-    _state_json_object,
     _state_text,
     _set_state_checkpoint,
     _set_state_int,
@@ -252,7 +252,7 @@ def test_bad_archive_checksum_fails_closed(tmp_path):
             json.dumps(rows[0], sort_keys=True, allow_nan=False) + "\n"
         ).encode("utf-8")
         _set_state_checkpoint(state, hot, "screening", len(first_line))
-        _set_hot_generation(state, hot)
+        _set_hot_generation(state, hot, durable_offset=len(first_line))
         _set_state_text(state, "screening_checkpoint_schema", "generation_v1")
         state.commit()
         archived = _compact_hot(hot, keep_lines=1, max_bytes=16)
@@ -448,7 +448,12 @@ def test_legacy_suffix_recovery_ignores_pre_checkpoint_archives(tmp_path):
         a2_sha = [s for s in shas if s not in {a0_sha, a1_sha}][0]
 
         stats = reconcile_screening_queue(state, hot, now=NOW)
-        assert stats["archive_segments_expensive_unique"] <= DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE
+        assert (
+            stats.archive_stats["archive_segments_expensive_unique"]
+            <= DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE
+        )
+        assert stats.recovery_pending is False
+        assert stats.continuity_proven is True
         ids = _queue_ids(state)
         # Offset already advanced past cp; only post-checkpoint remainder is queued.
         assert cp["metadata"]["observation_id"] not in ids
@@ -506,7 +511,7 @@ def test_warm_to_cold_identity_does_not_look_like_new_rotation(tmp_path):
         # Simulate WARM→COLD without Windows MAX_PATH tempfile prefixes.
         cold_segment = archive.cold_archive_dir / "c" / "s"
         cold_segment.mkdir(parents=True, exist_ok=True)
-        dest = cold_segment / "a.jsonl.gz"
+        dest = cold_segment / current_path.name
         shutil.copy2(current_path, dest)
         shutil.copy2(checksum, dest.with_suffix(dest.suffix + ".sha256"))
         verification = archive.verify_archive_file(dest, tier="COLD")
@@ -600,7 +605,9 @@ def test_manifest_growth_preserves_recovery_progress(tmp_path, monkeypatch):
 
         progress_sizes: list[int] = []
         stats1 = reconcile_screening_queue(state, hot, now=NOW)
-        assert stats1["archive_segments_expensive_unique"] <= 1
+        assert stats1.archive_stats["archive_segments_expensive_unique"] <= 1
+        assert stats1.recovery_pending is True
+        assert stats1.continuity_proven is False
         cursor1 = _load_recovery_cursor(state)
         progress_sizes.append(len(cursor1.get("segment_sizes") or {}))
         assert cursor1.get("active_end_sha")
@@ -624,7 +631,8 @@ def test_manifest_growth_preserves_recovery_progress(tmp_path, monkeypatch):
         assert len(_manifest_shas(hot)) == 4
 
         stats2 = reconcile_screening_queue(state, hot, now=NOW)
-        assert stats2["archive_segments_expensive_unique"] <= 1
+        assert stats2.archive_stats["archive_segments_expensive_unique"] <= 1
+        assert stats2.recovery_pending is True
         cursor2 = _load_recovery_cursor(state)
         progress_sizes.append(len(cursor2.get("segment_sizes") or {}))
         assert cursor2.get("active_end_sha") == active_end
@@ -633,10 +641,10 @@ def test_manifest_growth_preserves_recovery_progress(tmp_path, monkeypatch):
 
         for _ in range(10):
             stats = reconcile_screening_queue(state, hot, now=NOW)
-            assert stats["archive_segments_expensive_unique"] <= 1
+            assert stats.archive_stats["archive_segments_expensive_unique"] <= 1
             cursor = _load_recovery_cursor(state)
             n_sizes = len(cursor.get("segment_sizes") or {})
-            if not cursor.get("sequence"):
+            if not stats.recovery_pending and stats.continuity_proven:
                 progress_sizes.append(n_sizes)
                 break
             assert n_sizes >= progress_sizes[-1]
@@ -647,5 +655,269 @@ def test_manifest_growth_preserves_recovery_progress(tmp_path, monkeypatch):
         assert not _load_recovery_cursor(state).get("sequence")
         assert _state_text(state, "screening_checkpoint_schema") == "generation_v2"
         assert _state_int(state, "screening_indexed_offset", 0) == hot.stat().st_size
+    finally:
+        state.close()
+
+
+def test_recovery_pending_surfaces_through_outcomes_cycle(tmp_path, monkeypatch):
+    """Bounded recovery must be ERROR / FAILED_RETRYABLE, not silent OK."""
+    import gzip
+    import hashlib
+
+    import app.jobs.run_opportunity_intelligence_cycle as cycle
+    import app.opip.learning.job_disposition as jd
+
+    monkeypatch.setattr(
+        maturation_mod, "DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE", 1
+    )
+    monkeypatch.setattr(cycle, "_DEFAULT_DATA_ROOT", tmp_path)
+
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    parts = [_screening_row(f"SCAN:P{i}", f"P{i}USD") for i in range(6)]
+    _write_hot(hot, parts[0:2])
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(parts[2], sort_keys=True, allow_nan=False) + "\n").encode(
+                "utf-8"
+            )
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(parts[3], sort_keys=True, allow_nan=False) + "\n").encode(
+                "utf-8"
+            )
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+
+    archive = screening_evaluations_archive(hot)
+    rows = _list_manifest_segment_rows(archive)
+    from app.opip.discovery.maturation import _resolve_segment_path
+
+    virtual = b""
+    for row in rows:
+        path = _resolve_segment_path(archive, str(row["relative_path"]))
+        with gzip.open(path, "rb") as handle:
+            virtual += handle.read()
+    virtual += hot.read_bytes()
+    offset = len(virtual)
+    anchor = virtual[-32:]
+    state = open_discovery_state(
+        tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3"
+    )
+    try:
+        _set_state_int(state, "screening_indexed_offset", offset)
+        _set_state_int(state, "screening_anchor_start", offset - len(anchor))
+        _set_state_int(state, "screening_anchor_size", len(anchor))
+        _set_state_text(
+            state, "screening_anchor_sha256", hashlib.sha256(anchor).hexdigest()
+        )
+        state.commit()
+    finally:
+        state.close()
+
+    (tmp_path / "full_market_observations.jsonl").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        cycle,
+        "advance_accountability_handoff_backfill",
+        lambda **kwargs: {
+            "batch_rows": 0,
+            "enqueued_handoff": 0,
+            "terminalized_coverage_discontinuity": 0,
+            "complete": True,
+            "already_complete": True,
+        },
+    )
+    monkeypatch.setattr(cycle, "pending_accountability_outcomes", lambda: [])
+    monkeypatch.setattr(cycle, "build_outcomes_bounded", lambda: [])
+    monkeypatch.setattr(
+        cycle,
+        "build_incremental_from_outcomes",
+        lambda outcomes, replica_mode=True: {
+            "population": {},
+            "opportunity_capture_rate_pct": None,
+        },
+    )
+    monkeypatch.setattr(cycle, "resolved_accountability_outcomes", lambda outcomes: [])
+    monkeypatch.setattr(cycle, "acknowledge_accountability_outcomes", lambda resolved: 0)
+
+    # Cycle 1 — recovery pending.
+    cycle.main()
+    summary = jd.read_consumption_summary(tmp_path, "outcomes")
+    assert summary is not None
+    assert summary["status"] == "ERROR"
+    assert summary["discovery_job_status"] == "ERROR"
+    assert summary["disposition"] == jd.FAILED_RETRYABLE
+    assert summary["discovery_failure_nonfatal"] is True
+    assert (
+        summary["discovery_outcomes"]["error"]
+        == "DISCOVERY_SCREENING_ROTATION_RECOVERY_PENDING"
+    )
+    assert summary["discovery_outcomes"]["rotation_recovery_pending"] is True
+
+    # Drain recovery under budget=1 until continuity proven.
+    for _ in range(12):
+        result = mature_discovery_outcomes_bounded(
+            screening_path=hot,
+            observation_path=tmp_path / "full_market_observations.jsonl",
+            output_dir=tmp_path / "opip/discovery",
+            now=NOW,
+        )
+        if not result.get("rotation_recovery_pending"):
+            assert "error" not in result
+            break
+    else:
+        raise AssertionError("recovery never cleared")
+
+    cycle.main()
+    summary2 = jd.read_consumption_summary(tmp_path, "outcomes")
+    assert summary2 is not None
+    assert summary2["status"] == "OK"
+    assert summary2["discovery_job_status"] == "OK"
+    assert summary2["disposition"] in {jd.CONSUMED_OK, jd.CONSUMED_EMPTY}
+    assert not (summary2.get("discovery_outcomes") or {}).get(
+        "rotation_recovery_pending"
+    )
+
+
+def test_partial_jsonl_tail_repair_keeps_checkpoint_generation(tmp_path):
+    from app.opip.storage.bounded_jsonl import repair_truncated_tail
+
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    rows = [
+        _screening_row("SCAN:TA", "TAUSD"),
+        _screening_row("SCAN:TB", "TBUSD"),
+    ]
+    complete = b"".join(
+        (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+        for row in rows
+    )
+    hot.parent.mkdir(parents=True, exist_ok=True)
+    hot.write_bytes(complete + b'{"partial": true')  # no newline
+
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        result = reconcile_screening_queue(state, hot, now=NOW)
+        assert result.continuity_proven is True
+        assert result.recovery_pending is False
+        offset = _state_int(state, "screening_indexed_offset", 0)
+        assert offset == len(complete)
+        assert _queue_ids(state) == {
+            rows[0]["metadata"]["observation_id"],
+            rows[1]["metadata"]["observation_id"],
+        }
+        gen_bytes = _state_int(state, "screening_hot_generation_bytes", 0)
+        assert gen_bytes == min(offset, 65536)
+        assert gen_bytes <= offset
+
+        repair_truncated_tail(hot)
+        assert hot.read_bytes() == complete
+
+        result2 = reconcile_screening_queue(state, hot, now=NOW)
+        assert result2.recovery_pending is False
+        assert result2.continuity_proven is True
+        assert _state_int(state, "screening_indexed_offset", 0) == len(complete)
+
+        new_row = _screening_row("SCAN:TC", "TCUSD")
+        with hot.open("ab") as handle:
+            handle.write(
+                (json.dumps(new_row, sort_keys=True, allow_nan=False) + "\n").encode(
+                    "utf-8"
+                )
+            )
+        result3 = reconcile_screening_queue(state, hot, now=NOW)
+        assert result3.recovery_pending is False
+        assert new_row["metadata"]["observation_id"] in _queue_ids(state)
+    finally:
+        state.close()
+
+
+def test_ambiguous_archive_generation_filename_fails_closed(tmp_path):
+    import gzip
+
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    rows = [_screening_row("SCAN:AG", "AGUSD")]
+    _write_hot(hot, rows)
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        reconcile_screening_queue(state, hot, now=NOW)
+        archive = screening_evaluations_archive(hot)
+        archive.archive_dir.mkdir(parents=True, exist_ok=True)
+        bad_name = "screening_evaluations-notastamp-deadbeef.jsonl.gz"
+        bad_path = archive.archive_dir / bad_name
+        payload = (
+            json.dumps(rows[0], sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        with gzip.open(bad_path, "wb") as handle:
+            handle.write(payload)
+        digest = archive._sha256_file(bad_path)
+        bad_path.with_suffix(bad_path.suffix + ".sha256").write_text(
+            f"{digest}  {bad_name}\n", encoding="utf-8"
+        )
+        verification = archive.verify_archive_file(bad_path, tier="WARM")
+        archive.update_manifest_locked(verification)
+        with pytest.raises(
+            RuntimeError, match="DISCOVERY_SCREENING_ARCHIVE_GENERATION_AMBIGUOUS"
+        ):
+            reconcile_screening_queue(state, hot, now=NOW)
+    finally:
+        state.close()
+
+
+def test_archive_physical_order_ignores_observed_at(tmp_path):
+    """Later physical generation stays after earlier even if observed_at goes backward."""
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    early_obs = "2026-09-11T12:00:00+00:00"
+    late_obs = "2026-09-11T11:30:00+00:00"
+    g1 = _screening_row("SCAN:O1", "O1USD", observed_at=early_obs)
+    keep = _screening_row("SCAN:OK", "OKUSD", observed_at=early_obs)
+    g2 = _screening_row("SCAN:O2", "O2USD", observed_at=late_obs)
+
+    _write_hot(hot, [g1, keep])
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(g2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    rows = _list_manifest_segment_rows(screening_evaluations_archive(hot))
+    assert len(rows) == 2
+    assert rows[0]["generation_timestamp"] <= rows[1]["generation_timestamp"]
+    # Physical order is filename stamp order, not observed_at (12:00 then 11:30).
+    assert "12:00" in g1["observed_at"]
+    assert "11:30" in g2["observed_at"]
+
+
+def test_hot_generation_lineage_detects_compaction_prefix_collision(tmp_path, monkeypatch):
+    """Manifest-head lineage changes on compaction even if HOT prefix bytes collide."""
+    monkeypatch.setattr(maturation_mod, "DISCOVERY_HOT_GENERATION_PREFIX_BYTES", 32)
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    # Craft many identical-prefix-friendly rows then rotate so retained HOT can
+    # share leading bytes with an earlier generation fingerprint window.
+    rows = [_screening_row(f"SCAN:L{i}", f"L{i}USD") for i in range(4)]
+    _write_hot(hot, rows)
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        reconcile_screening_queue(state, hot, now=NOW)
+        head_before = _state_text(state, "screening_hot_generation_manifest_head_sha")
+        assert head_before == ""
+        offset_before = _state_int(state, "screening_indexed_offset", 0)
+        assert offset_before == hot.stat().st_size
+
+        archived = _compact_hot(hot, keep_lines=1, max_bytes=16)
+        assert archived is not None
+        head_after_archive = _manifest_shas(hot)[-1]
+        assert head_after_archive != ""
+
+        # Without lineage, a colliding prefix could look like same generation.
+        # With lineage, compacting published a new manifest head → recovery path.
+        result = reconcile_screening_queue(state, hot, now=NOW)
+        assert result.recovery_pending is False
+        assert result.continuity_proven is True
+        head_stored = _state_text(state, "screening_hot_generation_manifest_head_sha")
+        assert head_stored == head_after_archive
+        assert head_stored != head_before
     finally:
         state.close()
