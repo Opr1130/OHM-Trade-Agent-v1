@@ -215,15 +215,24 @@ class CanonicalWriterServer:
         if method == "SUBMIT":
             intent = WriterIntent.from_dict(request["intent"])
             return self._enqueue(intent).to_dict()
+        if method == "HEALTH":
+            return {"status": self._health_status(), "metrics": self.metrics_snapshot()}
+        if method == "LIST_PENDING_HANDOFFS":
+            # Read-only diagnostics remain available while fail-closed.
+            rows = [h.__dict__ for h in self.writer.list_pending_handoffs()]
+            return {"status": "OK", "handoffs": rows}
+
+        # Mutating control RPCs must not write after integrity is uncertain.
+        if self._health_status() != "OK":
+            return WriterAck(
+                status="RETRYABLE",
+                error_code="WORKER_UNHEALTHY",
+            ).to_dict()
+
         if method == "CONFIRM_OPS_APPLIED":
             return self.writer.confirm_ops_applied(str(request["event_id"])).to_dict()
         if method == "MARK_HANDOFF_SUPERSEDED":
             return self.writer.mark_handoff_superseded(str(request["event_id"])).to_dict()
-        if method == "LIST_PENDING_HANDOFFS":
-            rows = [h.__dict__ for h in self.writer.list_pending_handoffs()]
-            return {"status": "OK", "handoffs": rows}
-        if method == "HEALTH":
-            return {"status": self._health_status(), "metrics": self.metrics_snapshot()}
         if method == "ADVANCE_EPOCH":
             epoch = self.writer.advance_history_epoch_for_restore()
             return {"status": "OK", "history_epoch": epoch}
@@ -235,6 +244,10 @@ class CanonicalWriterServer:
         self.ensure_worker_started()
         item = _Queued(intent=intent, enqueued_at=time.monotonic())
         with self._lock:
+            # Re-check under the queue lock so we never append after a concurrent
+            # fail-closed transition that the outer check could have missed.
+            if self._worker_unhealthy:
+                return WriterAck(status="RETRYABLE", error_code="WORKER_UNHEALTHY")
             depth = len(self._high) + len(self._normal) + len(self._low)
             if intent.priority == "HIGH":
                 if len(self._high) >= HIGH_RESERVED and depth >= TOTAL_QUEUE:
@@ -259,6 +272,21 @@ class CanonicalWriterServer:
             if item is None:
                 time.sleep(0.001)
                 continue
+
+            with self._lock:
+                already_unhealthy = self._worker_unhealthy
+            if already_unhealthy:
+                # Fail-closed drain: never call writer.submit after integrity is
+                # uncertain. Release every waiter with a bounded RETRYABLE ack.
+                item.ack = WriterAck(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                )
+                with self._lock:
+                    self._metrics["retryable"] += 1
+                item.response_event.set()
+                continue
+
             started = time.monotonic()
             try:
                 if item.intent.priority == "HIGH":
@@ -295,8 +323,8 @@ class CanonicalWriterServer:
                     self._metrics["retryable"] += 1
                     # Fail-closed health: unexpected worker failure may imply
                     # uncertain storage integrity. Do not auto-restart into a
-                    # possibly corrupt state; report UNHEALTHY and keep draining
-                    # with RETRYABLE responses until the process is replaced.
+                    # possibly corrupt state; report UNHEALTHY and drain the
+                    # remainder without further writes until process replace.
                     self._worker_unhealthy = True
                     self._worker_error = type(exc).__name__
             finally:

@@ -1062,6 +1062,76 @@ def test_worker_internal_error_is_contained_and_health_degrades(
     assert later.error_code == "WORKER_UNHEALTHY"
 
 
+def test_unhealthy_worker_drains_queue_without_further_submit(
+    canonical_env, make_writer_server, monkeypatch
+):
+    """First queued submit raises; second queued item must never reach writer.submit."""
+    server = make_writer_server()
+    server.ensure_worker_started()
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    submit_keys: list[str] = []
+
+    def _controlled(self, intent):  # noqa: ANN001
+        submit_keys.append(str(intent.idempotency_key))
+        if len(submit_keys) == 1:
+            entered_first.set()
+            assert release_first.wait(timeout=2.0)
+            raise RuntimeError("first queued submit failure")
+        raise AssertionError(
+            f"queued item must not reach submit after unhealthy: {intent.idempotency_key}"
+        )
+
+    monkeypatch.setattr(CanonicalWriter, "submit", _controlled)
+
+    results: list[WriterAck | None] = [None, None]
+
+    def _run(idx: int, key: str) -> None:
+        results[idx] = server.enqueue_for_tests(
+            _record_intent(key=key, identity=f"EARLY_MOVER:Q{idx}")
+        )
+
+    t1 = threading.Thread(target=_run, args=(0, "q:1"), daemon=True)
+    t1.start()
+    assert entered_first.wait(timeout=2.0)
+    t2 = threading.Thread(target=_run, args=(1, "q:2"), daemon=True)
+    t2.start()
+    time.sleep(0.05)  # allow second intent to sit on the queue
+    release_first.set()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
+
+    assert results[0] is not None
+    assert results[1] is not None
+    assert results[0].status == "RETRYABLE"
+    assert results[0].error_code == "WORKER_INTERNAL_ERROR"
+    assert results[1].status == "RETRYABLE"
+    assert results[1].error_code == "WORKER_UNHEALTHY"
+    assert submit_keys == ["q:1"]
+    health = server.dispatch_for_tests({"method": "HEALTH"})
+    assert health["status"] == "UNHEALTHY"
+
+
+def test_mutating_control_rpcs_blocked_when_unhealthy(canonical_env, make_writer_server):
+    server = make_writer_server()
+    client = InProcessWriterClient(server)
+    server.mark_worker_unhealthy_for_tests("TEST")
+    confirm = client.confirm_ops_applied("EVT:missing")
+    assert confirm.status == "RETRYABLE"
+    assert confirm.error_code == "WORKER_UNHEALTHY"
+    supersede = client.mark_handoff_superseded("EVT:missing")
+    assert supersede.status == "RETRYABLE"
+    assert supersede.error_code == "WORKER_UNHEALTHY"
+    advance = server.dispatch_for_tests({"method": "ADVANCE_EPOCH"})
+    assert advance["status"] == "RETRYABLE"
+    assert advance["error_code"] == "WORKER_UNHEALTHY"
+    # Read-only paths remain available.
+    health = client.health()
+    assert health["status"] == "UNHEALTHY"
+    assert client.list_pending_handoffs() == []
+
+
 def test_health_detects_dead_worker(canonical_env, make_writer_server):
     server = make_writer_server()
     server.ensure_worker_started()
