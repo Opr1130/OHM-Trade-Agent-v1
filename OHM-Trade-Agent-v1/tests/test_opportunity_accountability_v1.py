@@ -8,7 +8,10 @@ import pytest
 
 from app.services import opportunity_accountability as accountability
 from app.services.dashboard_read_model import _opportunity_accountability_snapshot
+from app.scanner.candidates import MIN_TECHNICAL_SCORE
 from app.services.opportunity_accountability import (
+    ACCOUNTABILITY_THRESHOLD_DRIFT,
+    ACCOUNTABILITY_WINNER_DEFINITION,
     AccountabilityPolicy,
     append_accountability_rows,
     build_accountability_rows,
@@ -489,6 +492,29 @@ def test_incremental_join_splits_archive_ceiling_batches(monkeypatch, tmp_path):
     ) == 2
 
 
+def test_incomplete_available_outcome_stays_pending():
+    rows = _rows(
+        [_screening()],
+        [],
+        outcome=_outcome(window_complete=False, revision=1),
+    )
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    assert long_row["opportunity_classification"] == "PENDING_OUTCOME"
+    assert long_row["market_winner"] is False
+    assert long_row["outcome_complete"] is False
+
+
+def test_from_env_uses_min_technical_score_and_fails_closed_on_drift(monkeypatch):
+    monkeypatch.delenv("OPIP_PRODUCTION_TECHNICAL_THRESHOLD", raising=False)
+    policy = AccountabilityPolicy.from_env()
+    assert policy.production_threshold == float(MIN_TECHNICAL_SCORE)
+    monkeypatch.setenv("OPIP_PRODUCTION_TECHNICAL_THRESHOLD", "80")
+    assert AccountabilityPolicy.from_env().production_threshold == 80.0
+    monkeypatch.setenv("OPIP_PRODUCTION_TECHNICAL_THRESHOLD", "79")
+    with pytest.raises(RuntimeError, match=ACCOUNTABILITY_THRESHOLD_DRIFT):
+        AccountabilityPolicy.from_env()
+
+
 def test_threshold_70_79_winner_is_visible_without_changing_production():
     rows = _rows(
         [
@@ -519,12 +545,33 @@ def test_validated_rejection_that_later_wins_is_executable_false_negative():
     assert long_row["latency"]["gate_delta_ms"]["EXECUTION_VALIDATION"] == 75.0
 
 
-def test_advanced_candidate_dropped_before_funnel_is_ranking_or_cap_miss():
-    rows = _rows([_screening()], [])
+def test_ranked_outside_budget_winner_is_ranking_or_cap_miss():
+    rows = _rows(
+        [
+            _screening(
+                outcome="COARSE_RANK_LIMIT",
+                advanced_direction=None,
+            )
+        ],
+        [],
+    )
     long_row = next(row for row in rows if row["direction"] == "LONG")
     assert long_row["opportunity_classification"] == "RANKING_OR_CAP_MISS_CANDIDATE"
+    assert long_row["production_preferred_direction"] == "LONG"
+    assert long_row["production_direction"] is True
+    assert long_row["winner_definition"] == ACCOUNTABILITY_WINNER_DEFINITION
     assert long_row["counterfactuals"]["expanded_cap_shadow"] is True
     assert long_row["executable_false_negative"] is False
+
+
+def test_admitted_without_funnel_is_not_ranking_or_cap_miss():
+    rows = _rows([_screening()], [])
+    long_row = next(row for row in rows if row["direction"] == "LONG")
+    assert long_row["opportunity_classification"] == (
+        "MARKET_WINNER_UNVERIFIED_EXECUTABILITY"
+    )
+    assert long_row["counterfactuals"]["expanded_cap_shadow"] is False
+    assert long_row["observation_id"]
 
 
 def test_qualified_signal_paper_outcome_joins_same_accountability_record():

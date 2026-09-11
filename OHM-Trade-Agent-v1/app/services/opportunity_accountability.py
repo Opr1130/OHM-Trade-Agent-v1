@@ -41,8 +41,9 @@ from app.opip.learning.coverage_discontinuity import (
     resolve_discontinuity_for_archive,
     row_allowed_for_post_boundary_learning,
 )
+from app.opip.discovery.admission import observation_join_id
 from app.opip.storage.bounded_jsonl import ArchiveWindowSelection
-
+from app.scanner.candidates import MIN_TECHNICAL_SCORE
 
 
 DEFAULT_SCREENING_FILE = Path("/app/data/opip/qualification/screening_evaluations.jsonl")
@@ -58,9 +59,13 @@ ACCOUNTABILITY_ARCHIVE_WINDOW_PAD = timedelta(minutes=15)
 ACCOUNTABILITY_MAX_ARCHIVE_SEGMENTS_PER_WINDOW = 64
 
 
+ACCOUNTABILITY_WINNER_DEFINITION = "ACCOUNTABILITY_EXCURSION_V1"
+ACCOUNTABILITY_THRESHOLD_DRIFT = "ACCOUNTABILITY_THRESHOLD_DRIFT"
+
+
 @dataclass(frozen=True)
 class AccountabilityPolicy:
-    production_threshold: float = 80.0
+    production_threshold: float = float(MIN_TECHNICAL_SCORE)
     shadow_threshold: float = 70.0
     winner_move_pct: float = 2.0
 
@@ -73,7 +78,15 @@ class AccountabilityPolicy:
                 return default
             return value if math.isfinite(value) else default
 
-        production = max(0.0, number("OPIP_PRODUCTION_TECHNICAL_THRESHOLD", 80.0))
+        production = float(MIN_TECHNICAL_SCORE)
+        raw_threshold = os.getenv("OPIP_PRODUCTION_TECHNICAL_THRESHOLD")
+        if raw_threshold is not None and str(raw_threshold).strip() != "":
+            try:
+                env_threshold = float(raw_threshold)
+            except (TypeError, ValueError):
+                raise RuntimeError(ACCOUNTABILITY_THRESHOLD_DRIFT)
+            if not math.isfinite(env_threshold) or env_threshold != production:
+                raise RuntimeError(ACCOUNTABILITY_THRESHOLD_DRIFT)
         shadow = max(0.0, number("OPIP_ACCOUNTABILITY_SHADOW_THRESHOLD", 70.0))
         winner = max(0.0, number("OPIP_ACCOUNTABILITY_WINNER_MOVE_PCT", 2.0))
         if shadow > production:
@@ -146,6 +159,68 @@ def _screening_symbol(row: Mapping[str, Any]) -> str:
         nested.get("venue_instrument_symbol")
         or row.get("venue_instrument_id")
         or nested.get("raw_identifier")
+    )
+
+
+def _screening_venue_instrument_id(row: Mapping[str, Any]) -> str:
+    identity = row.get("venue_instrument")
+    nested = identity if isinstance(identity, Mapping) else {}
+    return str(
+        row.get("venue_instrument_id")
+        or nested.get("venue_instrument_id")
+        or nested.get("venue_instrument_symbol")
+        or nested.get("raw_identifier")
+        or ""
+    ).strip()
+
+
+def _preferred_production_direction(row: Mapping[str, Any]) -> str:
+    """Preferred direction for measurement joins; not shortlist admission.
+
+    V2-01 clears ``advanced_direction`` on RANKED_OUTSIDE_BUDGET /
+    BELOW_THRESHOLD rows. Accountability must still see the scorer preference
+    from metadata so rank/cap misses are not silently unverified.
+    """
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+    for source in (
+        (metadata or {}).get("production_preferred_direction"),
+        (metadata or {}).get("stronger_direction"),
+        row.get("advanced_direction"),
+    ):
+        value = str(source or "").strip().upper()
+        if value in {"LONG", "SHORT"}:
+            return value
+    long_score = _finite(row.get("long_score"))
+    short_score = _finite(row.get("short_score"))
+    if long_score is not None and short_score is None:
+        return "LONG"
+    if short_score is not None and long_score is None:
+        return "SHORT"
+    if long_score is not None and short_score is not None:
+        if long_score > short_score:
+            return "LONG"
+        if short_score > long_score:
+            return "SHORT"
+        return "LONG"
+    return ""
+
+
+def _observation_id_from_screening(row: Mapping[str, Any]) -> str | None:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+    existing = str((metadata or {}).get("observation_id") or "").strip()
+    if existing.startswith("OBS:"):
+        return existing
+    scan_id = str(row.get("scan_id") or "").strip()
+    scanner_type = str(row.get("scanner_type") or "").strip()
+    venue_id = _screening_venue_instrument_id(row)
+    observed_at = _iso(row.get("observed_at"))
+    if not scan_id or not scanner_type or not venue_id or not observed_at:
+        return None
+    return observation_join_id(
+        scan_id=scan_id,
+        scanner_type=scanner_type,
+        venue_instrument_id=venue_id,
+        observed_at=observed_at,
     )
 
 
@@ -375,7 +450,7 @@ def _classification(
     decision = str((funnel or {}).get("decision") or "").upper()
     reason_class = str((funnel or {}).get("terminal_reason_class") or "").upper()
 
-    if not outcome.get("outcome_available"):
+    if not outcome.get("outcome_available") or not outcome.get("outcome_complete"):
         return "PENDING_OUTCOME", False, False
     if decision == "QUALIFIED":
         return ("CAPTURED_WINNER" if winner else "QUALIFIED_NONWINNER"), winner, False
@@ -388,7 +463,11 @@ def _classification(
             return "OPERATIONAL_EXECUTABLE_MISS", True, True
         return "EXECUTABLE_FALSE_NEGATIVE", True, True
 
-    if production_direction and not production_selected:
+    if (
+        production_direction
+        and not production_selected
+        and screening_outcome == "COARSE_RANK_LIMIT"
+    ):
         return "RANKING_OR_CAP_MISS_CANDIDATE", True, False
     if score is not None and policy.shadow_threshold <= score < policy.production_threshold:
         return "THRESHOLD_70_79_MISS_CANDIDATE", True, False
@@ -435,8 +514,9 @@ def build_accountability_rows(
                     evidence_snapshot[target_name] = screening_metadata.get(source_name)
         snapshot_id = str((snapshot or {}).get("snapshot_id") or "")
         outcome_row = outcomes.get(snapshot_id)
-        advanced_direction = str(screening.get("advanced_direction") or "").upper()
+        preferred_direction = _preferred_production_direction(screening)
         screening_outcome = str(screening.get("outcome") or "UNKNOWN").upper()
+        observation_id = _observation_id_from_screening(screening)
 
         for direction, score_field in (("LONG", "long_score"), ("SHORT", "short_score")):
             score = _finite(screening.get(score_field))
@@ -448,7 +528,7 @@ def build_accountability_rows(
             classification, market_winner, executable_false_negative = _classification(
                 score=score,
                 screening_outcome=screening_outcome,
-                production_direction=advanced_direction == direction,
+                production_direction=preferred_direction == direction,
                 funnel=funnel,
                 outcome=direction_outcome,
                 executability=executability,
@@ -471,16 +551,19 @@ def build_accountability_rows(
                 "record_type": "OPPORTUNITY_ACCOUNTABILITY",
                 "schema_version": 1,
                 "accountability_id": accountability_id,
+                "observation_id": observation_id,
                 "observed_at": observed_at,
                 "scan_id": scan_id,
                 "symbol": symbol,
                 "direction": direction,
                 "screening_outcome": screening_outcome,
                 "technical_score": score,
-                "production_direction": advanced_direction == direction,
+                "production_preferred_direction": preferred_direction or None,
+                "production_direction": preferred_direction == direction,
                 "production_selected": funnel is not None,
                 "production_threshold": config.production_threshold,
                 "shadow_threshold": config.shadow_threshold,
+                "winner_definition": ACCOUNTABILITY_WINNER_DEFINITION,
                 "winner_move_threshold_pct": config.winner_move_pct,
                 "snapshot_id": snapshot_id or None,
                 "episode_id": (funnel or {}).get("episode_id") or (snapshot or {}).get("episode_id"),
@@ -526,7 +609,9 @@ def build_accountability_rows(
                         config.shadow_threshold <= score < config.production_threshold
                     ),
                     "expanded_cap_shadow": bool(
-                        advanced_direction == direction and funnel is None
+                        preferred_direction == direction
+                        and funnel is None
+                        and screening_outcome == "COARSE_RANK_LIMIT"
                     ),
                     "decay_aware_shadow": {
                         "eligible": range_consumed is not None,

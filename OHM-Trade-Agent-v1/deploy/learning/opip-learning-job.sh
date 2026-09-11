@@ -37,8 +37,12 @@ unset -v _opip_oneshot_var
 : "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 
 case "$JOB" in
-  capture)
-    MODULE="app.jobs.run_opip_ml_capture"
+  capture|reconcile)
+    if [[ "$JOB" == "reconcile" ]]; then
+      MODULE="app.jobs.reconcile_discovery_accountability_evidence"
+    else
+      MODULE="app.jobs.run_opip_ml_capture"
+    fi
     MEMORY_LIMIT="384m"
     CPU_LIMIT="0.60"
     MIN_AVAILABLE_KB=$((512 * 1024))
