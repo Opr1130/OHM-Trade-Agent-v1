@@ -1,8 +1,8 @@
 {
   "record_type": "DatasetExportManifest",
   "schema_version": 1,
-  "manifest_id": "EXPORT:7df7d6e588a6ff8e9ecade7cc7220548d187a45d:2026-09-11T15:02:00Z",
-  "source_release_sha": "7df7d6e588a6ff8e9ecade7cc7220548d187a45d",
+  "manifest_id": "EXPORT:808a308cd274d30b55fef47b382c229b761e07df:2026-09-11T15:02:00Z",
+  "source_release_sha": "808a308cd274d30b55fef47b382c229b761e07df",
   "published_and_verified_before_commit": true,
   "consumers_read_committed_manifest_only": true,
   "objects": [

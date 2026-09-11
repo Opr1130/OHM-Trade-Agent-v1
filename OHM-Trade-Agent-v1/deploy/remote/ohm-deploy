@@ -53,6 +53,40 @@ wait_core_health() {
   [[ "$healthy" == "1" ]]
 }
 
+wait_writer_health() {
+  # Writer health is validated separately from core. Core must never depend on
+  # writer availability to start; this check only gates a successful deploy of
+  # the PR 2 service itself.
+  local cid status
+  for _ in $(seq 1 30); do
+    cid="$(docker compose ps -q opip-canonical-writer 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true)"
+      if [[ "$status" == "healthy" ]]; then
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  echo "opip-canonical-writer health check failed" >&2
+  docker compose ps opip-canonical-writer >&2 || true
+  return 1
+}
+
+validate_writer_resource_limits() {
+  local actual expected_mem expected_swap expected_nano expected_pids
+  expected_mem=134217728
+  expected_swap=134217728
+  expected_nano=150000000
+  expected_pids=64
+  actual="$(docker inspect --format='{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.HostConfig.NanoCpus}}|{{.HostConfig.PidsLimit}}' opip-canonical-writer 2>/dev/null || true)"
+  if [[ "$actual" != "${expected_mem}|${expected_swap}|${expected_nano}|${expected_pids}" ]]; then
+    echo "writer resource limit mismatch: expected=${expected_mem}|${expected_swap}|${expected_nano}|${expected_pids} actual=$actual" >&2
+    return 1
+  fi
+  echo "O'Pip canonical writer resource validation: PASS"
+}
+
 paper_services() {
   docker compose -f "$PAPER_COMPOSE" config --services \
     | grep -E '^ohm-freqtrade-paper(-usdt)?$' || true
@@ -127,6 +161,7 @@ validate_target_resource_budget() {
   done <<'LIMITS'
 ohm-trade-agent|402653184|402653184
 ohm-dashboard-edge|67108864|67108864
+opip-canonical-writer|134217728|134217728
 opip-stream-worker|201326592|201326592
 ohm-freqtrade-paper|402653184|402653184
 ohm-freqtrade-paper-usdt|402653184|402653184
@@ -247,11 +282,20 @@ rollback() {
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
   cd "$APP_ROOT"
 
-  docker compose build ohm-trade-agent
+  docker compose build opip-canonical-writer ohm-trade-agent
+  # Start writer and core independently. Do not make core availability wait on
+  # writer health via Compose depends_on.
+  docker compose up -d --remove-orphans opip-canonical-writer
   docker compose up -d --remove-orphans ohm-trade-agent
 
   if ! wait_core_health; then
     echo "rollback core health check failed" >&2
+    restore_scheduler_state
+    cleanup_snapshot
+    exit "$rc"
+  fi
+  if ! wait_writer_health; then
+    echo "rollback writer health check failed" >&2
     restore_scheduler_state
     cleanup_snapshot
     exit "$rc"
@@ -284,11 +328,23 @@ stop_paper_stack
 "${GIT[@]}" reset --hard "$TARGET_SHA"
 
 cd "$APP_ROOT"
-docker compose build ohm-trade-agent
+docker compose build opip-canonical-writer ohm-trade-agent
+# Writer and core are independent services. Build/start both; validate each
+# separately. Never introduce Compose depends_on: condition=service_healthy
+# from ohm-trade-agent onto opip-canonical-writer.
+docker compose up -d --remove-orphans opip-canonical-writer
 docker compose up -d --remove-orphans ohm-trade-agent
 
 if ! wait_core_health; then
   echo "production core health check failed" >&2
+  false
+fi
+if ! wait_writer_health; then
+  echo "production writer health check failed" >&2
+  false
+fi
+if ! validate_writer_resource_limits; then
+  echo "production writer resource validation failed" >&2
   false
 fi
 

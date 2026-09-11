@@ -4,28 +4,26 @@
 
 | Field | Value |
 | --- | --- |
-| SHA | `7df7d6e588a6ff8e9ecade7cc7220548d187a45d` |
+| SHA | `808a308cd274d30b55fef47b382c229b761e07df` |
 | Ref | `origin/main` |
-| Date | 2026-09-10 22:49:15 -0400 |
-| Subject | Merge pull request #232 from Opr1130/feature/ef-01-evidence-foundation-repair |
+| Date | 2026-09-11 |
+| Subject | PR 1: Lock O'Pip Profit Intelligence architecture contracts v1.2 |
 
-All authority-map and capture-boundary symbols in this package are mapped to that commit.
+All authority-map and capture-boundary symbols in this package are mapped relative to that commit. PR 2 implementation branches from this SHA.
 
-PR 1 documentation is authored on branch `docs/pr1-architecture-validation-contracts` created from this SHA. It is not created from `fix/discovery-rotation-aware-checkpoint`.
+The earlier docs-only pin (pre-merge PR 1 branch base) is superseded by the merged PR 1 commit above for implementation work.
 
 ## GitHub PR #233 isolation
 
 GitHub PR #233 (`fix/discovery-rotation-aware-checkpoint`) is a **different existing artifact**. It repairs Discovery screening rotation-aware checkpoints.
 
-PR 1 **MUST NOT**:
+PR 2 **MUST NOT**:
 
 - merge GitHub PR #233
 - close GitHub PR #233
 - supersede GitHub PR #233
 - modify GitHub PR #233
 - otherwise disposition GitHub PR #233
-
-Working-tree SHA `21a93e68290c1a0d83cda7f8e9b9e8e1bfabdbf9` is **not** the architecture pin.
 
 ## Superseded implementation path
 

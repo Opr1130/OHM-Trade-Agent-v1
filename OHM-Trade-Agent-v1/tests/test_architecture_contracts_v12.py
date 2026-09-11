@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs" / "architecture" / "v1.2"
 FIXTURES = DOCS / "fixtures"
-PIN = "7df7d6e588a6ff8e9ecade7cc7220548d187a45d"
+PIN = "808a308cd274d30b55fef47b382c229b761e07df"
 
 CONTRACT_FILES = (
     "README.md",
@@ -140,6 +140,10 @@ def test_pr2_capture_boundary() -> None:
     assert "evaluate_opportunity_alert()" in text
     assert "record_opportunity_alert()" in text
     assert "release_opportunity_alert_reservation()" in text
+    assert "canonical durable ACK" in text
+    assert "CONFIRM_OPS_APPLIED" in text
+    assert "capture_gap_spool.json" in text
+    assert "OPIP_CANONICAL_WRITER_MODE=off" in text
     incident = _load_fixture("incident_lifecycle.example.json")
     boundary = incident["bounded_reminder_policy"]["pr2_boundary"]
     assert boundary["file"] == "app/services/alert_governor.py"

@@ -3,6 +3,12 @@ import logging
 
 from app.core.config import get_settings
 from app.exchanges.kraken_identity import canonicalize_asset, split_canonical_pair
+from app.opip.canonical.bridge import (
+    durable_record_opportunity_alert,
+    durable_release_opportunity_alert_reservation,
+    reconcile_capture_gap_spool,
+    reconcile_pending_ops_handoffs,
+)
 from app.opip.decision.identity import opip_scan_id
 from app.opip.decision.screening import (
     ScannerType,
@@ -639,6 +645,16 @@ def main() -> None:
             else []
         )
         deep_alert_symbols = {item.symbol.upper() for item in eligible_signals}
+        # PR 2: reconcile durable ops handoffs and capture-gap spool before any
+        # new Early Watch evaluate. Mode defaults to off (no-op).
+        try:
+            reconcile_pending_ops_handoffs(settings=settings)
+            reconcile_capture_gap_spool(settings=settings)
+        except Exception as exc:
+            logger.warning(
+                "canonical handoff/gap reconcile failed open: %s",
+                type(exc).__name__,
+            )
         for signal in eligible_signals[:10]:
             transition_key = _transition_key(signal)
             identity = f"EARLY_MOVER:{signal.symbol}"
@@ -676,11 +692,13 @@ def main() -> None:
                     symbol=signal.symbol,
                 )
                 if delivered_message_id is not None:
-                    record_opportunity_alert(
+                    durable_record_opportunity_alert(
                         identity=identity,
                         transition_key=transition_key,
                         message_id=delivered_message_id,
                         created_new=False,
+                        scan_id=screening_scan_id,
+                        settings=settings,
                     )
                     edited += 1
                     if delivery_action == "TRANSITION_PUSHED":
@@ -709,7 +727,13 @@ def main() -> None:
                     generated_at=decision_at,
                 )
             except Exception as exc:
-                release_opportunity_alert_reservation(decision.reservation_token)
+                durable_release_opportunity_alert_reservation(
+                    decision.reservation_token,
+                    scan_id=screening_scan_id,
+                    identity=identity,
+                    transition_key=transition_key,
+                    settings=settings,
+                )
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
                 print(
                     f"Telegram create failed for {signal.symbol}: "
@@ -717,17 +741,25 @@ def main() -> None:
                 )
                 continue
             if delivery.delivered and delivery.message_id is not None:
-                record_opportunity_alert(
+                durable_record_opportunity_alert(
                     identity=identity,
                     transition_key=transition_key,
                     message_id=delivery.message_id,
                     created_new=True,
                     reservation_token=decision.reservation_token,
+                    scan_id=screening_scan_id,
+                    settings=settings,
                 )
                 created += 1
                 early_mover_delivery[signal.symbol.upper()] = ("CREATED", True)
             else:
-                release_opportunity_alert_reservation(decision.reservation_token)
+                durable_release_opportunity_alert_reservation(
+                    decision.reservation_token,
+                    scan_id=screening_scan_id,
+                    identity=identity,
+                    transition_key=transition_key,
+                    settings=settings,
+                )
                 early_mover_delivery[signal.symbol.upper()] = ("CREATE_FAILED", False)
 
         # Issue #223: record what the operator was actually notified about,

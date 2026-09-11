@@ -1,6 +1,6 @@
 # Authority map (as-built at pin)
 
-Pinned commit: `7df7d6e588a6ff8e9ecade7cc7220548d187a45d`.
+Pinned commit: `808a308cd274d30b55fef47b382c229b761e07df`.
 
 This map records **current** writers and consumers. It does not change production behavior.
 

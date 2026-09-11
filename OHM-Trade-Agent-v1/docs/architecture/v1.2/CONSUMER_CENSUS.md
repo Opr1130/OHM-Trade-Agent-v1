@@ -1,6 +1,6 @@
 # Consumer census
 
-Pinned commit: `7df7d6e588a6ff8e9ecade7cc7220548d187a45d`.
+Pinned commit: `808a308cd274d30b55fef47b382c229b761e07df`.
 
 Legacy JSONL is the current production write-ahead log. It is **non-authoritative** for new calibration and promotion after the named stop-writing timestamp (set at technical cutover, not invented in PR 1).
 

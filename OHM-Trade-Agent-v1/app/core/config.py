@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # deep-qualified EARLY_MOVER watch channel. It does not re-enable legacy
     # broad-watch / price-movement Telegram and never grants trade authority.
     opip_early_watch_alerts_enabled: bool = False
+    # PR 2 canonical writer capture. Default off. "shadow" records Early Watch
+    # governor transitions into SQLite evidence only; it does not grant trading
+    # authority, ranking influence, or production activation.
+    opip_canonical_writer_mode: str = Field(default="off")
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).

@@ -1,41 +1,56 @@
 # PR 2 named capture boundary
 
-PR 2 will prove the canonical writer transaction pattern on **one** low-rate existing operational transition. PR 1 does not implement the writer.
+PR 2 proves the canonical writer transaction pattern on **one** low-rate existing operational transition: Early Watch alert-governor CREATE / EDIT / RELEASE.
 
 ## Approved boundary
 
-| Item | Value at pin `7df7d6e588a6ff8e9ecade7cc7220548d187a45d` |
+| Item | Value at pin `808a308cd274d30b55fef47b382c229b761e07df` |
 | --- | --- |
 | File | `app/services/alert_governor.py` |
 | Evaluate | `evaluate_opportunity_alert()` |
-| Durable commit (later) | writer transaction (not implemented in PR 1) |
-| Record | `record_opportunity_alert()` |
-| Rollback | `release_opportunity_alert_reservation()` |
-| Production caller | `app/jobs/scan_movers.py` |
+| Durable commit | `opip-canonical-writer` over UDS (`/app/data/opip/canonical/writer.sock`) |
+| Record | `record_opportunity_alert()` after durable ACK |
+| Rollback | `release_opportunity_alert_reservation()` after durable ACK |
+| Production caller | `app/jobs/scan_movers.py` (Early Watch only) |
 | Scheduler hook | `app/jobs/run_cycle.py` → `_run_early_watch_if_due()` |
 | Cron | `deploy/cron.d/ohm-unified-cycle` (`python -m app.jobs.run_cycle`) |
-| State today | `/app/data/alert_governor_state.json` |
+| Ops state (JSON) | `/app/data/alert_governor_state.json` |
+| Evidence DB | `/app/data/opip/canonical/opip_canonical_v1.sqlite3` |
+| Gap spool (non-authoritative) | `/app/data/opip/canonical/capture_gap_spool.json` |
 | Actions | `CREATE` / `EDIT` / `SUPPRESS` |
 | Rate limit | 8 new cards / 24h; 6h same-state cooldown |
+| Default mode | `OPIP_CANONICAL_WRITER_MODE=off` |
 
 Approved sequence:
 
-`evaluate_opportunity_alert()` → writer transaction → `record_opportunity_alert()` / `release_opportunity_alert_reservation()`.
+`evaluate_opportunity_alert()` → Telegram outcome → canonical durable ACK → `record_opportunity_alert()` / `release_opportunity_alert_reservation()` → `CONFIRM_OPS_APPLIED`.
 
-## Why this boundary
+JSON remains operational alert-control authority. SQLite is canonical evidence authority for the named Early Watch transition.
 
-- Already scheduled on the trading host at the pinned commit.
-- Low rate by construction.
-- Already separates evaluate from record/release, which is the transaction pattern PR 2 must prove.
+## Ops handoff (O12)
 
-## Not the named PR 2 boundary
+Initial writer transaction atomically writes `event + idempotency + projection(if recorded) + watermark + PENDING handoff`.
 
-| Candidate | Why not named |
-| --- | --- |
-| `app/opip/risk/alert_state.py` `AlertStateManager.evaluate` / `commit` | Cleaner token pattern; **not scheduled** in `run_cycle` at the pin |
-| Phase3C `.phase3c_forward_outcomes.jsonl.state.sqlite3` handoff | Learning-plane maturation, not an operational incident |
+After JSON mutation succeeds, the producer sends idempotent `CONFIRM_OPS_APPLIED(event_id)`.
 
-PR 2 may copy the Event Risk Shield evaluate/commit token pattern when wrapping governor transitions. PR 1 does not schedule the shield and does not add SQLite.
+At the start of each Early Watch cycle, PENDING handoffs are reconciled over UDS **before** new alert evaluation.
+
+## Gap spool (O10)
+
+Do **not** use a second append-only evidence journal for gaps. Unresolved writer-delivery failures live in the atomic JSON recovery spool. Their presence makes the evidence window **INCOMPLETE**. On writer recovery they are reconciled into canonical `alert_governor.capture_gap.recorded` evidence and then removed.
+
+## Deployment independence (O11)
+
+`ohm-trade-agent` must **not** `depends_on` the writer with `condition: service_healthy`. `deploy/remote/ohm-deploy` builds/starts/health-checks writer and core separately and validates writer resource limits.
+
+## Not in PR 2
+
+- Broad Watch integration
+- Detector / feature bus / paper work
+- Signal Quality SQ-01
+- Funded trading changes
+- GitHub PR #233 changes
+- Production shadow activation (`mode=shadow` remains an explicit later gate)
 
 ## Authority statements
 
@@ -44,3 +59,5 @@ PR 2 may copy the Event Risk Shield evaluate/commit token pattern when wrapping 
 `SIGNAL QUALITY SQ-01 STARTED = NO`
 
 `FUNDED TRADING ENABLED = NO`
+
+`PR 2 PRODUCTION ACTIVATION AUTHORIZED = NO`

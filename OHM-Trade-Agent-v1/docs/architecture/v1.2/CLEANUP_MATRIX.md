@@ -1,6 +1,6 @@
 # Cleanup matrix
 
-Disposition is toward the v1.2 target. Current as-built status is at pin `7df7d6e588a6ff8e9ecade7cc7220548d187a45d`.
+Disposition is toward the v1.2 target. Current as-built status is at pin `808a308cd274d30b55fef47b382c229b761e07df`.
 
 Every retained comparator or compatibility path has a termination gate.
 

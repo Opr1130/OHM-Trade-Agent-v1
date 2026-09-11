@@ -264,4 +264,17 @@ def test_first_stream_worker_deploy_uses_existing_trusted_reconcile_hook():
     assert "O'Pip deployment succeeded" in workflow
     assert "/diagnose-learning" in workflow
     assert "&& grep -q 'OPIP stream worker reconciliation: OK' deploy.log" not in workflow
+    assert "docker compose build opip-canonical-writer ohm-trade-agent" in deploy
+    assert "--remove-orphans opip-canonical-writer" in deploy
     assert "--remove-orphans ohm-trade-agent" in deploy
+    assert "wait_writer_health" in deploy
+    assert "validate_writer_resource_limits" in deploy
+    compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    core_block = compose.split("  ohm-trade-agent:", 1)[1].split("\n  opip-", 1)[0]
+    assert "opip-canonical-writer" not in core_block
+    assert 'OPIP_CANONICAL_WRITER_MODE: "off"' in compose
+    assert "opip-canonical-writer:" in compose
+    assert "app.opip.canonical.writer_service" in compose
+    assert "mem_limit: 128m" in compose
+    assert 'cpus: "0.15"' in compose
+    assert "oom_score_adj: 100" in compose.split("opip-canonical-writer:", 1)[1]
