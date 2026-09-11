@@ -37,8 +37,12 @@ unset -v _opip_oneshot_var
 : "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 
 case "$JOB" in
-  capture)
-    MODULE="app.jobs.run_opip_ml_capture"
+  capture|reconcile)
+    if [[ "$JOB" == "reconcile" ]]; then
+      MODULE="app.jobs.reconcile_discovery_accountability_evidence"
+    else
+      MODULE="app.jobs.run_opip_ml_capture"
+    fi
     MEMORY_LIMIT="384m"
     CPU_LIMIT="0.60"
     MIN_AVAILABLE_KB=$((512 * 1024))
@@ -269,6 +273,24 @@ if [[ "$rc" == "0" ]]; then
       printf 'accountability_pending_count=%s\n' "$pending_count" \
         >> "$STATE_ROOT/$JOB.disposition.env"
     fi
+  elif [[ "$JOB" == "reconcile" ]]; then
+    # Honor Python consumption summary so INCOMPLETE never masquerades as OK.
+    summary_disp="$(
+      awk -F'[:,]' '
+        /"disposition"/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /"disposition"/) {
+              gsub(/[^A-Za-z0-9_]/, "", $(i + 1))
+              if ($(i + 1) != "") { print $(i + 1); exit }
+            }
+          }
+        }
+      ' "$DATA_ROOT/.learning_consumption/reconcile.json" 2>/dev/null || true
+    )"
+    if [[ "$summary_disp" == "CONSUMED_EMPTY" || "$summary_disp" == "CONSUMED_OK" || "$summary_disp" == "FAILED_RETRYABLE" ]]; then
+      disposition="$summary_disp"
+    fi
+    write_disposition "$disposition" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "$detail"
   else
     write_disposition "$disposition" "$RELEASE_STATUS" "$EXPECTED_SHA" "$rc" "$detail"
   fi
