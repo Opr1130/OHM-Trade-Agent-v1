@@ -230,6 +230,9 @@ def test_reconcile_job_writes_empty_report_without_replica(tmp_path):
 def test_inspect_replica_marks_missing_files_unavailable(tmp_path):
     report = inspect_replica(tmp_path)
     assert report["replica_available"] is False
+    assert report["replica_present"] is False
+    assert report["reconciliation_complete"] is False
+    assert report["reconciliation_status"] == "EMPTY"
     assert report["population_counts"]["discovery_physical_rows"] == 0
 
 
@@ -689,6 +692,9 @@ def test_inspect_replica_streams_large_jsonl_without_read_text(tmp_path, monkeyp
 
     report = inspect_replica(tmp_path)
     assert report["replica_available"] is True
+    assert report["replica_present"] is True
+    assert report["reconciliation_complete"] is True
+    assert report["reconciliation_status"] == "RECONCILED"
     assert report["stage0_reconciliation"]["population"]["total"] == 400
     assert report["stage0_reconciliation"]["population"]["ADMITTED"] == 80
     assert report["resource_usage"]["used_path_read_text_for_jsonl"] is False
@@ -709,3 +715,306 @@ def test_inspect_replica_skips_truncated_and_malformed_jsonl(tmp_path):
     assert report["stage0_reconciliation"]["population"]["ADMITTED"] == 1
     assert report["resource_usage"]["ingest_stats"]["stage0"]["malformed_rows"] == 1
     assert report["resource_usage"]["ingest_stats"]["stage0"]["truncated_tail_skipped"] == 1
+
+
+def test_index_cap_exceeded_fail_closes_certification(tmp_path, monkeypatch):
+    monkeypatch.setattr(reconciliation_mod, "MAX_INDEX_ROWS_PER_PLANE", 2)
+    screening_rows = [
+        _stage0_row(scan_id=f"SCAN:CAP:{i}", symbol=f"C{i}USD", admission="ADMITTED")
+        for i in range(3)
+    ]
+    discovery_rows = []
+    oa_rows = []
+    for row in screening_rows:
+        observation_id = row["metadata"]["observation_id"]
+        discovery_rows.append(
+            {
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "venue_instrument_id": row["venue_instrument_id"],
+                "observed_at": row["observed_at"],
+                "production_preferred_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        )
+        oa_rows.append(
+            {
+                "accountability_id": f"OA:CAP:{row['scan_id']}",
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "symbol": row["venue_instrument_id"],
+                "direction": "LONG",
+                "observed_at": row["observed_at"],
+                "opportunity_classification": "MARKET_WINNER_UNVERIFIED_EXECUTABILITY",
+                "market_winner": True,
+                "outcome_complete": True,
+                "production_admission_result": "ADMITTED",
+                "production_preferred_direction": "LONG",
+                "funnel_evidence_present": False,
+                "revision": 1,
+            }
+        )
+    _write_jsonl(
+        tmp_path / "opip/qualification/screening_evaluations.jsonl",
+        screening_rows,
+    )
+    _write_jsonl(tmp_path / "opip/discovery/forward_outcomes.jsonl", discovery_rows)
+    _write_jsonl(tmp_path / "opip/opportunity_accountability.jsonl", oa_rows)
+
+    report = inspect_replica(tmp_path)
+    assert any(report["resource_usage"]["index_cap_exceeded"].values())
+    assert report["reconciliation_complete"] is False
+    assert report["reconciliation_status"] == "INCOMPLETE"
+    assert any(
+        item.startswith("INDEX_CAP_EXCEEDED:")
+        for item in report["reconciliation_blockers"]
+    )
+
+    payload = reconcile_main(tmp_path)
+    assert payload["status"] != "OK"
+    assert payload["status"] == "INCOMPLETE"
+    assert payload["reconciliation_complete"] is False
+    consumption = json.loads(
+        (tmp_path / ".learning_consumption/reconcile.json").read_text(encoding="utf-8")
+    )
+    assert consumption["disposition"] != "CONSUMED_OK"
+    assert consumption["disposition"] == "FAILED_RETRYABLE"
+
+
+def test_stage0_only_is_present_but_not_certified(tmp_path):
+    row = _stage0_row(scan_id="SCAN:S0", symbol="S0USD", admission="ADMITTED")
+    _write_jsonl(tmp_path / "opip/qualification/screening_evaluations.jsonl", [row])
+    report = inspect_replica(tmp_path)
+    assert report["replica_present"] is True
+    assert report["reconciliation_complete"] is False
+    assert report["reconciliation_status"] == "INCOMPLETE"
+    assert "MISSING_CORE_PLANE:discovery" in report["reconciliation_blockers"]
+    assert "MISSING_CORE_PLANE:oa" in report["reconciliation_blockers"]
+    assert report["core_planes"]["stage0"] is True
+    payload = reconcile_main(tmp_path)
+    assert payload["status"] != "OK"
+    assert payload["status"] == "INCOMPLETE"
+
+
+def test_discovery_and_oa_without_stage0_not_certified(tmp_path):
+    observation_id = observation_join_id(
+        scan_id="SCAN:NO0",
+        scanner_type="BROAD_SEARCH",
+        venue_instrument_id="NO0USD",
+        observed_at="2026-09-10T12:00:00+00:00",
+    )
+    _write_jsonl(
+        tmp_path / "opip/discovery/forward_outcomes.jsonl",
+        [
+            {
+                "observation_id": observation_id,
+                "scan_id": "SCAN:NO0",
+                "venue_instrument_id": "NO0USD",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "production_preferred_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "opip/opportunity_accountability.jsonl",
+        [
+            {
+                "accountability_id": "OA:NO0",
+                "observation_id": observation_id,
+                "scan_id": "SCAN:NO0",
+                "symbol": "NO0USD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "MARKET_WINNER_UNVERIFIED_EXECUTABILITY",
+                "market_winner": True,
+                "outcome_complete": True,
+                "production_admission_result": "ADMITTED",
+                "production_preferred_direction": "LONG",
+                "revision": 1,
+            }
+        ],
+    )
+    report = inspect_replica(tmp_path)
+    assert report["core_planes"]["discovery"] is True
+    assert report["core_planes"]["opportunity_accountability"] is True
+    assert report["core_planes"]["stage0"] is False
+    assert report["reconciliation_complete"] is False
+    assert "MISSING_CORE_PLANE:stage0" in report["reconciliation_blockers"]
+
+
+def test_phase3c_only_not_certified(tmp_path):
+    _write_jsonl(
+        tmp_path / "phase3c_forward_outcomes.jsonl",
+        [
+            {
+                "snapshot_id": "SNAP:P3",
+                "symbol": "P3USD",
+                "mfe_pct": 3.0,
+                "mae_pct": -1.0,
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+    )
+    report = inspect_replica(tmp_path)
+    assert report["replica_present"] is True
+    assert report["core_planes"]["phase3c"] is True
+    assert report["reconciliation_complete"] is False
+    assert report["reconciliation_status"] == "INCOMPLETE"
+    assert "MISSING_CORE_PLANE:stage0" in report["reconciliation_blockers"]
+
+
+def test_stage0_discovery_oa_certified_when_complete(tmp_path):
+    row = _stage0_row(scan_id="SCAN:FULL", symbol="FULLUSD", admission="ADMITTED")
+    observation_id = row["metadata"]["observation_id"]
+    _write_jsonl(tmp_path / "opip/qualification/screening_evaluations.jsonl", [row])
+    _write_jsonl(
+        tmp_path / "opip/discovery/forward_outcomes.jsonl",
+        [
+            {
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "venue_instrument_id": row["venue_instrument_id"],
+                "observed_at": row["observed_at"],
+                "production_preferred_direction": "LONG",
+                "market_discovery_opportunity_v1": "WINNER",
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "opip/opportunity_accountability.jsonl",
+        [
+            {
+                "accountability_id": "OA:FULL",
+                "observation_id": observation_id,
+                "scan_id": row["scan_id"],
+                "symbol": row["venue_instrument_id"],
+                "direction": "LONG",
+                "observed_at": row["observed_at"],
+                "opportunity_classification": "MARKET_WINNER_UNVERIFIED_EXECUTABILITY",
+                "market_winner": True,
+                "outcome_complete": True,
+                "production_admission_result": "ADMITTED",
+                "production_preferred_direction": "LONG",
+                "funnel_evidence_present": False,
+                "revision": 1,
+            }
+        ],
+    )
+    report = inspect_replica(tmp_path)
+    assert report["reconciliation_complete"] is True
+    assert report["reconciliation_status"] == "RECONCILED"
+    assert report["reconciliation_blockers"] == []
+    payload = reconcile_main(tmp_path)
+    assert payload["status"] == "OK"
+    consumption = json.loads(
+        (tmp_path / ".learning_consumption/reconcile.json").read_text(encoding="utf-8")
+    )
+    assert consumption["disposition"] == "CONSUMED_OK"
+
+
+def test_incomplete_winner_evidence_never_exact_match():
+    """Matching observation_id without comparable winner must not be EXACT_MATCH."""
+    observation_id = observation_join_id(
+        scan_id="SCAN:INC",
+        scanner_type="BROAD_SEARCH",
+        venue_instrument_id="INCUSD",
+        observed_at="2026-09-10T12:00:00+00:00",
+    )
+    screening = _stage0_row(scan_id="SCAN:INC", symbol="INCUSD", admission="ADMITTED")
+    report = reconcile_rows(
+        screening_rows=[screening],
+        discovery_rows=[
+            {
+                "observation_id": observation_id,
+                "scan_id": "SCAN:INC",
+                "venue_instrument_id": "INCUSD",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "production_preferred_direction": "LONG",
+                # Incomplete / non-comparable winner label
+                "market_discovery_opportunity_v1": "PENDING",
+                "window_complete": False,
+                "outcome_revision": 1,
+            }
+        ],
+        accountability_rows=[
+            {
+                "accountability_id": "OA:INC",
+                "observation_id": observation_id,
+                "scan_id": "SCAN:INC",
+                "symbol": "INCUSD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "PENDING_OUTCOME",
+                "market_winner": False,
+                "outcome_complete": False,
+                "outcome_available": False,
+                "production_admission_result": "ADMITTED",
+                "production_preferred_direction": "LONG",
+                "revision": 1,
+            }
+        ],
+    )
+    sample = report["overlap_sample"]
+    assert sample
+    assert all(item["compatibility"] != "EXACT_MATCH" for item in sample)
+    assert any(item["compatibility"] == "SEMANTICALLY_COMPATIBLE" for item in sample)
+
+
+def test_genuine_stage0_exact_match_requires_compared_admission_dims():
+    observation_id = observation_join_id(
+        scan_id="SCAN:EX",
+        scanner_type="BROAD_SEARCH",
+        venue_instrument_id="EXUSD",
+        observed_at="2026-09-10T12:00:00+00:00",
+    )
+    screening = _stage0_row(scan_id="SCAN:EX", symbol="EXUSD", admission="ADMITTED")
+    report = reconcile_rows(
+        screening_rows=[screening],
+        discovery_rows=[
+            {
+                "observation_id": observation_id,
+                "scan_id": "SCAN:EX",
+                "venue_instrument_id": "EXUSD",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "production_preferred_direction": "LONG",
+                # No market opportunity label — Stage-0 dims only.
+                "window_complete": True,
+                "outcome_revision": 1,
+            }
+        ],
+        accountability_rows=[
+            {
+                "accountability_id": "OA:EX",
+                "observation_id": observation_id,
+                "scan_id": "SCAN:EX",
+                "symbol": "EXUSD",
+                "direction": "LONG",
+                "observed_at": "2026-09-10T12:00:00+00:00",
+                "opportunity_classification": "MARKET_WINNER_UNVERIFIED_EXECUTABILITY",
+                "market_winner": False,
+                "outcome_complete": True,
+                "production_admission_result": "ADMITTED",
+                "production_preferred_direction": "LONG",
+                "revision": 1,
+            }
+        ],
+    )
+    sample = report["overlap_sample"]
+    assert sample
+    assert sample[0]["compatibility"] == "EXACT_MATCH"
+    assert sample[0]["via"] == "observation_id"
+
+
+def test_learning_job_shell_honors_reconcile_disposition_summary():
+    runner = (LEARNING / "opip-learning-job.sh").read_text(encoding="utf-8")
+    assert 'JOB" == "reconcile"' in runner or "JOB\" == \"reconcile\"" in runner
+    assert ".learning_consumption/reconcile.json" in runner
+    assert "FAILED_RETRYABLE" in runner

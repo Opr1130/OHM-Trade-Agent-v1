@@ -59,6 +59,14 @@ COMPAT_DIFFERENT_SCOPE = "DIFFERENT_SCOPE_EXPECTED"
 COMPAT_MISMATCH = "DATA_MISMATCH"
 COMPAT_UNMAPPABLE = "UNMAPPABLE"
 
+STATUS_RECONCILED = "RECONCILED"
+STATUS_INCOMPLETE = "INCOMPLETE"
+STATUS_EMPTY = "EMPTY"
+STATUS_ERROR = "ERROR"
+
+CORE_PLANES = ("stage0", "discovery", "oa")
+INDEX_PLANES = ("stage0", "discovery", "oa", "phase3c", "funnel")
+
 STAGE0_ADMISSION_VALUES = (
     "ADMITTED",
     "RANKED_OUTSIDE_BUDGET",
@@ -747,7 +755,20 @@ def _compat_verdict(
     winner_agree: bool,
     complete_agree: bool,
     classification_mismatch: bool,
+    stage0_admission_compared: bool = False,
+    stage0_admission_agree: bool = False,
+    preferred_direction_compared: bool = False,
+    preferred_direction_agree: bool = False,
+    outcome_label_incomplete: bool = False,
 ) -> str:
+    """Classify join compatibility.
+
+    ``EXACT_MATCH`` is reserved for Stage-0 identity/admission/preferred-direction
+    dimensions that were actually compared, with no incomplete or conflicting
+    outcome-label claim. Winner-label agreement never upgrades to ``EXACT_MATCH``
+    because V2-01 and OA winner definitions differ in scope. Vacuous
+    ``winner_agree=True`` without ``winner_compared`` cannot certify exactness.
+    """
     if not via:
         return COMPAT_UNMAPPABLE
     if classification_mismatch:
@@ -756,11 +777,120 @@ def _compat_verdict(
         return COMPAT_DIFFERENT_SCOPE
     if not complete_agree:
         return COMPAT_DIFFERENT_SCOPE
-    if via == "observation_id" and stage0_present and winner_agree:
+    # Different-scope winner definitions: agreement is semantic, never exact.
+    if winner_compared:
+        if via in {"observation_id", "reconstructed"} and stage0_present:
+            return COMPAT_SEMANTIC
+        if via in {"observation_id", "reconstructed"}:
+            return COMPAT_SEMANTIC
+        return COMPAT_UNMAPPABLE
+    # Discovery joined but winner label not finalized/comparable.
+    if outcome_label_incomplete:
+        if via in {"observation_id", "reconstructed"} and stage0_present:
+            return COMPAT_SEMANTIC
+        if via in {"observation_id", "reconstructed"}:
+            return COMPAT_SEMANTIC
+        return COMPAT_UNMAPPABLE
+    if (
+        via == "observation_id"
+        and stage0_present
+        and stage0_admission_compared
+        and stage0_admission_agree
+        and preferred_direction_compared
+        and preferred_direction_agree
+    ):
         return COMPAT_EXACT_MATCH
+    if via in {"observation_id", "reconstructed"} and stage0_present:
+        return COMPAT_SEMANTIC
     if via in {"observation_id", "reconstructed"}:
         return COMPAT_SEMANTIC
     return COMPAT_UNMAPPABLE
+
+
+def _stage0_exact_dimensions(
+    *,
+    stage0_admission: str,
+    stage0_preferred: str | None,
+    preferred_oa: Mapping[str, Any] | None,
+) -> tuple[bool, bool, bool, bool]:
+    """Return (admission_compared, admission_agree, preferred_compared, preferred_agree)."""
+    if preferred_oa is None:
+        return False, False, False, False
+    oa_admission = _optional_text(preferred_oa.get("production_admission_result")).upper()
+    admission_compared = bool(stage0_admission) and bool(oa_admission)
+    admission_agree = admission_compared and stage0_admission == oa_admission
+    oa_preferred = _optional_text(
+        preferred_oa.get("production_preferred_direction")
+    ).upper() or None
+    preferred_compared = bool(stage0_preferred) and bool(oa_preferred)
+    preferred_agree = (
+        preferred_compared
+        and stage0_preferred in {"LONG", "SHORT"}
+        and oa_preferred == stage0_preferred
+    )
+    return admission_compared, admission_agree, preferred_compared, preferred_agree
+
+
+def build_certification(
+    *,
+    physical: Mapping[str, int],
+    index_rows: Mapping[str, int],
+    index_cap_exceeded: Mapping[str, bool],
+) -> dict[str, Any]:
+    """Derive replica presence vs EF-01 certification completeness."""
+    stage0_present = int(index_rows.get("stage0") or 0) > 0 or int(
+        physical.get("stage0") or 0
+    ) > 0
+    discovery_present = int(index_rows.get("discovery") or 0) > 0 or int(
+        physical.get("discovery") or 0
+    ) > 0
+    oa_present = int(index_rows.get("oa") or 0) > 0 or int(physical.get("oa") or 0) > 0
+    phase3c_present = int(index_rows.get("phase3c") or 0) > 0 or int(
+        physical.get("phase3c") or 0
+    ) > 0
+    funnel_present = int(index_rows.get("funnel") or 0) > 0 or int(
+        physical.get("funnel") or 0
+    ) > 0
+
+    blockers: list[str] = []
+    for plane in INDEX_PLANES:
+        if index_cap_exceeded.get(plane):
+            blockers.append(f"INDEX_CAP_EXCEEDED:{plane}")
+    if not stage0_present:
+        blockers.append("MISSING_CORE_PLANE:stage0")
+    if not discovery_present:
+        blockers.append("MISSING_CORE_PLANE:discovery")
+    if not oa_present:
+        blockers.append("MISSING_CORE_PLANE:oa")
+
+    replica_present = bool(
+        stage0_present or discovery_present or oa_present or phase3c_present
+    )
+    core_complete = stage0_present and discovery_present and oa_present
+    cap_blockers = [item for item in blockers if item.startswith("INDEX_CAP_EXCEEDED:")]
+    reconciliation_complete = core_complete and not cap_blockers
+
+    if not replica_present:
+        status = STATUS_EMPTY
+    elif reconciliation_complete:
+        status = STATUS_RECONCILED
+    else:
+        status = STATUS_INCOMPLETE
+
+    return {
+        "replica_present": replica_present,
+        "replica_available": replica_present,  # legacy alias
+        "reconciliation_complete": reconciliation_complete,
+        "reconciliation_status": status,
+        "reconciliation_blockers": blockers,
+        "core_planes": {
+            "stage0": stage0_present,
+            "discovery": discovery_present,
+            "opportunity_accountability": oa_present,
+            "phase3c": phase3c_present,
+            "funnel": funnel_present,
+        },
+    }
 
 
 def _expected_oa_classification(
@@ -1131,16 +1261,33 @@ def _assemble_report(
         if disc_mae is not None and p3_mae is not None:
             mae_abs.append(abs(abs(disc_mae) - abs(p3_mae)))
 
-        winner_local_agree = True
-        if market in {"WINNER", "NON_WINNER"}:
+        winner_compared_local = market in {"WINNER", "NON_WINNER"}
+        winner_local_agree = False
+        if winner_compared_local:
             winner_local_agree = (market == "WINNER") == oa_winner
+        outcome_label_incomplete = bool(market) and not winner_compared_local
+        (
+            admission_compared,
+            admission_agree,
+            preferred_compared,
+            preferred_agree,
+        ) = _stage0_exact_dimensions(
+            stage0_admission=admission,
+            stage0_preferred=preferred,
+            preferred_oa=preferred_oa,
+        )
         verdict = _compat_verdict(
             via=via,
             stage0_present=True,
-            winner_compared=market in {"WINNER", "NON_WINNER"},
+            winner_compared=winner_compared_local,
             winner_agree=winner_local_agree,
             complete_agree=complete_local_agree if discovery is not None else True,
             classification_mismatch=classification_mismatch,
+            stage0_admission_compared=admission_compared,
+            stage0_admission_agree=admission_agree,
+            preferred_direction_compared=preferred_compared,
+            preferred_direction_agree=preferred_agree,
+            outcome_label_incomplete=outcome_label_incomplete,
         )
         verdict_counts[verdict] += 1
 
@@ -1221,8 +1368,9 @@ def _assemble_report(
             if preferred == realized:
                 direction_agree += 1
         market = str(discovery["market_opportunity"] or "")
-        winner_local_agree = True
-        if market in {"WINNER", "NON_WINNER"}:
+        winner_compared_local = market in {"WINNER", "NON_WINNER"}
+        winner_local_agree = False
+        if winner_compared_local:
             winner_compared += 1
             winner_local_agree = (market == "WINNER") == oa_winner
             if winner_local_agree:
@@ -1267,13 +1415,15 @@ def _assemble_report(
             mapping["fallback_reconstructed_joins"] += 1
             matched_recon += 1
         matched_total += 1
+        # No Stage-0 plane on this path — never emit EXACT_MATCH.
         verdict = _compat_verdict(
             via=via,
             stage0_present=False,
-            winner_compared=market in {"WINNER", "NON_WINNER"},
+            winner_compared=winner_compared_local,
             winner_agree=winner_local_agree,
             complete_agree=complete_local_agree,
             classification_mismatch=False,
+            outcome_label_incomplete=bool(market) and not winner_compared_local,
         )
         if verdict == COMPAT_EXACT_MATCH:
             verdict = COMPAT_SEMANTIC
@@ -1336,7 +1486,24 @@ def _assemble_report(
     identity_rate = (
         round(mapping["shared_observation_id_joins"] / stage0_n, 6) if stage0_n else None
     )
+    index_rows = {
+        "stage0": stage0_n,
+        "discovery": discovery_total,
+        "oa": oa_logical,
+        "phase3c": _table_count(connection, "phase3c"),
+        "funnel": _table_count(connection, "funnel"),
+    }
+    index_cap_exceeded = {
+        plane: bool(_meta_get(connection, f"cap_exceeded_{plane}"))
+        for plane in INDEX_PLANES
+    }
+    certification = build_certification(
+        physical=physical,
+        index_rows=index_rows,
+        index_cap_exceeded=index_cap_exceeded,
+    )
     return {
+        **certification,
         "measurement_only": True,
         "trade_authority_changed": False,
         "policy_change_authorized": False,
@@ -1473,17 +1640,8 @@ def _assemble_report(
             "ingest_stats": {key: dict(value) for key, value in ingest_stats.items()},
             "batches_processed": _meta_get(connection, "batches_processed"),
             "index_cardinality_cap": MAX_INDEX_ROWS_PER_PLANE,
-            "index_rows": {
-                "stage0": stage0_n,
-                "discovery": discovery_total,
-                "oa": oa_logical,
-                "phase3c": _table_count(connection, "phase3c"),
-                "funnel": _table_count(connection, "funnel"),
-            },
-            "index_cap_exceeded": {
-                plane: bool(_meta_get(connection, f"cap_exceeded_{plane}"))
-                for plane in ("stage0", "discovery", "oa", "phase3c", "funnel")
-            },
+            "index_rows": index_rows,
+            "index_cap_exceeded": index_cap_exceeded,
             "sqlite_working_set_bytes": sqlite_pages * sqlite_page_size,
             "peak_rss_kb": _peak_rss_kb(),
             "input_file_bytes": dict(input_file_bytes),
@@ -1734,10 +1892,9 @@ def inspect_replica(data_root: Path | str) -> dict[str, Any]:
                 pass
 
     report["replica_root"] = str(root)
-    report["replica_available"] = bool(
-        physical.get("stage0")
-        or (physical.get("discovery") and physical.get("oa"))
-    )
+    # Certification fields (replica_present / reconciliation_*) already set in
+    # _assemble_report via build_certification. Keep replica_available alias.
+    report["replica_available"] = bool(report.get("replica_present"))
     return report
 
 
@@ -1751,8 +1908,18 @@ def persist_reconciliation_report(report: Mapping[str, Any], path: Path) -> Path
 
 # Keep observation_join_id imported for tests that prove the formula.
 __all__ = [
+    "COMPAT_DIFFERENT_SCOPE",
+    "COMPAT_EXACT_MATCH",
+    "COMPAT_MISMATCH",
+    "COMPAT_SEMANTIC",
+    "COMPAT_UNMAPPABLE",
     "DISCOVERY_WINNER_DEFINITION",
     "MAX_INDEX_ROWS_PER_PLANE",
+    "STATUS_EMPTY",
+    "STATUS_ERROR",
+    "STATUS_INCOMPLETE",
+    "STATUS_RECONCILED",
+    "build_certification",
     "inspect_replica",
     "iter_jsonl_dicts",
     "join_key_from_accountability",
