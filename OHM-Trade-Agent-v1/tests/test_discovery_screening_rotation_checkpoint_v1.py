@@ -15,10 +15,15 @@ import pytest
 from app.opip.decision.store import screening_evaluations_archive
 from app.opip.discovery import maturation as maturation_mod
 from app.opip.discovery.admission import observation_join_id
+from app.opip.discovery.constants import DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE
 from app.opip.discovery.maturation import (
     open_discovery_state,
     reconcile_screening_queue,
+    _list_manifest_segment_rows,
+    _load_recovery_cursor,
     _state_int,
+    _state_json_list,
+    _state_json_object,
     _state_text,
     _set_state_checkpoint,
     _set_state_int,
@@ -119,27 +124,30 @@ def test_verified_rotation_indexes_archived_remainder_and_new_hot(tmp_path):
     _write_hot(hot, rows)
     state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
     try:
-        # Partially consume first row only.
+        # Consume first row for real, then rotate.
         first_line = (
             json.dumps(rows[0], sort_keys=True, allow_nan=False) + "\n"
         ).encode("utf-8")
-        _set_state_checkpoint(state, hot, "screening", len(first_line))
-        _set_hot_generation(state, hot)
-        _set_state_text(state, "screening_checkpoint_schema", "generation_v1")
-        state.commit()
+        hot.write_bytes(first_line)
+        reconcile_screening_queue(state, hot, now=NOW)
+        assert rows[0]["metadata"]["observation_id"] in _queue_ids(state)
+        with hot.open("ab") as handle:
+            for row in rows[1:]:
+                handle.write(
+                    (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode(
+                        "utf-8"
+                    )
+                )
 
         archived = _compact_hot(hot, keep_lines=1, max_bytes=16)
         assert archived is not None
-        assert hot.stat().st_size < len(first_line) + 20 or hot.stat().st_size < _state_int(
-            state, "screening_indexed_offset", 0
-        )
 
         reconcile_screening_queue(state, hot, now=NOW)
         ids = _queue_ids(state)
         assert rows[0]["metadata"]["observation_id"] in ids
         assert rows[1]["metadata"]["observation_id"] in ids
         assert rows[2]["metadata"]["observation_id"] in ids
-        assert _state_text(state, "screening_checkpoint_schema") == "generation_v1"
+        assert _state_text(state, "screening_checkpoint_schema") == "generation_v2"
     finally:
         state.close()
 
@@ -272,19 +280,23 @@ def test_same_generation_truncation_still_fails_closed(tmp_path):
         state.close()
 
 
-def test_same_generation_anchor_divergence_fails_closed(tmp_path):
+def test_same_generation_anchor_divergence_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(maturation_mod, "DISCOVERY_HOT_GENERATION_PREFIX_BYTES", 64)
     hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
-    rows = [_screening_row("SCAN:D1", "D1USD"), _screening_row("SCAN:D2", "D2USD")]
+    rows = [
+        _screening_row(f"SCAN:D{i}", f"D{i}USD") for i in range(8)
+    ]
     _write_hot(hot, rows)
     state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
     try:
         reconcile_screening_queue(state, hot, now=NOW)
         offset = _state_int(state, "screening_indexed_offset", 0)
-        # Rewrite bytes behind the checkpoint without changing size.
+        gen_bytes = _state_int(state, "screening_hot_generation_bytes", 0)
         payload = bytearray(hot.read_bytes())
-        if offset > 8:
-            payload[0] = (payload[0] + 1) % 256
-            hot.write_bytes(bytes(payload))
+        corrupt_at = min(offset - 1, gen_bytes + 8)
+        assert corrupt_at >= gen_bytes
+        payload[corrupt_at] = (payload[corrupt_at] + 1) % 256
+        hot.write_bytes(bytes(payload))
         with pytest.raises(RuntimeError, match="DISCOVERY_SCREENING_LEDGER_DIVERGED"):
             reconcile_screening_queue(state, hot, now=NOW)
     finally:
@@ -298,16 +310,17 @@ def test_crash_between_archive_ingest_and_checkpoint_is_idempotent(tmp_path, mon
         _screening_row("SCAN:C2", "C2USD"),
         _screening_row("SCAN:C3", "C3USD"),
     ]
-    _write_hot(hot, rows)
+    _write_hot(hot, rows[:1])
     state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
     try:
-        first_line = (
-            json.dumps(rows[0], sort_keys=True, allow_nan=False) + "\n"
-        ).encode("utf-8")
-        _set_state_checkpoint(state, hot, "screening", len(first_line))
-        _set_hot_generation(state, hot)
-        _set_state_text(state, "screening_checkpoint_schema", "generation_v1")
-        state.commit()
+        reconcile_screening_queue(state, hot, now=NOW)
+        with hot.open("ab") as handle:
+            for row in rows[1:]:
+                handle.write(
+                    (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode(
+                        "utf-8"
+                    )
+                )
         assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
 
         calls = {"n": 0}
@@ -347,7 +360,7 @@ def test_existing_offset_only_state_migrates_safely(tmp_path):
         state.commit()
 
         reconcile_screening_queue(state, hot, now=NOW)
-        assert _state_text(state, "screening_checkpoint_schema") == "generation_v1"
+        assert _state_text(state, "screening_checkpoint_schema") == "generation_v2"
         assert _state_int(state, "screening_hot_offset", -1) >= 0
         assert rows[0]["metadata"]["observation_id"] in _queue_ids(state)
     finally:
@@ -361,16 +374,17 @@ def test_archive_indexing_is_streaming_not_read_text(tmp_path, monkeypatch):
         _screening_row("SCAN:S2", "S2USD"),
         _screening_row("SCAN:S3", "S3USD"),
     ]
-    _write_hot(hot, rows)
+    _write_hot(hot, rows[:1])
     state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
     try:
-        first_line = (
-            json.dumps(rows[0], sort_keys=True, allow_nan=False) + "\n"
-        ).encode("utf-8")
-        _set_state_checkpoint(state, hot, "screening", len(first_line))
-        _set_hot_generation(state, hot)
-        _set_state_text(state, "screening_checkpoint_schema", "generation_v1")
-        state.commit()
+        reconcile_screening_queue(state, hot, now=NOW)
+        with hot.open("ab") as handle:
+            for row in rows[1:]:
+                handle.write(
+                    (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode(
+                        "utf-8"
+                    )
+                )
         assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
 
         original = Path.read_text
@@ -384,5 +398,254 @@ def test_archive_indexing_is_streaming_not_read_text(tmp_path, monkeypatch):
         monkeypatch.setattr(Path, "read_text", guarded)
         reconcile_screening_queue(state, hot, now=NOW)
         assert len(_queue_ids(state)) == 3
+    finally:
+        state.close()
+
+
+def _manifest_shas(hot: Path) -> list[str]:
+    archive = screening_evaluations_archive(hot)
+    return [str(row["sha256"]) for row in _list_manifest_segment_rows(archive)]
+
+
+def test_legacy_suffix_recovery_ignores_pre_checkpoint_archives(tmp_path):
+    """A0/A1 exist before checkpoint; only A2 (post-checkpoint) + HOT recover."""
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    a0 = _screening_row("SCAN:A0", "A0USD")
+    a1 = _screening_row("SCAN:A1", "A1USD")
+    keep = _screening_row("SCAN:KEEP", "KEEPUSD")
+    cp = _screening_row("SCAN:CP", "CPUSD")
+    post = _screening_row("SCAN:POST", "POSTUSD")
+
+    _write_hot(hot, [a0, keep])
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    shas_after_a0 = _manifest_shas(hot)
+    assert len(shas_after_a0) == 1
+    a0_sha = shas_after_a0[0]
+
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(a1, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    shas_after_a1 = _manifest_shas(hot)
+    assert len(shas_after_a1) == 2
+    a1_sha = [s for s in shas_after_a1 if s != a0_sha][0]
+
+    # Build checkpointed HOT content that will become A2.
+    _write_hot(hot, [cp, post])
+    cp_line = (json.dumps(cp, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        # Legacy offset-only state: no generation schema / known archives.
+        _set_state_checkpoint(state, hot, "screening", len(cp_line))
+        state.commit()
+        assert _state_text(state, "screening_checkpoint_schema") is None
+
+        archived = _compact_hot(hot, keep_lines=1, max_bytes=16)
+        assert archived is not None
+        shas = _manifest_shas(hot)
+        assert len(shas) == 3
+        a2_sha = [s for s in shas if s not in {a0_sha, a1_sha}][0]
+
+        stats = reconcile_screening_queue(state, hot, now=NOW)
+        assert stats["archive_segments_expensive_unique"] <= DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE
+        ids = _queue_ids(state)
+        # Offset already advanced past cp; only post-checkpoint remainder is queued.
+        assert cp["metadata"]["observation_id"] not in ids
+        assert post["metadata"]["observation_id"] in ids
+        assert a0["metadata"]["observation_id"] not in ids
+        assert a1["metadata"]["observation_id"] not in ids
+        consumed = set(_state_json_list(state, "screening_consumed_archives"))
+        assert a2_sha in consumed
+        assert a0_sha not in consumed
+        assert a1_sha not in consumed
+    finally:
+        state.close()
+
+
+def test_warm_to_cold_identity_does_not_look_like_new_rotation(tmp_path):
+    """Checkpoint while WARM → move to COLD → real rotation recovers only the new archive."""
+    import os
+    import shutil
+
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    rows = [
+        _screening_row("SCAN:W1", "W1USD"),
+        _screening_row("SCAN:W2", "W2USD"),
+        _screening_row("SCAN:W3", "W3USD"),
+    ]
+    _write_hot(hot, rows[:1])
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        reconcile_screening_queue(state, hot, now=NOW)
+        with hot.open("ab") as handle:
+            for row in rows[1:]:
+                handle.write(
+                    (json.dumps(row, sort_keys=True, allow_nan=False) + "\n").encode(
+                        "utf-8"
+                    )
+                )
+
+        warm_archive = _compact_hot(hot, keep_lines=1, max_bytes=16)
+        assert warm_archive is not None
+        warm_sha = _manifest_shas(hot)[0]
+        warm_rel = _list_manifest_segment_rows(screening_evaluations_archive(hot))[0][
+            "relative_path"
+        ]
+
+        reconcile_screening_queue(state, hot, now=NOW)
+        assert warm_sha in set(_state_json_list(state, "screening_consumed_archives"))
+        ids_after_warm = _queue_ids(state)
+
+        archive = screening_evaluations_archive(hot)
+        from app.opip.discovery.maturation import _resolve_segment_path
+
+        current_rel = _list_manifest_segment_rows(archive)[0]["relative_path"]
+        current_path = _resolve_segment_path(archive, current_rel)
+        checksum = current_path.with_suffix(current_path.suffix + ".sha256")
+        # Simulate WARM→COLD without Windows MAX_PATH tempfile prefixes.
+        cold_segment = archive.cold_archive_dir / "c" / "s"
+        cold_segment.mkdir(parents=True, exist_ok=True)
+        dest = cold_segment / "a.jsonl.gz"
+        shutil.copy2(current_path, dest)
+        shutil.copy2(checksum, dest.with_suffix(dest.suffix + ".sha256"))
+        verification = archive.verify_archive_file(dest, tier="COLD")
+        assert verification.sha256 == warm_sha
+        archive.update_manifest_locked(verification)
+        current_path.unlink()
+        checksum.unlink()
+
+        cold_rows = _list_manifest_segment_rows(archive)
+        assert len(cold_rows) == 1
+        assert cold_rows[0]["sha256"] == warm_sha
+        assert cold_rows[0]["relative_path"] != warm_rel
+        assert "cold" in str(cold_rows[0]["relative_path"]).replace("\\", "/")
+
+        reconcile_screening_queue(state, hot, now=NOW)
+        assert set(_state_json_list(state, "screening_consumed_archives")) == {warm_sha}
+        assert _queue_ids(state) == ids_after_warm
+
+        new_row = _screening_row("SCAN:W4", "W4USD")
+        with hot.open("ab") as handle:
+            handle.write(
+                (json.dumps(new_row, sort_keys=True, allow_nan=False) + "\n").encode(
+                    "utf-8"
+                )
+            )
+        new_archive = _compact_hot(hot, keep_lines=1, max_bytes=16)
+        assert new_archive is not None
+        shas = _manifest_shas(hot)
+        assert len(shas) == 2
+        new_sha = [s for s in shas if s != warm_sha][0]
+
+        reconcile_screening_queue(state, hot, now=NOW)
+        consumed = set(_state_json_list(state, "screening_consumed_archives"))
+        assert warm_sha in consumed
+        assert new_sha in consumed
+        assert new_row["metadata"]["observation_id"] in _queue_ids(state)
+    finally:
+        state.close()
+
+
+def test_manifest_growth_preserves_recovery_progress(tmp_path, monkeypatch):
+    """Budget 1 across 3+ segment recovery; mid-flight archive extends cursor only."""
+    import gzip
+    import hashlib
+    import os
+
+    monkeypatch.setattr(
+        maturation_mod, "DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE", 1
+    )
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    parts = [_screening_row(f"SCAN:G{i}", f"G{i}USD") for i in range(6)]
+    _write_hot(hot, parts[0:2])
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(parts[2], sort_keys=True, allow_nan=False) + "\n").encode(
+                "utf-8"
+            )
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    with hot.open("ab") as handle:
+        handle.write(
+            (json.dumps(parts[3], sort_keys=True, allow_nan=False) + "\n").encode(
+                "utf-8"
+            )
+        )
+    assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+    assert len(_manifest_shas(hot)) == 3
+
+    archive = screening_evaluations_archive(hot)
+    rows = _list_manifest_segment_rows(archive)
+    from app.opip.discovery.maturation import _decompressed_size, _resolve_segment_path
+
+    virtual = b""
+    for row in rows:
+        path = _resolve_segment_path(archive, str(row["relative_path"]))
+        with gzip.open(path, "rb") as handle:
+            virtual += handle.read()
+    virtual += hot.read_bytes()
+    offset = len(virtual)
+    anchor = virtual[-32:]
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        _set_state_int(state, "screening_indexed_offset", offset)
+        _set_state_int(state, "screening_anchor_start", offset - len(anchor))
+        _set_state_int(state, "screening_anchor_size", len(anchor))
+        _set_state_text(
+            state, "screening_anchor_sha256", hashlib.sha256(anchor).hexdigest()
+        )
+        state.commit()
+
+        progress_sizes: list[int] = []
+        stats1 = reconcile_screening_queue(state, hot, now=NOW)
+        assert stats1["archive_segments_expensive_unique"] <= 1
+        cursor1 = _load_recovery_cursor(state)
+        progress_sizes.append(len(cursor1.get("segment_sizes") or {}))
+        assert cursor1.get("active_end_sha")
+        active_end = str(cursor1["active_end_sha"])
+        assert len(cursor1.get("sequence") or []) == 3
+
+        # Inject an extra verified archive into the manifest without touching HOT.
+        extra_row = _screening_row("SCAN:GX", "GXUSD")
+        payload = (json.dumps(extra_row, sort_keys=True, allow_nan=False) + "\n").encode(
+            "utf-8"
+        )
+        extra_name = "screening_evaluations-20990101T000000Z-extra.jsonl.gz"
+        extra_path = archive.archive_dir / extra_name
+        with gzip.open(extra_path, "wb") as handle:
+            handle.write(payload)
+        digest = archive._sha256_file(extra_path)
+        checksum = extra_path.with_suffix(extra_path.suffix + ".sha256")
+        checksum.write_text(f"{digest}  {extra_name}\n", encoding="utf-8")
+        verification = archive.verify_archive_file(extra_path, tier="WARM")
+        archive.update_manifest_locked(verification)
+        assert len(_manifest_shas(hot)) == 4
+
+        stats2 = reconcile_screening_queue(state, hot, now=NOW)
+        assert stats2["archive_segments_expensive_unique"] <= 1
+        cursor2 = _load_recovery_cursor(state)
+        progress_sizes.append(len(cursor2.get("segment_sizes") or {}))
+        assert cursor2.get("active_end_sha") == active_end
+        assert len(cursor2.get("sequence") or []) == 4
+        assert progress_sizes[-1] >= progress_sizes[0]
+
+        for _ in range(10):
+            stats = reconcile_screening_queue(state, hot, now=NOW)
+            assert stats["archive_segments_expensive_unique"] <= 1
+            cursor = _load_recovery_cursor(state)
+            n_sizes = len(cursor.get("segment_sizes") or {})
+            if not cursor.get("sequence"):
+                progress_sizes.append(n_sizes)
+                break
+            assert n_sizes >= progress_sizes[-1]
+            progress_sizes.append(n_sizes)
+        else:
+            raise AssertionError("recovery did not complete under budget=1")
+
+        assert not _load_recovery_cursor(state).get("sequence")
+        assert _state_text(state, "screening_checkpoint_schema") == "generation_v2"
+        assert _state_int(state, "screening_indexed_offset", 0) == hot.stat().st_size
     finally:
         state.close()

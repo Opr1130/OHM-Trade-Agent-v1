@@ -450,10 +450,66 @@ def _observation_id_from_screening(row: Mapping[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _VerifiedScreeningSegment:
-    relative_path: str
+    """Immutable archive identity is content SHA (+ generation timestamp for order)."""
+
     sha256: str
     path: Path
+    generation_timestamp: str
     sort_key: str
+
+    @property
+    def identity(self) -> str:
+        # Path/tier must never participate — WARM→COLD keeps the same SHA.
+        if self.generation_timestamp:
+            return f"{self.generation_timestamp}:{self.sha256}"
+        return self.sha256
+
+
+@dataclass
+class _ArchiveCycleBudget:
+    limit: int
+    verified: set[str] = None  # type: ignore[assignment]
+    decompressed: set[str] = None  # type: ignore[assignment]
+    indexed: set[str] = None  # type: ignore[assignment]
+    anchor_read: set[str] = None  # type: ignore[assignment]
+    # SHAs already paid in a prior recovery cycle (durable cursor) — free reuse.
+    prepaid: set[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        self.verified = set() if self.verified is None else self.verified
+        self.decompressed = set() if self.decompressed is None else self.decompressed
+        self.indexed = set() if self.indexed is None else self.indexed
+        self.anchor_read = set() if self.anchor_read is None else self.anchor_read
+        self.prepaid = set() if self.prepaid is None else self.prepaid
+
+    def expensive_unique(self) -> set[str]:
+        touched = (
+            set(self.verified)
+            | set(self.decompressed)
+            | set(self.indexed)
+            | set(self.anchor_read)
+        )
+        return touched - set(self.prepaid)
+
+    def can_touch(self, sha: str) -> bool:
+        if sha in self.prepaid or sha in (
+            set(self.verified)
+            | set(self.decompressed)
+            | set(self.indexed)
+            | set(self.anchor_read)
+        ):
+            return True
+        return len(self.expensive_unique()) < int(self.limit)
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "archive_segments_verified": len(self.verified),
+            "archive_segments_decompressed": len(self.decompressed),
+            "archive_segments_indexed": len(self.indexed),
+            "anchor_segments_read": len(self.anchor_read),
+            "archive_segments_expensive_unique": len(self.expensive_unique()),
+            "archive_segment_budget": int(self.limit),
+        }
 
 
 def _state_json_list(connection: sqlite3.Connection, key: str) -> list[str]:
@@ -484,6 +540,27 @@ def _set_state_json_list(
         connection,
         key,
         json.dumps(unique, separators=(",", ":"), allow_nan=False),
+    )
+
+
+def _state_json_object(connection: sqlite3.Connection, key: str) -> dict[str, Any]:
+    raw = _state_text(connection, key)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _set_state_json_object(
+    connection: sqlite3.Connection, key: str, payload: Mapping[str, Any]
+) -> None:
+    _set_state_text(
+        connection,
+        key,
+        json.dumps(dict(payload), sort_keys=True, separators=(",", ":"), allow_nan=False),
     )
 
 
@@ -540,11 +617,96 @@ def _decompressed_size(path: Path) -> int:
     return total
 
 
+def _generation_timestamp_from_name(relative: str) -> str:
+    """Extract compact stamp from ``prefix-YYYYMMDDThhmmss…Z-digest.jsonl.gz``."""
+    name = Path(relative).name
+    parts = name.split("-")
+    for part in parts:
+        if part.endswith("Z") and part[:8].isdigit() and "T" in part:
+            return part
+    return ""
+
+
+def _list_manifest_segment_rows(
+    archive: BoundedJsonlArchive,
+) -> list[dict[str, Any]]:
+    """Light manifest listing (no gzip decompress / full-file hash)."""
+    if not archive.manifest_file.exists():
+        return []
+    archive._verified_manifest_signature_for_replica()
+    try:
+        raw = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_MANIFEST_INVALID") from exc
+    segments_raw = raw.get("segments") if isinstance(raw, dict) else None
+    if not isinstance(segments_raw, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for digest, row in segments_raw.items():
+        if not isinstance(row, Mapping):
+            continue
+        relative = str(row.get("archive") or "").strip()
+        sha = str(row.get("sha256") or digest or "").strip()
+        if not relative or not sha:
+            continue
+        generation_timestamp = (
+            _generation_timestamp_from_name(relative)
+            or str(row.get("first_visible_at_utc") or "")
+            or str(row.get("verified_at_utc") or "")
+        )
+        rows.append(
+            {
+                "relative_path": relative,
+                "sha256": sha,
+                "generation_timestamp": generation_timestamp,
+                "sort_key": f"{generation_timestamp}|{sha}",
+            }
+        )
+    rows.sort(key=lambda item: str(item["sort_key"]))
+    return rows
+
+
+def _resolve_segment_path(
+    archive: BoundedJsonlArchive, relative: str
+) -> Path:
+    path = (archive.archive_dir / relative).resolve()
+    try:
+        path.relative_to(archive.archive_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"DISCOVERY_SCREENING_ARCHIVE_PATH_ESCAPE:{relative}"
+        ) from exc
+    if path.is_file():
+        return path
+    cold = (archive.cold_archive_dir / relative).resolve()
+    if cold.is_file():
+        return cold
+    matches = [
+        item
+        for item in archive.cold_archive_dir.rglob(Path(relative).name)
+        if item.is_file()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    # Basename match under warm archive_dir (tiering mid-flight).
+    warm_matches = [
+        item
+        for item in archive.archive_dir.rglob(Path(relative).name)
+        if item.is_file() and item.suffixes[-2:] == [".jsonl", ".gz"]
+    ]
+    if len(warm_matches) == 1:
+        return warm_matches[0]
+    raise RuntimeError(f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}")
+
+
+
 def _read_virtual_range(
     segments: Sequence[_VerifiedScreeningSegment],
     hot_path: Path | None,
     start: int,
     length: int,
+    *,
+    budget: _ArchiveCycleBudget | None = None,
 ) -> bytes:
     if length <= 0:
         return b""
@@ -569,6 +731,10 @@ def _read_virtual_range(
     for segment in segments:
         if needed <= 0:
             break
+        if budget is not None:
+            if not budget.can_touch(segment.sha256):
+                raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_BUDGET_EXCEEDED")
+            budget.anchor_read.add(segment.sha256)
         with gzip.open(segment.path, "rb") as handle:
             _consume(handle)
     if needed > 0 and hot_path is not None and hot_path.exists():
@@ -584,6 +750,8 @@ def _anchor_matches_virtual(
     segments: Sequence[_VerifiedScreeningSegment],
     hot_path: Path | None,
     offset: int,
+    *,
+    budget: _ArchiveCycleBudget | None = None,
 ) -> bool:
     if offset <= 0:
         return True
@@ -593,83 +761,60 @@ def _anchor_matches_virtual(
     if not expected or start < 0 or size <= 0 or start + size != offset:
         return False
     try:
-        payload = _read_virtual_range(segments, hot_path, start, size)
+        payload = _read_virtual_range(
+            segments, hot_path, start, size, budget=budget
+        )
     except RuntimeError:
         return False
     return len(payload) == size and hashlib.sha256(payload).hexdigest() == expected
 
 
-def _verified_screening_segments(
+def _materialize_segment(
     archive: BoundedJsonlArchive,
-) -> list[_VerifiedScreeningSegment]:
-    if not archive.manifest_file.exists():
-        return []
-    archive._verified_manifest_signature_for_replica()
-    try:
-        raw = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_MANIFEST_INVALID") from exc
-    segments_raw = raw.get("segments") if isinstance(raw, dict) else None
-    if not isinstance(segments_raw, dict):
-        return []
-    out: list[_VerifiedScreeningSegment] = []
-    for digest, row in segments_raw.items():
-        if not isinstance(row, Mapping):
-            continue
-        relative = str(row.get("archive") or "").strip()
-        sha = str(row.get("sha256") or digest or "").strip()
-        if not relative or not sha:
-            continue
-        path = (archive.archive_dir / relative).resolve()
-        try:
-            path.relative_to(archive.archive_dir.resolve())
-        except ValueError as exc:
-            raise RuntimeError(
-                f"DISCOVERY_SCREENING_ARCHIVE_PATH_ESCAPE:{relative}"
-            ) from exc
-        if not path.is_file():
-            cold = (archive.cold_archive_dir / relative).resolve()
-            if cold.is_file():
-                path = cold
-            else:
-                matches = [
-                    item
-                    for item in archive.cold_archive_dir.rglob(Path(relative).name)
-                    if item.is_file()
-                ]
-                if len(matches) != 1:
-                    raise RuntimeError(
-                        f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}"
-                    )
-                path = matches[0]
-        checksum = path.with_suffix(path.suffix + ".sha256")
-        if not checksum.exists():
-            raise RuntimeError(f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}")
-        tokens = checksum.read_text(encoding="utf-8").split()
-        if not tokens:
-            raise RuntimeError(
-                f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
-            )
+    row: Mapping[str, Any],
+    *,
+    budget: _ArchiveCycleBudget,
+    sizes: dict[str, int],
+    require_decompress: bool,
+) -> _VerifiedScreeningSegment:
+    relative = str(row["relative_path"])
+    sha = str(row["sha256"])
+    if not budget.can_touch(sha):
+        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_BUDGET_EXCEEDED")
+    path = _resolve_segment_path(archive, relative)
+    checksum = path.with_suffix(path.suffix + ".sha256")
+    if not checksum.exists():
+        raise RuntimeError(f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}")
+    tokens = checksum.read_text(encoding="utf-8").split()
+    if not tokens:
+        raise RuntimeError(
+            f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
+        )
+    if sha not in budget.verified and sha not in budget.prepaid:
+        if not budget.can_touch(sha):
+            raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_BUDGET_EXCEEDED")
         actual = archive._sha256_file(path)
         if actual != tokens[0] or actual != sha:
             raise RuntimeError(
                 f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
             )
-        sort_key = (
-            str(row.get("first_visible_at_utc") or "")
-            or str(row.get("verified_at_utc") or "")
-            or relative
+        budget.verified.add(sha)
+    elif sha in budget.prepaid and tokens[0] != sha:
+        raise RuntimeError(
+            f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
         )
-        out.append(
-            _VerifiedScreeningSegment(
-                relative_path=relative,
-                sha256=sha,
-                path=path,
-                sort_key=f"{sort_key}|{relative}",
-            )
-        )
-    out.sort(key=lambda item: item.sort_key)
-    return out
+    if require_decompress and sha not in sizes:
+        if not budget.can_touch(sha):
+            raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_BUDGET_EXCEEDED")
+        sizes[sha] = _decompressed_size(path)
+        budget.decompressed.add(sha)
+    generation_timestamp = str(row.get("generation_timestamp") or "")
+    return _VerifiedScreeningSegment(
+        sha256=sha,
+        path=path,
+        generation_timestamp=generation_timestamp,
+        sort_key=str(row.get("sort_key") or f"{generation_timestamp}|{sha}"),
+    )
 
 
 def _enqueue_screening_snapshot(
@@ -771,7 +916,6 @@ def _index_hot_from_offset(
         )
     _set_state_checkpoint(connection, screening_path, "screening", last_complete)
     _set_hot_generation(connection, screening_path)
-    # Keep explicit hot-offset alias in sync for generation-aware readers.
     _set_state_int(connection, "screening_hot_offset", last_complete)
     connection.commit()
     return last_complete
@@ -783,7 +927,12 @@ def _index_archive_segment(
     *,
     now: datetime,
     start_offset: int = 0,
+    budget: _ArchiveCycleBudget | None = None,
 ) -> None:
+    if budget is not None:
+        if not budget.can_touch(segment.sha256):
+            raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_BUDGET_EXCEEDED")
+        budget.indexed.add(segment.sha256)
     with gzip.open(segment.path, "rb") as handle:
         _index_jsonl_handle(
             connection, handle, now=now, start_offset=start_offset
@@ -797,10 +946,15 @@ def _mark_segment_consumed(
     if segment.sha256 not in consumed:
         consumed.append(segment.sha256)
     _set_state_json_list(connection, "screening_consumed_archives", consumed)
-    known = _state_json_list(connection, "screening_generation_archives")
-    if segment.relative_path not in known:
-        known.append(segment.relative_path)
-    _set_state_json_list(connection, "screening_generation_archives", known)
+    known = _state_json_list(connection, "screening_known_archive_shas")
+    if segment.sha256 not in known:
+        known.append(segment.sha256)
+    _set_state_json_list(connection, "screening_known_archive_shas", known)
+
+
+def _sha_like(token: str) -> bool:
+    text = str(token).strip().lower()
+    return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
 
 
 def _migrate_screening_checkpoint_state(
@@ -808,55 +962,253 @@ def _migrate_screening_checkpoint_state(
     screening_path: Path,
 ) -> None:
     """Idempotent additive migration from offset-only production state."""
-    if _state_text(connection, "screening_checkpoint_schema") == "generation_v1":
+    schema = _state_text(connection, "screening_checkpoint_schema")
+    if schema in {"generation_v1", "generation_v2"}:
         if _state_text(connection, "screening_hot_offset") is None:
             _set_state_int(
                 connection,
                 "screening_hot_offset",
                 _state_int(connection, "screening_indexed_offset", 0),
             )
+        consumed = [c for c in _state_json_list(connection, "screening_consumed_archives") if _sha_like(c)]
+        _set_state_json_list(connection, "screening_consumed_archives", consumed)
+        if not _state_json_list(connection, "screening_known_archive_shas"):
+            legacy_known = _state_json_list(connection, "screening_generation_archives")
+            shas = [item for item in legacy_known if _sha_like(item)]
+            _set_state_json_list(
+                connection,
+                "screening_known_archive_shas",
+                list(dict.fromkeys([*consumed, *shas])),
+            )
+        else:
+            known = [
+                item
+                for item in _state_json_list(connection, "screening_known_archive_shas")
+                if _sha_like(item)
+            ]
+            _set_state_json_list(connection, "screening_known_archive_shas", known)
+        if schema != "generation_v2":
+            _set_state_text(connection, "screening_checkpoint_schema", "generation_v2")
+            connection.commit()
         return
 
     offset = _state_int(connection, "screening_indexed_offset", 0)
     _set_state_int(connection, "screening_hot_offset", offset)
     if not _state_json_list(connection, "screening_consumed_archives"):
         _set_state_json_list(connection, "screening_consumed_archives", [])
-    if not _state_json_list(connection, "screening_generation_archives"):
-        # Empty means "unknown prior set" so rotation recovery may consider
-        # all verified segments when proving continuity after HOT shrink.
-        _set_state_json_list(connection, "screening_generation_archives", [])
+    else:
+        _set_state_json_list(
+            connection,
+            "screening_consumed_archives",
+            [
+                item
+                for item in _state_json_list(connection, "screening_consumed_archives")
+                if _sha_like(item)
+            ],
+        )
+    if not _state_json_list(connection, "screening_known_archive_shas"):
+        # Empty known set => legacy / unknown prior archives. Recovery must
+        # prove the correct newest-to-oldest suffix against the saved anchor.
+        _set_state_json_list(connection, "screening_known_archive_shas", [])
     if screening_path.exists() and offset <= screening_path.stat().st_size:
         if offset <= 0 or _state_checkpoint_matches(
             connection, screening_path, "screening", offset
         ):
             _set_hot_generation(connection, screening_path)
-    _set_state_text(connection, "screening_checkpoint_schema", "generation_v1")
+    _set_state_text(connection, "screening_checkpoint_schema", "generation_v2")
     connection.commit()
 
 
-def _prove_rotation_prefix(
+def _load_recovery_cursor(connection: sqlite3.Connection) -> dict[str, Any]:
+    payload = _state_json_object(connection, "screening_rotation_recovery_v1")
+    sequence = payload.get("sequence")
+    sizes = payload.get("segment_sizes")
+    verified = payload.get("verified_shas")
+    return {
+        "sequence": [str(x) for x in sequence] if isinstance(sequence, list) else [],
+        "active_end_sha": str(payload.get("active_end_sha") or ""),
+        "suffix_len_next": int(payload.get("suffix_len_next") or 1),
+        "segment_sizes": {
+            str(k): int(v)
+            for k, v in (sizes.items() if isinstance(sizes, dict) else [])
+            if str(k).strip()
+        },
+        "verified_shas": [str(x) for x in verified] if isinstance(verified, list) else [],
+    }
+
+
+def _save_recovery_cursor(
+    connection: sqlite3.Connection, cursor: Mapping[str, Any]
+) -> None:
+    _set_state_json_object(connection, "screening_rotation_recovery_v1", cursor)
+
+
+def _clear_recovery_cursor(connection: sqlite3.Connection) -> None:
+    _set_state_json_object(connection, "screening_rotation_recovery_v1", {})
+
+
+def _sync_recovery_sequence(
+    cursor: dict[str, Any],
+    manifest_shas: Sequence[str],
+) -> dict[str, Any]:
+    """Extend recovery sequence when manifest grows; fail closed on rewrite.
+
+    Newer archives appended after recovery starts are tracked but do not move
+    the pinned proof head — suffix search stays newest-to-oldest ending at
+    ``active_end_sha`` so a mid-recovery rotation cannot reset progress.
+    """
+    prior = [str(x) for x in cursor.get("sequence") or []]
+    current = [str(x) for x in manifest_shas]
+    if not prior:
+        cursor["sequence"] = list(current)
+        if current and not cursor.get("active_end_sha"):
+            cursor["active_end_sha"] = current[-1]
+        cursor["suffix_len_next"] = max(1, int(cursor.get("suffix_len_next") or 1))
+        return cursor
+    if len(current) < len(prior):
+        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_SEQUENCE_REGRESSED")
+    if current[: len(prior)] != prior:
+        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_SEQUENCE_REORDERED")
+    cursor["sequence"] = list(current)
+    if not cursor.get("active_end_sha") and prior:
+        cursor["active_end_sha"] = prior[-1]
+    # Preserve suffix_len_next and caches when the prior immutable prefix is intact.
+    return cursor
+
+
+def _attempt_suffix_recovery(
     connection: sqlite3.Connection,
-    segments: Sequence[_VerifiedScreeningSegment],
+    archive: BoundedJsonlArchive,
+    manifest_rows: Sequence[Mapping[str, Any]],
     screening_path: Path,
     offset: int,
+    *,
+    now: datetime,
+    budget: _ArchiveCycleBudget,
 ) -> tuple[list[_VerifiedScreeningSegment], int] | None:
-    """Return (archive_prefix, hot_offset) when concat(prefix)+HOT matches anchor.
+    """Newest-to-oldest suffix search with durable cross-cycle progress."""
+    del now  # indexing happens after proof in reconcile_screening_queue
+    by_sha = {str(row["sha256"]): row for row in manifest_rows}
+    cursor = _load_recovery_cursor(connection)
+    sizes = {
+        str(k): int(v) for k, v in (cursor.get("segment_sizes") or {}).items()
+    }
+    prepaid = set(str(x) for x in (cursor.get("verified_shas") or [])) | set(sizes)
+    budget.prepaid |= prepaid
 
-    Rotation always archives a HOT prefix, so candidate reconstructions are
-    chronological *suffixes* of verified segments plus the current HOT file.
-    """
+    sequence_shas = [str(row["sha256"]) for row in manifest_rows]
+    cursor = _sync_recovery_sequence(cursor, sequence_shas)
+    _save_recovery_cursor(connection, cursor)
+    connection.commit()
+
     if offset <= 0:
+        _clear_recovery_cursor(connection)
+        connection.commit()
         return [], 0
+
     hot_size = screening_path.stat().st_size if screening_path.exists() else 0
-    items = list(segments)
-    for suffix_len in range(1, len(items) + 1):
-        prefix = items[-suffix_len:]
-        prefix_bytes = sum(_decompressed_size(item.path) for item in prefix)
-        if prefix_bytes + hot_size < offset:
-            continue
-        if _anchor_matches_virtual(connection, prefix, screening_path, offset):
-            return prefix, max(0, offset - prefix_bytes)
-    return None
+    suffix_next = max(1, int(cursor.get("suffix_len_next") or 1))
+    seq = [str(x) for x in cursor.get("sequence") or []]
+    active_end = str(cursor.get("active_end_sha") or "")
+    if active_end and active_end in seq:
+        end_idx = seq.index(active_end)
+        proof_seq = seq[: end_idx + 1]
+    else:
+        proof_seq = list(seq)
+        if proof_seq:
+            cursor["active_end_sha"] = proof_seq[-1]
+
+    if not proof_seq:
+        raise RuntimeError(
+            "DISCOVERY_SCREENING_LEDGER_DIVERGED"
+            if offset <= hot_size
+            else "DISCOVERY_SCREENING_LEDGER_TRUNCATED"
+        )
+
+    while suffix_next <= len(proof_seq):
+        suffix_shas = proof_seq[-suffix_next:]
+        materialized: list[_VerifiedScreeningSegment] = []
+        blocked = False
+        for sha in suffix_shas:
+            row = by_sha.get(sha)
+            if row is None:
+                raise RuntimeError(f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{sha}")
+            need_decompress = sha not in sizes
+            need_verify = sha not in budget.verified and sha not in budget.prepaid
+            if (need_decompress or need_verify) and not budget.can_touch(sha):
+                blocked = True
+                break
+            segment = _materialize_segment(
+                archive,
+                row,
+                budget=budget,
+                sizes=sizes,
+                require_decompress=True,
+            )
+            materialized.append(segment)
+        if blocked:
+            cursor["suffix_len_next"] = suffix_next
+            cursor["segment_sizes"] = sizes
+            cursor["verified_shas"] = sorted(
+                set(cursor.get("verified_shas") or [])
+                | set(budget.verified)
+                | set(sizes)
+            )
+            _save_recovery_cursor(connection, cursor)
+            connection.commit()
+            return None
+
+        prefix_bytes = sum(sizes[sha] for sha in suffix_shas)
+        if prefix_bytes + hot_size >= offset:
+            try:
+                matched = _anchor_matches_virtual(
+                    connection,
+                    materialized,
+                    screening_path,
+                    offset,
+                    budget=budget,
+                )
+            except RuntimeError as exc:
+                if "BUDGET_EXCEEDED" in str(exc):
+                    cursor["suffix_len_next"] = suffix_next
+                    cursor["segment_sizes"] = sizes
+                    cursor["verified_shas"] = sorted(
+                        set(cursor.get("verified_shas") or [])
+                        | set(budget.verified)
+                        | set(sizes)
+                    )
+                    _save_recovery_cursor(connection, cursor)
+                    connection.commit()
+                    return None
+                raise
+            if matched:
+                hot_offset = max(0, offset - prefix_bytes)
+                cursor["segment_sizes"] = sizes
+                cursor["verified_shas"] = sorted(
+                    set(cursor.get("verified_shas") or [])
+                    | set(budget.verified)
+                    | set(sizes)
+                )
+                _save_recovery_cursor(connection, cursor)
+                connection.commit()
+                return materialized, hot_offset
+
+        suffix_next += 1
+        cursor["suffix_len_next"] = suffix_next
+        cursor["segment_sizes"] = sizes
+        cursor["verified_shas"] = sorted(
+            set(cursor.get("verified_shas") or [])
+            | set(budget.verified)
+            | set(sizes)
+        )
+        _save_recovery_cursor(connection, cursor)
+        connection.commit()
+
+    raise RuntimeError(
+        "DISCOVERY_SCREENING_LEDGER_DIVERGED"
+        if offset <= hot_size
+        else "DISCOVERY_SCREENING_LEDGER_TRUNCATED"
+    )
 
 
 def reconcile_screening_queue(
@@ -864,40 +1216,35 @@ def reconcile_screening_queue(
     screening_path: Path,
     *,
     now: datetime,
-) -> None:
+) -> dict[str, Any]:
     """Index BROAD_SEARCH screening rows across verified archives + HOT.
 
     Contract:
     * Same HOT generation resumes from the durable byte offset.
-    * Verified bounded-JSONL rotation drains archived predecessor bytes before
-      initializing the new HOT generation.
-    * Unexplained truncation / divergence still fail closed.
+    * Legacy/rotated HOT recovery proves the correct newest-to-oldest archive
+      suffix against the saved checkpoint anchor before remapping HOT.
+    * Archive identity is content SHA (WARM→COLD safe).
+    * Per-cycle unique expensive archive touches stay within budget.
     * Queue upserts are idempotent on ``observation_id``.
     """
     _migrate_screening_checkpoint_state(connection, screening_path)
+    budget = _ArchiveCycleBudget(limit=DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE)
     archive = screening_evaluations_archive(screening_path)
-    all_segments = _verified_screening_segments(archive)
+    manifest_rows = _list_manifest_segment_rows(archive)
     consumed = set(_state_json_list(connection, "screening_consumed_archives"))
-    unconsumed = [item for item in all_segments if item.sha256 not in consumed]
-
-    # Bounded drain of verified archive generations (historical + rotation).
-    drained = 0
-    for segment in unconsumed:
-        if drained >= DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE:
-            break
-        _index_archive_segment(connection, segment, now=now, start_offset=0)
-        _mark_segment_consumed(connection, segment)
-        connection.commit()
-        drained += 1
-        consumed.add(segment.sha256)
-
-    unconsumed = [item for item in all_segments if item.sha256 not in consumed]
+    known = set(_state_json_list(connection, "screening_known_archive_shas"))
     indexed_offset = _state_int(connection, "screening_indexed_offset", 0)
 
     if not screening_path.exists():
-        if indexed_offset and not unconsumed:
+        if indexed_offset and not any(
+            str(row["sha256"]) not in consumed for row in manifest_rows
+        ):
             raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
-        return
+        _set_state_json_object(
+            connection, "screening_archive_cycle_stats", budget.as_dict()
+        )
+        connection.commit()
+        return budget.as_dict()
 
     size = screening_path.stat().st_size
     generation_ok = _hot_generation_matches(connection, screening_path)
@@ -905,77 +1252,129 @@ def reconcile_screening_queue(
         connection, screening_path, "screening", indexed_offset
     )
 
-    # Case 1 — same HOT generation continuity.
     if indexed_offset <= size and generation_ok and (indexed_offset == 0 or anchor_ok):
+        if known:
+            catchup = [
+                row
+                for row in manifest_rows
+                if str(row["sha256"]) not in consumed
+                and str(row["sha256"]) not in known
+            ]
+            for row in catchup:
+                sha = str(row["sha256"])
+                if not budget.can_touch(sha):
+                    break
+                sizes: dict[str, int] = {}
+                segment = _materialize_segment(
+                    archive,
+                    row,
+                    budget=budget,
+                    sizes=sizes,
+                    require_decompress=False,
+                )
+                _index_archive_segment(
+                    connection, segment, now=now, start_offset=0, budget=budget
+                )
+                _mark_segment_consumed(connection, segment)
+                connection.commit()
         _index_hot_from_offset(
             connection, screening_path, now=now, start_offset=indexed_offset
         )
-        return
+        _set_state_json_list(
+            connection,
+            "screening_known_archive_shas",
+            [str(row["sha256"]) for row in manifest_rows],
+        )
+        _clear_recovery_cursor(connection)
+        _set_state_json_object(
+            connection, "screening_archive_cycle_stats", budget.as_dict()
+        )
+        connection.commit()
+        return budget.as_dict()
 
     if indexed_offset <= size and generation_ok and not anchor_ok:
         raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
 
-    # Case 2 — HOT rotated (generation changed and/or file shrank). A later
-    # append onto the new HOT can make size >= old offset again, so generation
-    # mismatch must attempt verified rotation proof before fail-closed.
-    proof = _prove_rotation_prefix(
-        connection, all_segments, screening_path, indexed_offset
+    proof = _attempt_suffix_recovery(
+        connection,
+        archive,
+        manifest_rows,
+        screening_path,
+        indexed_offset,
+        now=now,
+        budget=budget,
     )
     if proof is None:
-        known = set(_state_json_list(connection, "screening_generation_archives"))
-        if not known:
-            candidates = list(all_segments)
-        else:
-            candidates = [
-                item
-                for item in all_segments
-                if item.relative_path not in known or item.sha256 not in consumed
-            ]
-        proof = _prove_rotation_prefix(
-            connection, candidates, screening_path, indexed_offset
+        unconsumed = [
+            row for row in manifest_rows if str(row["sha256"]) not in consumed
+        ]
+        _set_state_json_object(
+            connection, "screening_archive_cycle_stats", budget.as_dict()
         )
-
-    if proof is None:
-        if unconsumed:
-            # More verified segments remain for a later bounded cycle.
-            return
+        connection.commit()
+        if unconsumed or _load_recovery_cursor(connection).get("sequence"):
+            return budget.as_dict()
         if indexed_offset > size:
             raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
         raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
 
     prefix, hot_offset = proof
-    # Ensure every prefix segment is indexed (idempotent) and marked consumed.
+    sizes_map = {
+        str(k): int(v)
+        for k, v in (
+            _load_recovery_cursor(connection).get("segment_sizes") or {}
+        ).items()
+    }
     preceding = 0
     for segment in prefix:
-        seg_size = _decompressed_size(segment.path)
+        seg_size = int(
+            sizes_map.get(segment.sha256) or _decompressed_size(segment.path)
+        )
+        if segment.sha256 not in sizes_map:
+            if budget.can_touch(segment.sha256):
+                budget.decompressed.add(segment.sha256)
+            sizes_map[segment.sha256] = seg_size
         if indexed_offset >= preceding + seg_size:
-            local_start = seg_size  # already fully covered by prior HOT progress
+            local_start = seg_size
         elif indexed_offset > preceding:
             local_start = indexed_offset - preceding
         else:
             local_start = 0
         if segment.sha256 not in consumed:
             if local_start < seg_size:
+                if not budget.can_touch(segment.sha256):
+                    _set_state_json_object(
+                        connection, "screening_archive_cycle_stats", budget.as_dict()
+                    )
+                    connection.commit()
+                    return budget.as_dict()
                 _index_archive_segment(
-                    connection, segment, now=now, start_offset=local_start
+                    connection,
+                    segment,
+                    now=now,
+                    start_offset=local_start,
+                    budget=budget,
                 )
             _mark_segment_consumed(connection, segment)
             connection.commit()
             consumed.add(segment.sha256)
         preceding += seg_size
 
-    # Initialize new HOT generation and continue from mapped offset.
-    # Generation fingerprint is committed inside _index_hot_from_offset together
-    # with the remapped byte offset so a crash cannot strand a new generation
-    # identity against a stale offset.
     _set_state_json_list(
         connection,
-        "screening_generation_archives",
-        [item.relative_path for item in all_segments],
+        "screening_known_archive_shas",
+        [str(row["sha256"]) for row in manifest_rows],
     )
+    _clear_recovery_cursor(connection)
     _index_hot_from_offset(
         connection, screening_path, now=now, start_offset=hot_offset
     )
+    _set_state_json_object(
+        connection, "screening_archive_cycle_stats", budget.as_dict()
+    )
+    connection.commit()
+    return budget.as_dict()
+
 
 
 def due_observation_batch(
