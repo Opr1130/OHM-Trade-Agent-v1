@@ -251,8 +251,10 @@ def _deliver_claimed_terminal_retry(
     fingerprint = f"{setup.direction}:{result.status}"
 
     if terminal_status is None:
-        _remove_terminal_retry(setup.trade_id, lease_token=lease_token)
-        return "NOT_ELIGIBLE"
+        # A non-terminal result inside the terminal outbox is malformed durable
+        # evidence. Preserve the row and keep the setup quarantined.
+        _release_terminal_retry(setup.trade_id, lease_token)
+        return "MALFORMED"
 
     lifecycle = get_pending_setup_record(setup.trade_id)
     persisted_status = str((lifecycle or {}).get("status") or "")
@@ -352,6 +354,31 @@ def _deliver_claimed_terminal_retry(
     return "DELIVERED"
 
 
+def _decode_terminal_retry_row(
+    trade_id: str,
+    row: object,
+) -> tuple[PendingSetup, PendingSetupMonitorResult] | None:
+    """Validate complete terminal-outbox semantics before any state mutation."""
+    if not isinstance(row, dict):
+        return None
+    setup_raw = row.get("setup")
+    result_raw = row.get("result")
+    if not isinstance(setup_raw, dict) or not isinstance(result_raw, dict):
+        return None
+    try:
+        setup = PendingSetup(**dict(setup_raw))
+        result = PendingSetupMonitorResult(**dict(result_raw))
+    except (TypeError, ValueError):
+        return None
+    if str(setup.trade_id or "") != str(trade_id):
+        return None
+    if _terminal_status(result.status) is None:
+        return None
+    if str(result.symbol or "").upper() != str(setup.symbol or "").upper():
+        return None
+    return setup, result
+
+
 def _process_terminal_retry(
     trade_id: str,
     *,
@@ -363,11 +390,13 @@ def _process_terminal_retry(
         return "BUSY_OR_MISSING"
 
     lease_token, row = claim
+    decoded = _decode_terminal_retry_row(trade_id, row)
+    if decoded is None:
+        _release_terminal_retry(trade_id, lease_token)
+        return "MALFORMED"
+
+    setup, result = decoded
     try:
-        setup = PendingSetup(**dict(row.get("setup") or {}))
-        result = PendingSetupMonitorResult(**dict(row.get("result") or {}))
-        if str(setup.trade_id or "") != str(trade_id):
-            raise ValueError("terminal alert outbox trade_id mismatch")
         return _deliver_claimed_terminal_retry(
             setup=setup,
             result=result,
@@ -406,7 +435,7 @@ def retry_terminal_pending_notifications(
         )
         if status == "DELIVERED":
             sent += 1
-        elif status in {"FAILED", "SEND_FAILED", "TERMINALIZATION_PENDING"}:
+        elif status in {"FAILED", "SEND_FAILED", "TERMINALIZATION_PENDING", "MALFORMED"}:
             failed += 1
     return sent, failed
 
