@@ -273,7 +273,7 @@ def test_deploy_stops_paper_before_target_build():
     marker = "# Stop paper workers during the build/recreate window."
     section = source[source.index(marker):]
     assert section.index("stop_paper_stack") < section.index(
-        "docker compose build ohm-trade-agent"
+        "docker compose build opip-canonical-writer ohm-trade-agent"
     )
 
 

@@ -1,8 +1,8 @@
 # O'Pip Architecture & Validation Contracts v1.2
 
-Status: **PR 1 — documentation, contracts, repository mapping, and validation fixtures only.**
+Status: **PR 2 — canonical writer foundation (mode default off; production shadow activation not authorized).**
 
-Paper-only. No funded trading authority. No runtime, SQLite, deploy, threshold, or scheduler change in this package.
+Paper-only. No funded trading authority. Runtime adds an independent shadow-capable writer service; default mode remains off.
 
 ## Authority statements
 
@@ -18,9 +18,9 @@ Paper-only. No funded trading authority. No runtime, SQLite, deploy, threshold, 
 
 ## Source pin
 
-Authoritative production commit: [`7df7d6e588a6ff8e9ecade7cc7220548d187a45d`](SOURCE_PIN.md) (`origin/main`, merge of GitHub PR #232).
+Authoritative production commit: [`808a308cd274d30b55fef47b382c229b761e07df`](SOURCE_PIN.md) (`origin/main`, merged PR 1 architecture contracts).
 
-This package is branched from that SHA. It is **not** branched from `fix/discovery-rotation-aware-checkpoint`.
+PR 2 implementation branches from that SHA. It is **not** branched from `fix/discovery-rotation-aware-checkpoint`.
 
 ## Owners (PR 1)
 

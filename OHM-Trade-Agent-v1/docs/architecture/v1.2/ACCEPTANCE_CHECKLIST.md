@@ -1,8 +1,8 @@
 # PR 1 acceptance checklist
 
-- [x] Pinned source commit `7df7d6e588a6ff8e9ecade7cc7220548d187a45d` recorded
+- [x] Pinned source commit `808a308cd274d30b55fef47b382c229b761e07df` recorded
 - [x] Authority map and consumer census mapped to that SHA
-- [x] PR 2 capture boundary named: `alert_governor.py` evaluate → writer txn → record / release
+- [x] PR 2 capture boundary named: `alert_governor.py` evaluate → Telegram → durable ACK → record / release
 - [x] Contracts A–K written
 - [x] N1–N12 ratified as specified by the Business Decision Owner
 - [x] Owners recorded: Ohm Prakash / Ohm Prakash
