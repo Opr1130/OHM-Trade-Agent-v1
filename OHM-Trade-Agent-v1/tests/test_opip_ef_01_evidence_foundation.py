@@ -209,6 +209,11 @@ def test_reconcile_rows_join_on_observation_id_and_report_winner_scope():
         observed_at="2026-09-10T12:00:00+00:00",
         symbol="ETH-USD",
     ) == "SCAN:EF01:JOIN|2026-09-10T12:00:00+00:00|ETHUSD"
+    assert reconstructed_join_key(
+        scan_id="SCAN:EF01:JOIN",
+        observed_at="2026-09-10T12:00:00Z",
+        symbol="ETH-USD",
+    ) == "SCAN:EF01:JOIN|2026-09-10T12:00:00+00:00|ETHUSD"
 
 
 def test_reconcile_job_writes_empty_report_without_replica(tmp_path):

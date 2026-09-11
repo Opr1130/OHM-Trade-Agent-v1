@@ -32,6 +32,10 @@ def main(data_root: Path | None = None) -> dict:
     root = data_root or DEFAULT_DATA_ROOT
     try:
         report = inspect_replica(root)
+        report_path = DEFAULT_REPORT if root == DEFAULT_DATA_ROOT else (
+            root / "opip/discovery/ef01_reconciliation_report.json"
+        )
+        persist_reconciliation_report(report, report_path)
     except Exception as exc:
         payload = {
             "status": "ERROR",
@@ -50,10 +54,6 @@ def main(data_root: Path | None = None) -> dict:
         print(json.dumps(payload, sort_keys=True))
         raise
 
-    report_path = DEFAULT_REPORT if root == DEFAULT_DATA_ROOT else (
-        root / "opip/discovery/ef01_reconciliation_report.json"
-    )
-    persist_reconciliation_report(report, report_path)
     empty = not report.get("replica_available")
     disposition = CONSUMED_EMPTY if empty else CONSUMED_OK
     payload = {

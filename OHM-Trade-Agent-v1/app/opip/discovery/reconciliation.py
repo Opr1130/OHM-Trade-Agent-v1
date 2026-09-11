@@ -33,6 +33,7 @@ from app.services.opportunity_accountability import (
     ACCOUNTABILITY_THRESHOLD_DRIFT,
     ACCOUNTABILITY_WINNER_DEFINITION,
     AccountabilityPolicy,
+    _iso,
     _normalize_symbol,
     _observation_id_from_screening,
     _preferred_production_direction,
@@ -101,34 +102,31 @@ def iter_jsonl_dicts(
     """
     if not path.exists() or not path.is_file():
         return
-    try:
-        if path.suffix == ".gz" or path.name.endswith(".jsonl.gz"):
-            handle_cm = gzip.open(path, "rt", encoding="utf-8", errors="replace")
-        else:
-            handle_cm = path.open("r", encoding="utf-8", errors="replace")
-        with handle_cm as handle:
-            for raw in handle:
-                if not raw.endswith("\n"):
-                    if stats is not None:
-                        stats["truncated_tail_skipped"] = (
-                            int(stats.get("truncated_tail_skipped") or 0) + 1
-                        )
-                    break
-                text = raw.strip()
-                if not text:
-                    continue
+    if path.suffix == ".gz" or path.name.endswith(".jsonl.gz"):
+        handle_cm = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        handle_cm = path.open("r", encoding="utf-8", errors="replace")
+    with handle_cm as handle:
+        for raw in handle:
+            if not raw.endswith("\n"):
                 if stats is not None:
-                    stats["physical_rows"] = int(stats.get("physical_rows") or 0) + 1
-                try:
-                    value = json.loads(text)
-                except json.JSONDecodeError:
-                    if stats is not None:
-                        stats["malformed_rows"] = int(stats.get("malformed_rows") or 0) + 1
-                    continue
-                if isinstance(value, dict):
-                    yield value
-    except OSError:
-        return
+                    stats["truncated_tail_skipped"] = (
+                        int(stats.get("truncated_tail_skipped") or 0) + 1
+                    )
+                break
+            text = raw.strip()
+            if not text:
+                continue
+            if stats is not None:
+                stats["physical_rows"] = int(stats.get("physical_rows") or 0) + 1
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                if stats is not None:
+                    stats["malformed_rows"] = int(stats.get("malformed_rows") or 0) + 1
+                continue
+            if isinstance(value, dict):
+                yield value
 
 
 def _iter_checksummed_archive_jsonl(
@@ -178,7 +176,7 @@ def reconstructed_join_key(
     symbol: Any,
 ) -> str | None:
     scan = _optional_text(scan_id)
-    observed = _optional_text(observed_at)
+    observed = _iso(observed_at) or _optional_text(observed_at)
     normalized = _normalize_symbol(symbol)
     if not scan or not observed or not normalized:
         return None
@@ -213,17 +211,18 @@ def latest_accountability_by_id(
     rows: list[Mapping[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
+    revisions: dict[str, int] = {}
     for row in rows:
         key = str(row.get("accountability_id") or "")
         if not key:
             continue
-        current = latest.get(key)
         try:
             revision = int(row.get("revision") or 0)
         except (TypeError, ValueError):
             revision = 0
-        if current is None or revision >= int(current.get("revision") or 0):
+        if key not in revisions or revision >= revisions[key]:
             latest[key] = dict(row)
+            revisions[key] = revision
     return latest
 
 
@@ -1736,10 +1735,8 @@ def inspect_replica(data_root: Path | str) -> dict[str, Any]:
 
     report["replica_root"] = str(root)
     report["replica_available"] = bool(
-        physical.get("discovery")
-        or physical.get("oa")
-        or physical.get("phase3c")
-        or physical.get("stage0")
+        physical.get("stage0")
+        or (physical.get("discovery") and physical.get("oa"))
     )
     return report
 
