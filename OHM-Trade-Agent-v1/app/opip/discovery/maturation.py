@@ -4,26 +4,31 @@ MEASUREMENT ONLY — NO PRODUCTION DECISION AUTHORITY.
 
 Mirrors Phase 3C semantics: partial labels stay eligible, later revisions are
 appended, consumers read the latest revision per observation_id, and the
-screening ledger is indexed by byte offset so unprocessed rows cannot fall
-out of a tail read.
+screening ledger is indexed across verified archive generations plus the
+current HOT file so bounded HOT rotation cannot silently drop observations.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, BinaryIO, Iterable, Mapping, Sequence
 
+from app.opip.decision.store import screening_evaluations_archive
 from app.opip.discovery.constants import (
     DISCOVERY_BOUNDED_CHECKPOINT_ANCHOR_BYTES,
     DISCOVERY_BOUNDED_MAX_ROWS,
     DISCOVERY_BOUNDED_RETRY_DELAY,
     DISCOVERY_FORWARD_READ_GRACE,
+    DISCOVERY_HOT_GENERATION_PREFIX_BYTES,
     DISCOVERY_MATURATION_MILESTONES,
     DISCOVERY_PRIMARY_HORIZON,
+    DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE,
     PENDING_FINALIZATION,
 )
 from app.opip.discovery.attribution import attribution_record
@@ -36,7 +41,7 @@ from app.opip.discovery.store import (
     read_discovery_forward_outcomes,
 )
 from app.opip.early.point_in_time import parse_timestamp
-from app.opip.storage.bounded_jsonl import repair_truncated_tail
+from app.opip.storage.bounded_jsonl import BoundedJsonlArchive, repair_truncated_tail
 from app.services.registry_io import registry_lock
 from app.services.signal_quality_phase2 import build_timelines, read_observations
 
@@ -443,97 +448,534 @@ def _observation_id_from_screening(row: Mapping[str, Any]) -> str:
     return str((metadata or {}).get("observation_id") or "").strip()
 
 
+@dataclass(frozen=True)
+class _VerifiedScreeningSegment:
+    relative_path: str
+    sha256: str
+    path: Path
+    sort_key: str
+
+
+def _state_json_list(connection: sqlite3.Connection, key: str) -> list[str]:
+    raw = _state_text(connection, key)
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [str(item) for item in payload if str(item).strip()]
+
+
+def _set_state_json_list(
+    connection: sqlite3.Connection, key: str, values: Sequence[str]
+) -> None:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    _set_state_text(
+        connection,
+        key,
+        json.dumps(unique, separators=(",", ":"), allow_nan=False),
+    )
+
+
+def _hot_generation_fingerprint(path: Path) -> tuple[int, str]:
+    if not path.exists():
+        return 0, ""
+    size = path.stat().st_size
+    take = min(size, DISCOVERY_HOT_GENERATION_PREFIX_BYTES)
+    with path.open("rb") as handle:
+        payload = handle.read(take)
+    return take, hashlib.sha256(payload).hexdigest()
+
+
+def _hot_generation_matches(connection: sqlite3.Connection, path: Path) -> bool:
+    expected = _state_text(connection, "screening_hot_generation_sha256") or ""
+    expected_bytes = _state_int(connection, "screening_hot_generation_bytes", 0)
+    if not expected or expected_bytes <= 0:
+        return _state_int(connection, "screening_indexed_offset", 0) <= 0
+    if not path.exists():
+        return False
+    if path.stat().st_size < expected_bytes:
+        return False
+    with path.open("rb") as handle:
+        payload = handle.read(expected_bytes)
+    return (
+        len(payload) == expected_bytes
+        and hashlib.sha256(payload).hexdigest() == expected
+    )
+
+
+def _set_hot_generation(connection: sqlite3.Connection, path: Path) -> None:
+    nbytes, digest = _hot_generation_fingerprint(path)
+    _set_state_int(connection, "screening_hot_generation_bytes", nbytes)
+    _set_state_text(connection, "screening_hot_generation_sha256", digest)
+
+
+def _skip_exact(handle: BinaryIO, nbytes: int) -> None:
+    remaining = int(nbytes)
+    while remaining > 0:
+        chunk = handle.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise RuntimeError("DISCOVERY_SCREENING_CHECKPOINT_SHORT_READ")
+        remaining -= len(chunk)
+
+
+def _decompressed_size(path: Path) -> int:
+    total = 0
+    with gzip.open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+    return total
+
+
+def _read_virtual_range(
+    segments: Sequence[_VerifiedScreeningSegment],
+    hot_path: Path | None,
+    start: int,
+    length: int,
+) -> bytes:
+    if length <= 0:
+        return b""
+    skip = int(start)
+    needed = int(length)
+    out = bytearray()
+
+    def _consume(handle: BinaryIO) -> None:
+        nonlocal skip, needed
+        while skip > 0:
+            chunk = handle.read(min(1024 * 1024, skip))
+            if not chunk:
+                return
+            skip -= len(chunk)
+        while needed > 0:
+            chunk = handle.read(min(1024 * 1024, needed))
+            if not chunk:
+                return
+            out.extend(chunk)
+            needed -= len(chunk)
+
+    for segment in segments:
+        if needed <= 0:
+            break
+        with gzip.open(segment.path, "rb") as handle:
+            _consume(handle)
+    if needed > 0 and hot_path is not None and hot_path.exists():
+        with hot_path.open("rb") as handle:
+            _consume(handle)
+    if needed > 0 or skip > 0:
+        raise RuntimeError("DISCOVERY_SCREENING_CHECKPOINT_SHORT_READ")
+    return bytes(out)
+
+
+def _anchor_matches_virtual(
+    connection: sqlite3.Connection,
+    segments: Sequence[_VerifiedScreeningSegment],
+    hot_path: Path | None,
+    offset: int,
+) -> bool:
+    if offset <= 0:
+        return True
+    expected = _state_text(connection, "screening_anchor_sha256")
+    start = _state_int(connection, "screening_anchor_start", -1)
+    size = _state_int(connection, "screening_anchor_size", -1)
+    if not expected or start < 0 or size <= 0 or start + size != offset:
+        return False
+    try:
+        payload = _read_virtual_range(segments, hot_path, start, size)
+    except RuntimeError:
+        return False
+    return len(payload) == size and hashlib.sha256(payload).hexdigest() == expected
+
+
+def _verified_screening_segments(
+    archive: BoundedJsonlArchive,
+) -> list[_VerifiedScreeningSegment]:
+    if not archive.manifest_file.exists():
+        return []
+    archive._verified_manifest_signature_for_replica()
+    try:
+        raw = json.loads(archive.manifest_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("DISCOVERY_SCREENING_ARCHIVE_MANIFEST_INVALID") from exc
+    segments_raw = raw.get("segments") if isinstance(raw, dict) else None
+    if not isinstance(segments_raw, dict):
+        return []
+    out: list[_VerifiedScreeningSegment] = []
+    for digest, row in segments_raw.items():
+        if not isinstance(row, Mapping):
+            continue
+        relative = str(row.get("archive") or "").strip()
+        sha = str(row.get("sha256") or digest or "").strip()
+        if not relative or not sha:
+            continue
+        path = (archive.archive_dir / relative).resolve()
+        try:
+            path.relative_to(archive.archive_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DISCOVERY_SCREENING_ARCHIVE_PATH_ESCAPE:{relative}"
+            ) from exc
+        if not path.is_file():
+            cold = (archive.cold_archive_dir / relative).resolve()
+            if cold.is_file():
+                path = cold
+            else:
+                matches = [
+                    item
+                    for item in archive.cold_archive_dir.rglob(Path(relative).name)
+                    if item.is_file()
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}"
+                    )
+                path = matches[0]
+        checksum = path.with_suffix(path.suffix + ".sha256")
+        if not checksum.exists():
+            raise RuntimeError(f"DISCOVERY_SCREENING_ARCHIVE_MISSING:{relative}")
+        tokens = checksum.read_text(encoding="utf-8").split()
+        if not tokens:
+            raise RuntimeError(
+                f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
+            )
+        actual = archive._sha256_file(path)
+        if actual != tokens[0] or actual != sha:
+            raise RuntimeError(
+                f"DISCOVERY_SCREENING_ARCHIVE_CHECKSUM_MISMATCH:{relative}"
+            )
+        sort_key = (
+            str(row.get("first_visible_at_utc") or "")
+            or str(row.get("verified_at_utc") or "")
+            or relative
+        )
+        out.append(
+            _VerifiedScreeningSegment(
+                relative_path=relative,
+                sha256=sha,
+                path=path,
+                sort_key=f"{sort_key}|{relative}",
+            )
+        )
+    out.sort(key=lambda item: item.sort_key)
+    return out
+
+
+def _enqueue_screening_snapshot(
+    connection: sqlite3.Connection,
+    snapshot: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> None:
+    if str(snapshot.get("scanner_type") or "") != "BROAD_SEARCH":
+        return
+    if str(snapshot.get("outcome") or "") == PENDING_FINALIZATION:
+        return
+    metadata = snapshot.get("metadata")
+    if isinstance(metadata, Mapping) and str(
+        metadata.get("production_admission_result") or ""
+    ) == PENDING_FINALIZATION:
+        return
+    observation_id = _observation_id_from_screening(snapshot)
+    observed_at = parse_timestamp(snapshot.get("observed_at"))
+    if not observation_id or observed_at is None:
+        return
+
+    prior = latest_discovery_outcome_row(connection, observation_id)
+    if prior is not None and discovery_window_complete(prior):
+        connection.execute(
+            "DELETE FROM observation_queue WHERE observation_id = ?",
+            (observation_id,),
+        )
+        return
+    next_due = (
+        next_discovery_due_at(prior, evaluated_at=now)
+        if prior is not None
+        else observed_at
+    )
+    if next_due is None:
+        connection.execute(
+            "DELETE FROM observation_queue WHERE observation_id = ?",
+            (observation_id,),
+        )
+        return
+    connection.execute(
+        """
+        INSERT INTO observation_queue(
+            observation_id, observed_at, next_due_at,
+            venue_instrument_id, row_json
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(observation_id) DO UPDATE SET
+            row_json = excluded.row_json,
+            observed_at = excluded.observed_at,
+            venue_instrument_id = excluded.venue_instrument_id
+        """,
+        (
+            observation_id,
+            observed_at.isoformat(),
+            next_due.isoformat(),
+            str(snapshot.get("venue_instrument_id") or ""),
+            json.dumps(snapshot, sort_keys=True, allow_nan=False),
+        ),
+    )
+
+
+def _index_jsonl_handle(
+    connection: sqlite3.Connection,
+    handle: BinaryIO,
+    *,
+    now: datetime,
+    start_offset: int = 0,
+) -> int:
+    if start_offset > 0:
+        _skip_exact(handle, start_offset)
+    last_complete = int(start_offset)
+    while True:
+        raw = handle.readline()
+        if not raw:
+            break
+        if not raw.endswith(b"\n"):
+            break
+        last_complete += len(raw)
+        try:
+            snapshot = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(snapshot, dict):
+            _enqueue_screening_snapshot(connection, snapshot, now=now)
+    return last_complete
+
+
+def _index_hot_from_offset(
+    connection: sqlite3.Connection,
+    screening_path: Path,
+    *,
+    now: datetime,
+    start_offset: int,
+) -> int:
+    last_complete = int(start_offset)
+    with screening_path.open("rb") as handle:
+        last_complete = _index_jsonl_handle(
+            connection, handle, now=now, start_offset=start_offset
+        )
+    _set_state_checkpoint(connection, screening_path, "screening", last_complete)
+    _set_hot_generation(connection, screening_path)
+    # Keep explicit hot-offset alias in sync for generation-aware readers.
+    _set_state_int(connection, "screening_hot_offset", last_complete)
+    connection.commit()
+    return last_complete
+
+
+def _index_archive_segment(
+    connection: sqlite3.Connection,
+    segment: _VerifiedScreeningSegment,
+    *,
+    now: datetime,
+    start_offset: int = 0,
+) -> None:
+    with gzip.open(segment.path, "rb") as handle:
+        _index_jsonl_handle(
+            connection, handle, now=now, start_offset=start_offset
+        )
+
+
+def _mark_segment_consumed(
+    connection: sqlite3.Connection, segment: _VerifiedScreeningSegment
+) -> None:
+    consumed = _state_json_list(connection, "screening_consumed_archives")
+    if segment.sha256 not in consumed:
+        consumed.append(segment.sha256)
+    _set_state_json_list(connection, "screening_consumed_archives", consumed)
+    known = _state_json_list(connection, "screening_generation_archives")
+    if segment.relative_path not in known:
+        known.append(segment.relative_path)
+    _set_state_json_list(connection, "screening_generation_archives", known)
+
+
+def _migrate_screening_checkpoint_state(
+    connection: sqlite3.Connection,
+    screening_path: Path,
+) -> None:
+    """Idempotent additive migration from offset-only production state."""
+    if _state_text(connection, "screening_checkpoint_schema") == "generation_v1":
+        if _state_text(connection, "screening_hot_offset") is None:
+            _set_state_int(
+                connection,
+                "screening_hot_offset",
+                _state_int(connection, "screening_indexed_offset", 0),
+            )
+        return
+
+    offset = _state_int(connection, "screening_indexed_offset", 0)
+    _set_state_int(connection, "screening_hot_offset", offset)
+    if not _state_json_list(connection, "screening_consumed_archives"):
+        _set_state_json_list(connection, "screening_consumed_archives", [])
+    if not _state_json_list(connection, "screening_generation_archives"):
+        # Empty means "unknown prior set" so rotation recovery may consider
+        # all verified segments when proving continuity after HOT shrink.
+        _set_state_json_list(connection, "screening_generation_archives", [])
+    if screening_path.exists() and offset <= screening_path.stat().st_size:
+        if offset <= 0 or _state_checkpoint_matches(
+            connection, screening_path, "screening", offset
+        ):
+            _set_hot_generation(connection, screening_path)
+    _set_state_text(connection, "screening_checkpoint_schema", "generation_v1")
+    connection.commit()
+
+
+def _prove_rotation_prefix(
+    connection: sqlite3.Connection,
+    segments: Sequence[_VerifiedScreeningSegment],
+    screening_path: Path,
+    offset: int,
+) -> tuple[list[_VerifiedScreeningSegment], int] | None:
+    """Return (archive_prefix, hot_offset) when concat(prefix)+HOT matches anchor.
+
+    Rotation always archives a HOT prefix, so candidate reconstructions are
+    chronological *suffixes* of verified segments plus the current HOT file.
+    """
+    if offset <= 0:
+        return [], 0
+    hot_size = screening_path.stat().st_size if screening_path.exists() else 0
+    items = list(segments)
+    for suffix_len in range(1, len(items) + 1):
+        prefix = items[-suffix_len:]
+        prefix_bytes = sum(_decompressed_size(item.path) for item in prefix)
+        if prefix_bytes + hot_size < offset:
+            continue
+        if _anchor_matches_virtual(connection, prefix, screening_path, offset):
+            return prefix, max(0, offset - prefix_bytes)
+    return None
+
+
 def reconcile_screening_queue(
     connection: sqlite3.Connection,
     screening_path: Path,
     *,
     now: datetime,
 ) -> None:
+    """Index BROAD_SEARCH screening rows across verified archives + HOT.
+
+    Contract:
+    * Same HOT generation resumes from the durable byte offset.
+    * Verified bounded-JSONL rotation drains archived predecessor bytes before
+      initializing the new HOT generation.
+    * Unexplained truncation / divergence still fail closed.
+    * Queue upserts are idempotent on ``observation_id``.
+    """
+    _migrate_screening_checkpoint_state(connection, screening_path)
+    archive = screening_evaluations_archive(screening_path)
+    all_segments = _verified_screening_segments(archive)
+    consumed = set(_state_json_list(connection, "screening_consumed_archives"))
+    unconsumed = [item for item in all_segments if item.sha256 not in consumed]
+
+    # Bounded drain of verified archive generations (historical + rotation).
+    drained = 0
+    for segment in unconsumed:
+        if drained >= DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE:
+            break
+        _index_archive_segment(connection, segment, now=now, start_offset=0)
+        _mark_segment_consumed(connection, segment)
+        connection.commit()
+        drained += 1
+        consumed.add(segment.sha256)
+
+    unconsumed = [item for item in all_segments if item.sha256 not in consumed]
     indexed_offset = _state_int(connection, "screening_indexed_offset", 0)
+
     if not screening_path.exists():
-        if indexed_offset:
+        if indexed_offset and not unconsumed:
             raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
         return
 
     size = screening_path.stat().st_size
-    if indexed_offset > size:
-        raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
-    if not _state_checkpoint_matches(
+    generation_ok = _hot_generation_matches(connection, screening_path)
+    anchor_ok = _state_checkpoint_matches(
         connection, screening_path, "screening", indexed_offset
-    ):
+    )
+
+    # Case 1 — same HOT generation continuity.
+    if indexed_offset <= size and generation_ok and (indexed_offset == 0 or anchor_ok):
+        _index_hot_from_offset(
+            connection, screening_path, now=now, start_offset=indexed_offset
+        )
+        return
+
+    if indexed_offset <= size and generation_ok and not anchor_ok:
         raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
 
-    last_complete = indexed_offset
-    with screening_path.open("rb") as handle:
-        handle.seek(indexed_offset)
-        while True:
-            raw = handle.readline()
-            if not raw:
-                break
-            end = handle.tell()
-            if not raw.endswith(b"\n"):
-                break
-            last_complete = end
-            try:
-                snapshot = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(snapshot, dict):
-                continue
-            if str(snapshot.get("scanner_type") or "") != "BROAD_SEARCH":
-                continue
-            if str(snapshot.get("outcome") or "") == PENDING_FINALIZATION:
-                continue
-            metadata = snapshot.get("metadata")
-            if isinstance(metadata, Mapping) and str(
-                metadata.get("production_admission_result") or ""
-            ) == PENDING_FINALIZATION:
-                continue
-            observation_id = _observation_id_from_screening(snapshot)
-            observed_at = parse_timestamp(snapshot.get("observed_at"))
-            if not observation_id or observed_at is None:
-                continue
+    # Case 2 — HOT rotated (generation changed and/or file shrank). A later
+    # append onto the new HOT can make size >= old offset again, so generation
+    # mismatch must attempt verified rotation proof before fail-closed.
+    proof = _prove_rotation_prefix(
+        connection, all_segments, screening_path, indexed_offset
+    )
+    if proof is None:
+        known = set(_state_json_list(connection, "screening_generation_archives"))
+        if not known:
+            candidates = list(all_segments)
+        else:
+            candidates = [
+                item
+                for item in all_segments
+                if item.relative_path not in known or item.sha256 not in consumed
+            ]
+        proof = _prove_rotation_prefix(
+            connection, candidates, screening_path, indexed_offset
+        )
 
-            prior = latest_discovery_outcome_row(connection, observation_id)
-            if prior is not None and discovery_window_complete(prior):
-                connection.execute(
-                    "DELETE FROM observation_queue WHERE observation_id = ?",
-                    (observation_id,),
-                )
-                continue
-            next_due = (
-                next_discovery_due_at(prior, evaluated_at=now)
-                if prior is not None
-                else observed_at
-            )
-            if next_due is None:
-                connection.execute(
-                    "DELETE FROM observation_queue WHERE observation_id = ?",
-                    (observation_id,),
-                )
-                continue
-            connection.execute(
-                """
-                INSERT INTO observation_queue(
-                    observation_id, observed_at, next_due_at,
-                    venue_instrument_id, row_json
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(observation_id) DO UPDATE SET
-                    row_json = excluded.row_json,
-                    observed_at = excluded.observed_at,
-                    venue_instrument_id = excluded.venue_instrument_id
-                """,
-                (
-                    observation_id,
-                    observed_at.isoformat(),
-                    next_due.isoformat(),
-                    str(snapshot.get("venue_instrument_id") or ""),
-                    json.dumps(snapshot, sort_keys=True, allow_nan=False),
-                ),
-            )
+    if proof is None:
+        if unconsumed:
+            # More verified segments remain for a later bounded cycle.
+            return
+        if indexed_offset > size:
+            raise RuntimeError("DISCOVERY_SCREENING_LEDGER_TRUNCATED")
+        raise RuntimeError("DISCOVERY_SCREENING_LEDGER_DIVERGED")
 
-    _set_state_checkpoint(connection, screening_path, "screening", last_complete)
-    connection.commit()
+    prefix, hot_offset = proof
+    # Ensure every prefix segment is indexed (idempotent) and marked consumed.
+    preceding = 0
+    for segment in prefix:
+        seg_size = _decompressed_size(segment.path)
+        if indexed_offset >= preceding + seg_size:
+            local_start = seg_size  # already fully covered by prior HOT progress
+        elif indexed_offset > preceding:
+            local_start = indexed_offset - preceding
+        else:
+            local_start = 0
+        if segment.sha256 not in consumed:
+            if local_start < seg_size:
+                _index_archive_segment(
+                    connection, segment, now=now, start_offset=local_start
+                )
+            _mark_segment_consumed(connection, segment)
+            connection.commit()
+            consumed.add(segment.sha256)
+        preceding += seg_size
+
+    # Initialize new HOT generation and continue from mapped offset.
+    # Generation fingerprint is committed inside _index_hot_from_offset together
+    # with the remapped byte offset so a crash cannot strand a new generation
+    # identity against a stale offset.
+    _set_state_json_list(
+        connection,
+        "screening_generation_archives",
+        [item.relative_path for item in all_segments],
+    )
+    _index_hot_from_offset(
+        connection, screening_path, now=now, start_offset=hot_offset
+    )
 
 
 def due_observation_batch(

@@ -163,6 +163,9 @@ def main() -> None:
     payload = {
         "status": "ERROR" if cycle_error else "OK",
         "discovery_job_status": "ERROR" if discovery_error else "OK",
+        "discovery_failure_nonfatal": bool(
+            discovery_error and backfill_error is None and accountability_error is None
+        ),
         "new_outcomes_evaluated": newly_evaluated,
         "discovery_outcomes": discovery_summary,
         "accountability_handoff_rows": len(outcomes),
