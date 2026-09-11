@@ -607,13 +607,15 @@ def _hot_generation_matches(
     *,
     manifest_head_sha: str,
 ) -> bool:
+    del manifest_head_sha  # retained for call-site clarity; peak-size is authoritative
     expected = _state_text(connection, "screening_hot_generation_sha256") or ""
     expected_bytes = _state_int(connection, "screening_hot_generation_bytes", 0)
     if not expected or expected_bytes <= 0:
         return _state_int(connection, "screening_indexed_offset", 0) <= 0
     if not path.exists():
         return False
-    if path.stat().st_size < expected_bytes:
+    size = path.stat().st_size
+    if size < expected_bytes:
         return False
     with path.open("rb") as handle:
         payload = handle.read(expected_bytes)
@@ -623,13 +625,20 @@ def _hot_generation_matches(
     )
     if not content_ok:
         return False
-    # Durable compaction lineage: physical HOT replacement publishes a new
-    # archive SHA as the manifest head. Inode/mtime are not replica-stable.
-    stored_head = _state_text(connection, "screening_hot_generation_manifest_head_sha")
-    if stored_head is None:
-        # Pre-lineage checkpoints: content bound only until next successful set.
-        return True
-    return stored_head == str(manifest_head_sha)
+
+    # Peak HOT size for this generation. Compaction replaces HOT with a smaller
+    # file even when a crafted retained prefix collides with the fingerprint.
+    # Truncated-tail repair may shrink only the uncheckpointed open tail.
+    peak = _state_int(connection, "screening_hot_peak_size", 0)
+    durable = _state_int(connection, "screening_indexed_offset", 0)
+    if peak > 0 and size < peak:
+        if size < durable:
+            return False
+        # Permit exact repair back to the durable complete-line end.
+        if size == durable and peak >= durable:
+            return True
+        return False
+    return True
 
 
 def _set_hot_generation(
@@ -647,6 +656,17 @@ def _set_hot_generation(
         "screening_hot_generation_manifest_head_sha",
         str(manifest_head_sha or ""),
     )
+    if path.exists():
+        size = path.stat().st_size
+        peak = _state_int(connection, "screening_hot_peak_size", 0)
+        # Peak tracks observed HOT size for this generation. After a proven
+        # remap/recovery the caller clears peak first so compaction can raise it
+        # for the new generation without inheriting the prior file's high-water.
+        _set_state_int(connection, "screening_hot_peak_size", max(peak, size))
+
+
+def _reset_hot_generation_peak(connection: sqlite3.Connection) -> None:
+    _set_state_int(connection, "screening_hot_peak_size", 0)
 
 
 def _skip_exact(handle: BinaryIO, nbytes: int) -> None:
@@ -1345,12 +1365,13 @@ def reconcile_screening_queue(
     )
 
     if indexed_offset <= size and generation_ok and (indexed_offset == 0 or anchor_ok):
-        if known:
+        known_set = set(known)
+        if known_set:
             catchup = [
                 row
                 for row in manifest_rows
                 if str(row["sha256"]) not in consumed
-                and str(row["sha256"]) not in known
+                and str(row["sha256"]) not in known_set
             ]
             for row in catchup:
                 sha = str(row["sha256"])
@@ -1368,14 +1389,29 @@ def reconcile_screening_queue(
                     connection, segment, now=now, start_offset=0, budget=budget
                 )
                 _mark_segment_consumed(connection, segment)
+                known_set.add(sha)
+                consumed.add(sha)
                 connection.commit()
+            # Never mark budget-skipped catchup SHAs as known.
+            current_shas = {str(row["sha256"]) for row in manifest_rows}
+            _set_state_json_list(
+                connection,
+                "screening_known_archive_shas",
+                sorted(
+                    (known_set | set(_state_json_list(connection, "screening_consumed_archives")))
+                    & current_shas
+                ),
+            )
+        else:
+            # Empty known on a healthy HOT generation: adopt current inventory as
+            # the baseline so historical archives are not falsely treated as new.
+            _set_state_json_list(
+                connection,
+                "screening_known_archive_shas",
+                [str(row["sha256"]) for row in manifest_rows],
+            )
         _index_hot_from_offset(
             connection, screening_path, now=now, start_offset=indexed_offset
-        )
-        _set_state_json_list(
-            connection,
-            "screening_known_archive_shas",
-            [str(row["sha256"]) for row in manifest_rows],
         )
         _clear_recovery_cursor(connection)
         return _done(recovery_pending=False, continuity_proven=True)
@@ -1440,12 +1476,22 @@ def reconcile_screening_queue(
             consumed.add(segment.sha256)
         preceding += seg_size
 
+    # Account for proven/consumed/prior-known SHAs only. Archives newer than the
+    # pinned proof head remain unknown so normal catchup can index them later.
+    cursor_before_clear = _load_recovery_cursor(connection)
+    active_end = str(cursor_before_clear.get("active_end_sha") or "")
+    current = [str(row["sha256"]) for row in manifest_rows]
+    accounted = set(known) | set(consumed) | {segment.sha256 for segment in prefix}
+    if active_end and active_end in current:
+        end_idx = current.index(active_end)
+        accounted.update(current[: end_idx + 1])
     _set_state_json_list(
         connection,
         "screening_known_archive_shas",
-        [str(row["sha256"]) for row in manifest_rows],
+        [sha for sha in current if sha in accounted],
     )
     # Remap HOT before clearing recovery cursor so a crash mid-remap can resume.
+    _reset_hot_generation_peak(connection)
     _index_hot_from_offset(
         connection, screening_path, now=now, start_offset=hot_offset
     )

@@ -891,33 +891,97 @@ def test_archive_physical_order_ignores_observed_at(tmp_path):
 
 
 def test_hot_generation_lineage_detects_compaction_prefix_collision(tmp_path, monkeypatch):
-    """Manifest-head lineage changes on compaction even if HOT prefix bytes collide."""
+    """Peak HOT size declines on compaction even if retained prefix bytes collide."""
     monkeypatch.setattr(maturation_mod, "DISCOVERY_HOT_GENERATION_PREFIX_BYTES", 32)
     hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
-    # Craft many identical-prefix-friendly rows then rotate so retained HOT can
-    # share leading bytes with an earlier generation fingerprint window.
     rows = [_screening_row(f"SCAN:L{i}", f"L{i}USD") for i in range(4)]
     _write_hot(hot, rows)
     state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
     try:
         reconcile_screening_queue(state, hot, now=NOW)
-        head_before = _state_text(state, "screening_hot_generation_manifest_head_sha")
-        assert head_before == ""
-        offset_before = _state_int(state, "screening_indexed_offset", 0)
-        assert offset_before == hot.stat().st_size
+        peak_before = _state_int(state, "screening_hot_peak_size", 0)
+        assert peak_before == hot.stat().st_size
 
         archived = _compact_hot(hot, keep_lines=1, max_bytes=16)
         assert archived is not None
-        head_after_archive = _manifest_shas(hot)[-1]
-        assert head_after_archive != ""
+        assert hot.stat().st_size < peak_before
 
-        # Without lineage, a colliding prefix could look like same generation.
-        # With lineage, compacting published a new manifest head → recovery path.
         result = reconcile_screening_queue(state, hot, now=NOW)
+        # May need a second cycle under tight budgets; drain recovery if pending.
+        for _ in range(6):
+            if not result.recovery_pending and result.continuity_proven:
+                break
+            result = reconcile_screening_queue(state, hot, now=NOW)
         assert result.recovery_pending is False
         assert result.continuity_proven is True
-        head_stored = _state_text(state, "screening_hot_generation_manifest_head_sha")
-        assert head_stored == head_after_archive
-        assert head_stored != head_before
+        assert _state_int(state, "screening_hot_peak_size", 0) == hot.stat().st_size
+    finally:
+        state.close()
+
+
+def test_budgeted_catchup_does_not_mark_skipped_archives_known(tmp_path, monkeypatch):
+    """Unindexed catchup SHAs must remain eligible across later same-generation cycles."""
+    import gzip
+
+    monkeypatch.setattr(
+        maturation_mod, "DISCOVERY_SCREENING_ARCHIVE_SEGMENTS_PER_CYCLE", 1
+    )
+    hot = tmp_path / "opip/qualification/screening_evaluations.jsonl"
+    seed_rows = [
+        _screening_row("SCAN:BASE1", "B1USD"),
+        _screening_row("SCAN:BASE2", "B2USD"),
+    ]
+    _write_hot(hot, seed_rows)
+    state = open_discovery_state(tmp_path / "opip/discovery/.forward_outcomes.jsonl.state.sqlite3")
+    try:
+        reconcile_screening_queue(state, hot, now=NOW)
+        assert _compact_hot(hot, keep_lines=1, max_bytes=16) is not None
+        for _ in range(6):
+            result = reconcile_screening_queue(state, hot, now=NOW)
+            if not result.recovery_pending and result.continuity_proven:
+                break
+        else:
+            raise AssertionError("failed to finish post-compact recovery")
+        baseline_known = set(_state_json_list(state, "screening_known_archive_shas"))
+        assert baseline_known
+
+        archive = screening_evaluations_archive(hot)
+        extra_ids = []
+        extra_shas = []
+        for i in range(3):
+            row = _screening_row(f"SCAN:CU{i}", f"CU{i}USD")
+            extra_ids.append(row["metadata"]["observation_id"])
+            name = f"screening_evaluations-2099010{i}T000000Z-cu{i}.jsonl.gz"
+            path = archive.archive_dir / name
+            payload = (
+                json.dumps(row, sort_keys=True, allow_nan=False) + "\n"
+            ).encode("utf-8")
+            with gzip.open(path, "wb") as handle:
+                handle.write(payload)
+            digest = archive._sha256_file(path)
+            path.with_suffix(path.suffix + ".sha256").write_text(
+                f"{digest}  {name}\n", encoding="utf-8"
+            )
+            archive.update_manifest_locked(
+                archive.verify_archive_file(path, tier="WARM")
+            )
+            extra_shas.append(digest)
+
+        seen = set(_queue_ids(state))
+        for cycle_i in range(6):
+            result = reconcile_screening_queue(state, hot, now=NOW)
+            assert result.recovery_pending is False
+            assert result.continuity_proven is True
+            assert result.archive_stats["archive_segments_expensive_unique"] <= 1
+            seen |= _queue_ids(state)
+            known = set(_state_json_list(state, "screening_known_archive_shas"))
+            consumed = set(_state_json_list(state, "screening_consumed_archives"))
+            pending_extras = [sha for sha in extra_shas if sha not in consumed]
+            if pending_extras and cycle_i == 0:
+                assert any(sha not in known for sha in pending_extras)
+        assert set(extra_ids).issubset(seen)
+        assert set(extra_shas).issubset(
+            set(_state_json_list(state, "screening_consumed_archives"))
+        )
     finally:
         state.close()
