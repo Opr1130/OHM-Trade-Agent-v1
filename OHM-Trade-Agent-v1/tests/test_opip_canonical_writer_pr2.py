@@ -39,7 +39,7 @@ from app.opip.canonical.recovery import run_backup_restore_drill
 from app.opip.canonical.server import CanonicalWriterServer
 from app.opip.canonical.writer import CanonicalWriter
 from app.services.alert_governor import evaluate_opportunity_alert
-from app.services.registry_io import load_json
+from app.services.registry_io import load_json, save_json_atomic
 
 
 @pytest.fixture
@@ -54,7 +54,23 @@ def canonical_env(tmp_path, monkeypatch):
     set_writer_client_for_tests(None)
 
 
-def _record_intent(*, key: str, identity: str, priority: str = "NORMAL") -> WriterIntent:
+def _record_intent(
+    *,
+    key: str,
+    identity: str,
+    priority: str = "NORMAL",
+    transition_key: str = "READY:x",
+    message_id: int = 42,
+    created_new: bool = True,
+    pre_state: dict | None = None,
+) -> WriterIntent:
+    if pre_state is None:
+        pre_state = {
+            "snapshot_ok": True,
+            "identity_present": False,
+            "transition_key": None,
+            "message_id": None,
+        }
     return WriterIntent(
         schema_version=SCHEMA_VERSION,
         priority=priority,  # type: ignore[arg-type]
@@ -62,19 +78,21 @@ def _record_intent(*, key: str, identity: str, priority: str = "NORMAL") -> Writ
         event_type="alert_governor.transition.recorded",
         payload={
             "identity": identity,
-            "transition_key": "READY:x",
-            "message_id": 42,
-            "created_new": True,
+            "transition_key": transition_key,
+            "message_id": message_id,
+            "created_new": created_new,
             "scan_id": "scan-1",
+            "pre_state": pre_state,
         },
         ops_handoff={
             "operation": "RECORD",
             "identity": identity,
-            "transition_key": "READY:x",
-            "message_id": 42,
-            "created_new": True,
+            "transition_key": transition_key,
+            "message_id": message_id,
+            "created_new": created_new,
             "reservation_token": "tok-1",
             "state_family": STATE_FAMILY_EARLY_WATCH,
+            "pre_state": pre_state,
         },
     )
 
@@ -387,6 +405,209 @@ def test_corrupt_gap_spool_fail_closed_preserves_file(canonical_env):
             error_code="E",
         )
     assert spool.read_bytes() == before
+
+
+def test_writer_and_spool_failure_still_records_json(canonical_env, monkeypatch):
+    settings = SimpleNamespace(opip_canonical_writer_mode="shadow")
+
+    class _Down:
+        def submit(self, intent):  # noqa: ANN001
+            raise ConnectionError("writer down")
+
+    set_writer_client_for_tests(_Down())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "app.opip.canonical.bridge.append_capture_gap",
+        lambda **_kwargs: (_ for _ in ()).throw(GapSpoolError("spool dead")),
+    )
+    decision = evaluate_opportunity_alert(
+        identity="EARLY_MOVER:BOTH",
+        transition_key="READY:both",
+        state_file=canonical_env["state"],
+    )
+    ack = durable_record_opportunity_alert(
+        identity="EARLY_MOVER:BOTH",
+        transition_key="READY:both",
+        message_id=77,
+        created_new=True,
+        reservation_token=decision.reservation_token,
+        scan_id="scan-both",
+        state_file=canonical_env["state"],
+        settings=settings,
+    )
+    assert ack is not None
+    assert ack.status == "RETRYABLE"
+    state = load_json(canonical_env["state"])
+    assert state["identities"]["EARLY_MOVER:BOTH"]["message_id"] == 77
+
+
+def test_writer_and_spool_failure_still_releases_json(canonical_env, monkeypatch):
+    settings = SimpleNamespace(opip_canonical_writer_mode="shadow")
+    decision = evaluate_opportunity_alert(
+        identity="EARLY_MOVER:BOTHREL",
+        transition_key="READY:br",
+        state_file=canonical_env["state"],
+    )
+    token = decision.reservation_token
+
+    class _Down:
+        def submit(self, intent):  # noqa: ANN001
+            return WriterAck(status="RETRYABLE", error_code="QUEUE_FULL")
+
+    set_writer_client_for_tests(_Down())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "app.opip.canonical.bridge.append_capture_gap",
+        lambda **_kwargs: (_ for _ in ()).throw(GapSpoolError("spool dead")),
+    )
+    ack = durable_release_opportunity_alert_reservation(
+        token,
+        scan_id="scan-br",
+        identity="EARLY_MOVER:BOTHREL",
+        transition_key="READY:br",
+        state_file=canonical_env["state"],
+        settings=settings,
+    )
+    assert ack is not None
+    assert ack.status == "RETRYABLE"
+    state = load_json(canonical_env["state"])
+    assert token not in (state.get("new_card_reservations") or {})
+
+
+def test_recovery_replays_when_json_still_at_precondition(canonical_env):
+    """Canonical new committed + JSON write failed → replay, not SUPERSEDED."""
+    server = CanonicalWriterServer(
+        db_path=canonical_env["db"],
+        socket_path=canonical_env["root"] / "writer.sock",
+    )
+    client = InProcessWriterClient(server)
+    set_writer_client_for_tests(client)
+    settings = SimpleNamespace(opip_canonical_writer_mode="shadow")
+
+    save_json_atomic(
+        canonical_env["state"],
+        {
+            "identities": {
+                "EARLY_MOVER:OLD": {
+                    "transition_key": "READY:old",
+                    "message_id": 10,
+                }
+            },
+            "new_card_reservations": {},
+            "new_card_history": [],
+        },
+    )
+    pre = {
+        "snapshot_ok": True,
+        "identity_present": True,
+        "transition_key": "READY:old",
+        "message_id": 10,
+    }
+    intent = _record_intent(
+        key="sup:replay",
+        identity="EARLY_MOVER:OLD",
+        transition_key="READY:new",
+        message_id=20,
+        created_new=False,
+        pre_state=pre,
+    )
+    ack = client.submit(intent)
+    assert ack.status == "OK"
+    assert len(client.list_pending_handoffs()) == 1
+    # Simulate JSON write never landing: state remains at precondition.
+    assert (
+        load_json(canonical_env["state"])["identities"]["EARLY_MOVER:OLD"]["transition_key"]
+        == "READY:old"
+    )
+
+    stats = reconcile_pending_ops_handoffs(
+        settings=settings,
+        state_file=canonical_env["state"],
+    )
+    assert stats["replayed"] == 1
+    assert stats.get("superseded", 0) == 0
+    state = load_json(canonical_env["state"])
+    assert state["identities"]["EARLY_MOVER:OLD"]["transition_key"] == "READY:new"
+    assert state["identities"]["EARLY_MOVER:OLD"]["message_id"] == 20
+    assert client.list_pending_handoffs() == []
+    server.stop()
+
+
+def test_recovery_supersedes_only_when_json_proves_newer(canonical_env):
+    server = CanonicalWriterServer(
+        db_path=canonical_env["db"],
+        socket_path=canonical_env["root"] / "writer.sock",
+    )
+    client = InProcessWriterClient(server)
+    set_writer_client_for_tests(client)
+    settings = SimpleNamespace(opip_canonical_writer_mode="shadow")
+
+    pre = {
+        "snapshot_ok": True,
+        "identity_present": True,
+        "transition_key": "READY:old",
+        "message_id": 10,
+    }
+    intent = _record_intent(
+        key="sup:newer",
+        identity="EARLY_MOVER:NS",
+        transition_key="READY:new",
+        message_id=20,
+        created_new=False,
+        pre_state=pre,
+    )
+    ack = client.submit(intent)
+    assert ack.status == "OK"
+
+    # Later operational JSON advanced past both pre and the pending target.
+    save_json_atomic(
+        canonical_env["state"],
+        {
+            "identities": {
+                "EARLY_MOVER:NS": {
+                    "transition_key": "READY:newer",
+                    "message_id": 30,
+                }
+            },
+            "new_card_reservations": {},
+            "new_card_history": [],
+        },
+    )
+    stats = reconcile_pending_ops_handoffs(
+        settings=settings,
+        state_file=canonical_env["state"],
+    )
+    assert stats["superseded"] == 1
+    state = load_json(canonical_env["state"])
+    assert state["identities"]["EARLY_MOVER:NS"]["transition_key"] == "READY:newer"
+    assert client.list_pending_handoffs() == []
+    server.stop()
+
+
+def test_capture_gap_reconcile_never_submits_high(canonical_env):
+    append_capture_gap(
+        idempotency_key="gap-prio",
+        scan_id="s",
+        identity="EARLY_MOVER:GP",
+        intended_event_type="alert_governor.transition.recorded",
+        error_code="DOWN",
+    )
+    seen: list[str] = []
+
+    class _Capture:
+        def submit(self, intent):  # noqa: ANN001
+            seen.append(str(intent.priority))
+            return WriterAck(
+                status="OK",
+                event_id="evt-gap",
+                history_epoch=1,
+                local_sequence=1,
+            )
+
+    set_writer_client_for_tests(_Capture())  # type: ignore[arg-type]
+    settings = SimpleNamespace(opip_canonical_writer_mode="shadow")
+    stats = reconcile_capture_gap_spool(settings=settings)
+    assert stats["resolved"] == 1
+    assert seen == ["LOW"]
+    assert "HIGH" not in seen
 
 
 def test_backup_manifest_matches_snapshot_after_live_write(canonical_env, tmp_path):

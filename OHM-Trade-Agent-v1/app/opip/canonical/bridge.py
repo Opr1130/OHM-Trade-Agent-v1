@@ -150,6 +150,114 @@ def _confirm_if_verified(
     return True
 
 
+def _try_append_capture_gap(
+    *,
+    idempotency_key: str,
+    scan_id: str,
+    identity: str,
+    intended_event_type: str,
+    error_code: str,
+) -> None:
+    """Best-effort gap marker. Must never block JSON operational authority."""
+    try:
+        append_capture_gap(
+            idempotency_key=idempotency_key,
+            scan_id=scan_id,
+            identity=identity,
+            intended_event_type=intended_event_type,
+            error_code=error_code,
+        )
+    except Exception as exc:  # noqa: BLE001 — evidence uncertified; ops continue
+        logger.error(
+            "capture gap append failed; evidence window uncertified: %s",
+            type(exc).__name__,
+        )
+
+
+def _identity_state_snapshot(target: Path, identity: str) -> dict[str, Any]:
+    """Capture pre-mutation JSON identity state for RECORD handoff recovery."""
+    try:
+        state = load_json(target)
+    except (OSError, TimeoutError, RegistryIOError):
+        return {
+            "snapshot_ok": False,
+            "identity_present": False,
+            "transition_key": None,
+            "message_id": None,
+        }
+    current = (state.get("identities") or {}).get(identity)
+    if not isinstance(current, dict):
+        return {
+            "snapshot_ok": True,
+            "identity_present": False,
+            "transition_key": None,
+            "message_id": None,
+        }
+    raw_msg = current.get("message_id")
+    try:
+        message_id = int(raw_msg) if raw_msg is not None else None
+    except (TypeError, ValueError):
+        message_id = None
+    key = str(current.get("transition_key") or "").strip() or None
+    return {
+        "snapshot_ok": True,
+        "identity_present": True,
+        "transition_key": key,
+        "message_id": message_id,
+    }
+
+
+def _snapshot_matches_pre(current: dict[str, Any], pre: dict[str, Any] | None) -> bool:
+    if not isinstance(pre, dict) or not pre.get("snapshot_ok"):
+        return False
+    return (
+        bool(current.get("identity_present")) == bool(pre.get("identity_present"))
+        and current.get("transition_key") == pre.get("transition_key")
+        and current.get("message_id") == pre.get("message_id")
+    )
+
+
+def _snapshot_matches_record_target(
+    current: dict[str, Any],
+    *,
+    transition_key: str,
+    message_id: int | None,
+) -> bool:
+    if not current.get("identity_present"):
+        return False
+    if str(current.get("transition_key") or "") != str(transition_key):
+        return False
+    if message_id is None:
+        return False
+    try:
+        return int(current.get("message_id")) == int(message_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _json_proves_newer_than_pre(
+    current: dict[str, Any],
+    pre: dict[str, Any] | None,
+    *,
+    transition_key: str,
+    message_id: int | None,
+) -> bool:
+    """True only when JSON moved away from the recorded precondition to a non-target state."""
+    if not isinstance(pre, dict) or not pre.get("snapshot_ok"):
+        # Without a durable precondition, inequality alone must not SUPERSEDE.
+        return False
+    if not current.get("snapshot_ok"):
+        return False
+    if _snapshot_matches_record_target(
+        current, transition_key=transition_key, message_id=message_id
+    ):
+        return False
+    if _snapshot_matches_pre(current, pre):
+        return False
+    # Operational JSON differs from both precondition and target → later authority won.
+    return True
+
+
 def durable_record_opportunity_alert(
     *,
     identity: str,
@@ -184,6 +292,9 @@ def durable_record_opportunity_alert(
         identity=identity,
         transition_key=transition_key,
     )
+    # Durable precondition so recovery can distinguish "JSON write failed" from
+    # "a later JSON transition truly superseded this handoff".
+    pre_state = _identity_state_snapshot(target, identity)
     intent = WriterIntent(
         schema_version=SCHEMA_VERSION,
         priority="NORMAL",
@@ -196,6 +307,7 @@ def durable_record_opportunity_alert(
             "created_new": bool(created_new),
             "scan_id": scan_id,
             "reservation_token": reservation_token,
+            "pre_state": pre_state,
         },
         correlation_id=scan_id,
         ops_handoff={
@@ -206,6 +318,7 @@ def durable_record_opportunity_alert(
             "created_new": bool(created_new),
             "reservation_token": reservation_token,
             "state_family": STATE_FAMILY_EARLY_WATCH,
+            "pre_state": pre_state,
         },
     )
 
@@ -214,7 +327,7 @@ def durable_record_opportunity_alert(
     try:
         ack = _client().submit(intent)
     except Exception as exc:  # noqa: BLE001 — evidence fail-closed; ops continue
-        append_capture_gap(
+        _try_append_capture_gap(
             idempotency_key=key,
             scan_id=scan_id,
             identity=identity,
@@ -227,7 +340,7 @@ def durable_record_opportunity_alert(
         if ack.status in {"OK", "DUPLICATE_OK"}:
             writer_committed = True
         else:
-            append_capture_gap(
+            _try_append_capture_gap(
                 idempotency_key=key,
                 scan_id=scan_id,
                 identity=identity,
@@ -310,7 +423,7 @@ def durable_release_opportunity_alert_reservation(
     try:
         ack = _client().submit(intent)
     except Exception as exc:  # noqa: BLE001
-        append_capture_gap(
+        _try_append_capture_gap(
             idempotency_key=key,
             scan_id=scan_id,
             identity=identity,
@@ -322,7 +435,7 @@ def durable_release_opportunity_alert_reservation(
         if ack.status in {"OK", "DUPLICATE_OK"}:
             writer_committed = True
         else:
-            append_capture_gap(
+            _try_append_capture_gap(
                 idempotency_key=key,
                 scan_id=scan_id,
                 identity=identity,
@@ -400,7 +513,8 @@ def reconcile_capture_gap_spool(*, settings: Any | None = None) -> dict[str, int
         key = f"ag:v1:early_watch:CAPTURE_GAP:{gap_id}"
         intent = WriterIntent(
             schema_version=SCHEMA_VERSION,
-            priority="HIGH",
+            # Gap evidence is telemetry/recovery — never compete with HIGH protection.
+            priority="LOW",
             idempotency_key=key,
             event_type="alert_governor.capture_gap.recorded",
             payload={
@@ -456,27 +570,50 @@ def _reconcile_one(handoff: Any, *, target: Path) -> str:
     except (OSError, TimeoutError, RegistryIOError) as exc:
         raise RuntimeError("state unavailable") from exc
 
-    identities = state.get("identities") or {}
-    current = identities.get(handoff.identity) or {}
     reservations = state.get("new_card_reservations") or {}
 
     if handoff.operation == "RECORD":
-        cur_key = str(current.get("transition_key") or "")
-        cur_msg = current.get("message_id")
-        if (
-            cur_key == handoff.transition_key
-            and cur_msg is not None
-            and int(cur_msg) == int(handoff.message_id or -1)
+        current = _identity_state_snapshot(target, handoff.identity)
+        pre_raw = None
+        payload = getattr(handoff, "payload", None) or {}
+        if isinstance(payload, dict):
+            pre_raw = payload.get("pre_state")
+        if not isinstance(pre_raw, dict):
+            pre_raw = None
+
+        if _snapshot_matches_record_target(
+            current,
+            transition_key=str(handoff.transition_key),
+            message_id=handoff.message_id,
         ):
             ack = client.confirm_ops_applied(handoff.event_id)
             if ack.status not in {"OK", "DUPLICATE_OK"}:
                 return "pending"
             return "applied"
-        if cur_key and cur_key != handoff.transition_key:
+
+        if _json_proves_newer_than_pre(
+            current,
+            pre_raw,
+            transition_key=str(handoff.transition_key),
+            message_id=handoff.message_id,
+        ):
             ack = client.mark_handoff_superseded(handoff.event_id)
             if ack.status not in {"OK", "DUPLICATE_OK"}:
                 return "pending"
             return "superseded"
+
+        # Replay only when precondition still holds (JSON write never landed), or
+        # when a CREATE handoff lacks pre_state and JSON still has no identity.
+        # Inequality alone must never SUPERSEDE; ambiguous cases stay PENDING.
+        can_replay = _snapshot_matches_pre(current, pre_raw)
+        if not can_replay and (pre_raw is None or not pre_raw.get("snapshot_ok")):
+            can_replay = bool(
+                current.get("snapshot_ok") and not current.get("identity_present")
+            )
+        if not can_replay:
+            return "pending"
+
+        # Precondition still holds: fall through to replay.
 
     if handoff.operation == "RELEASE":
         token = str(handoff.reservation_token or "")
