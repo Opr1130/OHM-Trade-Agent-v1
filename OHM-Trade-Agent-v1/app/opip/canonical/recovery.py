@@ -80,7 +80,7 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
                     "message_id": 1000 + idx,
                     "created_new": True,
                     "reservation_token": f"tok{idx}",
-                    "state_file": "/app/data/alert_governor_state.json",
+                    "state_family": "early_watch",
                 },
             )
             ack = writer.submit(intent)
@@ -91,7 +91,10 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
     backup_started = time.perf_counter()
     backup_database(live, backup)
     backup_ms = (time.perf_counter() - backup_started) * 1000.0
-    manifest = build_backup_manifest(backup_path=backup, source_db=live)
+    manifest = build_backup_manifest(
+        backup_path=backup,
+        source_release_sha="808a308cd274d30b55fef47b382c229b761e07df",
+    )
     write_backup_manifest(manifest, manifest_path)
 
     restore_result = restore_from_backup(

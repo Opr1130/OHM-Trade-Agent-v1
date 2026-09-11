@@ -13,6 +13,7 @@ from typing import Any
 
 from app.opip.canonical.client import CanonicalWriterClient, WriterClient
 from app.opip.canonical.gap_spool import (
+    GapSpoolError,
     append_capture_gap,
     bump_gap_retry,
     evidence_window_incomplete,
@@ -20,13 +21,13 @@ from app.opip.canonical.gap_spool import (
     resolve_gap,
 )
 from app.opip.canonical.models import WriterAck, WriterIntent
-from app.opip.canonical.paths import SCHEMA_VERSION
+from app.opip.canonical.paths import SCHEMA_VERSION, STATE_FAMILY_EARLY_WATCH
 from app.services.alert_governor import (
     STATE_FILE,
     record_opportunity_alert,
     release_opportunity_alert_reservation,
 )
-from app.services.registry_io import load_json, registry_lock
+from app.services.registry_io import RegistryIOError, load_json
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,22 @@ def shadow_capture_enabled(settings: Any | None = None) -> bool:
     return resolve_writer_mode(settings) == "shadow"
 
 
+def resolve_state_target(
+    *,
+    state_family: str | None = None,
+    state_file: Path | None = None,
+) -> Path:
+    """Map a bounded family (or local override for tests) to a governor JSON path."""
+    if state_file is not None:
+        # Local/unit callers may pass an explicit temp state file. IPC recovery
+        # never trusts arbitrary remote paths — only state_family.
+        return Path(state_file)
+    family = str(state_family or STATE_FAMILY_EARLY_WATCH).strip()
+    if family == STATE_FAMILY_EARLY_WATCH:
+        return STATE_FILE
+    raise ValueError(f"unsupported state_family={family!r}")
+
+
 def _client() -> WriterClient:
     if _client_override is not None:
         return _client_override
@@ -82,6 +99,57 @@ def idempotency_key_for_release(reservation_token: str) -> str:
     return f"ag:v1:early_watch:RELEASE:{reservation_token}"
 
 
+def _record_postcondition_met(
+    target: Path,
+    *,
+    identity: str,
+    transition_key: str,
+    message_id: int,
+) -> bool:
+    try:
+        state = load_json(target)
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+    current = (state.get("identities") or {}).get(identity) or {}
+    if str(current.get("transition_key") or "") != transition_key:
+        return False
+    try:
+        return int(current.get("message_id")) == int(message_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _release_postcondition_met(target: Path, *, reservation_token: str) -> bool:
+    try:
+        state = load_json(target)
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+    reservations = state.get("new_card_reservations") or {}
+    return str(reservation_token) not in reservations
+
+
+def _confirm_if_verified(
+    *,
+    event_id: str | None,
+    verified: bool,
+) -> bool:
+    if not event_id or not verified:
+        return False
+    try:
+        ack = _client().confirm_ops_applied(event_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("confirm_ops_applied failed: %s", type(exc).__name__)
+        return False
+    if ack.status not in {"OK", "DUPLICATE_OK"}:
+        logger.warning(
+            "confirm_ops_applied rejected status=%s code=%s",
+            ack.status,
+            ack.error_code,
+        )
+        return False
+    return True
+
+
 def durable_record_opportunity_alert(
     *,
     identity: str,
@@ -93,8 +161,11 @@ def durable_record_opportunity_alert(
     state_file: Path | None = None,
     settings: Any | None = None,
 ) -> WriterAck | None:
-    """ACK then JSON record. Mode off → JSON only."""
-    target = state_file or STATE_FILE
+    """Canonical ACK (when shadow) then JSON record. JSON always updates on ops path."""
+    target = resolve_state_target(
+        state_family=STATE_FAMILY_EARLY_WATCH,
+        state_file=state_file,
+    )
     if not shadow_capture_enabled(settings):
         record_opportunity_alert(
             identity=identity,
@@ -134,12 +205,15 @@ def durable_record_opportunity_alert(
             "message_id": int(message_id),
             "created_new": bool(created_new),
             "reservation_token": reservation_token,
-            "state_file": str(target),
+            "state_family": STATE_FAMILY_EARLY_WATCH,
         },
     )
+
+    ack: WriterAck | None = None
+    writer_committed = False
     try:
         ack = _client().submit(intent)
-    except Exception as exc:  # noqa: BLE001 — fail closed for evidence
+    except Exception as exc:  # noqa: BLE001 — evidence fail-closed; ops continue
         append_capture_gap(
             idempotency_key=key,
             scan_id=scan_id,
@@ -148,18 +222,20 @@ def durable_record_opportunity_alert(
             error_code=type(exc).__name__,
         )
         logger.warning("canonical writer submit failed: %s", type(exc).__name__)
-        return WriterAck(status="RETRYABLE", error_code=type(exc).__name__)
+        ack = WriterAck(status="RETRYABLE", error_code=type(exc).__name__)
+    else:
+        if ack.status in {"OK", "DUPLICATE_OK"}:
+            writer_committed = True
+        else:
+            append_capture_gap(
+                idempotency_key=key,
+                scan_id=scan_id,
+                identity=identity,
+                intended_event_type="alert_governor.transition.recorded",
+                error_code=str(ack.error_code or ack.status),
+            )
 
-    if ack.status not in {"OK", "DUPLICATE_OK"}:
-        append_capture_gap(
-            idempotency_key=key,
-            scan_id=scan_id,
-            identity=identity,
-            intended_event_type="alert_governor.transition.recorded",
-            error_code=str(ack.error_code or ack.status),
-        )
-        return ack
-
+    # JSON remains operational authority even when evidence capture fails.
     record_opportunity_alert(
         identity=identity,
         transition_key=transition_key,
@@ -168,11 +244,20 @@ def durable_record_opportunity_alert(
         reservation_token=reservation_token,
         state_file=target,
     )
-    if ack.event_id:
-        try:
-            _client().confirm_ops_applied(ack.event_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("confirm_ops_applied failed: %s", type(exc).__name__)
+
+    if writer_committed:
+        verified = _record_postcondition_met(
+            target,
+            identity=identity,
+            transition_key=transition_key,
+            message_id=message_id,
+        )
+        if not _confirm_if_verified(event_id=ack.event_id if ack else None, verified=verified):
+            logger.warning(
+                "leaving handoff PENDING after record verify_failed=%s event_id=%s",
+                not verified,
+                ack.event_id if ack else None,
+            )
     return ack
 
 
@@ -185,7 +270,10 @@ def durable_release_opportunity_alert_reservation(
     state_file: Path | None = None,
     settings: Any | None = None,
 ) -> WriterAck | None:
-    target = state_file or STATE_FILE
+    target = resolve_state_target(
+        state_family=STATE_FAMILY_EARLY_WATCH,
+        state_file=state_file,
+    )
     if not reservation_token:
         return None
     if not shadow_capture_enabled(settings):
@@ -213,9 +301,12 @@ def durable_release_opportunity_alert_reservation(
             "message_id": None,
             "created_new": False,
             "reservation_token": reservation_token,
-            "state_file": str(target),
+            "state_family": STATE_FAMILY_EARLY_WATCH,
         },
     )
+
+    ack: WriterAck | None = None
+    writer_committed = False
     try:
         ack = _client().submit(intent)
     except Exception as exc:  # noqa: BLE001
@@ -226,24 +317,31 @@ def durable_release_opportunity_alert_reservation(
             intended_event_type="alert_governor.reservation.released",
             error_code=type(exc).__name__,
         )
-        return WriterAck(status="RETRYABLE", error_code=type(exc).__name__)
-
-    if ack.status not in {"OK", "DUPLICATE_OK"}:
-        append_capture_gap(
-            idempotency_key=key,
-            scan_id=scan_id,
-            identity=identity,
-            intended_event_type="alert_governor.reservation.released",
-            error_code=str(ack.error_code or ack.status),
-        )
-        return ack
+        ack = WriterAck(status="RETRYABLE", error_code=type(exc).__name__)
+    else:
+        if ack.status in {"OK", "DUPLICATE_OK"}:
+            writer_committed = True
+        else:
+            append_capture_gap(
+                idempotency_key=key,
+                scan_id=scan_id,
+                identity=identity,
+                intended_event_type="alert_governor.reservation.released",
+                error_code=str(ack.error_code or ack.status),
+            )
 
     release_opportunity_alert_reservation(reservation_token, state_file=target)
-    if ack.event_id:
-        try:
-            _client().confirm_ops_applied(ack.event_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("confirm_ops_applied failed: %s", type(exc).__name__)
+
+    if writer_committed:
+        verified = _release_postcondition_met(
+            target, reservation_token=str(reservation_token)
+        )
+        if not _confirm_if_verified(event_id=ack.event_id if ack else None, verified=verified):
+            logger.warning(
+                "leaving handoff PENDING after release verify_failed=%s event_id=%s",
+                not verified,
+                ack.event_id if ack else None,
+            )
     return ack
 
 
@@ -253,7 +351,7 @@ def reconcile_pending_ops_handoffs(
     state_file: Path | None = None,
 ) -> dict[str, int]:
     """Reconcile PENDING handoffs before new Early Watch alert evaluation."""
-    stats = {"applied": 0, "superseded": 0, "replayed": 0, "errors": 0}
+    stats = {"applied": 0, "superseded": 0, "replayed": 0, "errors": 0, "pending": 0}
     if not shadow_capture_enabled(settings):
         return stats
     try:
@@ -263,12 +361,16 @@ def reconcile_pending_ops_handoffs(
         stats["errors"] += 1
         return stats
 
-    default_state = state_file or STATE_FILE
     for handoff in handoffs:
-        target = Path(handoff.state_file) if handoff.state_file else default_state
         try:
+            # Never trust arbitrary IPC paths; resolve only known families.
+            # Tests may pass state_file to override the Early Watch target.
+            target = resolve_state_target(
+                state_family=str(handoff.state_file or STATE_FAMILY_EARLY_WATCH),
+                state_file=state_file,
+            )
             disposition = _reconcile_one(handoff, target=target)
-            stats[disposition] += 1
+            stats[disposition] = int(stats.get(disposition, 0)) + 1
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "handoff reconcile failed event_id=%s err=%s",
@@ -284,7 +386,13 @@ def reconcile_capture_gap_spool(*, settings: Any | None = None) -> dict[str, int
     stats = {"resolved": 0, "errors": 0, "incomplete": 0}
     if not shadow_capture_enabled(settings):
         return stats
-    spool = load_gap_spool()
+    try:
+        spool = load_gap_spool()
+    except GapSpoolError as exc:
+        logger.error("capture gap spool unreadable; fail closed: %s", exc)
+        stats["errors"] += 1
+        stats["incomplete"] = 1
+        return stats
     if spool["unresolved"]:
         stats["incomplete"] = len(spool["unresolved"])
     for row in list(spool["unresolved"]):
@@ -311,50 +419,74 @@ def reconcile_capture_gap_spool(*, settings: Any | None = None) -> dict[str, int
         try:
             ack = _client().submit(intent)
         except Exception:
-            bump_gap_retry(gap_id)
+            try:
+                bump_gap_retry(gap_id)
+            except GapSpoolError:
+                stats["errors"] += 1
+                return stats
             stats["errors"] += 1
             continue
         if ack.status in {"OK", "DUPLICATE_OK"}:
-            resolve_gap(gap_id)
+            try:
+                resolve_gap(gap_id)
+            except GapSpoolError:
+                stats["errors"] += 1
+                return stats
             stats["resolved"] += 1
         else:
-            bump_gap_retry(gap_id)
+            try:
+                bump_gap_retry(gap_id)
+            except GapSpoolError:
+                stats["errors"] += 1
+                return stats
             stats["errors"] += 1
-    if evidence_window_incomplete():
-        stats["incomplete"] = len(load_gap_spool()["unresolved"])
+    try:
+        if evidence_window_incomplete():
+            stats["incomplete"] = len(load_gap_spool()["unresolved"])
+    except GapSpoolError:
+        stats["errors"] += 1
+        stats["incomplete"] = max(int(stats["incomplete"]), 1)
     return stats
 
 
 def _reconcile_one(handoff: Any, *, target: Path) -> str:
     client = _client()
-    lock = target.parent / f".{target.name}.lock"
-    with registry_lock(lock):
+    try:
         state = load_json(target)
-        identities = state.get("identities") or {}
-        current = identities.get(handoff.identity) or {}
-        reservations = state.get("new_card_reservations") or {}
+    except (OSError, TimeoutError, RegistryIOError) as exc:
+        raise RuntimeError("state unavailable") from exc
 
-        if handoff.operation == "RECORD":
-            cur_key = str(current.get("transition_key") or "")
-            cur_msg = current.get("message_id")
-            if (
-                cur_key == handoff.transition_key
-                and cur_msg is not None
-                and int(cur_msg) == int(handoff.message_id or -1)
-            ):
-                client.confirm_ops_applied(handoff.event_id)
-                return "applied"
-            if cur_key and cur_key != handoff.transition_key:
-                client.mark_handoff_superseded(handoff.event_id)
-                return "superseded"
+    identities = state.get("identities") or {}
+    current = identities.get(handoff.identity) or {}
+    reservations = state.get("new_card_reservations") or {}
 
-        if handoff.operation == "RELEASE":
-            token = str(handoff.reservation_token or "")
-            if token and token not in reservations:
-                client.confirm_ops_applied(handoff.event_id)
-                return "applied"
+    if handoff.operation == "RECORD":
+        cur_key = str(current.get("transition_key") or "")
+        cur_msg = current.get("message_id")
+        if (
+            cur_key == handoff.transition_key
+            and cur_msg is not None
+            and int(cur_msg) == int(handoff.message_id or -1)
+        ):
+            ack = client.confirm_ops_applied(handoff.event_id)
+            if ack.status not in {"OK", "DUPLICATE_OK"}:
+                return "pending"
+            return "applied"
+        if cur_key and cur_key != handoff.transition_key:
+            ack = client.mark_handoff_superseded(handoff.event_id)
+            if ack.status not in {"OK", "DUPLICATE_OK"}:
+                return "pending"
+            return "superseded"
 
-    # Replay outside the lock inspection path using governor helpers.
+    if handoff.operation == "RELEASE":
+        token = str(handoff.reservation_token or "")
+        if token and token not in reservations:
+            ack = client.confirm_ops_applied(handoff.event_id)
+            if ack.status not in {"OK", "DUPLICATE_OK"}:
+                return "pending"
+            return "applied"
+
+    # Replay, then verify before confirm.
     if handoff.operation == "RECORD":
         if handoff.message_id is None:
             raise RuntimeError("RECORD handoff missing message_id")
@@ -366,10 +498,24 @@ def _reconcile_one(handoff: Any, *, target: Path) -> str:
             reservation_token=handoff.reservation_token,
             state_file=target,
         )
+        verified = _record_postcondition_met(
+            target,
+            identity=handoff.identity,
+            transition_key=handoff.transition_key,
+            message_id=int(handoff.message_id),
+        )
     else:
         release_opportunity_alert_reservation(
             handoff.reservation_token,
             state_file=target,
         )
-    client.confirm_ops_applied(handoff.event_id)
+        verified = _release_postcondition_met(
+            target, reservation_token=str(handoff.reservation_token or "")
+        )
+
+    if not verified:
+        return "pending"
+    ack = client.confirm_ops_applied(handoff.event_id)
+    if ack.status not in {"OK", "DUPLICATE_OK"}:
+        return "pending"
     return "replayed"

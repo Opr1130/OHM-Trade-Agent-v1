@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
-from app.opip.canonical.paths import EVENT_SCHEMA_VERSION, SCHEMA_VERSION, STREAM_EARLY_WATCH
+from app.opip.canonical.paths import (
+    EVENT_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    STATE_FAMILY_EARLY_WATCH,
+    STREAM_EARLY_WATCH,
+)
 from app.opip.canonical.schema import connect, initialize_schema
 
 MAX_PAYLOAD_BYTES = 16 * 1024
@@ -218,6 +223,13 @@ class CanonicalWriter:
             raise ValueError("released event requires RELEASE handoff")
         if intent.event_type == "alert_governor.transition.recorded" and op != "RECORD":
             raise ValueError("recorded event requires RECORD handoff")
+        family = str(
+            intent.ops_handoff.get("state_family")
+            or intent.ops_handoff.get("state_file")
+            or ""
+        ).strip()
+        if family not in {STATE_FAMILY_EARLY_WATCH}:
+            raise ValueError("unsupported ops_handoff.state_family")
 
     def _commit_new(self, intent: WriterIntent) -> WriterAck:
         now = _utc_now()
@@ -229,7 +241,8 @@ class CanonicalWriter:
         transition_key = str(handoff.get("transition_key") or "")
         message_id = handoff.get("message_id")
         reservation_token = handoff.get("reservation_token")
-        state_file = str(handoff.get("state_file") or "")
+        # Persist bounded family id only — never an arbitrary filesystem path.
+        state_file = STATE_FAMILY_EARLY_WATCH
         operation = str(handoff.get("operation") or "")
         is_gap = intent.event_type == "alert_governor.capture_gap.recorded"
 

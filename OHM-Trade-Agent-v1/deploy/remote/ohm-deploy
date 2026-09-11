@@ -282,23 +282,34 @@ rollback() {
   "${GIT[@]}" reset --hard "$PREVIOUS_SHA"
   cd "$APP_ROOT"
 
-  docker compose build opip-canonical-writer ohm-trade-agent
-  # Start writer and core independently. Do not make core availability wait on
-  # writer health via Compose depends_on.
-  docker compose up -d --remove-orphans opip-canonical-writer
-  docker compose up -d --remove-orphans ohm-trade-agent
-
-  if ! wait_core_health; then
-    echo "rollback core health check failed" >&2
-    restore_scheduler_state
-    cleanup_snapshot
-    exit "$rc"
-  fi
-  if ! wait_writer_health; then
-    echo "rollback writer health check failed" >&2
-    restore_scheduler_state
-    cleanup_snapshot
-    exit "$rc"
+  # First PR 2 deploy may roll back to a SHA that does not declare the writer.
+  # Detect Compose services after reset; never require a missing service.
+  if docker compose config --services 2>/dev/null | grep -qx 'opip-canonical-writer'; then
+    docker compose build opip-canonical-writer ohm-trade-agent
+    docker compose up -d --remove-orphans opip-canonical-writer
+    docker compose up -d --remove-orphans ohm-trade-agent
+    if ! wait_core_health; then
+      echo "rollback core health check failed" >&2
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
+    if ! wait_writer_health; then
+      echo "rollback writer health check failed" >&2
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
+  else
+    docker compose build ohm-trade-agent
+    # --remove-orphans drops a writer left from the failed PR 2 attempt.
+    docker compose up -d --remove-orphans ohm-trade-agent
+    if ! wait_core_health; then
+      echo "rollback core health check failed" >&2
+      restore_scheduler_state
+      cleanup_snapshot
+      exit "$rc"
+    fi
   fi
 
   # Restore the exact scheduler state that was installed before this deploy.
