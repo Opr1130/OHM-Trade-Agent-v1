@@ -67,6 +67,16 @@ class Settings(BaseSettings):
         default="off",
         pattern=r"^(off|shadow)$",
     )
+    # PR 3 feature bus capture. Default off. "shadow" persists market
+    # observations, feature snapshots and checkpoints as canonical evidence
+    # only. It grants no trading authority, no ranking influence, and no
+    # detector authority, and it additionally requires the canonical writer to
+    # be in shadow: feature-bus capture fails closed when it is not.
+    # Invalid env values must fail Settings parsing (never silently become off).
+    opip_feature_bus_mode: str = Field(
+        default="off",
+        pattern=r"^(off|shadow)$",
+    )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).

@@ -17,8 +17,23 @@ from app.opip.canonical.paths import (
     STREAM_EARLY_WATCH,
 )
 from app.opip.canonical.schema import connect, initialize_schema
+from app.opip.contracts.events import (
+    FEATURE_BUS_EVENT_TYPES,
+    FEATURE_BUS_PRIORITY,
+    FEATURE_BUS_STREAM,
+)
 
 MAX_PAYLOAD_BYTES = 16 * 1024
+
+ALERT_GOVERNOR_EVENT_TYPES = frozenset(
+    {
+        "alert_governor.transition.recorded",
+        "alert_governor.reservation.released",
+        "alert_governor.capture_gap.recorded",
+    }
+)
+
+ACCEPTED_EVENT_TYPES = ALERT_GOVERNOR_EVENT_TYPES | FEATURE_BUS_EVENT_TYPES
 
 
 def _utc_now() -> str:
@@ -226,15 +241,19 @@ class CanonicalWriter:
             raise ValueError("invalid priority")
         if not intent.idempotency_key.strip():
             raise ValueError("idempotency_key required")
-        if intent.event_type not in {
-            "alert_governor.transition.recorded",
-            "alert_governor.reservation.released",
-            "alert_governor.capture_gap.recorded",
-        }:
+        if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
         raw = json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
         if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload too large")
+        if intent.event_type in FEATURE_BUS_EVENT_TYPES:
+            # Feature-bus traffic is telemetry. It must not borrow protection or
+            # execution priority, and it never drives an operational handoff.
+            if intent.priority != FEATURE_BUS_PRIORITY:
+                raise ValueError("feature bus events must use LOW priority")
+            if intent.ops_handoff is not None:
+                raise ValueError("feature bus events must not carry ops_handoff")
+            return
         if intent.event_type == "alert_governor.capture_gap.recorded":
             if intent.ops_handoff is not None:
                 raise ValueError("capture_gap must not carry ops_handoff")
@@ -270,6 +289,10 @@ class CanonicalWriter:
         state_file = STATE_FAMILY_EARLY_WATCH
         operation = str(handoff.get("operation") or "")
         is_gap = intent.event_type == "alert_governor.capture_gap.recorded"
+        is_feature_bus = intent.event_type in FEATURE_BUS_EVENT_TYPES
+        # Separate watermark streams: feature-bus progress can never rewind or
+        # advance Early Watch alert-control progress, or the reverse.
+        stream = FEATURE_BUS_STREAM if is_feature_bus else STREAM_EARLY_WATCH
 
         self._conn.execute("BEGIN IMMEDIATE")
         meta = self._conn.execute(
@@ -351,9 +374,9 @@ class CanonicalWriter:
                 local_sequence = excluded.local_sequence,
                 updated_at = excluded.updated_at
             """,
-            (STREAM_EARLY_WATCH, history_epoch, local_sequence, now),
+            (stream, history_epoch, local_sequence, now),
         )
-        if not is_gap:
+        if not is_gap and not is_feature_bus:
             self._conn.execute(
                 """
                 INSERT INTO alert_ops_handoffs (

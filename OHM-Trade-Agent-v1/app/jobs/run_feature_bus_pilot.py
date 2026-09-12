@@ -1,0 +1,207 @@
+"""Manual-only PR3 feature-bus pilot. Never scheduled.
+
+Ruling D4: PR3 measures what a one-minute market source would cost before any
+activation decision. This entrypoint exists to produce that measurement and
+nothing else.
+
+Deliberate safety properties:
+
+* It is not registered with the scheduler and no other module imports it.
+* It performs no network request unless ``--live`` is passed explicitly.
+* It writes canonical evidence only when both ``OPIP_FEATURE_BUS_MODE`` and
+  ``OPIP_CANONICAL_WRITER_MODE`` are ``shadow``; otherwise every write is a
+  recorded ``DISABLED`` no-op and the report says so.
+* It never places orders, sends alerts, ranks candidates, or changes policy.
+
+Usage::
+
+    python -m app.jobs.run_feature_bus_pilot                 # synthetic dry run
+    python -m app.jobs.run_feature_bus_pilot --live --limit 5 # measured pilot
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import random
+from typing import Any
+
+from app.opip.contracts.identity import InstrumentVersion
+from app.opip.features.parity import compare_against_production_indicators
+from app.opip.features.pipeline import run_cycle
+from app.opip.features.publisher import (
+    FeatureBusPublisher,
+    feature_bus_capture_enabled,
+    resolve_feature_bus_mode,
+)
+from app.opip.market.aggregates import grid_floor
+from app.opip.market.observations import IntervalRow, normalize_interval_rows
+from app.opip.market.source import run_pilot_cycle
+from app.services.opip_feature_bus_market_source import (
+    KRAKEN_OHLC_SOURCE_LABEL,
+    KrakenInstrumentProvider,
+    kraken_minute_source,
+)
+
+SYNTHETIC_SOURCE_LABEL = "synthetic_dry_run"
+
+
+def _synthetic_instrument(now: datetime) -> InstrumentVersion:
+    return InstrumentVersion(
+        venue="kraken",
+        base_asset="SOL",
+        quote_currency="USD",
+        venue_instrument_id="SOLUSD",
+        version=1,
+        reference_data_version="opip-evidence-identity-v1",
+        observed_at_utc=now,
+        price_decimals=2,
+        tick_size=0.01,
+        min_order_size=0.2,
+    )
+
+
+def _synthetic_observations(
+    instrument_version: InstrumentVersion,
+    *,
+    cutoff: datetime,
+    intervals: int,
+    now: datetime,
+) -> Any:
+    random.seed(11)
+    first = cutoff - timedelta(minutes=intervals)
+    epoch = int(first.timestamp())
+    price = 147.0
+    rows: list[IntervalRow] = []
+    for index in range(intervals):
+        price *= 1.0 + random.uniform(-0.0015, 0.0018)
+        rows.append(
+            IntervalRow(
+                interval_start_epoch=epoch + 60 * index,
+                open=price,
+                high=price * 1.001,
+                low=price * 0.999,
+                close=price,
+                volume=100.0 + random.random() * 50.0,
+                vwap=price,
+                trade_count=20 + index % 7,
+            )
+        )
+    return normalize_interval_rows(
+        rows,
+        instrument_version=instrument_version,
+        interval_seconds=60,
+        receipt_time=now,
+        now=now,
+        source_label=SYNTHETIC_SOURCE_LABEL,
+        source_sequence_prefix="synthetic-1m",
+    ).observations
+
+
+def _dry_run(intervals: int) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cutoff = grid_floor(now)
+    instrument_version = _synthetic_instrument(now)
+    observations = _synthetic_observations(
+        instrument_version, cutoff=cutoff, intervals=intervals, now=now
+    )
+    publisher = FeatureBusPublisher()
+    result = run_cycle(
+        observations,
+        instrument_version=instrument_version,
+        evaluation_cutoff=cutoff,
+        evaluated_at_utc=now,
+        publisher=publisher,
+        source_version=SYNTHETIC_SOURCE_LABEL,
+    )
+    parity = compare_against_production_indicators(
+        result.alignment,
+        instrument_version=instrument_version,
+        evaluated_at_utc=now,
+    )
+    return {
+        "mode": "dry_run",
+        "cycle": result.to_dict(),
+        "publisher": publisher.summary(),
+        "parity": parity.to_dict(),
+    }
+
+
+def _live_pilot(limit: int) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cutoff = grid_floor(now)
+    provider = KrakenInstrumentProvider()
+    universe = provider.refresh(observed_at_utc=now)
+    selected = universe[:limit]
+    source = kraken_minute_source()
+    batches, report, _ = run_pilot_cycle(
+        source,
+        selected,
+        now=now,
+        eligible_instruments=len(universe),
+    )
+    publisher = FeatureBusPublisher()
+    cycles: list[dict[str, Any]] = []
+    for batch in batches:
+        if not batch.observations:
+            cycles.append(
+                {
+                    "instrument_version_id": (
+                        batch.instrument_version.instrument_version_id
+                    ),
+                    "skipped": batch.error or "no_closed_intervals",
+                }
+            )
+            continue
+        result = run_cycle(
+            batch.observations,
+            instrument_version=batch.instrument_version,
+            evaluation_cutoff=cutoff,
+            evaluated_at_utc=now,
+            publisher=publisher,
+            source_version=KRAKEN_OHLC_SOURCE_LABEL,
+        )
+        cycles.append(result.to_dict())
+    return {
+        "mode": "live_pilot",
+        "measurement": report.to_dict(),
+        "cycles": cycles,
+        "publisher": publisher.summary(),
+    }
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="contact Kraken for a measured pilot cycle (off by default)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="maximum instruments to request in a live pilot",
+    )
+    parser.add_argument(
+        "--intervals",
+        type=int,
+        default=140,
+        help="synthetic intervals to generate in a dry run",
+    )
+    args = parser.parse_args(argv)
+
+    print("O'Pip PR3 Feature Bus Pilot - MANUAL, EVIDENCE ONLY")
+    print("feature bus mode:", resolve_feature_bus_mode())
+    print("canonical capture enabled:", feature_bus_capture_enabled())
+    print("trading authority: NONE")
+
+    payload = _live_pilot(max(1, args.limit)) if args.live else _dry_run(
+        max(2, args.intervals)
+    )
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
