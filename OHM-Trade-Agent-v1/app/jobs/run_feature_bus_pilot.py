@@ -38,7 +38,7 @@ from app.opip.features.publisher import (
     resolve_feature_bus_mode,
 )
 from app.opip.features.revision_ledger import load_revision_ledger
-from app.opip.market.aggregates import grid_floor
+from app.opip.market.aggregates import DEFAULT_INTERVAL_SECONDS, grid_floor
 from app.opip.market.instrument_version_store import hydrate_instrument_version_registry
 from app.opip.market.observations import IntervalRow, normalize_interval_rows
 from app.opip.market.source import run_pilot_cycle
@@ -49,6 +49,46 @@ from app.services.opip_feature_bus_market_source import (
 )
 
 SYNTHETIC_SOURCE_LABEL = "synthetic_dry_run"
+
+
+def restore_pilot_continuity(
+    versions: list[InstrumentVersion],
+    *,
+    load_state=load_rolling_state,
+    load_ledger=load_revision_ledger,
+    default_interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Restore state, revision ledgers, and source watermarks for a live pilot.
+
+    Revision ledgers load even when no checkpoint exists so observation
+    revisions committed before a dependent-write failure survive process restart.
+    """
+    restored_states: dict[str, Any] = {}
+    restored_ledgers: dict[str, Any] = {}
+    source_watermarks: dict[str, Any] = {}
+    for version in versions:
+        state = load_state(version.instrument_version_id)
+        since_epoch = None
+        interval_seconds = int(default_interval_seconds)
+        if state is not None:
+            restored_states[version.instrument_version_id] = state
+            since_epoch = state.first_interval_epoch
+            interval_seconds = int(state.interval_seconds)
+            if state.last_interval_epoch is not None:
+                tip_end = datetime.fromtimestamp(
+                    state.last_interval_epoch + state.interval_seconds,
+                    tz=timezone.utc,
+                )
+                source_watermarks[version.instrument_version_id] = SourceWatermark(
+                    instrument_version_id=version.instrument_version_id,
+                    through_utc=tip_end,
+                )
+        restored_ledgers[version.instrument_version_id] = load_ledger(
+            version.instrument_version_id,
+            interval_seconds=interval_seconds,
+            since_interval_epoch=since_epoch,
+        )
+    return restored_states, restored_ledgers, source_watermarks
 
 
 def _synthetic_instrument(now: datetime) -> InstrumentVersion:
@@ -165,30 +205,9 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     # Fixed cycle cutoff at pilot start — never advances mid-cycle merely because
     # sequential fetches crossed a minute boundary.
     cycle_cutoff = grid_floor(refresh_at)
-    # Restore source watermarks from retained checkpoints so tip re-poll and
-    # superseding revisions work across process restarts.
-    restored_states: dict[str, Any] = {}
-    restored_ledgers: dict[str, Any] = {}
-    source_watermarks: dict[str, Any] = {}
-    for version in committed_versions:
-        state = load_rolling_state(version.instrument_version_id)
-        if state is None:
-            continue
-        restored_states[version.instrument_version_id] = state
-        restored_ledgers[version.instrument_version_id] = load_revision_ledger(
-            version.instrument_version_id,
-            interval_seconds=state.interval_seconds,
-            since_interval_epoch=state.first_interval_epoch,
-        )
-        if state.last_interval_epoch is not None:
-            tip_end = datetime.fromtimestamp(
-                state.last_interval_epoch + state.interval_seconds,
-                tz=timezone.utc,
-            )
-            source_watermarks[version.instrument_version_id] = SourceWatermark(
-                instrument_version_id=version.instrument_version_id,
-                through_utc=tip_end,
-            )
+    restored_states, restored_ledgers, source_watermarks = restore_pilot_continuity(
+        committed_versions
+    )
 
     batches, report, _ = run_pilot_cycle(
         source,

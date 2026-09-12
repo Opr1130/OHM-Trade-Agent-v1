@@ -18,6 +18,7 @@ Two design points are deliberate:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -59,6 +60,8 @@ def _scalar_values(values: Mapping[str, Any], *, field_name: str) -> dict[str, A
     for key, value in dict(values).items():
         name = str(key)
         if value is None or isinstance(value, _SCALAR_TYPES):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{field_name}[{name}] must be finite")
             cleaned[name] = value
             continue
         raise TypeError(f"{field_name}[{name}] must be a JSON scalar or None")
@@ -318,6 +321,8 @@ def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in dict(state).items():
         name = str(key)
         if value is None or isinstance(value, _SCALAR_TYPES):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"rolling_state[{name}] must be finite")
             cleaned[name] = value
             continue
         if isinstance(value, (list, tuple)):
@@ -331,7 +336,12 @@ def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
             if all(isinstance(item, bool) for item in items):
                 cleaned[name] = tuple(bool(item) for item in items)
                 continue
-            if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in items):
+            if any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or (isinstance(item, float) and not math.isfinite(item))
+                for item in items
+            ):
                 raise TypeError(f"rolling_state[{name}] lists must be numeric")
             cleaned[name] = tuple(float(item) for item in items)
             continue

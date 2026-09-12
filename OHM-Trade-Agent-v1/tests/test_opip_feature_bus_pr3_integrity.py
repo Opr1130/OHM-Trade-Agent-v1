@@ -2154,3 +2154,63 @@ def test_run_cycle_rejects_revision_ledger_interval_mismatch():
             revision_ledger=wrong_ledger,
             source_version="test",
         )
+
+
+def test_pilot_loads_revision_ledger_without_checkpoint(tmp_path):
+    from app.jobs.run_feature_bus_pilot import restore_pilot_continuity
+
+    observations = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path, socket_path=tmp_path / "writer.sock"
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    for item in observations:
+        assert publisher.publish(observation_intent(item)).committed
+
+    version = _instrument()
+
+    def _no_state(_instrument_version_id: str):
+        return None
+
+    def _ledger(instrument_version_id, **kwargs):
+        return load_revision_ledger(
+            instrument_version_id, db_path=db_path, **kwargs
+        )
+
+    states, ledgers, watermarks = restore_pilot_continuity(
+        [version],
+        load_state=_no_state,
+        load_ledger=_ledger,
+    )
+    assert states == {}
+    assert watermarks == {}
+    assert version.instrument_version_id in ledgers
+    assert len(ledgers[version.instrument_version_id].entries) == 2
+
+
+def test_feature_snapshot_rejects_non_finite_values():
+    from app.opip.contracts.features import FeatureSnapshot
+    from app.opip.contracts.temporal import AvailabilityStamp
+
+    availability = AvailabilityStamp(
+        source_at_utc=CUTOFF,
+        ingested_at_utc=NOW,
+        visible_at_utc=NOW,
+        source_version="test",
+    )
+    with pytest.raises(ValueError, match="finite"):
+        FeatureSnapshot(
+            instrument_version_id=_instrument().instrument_version_id,
+            venue_instrument_id="SOLUSD",
+            feature_version="features-v1",
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            consumed_input_watermark=ConsumedInputWatermark(1, 1),
+            values={"rsi_14": float("nan")},
+            availability=availability,
+            feature_dag_hash="abc",
+        )
