@@ -36,7 +36,12 @@ from app.opip.features.publisher import (
     SHADOW_CAPTURE_SETTINGS,
     observation_intent,
 )
-from app.opip.features.revision_ledger import RevisionLedger, load_revision_ledger
+from app.opip.features.revision_ledger import (
+    CommittedObservationRevision,
+    RevisionLedger,
+    load_revision_ledger,
+)
+from app.opip.market.observations import aggregate_content_fingerprint
 from app.opip.features.state import (
     advance_state,
     alignment_from_state,
@@ -2004,3 +2009,148 @@ def test_revision_ledger_hydrates_from_canonical_observations(tmp_path):
         assert entry is not None
         assert entry.revision == 1
         assert entry.observation_id == item.observation_id
+
+
+def test_stale_retained_match_vs_ledger_ahead_mints_next_revision():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    tip_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    tip_index = previous.interval_count - 1
+    retained_fp = previous.content_fingerprints[tip_index]
+    ledger = RevisionLedger(
+        instrument_version_id=_instrument().instrument_version_id,
+        interval_seconds=60,
+        entries={
+            tip_epoch: CommittedObservationRevision(
+                interval_epoch=tip_epoch,
+                revision=2,
+                content_fingerprint="fp-committed-rev2-different",
+                observation_id=(
+                    f"OBS:{_instrument().instrument_version_id}:60s:{tip_epoch}:2"
+                ),
+                commit_watermark=ConsumedInputWatermark(1, 9),
+            )
+        },
+    )
+    same_as_retained = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=previous.opens[tip_index],
+                high=previous.highs[tip_index],
+                low=previous.lows[tip_index],
+                close=previous.closes[tip_index],
+                volume=previous.volumes[tip_index],
+                vwap=previous.closes[tip_index],
+                trade_count=14,
+            )
+        ],
+        commit_from=None,
+    )
+    assert (
+        aggregate_content_fingerprint(dict(same_as_retained[0].values)) == retained_fp
+    )
+    plan = plan_revisions(same_as_retained, previous, ledger=ledger)
+    assert plan.coverage_only == ()
+    assert len(plan.evidence) == 1
+    assert plan.evidence[0].revision == 3
+
+
+def test_deferred_gap_does_not_prune_ledger_for_previous_window():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    early_epoch = int(previous.first_interval_epoch)
+    tip_epoch = early_epoch + 60 * (previous.interval_count - 1)
+    # Far-future bar forces a retained-window reset (gap).
+    far_epoch = tip_epoch + 60 * 50
+    far = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=far_epoch,
+                open=300.0,
+                high=301.0,
+                low=299.0,
+                close=300.5,
+                volume=4.0,
+            )
+        ],
+        commit_from=None,
+    )
+    seed_ledger = RevisionLedger(
+        instrument_version_id=_instrument().instrument_version_id,
+        interval_seconds=60,
+        entries={
+            early_epoch: CommittedObservationRevision(
+                interval_epoch=early_epoch,
+                revision=2,
+                content_fingerprint="early-rev2",
+                observation_id=(
+                    f"OBS:{_instrument().instrument_version_id}:60s:{early_epoch}:2"
+                ),
+                commit_watermark=ConsumedInputWatermark(1, 3),
+            )
+        },
+    )
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+            self._seq = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._seq += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._seq),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            outcome = PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="SPOOLED",
+            )
+            self.outcomes.append(outcome)
+            return outcome
+
+    result = run_cycle(
+        far,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        revision_ledger=seed_ledger,
+        publisher=_Publisher(),
+        source_version="test",
+        window_start=datetime.fromtimestamp(early_epoch, tz=timezone.utc),
+    )
+    assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert result.state == previous
+    assert result.revision_ledger is not None
+    assert result.revision_ledger.entry_for(early_epoch) is not None
+    assert result.revision_ledger.entry_for(early_epoch).revision == 2
+
+
+def test_run_cycle_rejects_revision_ledger_interval_mismatch():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=2, end_before=CUTOFF), commit_from=None),
+    ).state
+    wrong_ledger = RevisionLedger.empty(_instrument(), interval_seconds=300)
+    with pytest.raises(CycleIdentityMismatch, match="interval_seconds"):
+        run_cycle(
+            (),
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=previous,
+            revision_ledger=wrong_ledger,
+            source_version="test",
+        )

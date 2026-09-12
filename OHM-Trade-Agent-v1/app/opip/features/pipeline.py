@@ -253,6 +253,11 @@ def run_cycle(
             f"{ledger.instrument_version_id!r} != "
             f"{instrument_version.instrument_version_id!r}"
         )
+    if int(ledger.interval_seconds) != int(interval_seconds):
+        raise CycleIdentityMismatch(
+            f"revision_ledger interval_seconds "
+            f"{ledger.interval_seconds!r} != {interval_seconds!r}"
+        )
     capture_enabled = publisher is not None and publisher.enabled
     if capture_enabled and not publish_observations:
         raise ValueError(
@@ -288,8 +293,10 @@ def run_cycle(
         observation_outcomes = publisher.publish_observations(publish_set)
         outcomes.extend(observation_outcomes)
 
+    # Fold newly committed observation revisions immediately. Do NOT prune to the
+    # candidate window until promotion succeeds: deferred paths return previous
+    # state and must retain ledger knowledge for intervals still in that window.
     active_ledger = ledger.with_committed(publish_set, observation_outcomes)
-    active_ledger = active_ledger.pruned_to(candidate.first_interval_epoch)
 
     observations_committed = (
         True
@@ -388,6 +395,7 @@ def run_cycle(
         if not checkpoint_outcome.committed:
             return _deferred_dependent(restart_ok=restart_recorded)
 
+    promoted_ledger = active_ledger.pruned_to(watermarked.first_interval_epoch)
     disposition = DISPOSITION_DRY_RUN if not capture_enabled else DISPOSITION_OK
     return CycleResult(
         instrument_version=instrument_version,
@@ -400,7 +408,7 @@ def run_cycle(
         outcomes=tuple(outcomes),
         disposition=disposition,
         promoted=True,
-        revision_ledger=active_ledger,
+        revision_ledger=promoted_ledger,
     )
 
 

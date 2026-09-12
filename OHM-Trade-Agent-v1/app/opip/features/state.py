@@ -239,6 +239,10 @@ def plan_revisions(
     When ``ledger`` knows a committed revision for an interval, content-equal
     re-polls are marked already-committed (foldable, not re-published) and
     content-changed re-polls mint from ``max(retained, ledger) + 1``.
+
+    Ledger is consulted before treating a retained content match as coverage-only:
+    a stale retained tip that matches source content while a newer committed
+    revision exists with different content must mint the next revision.
     """
     from app.opip.features.revision_ledger import RevisionLedger
 
@@ -281,10 +285,6 @@ def plan_revisions(
                         else ""
                     )
 
-        if in_window and retained_fp and retained_fp == incoming_fp:
-            coverage_only.append(observation)
-            continue
-
         if ledger_entry is not None and ledger_entry.content_fingerprint == incoming_fp:
             committed = replace(
                 observation,
@@ -304,12 +304,33 @@ def plan_revisions(
             already_committed.add(committed.observation_id)
             continue
 
+        # Retained content match is coverage-only only when the ledger does not
+        # already hold a newer committed revision with different content. After a
+        # dependent failure, retained state may still show rev N while canonical
+        # holds rev N+1; matching the stale retained tip must mint the next rev.
+        if in_window and retained_fp and retained_fp == incoming_fp:
+            ledger_ahead = (
+                ledger_entry is not None
+                and int(ledger_entry.revision) > retained_revision
+                and ledger_entry.content_fingerprint != incoming_fp
+            )
+            if not ledger_ahead:
+                coverage_only.append(observation)
+                continue
+
         if not in_window and ledger_entry is None:
             evidence.append(observation)
             continue
 
         if in_window:
             if retained_fp and retained_fp != incoming_fp:
+                changed = True
+            elif (
+                ledger_entry is not None
+                and int(ledger_entry.revision) > retained_revision
+                and ledger_entry.content_fingerprint != incoming_fp
+            ):
+                # Stale retained match vs newer committed revision.
                 changed = True
             elif state.opens_known[index] if index < len(state.opens_known) else False:
                 live_retained = (
