@@ -61,6 +61,7 @@ class RollingState:
     venue_instrument_id: str
     feature_version: str
     closes: tuple[float, ...] = ()
+    opens: tuple[float, ...] = ()
     highs: tuple[float, ...] = ()
     lows: tuple[float, ...] = ()
     volumes: tuple[float, ...] = ()
@@ -78,8 +79,14 @@ class RollingState:
     def __post_init__(self) -> None:
         if not str(self.venue or "").strip():
             raise ValueError("venue is required")
+        # Legacy checkpoints may omit opens; synthesize from closes when empty.
+        if self.opens and len(self.opens) != len(self.closes):
+            raise ValueError("retained series must have equal lengths")
+        if not self.opens and self.closes:
+            object.__setattr__(self, "opens", tuple(self.closes))
         lengths = {
             len(self.closes),
+            len(self.opens),
             len(self.highs),
             len(self.lows),
             len(self.volumes),
@@ -160,8 +167,10 @@ def _resolve_restart_state(state: RollingState) -> RestartState:
     return RestartState.INSUFFICIENT_HISTORY
 
 
-def _clear_series() -> tuple[list[float], list[float], list[float], list[float], list[int]]:
-    return [], [], [], [], []
+def _clear_series() -> tuple[
+    list[float], list[float], list[float], list[float], list[float], list[int]
+]:
+    return [], [], [], [], [], []
 
 
 def revise_against_retained(
@@ -175,6 +184,9 @@ def revise_against_retained(
     same observation_id, the writer returns DUPLICATE_OK for the old payload,
     and RollingState ignores the equal revision. Canonical history stays
     append-only; this only assigns the next revision identity before publish.
+
+    Unchanged tip re-polls are dropped so watermark-driven re-admission of the
+    tip does not republish identical revision-1 evidence every cycle.
     """
     if not observations or state.interval_count == 0 or state.first_interval_epoch is None:
         return tuple(observations)
@@ -198,21 +210,22 @@ def revise_against_retained(
             revised.append(observation)
             continue
         retained_revision = int(state.revisions[index])
-        # RollingState retains high/low/close/volume (open is not separately kept).
         live_retained = (
+            float(state.opens[index]),
             float(state.highs[index]),
             float(state.lows[index]),
             float(state.closes[index]),
             float(state.volumes[index]),
         )
         incoming = (
+            float(observation.values["open"]),
             float(observation.values["high"]),
             float(observation.values["low"]),
             float(observation.values["close"]),
             float(observation.values["volume"]),
         )
         if incoming == live_retained:
-            revised.append(observation)
+            # Identical tip re-poll: omit rather than republish DUPLICATE_OK.
             continue
         if int(observation.revision) > retained_revision:
             revised.append(observation)
@@ -249,6 +262,7 @@ def advance_state(
         key=lambda item: (item.source_event_time, item.revision, item.ingestion_order),
     )
     closes = list(state.closes)
+    opens = list(state.opens)
     highs = list(state.highs)
     lows = list(state.lows)
     volumes = list(state.volumes)
@@ -281,6 +295,7 @@ def advance_state(
                     if int(observation.revision) <= int(revisions[index]):
                         ignored += 1
                         continue
+                    opens[index] = float(observation.values["open"])
                     closes[index] = float(observation.values["close"])
                     highs[index] = float(observation.values["high"])
                     lows[index] = float(observation.values["low"])
@@ -313,12 +328,13 @@ def advance_state(
             gap_intervals += int(missing)
             last_gap_epoch = expected
             gap_resets += 1
-            closes, highs, lows, volumes, revisions = _clear_series()
+            opens, closes, highs, lows, volumes, revisions = _clear_series()
             first_epoch = None
             persistence = 0
 
         if not closes:
             first_epoch = epoch
+        opens.append(float(observation.values["open"]))
         closes.append(float(observation.values["close"]))
         highs.append(float(observation.values["high"]))
         lows.append(float(observation.values["low"]))
@@ -338,6 +354,7 @@ def advance_state(
 
         overflow = len(closes) - FEATURE_WINDOW_INTERVALS
         if overflow > 0:
+            del opens[:overflow]
             del closes[:overflow]
             del highs[:overflow]
             del lows[:overflow]
@@ -347,6 +364,7 @@ def advance_state(
 
     advanced = replace(
         state,
+        opens=tuple(opens),
         closes=tuple(closes),
         highs=tuple(highs),
         lows=tuple(lows),
@@ -387,6 +405,7 @@ def to_checkpoint(
     ignores them, so a stale summary can never poison a resumed feature value.
     """
     rolling: dict[str, Any] = {
+        "opens": list(state.opens),
         "closes": list(state.closes),
         "highs": list(state.highs),
         "lows": list(state.lows),
@@ -422,6 +441,11 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
     """Restore rolling state. The result is explicitly a resumed state."""
     rolling = dict(checkpoint.rolling_state)
     closes = tuple(float(value) for value in rolling.get("closes") or ())
+    raw_opens = rolling.get("opens")
+    if raw_opens is None:
+        opens = closes
+    else:
+        opens = tuple(float(value) for value in raw_opens)
     highs = tuple(float(value) for value in rolling.get("highs") or ())
     lows = tuple(float(value) for value in rolling.get("lows") or ())
     volumes = tuple(float(value) for value in rolling.get("volumes") or ())
@@ -442,6 +466,7 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
         venue=venue,
         venue_instrument_id=checkpoint.venue_instrument_id,
         feature_version=checkpoint.feature_version,
+        opens=opens,
         closes=closes,
         highs=highs,
         lows=lows,
@@ -501,7 +526,7 @@ def alignment_from_state(
                 revision=revision,
                 supersedes=supersedes,
                 values={
-                    "open": state.closes[index],
+                    "open": state.opens[index],
                     "high": state.highs[index],
                     "low": state.lows[index],
                     "close": state.closes[index],

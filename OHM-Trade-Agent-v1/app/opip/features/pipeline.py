@@ -126,16 +126,18 @@ def _observations_fully_committed(
 
 
 def _dependent_evidence_committed(outcomes: Sequence[PublishOutcome]) -> bool:
-    """Snapshot and checkpoint must both commit when capture is enabled."""
-    by_type = {outcome.event_type: outcome for outcome in outcomes}
-    snapshot = by_type.get("feature.snapshot.recorded")
-    checkpoint = by_type.get("feature.checkpoint.recorded")
-    return (
-        snapshot is not None
-        and checkpoint is not None
-        and snapshot.committed
-        and checkpoint.committed
-    )
+    """Snapshot, checkpoint, and any published coverage gaps must commit."""
+    by_type: dict[str, list[PublishOutcome]] = {}
+    for outcome in outcomes:
+        by_type.setdefault(outcome.event_type, []).append(outcome)
+    snapshot = by_type.get("feature.snapshot.recorded") or []
+    checkpoint = by_type.get("feature.checkpoint.recorded") or []
+    if not snapshot or not checkpoint:
+        return False
+    if not all(item.committed for item in snapshot + checkpoint):
+        return False
+    gaps = by_type.get("coverage.gap.recorded") or []
+    return all(item.committed for item in gaps)
 
 
 def _build_snapshot_and_checkpoint(
@@ -255,18 +257,18 @@ def run_cycle(
     dependent_outcomes: list[PublishOutcome] = []
     if capture_enabled:
         if alignment.gaps:
-            outcomes.extend(
-                publisher.publish_coverage_gaps(
-                    alignment.gaps,
-                    instrument_version_id=instrument_version.instrument_version_id,
-                    venue_instrument_id=instrument_version.venue_instrument_id,
-                    detected_at_utc=evaluated_at_utc,
-                )
+            gap_outcomes = publisher.publish_coverage_gaps(
+                alignment.gaps,
+                instrument_version_id=instrument_version.instrument_version_id,
+                venue_instrument_id=instrument_version.venue_instrument_id,
+                detected_at_utc=evaluated_at_utc,
             )
+            dependent_outcomes.extend(gap_outcomes)
+            outcomes.extend(gap_outcomes)
         snapshot_outcome = publisher.publish_snapshot(snapshot)
         checkpoint_outcome = publisher.publish_checkpoint(checkpoint)
-        dependent_outcomes = [snapshot_outcome, checkpoint_outcome]
-        outcomes.extend(dependent_outcomes)
+        dependent_outcomes.extend([snapshot_outcome, checkpoint_outcome])
+        outcomes.extend([snapshot_outcome, checkpoint_outcome])
         if not _dependent_evidence_committed(dependent_outcomes):
             return CycleResult(
                 instrument_version=instrument_version,

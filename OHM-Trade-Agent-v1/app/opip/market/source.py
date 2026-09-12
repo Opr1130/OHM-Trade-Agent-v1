@@ -18,7 +18,7 @@ an injected fetcher.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -236,10 +236,13 @@ class PolledMinuteBarSource:
         closed = completed_observations(result.observations)
         completed = closed
         if previous.through_utc is not None:
+            # Re-admit the tip closed interval (through_utc is its end) so an
+            # OHLC correction can reach revise_against_retained / supersede.
+            tip_start = previous.through_utc - timedelta(seconds=self.interval_seconds)
             completed = tuple(
                 item
                 for item in closed
-                if item.source_event_time >= previous.through_utc
+                if item.source_event_time >= tip_start
             )
         coverage = (
             CoverageState.COMPLETE

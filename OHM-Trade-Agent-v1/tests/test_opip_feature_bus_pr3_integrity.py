@@ -707,3 +707,154 @@ def test_not_retained_input_missingness_keys_remain_distinct_from_values():
         assert name in computation.missingness
         assert computation.missingness[name] is Missingness.NOT_RETAINED
         assert name not in computation.values
+
+
+def test_open_only_correction_mints_revision():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    last_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    tip_open = previous.opens[-1]
+    tip_close = previous.closes[-1]
+    tip_high = previous.highs[-1]
+    tip_low = previous.lows[-1]
+    tip_volume = previous.volumes[-1]
+    new_open = tip_open + (tip_high - tip_open) * 0.5
+    assert new_open != tip_open
+    corrected = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=last_epoch,
+                open=new_open,
+                high=tip_high,
+                low=tip_low,
+                close=tip_close,
+                volume=tip_volume,
+            )
+        ],
+        commit_from=None,
+    )
+    revised = revise_against_retained(corrected, previous)
+    assert len(revised) == 1
+    assert revised[0].revision == 2
+    advanced_open = advance_state(previous, revised).state
+    assert advanced_open.opens[-1] == new_open
+    assert advanced_open.revisions[-1] == 2
+
+
+def test_unchanged_tip_repoll_is_dropped_before_publish():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    last_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    same = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=last_epoch,
+                open=previous.opens[-1],
+                high=previous.highs[-1],
+                low=previous.lows[-1],
+                close=previous.closes[-1],
+                volume=previous.volumes[-1],
+            )
+        ],
+        commit_from=None,
+    )
+    assert revise_against_retained(same, previous) == ()
+
+
+def test_coverage_gap_uncommitted_defers_promotion():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=10))),
+    ).state
+    # Skip an interval inside the window so alignment reports a coverage gap.
+    observations = _observations(
+        _rows(count=4, end_before=CUTOFF, skip={1}),
+        commit_from=None,
+    )
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type == "coverage.gap.recorded":
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="SPOOLED",
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type in {
+                "feature.snapshot.recorded",
+                "feature.checkpoint.recorded",
+            }:
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, 100 + self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    result = run_cycle(
+        observations,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+        window_start=CUTOFF - timedelta(minutes=4),
+    )
+    assert result.alignment.gaps
+    assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert result.promoted is False
+
+
+def test_source_readmits_tip_interval_for_correction():
+    instrument = _instrument()
+    rows = _rows(count=3, end_before=CUTOFF)
+    calls: list[int | None] = []
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        calls.append(since_epoch)
+        return rows
+
+    source = PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="test",
+        interval_seconds=60,
+        clock=lambda: NOW,
+    )
+    first = source.fetch_through(instrument, watermark=None, now=NOW)
+    assert first.ok
+    assert first.watermark.through_utc is not None
+    second = source.fetch_through(
+        instrument, watermark=first.watermark, now=NOW
+    )
+    tip_start = first.watermark.through_utc - timedelta(seconds=60)
+    assert any(item.source_event_time == tip_start for item in second.observations)
