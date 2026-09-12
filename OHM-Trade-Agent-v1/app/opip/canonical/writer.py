@@ -21,9 +21,15 @@ from app.opip.contracts.events import (
     FEATURE_BUS_EVENT_TYPES,
     FEATURE_BUS_PRIORITY,
     FEATURE_BUS_STREAM,
+    MARKET_OBSERVATION_RECORDED,
 )
 
 MAX_PAYLOAD_BYTES = 16 * 1024
+
+#: Observation identities are immutable facts. Same key + different payload is
+#: integrity corruption. Snapshot/checkpoint/restart intentionally omit this
+#: check because their payloads carry re-evaluation wall clocks.
+IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset({MARKET_OBSERVATION_RECORDED})
 
 ALERT_GOVERNOR_EVENT_TYPES = frozenset(
     {
@@ -74,14 +80,23 @@ class CanonicalWriter:
             except ValueError as exc:
                 return WriterAck(status="REJECTED", error_code="INVALID_INTENT", detail=str(exc))
 
-            existing = self._lookup_idempotency(intent.idempotency_key)
+            payload_json = None
+            if intent.event_type in IDEMPOTENT_PAYLOAD_EVENT_TYPES:
+                payload_json = json.dumps(
+                    intent.payload, separators=(",", ":"), sort_keys=True
+                )
+            existing = self._lookup_idempotency(
+                intent.idempotency_key, payload_json=payload_json
+            )
             if existing is not None:
                 return existing
 
             try:
                 return self._commit_new(intent)
             except sqlite3.IntegrityError:
-                existing = self._lookup_idempotency(intent.idempotency_key)
+                existing = self._lookup_idempotency(
+                    intent.idempotency_key, payload_json=payload_json
+                )
                 if existing is not None:
                     return existing
                 return WriterAck(status="RETRYABLE", error_code="INTEGRITY_CONFLICT")
@@ -220,13 +235,23 @@ class CanonicalWriter:
                     pass
                 raise
 
-    def _lookup_idempotency(self, key: str) -> WriterAck | None:
+    def _lookup_idempotency(
+        self, key: str, *, payload_json: str | None = None
+    ) -> WriterAck | None:
         existing = self._conn.execute(
-            "SELECT event_id, history_epoch, local_sequence FROM events WHERE idempotency_key = ?",
+            "SELECT event_id, history_epoch, local_sequence, payload_json "
+            "FROM events WHERE idempotency_key = ?",
             (key,),
         ).fetchone()
         if existing is None:
             return None
+        if payload_json is not None and str(existing["payload_json"]) != payload_json:
+            return WriterAck(
+                status="REJECTED",
+                error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                event_id=str(existing["event_id"]),
+                detail="idempotency_key already committed with a different payload",
+            )
         return WriterAck(
             status="DUPLICATE_OK",
             event_id=str(existing["event_id"]),

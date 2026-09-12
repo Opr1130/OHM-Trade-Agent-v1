@@ -20,9 +20,12 @@ still reproducing the same supported feature state as uninterrupted processing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
+
+if TYPE_CHECKING:
+    from app.opip.features.revision_ledger import RevisionLedger
 
 from app.opip.contracts.enums import CoverageState, PayloadKind, RestartState
 from app.opip.contracts.features import FeatureStateCheckpoint
@@ -198,107 +201,188 @@ def _clear_series() -> tuple[
     return [], [], [], [], [], [], [], []
 
 
-def revise_against_retained(
+@dataclass(frozen=True)
+class RevisionPlan:
+    """Coverage-only vs publishable evidence for one cycle's re-poll inputs."""
+
+    evidence: tuple[Observation, ...]
+    coverage_only: tuple[Observation, ...]
+    already_committed_ids: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def all_observations(self) -> tuple[Observation, ...]:
+        return self.evidence + self.coverage_only
+
+    @property
+    def publishable(self) -> tuple[Observation, ...]:
+        """Evidence that has not already committed under its observation_id."""
+        blocked = self.already_committed_ids
+        if not blocked:
+            return self.evidence
+        return tuple(
+            item for item in self.evidence if item.observation_id not in blocked
+        )
+
+
+def plan_revisions(
     observations: Sequence[Observation],
     state: RollingState,
-) -> tuple[Observation, ...]:
-    """Mint a superseding revision when a re-polled bar differs from retained evidence.
+    *,
+    ledger: "RevisionLedger | None" = None,
+) -> RevisionPlan:
+    """Classify re-polls into evidence vs coverage-only; mint superseding revisions.
 
-    Normalization always emits revision 1. Without this step a later poll with
-    corrected OHLC for an interval still in the retained window collides on the
-    same observation_id, the writer returns DUPLICATE_OK for the old payload,
-    and RollingState ignores the equal revision. Canonical history stays
-    append-only; this only assigns the next revision identity before publish.
+    Unchanged retained-tip re-polls stay in ``coverage_only`` so tip-bounded
+    windows do not invent gaps, but they never contribute receipt timestamps to
+    snapshot availability or late-arrival counts.
 
-    Unchanged tip re-polls are retained for alignment/coverage so a tip-bounded
-    expected window does not invent false gaps, but they are not revision-minted.
-    Equal or older revisions are ignored by ``advance_state``; publish relies on
-    writer ``DUPLICATE_OK`` for identical observation identities.
+    When ``ledger`` knows a committed revision for an interval, content-equal
+    re-polls are marked already-committed (foldable, not re-published) and
+    content-changed re-polls mint from ``max(retained, ledger) + 1``.
     """
-    if not observations or state.interval_count == 0 or state.first_interval_epoch is None:
-        return tuple(observations)
+    from app.opip.features.revision_ledger import RevisionLedger
 
-    revised: list[Observation] = []
+    if not observations:
+        return RevisionPlan(evidence=(), coverage_only=())
+
+    evidence: list[Observation] = []
+    coverage_only: list[Observation] = []
+    already_committed: set[str] = set()
+    has_retained = (
+        state.interval_count > 0 and state.first_interval_epoch is not None
+    )
+
     for observation in observations:
         if (
             observation.interval_forming
             or observation.aggregate_interval_seconds != state.interval_seconds
             or observation.instrument_version_id != state.instrument_version_id
         ):
-            revised.append(observation)
+            evidence.append(observation)
             continue
+
         epoch = int(observation.source_event_time.timestamp())
-        delta = epoch - int(state.first_interval_epoch)
-        if delta < 0 or delta % state.interval_seconds != 0:
-            revised.append(observation)
-            continue
-        index = delta // state.interval_seconds
-        if index < 0 or index >= state.interval_count:
-            revised.append(observation)
-            continue
-        retained_revision = int(state.revisions[index])
         incoming_fp = aggregate_content_fingerprint(dict(observation.values))
-        retained_fp = (
-            state.content_fingerprints[index]
-            if index < len(state.content_fingerprints)
-            else ""
-        )
-        if retained_fp and retained_fp == incoming_fp:
-            # Unchanged: keep for coverage; do not mint a superseding revision.
-            revised.append(observation)
+        ledger_entry = ledger.entry_for(epoch) if ledger is not None else None
+
+        retained_revision = 0
+        retained_fp = ""
+        in_window = False
+        if has_retained:
+            delta = epoch - int(state.first_interval_epoch)
+            if delta >= 0 and delta % state.interval_seconds == 0:
+                index = delta // state.interval_seconds
+                if 0 <= index < state.interval_count:
+                    in_window = True
+                    retained_revision = int(state.revisions[index])
+                    retained_fp = (
+                        state.content_fingerprints[index]
+                        if index < len(state.content_fingerprints)
+                        else ""
+                    )
+
+        if in_window and retained_fp and retained_fp == incoming_fp:
+            coverage_only.append(observation)
             continue
-        if retained_fp and retained_fp != incoming_fp:
-            changed = True
-        elif state.opens_known[index] if index < len(state.opens_known) else False:
-            live_retained = (
-                float(state.opens[index]),
-                float(state.highs[index]),
-                float(state.lows[index]),
-                float(state.closes[index]),
-                float(state.volumes[index]),
+
+        if ledger_entry is not None and ledger_entry.content_fingerprint == incoming_fp:
+            committed = replace(
+                observation,
+                revision=int(ledger_entry.revision),
+                supersedes=(
+                    None
+                    if int(ledger_entry.revision) == 1
+                    else (
+                        f"OBS:{state.instrument_version_id}"
+                        f":{state.interval_seconds}s:{epoch}"
+                        f":{int(ledger_entry.revision) - 1}"
+                    )
+                ),
+                commit_order=ledger_entry.commit_watermark,
             )
-            incoming = (
-                float(observation.values["open"]),
-                float(observation.values["high"]),
-                float(observation.values["low"]),
-                float(observation.values["close"]),
-                float(observation.values["volume"]),
-            )
-            changed = incoming != live_retained
+            evidence.append(committed)
+            already_committed.add(committed.observation_id)
+            continue
+
+        if not in_window and ledger_entry is None:
+            evidence.append(observation)
+            continue
+
+        if in_window:
+            if retained_fp and retained_fp != incoming_fp:
+                changed = True
+            elif state.opens_known[index] if index < len(state.opens_known) else False:
+                live_retained = (
+                    float(state.opens[index]),
+                    float(state.highs[index]),
+                    float(state.lows[index]),
+                    float(state.closes[index]),
+                    float(state.volumes[index]),
+                )
+                incoming = (
+                    float(observation.values["open"]),
+                    float(observation.values["high"]),
+                    float(observation.values["low"]),
+                    float(observation.values["close"]),
+                    float(observation.values["volume"]),
+                )
+                changed = incoming != live_retained
+            else:
+                live_retained = (
+                    float(state.highs[index]),
+                    float(state.lows[index]),
+                    float(state.closes[index]),
+                    float(state.volumes[index]),
+                )
+                incoming = (
+                    float(observation.values["high"]),
+                    float(observation.values["low"]),
+                    float(observation.values["close"]),
+                    float(observation.values["volume"]),
+                )
+                changed = incoming != live_retained
+            if not changed:
+                coverage_only.append(observation)
+                continue
         else:
-            # Legacy unknown open: never mint on open alone.
-            live_retained = (
-                float(state.highs[index]),
-                float(state.lows[index]),
-                float(state.closes[index]),
-                float(state.volumes[index]),
-            )
-            incoming = (
-                float(observation.values["high"]),
-                float(observation.values["low"]),
-                float(observation.values["close"]),
-                float(observation.values["volume"]),
-            )
-            changed = incoming != live_retained
-        if not changed:
-            revised.append(observation)
+            # Outside retained window but ledger knows a prior durable revision.
+            changed = True
+
+        prior_revision = max(
+            retained_revision,
+            int(ledger_entry.revision) if ledger_entry is not None else 0,
+        )
+        if int(observation.revision) > prior_revision:
+            evidence.append(observation)
             continue
-        if int(observation.revision) > retained_revision:
-            revised.append(observation)
-            continue
-        next_revision = retained_revision + 1
+        next_revision = prior_revision + 1
         prior_id = (
             f"OBS:{state.instrument_version_id}"
-            f":{state.interval_seconds}s:{epoch}:{retained_revision}"
+            f":{state.interval_seconds}s:{epoch}:{prior_revision}"
         )
-        revised.append(
+        evidence.append(
             replace(
                 observation,
                 revision=next_revision,
                 supersedes=prior_id,
             )
         )
-    return tuple(revised)
+
+    return RevisionPlan(
+        evidence=tuple(evidence),
+        coverage_only=tuple(coverage_only),
+        already_committed_ids=frozenset(already_committed),
+    )
+
+
+def revise_against_retained(
+    observations: Sequence[Observation],
+    state: RollingState,
+    *,
+    ledger: "RevisionLedger | None" = None,
+) -> tuple[Observation, ...]:
+    """Mint superseding revisions; return coverage+evidence (legacy contract)."""
+    return plan_revisions(observations, state, ledger=ledger).all_observations
 
 
 def advance_state(
@@ -663,6 +747,7 @@ def checkpoint_payload_bytes(checkpoint: FeatureStateCheckpoint) -> int:
 __all__ = [
     "AGGREGATE_DEPENDENCY",
     "AdvanceResult",
+    "RevisionPlan",
     "RollingState",
     "advance_from_alignment",
     "advance_state",
@@ -670,6 +755,7 @@ __all__ = [
     "checkpoint_payload_bytes",
     "from_checkpoint",
     "initial_state",
+    "plan_revisions",
     "restart_disposition",
     "revise_against_retained",
     "to_checkpoint",

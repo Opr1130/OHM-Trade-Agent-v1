@@ -31,12 +31,13 @@ from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.observation import SourceWatermark
 from app.opip.features.checkpoint_store import load_rolling_state
 from app.opip.features.parity import compare_against_production_indicators
-from app.opip.features.pipeline import run_cycle
+from app.opip.features.pipeline import CycleIdentityMismatch, run_cycle
 from app.opip.features.publisher import (
     FeatureBusPublisher,
     feature_bus_capture_enabled,
     resolve_feature_bus_mode,
 )
+from app.opip.features.revision_ledger import load_revision_ledger
 from app.opip.market.aggregates import grid_floor
 from app.opip.market.instrument_version_store import hydrate_instrument_version_registry
 from app.opip.market.observations import IntervalRow, normalize_interval_rows
@@ -167,12 +168,18 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     # Restore source watermarks from retained checkpoints so tip re-poll and
     # superseding revisions work across process restarts.
     restored_states: dict[str, Any] = {}
+    restored_ledgers: dict[str, Any] = {}
     source_watermarks: dict[str, Any] = {}
     for version in committed_versions:
         state = load_rolling_state(version.instrument_version_id)
         if state is None:
             continue
         restored_states[version.instrument_version_id] = state
+        restored_ledgers[version.instrument_version_id] = load_revision_ledger(
+            version.instrument_version_id,
+            interval_seconds=state.interval_seconds,
+            since_interval_epoch=state.first_interval_epoch,
+        )
         if state.last_interval_epoch is not None:
             tip_end = datetime.fromtimestamp(
                 state.last_interval_epoch + state.interval_seconds,
@@ -197,6 +204,7 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     cycles: list[dict[str, Any]] = []
     for batch in batches:
         prior = restored_states.get(batch.instrument_version.instrument_version_id)
+        ledger = restored_ledgers.get(batch.instrument_version.instrument_version_id)
         # Resumed coverage bounds THIS cycle's tip re-poll window only.
         # Widening to the oldest retained bar invents false gaps for intervals
         # that were never supposed to be re-fetched this cycle.
@@ -207,17 +215,31 @@ def _live_pilot(limit: int) -> dict[str, Any]:
             )
         # Always evaluate the expected window — empty/transport failures still
         # produce incomplete coverage evidence rather than silent skips.
-        result = run_cycle(
-            batch.observations,
-            instrument_version=batch.instrument_version,
-            evaluation_cutoff=cycle_cutoff,
-            evaluated_at_utc=evaluated_at,
-            state=prior,
-            publisher=publisher,
-            source_version=KRAKEN_OHLC_SOURCE_LABEL,
-            window_start=window_start,
-            source_coverage=batch.coverage,
-        )
+        try:
+            result = run_cycle(
+                batch.observations,
+                instrument_version=batch.instrument_version,
+                evaluation_cutoff=cycle_cutoff,
+                evaluated_at_utc=evaluated_at,
+                state=prior,
+                revision_ledger=ledger,
+                publisher=publisher,
+                source_version=KRAKEN_OHLC_SOURCE_LABEL,
+                window_start=window_start,
+                source_coverage=batch.coverage,
+            )
+        except CycleIdentityMismatch as exc:
+            cycles.append(
+                {
+                    "instrument_version_id": (
+                        batch.instrument_version.instrument_version_id
+                    ),
+                    "disposition": "REJECTED_IDENTITY_MISMATCH",
+                    "promoted": False,
+                    "error": str(exc),
+                }
+            )
+            continue
         payload = result.to_dict()
         if batch.error:
             payload["source_error"] = batch.error

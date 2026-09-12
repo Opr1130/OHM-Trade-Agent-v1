@@ -149,6 +149,9 @@ def build_intent(
 
 
 def observation_intent(observation: Observation) -> WriterIntent:
+    from app.opip.contracts.observation import require_durable_identity
+
+    require_durable_identity(observation)
     return build_intent(
         event_type=MARKET_OBSERVATION_RECORDED,
         idempotency_key=observation_idempotency_key(observation),

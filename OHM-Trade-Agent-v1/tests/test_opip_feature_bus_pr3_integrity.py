@@ -27,18 +27,22 @@ from app.opip.features.pipeline import (
     DISPOSITION_DEFERRED_UNCOMMITTED,
     DISPOSITION_DRY_RUN,
     DISPOSITION_OK,
+    CycleIdentityMismatch,
     run_cycle,
 )
 from app.opip.features.publisher import (
     FeatureBusPublisher,
     PublishOutcome,
     SHADOW_CAPTURE_SETTINGS,
+    observation_intent,
 )
+from app.opip.features.revision_ledger import RevisionLedger, load_revision_ledger
 from app.opip.features.state import (
     advance_state,
     alignment_from_state,
     from_checkpoint,
     initial_state,
+    plan_revisions,
     revise_against_retained,
     to_checkpoint,
 )
@@ -1168,12 +1172,20 @@ def test_reference_data_version_participates_in_fingerprint():
 
 
 def test_instrument_version_same_version_fingerprint_conflict_fails_closed():
-    v1 = _instrument(version=1)
+    v1 = _instrument(version=1, tick_size=0.01)
+    alt = _instrument(version=1, tick_size=0.02)
     payload = instrument_version_record_payload(v1)
-    conflict = dict(payload)
-    conflict["tick_size"] = 0.02
+    conflict = instrument_version_record_payload(alt)
     with pytest.raises(ValueError, match="instrument version conflict"):
         reconstruct_instrument_version_registry([payload, conflict])
+
+
+def test_instrument_version_payload_tampered_fingerprint_fails_closed():
+    payload = instrument_version_record_payload(_instrument())
+    tampered = dict(payload)
+    tampered["tick_size"] = 0.02
+    with pytest.raises(ValueError, match="reference_fingerprint"):
+        reconstruct_instrument_version_registry([tampered])
 
 
 def test_window_start_must_be_grid_aligned():
@@ -1439,10 +1451,10 @@ def test_checkpoint_not_published_when_earlier_dependent_gate_fails():
 def test_stale_instrument_version_conflict_after_newer_version_fails_closed():
     v1 = _instrument(version=1, tick_size=0.01)
     v2 = _instrument(version=2, tick_size=0.01)
+    alt = _instrument(version=1, tick_size=0.02)
     payload_v1 = instrument_version_record_payload(v1)
     payload_v2 = instrument_version_record_payload(v2)
-    stale_conflict = dict(payload_v1)
-    stale_conflict["tick_size"] = 0.02
+    stale_conflict = instrument_version_record_payload(alt)
     with pytest.raises(ValueError, match="instrument version conflict"):
         reconstruct_instrument_version_registry(
             [payload_v1, payload_v2, stale_conflict]
@@ -1517,3 +1529,478 @@ def test_checkpoint_restore_ignores_other_feature_versions(tmp_path):
     )
     assert matched is not None
     assert matched["feature_version"] == FEATURE_VERSION
+
+
+def test_unchanged_tip_does_not_contaminate_snapshot_availability():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    tip_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    late_receipt = NOW + timedelta(minutes=10)
+    same = normalize_interval_rows(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=previous.opens[-1],
+                high=previous.highs[-1],
+                low=previous.lows[-1],
+                close=previous.closes[-1],
+                volume=previous.volumes[-1],
+                vwap=previous.closes[-1],
+                trade_count=14,
+            )
+        ],
+        instrument_version=_instrument(),
+        interval_seconds=60,
+        receipt_time=late_receipt,
+        now=late_receipt,
+        source_label="test",
+        source_sequence_prefix="t",
+    ).observations
+    tip_start = datetime.fromtimestamp(tip_epoch, tz=timezone.utc)
+    baseline = run_cycle(
+        (),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        source_version="test",
+        window_start=tip_start,
+    )
+    result = run_cycle(
+        same,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=late_receipt,
+        state=previous,
+        source_version="test",
+        window_start=tip_start,
+    )
+    assert result.alignment.coverage is CoverageState.COMPLETE
+    assert result.alignment.gaps == ()
+    assert result.alignment.observations == ()
+    assert len(result.alignment.coverage_only) == 1
+    assert result.snapshot.availability.visible_at_utc != late_receipt
+    assert (
+        result.snapshot.availability.visible_at_utc
+        == baseline.snapshot.availability.visible_at_utc
+    )
+    assert result.snapshot.values["late_arrival_count"] == 0
+
+
+def test_unchanged_tip_with_capture_is_not_republished():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    tip_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    same = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=previous.opens[-1],
+                high=previous.highs[-1],
+                low=previous.lows[-1],
+                close=previous.closes[-1],
+                volume=previous.volumes[-1],
+                vwap=previous.closes[-1],
+                trade_count=14,
+            )
+        ],
+        commit_from=None,
+    )
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                raise AssertionError("unchanged tip must not be republished")
+            outcome = PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="OK",
+                watermark=ConsumedInputWatermark(1, 1),
+            )
+            self.outcomes.append(outcome)
+            return outcome
+
+    tip_start = datetime.fromtimestamp(tip_epoch, tz=timezone.utc)
+    result = run_cycle(
+        same,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+        window_start=tip_start,
+    )
+    assert result.promoted is True
+    assert not any(
+        outcome.event_type == "market.observation.recorded"
+        for outcome in result.outcomes
+    )
+
+
+def test_run_cycle_rejects_mismatched_observation_instrument():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=3, end_before=CUTOFF), commit_from=None),
+    ).state
+    other = _observations(
+        _rows(count=1, end_before=CUTOFF),
+        commit_from=None,
+    )
+    mismatched = tuple(
+        replace(
+            item,
+            instrument_version_id="INSTR:kraken:ETH:USD:1",
+            venue_instrument_id="ETHUSD",
+        )
+        for item in other
+    )
+    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+        run_cycle(
+            mismatched,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=previous,
+            source_version="test",
+        )
+
+
+def test_run_cycle_rejects_mismatched_state_instrument():
+    wrong_state = initial_state(_instrument(base_asset="ETH", venue_instrument_id="ETHUSD"))
+    with pytest.raises(CycleIdentityMismatch, match="instrument_version_id"):
+        run_cycle(
+            _observations(_rows(count=2, end_before=CUTOFF), commit_from=None),
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=wrong_state,
+            source_version="test",
+        )
+
+
+def test_run_cycle_rejects_observation_venue_mismatch():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=2, end_before=CUTOFF), commit_from=None),
+    ).state
+    observations = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)
+    mismatched = tuple(replace(item, venue="binance") for item in observations)
+    with pytest.raises(CycleIdentityMismatch, match="venue"):
+        run_cycle(
+            mismatched,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=previous,
+            source_version="test",
+        )
+
+
+def test_run_cycle_rejects_observation_venue_instrument_mismatch():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=2, end_before=CUTOFF), commit_from=None),
+    ).state
+    observations = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)
+    mismatched = tuple(
+        replace(item, venue_instrument_id="ETHUSD") for item in observations
+    )
+    with pytest.raises(CycleIdentityMismatch, match="venue_instrument_id"):
+        run_cycle(
+            mismatched,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=previous,
+            source_version="test",
+        )
+
+
+def test_mixed_batch_one_wrong_observation_fails_closed_zero_writes():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=3, end_before=CUTOFF), commit_from=None),
+    ).state
+    watermark_before = previous.consumed_input_watermark
+    rows = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+    mixed = (
+        rows[0],
+        replace(
+            rows[1],
+            instrument_version_id="INSTR:kraken:ETH:USD:1",
+            venue_instrument_id="ETHUSD",
+        ),
+    )
+    published: list[str] = []
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+
+        def publish(self, intent):  # type: ignore[override]
+            published.append(str(intent.event_type))
+            raise AssertionError("identity mismatch must fail before writes")
+
+    with pytest.raises(CycleIdentityMismatch):
+        run_cycle(
+            mixed,
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            state=previous,
+            publisher=_Publisher(),
+            source_version="test",
+        )
+    assert published == []
+    assert previous.consumed_input_watermark == watermark_before
+
+
+def test_restart_reconstruction_mints_next_revision_after_deferred_commit(tmp_path):
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    tip_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    first_plan = plan_revisions(
+        _observations(
+            [
+                IntervalRow(
+                    interval_start_epoch=tip_epoch,
+                    open=111.0,
+                    high=112.0,
+                    low=110.0,
+                    close=111.5,
+                    volume=9.0,
+                )
+            ],
+            commit_from=None,
+        ),
+        previous,
+    )
+    assert first_plan.evidence[0].revision == 2
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path, socket_path=tmp_path / "writer.sock"
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    outcome = publisher.publish(observation_intent(first_plan.evidence[0]))
+    assert outcome.committed
+    hydrated = load_revision_ledger(
+        _instrument().instrument_version_id, db_path=db_path
+    )
+    assert hydrated.entry_for(tip_epoch) is not None
+    assert hydrated.entry_for(tip_epoch).revision == 2
+    later = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=211.0,
+                high=212.0,
+                low=210.0,
+                close=211.5,
+                volume=11.0,
+            )
+        ],
+        commit_from=None,
+    )
+    plan = plan_revisions(later, previous, ledger=hydrated)
+    assert plan.evidence[0].revision == 3
+
+
+def test_committed_revision_survives_dependent_failure_and_mints_next():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    tip_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    first_correction = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=111.0,
+                high=112.0,
+                low=110.0,
+                close=111.5,
+                volume=9.0,
+            )
+        ],
+        commit_from=None,
+    )
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type == "feature.snapshot.recorded":
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="SPOOLED",
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    first = run_cycle(
+        first_correction,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+        window_start=datetime.fromtimestamp(tip_epoch, tz=timezone.utc),
+    )
+    assert first.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert first.promoted is False
+    assert first.state == previous
+    assert first.revision_ledger is not None
+    entry = first.revision_ledger.entry_for(tip_epoch)
+    assert entry is not None
+    assert entry.revision == 2
+
+    second_correction = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=tip_epoch,
+                open=211.0,
+                high=212.0,
+                low=210.0,
+                close=211.5,
+                volume=11.0,
+            )
+        ],
+        commit_from=None,
+    )
+    plan = plan_revisions(
+        second_correction, previous, ledger=first.revision_ledger
+    )
+    assert len(plan.evidence) == 1
+    assert plan.evidence[0].revision == 3
+
+
+def test_duplicate_observation_key_different_payload_rejected(tmp_path):
+    observations = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path, socket_path=tmp_path / "writer.sock"
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    first = publisher.publish(observation_intent(observations[0]))
+    assert first.committed
+    altered = replace(
+        observations[0],
+        receipt_time=NOW + timedelta(seconds=30),
+    )
+    assert altered.observation_id == observations[0].observation_id
+    second = publisher.publish(observation_intent(altered))
+    assert second.status == "REJECTED"
+    assert second.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+
+
+def test_identical_observation_resubmission_is_duplicate_ok(tmp_path):
+    observations = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path, socket_path=tmp_path / "writer.sock"
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    first = publisher.publish(observation_intent(observations[0]))
+    second = publisher.publish(observation_intent(observations[0]))
+    assert first.committed
+    assert second.status == "DUPLICATE_OK"
+
+
+def test_non_aggregate_observation_id_stable_across_ingestion_order():
+    from app.opip.contracts.enums import PayloadKind
+    from app.opip.contracts.observation import Observation
+
+    shared = {
+        "instrument_version_id": "INSTR:kraken:SOL:USD:1",
+        "venue": "kraken",
+        "venue_instrument_id": "SOLUSD",
+        "source_event_time": CUTOFF,
+        "receipt_time": NOW,
+        "payload_kind": PayloadKind.TRADE,
+        "values": {"price": 100.0, "size": 1.0},
+    }
+    a = Observation(**shared, ingestion_order=1)
+    b = Observation(**shared, ingestion_order=99)
+    assert a.observation_id == b.observation_id
+    assert "ingest-" not in a.observation_id
+
+
+def test_publishing_non_aggregate_without_source_sequence_fails_closed():
+    from app.opip.contracts.enums import PayloadKind
+    from app.opip.contracts.observation import Observation
+
+    trade = Observation(
+        instrument_version_id="INSTR:kraken:SOL:USD:1",
+        venue="kraken",
+        venue_instrument_id="SOLUSD",
+        source_event_time=CUTOFF,
+        receipt_time=NOW,
+        ingestion_order=1,
+        payload_kind=PayloadKind.TRADE,
+        values={"price": 100.0, "size": 1.0},
+    )
+    with pytest.raises(ValueError, match="source_sequence"):
+        observation_intent(trade)
+
+
+def test_revision_ledger_hydrates_from_canonical_observations(tmp_path):
+    observations = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path, socket_path=tmp_path / "writer.sock"
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    for item in observations:
+        outcome = publisher.publish(observation_intent(item))
+        assert outcome.committed
+    ledger = load_revision_ledger(
+        _instrument().instrument_version_id, db_path=db_path
+    )
+    assert len(ledger.entries) == 2
+    for item in observations:
+        epoch = int(item.source_event_time.timestamp())
+        entry = ledger.entry_for(epoch)
+        assert entry is not None
+        assert entry.revision == 1
+        assert entry.observation_id == item.observation_id

@@ -26,9 +26,17 @@ from app.opip.identity.contract import (
 from app.opip.market.instruments import InstrumentVersionRegistry
 
 
-def instrument_version_from_payload(payload: Mapping[str, Any]) -> InstrumentVersion:
+class InstrumentVersionIntegrityError(ValueError):
+    """Declared payload identity does not match recomputed identity."""
+
+
+def instrument_version_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    verify_declared_identity: bool = True,
+) -> InstrumentVersion:
     """Rebuild one InstrumentVersion from a committed canonical payload."""
-    return InstrumentVersion(
+    version = InstrumentVersion(
         venue=str(payload["venue"]),
         base_asset=str(payload["base_asset"]),
         quote_currency=str(payload["quote_currency"]),
@@ -66,6 +74,36 @@ def instrument_version_from_payload(payload: Mapping[str, Any]) -> InstrumentVer
             for key, value in dict(payload.get("attributes") or {}).items()
         },
     )
+    if verify_declared_identity:
+        _verify_declared_identity(payload, version)
+    return version
+
+
+def _verify_declared_identity(
+    payload: Mapping[str, Any], version: InstrumentVersion
+) -> None:
+    declared_id = str(payload.get("instrument_version_id") or "").strip()
+    declared_fp = str(payload.get("reference_fingerprint") or "").strip()
+    if not declared_id or not declared_fp:
+        raise InstrumentVersionIntegrityError(
+            "committed instrument version payload must declare both "
+            "instrument_version_id and reference_fingerprint"
+        )
+    if declared_id != version.instrument_version_id:
+        raise InstrumentVersionIntegrityError(
+            f"declared instrument_version_id {declared_id!r} does not match "
+            f"recomputed {version.instrument_version_id!r}"
+        )
+    if declared_fp != version.reference_fingerprint():
+        raise InstrumentVersionIntegrityError(
+            f"declared reference_fingerprint for {declared_id} does not match "
+            "recomputed reference data"
+        )
+    declared_key = str(payload.get("instrument_key") or "").strip()
+    if declared_key and declared_key != version.instrument_key:
+        raise InstrumentVersionIntegrityError(
+            f"declared instrument_key {declared_key!r} does not match recomputed"
+        )
 
 
 def reconstruct_instrument_version_registry(
@@ -161,10 +199,12 @@ def instrument_version_record_payload(version: InstrumentVersion) -> dict[str, A
     payload["observed_at_utc"] = iso_z(
         version.observed_at_utc, field_name="observed_at_utc"
     )
+    payload["reference_fingerprint"] = version.reference_fingerprint()
     return payload
 
 
 __all__ = [
+    "InstrumentVersionIntegrityError",
     "hydrate_instrument_version_registry",
     "instrument_version_from_payload",
     "instrument_version_record_payload",

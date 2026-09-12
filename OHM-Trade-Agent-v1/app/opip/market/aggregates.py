@@ -92,12 +92,18 @@ class CoverageGap:
 
 @dataclass(frozen=True)
 class AlignmentResult:
-    """Grid-aligned, deduplicated, closed intervals plus coverage evidence."""
+    """Grid-aligned, deduplicated, closed intervals plus coverage evidence.
+
+    ``observations`` are evidence rows (feature/publish/availability inputs).
+    ``coverage_only`` fills expected-window continuity without contributing
+    receipt timestamps to lateness or snapshot availability.
+    """
 
     observations: tuple[Observation, ...]
     gaps: tuple[CoverageGap, ...] = ()
     late_arrivals: tuple[Observation, ...] = ()
     superseded: tuple[Observation, ...] = ()
+    coverage_only: tuple[Observation, ...] = ()
     excluded_forming: int = 0
     excluded_unclosed: int = 0
     excluded_misaligned: int = 0
@@ -106,7 +112,7 @@ class AlignmentResult:
 
     @property
     def present_intervals(self) -> int:
-        return len(self.observations)
+        return len(self.observations) + len(self.coverage_only)
 
     @property
     def missing_intervals(self) -> int:
@@ -147,6 +153,7 @@ def align_minute_observations(
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
     window_start: datetime | None = None,
     late_threshold_seconds: float = DEFAULT_LATE_THRESHOLD_SECONDS,
+    coverage_only: Iterable[Observation] = (),
 ) -> AlignmentResult:
     """Align observations onto the grid and report what is missing.
 
@@ -154,6 +161,9 @@ def align_minute_observations(
     before it are eligible. ``window_start`` bounds gap detection; without it,
     detection starts at the earliest interval actually present, so a cold start
     is not reported as a giant historical gap.
+
+    ``coverage_only`` rows participate in gap detection and present-interval
+    counts but never in late-arrival or evidence observation lists.
     """
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
@@ -161,6 +171,80 @@ def align_minute_observations(
     if not is_grid_aligned(cutoff_utc, interval_seconds=interval_seconds):
         raise ValueError("cutoff must sit on the interval grid")
 
+    evidence_best, evidence_super, ef, eu, em = _admit_closed_intervals(
+        observations,
+        cutoff_utc=cutoff_utc,
+        interval_seconds=interval_seconds,
+        window_start=window_start,
+    )
+    coverage_best, coverage_super, cf, cu, cm = _admit_closed_intervals(
+        coverage_only,
+        cutoff_utc=cutoff_utc,
+        interval_seconds=interval_seconds,
+        window_start=window_start,
+    )
+    # Evidence wins a shared interval; coverage-only only fills holes.
+    coverage_only_best = {
+        start: item
+        for start, item in coverage_best.items()
+        if start not in evidence_best
+    }
+    ordered = [evidence_best[key] for key in sorted(evidence_best)]
+    coverage_ordered = [coverage_only_best[key] for key in sorted(coverage_only_best)]
+    late = tuple(
+        item
+        for item in ordered
+        if item.arrival_lag_seconds > float(late_threshold_seconds)
+    )
+
+    gaps: tuple[CoverageGap, ...] = ()
+    expected = 0
+    first: datetime | None = None
+    if window_start is not None:
+        window_utc = window_start.astimezone(timezone.utc)
+        if not is_grid_aligned(window_utc, interval_seconds=interval_seconds):
+            raise ValueError("window_start must sit on the interval grid")
+        first = window_utc
+    elif ordered or coverage_ordered:
+        first = min(
+            item.source_event_time for item in (*ordered, *coverage_ordered)
+        )
+    if first is not None:
+        last_expected = cutoff_utc - timedelta(seconds=interval_seconds)
+        if last_expected >= first:
+            expected = (
+                int((last_expected - first).total_seconds()) // interval_seconds
+            ) + 1
+            present = {item.source_event_time for item in ordered} | {
+                item.source_event_time for item in coverage_ordered
+            }
+            gaps = _contiguous_gaps(
+                first=first,
+                last=last_expected,
+                present=present,
+                interval_seconds=interval_seconds,
+            )
+
+    return AlignmentResult(
+        observations=tuple(ordered),
+        gaps=gaps,
+        late_arrivals=late,
+        superseded=tuple(evidence_super + coverage_super),
+        coverage_only=tuple(coverage_ordered),
+        excluded_forming=ef + cf,
+        excluded_unclosed=eu + cu,
+        excluded_misaligned=em + cm,
+        expected_intervals=expected,
+    )
+
+
+def _admit_closed_intervals(
+    observations: Iterable[Observation],
+    *,
+    cutoff_utc: datetime,
+    interval_seconds: int,
+    window_start: datetime | None,
+) -> tuple[dict[datetime, Observation], list[Observation], int, int, int]:
     excluded_forming = 0
     excluded_unclosed = 0
     excluded_misaligned = 0
@@ -196,48 +280,7 @@ def align_minute_observations(
             superseded.append(incumbent)
         else:
             superseded.append(observation)
-
-    ordered = [best[key] for key in sorted(best)]
-    late = tuple(
-        item
-        for item in ordered
-        if item.arrival_lag_seconds > float(late_threshold_seconds)
-    )
-
-    gaps: tuple[CoverageGap, ...] = ()
-    expected = 0
-    first: datetime | None = None
-    if window_start is not None:
-        window_utc = window_start.astimezone(timezone.utc)
-        if not is_grid_aligned(window_utc, interval_seconds=interval_seconds):
-            raise ValueError("window_start must sit on the interval grid")
-        first = window_utc
-    elif ordered:
-        first = ordered[0].source_event_time
-    if first is not None:
-        last_expected = cutoff_utc - timedelta(seconds=interval_seconds)
-        if last_expected >= first:
-            expected = (
-                int((last_expected - first).total_seconds()) // interval_seconds
-            ) + 1
-            present = {item.source_event_time for item in ordered}
-            gaps = _contiguous_gaps(
-                first=first,
-                last=last_expected,
-                present=present,
-                interval_seconds=interval_seconds,
-            )
-
-    return AlignmentResult(
-        observations=tuple(ordered),
-        gaps=gaps,
-        late_arrivals=late,
-        superseded=tuple(superseded),
-        excluded_forming=excluded_forming,
-        excluded_unclosed=excluded_unclosed,
-        excluded_misaligned=excluded_misaligned,
-        expected_intervals=expected,
-    )
+    return best, superseded, excluded_forming, excluded_unclosed, excluded_misaligned
 
 
 def contiguous_tail(result: AlignmentResult) -> tuple[Observation, ...]:

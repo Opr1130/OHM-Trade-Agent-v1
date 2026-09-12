@@ -18,6 +18,10 @@ A resumable checkpoint must never become durable before those earlier gates
 succeed; otherwise prior state is retained and the disposition names the
 deferred dependent evidence.
 
+Committed observation revisions are retained in a RevisionLedger even when
+feature-state promotion is deferred, so a later correction cannot reuse a
+durable observation_id.
+
 Nothing here schedules itself, ranks candidates, emits alerts, or evaluates a
 detector.
 """
@@ -32,15 +36,16 @@ from app.opip.contracts.enums import CoverageState, RestartState
 from app.opip.contracts.features import FeatureSnapshot, FeatureStateCheckpoint
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.observation import Observation
-from app.opip.features.engine import build_feature_snapshot
+from app.opip.features.engine import FEATURE_VERSION, build_feature_snapshot
 from app.opip.features.publisher import FeatureBusPublisher, PublishOutcome
+from app.opip.features.revision_ledger import RevisionLedger
 from app.opip.features.state import (
     RollingState,
     advance_state,
     alignment_from_state,
     initial_state,
+    plan_revisions,
     restart_disposition,
-    revise_against_retained,
     to_checkpoint,
 )
 from app.opip.market.aggregates import (
@@ -53,6 +58,10 @@ DISPOSITION_OK = "OK"
 DISPOSITION_DRY_RUN = "DRY_RUN"
 DISPOSITION_DEFERRED_UNCOMMITTED = "DEFERRED_UNCOMMITTED_OBSERVATIONS"
 DISPOSITION_DEFERRED_DEPENDENT = "DEFERRED_UNCOMMITTED_SNAPSHOT_OR_CHECKPOINT"
+
+
+class CycleIdentityMismatch(ValueError):
+    """Observations or retained state do not belong to the requested version."""
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,7 @@ class CycleResult:
     outcomes: tuple[PublishOutcome, ...] = field(default_factory=tuple)
     disposition: str = DISPOSITION_OK
     promoted: bool = True
+    revision_ledger: RevisionLedger | None = None
 
     @property
     def coverage(self) -> CoverageState:
@@ -91,11 +101,65 @@ class CycleResult:
             "persisted": self.persisted,
             "disposition": self.disposition,
             "promoted": self.promoted,
+            "revision_ledger_entries": (
+                len(self.revision_ledger.entries) if self.revision_ledger else 0
+            ),
             "outcomes": [
                 {"event_type": item.event_type, "status": item.status}
                 for item in self.outcomes
             ],
         }
+
+
+def _assert_cycle_identity(
+    observations: Sequence[Observation],
+    *,
+    instrument_version: InstrumentVersion,
+    state: RollingState | None,
+    interval_seconds: int,
+) -> None:
+    expected_id = instrument_version.instrument_version_id
+    expected_venue = instrument_version.venue
+    expected_venue_instrument = instrument_version.venue_instrument_id
+    for observation in observations:
+        if observation.instrument_version_id != expected_id:
+            raise CycleIdentityMismatch(
+                f"observation instrument_version_id "
+                f"{observation.instrument_version_id!r} != {expected_id!r}"
+            )
+        if observation.venue != expected_venue:
+            raise CycleIdentityMismatch(
+                f"observation venue {observation.venue!r} != {expected_venue!r}"
+            )
+        if observation.venue_instrument_id != expected_venue_instrument:
+            raise CycleIdentityMismatch(
+                f"observation venue_instrument_id "
+                f"{observation.venue_instrument_id!r} != {expected_venue_instrument!r}"
+            )
+    if state is None:
+        return
+    if state.instrument_version_id != expected_id:
+        raise CycleIdentityMismatch(
+            f"state instrument_version_id "
+            f"{state.instrument_version_id!r} != {expected_id!r}"
+        )
+    if state.venue != expected_venue:
+        raise CycleIdentityMismatch(
+            f"state venue {state.venue!r} != {expected_venue!r}"
+        )
+    if state.venue_instrument_id != expected_venue_instrument:
+        raise CycleIdentityMismatch(
+            f"state venue_instrument_id "
+            f"{state.venue_instrument_id!r} != {expected_venue_instrument!r}"
+        )
+    if state.feature_version != FEATURE_VERSION:
+        raise CycleIdentityMismatch(
+            f"state feature_version {state.feature_version!r} != {FEATURE_VERSION!r}"
+        )
+    if int(state.interval_seconds) != int(interval_seconds):
+        raise CycleIdentityMismatch(
+            f"state interval_seconds {state.interval_seconds!r} != {interval_seconds!r}"
+        )
 
 
 def _advance_watermark_from_outcomes(
@@ -125,21 +189,6 @@ def _observations_fully_committed(
     return all(
         outcome.committed and outcome.watermark is not None for outcome in outcomes
     )
-
-
-def _dependent_evidence_committed(outcomes: Sequence[PublishOutcome]) -> bool:
-    """Snapshot, checkpoint, and any published coverage gaps must commit."""
-    by_type: dict[str, list[PublishOutcome]] = {}
-    for outcome in outcomes:
-        by_type.setdefault(outcome.event_type, []).append(outcome)
-    snapshot = by_type.get("feature.snapshot.recorded") or []
-    checkpoint = by_type.get("feature.checkpoint.recorded") or []
-    if not snapshot or not checkpoint:
-        return False
-    if not all(item.committed for item in snapshot + checkpoint):
-        return False
-    gaps = by_type.get("coverage.gap.recorded") or []
-    return all(item.committed for item in gaps)
 
 
 def _build_snapshot_and_checkpoint(
@@ -172,6 +221,7 @@ def run_cycle(
     evaluation_cutoff: datetime,
     evaluated_at_utc: datetime,
     state: RollingState | None = None,
+    revision_ledger: RevisionLedger | None = None,
     publisher: FeatureBusPublisher | None = None,
     source_version: str,
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
@@ -185,48 +235,69 @@ def run_cycle(
     publication require every observation to commit when capture is enabled.
     Snapshot and checkpoint must also commit before promotion is claimed.
     """
+    _assert_cycle_identity(
+        observations,
+        instrument_version=instrument_version,
+        state=state,
+        interval_seconds=interval_seconds,
+    )
     previous = state or initial_state(
         instrument_version, interval_seconds=interval_seconds
     )
+    ledger = revision_ledger or RevisionLedger.empty(
+        instrument_version, interval_seconds=interval_seconds
+    )
+    if ledger.instrument_version_id != instrument_version.instrument_version_id:
+        raise CycleIdentityMismatch(
+            f"revision_ledger instrument_version_id "
+            f"{ledger.instrument_version_id!r} != "
+            f"{instrument_version.instrument_version_id!r}"
+        )
     capture_enabled = publisher is not None and publisher.enabled
     if capture_enabled and not publish_observations:
         raise ValueError(
             "publish_observations=False is not allowed when capture is enabled; "
             "PR3 refuses unverified observation watermarks for dependent promotion"
         )
-    revised = revise_against_retained(observations, previous)
+    plan = plan_revisions(observations, previous, ledger=ledger)
     alignment = align_minute_observations(
-        revised,
+        plan.evidence,
         cutoff=evaluation_cutoff,
         interval_seconds=interval_seconds,
         window_start=window_start,
+        coverage_only=plan.coverage_only,
     )
     if source_coverage is CoverageState.INCOMPLETE_COVERAGE:
         alignment = replace(alignment, source_incomplete=True)
     advance = advance_state(previous, alignment.observations)
     candidate = advance.state
 
+    publish_set = tuple(
+        item
+        for item in alignment.observations
+        if item.observation_id not in plan.already_committed_ids
+    )
+
     outcomes: list[PublishOutcome] = []
     must_commit_observations = (
-        capture_enabled and publish_observations and bool(alignment.observations)
+        capture_enabled and publish_observations and bool(publish_set)
     )
 
     observation_outcomes: list[PublishOutcome] = []
-    if publisher is not None and publish_observations:
-        observation_outcomes = publisher.publish_observations(alignment.observations)
+    if publisher is not None and publish_observations and publish_set:
+        observation_outcomes = publisher.publish_observations(publish_set)
         outcomes.extend(observation_outcomes)
+
+    active_ledger = ledger.with_committed(publish_set, observation_outcomes)
+    active_ledger = active_ledger.pruned_to(candidate.first_interval_epoch)
 
     observations_committed = (
         True
         if not must_commit_observations
-        else _observations_fully_committed(
-            alignment.observations, observation_outcomes
-        )
+        else _observations_fully_committed(publish_set, observation_outcomes)
     )
 
     if must_commit_observations and not observations_committed:
-        # Fail closed: keep prior committed state. Candidate snapshot/checkpoint
-        # remain inspectable but are not published and must not be promoted.
         snapshot, checkpoint = _build_snapshot_and_checkpoint(
             state=candidate,
             alignment=alignment,
@@ -246,10 +317,11 @@ def run_cycle(
             outcomes=tuple(outcomes),
             disposition=DISPOSITION_DEFERRED_UNCOMMITTED,
             promoted=False,
+            revision_ledger=active_ledger,
         )
 
     watermarked = candidate
-    if capture_enabled and publish_observations:
+    if capture_enabled and publish_observations and observation_outcomes:
         watermarked = _advance_watermark_from_outcomes(
             candidate, observation_outcomes
         )
@@ -266,11 +338,8 @@ def run_cycle(
     restart_recorded = False
     if capture_enabled:
         # Publish order is fail-closed: never make a resumable checkpoint durable
-        # until every other required write for this cycle has committed. A
-        # checkpoint written before a failed gap/snapshot/restart would become
-        # the next process's authoritative resume and skip re-detecting missing
-        # evidence.
-        def _deferred_dependent() -> CycleResult:
+        # until every other required write for this cycle has committed.
+        def _deferred_dependent(*, restart_ok: bool = False) -> CycleResult:
             return CycleResult(
                 instrument_version=instrument_version,
                 alignment=alignment,
@@ -278,10 +347,12 @@ def run_cycle(
                 snapshot=snapshot,
                 checkpoint=checkpoint,
                 gap_detected=advance.gap_detected or bool(alignment.gaps),
-                restart_recorded=False,
+                restart_recorded=restart_ok,
                 outcomes=tuple(outcomes),
                 disposition=DISPOSITION_DEFERRED_DEPENDENT,
                 promoted=False,
+                # Observation revisions already durable must survive deferral.
+                revision_ledger=active_ledger,
             )
 
         if alignment.gaps:
@@ -315,7 +386,7 @@ def run_cycle(
         checkpoint_outcome = publisher.publish_checkpoint(checkpoint)
         outcomes.append(checkpoint_outcome)
         if not checkpoint_outcome.committed:
-            return _deferred_dependent()
+            return _deferred_dependent(restart_ok=restart_recorded)
 
     disposition = DISPOSITION_DRY_RUN if not capture_enabled else DISPOSITION_OK
     return CycleResult(
@@ -329,10 +400,12 @@ def run_cycle(
         outcomes=tuple(outcomes),
         disposition=disposition,
         promoted=True,
+        revision_ledger=active_ledger,
     )
 
 
 __all__ = [
+    "CycleIdentityMismatch",
     "CycleResult",
     "DISPOSITION_DEFERRED_DEPENDENT",
     "DISPOSITION_DEFERRED_UNCOMMITTED",

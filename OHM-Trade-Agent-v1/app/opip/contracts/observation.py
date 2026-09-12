@@ -23,11 +23,12 @@ from typing import Any, Mapping
 
 from app.opip.contracts.enums import CoverageState, PayloadKind
 from app.opip.contracts.identity import ConsumedInputWatermark
-from app.opip.contracts.serialization import iso_z
+from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import AvailabilityStamp, require_utc
 
 OBSERVATION_RECORD_TYPE = "Observation"
 OBSERVATION_SCHEMA_VERSION = 1
+DERIVED_IDENTITY_PREFIX = "cid"
 
 #: Value keys carried by a fixed-interval aggregate. ``vwap`` and
 #: ``trade_count`` stay optional because not every venue reports them.
@@ -171,10 +172,24 @@ class Observation:
                 f"OBS:{self.instrument_version_id}"
                 f":{self.aggregate_interval_seconds}s:{grid}:{self.revision}"
             )
-        sequence = self.source_sequence or f"ingest-{self.ingestion_order}"
+        sequence = self.source_sequence or (
+            f"{DERIVED_IDENTITY_PREFIX}-{self._content_identity()}"
+        )
         return (
             f"OBS:{self.instrument_version_id}"
             f":{self.payload_kind.value}:{sequence}:{self.revision}"
+        )
+
+    def _content_identity(self) -> str:
+        """Restart-stable identity when the venue supplies no source_sequence."""
+        return stable_hash(
+            "OBSCID",
+            {
+                "source_event_time": iso_z(self.source_event_time),
+                "payload_kind": self.payload_kind.value,
+                "values": dict(sorted(self.values.items())),
+            },
+            length=16,
         )
 
     @property
@@ -232,11 +247,29 @@ class Observation:
         }
 
 
+def require_durable_identity(observation: Observation) -> None:
+    """Canonical persistence requires restart-stable venue-anchored identity.
+
+    Fixed-interval aggregates are keyed by grid epoch. Non-aggregate facts must
+    carry an explicit ``source_sequence``; process-local ``ingestion_order`` is
+    never sufficient durable identity on its own.
+    """
+    if observation.aggregate_interval_seconds is not None:
+        return
+    if not str(observation.source_sequence or "").strip():
+        raise ValueError(
+            f"{observation.payload_kind.value} observation requires source_sequence "
+            "before canonical persistence; process-local ingestion_order is not identity"
+        )
+
+
 __all__ = [
     "AGGREGATE_OPTIONAL_KEYS",
     "AGGREGATE_REQUIRED_KEYS",
+    "DERIVED_IDENTITY_PREFIX",
     "OBSERVATION_RECORD_TYPE",
     "OBSERVATION_SCHEMA_VERSION",
     "Observation",
     "SourceWatermark",
+    "require_durable_identity",
 ]
