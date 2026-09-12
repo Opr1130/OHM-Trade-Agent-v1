@@ -12,9 +12,11 @@ is produced and inspectable without being written anywhere.
 Canonical-first rule: when the publisher is enabled and observations are to be
 persisted, every observation consumed by the candidate state must commit
 (OK / DUPLICATE_OK with a writer watermark) before RollingState is promoted or
-snapshot/checkpoint/restart evidence is published. Snapshot and checkpoint must
-also commit before the cycle claims durable promotion; otherwise prior state is
-retained and the disposition names the deferred dependent evidence.
+snapshot/checkpoint/restart evidence is published. Dependent writes then commit
+in order: coverage gaps, snapshot, required restart, and only then checkpoint.
+A resumable checkpoint must never become durable before those earlier gates
+succeed; otherwise prior state is retained and the disposition names the
+deferred dependent evidence.
 
 Nothing here schedules itself, ranks candidates, emits alerts, or evaluates a
 detector.
@@ -262,22 +264,13 @@ def run_cycle(
     )
 
     restart_recorded = False
-    dependent_outcomes: list[PublishOutcome] = []
     if capture_enabled:
-        if alignment.gaps:
-            gap_outcomes = publisher.publish_coverage_gaps(
-                alignment.gaps,
-                instrument_version_id=instrument_version.instrument_version_id,
-                venue_instrument_id=instrument_version.venue_instrument_id,
-                detected_at_utc=evaluated_at_utc,
-            )
-            dependent_outcomes.extend(gap_outcomes)
-            outcomes.extend(gap_outcomes)
-        snapshot_outcome = publisher.publish_snapshot(snapshot)
-        checkpoint_outcome = publisher.publish_checkpoint(checkpoint)
-        dependent_outcomes.extend([snapshot_outcome, checkpoint_outcome])
-        outcomes.extend([snapshot_outcome, checkpoint_outcome])
-        if not _dependent_evidence_committed(dependent_outcomes):
+        # Publish order is fail-closed: never make a resumable checkpoint durable
+        # until every other required write for this cycle has committed. A
+        # checkpoint written before a failed gap/snapshot/restart would become
+        # the next process's authoritative resume and skip re-detecting missing
+        # evidence.
+        def _deferred_dependent() -> CycleResult:
             return CycleResult(
                 instrument_version=instrument_version,
                 alignment=alignment,
@@ -290,6 +283,21 @@ def run_cycle(
                 disposition=DISPOSITION_DEFERRED_DEPENDENT,
                 promoted=False,
             )
+
+        if alignment.gaps:
+            gap_outcomes = publisher.publish_coverage_gaps(
+                alignment.gaps,
+                instrument_version_id=instrument_version.instrument_version_id,
+                venue_instrument_id=instrument_version.venue_instrument_id,
+                detected_at_utc=evaluated_at_utc,
+            )
+            outcomes.extend(gap_outcomes)
+            if not _dependent_evidence_committed(gap_outcomes):
+                return _deferred_dependent()
+        snapshot_outcome = publisher.publish_snapshot(snapshot)
+        outcomes.append(snapshot_outcome)
+        if not snapshot_outcome.committed:
+            return _deferred_dependent()
         restart_required = (
             watermarked.restart_state is not RestartState.WARM
             or advance.gap_detected
@@ -301,23 +309,13 @@ def run_cycle(
                 recorded_at_utc=evaluated_at_utc,
             )
             outcomes.append(restart_outcome)
-            # Restart evidence is dependent when required: fail closed so a
-            # process restart cannot promote state without durable restart
-            # disposition for the gap / cold-start.
             if not restart_outcome.committed:
-                return CycleResult(
-                    instrument_version=instrument_version,
-                    alignment=alignment,
-                    state=previous,
-                    snapshot=snapshot,
-                    checkpoint=checkpoint,
-                    gap_detected=advance.gap_detected or bool(alignment.gaps),
-                    restart_recorded=False,
-                    outcomes=tuple(outcomes),
-                    disposition=DISPOSITION_DEFERRED_DEPENDENT,
-                    promoted=False,
-                )
+                return _deferred_dependent()
             restart_recorded = True
+        checkpoint_outcome = publisher.publish_checkpoint(checkpoint)
+        outcomes.append(checkpoint_outcome)
+        if not checkpoint_outcome.committed:
+            return _deferred_dependent()
 
     disposition = DISPOSITION_DRY_RUN if not capture_enabled else DISPOSITION_OK
     return CycleResult(

@@ -972,6 +972,10 @@ def test_required_restart_uncommitted_defers_promotion(status):
     assert result.promoted is False
     assert result.restart_recorded is False
     assert result.state.interval_count == 0
+    assert not any(
+        outcome.event_type == "feature.checkpoint.recorded"
+        for outcome in result.outcomes
+    )
 
 
 def test_legacy_opens_retained_stays_false_until_series_rebuild():
@@ -1266,3 +1270,131 @@ def test_empty_expected_window_cycle_is_incomplete():
     assert result.alignment.expected_intervals == 5
     assert result.alignment.coverage is CoverageState.INCOMPLETE_COVERAGE
     assert result.alignment.gaps
+
+
+def test_resumed_cycle_coverage_window_starts_at_tip_not_full_history():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=10, end_before=CUTOFF - timedelta(minutes=2))),
+    ).state
+    tip_start = datetime.fromtimestamp(previous.last_interval_epoch, tz=timezone.utc)
+    # Tip re-poll covers tip through latest closed before cutoff. Must not invent
+    # gaps for older retained intervals outside this tip window.
+    tip_and_new = _observations(
+        _rows(count=3, end_before=CUTOFF),
+        commit_from=None,
+    )
+    assert tip_and_new[0].source_event_time == tip_start
+    result = run_cycle(
+        tip_and_new,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        source_version="test",
+        window_start=tip_start,
+    )
+    assert result.alignment.expected_intervals == 3
+    assert result.alignment.present_intervals == 3
+    assert result.alignment.gaps == ()
+    assert result.alignment.coverage is CoverageState.COMPLETE
+
+
+def test_checkpoint_not_published_when_earlier_dependent_gate_fails():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=10))),
+    ).state
+    observations = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type == "feature.snapshot.recorded":
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="SPOOLED",
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type == "feature.checkpoint.recorded":
+                raise AssertionError("checkpoint must not publish before snapshot commits")
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    result = run_cycle(
+        observations,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+    )
+    assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert result.promoted is False
+    assert result.state == previous
+    assert not any(
+        outcome.event_type == "feature.checkpoint.recorded"
+        for outcome in result.outcomes
+    )
+
+
+def test_stale_instrument_version_conflict_after_newer_version_fails_closed():
+    v1 = _instrument(version=1, tick_size=0.01)
+    v2 = _instrument(version=2, tick_size=0.01)
+    payload_v1 = instrument_version_record_payload(v1)
+    payload_v2 = instrument_version_record_payload(v2)
+    stale_conflict = dict(payload_v1)
+    stale_conflict["tick_size"] = 0.02
+    with pytest.raises(ValueError, match="instrument version conflict"):
+        reconstruct_instrument_version_registry(
+            [payload_v1, payload_v2, stale_conflict]
+        )
+
+
+def test_registry_active_reference_defaults_to_code_constant():
+    from app.opip.identity.contract import IDENTITY_REFERENCE_DATA_VERSION
+
+    payload = instrument_version_record_payload(
+        _instrument(reference_data_version="opip-evidence-identity-legacy")
+    )
+    restored = reconstruct_instrument_version_registry([payload])
+    assert restored.reference_data_version == IDENTITY_REFERENCE_DATA_VERSION
+
+
+def test_feature_snapshot_mappings_are_immutable_after_construction():
+    result = run_cycle(
+        _observations(
+            _rows(count=MINIMUM_WARMUP_INTERVALS, end_before=CUTOFF),
+            commit_from=None,
+        ),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        source_version="test",
+    )
+    snapshot = result.snapshot
+    before_hash = snapshot.content_hash()
+    with pytest.raises(TypeError):
+        snapshot.values["rsi_14"] = 0.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        snapshot.missingness["rsi_14"] = Missingness.MISSING  # type: ignore[index]
+    assert snapshot.content_hash() == before_hash

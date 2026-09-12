@@ -18,6 +18,7 @@ from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.serialization import iso_z
 from app.opip.contracts.temporal import require_utc
 from app.opip.identity.contract import (
+    IDENTITY_REFERENCE_DATA_VERSION,
     IdentityProvenance,
     IdentityResolutionStatus,
     InstrumentClass,
@@ -75,11 +76,25 @@ def reconstruct_instrument_version_registry(
     """Latest committed version wins per instrument_key (monotonic versions).
 
     Same version with a different reference fingerprint is integrity corruption
-    and fails closed. Same version with the same fingerprint is idempotent.
+    and fails closed — including stale conflicting records that appear after a
+    higher version in commit order. Same version with the same fingerprint is
+    idempotent. Active registry reference schema defaults to the current code
+    constant unless the caller overrides it; historical payloads remain
+    comparison state only.
     """
     latest: dict[str, InstrumentVersion] = {}
+    fingerprints: dict[tuple[str, int], str] = {}
     for payload in payloads:
         version = instrument_version_from_payload(payload)
+        fp = version.reference_fingerprint()
+        slot = (version.instrument_key, int(version.version))
+        prior_fp = fingerprints.get(slot)
+        if prior_fp is not None and prior_fp != fp:
+            raise ValueError(
+                "instrument version conflict: same version with different "
+                f"reference fingerprint for {version.instrument_key}"
+            )
+        fingerprints[slot] = fp
         existing = latest.get(version.instrument_key)
         if existing is None:
             latest[version.instrument_key] = version
@@ -89,19 +104,10 @@ def reconstruct_instrument_version_registry(
         if version.version > existing.version:
             latest[version.instrument_key] = version
             continue
-        if version.reference_fingerprint() != existing.reference_fingerprint():
-            raise ValueError(
-                "instrument version conflict: same version with different "
-                f"reference fingerprint for {version.instrument_key}"
-            )
         # Identical version + fingerprint: idempotent keep.
         latest[version.instrument_key] = version
-    ref = reference_data_version
-    if ref is None and latest:
-        ref = next(iter(latest.values())).reference_data_version
-    return InstrumentVersionRegistry(
-        reference_data_version=ref or "opip-evidence-identity-v1", known=latest
-    )
+    ref = reference_data_version or IDENTITY_REFERENCE_DATA_VERSION
+    return InstrumentVersionRegistry(reference_data_version=ref, known=latest)
 
 
 def load_instrument_version_payloads(db_path: Path) -> list[dict[str, Any]]:

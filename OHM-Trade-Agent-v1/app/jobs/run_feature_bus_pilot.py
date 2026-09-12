@@ -197,14 +197,14 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     cycles: list[dict[str, Any]] = []
     for batch in batches:
         prior = restored_states.get(batch.instrument_version.instrument_version_id)
+        # Resumed coverage bounds THIS cycle's tip re-poll window only.
+        # Widening to the oldest retained bar invents false gaps for intervals
+        # that were never supposed to be re-fetched this cycle.
         window_start = None
-        if prior is not None and prior.first_interval_epoch is not None:
+        if prior is not None and prior.last_interval_epoch is not None:
             window_start = datetime.fromtimestamp(
-                prior.first_interval_epoch, tz=timezone.utc
+                prior.last_interval_epoch, tz=timezone.utc
             )
-        elif prior is not None and prior.last_interval_epoch is not None:
-            tip_start = prior.last_interval_epoch
-            window_start = datetime.fromtimestamp(tip_start, tz=timezone.utc)
         # Always evaluate the expected window — empty/transport failures still
         # produce incomplete coverage evidence rather than silent skips.
         result = run_cycle(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.contracts.enums import CoverageState, Missingness, RestartState
@@ -129,9 +130,15 @@ class FeatureSnapshot:
         object.__setattr__(self, "evaluated_at_utc", evaluated_at)
         object.__setattr__(self, "evaluation_grid_seconds", int(self.evaluation_grid_seconds))
         object.__setattr__(
-            self, "values", _scalar_values(self.values, field_name="values")
+            self,
+            "values",
+            MappingProxyType(_scalar_values(self.values, field_name="values")),
         )
-        object.__setattr__(self, "missingness", dict(sorted(missingness.items())))
+        object.__setattr__(
+            self,
+            "missingness",
+            MappingProxyType(dict(sorted(missingness.items()))),
+        )
         object.__setattr__(
             self, "venue_instrument_id", str(self.venue_instrument_id).strip()
         )
@@ -266,7 +273,7 @@ class FeatureStateCheckpoint:
         object.__setattr__(
             self,
             "rolling_state",
-            _scalar_or_list_state(self.rolling_state),
+            MappingProxyType(_scalar_or_list_state(self.rolling_state)),
         )
         object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
 
