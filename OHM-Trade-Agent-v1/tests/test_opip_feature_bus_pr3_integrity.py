@@ -852,9 +852,211 @@ def test_source_readmits_tip_interval_for_correction():
     )
     first = source.fetch_through(instrument, watermark=None, now=NOW)
     assert first.ok
+    assert first.coverage is CoverageState.COMPLETE
     assert first.watermark.through_utc is not None
     second = source.fetch_through(
         instrument, watermark=first.watermark, now=NOW
     )
     tip_start = first.watermark.through_utc - timedelta(seconds=60)
     assert any(item.source_event_time == tip_start for item in second.observations)
+    # Same evaluation clock: only the tip closed bar is expected → COMPLETE.
+    assert second.coverage is CoverageState.COMPLETE
+
+
+def test_source_coverage_incomplete_when_tip_window_has_gaps():
+    instrument = _instrument()
+    gapped = _rows(count=4, end_before=CUTOFF, skip={1})
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        return gapped
+
+    source = PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="test",
+        interval_seconds=60,
+        clock=lambda: NOW,
+    )
+    batch = source.fetch_through(instrument, watermark=None, now=NOW)
+    assert batch.observations
+    assert batch.coverage is CoverageState.INCOMPLETE_COVERAGE
+
+
+def test_source_coverage_incomplete_when_tip_lags_evaluation_clock():
+    instrument = _instrument()
+    rows = _rows(count=3, end_before=CUTOFF)
+
+    def fetcher(venue_id, *, interval_minutes, since_epoch):
+        return rows
+
+    source = PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="test",
+        interval_seconds=60,
+        clock=lambda: NOW,
+    )
+    first = source.fetch_through(instrument, watermark=None, now=NOW)
+    later = NOW + timedelta(minutes=3)
+    tip_only = source.fetch_through(
+        instrument, watermark=first.watermark, now=later
+    )
+    assert tip_only.observations
+    assert tip_only.coverage is CoverageState.INCOMPLETE_COVERAGE
+
+
+@pytest.mark.parametrize("status", ["SPOOLED", "REJECTED", "RETRYABLE"])
+def test_required_restart_uncommitted_defers_promotion(status):
+    observations = _observations(_rows(count=5, end_before=CUTOFF), commit_from=None)
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type in {
+                "feature.snapshot.recorded",
+                "feature.checkpoint.recorded",
+            }:
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, 100 + self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type == "feature.restart.recorded":
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status=status,
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    result = run_cycle(
+        observations,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        publisher=_Publisher(),
+        source_version="test",
+    )
+    assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert result.promoted is False
+    assert result.restart_recorded is False
+    assert result.state.interval_count == 0
+
+
+def test_legacy_opens_retained_stays_false_until_series_rebuild():
+    early = advance_state(
+        initial_state(_instrument()),
+        _observations(
+            _rows(count=5, end_before=CUTOFF - timedelta(minutes=40)),
+            commit_from=None,
+        ),
+    ).state
+    checkpoint = to_checkpoint(early, created_at_utc=NOW)
+    rolling = dict(checkpoint.rolling_state)
+    rolling.pop("opens", None)
+    rolling.pop("opens_retained", None)
+    restored = from_checkpoint(replace(checkpoint, rolling_state=rolling))
+    assert restored.opens_retained is False
+
+    tip_epoch = int(restored.first_interval_epoch) + 60 * (restored.interval_count - 1)
+    corrected = replace(
+        _observations(
+            [
+                IntervalRow(
+                    interval_start_epoch=tip_epoch,
+                    open=111.0,
+                    high=112.0,
+                    low=110.0,
+                    close=111.5,
+                    volume=9.0,
+                    vwap=111.2,
+                    trade_count=3,
+                )
+            ],
+            commit_from=None,
+        )[0],
+        revision=2,
+        supersedes="OBS:legacy",
+    )
+    advanced = advance_state(restored, (corrected,)).state
+    assert advanced.opens_retained is False
+    assert advanced.closes[-1] == 111.5
+
+    rebuilt = advance_state(
+        advanced,
+        _observations(_rows(count=5, end_before=CUTOFF), commit_from=None),
+    )
+    assert rebuilt.gap_detected
+    assert rebuilt.state.opens_retained is True
+    assert rebuilt.state.interval_count == 5
+
+
+def test_pilot_dry_run_forces_disabled_capture_and_synthetic_identity(monkeypatch):
+    monkeypatch.setenv("OPIP_FEATURE_BUS_MODE", "shadow")
+    monkeypatch.setenv("OPIP_CANONICAL_WRITER_MODE", "shadow")
+    from app.jobs import run_feature_bus_pilot as pilot
+
+    captured: dict[str, object] = {}
+
+    class _SpyPublisher(FeatureBusPublisher):
+        def __init__(self, *args, **kwargs):
+            captured["enabled"] = kwargs.get("enabled", True)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pilot, "FeatureBusPublisher", _SpyPublisher)
+    report = pilot._dry_run(4)
+    assert captured.get("enabled") is False
+    assert report["cycle"]["instrument_version_id"].startswith("INSTR:synthetic:")
+    assert report["cycle"]["persisted"] is False
+    assert report["cycle"]["disposition"] == DISPOSITION_DRY_RUN
+
+
+def test_checkpoint_store_restores_rolling_state(canonical_env, writer_server):
+    from app.opip.features.checkpoint_store import load_rolling_state
+
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(client, enabled=True)
+    instrument = _instrument()
+    observations = _observations(
+        _rows(count=MINIMUM_WARMUP_INTERVALS, end_before=CUTOFF), commit_from=None
+    )
+    result = run_cycle(
+        observations,
+        instrument_version=instrument,
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        publisher=publisher,
+        source_version="test",
+    )
+    assert result.promoted is True
+    restored = load_rolling_state(
+        instrument.instrument_version_id, db_path=canonical_env["db"]
+    )
+    assert restored is not None
+    assert restored.interval_count == result.state.interval_count
+    assert restored.closes == result.state.closes
+    assert restored.resumed_from_checkpoint is True

@@ -137,6 +137,76 @@ def _advance_watermark(
     )
 
 
+def _observation_start_epochs(observations: Sequence[Observation]) -> tuple[int, ...]:
+    return tuple(
+        sorted({int(item.source_event_time.timestamp()) for item in observations})
+    )
+
+
+def _epochs_are_contiguous(epochs: Sequence[int], *, interval_seconds: int) -> bool:
+    if not epochs:
+        return False
+    step = int(interval_seconds)
+    for previous, current in zip(epochs, epochs[1:]):
+        if int(current) - int(previous) != step:
+            return False
+    return True
+
+
+def _expected_tip_window_epochs(
+    previous: SourceWatermark,
+    *,
+    now: datetime,
+    interval_seconds: int,
+) -> tuple[int, ...] | None:
+    """Closed interval starts expected when resuming from a tip watermark.
+
+    Cold starts (no through_utc) return None — completeness is then contiguous
+    non-empty closed rows only. Resumed polls must cover tip through the latest
+    closed cutoff at ``now``, or coverage stays incomplete.
+    """
+    if previous.through_utc is None:
+        return None
+    tip_start = previous.through_utc - timedelta(seconds=interval_seconds)
+    cutoff = latest_closed_cutoff(now, interval_seconds=interval_seconds)
+    last_start = cutoff - timedelta(seconds=interval_seconds)
+    if last_start < tip_start:
+        return ()
+    epochs: list[int] = []
+    epoch = int(tip_start.timestamp())
+    end = int(last_start.timestamp())
+    step = int(interval_seconds)
+    while epoch <= end:
+        epochs.append(epoch)
+        epoch += step
+    return tuple(epochs)
+
+
+def _coverage_for_completed(
+    completed: Sequence[Observation],
+    *,
+    previous: SourceWatermark,
+    now: datetime,
+    interval_seconds: int,
+    rejected: bool,
+) -> CoverageState:
+    if rejected or not completed:
+        return CoverageState.INCOMPLETE_COVERAGE
+    epochs = _observation_start_epochs(completed)
+    if not _epochs_are_contiguous(epochs, interval_seconds=interval_seconds):
+        return CoverageState.INCOMPLETE_COVERAGE
+    expected = _expected_tip_window_epochs(
+        previous, now=now, interval_seconds=interval_seconds
+    )
+    if expected is None:
+        return CoverageState.COMPLETE
+    if not expected:
+        return CoverageState.COMPLETE
+    if tuple(epochs) != tuple(expected):
+        return CoverageState.INCOMPLETE_COVERAGE
+    return CoverageState.COMPLETE
+
+
 class PolledMinuteBarSource:
     """Pilot polling source over an injected fixed-interval fetcher.
 
@@ -245,10 +315,12 @@ class PolledMinuteBarSource:
                 for item in closed
                 if item.source_event_time >= tip_start
             )
-        coverage = (
-            CoverageState.COMPLETE
-            if completed and not result.rejected
-            else CoverageState.INCOMPLETE_COVERAGE
+        coverage = _coverage_for_completed(
+            completed,
+            previous=previous,
+            now=now,
+            interval_seconds=self.interval_seconds,
+            rejected=bool(result.rejected),
         )
         return SourceBatch(
             instrument_version=instrument_version,

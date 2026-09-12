@@ -392,7 +392,15 @@ def advance_state(
         persistence_intervals=persistence,
         gap_resets=gap_resets,
         last_gap_epoch=last_gap_epoch,
-        opens_retained=True if applied else state.opens_retained,
+        # Never flip legacy placeholder opens to "trusted" merely because one
+        # live bar was applied mid-window. Trust returns only after a cold
+        # start, a mid-window gap rebuild, or when opens were already retained.
+        opens_retained=(
+            True
+            if applied
+            and (state.opens_retained or gap_detected or state.interval_count == 0)
+            else state.opens_retained
+        ),
     )
     advanced = replace(advanced, restart_state=_resolve_restart_state(advanced))
     return AdvanceResult(

@@ -28,6 +28,8 @@ import random
 from typing import Any
 
 from app.opip.contracts.identity import InstrumentVersion
+from app.opip.contracts.observation import SourceWatermark
+from app.opip.features.checkpoint_store import load_rolling_state
 from app.opip.features.parity import compare_against_production_indicators
 from app.opip.features.pipeline import run_cycle
 from app.opip.features.publisher import (
@@ -49,11 +51,13 @@ SYNTHETIC_SOURCE_LABEL = "synthetic_dry_run"
 
 
 def _synthetic_instrument(now: datetime) -> InstrumentVersion:
+    # Distinct venue/identity so a mis-enabled publisher cannot collide with
+    # real Kraken SOL/USD observation identity.
     return InstrumentVersion(
-        venue="kraken",
+        venue="synthetic",
         base_asset="SOL",
         quote_currency="USD",
-        venue_instrument_id="SOLUSD",
+        venue_instrument_id="SYNTHETIC-SOLUSD",
         version=1,
         reference_data_version="opip-evidence-identity-v1",
         observed_at_utc=now,
@@ -107,7 +111,9 @@ def _dry_run(intervals: int) -> dict[str, Any]:
     observations = _synthetic_observations(
         instrument_version, cutoff=cutoff, intervals=intervals, now=now
     )
-    publisher = FeatureBusPublisher()
+    # Capture must stay disabled on the synthetic path even if shadow gates are
+    # enabled — fabricated candles must never enter the canonical WAL.
+    publisher = FeatureBusPublisher(enabled=False)
     result = run_cycle(
         observations,
         instrument_version=instrument_version,
@@ -155,11 +161,31 @@ def _live_pilot(limit: int) -> dict[str, Any]:
         committed_versions.append(version)
 
     source = kraken_minute_source()
+    # Restore source watermarks from retained checkpoints so tip re-poll and
+    # superseding revisions work across process restarts.
+    restored_states: dict[str, Any] = {}
+    source_watermarks: dict[str, Any] = {}
+    for version in committed_versions:
+        state = load_rolling_state(version.instrument_version_id)
+        if state is None:
+            continue
+        restored_states[version.instrument_version_id] = state
+        if state.last_interval_epoch is not None:
+            tip_end = datetime.fromtimestamp(
+                state.last_interval_epoch + state.interval_seconds,
+                tz=timezone.utc,
+            )
+            source_watermarks[version.instrument_version_id] = SourceWatermark(
+                instrument_version_id=version.instrument_version_id,
+                through_utc=tip_end,
+            )
+
     batches, report, _ = run_pilot_cycle(
         source,
         committed_versions,
         now=refresh_at,
         eligible_instruments=len(universe),
+        watermarks=source_watermarks or None,
     )
     # Evaluation time is after network receipt so availability cannot outrun it.
     evaluated_at = report.finished_at_utc
@@ -176,11 +202,13 @@ def _live_pilot(limit: int) -> dict[str, Any]:
                 }
             )
             continue
+        prior = restored_states.get(batch.instrument_version.instrument_version_id)
         result = run_cycle(
             batch.observations,
             instrument_version=batch.instrument_version,
             evaluation_cutoff=cutoff,
             evaluated_at_utc=evaluated_at,
+            state=prior,
             publisher=publisher,
             source_version=KRAKEN_OHLC_SOURCE_LABEL,
         )
@@ -191,6 +219,7 @@ def _live_pilot(limit: int) -> dict[str, Any]:
         "instrument_versions": instrument_version_outcomes,
         "cycles": cycles,
         "publisher": publisher.summary(),
+        "restored_checkpoints": len(restored_states),
     }
 
 

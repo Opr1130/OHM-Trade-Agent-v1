@@ -282,17 +282,34 @@ def run_cycle(
                 disposition=DISPOSITION_DEFERRED_DEPENDENT,
                 promoted=False,
             )
-        if (
+        restart_required = (
             watermarked.restart_state is not RestartState.WARM
             or advance.gap_detected
-        ):
+        )
+        if restart_required:
             restart_outcome = publisher.publish_restart(
                 restart_disposition(watermarked),
                 watermark=watermarked.consumed_input_watermark,
                 recorded_at_utc=evaluated_at_utc,
             )
             outcomes.append(restart_outcome)
-            restart_recorded = restart_outcome.committed
+            # Restart evidence is dependent when required: fail closed so a
+            # process restart cannot promote state without durable restart
+            # disposition for the gap / cold-start.
+            if not restart_outcome.committed:
+                return CycleResult(
+                    instrument_version=instrument_version,
+                    alignment=alignment,
+                    state=previous,
+                    snapshot=snapshot,
+                    checkpoint=checkpoint,
+                    gap_detected=advance.gap_detected or bool(alignment.gaps),
+                    restart_recorded=False,
+                    outcomes=tuple(outcomes),
+                    disposition=DISPOSITION_DEFERRED_DEPENDENT,
+                    promoted=False,
+                )
+            restart_recorded = True
 
     disposition = DISPOSITION_DRY_RUN if not capture_enabled else DISPOSITION_OK
     return CycleResult(
