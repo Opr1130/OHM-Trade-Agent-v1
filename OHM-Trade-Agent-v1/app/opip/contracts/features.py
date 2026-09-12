@@ -309,7 +309,11 @@ class FeatureStateCheckpoint:
 
 
 def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    """Rolling state may hold scalars, numeric lists, bool lists, or string lists."""
+    """Rolling state may hold scalars, numeric lists, bool lists, or string lists.
+
+    Nested sequences are frozen as tuples so MappingProxyType exposure cannot be
+    mutated through list element assignment after construction.
+    """
     cleaned: dict[str, Any] = {}
     for key, value in dict(state).items():
         name = str(key)
@@ -319,17 +323,17 @@ def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, (list, tuple)):
             items = list(value)
             if not items:
-                cleaned[name] = []
+                cleaned[name] = ()
                 continue
             if all(isinstance(item, str) for item in items):
-                cleaned[name] = [str(item) for item in items]
+                cleaned[name] = tuple(str(item) for item in items)
                 continue
             if all(isinstance(item, bool) for item in items):
-                cleaned[name] = [bool(item) for item in items]
+                cleaned[name] = tuple(bool(item) for item in items)
                 continue
             if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in items):
                 raise TypeError(f"rolling_state[{name}] lists must be numeric")
-            cleaned[name] = [float(item) for item in items]
+            cleaned[name] = tuple(float(item) for item in items)
             continue
         raise TypeError(f"rolling_state[{name}] must be a scalar or list")
     return dict(sorted(cleaned.items()))

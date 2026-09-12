@@ -292,7 +292,7 @@ def run_cycle(
                 detected_at_utc=evaluated_at_utc,
             )
             outcomes.extend(gap_outcomes)
-            if not _dependent_evidence_committed(gap_outcomes):
+            if not all(item.committed for item in gap_outcomes):
                 return _deferred_dependent()
         snapshot_outcome = publisher.publish_snapshot(snapshot)
         outcomes.append(snapshot_outcome)

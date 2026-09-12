@@ -26,6 +26,7 @@ from app.opip.features.pipeline import (
     DISPOSITION_DEFERRED_DEPENDENT,
     DISPOSITION_DEFERRED_UNCOMMITTED,
     DISPOSITION_DRY_RUN,
+    DISPOSITION_OK,
     run_cycle,
 )
 from app.opip.features.publisher import (
@@ -747,7 +748,7 @@ def test_open_only_correction_mints_revision():
     assert advanced_open.revisions[-1] == 2
 
 
-def test_unchanged_tip_repoll_is_dropped_before_publish():
+def test_unchanged_tip_repoll_is_kept_for_coverage_without_revision_mint():
     previous = advance_state(
         initial_state(_instrument()),
         _observations(_rows(count=5, end_before=CUTOFF)),
@@ -769,7 +770,85 @@ def test_unchanged_tip_repoll_is_dropped_before_publish():
         ],
         commit_from=None,
     )
-    assert revise_against_retained(same, previous) == ()
+    revised = revise_against_retained(same, previous)
+    assert len(revised) == 1
+    assert revised[0].revision == 1
+    assert revised[0].supersedes is None
+    tip_start = datetime.fromtimestamp(last_epoch, tz=timezone.utc)
+    result = run_cycle(
+        same,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        source_version="test",
+        window_start=tip_start,
+    )
+    assert result.alignment.gaps == ()
+    assert result.alignment.coverage is CoverageState.COMPLETE
+    assert result.alignment.present_intervals == 1
+
+
+def test_coverage_gap_committed_allows_snapshot_and_checkpoint():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=10))),
+    ).state
+    observations = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type in {
+                "coverage.gap.recorded",
+                "feature.snapshot.recorded",
+                "feature.checkpoint.recorded",
+                "feature.restart.recorded",
+            }:
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, 200 + self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    result = run_cycle(
+        observations,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+        window_start=CUTOFF - timedelta(minutes=4),
+    )
+    assert result.alignment.gaps
+    assert result.disposition == DISPOSITION_OK
+    assert result.promoted is True
+    assert any(
+        outcome.event_type == "feature.checkpoint.recorded" and outcome.committed
+        for outcome in result.outcomes
+    )
 
 
 def test_coverage_gap_uncommitted_defers_promotion():
@@ -1398,3 +1477,43 @@ def test_feature_snapshot_mappings_are_immutable_after_construction():
     with pytest.raises(TypeError):
         snapshot.missingness["rsi_14"] = Missingness.MISSING  # type: ignore[index]
     assert snapshot.content_hash() == before_hash
+    with pytest.raises(TypeError):
+        result.checkpoint.rolling_state["closes"][0] = 0.0  # type: ignore[index]
+
+
+def test_checkpoint_restore_ignores_other_feature_versions(tmp_path):
+    from app.opip.features.checkpoint_store import load_latest_checkpoint_payload
+    from app.opip.features.engine import FEATURE_VERSION
+
+    state = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF), commit_from=None),
+    ).state
+    checkpoint = to_checkpoint(state, created_at_utc=NOW)
+    assert checkpoint.feature_version == FEATURE_VERSION
+    db_path = tmp_path / "canonical.db"
+    server = CanonicalWriterServer(
+        db_path=db_path,
+        socket_path=tmp_path / "writer.sock",
+    )
+    client = InProcessWriterClient(server)
+    publisher = FeatureBusPublisher(
+        enabled=True, settings=SHADOW_CAPTURE_SETTINGS, client=client
+    )
+    outcome = publisher.publish_checkpoint(checkpoint)
+    assert outcome.committed
+    assert (
+        load_latest_checkpoint_payload(
+            checkpoint.instrument_version_id,
+            db_path=db_path,
+            feature_version="features-v0-legacy",
+        )
+        is None
+    )
+    matched = load_latest_checkpoint_payload(
+        checkpoint.instrument_version_id,
+        db_path=db_path,
+        feature_version=FEATURE_VERSION,
+    )
+    assert matched is not None
+    assert matched["feature_version"] == FEATURE_VERSION

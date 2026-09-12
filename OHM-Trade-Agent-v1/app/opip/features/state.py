@@ -210,8 +210,10 @@ def revise_against_retained(
     and RollingState ignores the equal revision. Canonical history stays
     append-only; this only assigns the next revision identity before publish.
 
-    Unchanged tip re-polls are dropped so watermark-driven re-admission of the
-    tip does not republish identical revision-1 evidence every cycle.
+    Unchanged tip re-polls are retained for alignment/coverage so a tip-bounded
+    expected window does not invent false gaps, but they are not revision-minted.
+    Equal or older revisions are ignored by ``advance_state``; publish relies on
+    writer ``DUPLICATE_OK`` for identical observation identities.
     """
     if not observations or state.interval_count == 0 or state.first_interval_epoch is None:
         return tuple(observations)
@@ -242,6 +244,8 @@ def revise_against_retained(
             else ""
         )
         if retained_fp and retained_fp == incoming_fp:
+            # Unchanged: keep for coverage; do not mint a superseding revision.
+            revised.append(observation)
             continue
         if retained_fp and retained_fp != incoming_fp:
             changed = True
@@ -277,6 +281,7 @@ def revise_against_retained(
             )
             changed = incoming != live_retained
         if not changed:
+            revised.append(observation)
             continue
         if int(observation.revision) > retained_revision:
             revised.append(observation)

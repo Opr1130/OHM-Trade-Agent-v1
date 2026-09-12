@@ -48,8 +48,15 @@ def checkpoint_from_payload(payload: Mapping[str, Any]) -> FeatureStateCheckpoin
 def load_latest_checkpoint_payload(
     instrument_version_id: str,
     db_path: Path | None = None,
+    *,
+    feature_version: str | None = None,
 ) -> dict[str, Any] | None:
-    """Latest committed checkpoint for one instrument_version_id, or None."""
+    """Latest committed checkpoint for one instrument_version_id, or None.
+
+    When ``feature_version`` is provided, older-version checkpoints are ignored
+    so a feature-engine bump cold-starts instead of restoring incompatible
+    retained-window assumptions under a new snapshot stamp.
+    """
     from app.opip.canonical.schema import connect
 
     if db_path is None:
@@ -79,6 +86,8 @@ def load_latest_checkpoint_payload(
             continue
         if str(payload.get("instrument_version_id") or "") != instrument_version_id:
             continue
+        if feature_version is not None and str(payload.get("feature_version") or "") != feature_version:
+            continue
         latest = payload
     return latest
 
@@ -86,9 +95,18 @@ def load_latest_checkpoint_payload(
 def load_rolling_state(
     instrument_version_id: str,
     db_path: Path | None = None,
+    *,
+    feature_version: str | None = None,
 ) -> RollingState | None:
     """Resume RollingState from the latest committed checkpoint, if any."""
-    payload = load_latest_checkpoint_payload(instrument_version_id, db_path=db_path)
+    from app.opip.features.engine import FEATURE_VERSION
+
+    required_version = FEATURE_VERSION if feature_version is None else feature_version
+    payload = load_latest_checkpoint_payload(
+        instrument_version_id,
+        db_path=db_path,
+        feature_version=required_version,
+    )
     if payload is None:
         return None
     return from_checkpoint(checkpoint_from_payload(payload))
