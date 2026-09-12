@@ -36,6 +36,7 @@ from app.opip.features.publisher import (
     resolve_feature_bus_mode,
 )
 from app.opip.market.aggregates import grid_floor
+from app.opip.market.instrument_version_store import hydrate_instrument_version_registry
 from app.opip.market.observations import IntervalRow, normalize_interval_rows
 from app.opip.market.source import run_pilot_cycle
 from app.services.opip_feature_bus_market_source import (
@@ -129,19 +130,40 @@ def _dry_run(intervals: int) -> dict[str, Any]:
 
 
 def _live_pilot(limit: int) -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    cutoff = grid_floor(now)
-    provider = KrakenInstrumentProvider()
-    universe = provider.refresh(observed_at_utc=now)
+    publisher = FeatureBusPublisher()
+    registry = hydrate_instrument_version_registry()
+    provider = KrakenInstrumentProvider(registry=registry)
+    refresh_at = datetime.now(timezone.utc)
+    universe = provider.refresh(observed_at_utc=refresh_at)
     selected = universe[:limit]
+
+    instrument_version_outcomes: list[dict[str, Any]] = []
+    committed_versions: list[InstrumentVersion] = []
+    for version in selected:
+        outcome = publisher.publish_instrument_version(version)
+        instrument_version_outcomes.append(
+            {
+                "instrument_version_id": version.instrument_version_id,
+                "status": outcome.status,
+                "committed": outcome.committed,
+            }
+        )
+        # Capture-off (DISABLED) is a deliberate dry path; only fail closed when
+        # capture is enabled and the newly required version did not commit.
+        if publisher.enabled and not outcome.committed:
+            continue
+        committed_versions.append(version)
+
     source = kraken_minute_source()
     batches, report, _ = run_pilot_cycle(
         source,
-        selected,
-        now=now,
+        committed_versions,
+        now=refresh_at,
         eligible_instruments=len(universe),
     )
-    publisher = FeatureBusPublisher()
+    # Evaluation time is after network receipt so availability cannot outrun it.
+    evaluated_at = report.finished_at_utc
+    cutoff = grid_floor(evaluated_at)
     cycles: list[dict[str, Any]] = []
     for batch in batches:
         if not batch.observations:
@@ -158,7 +180,7 @@ def _live_pilot(limit: int) -> dict[str, Any]:
             batch.observations,
             instrument_version=batch.instrument_version,
             evaluation_cutoff=cutoff,
-            evaluated_at_utc=now,
+            evaluated_at_utc=evaluated_at,
             publisher=publisher,
             source_version=KRAKEN_OHLC_SOURCE_LABEL,
         )
@@ -166,6 +188,7 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     return {
         "mode": "live_pilot",
         "measurement": report.to_dict(),
+        "instrument_versions": instrument_version_outcomes,
         "cycles": cycles,
         "publisher": publisher.summary(),
     }

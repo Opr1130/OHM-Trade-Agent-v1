@@ -12,7 +12,9 @@ is produced and inspectable without being written anywhere.
 Canonical-first rule: when the publisher is enabled and observations are to be
 persisted, every observation consumed by the candidate state must commit
 (OK / DUPLICATE_OK with a writer watermark) before RollingState is promoted or
-snapshot/checkpoint/restart evidence is published.
+snapshot/checkpoint/restart evidence is published. Snapshot and checkpoint must
+also commit before the cycle claims durable promotion; otherwise prior state is
+retained and the disposition names the deferred dependent evidence.
 
 Nothing here schedules itself, ranks candidates, emits alerts, or evaluates a
 detector.
@@ -36,6 +38,7 @@ from app.opip.features.state import (
     alignment_from_state,
     initial_state,
     restart_disposition,
+    revise_against_retained,
     to_checkpoint,
 )
 from app.opip.market.aggregates import (
@@ -47,6 +50,7 @@ from app.opip.market.aggregates import (
 DISPOSITION_OK = "OK"
 DISPOSITION_DRY_RUN = "DRY_RUN"
 DISPOSITION_DEFERRED_UNCOMMITTED = "DEFERRED_UNCOMMITTED_OBSERVATIONS"
+DISPOSITION_DEFERRED_DEPENDENT = "DEFERRED_UNCOMMITTED_SNAPSHOT_OR_CHECKPOINT"
 
 
 @dataclass(frozen=True)
@@ -121,6 +125,19 @@ def _observations_fully_committed(
     )
 
 
+def _dependent_evidence_committed(outcomes: Sequence[PublishOutcome]) -> bool:
+    """Snapshot and checkpoint must both commit when capture is enabled."""
+    by_type = {outcome.event_type: outcome for outcome in outcomes}
+    snapshot = by_type.get("feature.snapshot.recorded")
+    checkpoint = by_type.get("feature.checkpoint.recorded")
+    return (
+        snapshot is not None
+        and checkpoint is not None
+        and snapshot.committed
+        and checkpoint.committed
+    )
+
+
 def _build_snapshot_and_checkpoint(
     *,
     state: RollingState,
@@ -161,15 +178,17 @@ def run_cycle(
 
     Candidate state is always computed. Promotion and dependent canonical
     publication require every observation to commit when capture is enabled.
+    Snapshot and checkpoint must also commit before promotion is claimed.
     """
+    previous = state or initial_state(
+        instrument_version, interval_seconds=interval_seconds
+    )
+    revised = revise_against_retained(observations, previous)
     alignment = align_minute_observations(
-        observations,
+        revised,
         cutoff=evaluation_cutoff,
         interval_seconds=interval_seconds,
         window_start=window_start,
-    )
-    previous = state or initial_state(
-        instrument_version, interval_seconds=interval_seconds
     )
     advance = advance_state(previous, alignment.observations)
     candidate = advance.state
@@ -217,14 +236,14 @@ def run_cycle(
             promoted=False,
         )
 
-    promoted_state = candidate
+    watermarked = candidate
     if capture_enabled and publish_observations:
-        promoted_state = _advance_watermark_from_outcomes(
+        watermarked = _advance_watermark_from_outcomes(
             candidate, observation_outcomes
         )
 
     snapshot, checkpoint = _build_snapshot_and_checkpoint(
-        state=promoted_state,
+        state=watermarked,
         alignment=alignment,
         instrument_version=instrument_version,
         evaluation_cutoff=evaluation_cutoff,
@@ -233,6 +252,7 @@ def run_cycle(
     )
 
     restart_recorded = False
+    dependent_outcomes: list[PublishOutcome] = []
     if capture_enabled:
         if alignment.gaps:
             outcomes.extend(
@@ -243,15 +263,30 @@ def run_cycle(
                     detected_at_utc=evaluated_at_utc,
                 )
             )
-        outcomes.append(publisher.publish_snapshot(snapshot))
-        outcomes.append(publisher.publish_checkpoint(checkpoint))
+        snapshot_outcome = publisher.publish_snapshot(snapshot)
+        checkpoint_outcome = publisher.publish_checkpoint(checkpoint)
+        dependent_outcomes = [snapshot_outcome, checkpoint_outcome]
+        outcomes.extend(dependent_outcomes)
+        if not _dependent_evidence_committed(dependent_outcomes):
+            return CycleResult(
+                instrument_version=instrument_version,
+                alignment=alignment,
+                state=previous,
+                snapshot=snapshot,
+                checkpoint=checkpoint,
+                gap_detected=advance.gap_detected or bool(alignment.gaps),
+                restart_recorded=False,
+                outcomes=tuple(outcomes),
+                disposition=DISPOSITION_DEFERRED_DEPENDENT,
+                promoted=False,
+            )
         if (
-            promoted_state.restart_state is not RestartState.WARM
+            watermarked.restart_state is not RestartState.WARM
             or advance.gap_detected
         ):
             restart_outcome = publisher.publish_restart(
-                restart_disposition(promoted_state),
-                watermark=promoted_state.consumed_input_watermark,
+                restart_disposition(watermarked),
+                watermark=watermarked.consumed_input_watermark,
                 recorded_at_utc=evaluated_at_utc,
             )
             outcomes.append(restart_outcome)
@@ -261,7 +296,7 @@ def run_cycle(
     return CycleResult(
         instrument_version=instrument_version,
         alignment=alignment,
-        state=promoted_state,
+        state=watermarked,
         snapshot=snapshot,
         checkpoint=checkpoint,
         gap_detected=advance.gap_detected or bool(alignment.gaps),
@@ -274,6 +309,7 @@ def run_cycle(
 
 __all__ = [
     "CycleResult",
+    "DISPOSITION_DEFERRED_DEPENDENT",
     "DISPOSITION_DEFERRED_UNCOMMITTED",
     "DISPOSITION_DRY_RUN",
     "DISPOSITION_OK",

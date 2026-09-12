@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from app.opip.contracts.enums import CoverageState, PayloadKind, RestartState
 from app.opip.contracts.features import FeatureStateCheckpoint
@@ -162,6 +162,74 @@ def _resolve_restart_state(state: RollingState) -> RestartState:
 
 def _clear_series() -> tuple[list[float], list[float], list[float], list[float], list[int]]:
     return [], [], [], [], []
+
+
+def revise_against_retained(
+    observations: Sequence[Observation],
+    state: RollingState,
+) -> tuple[Observation, ...]:
+    """Mint a superseding revision when a re-polled bar differs from retained OHLC.
+
+    Normalization always emits revision 1. Without this step a later poll with
+    corrected OHLC for an interval still in the retained window collides on the
+    same observation_id, the writer returns DUPLICATE_OK for the old payload,
+    and RollingState ignores the equal revision. Canonical history stays
+    append-only; this only assigns the next revision identity before publish.
+    """
+    if not observations or state.interval_count == 0 or state.first_interval_epoch is None:
+        return tuple(observations)
+
+    revised: list[Observation] = []
+    for observation in observations:
+        if (
+            observation.interval_forming
+            or observation.aggregate_interval_seconds != state.interval_seconds
+            or observation.instrument_version_id != state.instrument_version_id
+        ):
+            revised.append(observation)
+            continue
+        epoch = int(observation.source_event_time.timestamp())
+        delta = epoch - int(state.first_interval_epoch)
+        if delta < 0 or delta % state.interval_seconds != 0:
+            revised.append(observation)
+            continue
+        index = delta // state.interval_seconds
+        if index < 0 or index >= state.interval_count:
+            revised.append(observation)
+            continue
+        retained_revision = int(state.revisions[index])
+        # RollingState retains high/low/close/volume (open is not separately kept).
+        live_retained = (
+            float(state.highs[index]),
+            float(state.lows[index]),
+            float(state.closes[index]),
+            float(state.volumes[index]),
+        )
+        incoming = (
+            float(observation.values["high"]),
+            float(observation.values["low"]),
+            float(observation.values["close"]),
+            float(observation.values["volume"]),
+        )
+        if incoming == live_retained:
+            revised.append(observation)
+            continue
+        if int(observation.revision) > retained_revision:
+            revised.append(observation)
+            continue
+        next_revision = retained_revision + 1
+        prior_id = (
+            f"OBS:{state.instrument_version_id}"
+            f":{state.interval_seconds}s:{epoch}:{retained_revision}"
+        )
+        revised.append(
+            replace(
+                observation,
+                revision=next_revision,
+                supersedes=prior_id,
+            )
+        )
+    return tuple(revised)
 
 
 def advance_state(
@@ -482,5 +550,6 @@ __all__ = [
     "from_checkpoint",
     "initial_state",
     "restart_disposition",
+    "revise_against_retained",
     "to_checkpoint",
 ]

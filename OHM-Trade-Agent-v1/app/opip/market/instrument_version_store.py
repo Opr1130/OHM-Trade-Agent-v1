@@ -8,9 +8,12 @@ commit any newly minted version before dependent observations.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from app.opip.contracts.events import MARKET_INSTRUMENT_VERSION_RECORDED
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.serialization import iso_z
 from app.opip.contracts.temporal import require_utc
@@ -79,7 +82,53 @@ def reconstruct_instrument_version_registry(
     ref = reference_data_version
     if ref is None and latest:
         ref = next(iter(latest.values())).reference_data_version
-    return InstrumentVersionRegistry(reference_data_version=ref or "opip-evidence-identity-v1", known=latest)
+    return InstrumentVersionRegistry(
+        reference_data_version=ref or "opip-evidence-identity-v1", known=latest
+    )
+
+
+def load_instrument_version_payloads(db_path: Path) -> list[dict[str, Any]]:
+    """Read committed instrument-version records from the canonical SQLite WAL."""
+    from app.opip.canonical.schema import connect
+
+    target = Path(db_path)
+    if not target.exists():
+        return []
+    conn = connect(target, read_only=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (MARKET_INSTRUMENT_VERSION_RECORDED,),
+        ).fetchall()
+    finally:
+        conn.close()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        payload = json.loads(str(row["payload_json"]))
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def hydrate_instrument_version_registry(
+    db_path: Path | None = None,
+    *,
+    reference_data_version: str | None = None,
+) -> InstrumentVersionRegistry:
+    """Rebuild the registry from durable evidence (empty when DB is absent)."""
+    if db_path is None:
+        from app.opip.canonical.paths import db_path as default_db_path
+
+        db_path = default_db_path()
+    payloads = load_instrument_version_payloads(Path(db_path))
+    return reconstruct_instrument_version_registry(
+        payloads, reference_data_version=reference_data_version
+    )
 
 
 def instrument_version_record_payload(version: InstrumentVersion) -> dict[str, Any]:
@@ -93,7 +142,9 @@ def instrument_version_record_payload(version: InstrumentVersion) -> dict[str, A
 
 
 __all__ = [
+    "hydrate_instrument_version_registry",
     "instrument_version_from_payload",
     "instrument_version_record_payload",
+    "load_instrument_version_payloads",
     "reconstruct_instrument_version_registry",
 ]

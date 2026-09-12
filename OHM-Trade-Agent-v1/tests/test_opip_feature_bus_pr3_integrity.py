@@ -23,6 +23,7 @@ from app.opip.features.engine import (
     feature_dag_hash,
 )
 from app.opip.features.pipeline import (
+    DISPOSITION_DEFERRED_DEPENDENT,
     DISPOSITION_DEFERRED_UNCOMMITTED,
     DISPOSITION_DRY_RUN,
     run_cycle,
@@ -30,12 +31,15 @@ from app.opip.features.pipeline import (
 from app.opip.features.publisher import FeatureBusPublisher, PublishOutcome
 from app.opip.features.state import (
     advance_state,
+    alignment_from_state,
     from_checkpoint,
     initial_state,
+    revise_against_retained,
     to_checkpoint,
 )
 from app.opip.market.aggregates import align_minute_observations
 from app.opip.market.instrument_version_store import (
+    hydrate_instrument_version_registry,
     instrument_version_record_payload,
     reconstruct_instrument_version_registry,
 )
@@ -534,3 +538,172 @@ def test_restart_recorded_only_when_restart_event_commits(canonical_env, writer_
     # Short history => restart disposition published; must be committed.
     assert result.state.restart_state is not RestartState.WARM
     assert result.restart_recorded is True
+
+
+@pytest.mark.parametrize("status", ["SPOOLED", "REJECTED", "RETRYABLE"])
+def test_dependent_snapshot_or_checkpoint_uncommitted_defers_promotion(status):
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=10))),
+    ).state
+    observations = _observations(_rows(count=2, end_before=CUTOFF), commit_from=None)
+
+    class _Publisher(FeatureBusPublisher):
+        def __init__(self) -> None:
+            super().__init__(enabled=True)
+            self._obs = 0
+
+        def publish(self, intent):  # type: ignore[override]
+            if intent.event_type == "market.observation.recorded":
+                self._obs += 1
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status="OK",
+                    watermark=ConsumedInputWatermark(1, self._obs),
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            if intent.event_type in {
+                "feature.snapshot.recorded",
+                "feature.checkpoint.recorded",
+            }:
+                outcome = PublishOutcome(
+                    event_type=str(intent.event_type),
+                    idempotency_key=intent.idempotency_key,
+                    status=status,
+                )
+                self.outcomes.append(outcome)
+                return outcome
+            return PublishOutcome(
+                event_type=str(intent.event_type),
+                idempotency_key=intent.idempotency_key,
+                status="DISABLED",
+            )
+
+    result = run_cycle(
+        observations,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        publisher=_Publisher(),
+        source_version="test",
+    )
+    assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
+    assert result.promoted is False
+    assert result.state.interval_count == previous.interval_count
+    assert result.restart_recorded is False
+
+
+def test_normalize_r1_correction_is_minted_against_retained_state():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    last_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    corrected = IntervalRow(
+        interval_start_epoch=last_epoch,
+        open=999.0,
+        high=1001.0,
+        low=998.0,
+        close=1000.0,
+        volume=50.0,
+        vwap=1000.0,
+        trade_count=9,
+    )
+    raw = _observations([corrected], commit_from=None)
+    assert all(item.revision == 1 for item in raw)
+    revised = revise_against_retained(raw, previous)
+    assert len(revised) == 1
+    assert revised[0].revision == 2
+    assert revised[0].supersedes is not None
+    assert revised[0].values["close"] == 1000.0
+
+    advanced = advance_state(previous, revised).state
+    assert advanced.closes[-1] == 1000.0
+    assert advanced.revisions[-1] == 2
+
+
+def test_run_cycle_applies_minted_revision_for_ohlc_correction():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF)),
+    ).state
+    last_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    corrected = _observations(
+        [
+            IntervalRow(
+                interval_start_epoch=last_epoch,
+                open=200.0,
+                high=201.0,
+                low=199.0,
+                close=200.5,
+                volume=12.0,
+            )
+        ],
+        commit_from=None,
+    )
+    result = run_cycle(
+        corrected,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        source_version="test",
+    )
+    assert result.promoted is True
+    assert result.state.closes[-1] == 200.5
+    assert result.state.revisions[-1] == 2
+    assert result.alignment.observations[0].revision == 2
+
+
+def test_hydrate_registry_from_canonical_db(canonical_env, writer_server):
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(client, enabled=True)
+    v1 = _instrument(version=1, min_order_size=0.2)
+    assert publisher.publish_instrument_version(v1).committed
+    restored = hydrate_instrument_version_registry(canonical_env["db"])
+    again = restored.observe(
+        VenueInstrumentDescriptor(
+            venue="kraken",
+            base_asset="SOL",
+            quote_currency="USD",
+            venue_instrument_id="SOLUSD",
+            price_decimals=2,
+            tick_size=0.01,
+            min_order_size=0.2,
+        ),
+        observed_at_utc=NOW + timedelta(minutes=1),
+    )
+    assert again.version == 1
+    changed = restored.observe(
+        VenueInstrumentDescriptor(
+            venue="kraken",
+            base_asset="SOL",
+            quote_currency="USD",
+            venue_instrument_id="SOLUSD",
+            price_decimals=2,
+            tick_size=0.01,
+            min_order_size=0.5,
+        ),
+        observed_at_utc=NOW + timedelta(minutes=2),
+    )
+    assert changed.version == 2
+
+
+def test_not_retained_input_missingness_keys_remain_distinct_from_values():
+    """Phase 14 REJECT: raw input missingness is intentional, not a defect."""
+    state = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=140, end_before=CUTOFF)),
+    ).state
+    computation = compute_features(
+        alignment_from_state(state),
+        instrument_version=_instrument(),
+        evaluated_at_utc=NOW,
+    )
+    for name in NOT_RETAINED_INPUTS:
+        assert name in computation.missingness
+        assert computation.missingness[name] is Missingness.NOT_RETAINED
+        assert name not in computation.values
