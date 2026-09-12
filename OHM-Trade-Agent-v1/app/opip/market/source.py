@@ -191,10 +191,11 @@ class PolledMinuteBarSource:
 
         since: int | None = None
         if previous.through_utc is not None:
-            # Venues commonly return intervals strictly after ``since``; step
-            # back one second so the interval starting exactly at the watermark
-            # is kept.
-            since = int(previous.through_utc.timestamp()) - 1
+            # Request from the tip closed interval start (through_utc is its
+            # end), not through_utc-1s, so venue rows at the tip can be
+            # re-admitted for OHLC correction / superseding revisions.
+            tip_start = previous.through_utc - timedelta(seconds=self.interval_seconds)
+            since = int(tip_start.timestamp()) - 1
 
         started = time.monotonic()
         try:

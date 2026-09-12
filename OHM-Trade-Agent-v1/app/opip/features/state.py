@@ -73,17 +73,19 @@ class RollingState:
     last_gap_epoch: int | None = None
     restart_state: RestartState = RestartState.NEW_LISTING_COLD_START
     resumed_from_checkpoint: bool = False
+    # False only when restored from a pre-opens checkpoint (opens filled from closes).
+    opens_retained: bool = True
     consumed_input_watermark: ConsumedInputWatermark = ConsumedInputWatermark.zero()
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         if not str(self.venue or "").strip():
             raise ValueError("venue is required")
-        # Legacy checkpoints may omit opens; synthesize from closes when empty.
         if self.opens and len(self.opens) != len(self.closes):
             raise ValueError("retained series must have equal lengths")
         if not self.opens and self.closes:
             object.__setattr__(self, "opens", tuple(self.closes))
+            object.__setattr__(self, "opens_retained", False)
         lengths = {
             len(self.closes),
             len(self.opens),
@@ -210,20 +212,35 @@ def revise_against_retained(
             revised.append(observation)
             continue
         retained_revision = int(state.revisions[index])
-        live_retained = (
-            float(state.opens[index]),
-            float(state.highs[index]),
-            float(state.lows[index]),
-            float(state.closes[index]),
-            float(state.volumes[index]),
-        )
-        incoming = (
-            float(observation.values["open"]),
-            float(observation.values["high"]),
-            float(observation.values["low"]),
-            float(observation.values["close"]),
-            float(observation.values["volume"]),
-        )
+        if state.opens_retained:
+            live_retained = (
+                float(state.opens[index]),
+                float(state.highs[index]),
+                float(state.lows[index]),
+                float(state.closes[index]),
+                float(state.volumes[index]),
+            )
+            incoming = (
+                float(observation.values["open"]),
+                float(observation.values["high"]),
+                float(observation.values["low"]),
+                float(observation.values["close"]),
+                float(observation.values["volume"]),
+            )
+        else:
+            # Legacy resume: opens were length-fillers only; never mint on open alone.
+            live_retained = (
+                float(state.highs[index]),
+                float(state.lows[index]),
+                float(state.closes[index]),
+                float(state.volumes[index]),
+            )
+            incoming = (
+                float(observation.values["high"]),
+                float(observation.values["low"]),
+                float(observation.values["close"]),
+                float(observation.values["volume"]),
+            )
         if incoming == live_retained:
             # Identical tip re-poll: omit rather than republish DUPLICATE_OK.
             continue
@@ -375,6 +392,7 @@ def advance_state(
         persistence_intervals=persistence,
         gap_resets=gap_resets,
         last_gap_epoch=last_gap_epoch,
+        opens_retained=True if applied else state.opens_retained,
     )
     advanced = replace(advanced, restart_state=_resolve_restart_state(advanced))
     return AdvanceResult(
@@ -406,6 +424,7 @@ def to_checkpoint(
     """
     rolling: dict[str, Any] = {
         "opens": list(state.opens),
+        "opens_retained": state.opens_retained,
         "closes": list(state.closes),
         "highs": list(state.highs),
         "lows": list(state.lows),
@@ -442,8 +461,10 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
     rolling = dict(checkpoint.rolling_state)
     closes = tuple(float(value) for value in rolling.get("closes") or ())
     raw_opens = rolling.get("opens")
+    opens_retained = bool(rolling.get("opens_retained", raw_opens is not None))
     if raw_opens is None:
         opens = closes
+        opens_retained = False
     else:
         opens = tuple(float(value) for value in raw_opens)
     highs = tuple(float(value) for value in rolling.get("highs") or ())
@@ -482,6 +503,7 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
             else None
         ),
         resumed_from_checkpoint=True,
+        opens_retained=opens_retained,
         consumed_input_watermark=checkpoint.consumed_input_watermark,
         interval_seconds=int(
             rolling.get("interval_seconds") or DEFAULT_INTERVAL_SECONDS

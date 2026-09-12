@@ -503,7 +503,7 @@ def test_kraken_pilot_source_requests_one_minute_and_excludes_forming():
     resumed = source.fetch_through(
         _instrument(), watermark=batch.watermark, now=CUTOFF + timedelta(seconds=30)
     )
-    assert client.calls[1]["since"] == int(CUTOFF.timestamp()) - 1
+    assert client.calls[1]["since"] == int(CUTOFF.timestamp()) - 60 - 1
     # Tip closed interval is re-admitted so OHLC corrections can supersede.
     tip_start = batch.watermark.through_utc - timedelta(seconds=60)
     assert len(resumed.observations) == 1
