@@ -113,6 +113,9 @@ class AlignmentResult:
 
     @property
     def coverage(self) -> CoverageState:
+        # A declared expected window with nothing usable is an outage, never COMPLETE.
+        if self.expected_intervals > 0 and self.present_intervals == 0:
+            return CoverageState.INCOMPLETE_COVERAGE
         if self.gaps or self.excluded_misaligned:
             return CoverageState.INCOMPLETE_COVERAGE
         if any(
@@ -200,12 +203,12 @@ def align_minute_observations(
 
     gaps: tuple[CoverageGap, ...] = ()
     expected = 0
-    if ordered:
-        first = (
-            grid_floor(window_start, interval_seconds=interval_seconds)
-            if window_start is not None
-            else ordered[0].source_event_time
-        )
+    first: datetime | None = None
+    if window_start is not None:
+        first = grid_floor(window_start, interval_seconds=interval_seconds)
+    elif ordered:
+        first = ordered[0].source_event_time
+    if first is not None:
         last_expected = cutoff_utc - timedelta(seconds=interval_seconds)
         if last_expected >= first:
             expected = (

@@ -75,10 +75,11 @@ VOLATILITY_HIGH_PERCENTILE = 75.0
 #: writer bounds payloads at 16 KiB.
 FEATURE_WINDOW_INTERVALS = PERCENTILE_LOOKBACK_INTERVALS + BANDWIDTH_PERIOD
 
-#: Below this many contiguous one-minute intervals the snapshot is still
-#: persisted, but it is not warm: slow-window features are absent by
-#: construction rather than approximated.
-MINIMUM_WARMUP_INTERVALS = EMA_SLOW_PERIOD
+#: Warm only when the retained contiguous window can satisfy every declared
+#: supported rolling feature. Derived from the same bound as
+#: ``FEATURE_WINDOW_INTERVALS`` so 21–139 bars cannot be labeled fully WARM
+#: while percentile/bandwidth features are still missing by construction.
+MINIMUM_WARMUP_INTERVALS = FEATURE_WINDOW_INTERVALS
 
 #: N10, restated where it is enforced: longer candles are feature inputs; the
 #: evaluation cadence itself is one minute.

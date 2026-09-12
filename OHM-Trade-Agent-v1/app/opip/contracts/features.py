@@ -97,7 +97,9 @@ class FeatureSnapshot:
         if int(self.evaluation_grid_seconds) <= 0:
             raise ValueError("evaluation_grid_seconds must be positive")
         cutoff = require_utc(self.evaluation_cutoff, field_name="evaluation_cutoff")
-        if cutoff.second % int(self.evaluation_grid_seconds) != 0 or cutoff.microsecond:
+        grid = int(self.evaluation_grid_seconds)
+        cutoff_epoch = int(cutoff.timestamp())
+        if cutoff_epoch % grid != 0 or cutoff.microsecond:
             raise ValueError("evaluation_cutoff must sit on the evaluation grid")
         evaluated_at = require_utc(self.evaluated_at_utc, field_name="evaluated_at_utc")
         if evaluated_at < cutoff:
@@ -143,6 +145,7 @@ class FeatureSnapshot:
         return stable_hash("FSHASH", self._hash_payload())
 
     def _hash_payload(self) -> dict[str, Any]:
+        availability = self.availability
         return {
             "instrument_version_id": self.instrument_version_id,
             "feature_version": self.feature_version,
@@ -150,6 +153,7 @@ class FeatureSnapshot:
             "feature_calc_version": self.feature_calc_version,
             "feature_dag_hash": self.feature_dag_hash,
             "evaluation_cutoff": iso_z(self.evaluation_cutoff),
+            "evaluated_at_utc": iso_z(self.evaluated_at_utc),
             "evaluation_grid_seconds": self.evaluation_grid_seconds,
             "consumed_input_watermark": self.consumed_input_watermark.to_dict(),
             "values": dict(self.values),
@@ -158,9 +162,20 @@ class FeatureSnapshot:
             },
             "coverage": self.coverage.value,
             "restart_state": self.restart_state.value,
+            "availability": {
+                "source_at_utc": (
+                    iso_z(availability.source_at_utc)
+                    if availability.source_at_utc is not None
+                    else None
+                ),
+                "ingested_at_utc": iso_z(availability.ingested_at_utc),
+                "visible_at_utc": iso_z(availability.visible_at_utc),
+                "source_version": availability.source_version,
+            },
         }
 
     def to_dict(self) -> dict[str, Any]:
+        availability = self.availability
         payload: dict[str, Any] = {
             "record_type": FEATURE_SNAPSHOT_RECORD_TYPE,
             "schema_version": self.schema_version,
@@ -182,7 +197,17 @@ class FeatureSnapshot:
             "feature_calc_version": self.feature_calc_version,
             "feature_dag_hash": self.feature_dag_hash,
             "evaluated_at_utc": iso_z(self.evaluated_at_utc),
-            "visible_at_utc": iso_z(self.availability.visible_at_utc),
+            "availability": {
+                "source_at_utc": (
+                    iso_z(availability.source_at_utc)
+                    if availability.source_at_utc is not None
+                    else None
+                ),
+                "ingested_at_utc": iso_z(availability.ingested_at_utc),
+                "visible_at_utc": iso_z(availability.visible_at_utc),
+                "source_version": availability.source_version,
+            },
+            "visible_at_utc": iso_z(availability.visible_at_utc),
             "content_hash": self.content_hash(),
         }
         return payload
@@ -236,13 +261,14 @@ class FeatureStateCheckpoint:
 
     @property
     def checkpoint_id(self) -> str:
+        watermark = self.consumed_input_watermark
         return ":".join(
             (
                 "FSC",
                 str(self.schema_version),
                 self.venue_instrument_id.lower(),
                 self.feature_version,
-                str(self.consumed_input_watermark.local_sequence),
+                f"{watermark.history_epoch}-{watermark.local_sequence}",
             )
         )
 

@@ -16,6 +16,7 @@ EventType = Literal[
     # by app.opip.contracts.events; the literal is restated here only because
     # the type annotation cannot be computed from that frozenset.
     "market.observation.recorded",
+    "market.instrument_version.recorded",
     "feature.snapshot.recorded",
     "feature.checkpoint.recorded",
     "coverage.gap.recorded",

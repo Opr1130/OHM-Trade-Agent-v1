@@ -9,6 +9,11 @@ Persistence is off by default. With capture disabled the cycle still computes
 and returns everything, which is what makes a dry run meaningful: the evidence
 is produced and inspectable without being written anywhere.
 
+Canonical-first rule: when the publisher is enabled and observations are to be
+persisted, every observation consumed by the candidate state must commit
+(OK / DUPLICATE_OK with a writer watermark) before RollingState is promoted or
+snapshot/checkpoint/restart evidence is published.
+
 Nothing here schedules itself, ranks candidates, emits alerts, or evaluates a
 detector.
 """
@@ -39,6 +44,10 @@ from app.opip.market.aggregates import (
     align_minute_observations,
 )
 
+DISPOSITION_OK = "OK"
+DISPOSITION_DRY_RUN = "DRY_RUN"
+DISPOSITION_DEFERRED_UNCOMMITTED = "DEFERRED_UNCOMMITTED_OBSERVATIONS"
+
 
 @dataclass(frozen=True)
 class CycleResult:
@@ -52,6 +61,8 @@ class CycleResult:
     gap_detected: bool = False
     restart_recorded: bool = False
     outcomes: tuple[PublishOutcome, ...] = field(default_factory=tuple)
+    disposition: str = DISPOSITION_OK
+    promoted: bool = True
 
     @property
     def coverage(self) -> CoverageState:
@@ -72,6 +83,8 @@ class CycleResult:
             "restart_recorded": self.restart_recorded,
             "intervals": self.state.interval_count,
             "persisted": self.persisted,
+            "disposition": self.disposition,
+            "promoted": self.promoted,
             "outcomes": [
                 {"event_type": item.event_type, "status": item.status}
                 for item in self.outcomes
@@ -82,12 +95,7 @@ class CycleResult:
 def _advance_watermark_from_outcomes(
     state: RollingState, outcomes: Sequence[PublishOutcome]
 ) -> RollingState:
-    """Fold committed observation publish watermarks into retained state.
-
-    Live observations do not carry commit_order until the canonical writer
-    acks them. Snapshot and checkpoint identity must advance from those acks,
-    or every cycle collapses onto watermark 0-0 and collides on idempotency.
-    """
+    """Fold committed observation publish watermarks into retained state."""
     watermark = state.consumed_input_watermark
     for outcome in outcomes:
         if not outcome.committed or outcome.watermark is None:
@@ -99,6 +107,41 @@ def _advance_watermark_from_outcomes(
     if watermark == state.consumed_input_watermark:
         return state
     return replace(state, consumed_input_watermark=watermark)
+
+
+def _observations_fully_committed(
+    observations: Sequence[Observation],
+    outcomes: Sequence[PublishOutcome],
+) -> bool:
+    """Every consumed observation must commit with a canonical watermark."""
+    if len(outcomes) != len(observations):
+        return False
+    return all(
+        outcome.committed and outcome.watermark is not None for outcome in outcomes
+    )
+
+
+def _build_snapshot_and_checkpoint(
+    *,
+    state: RollingState,
+    alignment: AlignmentResult,
+    instrument_version: InstrumentVersion,
+    evaluation_cutoff: datetime,
+    evaluated_at_utc: datetime,
+    source_version: str,
+) -> tuple[FeatureSnapshot, FeatureStateCheckpoint]:
+    snapshot = build_feature_snapshot(
+        alignment_from_state(state),
+        instrument_version=instrument_version,
+        evaluation_cutoff=evaluation_cutoff,
+        evaluated_at_utc=evaluated_at_utc,
+        consumed_input_watermark=state.consumed_input_watermark,
+        restart_state=state.restart_state,
+        source_version=source_version,
+        freshness_alignment=alignment,
+    )
+    checkpoint = to_checkpoint(state, created_at_utc=evaluated_at_utc)
+    return snapshot, checkpoint
 
 
 def run_cycle(
@@ -116,10 +159,8 @@ def run_cycle(
 ) -> CycleResult:
     """Run one evaluation for one instrument.
 
-    Order matters: observations are persisted before the snapshot that consumed
-    them, so canonical evidence never references inputs it does not contain.
-    Rolling features are computed from retained state after advance, not from
-    the current fetch batch alone, so resume/incremental cycles stay warm.
+    Candidate state is always computed. Promotion and dependent canonical
+    publication require every observation to commit when capture is enabled.
     """
     alignment = align_minute_observations(
         observations,
@@ -131,29 +172,68 @@ def run_cycle(
         instrument_version, interval_seconds=interval_seconds
     )
     advance = advance_state(previous, alignment.observations)
-    advanced = advance.state
+    candidate = advance.state
 
     outcomes: list[PublishOutcome] = []
+    capture_enabled = publisher is not None and publisher.enabled
+    must_commit_observations = (
+        capture_enabled and publish_observations and bool(alignment.observations)
+    )
+
+    observation_outcomes: list[PublishOutcome] = []
     if publisher is not None and publish_observations:
         observation_outcomes = publisher.publish_observations(alignment.observations)
         outcomes.extend(observation_outcomes)
-        advanced = _advance_watermark_from_outcomes(advanced, observation_outcomes)
 
-    # Rolling series from retained state; this cycle's alignment for freshness.
-    snapshot = build_feature_snapshot(
-        alignment_from_state(advanced),
+    observations_committed = (
+        True
+        if not must_commit_observations
+        else _observations_fully_committed(
+            alignment.observations, observation_outcomes
+        )
+    )
+
+    if must_commit_observations and not observations_committed:
+        # Fail closed: keep prior committed state. Candidate snapshot/checkpoint
+        # remain inspectable but are not published and must not be promoted.
+        snapshot, checkpoint = _build_snapshot_and_checkpoint(
+            state=candidate,
+            alignment=alignment,
+            instrument_version=instrument_version,
+            evaluation_cutoff=evaluation_cutoff,
+            evaluated_at_utc=evaluated_at_utc,
+            source_version=source_version,
+        )
+        return CycleResult(
+            instrument_version=instrument_version,
+            alignment=alignment,
+            state=previous,
+            snapshot=snapshot,
+            checkpoint=checkpoint,
+            gap_detected=advance.gap_detected or bool(alignment.gaps),
+            restart_recorded=False,
+            outcomes=tuple(outcomes),
+            disposition=DISPOSITION_DEFERRED_UNCOMMITTED,
+            promoted=False,
+        )
+
+    promoted_state = candidate
+    if capture_enabled and publish_observations:
+        promoted_state = _advance_watermark_from_outcomes(
+            candidate, observation_outcomes
+        )
+
+    snapshot, checkpoint = _build_snapshot_and_checkpoint(
+        state=promoted_state,
+        alignment=alignment,
         instrument_version=instrument_version,
         evaluation_cutoff=evaluation_cutoff,
         evaluated_at_utc=evaluated_at_utc,
-        consumed_input_watermark=advanced.consumed_input_watermark,
-        restart_state=advanced.restart_state,
         source_version=source_version,
-        freshness_alignment=alignment,
     )
-    checkpoint = to_checkpoint(advanced, created_at_utc=evaluated_at_utc)
 
     restart_recorded = False
-    if publisher is not None:
+    if capture_enabled:
         if alignment.gaps:
             outcomes.extend(
                 publisher.publish_coverage_gaps(
@@ -165,26 +245,37 @@ def run_cycle(
             )
         outcomes.append(publisher.publish_snapshot(snapshot))
         outcomes.append(publisher.publish_checkpoint(checkpoint))
-        if advanced.restart_state is not RestartState.WARM or advance.gap_detected:
-            outcomes.append(
-                publisher.publish_restart(
-                    restart_disposition(advanced),
-                    watermark=advanced.consumed_input_watermark,
-                    recorded_at_utc=evaluated_at_utc,
-                )
+        if (
+            promoted_state.restart_state is not RestartState.WARM
+            or advance.gap_detected
+        ):
+            restart_outcome = publisher.publish_restart(
+                restart_disposition(promoted_state),
+                watermark=promoted_state.consumed_input_watermark,
+                recorded_at_utc=evaluated_at_utc,
             )
-            restart_recorded = True
+            outcomes.append(restart_outcome)
+            restart_recorded = restart_outcome.committed
 
+    disposition = DISPOSITION_DRY_RUN if not capture_enabled else DISPOSITION_OK
     return CycleResult(
         instrument_version=instrument_version,
         alignment=alignment,
-        state=advanced,
+        state=promoted_state,
         snapshot=snapshot,
         checkpoint=checkpoint,
         gap_detected=advance.gap_detected or bool(alignment.gaps),
         restart_recorded=restart_recorded,
         outcomes=tuple(outcomes),
+        disposition=disposition,
+        promoted=True,
     )
 
 
-__all__ = ["CycleResult", "run_cycle"]
+__all__ = [
+    "CycleResult",
+    "DISPOSITION_DEFERRED_UNCOMMITTED",
+    "DISPOSITION_DRY_RUN",
+    "DISPOSITION_OK",
+    "run_cycle",
+]

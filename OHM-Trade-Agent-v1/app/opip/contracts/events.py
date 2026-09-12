@@ -18,6 +18,7 @@ from app.opip.contracts.observation import Observation
 from app.opip.contracts.serialization import iso_z
 
 MARKET_OBSERVATION_RECORDED = "market.observation.recorded"
+MARKET_INSTRUMENT_VERSION_RECORDED = "market.instrument_version.recorded"
 FEATURE_SNAPSHOT_RECORDED = "feature.snapshot.recorded"
 FEATURE_CHECKPOINT_RECORDED = "feature.checkpoint.recorded"
 COVERAGE_GAP_RECORDED = "coverage.gap.recorded"
@@ -26,6 +27,7 @@ FEATURE_RESTART_RECORDED = "feature.restart.recorded"
 FEATURE_BUS_EVENT_TYPES: frozenset[str] = frozenset(
     {
         MARKET_OBSERVATION_RECORDED,
+        MARKET_INSTRUMENT_VERSION_RECORDED,
         FEATURE_SNAPSHOT_RECORDED,
         FEATURE_CHECKPOINT_RECORDED,
         COVERAGE_GAP_RECORDED,
@@ -53,12 +55,28 @@ def observation_idempotency_key(observation: Observation) -> str:
 def snapshot_idempotency_key(snapshot: FeatureSnapshot) -> str:
     """Identifies instrument, cutoff, feature version and consumed inputs.
 
-    The consumed watermark is included because re-evaluating the same cutoff
-    after late evidence arrives is a genuinely different snapshot, not a
-    duplicate of the earlier one.
+    ``snapshot_id`` keeps the ratified v1.2 fixture format (venue + cutoff +
+    feature version). Canonical idempotency additionally binds
+    ``instrument_version_id`` and the full consumed watermark so distinct
+    instrument versions cannot collide on the writer key.
     """
     token = _watermark_token(snapshot.consumed_input_watermark)
-    return f"{FEATURE_SNAPSHOT_RECORDED}:{snapshot.snapshot_id}:{token}"
+    return (
+        f"{FEATURE_SNAPSHOT_RECORDED}:{snapshot.instrument_version_id}"
+        f":{snapshot.snapshot_id}:{token}"
+    )
+
+
+def instrument_version_idempotency_key(
+    *,
+    instrument_version_id: str,
+    reference_fingerprint: str,
+) -> str:
+    """Binds instrument version identity to its reference-data fingerprint."""
+    return (
+        f"{MARKET_INSTRUMENT_VERSION_RECORDED}:{instrument_version_id}"
+        f":{reference_fingerprint}"
+    )
 
 
 def checkpoint_idempotency_key(checkpoint: FeatureStateCheckpoint) -> str:
@@ -108,9 +126,11 @@ __all__ = [
     "FEATURE_CHECKPOINT_RECORDED",
     "FEATURE_RESTART_RECORDED",
     "FEATURE_SNAPSHOT_RECORDED",
+    "MARKET_INSTRUMENT_VERSION_RECORDED",
     "MARKET_OBSERVATION_RECORDED",
     "checkpoint_idempotency_key",
     "coverage_gap_idempotency_key",
+    "instrument_version_idempotency_key",
     "observation_idempotency_key",
     "restart_idempotency_key",
     "snapshot_idempotency_key",

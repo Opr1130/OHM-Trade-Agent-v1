@@ -256,7 +256,7 @@ def test_fixture_identities_reproduce_exactly():
     ).state
     checkpoint = to_checkpoint(state, created_at_utc=NOW)
     assert checkpoint.consumed_input_watermark.local_sequence == 1042
-    assert checkpoint.checkpoint_id == "FSC:1:solusd:features-v1:1042"
+    assert checkpoint.checkpoint_id == "FSC:1:solusd:features-v1:1-1042"
 
 
 def test_snapshot_rejects_input_visible_after_evaluation():

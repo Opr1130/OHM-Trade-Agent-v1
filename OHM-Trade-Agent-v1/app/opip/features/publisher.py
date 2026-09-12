@@ -34,18 +34,21 @@ from app.opip.contracts.events import (
     FEATURE_CHECKPOINT_RECORDED,
     FEATURE_RESTART_RECORDED,
     FEATURE_SNAPSHOT_RECORDED,
+    MARKET_INSTRUMENT_VERSION_RECORDED,
     MARKET_OBSERVATION_RECORDED,
     checkpoint_idempotency_key,
     coverage_gap_idempotency_key,
+    instrument_version_idempotency_key,
     observation_idempotency_key,
     restart_idempotency_key,
     snapshot_idempotency_key,
 )
 from app.opip.contracts.features import FeatureSnapshot, FeatureStateCheckpoint
-from app.opip.contracts.identity import ConsumedInputWatermark
+from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.observation import Observation
 from app.opip.contracts.serialization import canonical_json_bytes, iso_z
 from app.opip.market.aggregates import CoverageGap
+from app.opip.market.instrument_version_store import instrument_version_record_payload
 from app.opip.storage.bounded_jsonl import BoundedJsonlArchive, encode_row, parse_json_object_line
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,19 @@ def observation_intent(observation: Observation) -> WriterIntent:
         idempotency_key=observation_idempotency_key(observation),
         payload=observation.to_dict(),
         event_time=observation.source_event_time,
+    )
+
+
+def instrument_version_intent(version: InstrumentVersion) -> WriterIntent:
+    return build_intent(
+        event_type=MARKET_INSTRUMENT_VERSION_RECORDED,
+        idempotency_key=instrument_version_idempotency_key(
+            instrument_version_id=version.instrument_version_id,
+            reference_fingerprint=version.reference_fingerprint(),
+        ),
+        payload=instrument_version_record_payload(version),
+        event_time=version.observed_at_utc,
+        correlation_id=version.instrument_key,
     )
 
 
@@ -338,6 +354,11 @@ class FeatureBusPublisher:
     ) -> list[PublishOutcome]:
         return [self.publish(observation_intent(item)) for item in observations]
 
+    def publish_instrument_version(
+        self, version: InstrumentVersion
+    ) -> PublishOutcome:
+        return self.publish(instrument_version_intent(version))
+
     def publish_snapshot(self, snapshot: FeatureSnapshot) -> PublishOutcome:
         return self.publish(snapshot_intent(snapshot))
 
@@ -394,6 +415,7 @@ __all__ = [
     "checkpoint_intent",
     "coverage_gap_intent",
     "feature_bus_capture_enabled",
+    "instrument_version_intent",
     "observation_intent",
     "resolve_feature_bus_mode",
     "restart_intent",

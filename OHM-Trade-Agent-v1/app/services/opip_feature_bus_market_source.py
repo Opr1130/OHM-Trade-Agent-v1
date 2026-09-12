@@ -81,7 +81,13 @@ def kraken_minute_source(
 
 
 class KrakenInstrumentProvider:
-    """Resolves the eligible USD/USDT universe into instrument versions."""
+    """Resolves the eligible USD/USDT universe into instrument versions.
+
+    Pass a registry hydrated from durable ``market.instrument_version.recorded``
+    payloads (via ``reconstruct_instrument_version_registry``) so process
+    restarts do not forget version history. Newly minted versions must be
+    committed through the feature-bus publisher before dependent observations.
+    """
 
     def __init__(
         self,

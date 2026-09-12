@@ -7,7 +7,7 @@ keeps the two facts separable:
 * ``INSUFFICIENT_HISTORY`` — history exists but is shorter than the slowest
   window, so slow features are absent by construction.
 * ``RESTART_WARMUP`` — state was resumed from a checkpoint and is still short.
-* ``WARM`` — the retained window is complete.
+* ``WARM`` — the retained window is complete for every declared supported feature.
 
 Material feed gaps reset persistence evidence. A compression run that "lasted
 90 minutes" across a 40-minute hole did not last 90 minutes, so the run is
@@ -51,15 +51,20 @@ class RollingState:
     ``interval_starts`` is not stored: the window is contiguous by
     construction, so the first interval start plus the interval length is
     enough. That is one fewer array in every checkpoint payload.
+
+    ``venue`` is persisted explicitly; never reconstructed by splitting opaque
+    instrument version IDs.
     """
 
     instrument_version_id: str
+    venue: str
     venue_instrument_id: str
     feature_version: str
     closes: tuple[float, ...] = ()
     highs: tuple[float, ...] = ()
     lows: tuple[float, ...] = ()
     volumes: tuple[float, ...] = ()
+    revisions: tuple[int, ...] = ()
     first_interval_epoch: int | None = None
     last_receipt_epoch: float | None = None
     persistence_intervals: int = 0
@@ -71,11 +76,14 @@ class RollingState:
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
+        if not str(self.venue or "").strip():
+            raise ValueError("venue is required")
         lengths = {
             len(self.closes),
             len(self.highs),
             len(self.lows),
             len(self.volumes),
+            len(self.revisions),
         }
         if len(lengths) != 1:
             raise ValueError("retained series must have equal lengths")
@@ -115,6 +123,7 @@ def initial_state(
 ) -> RollingState:
     return RollingState(
         instrument_version_id=instrument_version.instrument_version_id,
+        venue=instrument_version.venue,
         venue_instrument_id=instrument_version.venue_instrument_id,
         feature_version=feature_version,
         restart_state=RestartState.NEW_LISTING_COLD_START,
@@ -151,22 +160,31 @@ def _resolve_restart_state(state: RollingState) -> RestartState:
     return RestartState.INSUFFICIENT_HISTORY
 
 
+def _clear_series() -> tuple[list[float], list[float], list[float], list[float], list[int]]:
+    return [], [], [], [], []
+
+
 def advance_state(
     state: RollingState,
     observations: Iterable[Observation],
-    *,
-    reset_persistence_on_gap: bool = True,
 ) -> AdvanceResult:
     """Fold closed intervals into rolling state, in strict grid order.
 
-    A non-contiguous interval is a material gap: the retained window restarts
-    at the new interval instead of concatenating across the hole.
+    A non-contiguous interval is a material gap: the retained window always
+    restarts at the new interval instead of concatenating across the hole.
+
+    A higher revision for an interval still inside the retained horizon replaces
+    the prior bar in place. Equal or older revisions never rewind state.
     """
-    ordered = sorted(observations, key=lambda item: item.source_event_time)
+    ordered = sorted(
+        observations,
+        key=lambda item: (item.source_event_time, item.revision, item.ingestion_order),
+    )
     closes = list(state.closes)
     highs = list(state.highs)
     lows = list(state.lows)
     volumes = list(state.volumes)
+    revisions = list(state.revisions)
     first_epoch = state.first_interval_epoch
     persistence = state.persistence_intervals
     gap_resets = state.gap_resets
@@ -185,14 +203,40 @@ def advance_state(
             ignored += 1
             continue
         epoch = int(observation.source_event_time.timestamp())
+
+        # Superseding revision for an interval still inside the retained window.
+        if first_epoch is not None and closes:
+            delta = epoch - first_epoch
+            if delta >= 0 and delta % state.interval_seconds == 0:
+                index = delta // state.interval_seconds
+                if 0 <= index < len(closes):
+                    if int(observation.revision) <= int(revisions[index]):
+                        ignored += 1
+                        continue
+                    closes[index] = float(observation.values["close"])
+                    highs[index] = float(observation.values["high"])
+                    lows[index] = float(observation.values["low"])
+                    volumes[index] = float(observation.values["volume"])
+                    revisions[index] = int(observation.revision)
+                    last_receipt = observation.receipt_time.timestamp()
+                    applied += 1
+                    if observation.commit_order is not None:
+                        state = replace(
+                            state,
+                            consumed_input_watermark=state.consumed_input_watermark.advanced_to(
+                                history_epoch=observation.commit_order.history_epoch,
+                                local_sequence=observation.commit_order.local_sequence,
+                            ),
+                        )
+                    continue
+
         expected = (
             None
             if not closes or first_epoch is None
             else first_epoch + state.interval_seconds * len(closes)
         )
         if expected is not None and epoch < expected:
-            # Already folded, or a correction that arrived after the interval
-            # left the retained window. Never rewinds committed state.
+            # Already left the retained window, or stale relative to tip.
             ignored += 1
             continue
         if expected is not None and epoch > expected:
@@ -201,13 +245,9 @@ def advance_state(
             gap_intervals += int(missing)
             last_gap_epoch = expected
             gap_resets += 1
-            if reset_persistence_on_gap:
-                closes.clear()
-                highs.clear()
-                lows.clear()
-                volumes.clear()
-                first_epoch = None
-                persistence = 0
+            closes, highs, lows, volumes, revisions = _clear_series()
+            first_epoch = None
+            persistence = 0
 
         if not closes:
             first_epoch = epoch
@@ -215,6 +255,7 @@ def advance_state(
         highs.append(float(observation.values["high"]))
         lows.append(float(observation.values["low"]))
         volumes.append(float(observation.values["volume"]))
+        revisions.append(int(observation.revision))
         persistence += 1
         applied += 1
         last_receipt = observation.receipt_time.timestamp()
@@ -233,6 +274,7 @@ def advance_state(
             del highs[:overflow]
             del lows[:overflow]
             del volumes[:overflow]
+            del revisions[:overflow]
             first_epoch = (first_epoch or epoch) + state.interval_seconds * overflow
 
     advanced = replace(
@@ -241,6 +283,7 @@ def advance_state(
         highs=tuple(highs),
         lows=tuple(lows),
         volumes=tuple(volumes),
+        revisions=tuple(revisions),
         first_interval_epoch=first_epoch,
         last_receipt_epoch=last_receipt,
         persistence_intervals=persistence,
@@ -280,6 +323,8 @@ def to_checkpoint(
         "highs": list(state.highs),
         "lows": list(state.lows),
         "volumes": list(state.volumes),
+        "revisions": list(state.revisions),
+        "venue": state.venue,
         "first_interval_epoch": state.first_interval_epoch,
         "last_receipt_epoch": state.last_receipt_epoch,
         "interval_seconds": state.interval_seconds,
@@ -312,16 +357,28 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
     highs = tuple(float(value) for value in rolling.get("highs") or ())
     lows = tuple(float(value) for value in rolling.get("lows") or ())
     volumes = tuple(float(value) for value in rolling.get("volumes") or ())
+    raw_revisions = rolling.get("revisions")
+    if raw_revisions is None:
+        revisions = tuple(1 for _ in closes)
+    else:
+        revisions = tuple(int(value) for value in raw_revisions)
+    if len(revisions) != len(closes):
+        raise ValueError("checkpoint revisions length mismatch")
+    venue = str(rolling.get("venue") or "").strip()
+    if not venue:
+        raise ValueError("checkpoint rolling_state.venue is required")
     first_epoch = rolling.get("first_interval_epoch")
     last_receipt = rolling.get("last_receipt_epoch")
     state = RollingState(
         instrument_version_id=checkpoint.instrument_version_id,
+        venue=venue,
         venue_instrument_id=checkpoint.venue_instrument_id,
         feature_version=checkpoint.feature_version,
         closes=closes,
         highs=highs,
         lows=lows,
         volumes=volumes,
+        revisions=revisions,
         first_interval_epoch=int(first_epoch) if first_epoch is not None else None,
         last_receipt_epoch=float(last_receipt) if last_receipt is not None else None,
         persistence_intervals=int(rolling.get("persistence_intervals") or 0),
@@ -356,16 +413,25 @@ def alignment_from_state(
     for index in range(state.interval_count):
         start = state.interval_start_at(index)
         end = start + timedelta(seconds=state.interval_seconds)
+        revision = int(state.revisions[index])
+        supersedes = (
+            f"retained-prior:{state.instrument_version_id}:{int(start.timestamp())}"
+            f":r{revision - 1}"
+            if revision > 1
+            else None
+        )
         observations.append(
             Observation(
                 instrument_version_id=state.instrument_version_id,
-                venue=state.instrument_version_id.split(":")[1],
+                venue=state.venue,
                 venue_instrument_id=state.venue_instrument_id,
                 source_event_time=start,
                 receipt_time=end,
                 ingestion_order=index + 1,
                 payload_kind=PayloadKind.FIXED_INTERVAL_AGGREGATE,
                 aggregate_interval_seconds=state.interval_seconds,
+                revision=revision,
+                supersedes=supersedes,
                 values={
                     "open": state.closes[index],
                     "high": state.highs[index],
@@ -387,6 +453,7 @@ def restart_disposition(state: RollingState) -> dict[str, Any]:
     """Durable record of why this state is or is not warm."""
     return {
         "instrument_version_id": state.instrument_version_id,
+        "venue": state.venue,
         "feature_version": state.feature_version,
         "restart_state": state.restart_state.value,
         "resumed_from_checkpoint": state.resumed_from_checkpoint,

@@ -159,6 +159,7 @@ class PolledMinuteBarSource:
         sequence_prefix: str,
         interval_seconds: int = 60,
         transport_errors: tuple[type[BaseException], ...] = (),
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if interval_seconds <= 0 or interval_seconds % 60 != 0:
             raise ValueError("interval_seconds must be a positive whole minute")
@@ -169,6 +170,7 @@ class PolledMinuteBarSource:
         self._sequence_prefix = str(sequence_prefix)
         self._transport_errors = tuple(transport_errors)
         self._interval_minutes = int(interval_seconds // 60)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     @property
     def sequence_prefix(self) -> str:
@@ -217,13 +219,15 @@ class PolledMinuteBarSource:
                 ),
                 error=message,
             )
+        # Receipt time is when the payload arrived, not when the request started.
+        receipt_time = self._clock()
         elapsed = time.monotonic() - started
 
         result = normalize_interval_rows(
             rows,
             instrument_version=instrument_version,
             interval_seconds=self.interval_seconds,
-            receipt_time=now,
+            receipt_time=receipt_time,
             now=now,
             source_label=self.source_label,
             source_sequence_prefix=self.sequence_prefix,
