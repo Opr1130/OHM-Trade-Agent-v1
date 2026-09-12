@@ -88,6 +88,17 @@ def feature_bus_capture_enabled(settings: Any | None = None) -> bool:
 
 
 @dataclass(frozen=True)
+class ShadowCaptureSettings:
+    """Test/helper settings that satisfy both dual shadow gates."""
+
+    opip_feature_bus_mode: str = "shadow"
+    opip_canonical_writer_mode: str = "shadow"
+
+
+SHADOW_CAPTURE_SETTINGS = ShadowCaptureSettings()
+
+
+@dataclass(frozen=True)
 class PublishOutcome:
     """What happened to one feature-bus write, always explicitly."""
 
@@ -257,11 +268,13 @@ class FeatureBusPublisher:
         self._client = client
         self._settings = settings
         self._spool_dir = spool_dir
-        self._enabled = (
-            bool(enabled)
-            if enabled is not None
-            else feature_bus_capture_enabled(settings)
-        )
+        # Dual shadow gates are authoritative. ``enabled`` may only further
+        # disable capture — never force-enable when either gate is off.
+        gates_on = feature_bus_capture_enabled(settings)
+        if enabled is False:
+            self._enabled = False
+        else:
+            self._enabled = gates_on
         self.outcomes: list[PublishOutcome] = []
 
     @property
@@ -411,6 +424,8 @@ __all__ = [
     "FEATURE_BUS_SPOOL_PREFIX",
     "FeatureBusPublisher",
     "PublishOutcome",
+    "SHADOW_CAPTURE_SETTINGS",
+    "ShadowCaptureSettings",
     "build_intent",
     "checkpoint_intent",
     "coverage_gap_intent",

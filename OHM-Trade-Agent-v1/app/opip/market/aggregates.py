@@ -102,6 +102,7 @@ class AlignmentResult:
     excluded_unclosed: int = 0
     excluded_misaligned: int = 0
     expected_intervals: int = 0
+    source_incomplete: bool = False
 
     @property
     def present_intervals(self) -> int:
@@ -113,6 +114,8 @@ class AlignmentResult:
 
     @property
     def coverage(self) -> CoverageState:
+        if self.source_incomplete:
+            return CoverageState.INCOMPLETE_COVERAGE
         # A declared expected window with nothing usable is an outage, never COMPLETE.
         if self.expected_intervals > 0 and self.present_intervals == 0:
             return CoverageState.INCOMPLETE_COVERAGE
@@ -205,7 +208,10 @@ def align_minute_observations(
     expected = 0
     first: datetime | None = None
     if window_start is not None:
-        first = grid_floor(window_start, interval_seconds=interval_seconds)
+        window_utc = window_start.astimezone(timezone.utc)
+        if not is_grid_aligned(window_utc, interval_seconds=interval_seconds):
+            raise ValueError("window_start must sit on the interval grid")
+        first = window_utc
     elif ordered:
         first = ordered[0].source_event_time
     if first is not None:

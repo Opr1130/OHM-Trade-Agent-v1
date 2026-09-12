@@ -161,6 +161,9 @@ def _live_pilot(limit: int) -> dict[str, Any]:
         committed_versions.append(version)
 
     source = kraken_minute_source()
+    # Fixed cycle cutoff at pilot start — never advances mid-cycle merely because
+    # sequential fetches crossed a minute boundary.
+    cycle_cutoff = grid_floor(refresh_at)
     # Restore source watermarks from retained checkpoints so tip re-poll and
     # superseding revisions work across process restarts.
     restored_states: dict[str, Any] = {}
@@ -183,36 +186,42 @@ def _live_pilot(limit: int) -> dict[str, Any]:
     batches, report, _ = run_pilot_cycle(
         source,
         committed_versions,
-        now=refresh_at,
+        now=cycle_cutoff,
         eligible_instruments=len(universe),
         watermarks=source_watermarks or None,
     )
     # Evaluation time is after network receipt so availability cannot outrun it.
     evaluated_at = report.finished_at_utc
-    cutoff = grid_floor(evaluated_at)
+    if evaluated_at < cycle_cutoff:
+        evaluated_at = cycle_cutoff
     cycles: list[dict[str, Any]] = []
     for batch in batches:
-        if not batch.observations:
-            cycles.append(
-                {
-                    "instrument_version_id": (
-                        batch.instrument_version.instrument_version_id
-                    ),
-                    "skipped": batch.error or "no_closed_intervals",
-                }
-            )
-            continue
         prior = restored_states.get(batch.instrument_version.instrument_version_id)
+        window_start = None
+        if prior is not None and prior.first_interval_epoch is not None:
+            window_start = datetime.fromtimestamp(
+                prior.first_interval_epoch, tz=timezone.utc
+            )
+        elif prior is not None and prior.last_interval_epoch is not None:
+            tip_start = prior.last_interval_epoch
+            window_start = datetime.fromtimestamp(tip_start, tz=timezone.utc)
+        # Always evaluate the expected window — empty/transport failures still
+        # produce incomplete coverage evidence rather than silent skips.
         result = run_cycle(
             batch.observations,
             instrument_version=batch.instrument_version,
-            evaluation_cutoff=cutoff,
+            evaluation_cutoff=cycle_cutoff,
             evaluated_at_utc=evaluated_at,
             state=prior,
             publisher=publisher,
             source_version=KRAKEN_OHLC_SOURCE_LABEL,
+            window_start=window_start,
+            source_coverage=batch.coverage,
         )
-        cycles.append(result.to_dict())
+        payload = result.to_dict()
+        if batch.error:
+            payload["source_error"] = batch.error
+        cycles.append(payload)
     return {
         "mode": "live_pilot",
         "measurement": report.to_dict(),
@@ -220,6 +229,7 @@ def _live_pilot(limit: int) -> dict[str, Any]:
         "cycles": cycles,
         "publisher": publisher.summary(),
         "restored_checkpoints": len(restored_states),
+        "evaluation_cutoff": cycle_cutoff.isoformat(),
     }
 
 

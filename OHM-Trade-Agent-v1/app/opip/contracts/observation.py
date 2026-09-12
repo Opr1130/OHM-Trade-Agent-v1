@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from math import isfinite
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.contracts.enums import CoverageState, PayloadKind
@@ -126,6 +128,19 @@ class Observation:
             ]
             if missing:
                 raise ValueError(f"aggregate is missing values: {sorted(missing)}")
+            for key in (*AGGREGATE_REQUIRED_KEYS, "vwap"):
+                if key not in self.values or self.values.get(key) is None:
+                    continue
+                try:
+                    number = float(self.values[key])  # type: ignore[arg-type]
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"aggregate {key} must be numeric") from exc
+                if not isfinite(number):
+                    raise ValueError(f"aggregate {key} must be finite")
+            if "trade_count" in self.values and self.values.get("trade_count") is not None:
+                count = self.values["trade_count"]
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    raise ValueError("aggregate trade_count must be a non-negative int")
             object.__setattr__(self, "aggregate_interval_seconds", int(interval))
         elif self.aggregate_interval_seconds is not None:
             raise ValueError(
@@ -139,11 +154,13 @@ class Observation:
         object.__setattr__(self, "receipt_time", receipt)
         object.__setattr__(self, "ingestion_order", int(self.ingestion_order))
         object.__setattr__(self, "revision", int(self.revision))
-        object.__setattr__(self, "values", dict(self.values))
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
         object.__setattr__(
             self,
             "provenance",
-            {str(key): str(value) for key, value in dict(self.provenance).items()},
+            MappingProxyType(
+                {str(key): str(value) for key, value in dict(self.provenance).items()}
+            ),
         )
 
     @property

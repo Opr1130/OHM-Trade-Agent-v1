@@ -18,11 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Sequence
+from math import isfinite
+from typing import Iterable, Mapping, Sequence
 
 from app.opip.contracts.enums import CoverageState, PayloadKind
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.observation import Observation
+from app.opip.contracts.serialization import stable_hash
 
 DERIVED_SEQUENCE_ORIGIN = "derived_from_interval_start"
 VENUE_SEQUENCE_ORIGIN = "venue_provided"
@@ -60,26 +62,57 @@ class NormalizationResult:
         return len(self.rejected)
 
 
+def aggregate_content_fingerprint(values: Mapping[str, object]) -> str:
+    """Deterministic fingerprint of all persisted aggregate fields."""
+    payload = {
+        key: values[key]
+        for key in ("open", "high", "low", "close", "volume", "vwap", "trade_count")
+        if key in values and values[key] is not None
+    }
+    return stable_hash("AGGFP", payload, length=8)
+
+
 def _validate_row(row: IntervalRow, *, interval_seconds: int) -> str | None:
     if interval_seconds <= 0:
         return "non_positive_interval"
     if row.interval_start_epoch % interval_seconds != 0:
         return "interval_start_not_grid_aligned"
-    values = (row.open, row.high, row.low, row.close)
-    if any(value is None for value in values):
-        return "missing_price"
-    if any(float(value) <= 0 for value in values):
+    prices = (row.open, row.high, row.low, row.close, row.volume)
+    try:
+        floats = tuple(float(value) for value in prices)
+    except (TypeError, ValueError):
+        return "non_numeric_price"
+    # Finite checks before relational OHLC comparisons (NaN otherwise fails open).
+    if any(not isfinite(value) for value in floats):
+        return "non_finite_price"
+    if any(value <= 0 for value in floats[:4]):
         return "non_positive_price"
-    if float(row.volume) < 0:
+    if floats[4] < 0:
         return "negative_volume"
-    if float(row.high) < float(row.low):
+    if row.vwap is not None:
+        try:
+            vwap = float(row.vwap)
+        except (TypeError, ValueError):
+            return "non_numeric_vwap"
+        if not isfinite(vwap):
+            return "non_finite_vwap"
+    if row.trade_count is not None:
+        if isinstance(row.trade_count, bool):
+            return "invalid_trade_count"
+        try:
+            count = int(row.trade_count)
+        except (TypeError, ValueError):
+            return "invalid_trade_count"
+        if count != float(row.trade_count):
+            return "invalid_trade_count"
+        if count < 0:
+            return "negative_trade_count"
+    if floats[1] < floats[2]:
         return "high_below_low"
-    if float(row.high) < max(float(row.open), float(row.close)):
+    if floats[1] < max(floats[0], floats[3]):
         return "high_below_body"
-    if float(row.low) > min(float(row.open), float(row.close)):
+    if floats[2] > min(floats[0], floats[3]):
         return "low_above_body"
-    if row.trade_count is not None and int(row.trade_count) < 0:
-        return "negative_trade_count"
     return None
 
 
@@ -185,6 +218,7 @@ __all__ = [
     "IntervalRow",
     "NormalizationResult",
     "RejectedRow",
+    "aggregate_content_fingerprint",
     "completed_observations",
     "normalize_interval_rows",
 ]

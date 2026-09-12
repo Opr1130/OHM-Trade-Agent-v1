@@ -40,6 +40,7 @@ from app.opip.market.aggregates import (
     AlignmentResult,
     contiguous_tail,
 )
+from app.opip.market.observations import aggregate_content_fingerprint
 
 AGGREGATE_DEPENDENCY = f"fixed_interval_aggregate:{DEFAULT_INTERVAL_SECONDS}s"
 
@@ -66,6 +67,8 @@ class RollingState:
     lows: tuple[float, ...] = ()
     volumes: tuple[float, ...] = ()
     revisions: tuple[int, ...] = ()
+    opens_known: tuple[bool, ...] = ()
+    content_fingerprints: tuple[str, ...] = ()
     first_interval_epoch: int | None = None
     last_receipt_epoch: float | None = None
     persistence_intervals: int = 0
@@ -73,7 +76,7 @@ class RollingState:
     last_gap_epoch: int | None = None
     restart_state: RestartState = RestartState.NEW_LISTING_COLD_START
     resumed_from_checkpoint: bool = False
-    # False only when restored from a pre-opens checkpoint (opens filled from closes).
+    # Aggregate trust: True only when every retained open slot is known.
     opens_retained: bool = True
     consumed_input_watermark: ConsumedInputWatermark = ConsumedInputWatermark.zero()
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS
@@ -85,7 +88,16 @@ class RollingState:
             raise ValueError("retained series must have equal lengths")
         if not self.opens and self.closes:
             object.__setattr__(self, "opens", tuple(self.closes))
+            object.__setattr__(self, "opens_known", tuple(False for _ in self.closes))
             object.__setattr__(self, "opens_retained", False)
+        if not self.opens_known and self.closes:
+            # Legacy path without per-slot trust: all unknown when opens_retained false.
+            known = tuple(bool(self.opens_retained) for _ in self.closes)
+            object.__setattr__(self, "opens_known", known)
+        if not self.content_fingerprints and self.closes:
+            object.__setattr__(
+                self, "content_fingerprints", tuple("" for _ in self.closes)
+            )
         lengths = {
             len(self.closes),
             len(self.opens),
@@ -93,9 +105,13 @@ class RollingState:
             len(self.lows),
             len(self.volumes),
             len(self.revisions),
+            len(self.opens_known),
+            len(self.content_fingerprints),
         }
-        if len(lengths) != 1:
+        if self.closes and len(lengths) != 1:
             raise ValueError("retained series must have equal lengths")
+        if self.closes:
+            object.__setattr__(self, "opens_retained", all(self.opens_known))
 
     @property
     def interval_count(self) -> int:
@@ -170,16 +186,23 @@ def _resolve_restart_state(state: RollingState) -> RestartState:
 
 
 def _clear_series() -> tuple[
-    list[float], list[float], list[float], list[float], list[float], list[int]
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[int],
+    list[bool],
+    list[str],
 ]:
-    return [], [], [], [], [], []
+    return [], [], [], [], [], [], [], []
 
 
 def revise_against_retained(
     observations: Sequence[Observation],
     state: RollingState,
 ) -> tuple[Observation, ...]:
-    """Mint a superseding revision when a re-polled bar differs from retained OHLC.
+    """Mint a superseding revision when a re-polled bar differs from retained evidence.
 
     Normalization always emits revision 1. Without this step a later poll with
     corrected OHLC for an interval still in the retained window collides on the
@@ -212,7 +235,17 @@ def revise_against_retained(
             revised.append(observation)
             continue
         retained_revision = int(state.revisions[index])
-        if state.opens_retained:
+        incoming_fp = aggregate_content_fingerprint(dict(observation.values))
+        retained_fp = (
+            state.content_fingerprints[index]
+            if index < len(state.content_fingerprints)
+            else ""
+        )
+        if retained_fp and retained_fp == incoming_fp:
+            continue
+        if retained_fp and retained_fp != incoming_fp:
+            changed = True
+        elif state.opens_known[index] if index < len(state.opens_known) else False:
             live_retained = (
                 float(state.opens[index]),
                 float(state.highs[index]),
@@ -227,8 +260,9 @@ def revise_against_retained(
                 float(observation.values["close"]),
                 float(observation.values["volume"]),
             )
+            changed = incoming != live_retained
         else:
-            # Legacy resume: opens were length-fillers only; never mint on open alone.
+            # Legacy unknown open: never mint on open alone.
             live_retained = (
                 float(state.highs[index]),
                 float(state.lows[index]),
@@ -241,8 +275,8 @@ def revise_against_retained(
                 float(observation.values["close"]),
                 float(observation.values["volume"]),
             )
-        if incoming == live_retained:
-            # Identical tip re-poll: omit rather than republish DUPLICATE_OK.
+            changed = incoming != live_retained
+        if not changed:
             continue
         if int(observation.revision) > retained_revision:
             revised.append(observation)
@@ -284,6 +318,8 @@ def advance_state(
     lows = list(state.lows)
     volumes = list(state.volumes)
     revisions = list(state.revisions)
+    opens_known = list(state.opens_known)
+    content_fingerprints = list(state.content_fingerprints)
     first_epoch = state.first_interval_epoch
     persistence = state.persistence_intervals
     gap_resets = state.gap_resets
@@ -302,6 +338,7 @@ def advance_state(
             ignored += 1
             continue
         epoch = int(observation.source_event_time.timestamp())
+        fingerprint = aggregate_content_fingerprint(dict(observation.values))
 
         # Superseding revision for an interval still inside the retained window.
         if first_epoch is not None and closes:
@@ -318,6 +355,8 @@ def advance_state(
                     lows[index] = float(observation.values["low"])
                     volumes[index] = float(observation.values["volume"])
                     revisions[index] = int(observation.revision)
+                    opens_known[index] = True
+                    content_fingerprints[index] = fingerprint
                     last_receipt = observation.receipt_time.timestamp()
                     applied += 1
                     if observation.commit_order is not None:
@@ -345,7 +384,16 @@ def advance_state(
             gap_intervals += int(missing)
             last_gap_epoch = expected
             gap_resets += 1
-            opens, closes, highs, lows, volumes, revisions = _clear_series()
+            (
+                opens,
+                closes,
+                highs,
+                lows,
+                volumes,
+                revisions,
+                opens_known,
+                content_fingerprints,
+            ) = _clear_series()
             first_epoch = None
             persistence = 0
 
@@ -357,6 +405,8 @@ def advance_state(
         lows.append(float(observation.values["low"]))
         volumes.append(float(observation.values["volume"]))
         revisions.append(int(observation.revision))
+        opens_known.append(True)
+        content_fingerprints.append(fingerprint)
         persistence += 1
         applied += 1
         last_receipt = observation.receipt_time.timestamp()
@@ -377,6 +427,8 @@ def advance_state(
             del lows[:overflow]
             del volumes[:overflow]
             del revisions[:overflow]
+            del opens_known[:overflow]
+            del content_fingerprints[:overflow]
             first_epoch = (first_epoch or epoch) + state.interval_seconds * overflow
 
     advanced = replace(
@@ -387,20 +439,14 @@ def advance_state(
         lows=tuple(lows),
         volumes=tuple(volumes),
         revisions=tuple(revisions),
+        opens_known=tuple(opens_known),
+        content_fingerprints=tuple(content_fingerprints),
         first_interval_epoch=first_epoch,
         last_receipt_epoch=last_receipt,
         persistence_intervals=persistence,
         gap_resets=gap_resets,
         last_gap_epoch=last_gap_epoch,
-        # Never flip legacy placeholder opens to "trusted" merely because one
-        # live bar was applied mid-window. Trust returns only after a cold
-        # start, a mid-window gap rebuild, or when opens were already retained.
-        opens_retained=(
-            True
-            if applied
-            and (state.opens_retained or gap_detected or state.interval_count == 0)
-            else state.opens_retained
-        ),
+        opens_retained=all(opens_known) if closes else True,
     )
     advanced = replace(advanced, restart_state=_resolve_restart_state(advanced))
     return AdvanceResult(
@@ -432,12 +478,14 @@ def to_checkpoint(
     """
     rolling: dict[str, Any] = {
         "opens": list(state.opens),
+        "opens_known": list(state.opens_known),
         "opens_retained": state.opens_retained,
         "closes": list(state.closes),
         "highs": list(state.highs),
         "lows": list(state.lows),
         "volumes": list(state.volumes),
         "revisions": list(state.revisions),
+        "content_fingerprints": list(state.content_fingerprints),
         "venue": state.venue,
         "first_interval_epoch": state.first_interval_epoch,
         "last_receipt_epoch": state.last_receipt_epoch,
@@ -469,12 +517,18 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
     rolling = dict(checkpoint.rolling_state)
     closes = tuple(float(value) for value in rolling.get("closes") or ())
     raw_opens = rolling.get("opens")
-    opens_retained = bool(rolling.get("opens_retained", raw_opens is not None))
+    raw_known = rolling.get("opens_known")
     if raw_opens is None:
         opens = closes
-        opens_retained = False
+        opens_known = tuple(False for _ in closes)
     else:
         opens = tuple(float(value) for value in raw_opens)
+        if raw_known is None:
+            # Pre-opens_known checkpoint: trust only if legacy flag said retained.
+            trusted = bool(rolling.get("opens_retained", False))
+            opens_known = tuple(trusted for _ in closes)
+        else:
+            opens_known = tuple(bool(value) for value in raw_known)
     highs = tuple(float(value) for value in rolling.get("highs") or ())
     lows = tuple(float(value) for value in rolling.get("lows") or ())
     volumes = tuple(float(value) for value in rolling.get("volumes") or ())
@@ -485,6 +539,11 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
         revisions = tuple(int(value) for value in raw_revisions)
     if len(revisions) != len(closes):
         raise ValueError("checkpoint revisions length mismatch")
+    raw_fps = rolling.get("content_fingerprints")
+    if raw_fps is None:
+        content_fingerprints = tuple("" for _ in closes)
+    else:
+        content_fingerprints = tuple(str(value) for value in raw_fps)
     venue = str(rolling.get("venue") or "").strip()
     if not venue:
         raise ValueError("checkpoint rolling_state.venue is required")
@@ -501,6 +560,8 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
         lows=lows,
         volumes=volumes,
         revisions=revisions,
+        opens_known=opens_known,
+        content_fingerprints=content_fingerprints,
         first_interval_epoch=int(first_epoch) if first_epoch is not None else None,
         last_receipt_epoch=float(last_receipt) if last_receipt is not None else None,
         persistence_intervals=int(rolling.get("persistence_intervals") or 0),
@@ -511,7 +572,7 @@ def from_checkpoint(checkpoint: FeatureStateCheckpoint) -> RollingState:
             else None
         ),
         resumed_from_checkpoint=True,
-        opens_retained=opens_retained,
+        opens_retained=all(opens_known) if closes else True,
         consumed_input_watermark=checkpoint.consumed_input_watermark,
         interval_seconds=int(
             rolling.get("interval_seconds") or DEFAULT_INTERVAL_SECONDS

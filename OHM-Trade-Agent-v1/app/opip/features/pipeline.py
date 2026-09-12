@@ -175,6 +175,7 @@ def run_cycle(
     interval_seconds: int = DEFAULT_INTERVAL_SECONDS,
     window_start: datetime | None = None,
     publish_observations: bool = True,
+    source_coverage: CoverageState | None = None,
 ) -> CycleResult:
     """Run one evaluation for one instrument.
 
@@ -185,6 +186,12 @@ def run_cycle(
     previous = state or initial_state(
         instrument_version, interval_seconds=interval_seconds
     )
+    capture_enabled = publisher is not None and publisher.enabled
+    if capture_enabled and not publish_observations:
+        raise ValueError(
+            "publish_observations=False is not allowed when capture is enabled; "
+            "PR3 refuses unverified observation watermarks for dependent promotion"
+        )
     revised = revise_against_retained(observations, previous)
     alignment = align_minute_observations(
         revised,
@@ -192,11 +199,12 @@ def run_cycle(
         interval_seconds=interval_seconds,
         window_start=window_start,
     )
+    if source_coverage is CoverageState.INCOMPLETE_COVERAGE:
+        alignment = replace(alignment, source_incomplete=True)
     advance = advance_state(previous, alignment.observations)
     candidate = advance.state
 
     outcomes: list[PublishOutcome] = []
-    capture_enabled = publisher is not None and publisher.enabled
     must_commit_observations = (
         capture_enabled and publish_observations and bool(alignment.observations)
     )

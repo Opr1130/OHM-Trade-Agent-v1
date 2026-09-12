@@ -149,6 +149,7 @@ def assert_snapshot_determinism(snapshots: Sequence[FeatureSnapshot]) -> None:
     if len(snapshots) < 2:
         return
     reference = snapshots[0]
+    expected_bytes = canonical_json_bytes(reference.to_dict())
     expected_id = reference.snapshot_id
     expected_hash = reference.content_hash()
     expected_input = detector_input_fingerprint(reference)
@@ -159,6 +160,8 @@ def assert_snapshot_determinism(snapshots: Sequence[FeatureSnapshot]) -> None:
             raise AssertionError("snapshot content hash is not deterministic")
         if detector_input_fingerprint(candidate) != expected_input:
             raise AssertionError("detector replay input is not deterministic")
+        if canonical_json_bytes(candidate.to_dict()) != expected_bytes:
+            raise AssertionError("canonical snapshot bytes are not identical")
 
 
 __all__ = [

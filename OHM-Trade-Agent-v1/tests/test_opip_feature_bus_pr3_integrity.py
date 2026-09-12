@@ -28,7 +28,11 @@ from app.opip.features.pipeline import (
     DISPOSITION_DRY_RUN,
     run_cycle,
 )
-from app.opip.features.publisher import FeatureBusPublisher, PublishOutcome
+from app.opip.features.publisher import (
+    FeatureBusPublisher,
+    PublishOutcome,
+    SHADOW_CAPTURE_SETTINGS,
+)
 from app.opip.features.state import (
     advance_state,
     alignment_from_state,
@@ -140,7 +144,7 @@ class _ScriptedPublisher(FeatureBusPublisher):
     """Forces observation outcomes for canonical-first adversarial cases."""
 
     def __init__(self, script: list[PublishOutcome]):
-        super().__init__(enabled=True)
+        super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
         self._script = list(script)
         self._index = 0
 
@@ -489,7 +493,7 @@ def test_canonical_first_defers_promotion_when_observation_uncommitted(status, w
 
 def test_canonical_first_promotes_when_all_observations_commit(canonical_env, writer_server):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     previous = advance_state(
         initial_state(_instrument()),
         _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=3))),
@@ -526,7 +530,7 @@ def test_dry_run_without_publisher_does_not_claim_persistence():
 
 def test_restart_recorded_only_when_restart_event_commits(canonical_env, writer_server):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     result = run_cycle(
         _observations(_rows(count=5, end_before=CUTOFF), commit_from=None),
         instrument_version=_instrument(),
@@ -550,7 +554,7 @@ def test_dependent_snapshot_or_checkpoint_uncommitted_defers_promotion(status):
 
     class _Publisher(FeatureBusPublisher):
         def __init__(self) -> None:
-            super().__init__(enabled=True)
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
             self._obs = 0
 
         def publish(self, intent):  # type: ignore[override]
@@ -592,7 +596,7 @@ def test_dependent_snapshot_or_checkpoint_uncommitted_defers_promotion(status):
     )
     assert result.disposition == DISPOSITION_DEFERRED_DEPENDENT
     assert result.promoted is False
-    assert result.state.interval_count == previous.interval_count
+    assert result.state == previous
     assert result.restart_recorded is False
 
 
@@ -660,7 +664,7 @@ def test_run_cycle_applies_minted_revision_for_ohlc_correction():
 
 def test_hydrate_registry_from_canonical_db(canonical_env, writer_server):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     v1 = _instrument(version=1, min_order_size=0.2)
     assert publisher.publish_instrument_version(v1).committed
     restored = hydrate_instrument_version_registry(canonical_env["db"])
@@ -749,6 +753,7 @@ def test_unchanged_tip_repoll_is_dropped_before_publish():
         _observations(_rows(count=5, end_before=CUTOFF)),
     ).state
     last_epoch = int(previous.first_interval_epoch) + 60 * (previous.interval_count - 1)
+    # Must include the same optional aggregate fields the source originally persisted.
     same = _observations(
         [
             IntervalRow(
@@ -758,6 +763,8 @@ def test_unchanged_tip_repoll_is_dropped_before_publish():
                 low=previous.lows[-1],
                 close=previous.closes[-1],
                 volume=previous.volumes[-1],
+                vwap=previous.closes[-1],
+                trade_count=14,
             )
         ],
         commit_from=None,
@@ -778,7 +785,7 @@ def test_coverage_gap_uncommitted_defers_promotion():
 
     class _Publisher(FeatureBusPublisher):
         def __init__(self) -> None:
-            super().__init__(enabled=True)
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
             self._obs = 0
 
         def publish(self, intent):  # type: ignore[override]
@@ -913,7 +920,7 @@ def test_required_restart_uncommitted_defers_promotion(status):
 
     class _Publisher(FeatureBusPublisher):
         def __init__(self) -> None:
-            super().__init__(enabled=True)
+            super().__init__(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
             self._obs = 0
 
         def publish(self, intent):  # type: ignore[override]
@@ -1039,7 +1046,7 @@ def test_checkpoint_store_restores_rolling_state(canonical_env, writer_server):
     from app.opip.features.checkpoint_store import load_rolling_state
 
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     instrument = _instrument()
     observations = _observations(
         _rows(count=MINIMUM_WARMUP_INTERVALS, end_before=CUTOFF), commit_from=None
@@ -1060,3 +1067,202 @@ def test_checkpoint_store_restores_rolling_state(canonical_env, writer_server):
     assert restored.interval_count == result.state.interval_count
     assert restored.closes == result.state.closes
     assert restored.resumed_from_checkpoint is True
+
+
+def test_enabled_true_cannot_bypass_dual_shadow_gates():
+    off = FeatureBusPublisher(enabled=True)
+    assert off.enabled is False
+    on = FeatureBusPublisher(enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+    assert on.enabled is True
+    forced_off = FeatureBusPublisher(enabled=False, settings=SHADOW_CAPTURE_SETTINGS)
+    assert forced_off.enabled is False
+
+
+def test_reference_data_version_participates_in_fingerprint():
+    a = _instrument(reference_data_version="opip-evidence-identity-v1")
+    b = _instrument(reference_data_version="opip-evidence-identity-v2")
+    assert a.reference_fingerprint() != b.reference_fingerprint()
+
+
+def test_instrument_version_same_version_fingerprint_conflict_fails_closed():
+    v1 = _instrument(version=1)
+    payload = instrument_version_record_payload(v1)
+    conflict = dict(payload)
+    conflict["tick_size"] = 0.02
+    with pytest.raises(ValueError, match="instrument version conflict"):
+        reconstruct_instrument_version_registry([payload, conflict])
+
+
+def test_window_start_must_be_grid_aligned():
+    with pytest.raises(ValueError, match="window_start"):
+        align_minute_observations(
+            (),
+            cutoff=CUTOFF,
+            window_start=CUTOFF + timedelta(seconds=1),
+        )
+
+
+def test_source_incomplete_propagates_into_cycle_coverage():
+    previous = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF - timedelta(minutes=5))),
+    ).state
+    result = run_cycle(
+        _observations(_rows(count=1, end_before=CUTOFF), commit_from=None),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        source_version="test",
+        window_start=datetime.fromtimestamp(previous.first_interval_epoch, tz=timezone.utc),
+        source_coverage=CoverageState.INCOMPLETE_COVERAGE,
+    )
+    assert result.alignment.coverage is CoverageState.INCOMPLETE_COVERAGE
+
+
+def test_publish_observations_false_with_capture_raises():
+    with pytest.raises(ValueError, match="publish_observations=False"):
+        run_cycle(
+            _observations(_rows(count=3, end_before=CUTOFF), commit_from=None),
+            instrument_version=_instrument(),
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW,
+            publisher=FeatureBusPublisher(
+                enabled=True, settings=SHADOW_CAPTURE_SETTINGS
+            ),
+            source_version="test",
+            publish_observations=False,
+        )
+
+
+def test_non_finite_rows_are_rejected():
+    from app.opip.market.observations import normalize_interval_rows
+
+    result = normalize_interval_rows(
+        [
+            IntervalRow(
+                interval_start_epoch=int(CUTOFF.timestamp()) - 60,
+                open=float("nan"),
+                high=1.0,
+                low=1.0,
+                close=1.0,
+                volume=1.0,
+            )
+        ],
+        instrument_version=_instrument(),
+        interval_seconds=60,
+        receipt_time=NOW,
+        now=NOW,
+        source_label="test",
+        source_sequence_prefix="t",
+    )
+    assert result.observations == ()
+    assert result.rejected[0].reason == "non_finite_price"
+
+
+def test_kraken_invalid_pair_decimals_fail_closed():
+    from app.opip.market.instruments import kraken_descriptor
+
+    assert (
+        kraken_descriptor(
+            "X",
+            {
+                "wsname": "SOL/USD",
+                "base": "SOL",
+                "quote": "ZUSD",
+                "pair_decimals": True,
+                "ordermin": "0.1",
+            },
+        )
+        is None
+    )
+    assert (
+        kraken_descriptor(
+            "X",
+            {
+                "wsname": "SOL/USD",
+                "base": "SOL",
+                "quote": "ZUSD",
+                "pair_decimals": 99,
+                "ordermin": "0.1",
+            },
+        )
+        is None
+    )
+
+
+def test_opens_known_recovers_after_full_window_eviction():
+    from app.opip.features.engine import FEATURE_WINDOW_INTERVALS
+
+    early = advance_state(
+        initial_state(_instrument()),
+        _observations(
+            _rows(count=5, end_before=CUTOFF - timedelta(minutes=200)),
+            commit_from=None,
+        ),
+    ).state
+    checkpoint = to_checkpoint(early, created_at_utc=NOW)
+    rolling = dict(checkpoint.rolling_state)
+    rolling.pop("opens", None)
+    rolling.pop("opens_known", None)
+    rolling.pop("opens_retained", None)
+    rolling.pop("content_fingerprints", None)
+    legacy = from_checkpoint(replace(checkpoint, rolling_state=rolling))
+    assert legacy.opens_retained is False
+    assert all(not known for known in legacy.opens_known)
+
+    filled = advance_state(
+        legacy,
+        _observations(
+            _rows(count=FEATURE_WINDOW_INTERVALS, end_before=CUTOFF),
+            commit_from=None,
+        ),
+    ).state
+    assert filled.interval_count == FEATURE_WINDOW_INTERVALS
+    assert filled.opens_retained is True
+    assert all(filled.opens_known)
+
+
+def test_schema_version_rejects_bool_and_zero():
+    shared = dict(
+        instrument_version_id="INSTR:kraken:SOL:USD:1",
+        venue_instrument_id="SOLUSD",
+        feature_version="features-v1",
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=ConsumedInputWatermark(1, 1),
+        values={"x": 1.0},
+        availability=AvailabilityStamp(
+            source_at_utc=CUTOFF,
+            ingested_at_utc=NOW,
+            visible_at_utc=NOW,
+            source_version="test",
+        ),
+        feature_dag_hash=feature_dag_hash(),
+    )
+    with pytest.raises(ValueError):
+        FeatureSnapshot(**shared, schema_version=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        FeatureSnapshot(**shared, schema_version=0)
+
+
+def test_observation_values_are_immutable_after_construction():
+    obs = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)[0]
+    before = dict(obs.values)
+    with pytest.raises(TypeError):
+        obs.values["close"] = 0.0  # type: ignore[index]
+    assert dict(obs.values) == before
+
+
+def test_empty_expected_window_cycle_is_incomplete():
+    result = run_cycle(
+        (),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        source_version="test",
+        window_start=CUTOFF - timedelta(minutes=5),
+    )
+    assert result.alignment.expected_intervals == 5
+    assert result.alignment.coverage is CoverageState.INCOMPLETE_COVERAGE
+    assert result.alignment.gaps

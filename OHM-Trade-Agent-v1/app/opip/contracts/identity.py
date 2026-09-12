@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.identity.contract import (
@@ -122,7 +123,7 @@ class InstrumentVersion:
             "observed_at_utc",
             require_utc(self.observed_at_utc, field_name="observed_at_utc"),
         )
-        object.__setattr__(self, "attributes", attributes)
+        object.__setattr__(self, "attributes", MappingProxyType(attributes))
 
     @property
     def instrument_version_id(self) -> str:
@@ -156,6 +157,7 @@ class InstrumentVersion:
                 "venue_instrument_id": self.venue_instrument_id,
                 "instrument_class": self.instrument_class.value,
                 "resolution_status": self.resolution_status.value,
+                "reference_data_version": self.reference_data_version,
                 "price_decimals": self.price_decimals,
                 "tick_size": self.tick_size,
                 "min_order_size": self.min_order_size,

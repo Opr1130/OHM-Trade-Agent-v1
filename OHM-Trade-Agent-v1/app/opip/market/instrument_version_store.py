@@ -72,13 +72,30 @@ def reconstruct_instrument_version_registry(
     *,
     reference_data_version: str | None = None,
 ) -> InstrumentVersionRegistry:
-    """Latest committed version wins per instrument_key (monotonic versions)."""
+    """Latest committed version wins per instrument_key (monotonic versions).
+
+    Same version with a different reference fingerprint is integrity corruption
+    and fails closed. Same version with the same fingerprint is idempotent.
+    """
     latest: dict[str, InstrumentVersion] = {}
     for payload in payloads:
         version = instrument_version_from_payload(payload)
         existing = latest.get(version.instrument_key)
-        if existing is None or version.version >= existing.version:
+        if existing is None:
             latest[version.instrument_key] = version
+            continue
+        if version.version < existing.version:
+            continue
+        if version.version > existing.version:
+            latest[version.instrument_key] = version
+            continue
+        if version.reference_fingerprint() != existing.reference_fingerprint():
+            raise ValueError(
+                "instrument version conflict: same version with different "
+                f"reference fingerprint for {version.instrument_key}"
+            )
+        # Identical version + fingerprint: idempotent keep.
+        latest[version.instrument_key] = version
     ref = reference_data_version
     if ref is None and latest:
         ref = next(iter(latest.values())).reference_data_version

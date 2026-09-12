@@ -65,6 +65,7 @@ from app.opip.features.parity import (
 from app.opip.features.pipeline import run_cycle
 from app.opip.features.publisher import (
     FeatureBusPublisher,
+    SHADOW_CAPTURE_SETTINGS,
     build_intent,
     feature_bus_capture_enabled,
     observation_intent,
@@ -977,7 +978,7 @@ def test_writer_accepts_feature_bus_events_on_a_separate_stream(
     canonical_env, writer_server
 ):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     result = run_cycle(
         _observations(_rows(count=40, end_before=CUTOFF)),
         instrument_version=_instrument(),
@@ -1017,7 +1018,7 @@ def test_writer_accepts_feature_bus_events_on_a_separate_stream(
 
 def test_feature_bus_writes_are_idempotent(canonical_env, writer_server):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     snapshot = build_feature_snapshot(
         _aligned(_observations(_rows(count=30, end_before=CUTOFF))),
         instrument_version=_instrument(),
@@ -1063,7 +1064,7 @@ def test_writer_rejects_feature_bus_traffic_that_breaks_its_contract(
 
 def test_projection_rebuild_ignores_feature_bus_events(canonical_env, writer_server):
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     publisher.publish_observations(_observations(_rows(count=5, end_before=CUTOFF)))
     summary = rebuild_identity_projection(canonical_env["db"])
     assert summary["events_applied"] == 0
@@ -1075,7 +1076,7 @@ def test_failed_submission_spools_diagnostically(tmp_path):
         def submit(self, intent):
             raise RuntimeError("writer down")
 
-    publisher = FeatureBusPublisher(_Boom(), enabled=True, spool_dir=tmp_path)
+    publisher = FeatureBusPublisher(_Boom(), enabled=True, settings=SHADOW_CAPTURE_SETTINGS, spool_dir=tmp_path)
     outcome = publisher.publish_observations(
         _observations(_rows(count=1, end_before=CUTOFF))
     )[0]
@@ -1259,7 +1260,7 @@ def test_published_observations_advance_watermark_without_pre_stamped_commit_ord
 ):
     """Live path: commit_order is absent until the writer ack supplies it."""
     client = InProcessWriterClient(writer_server)
-    publisher = FeatureBusPublisher(client, enabled=True)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
     result = run_cycle(
         _observations(_rows(count=40, end_before=CUTOFF), commit_from=None),
         instrument_version=_instrument(),

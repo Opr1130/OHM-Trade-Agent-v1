@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+import math
 from typing import Any, Mapping
 
 from app.opip.contracts.identity import InstrumentVersion
@@ -102,34 +103,58 @@ def is_eligible_pair(details: Mapping[str, Any]) -> bool:
 
 
 def _optional_float(value: Any) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return None
-    return parsed if parsed > 0 else None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
 
 
-def _optional_int(value: Any) -> int | None:
-    if value is None:
+#: Kraken pair_decimals above this would overflow tick construction and is rejected.
+_MAX_PAIR_DECIMALS = 18
+
+
+def _optional_pair_decimals(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         return None
+    if parsed != float(value):
+        return None
+    if parsed < 0 or parsed > _MAX_PAIR_DECIMALS:
+        return None
+    return parsed
 
 
 def kraken_descriptor(
     pair_id: str, details: Mapping[str, Any]
 ) -> VenueInstrumentDescriptor | None:
-    """Extract a descriptor from one ``AssetPairs`` entry. Pure, no network."""
+    """Extract a descriptor from one ``AssetPairs`` entry. Pure, no network.
+
+    Invalid numeric metadata fails closed (returns None) rather than inventing
+    a plausible tick size or minimum order.
+    """
     symbols = _pair_symbols(details)
     if symbols is None:
         return None
     base_asset, quote_currency = symbols
-    price_decimals = _optional_int(details.get("pair_decimals"))
-    tick_size = 10.0 ** (-price_decimals) if price_decimals is not None else None
+    price_decimals = _optional_pair_decimals(details.get("pair_decimals"))
+    if details.get("pair_decimals") is not None and price_decimals is None:
+        return None
+    tick_size = None
+    if price_decimals is not None:
+        tick_size = 10.0 ** (-price_decimals)
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            return None
+    min_order = _optional_float(details.get("ordermin"))
+    if details.get("ordermin") is not None and min_order is None:
+        return None
     altname = str(details.get("altname") or pair_id).upper()
     attributes = {"pair_id": str(pair_id), "altname": altname}
     status = details.get("status")
@@ -142,7 +167,7 @@ def kraken_descriptor(
         venue_instrument_id=altname,
         price_decimals=price_decimals,
         tick_size=tick_size,
-        min_order_size=_optional_float(details.get("ordermin")),
+        min_order_size=min_order,
         attributes=attributes,
     )
 

@@ -36,6 +36,15 @@ FEATURE_SNAPSHOT_RECORD_TYPE = "FeatureSnapshot"
 FEATURE_CHECKPOINT_RECORD_TYPE = "FeatureStateCheckpoint"
 FEATURE_BUS_SCHEMA_VERSION = 1
 
+
+def _require_schema_version(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("schema_version must be an integer")
+    if int(value) < 1:
+        raise ValueError("schema_version must be >= 1")
+    return int(value)
+
+
 #: N10: IGNITION evaluates on a one-minute grid. Longer candles are feature
 #: inputs, never the evaluation cadence.
 DEFAULT_EVALUATION_GRID_SECONDS = 60
@@ -126,6 +135,7 @@ class FeatureSnapshot:
         object.__setattr__(
             self, "venue_instrument_id", str(self.venue_instrument_id).strip()
         )
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
 
     @property
     def snapshot_id(self) -> str:
@@ -258,6 +268,7 @@ class FeatureStateCheckpoint:
             "rolling_state",
             _scalar_or_list_state(self.rolling_state),
         )
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
 
     @property
     def checkpoint_id(self) -> str:
@@ -291,7 +302,7 @@ class FeatureStateCheckpoint:
 
 
 def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    """Rolling state may hold scalars or flat numeric lists (retained windows)."""
+    """Rolling state may hold scalars, numeric lists, bool lists, or string lists."""
     cleaned: dict[str, Any] = {}
     for key, value in dict(state).items():
         name = str(key)
@@ -300,11 +311,20 @@ def _scalar_or_list_state(state: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(value, (list, tuple)):
             items = list(value)
-            if any(not isinstance(item, (int, float)) for item in items):
+            if not items:
+                cleaned[name] = []
+                continue
+            if all(isinstance(item, str) for item in items):
+                cleaned[name] = [str(item) for item in items]
+                continue
+            if all(isinstance(item, bool) for item in items):
+                cleaned[name] = [bool(item) for item in items]
+                continue
+            if any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in items):
                 raise TypeError(f"rolling_state[{name}] lists must be numeric")
             cleaned[name] = [float(item) for item in items]
             continue
-        raise TypeError(f"rolling_state[{name}] must be a scalar or numeric list")
+        raise TypeError(f"rolling_state[{name}] must be a scalar or list")
     return dict(sorted(cleaned.items()))
 
 
