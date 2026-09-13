@@ -367,6 +367,12 @@ def aggregate_trades_to_minutes(
     Trades are ephemeral by contract; the aggregate is what gets persisted.
     Ordering is by ``(source_event_time, ingestion_order)`` so the same trades
     always fold to the same bar regardless of arrival order.
+
+    Every TRADE observation must already carry the requested instrument
+    version's identity. A trade minted under a different
+    ``instrument_version_id`` is never aggregated, bucketed, or renormalized
+    under this instrument: mixing instruments here would let another
+    instrument's prices and volume become canonical evidence for this one.
     """
     buckets: dict[int, dict[str, float]] = {}
     ordered = sorted(
@@ -377,6 +383,19 @@ def aggregate_trades_to_minutes(
         ),
         key=lambda trade: (trade.source_event_time, trade.ingestion_order),
     )
+    expected_instrument_version_id = instrument_version.instrument_version_id
+    mismatched = [
+        trade
+        for trade in ordered
+        if trade.instrument_version_id != expected_instrument_version_id
+    ]
+    if mismatched:
+        raise ValueError(
+            "trade observation instrument_version_id "
+            f"{mismatched[0].instrument_version_id!r} != "
+            f"{expected_instrument_version_id!r}; refusing to aggregate "
+            "mixed-instrument trades"
+        )
     for trade in ordered:
         price = trade.values.get("price")
         quantity = trade.values.get("quantity")

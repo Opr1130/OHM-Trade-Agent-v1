@@ -2214,3 +2214,269 @@ def test_feature_snapshot_rejects_non_finite_values():
             availability=availability,
             feature_dag_hash="abc",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Blocker 1 - mixed-instrument trade attribution (aggregate_trades_to_minutes)
+# --------------------------------------------------------------------------- #
+
+
+def _trade(
+    *,
+    instrument_version_id: str,
+    venue_instrument_id: str,
+    offset_seconds: int,
+    price: float,
+    quantity: float = 1.0,
+    ingestion_order: int = 1,
+    base: datetime = CUTOFF - timedelta(minutes=2),
+):
+    from app.opip.contracts.enums import PayloadKind
+    from app.opip.contracts.observation import Observation
+
+    return Observation(
+        instrument_version_id=instrument_version_id,
+        venue="kraken",
+        venue_instrument_id=venue_instrument_id,
+        source_event_time=base + timedelta(seconds=offset_seconds),
+        receipt_time=NOW,
+        ingestion_order=ingestion_order,
+        payload_kind=PayloadKind.TRADE,
+        values={"price": price, "quantity": quantity},
+    )
+
+
+def test_same_instrument_trades_still_aggregate_normally():
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    trades = [
+        _trade(
+            instrument_version_id=instrument.instrument_version_id,
+            venue_instrument_id="SOLUSD",
+            offset_seconds=offset,
+            price=price,
+            ingestion_order=index + 1,
+        )
+        for index, (offset, price) in enumerate(
+            [(1, 100.0), (10, 101.0), (59, 99.5)]
+        )
+    ]
+    result = aggregate_trades_to_minutes(
+        trades,
+        instrument_version=instrument,
+        receipt_time=NOW,
+        now=NOW,
+        source_label="trades",
+        source_sequence_prefix="trade-1m",
+    )
+    assert len(result.observations) == 1
+    assert result.observations[0].values["trade_count"] == 3
+    assert result.observations[0].instrument_version_id == (
+        instrument.instrument_version_id
+    )
+
+
+def test_batch_with_foreign_instrument_trade_is_rejected():
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    foreign = _instrument(base_asset="ETH", venue_instrument_id="ETHUSD")
+    trades = [
+        _trade(
+            instrument_version_id=instrument.instrument_version_id,
+            venue_instrument_id="SOLUSD",
+            offset_seconds=1,
+            price=100.0,
+            ingestion_order=1,
+        ),
+        _trade(
+            instrument_version_id=foreign.instrument_version_id,
+            venue_instrument_id="ETHUSD",
+            offset_seconds=10,
+            price=3000.0,
+            ingestion_order=2,
+        ),
+    ]
+    with pytest.raises(ValueError, match="instrument_version_id"):
+        aggregate_trades_to_minutes(
+            trades,
+            instrument_version=instrument,
+            receipt_time=NOW,
+            now=NOW,
+            source_label="trades",
+            source_sequence_prefix="trade-1m",
+        )
+
+
+def test_foreign_trade_price_never_enters_the_target_bar():
+    """A rejected mixed batch must not leave any partial bar behind.
+
+    Before the fix, the foreign-instrument trade's price and volume would
+    have been folded into the same bucket and relabeled with the target
+    instrument's identity. Proves the whole call raises before any bucket
+    is built, so a caller cannot recover a partially-aggregated, mislabeled
+    bar from a failed call.
+    """
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    foreign = _instrument(base_asset="ETH", venue_instrument_id="ETHUSD")
+    poison_price = 999999.0
+    trades = [
+        _trade(
+            instrument_version_id=instrument.instrument_version_id,
+            venue_instrument_id="SOLUSD",
+            offset_seconds=1,
+            price=100.0,
+            ingestion_order=1,
+        ),
+        _trade(
+            instrument_version_id=foreign.instrument_version_id,
+            venue_instrument_id="ETHUSD",
+            offset_seconds=5,
+            price=poison_price,
+            ingestion_order=2,
+        ),
+    ]
+    with pytest.raises(ValueError):
+        aggregate_trades_to_minutes(
+            trades,
+            instrument_version=instrument,
+            receipt_time=NOW,
+            now=NOW,
+            source_label="trades",
+            source_sequence_prefix="trade-1m",
+        )
+    # Same-instrument-only replay proves the foreign trade never contributed
+    # to a bar under this instrument's identity.
+    clean = aggregate_trades_to_minutes(
+        [trades[0]],
+        instrument_version=instrument,
+        receipt_time=NOW,
+        now=NOW,
+        source_label="trades",
+        source_sequence_prefix="trade-1m",
+    )
+    assert clean.observations[0].values["high"] < poison_price
+    assert clean.observations[0].values["close"] == 100.0
+
+
+def test_non_trade_observations_are_still_ignored_by_trade_folding():
+    """Non-TRADE observations must retain existing intended behaviour: they
+    are excluded from trade folding entirely, mismatched identity or not."""
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    bar = _observations(_rows(count=1, end_before=CUTOFF), commit_from=None)[0]
+    foreign_bar = replace(
+        bar,
+        instrument_version_id="INSTR:kraken:ETH:USD:1",
+        venue_instrument_id="ETHUSD",
+    )
+    trade = _trade(
+        instrument_version_id=instrument.instrument_version_id,
+        venue_instrument_id="SOLUSD",
+        offset_seconds=1,
+        price=100.0,
+        ingestion_order=1,
+    )
+    result = aggregate_trades_to_minutes(
+        [bar, foreign_bar, trade],
+        instrument_version=instrument,
+        receipt_time=NOW,
+        now=NOW,
+        source_label="trades",
+        source_sequence_prefix="trade-1m",
+    )
+    assert len(result.observations) == 1
+    assert result.observations[0].values["trade_count"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Blocker 2 - malformed committed instrument-version payloads
+# --------------------------------------------------------------------------- #
+
+
+def _insert_raw_event(
+    conn,
+    *,
+    event_type: str,
+    payload_json: str,
+    history_epoch: int = 1,
+    local_sequence: int = 1,
+):
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        """
+        INSERT INTO events (
+            event_id, schema_version, event_type, history_epoch, local_sequence,
+            recorded_at, event_time, causation_id, correlation_id,
+            idempotency_key, payload_json
+        ) VALUES (?, 1, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+        """,
+        (
+            f"EVT:test-{event_type}-{history_epoch}-{local_sequence}",
+            event_type,
+            history_epoch,
+            local_sequence,
+            now,
+            f"idem-{event_type}-{history_epoch}-{local_sequence}",
+            payload_json,
+        ),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize(
+    "malformed_json",
+    ["[]", '"string"', "123", "true", "null"],
+    ids=["list", "string", "number", "boolean", "null"],
+)
+def test_malformed_committed_payload_fails_closed(
+    canonical_env, writer_server, malformed_json
+):
+    from app.opip.contracts.events import MARKET_INSTRUMENT_VERSION_RECORDED
+    from app.opip.market.instrument_version_store import (
+        InstrumentVersionIntegrityError,
+        load_instrument_version_payloads,
+    )
+
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=MARKET_INSTRUMENT_VERSION_RECORDED,
+        payload_json=malformed_json,
+    )
+    with pytest.raises(InstrumentVersionIntegrityError):
+        load_instrument_version_payloads(canonical_env["db"])
+
+
+def test_valid_dict_payload_still_reconstructs_successfully(
+    canonical_env, writer_server
+):
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS)
+    v1 = _instrument(version=1, min_order_size=0.2)
+    assert publisher.publish_instrument_version(v1).committed
+
+    from app.opip.market.instrument_version_store import (
+        load_instrument_version_payloads,
+    )
+
+    payloads = load_instrument_version_payloads(canonical_env["db"])
+    assert len(payloads) == 1
+    assert payloads[0]["instrument_version_id"] == v1.instrument_version_id
+    restored = reconstruct_instrument_version_registry(payloads)
+    again = restored.observe(
+        VenueInstrumentDescriptor(
+            venue="kraken",
+            base_asset="SOL",
+            quote_currency="USD",
+            venue_instrument_id="SOLUSD",
+            price_decimals=2,
+            tick_size=0.01,
+            min_order_size=0.2,
+        ),
+        observed_at_utc=NOW + timedelta(minutes=1),
+    )
+    assert again.version == 1

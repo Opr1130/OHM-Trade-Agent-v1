@@ -149,7 +149,14 @@ def reconstruct_instrument_version_registry(
 
 
 def load_instrument_version_payloads(db_path: Path) -> list[dict[str, Any]]:
-    """Read committed instrument-version records from the canonical SQLite WAL."""
+    """Read committed instrument-version records from the canonical SQLite WAL.
+
+    A committed ``payload_json`` that does not decode to a JSON object (for
+    example a list, string, number, boolean, or null) is corrupt canonical
+    evidence, not an absent record. Reconstruction fails closed immediately
+    instead of silently skipping it, so history can never be rebuilt from an
+    incomplete set of committed records without raising.
+    """
     from app.opip.canonical.schema import connect
 
     target = Path(db_path)
@@ -171,8 +178,13 @@ def load_instrument_version_payloads(db_path: Path) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for row in rows:
         payload = json.loads(str(row["payload_json"]))
-        if isinstance(payload, dict):
-            payloads.append(payload)
+        if not isinstance(payload, dict):
+            raise InstrumentVersionIntegrityError(
+                "committed instrument version payload_json did not decode to "
+                f"a JSON object (got {type(payload).__name__}); refusing to "
+                "silently skip malformed canonical evidence"
+            )
+        payloads.append(payload)
     return payloads
 
 
