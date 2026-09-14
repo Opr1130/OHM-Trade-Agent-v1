@@ -71,7 +71,7 @@ jobs:
               "Never commit directly to `main`",
               "Never deploy to production unless explicitly authorized",
               "Never enable live trading",
-              "coding automation has no trading authority",
+              "Coding automation has no trading authority",
               "Never expose, print, copy into source, log, or commit secrets",
               "Do not create or push commits until explicitly instructed",
               "Do not merge PRs or run deployment commands unless explicitly instructed",
