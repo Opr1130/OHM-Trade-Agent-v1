@@ -11,6 +11,16 @@ EventType = Literal[
     "alert_governor.transition.recorded",
     "alert_governor.reservation.released",
     "alert_governor.capture_gap.recorded",
+    # PR3 feature bus. These reuse the existing generic events and watermarks
+    # tables, so no physical schema version bump is required. Names are owned
+    # by app.opip.contracts.events; the literal is restated here only because
+    # the type annotation cannot be computed from that frozenset.
+    "market.observation.recorded",
+    "market.instrument_version.recorded",
+    "feature.snapshot.recorded",
+    "feature.checkpoint.recorded",
+    "coverage.gap.recorded",
+    "feature.restart.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]

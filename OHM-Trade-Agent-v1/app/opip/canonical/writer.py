@@ -8,6 +8,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
 from app.opip.canonical.paths import (
@@ -17,8 +18,89 @@ from app.opip.canonical.paths import (
     STREAM_EARLY_WATCH,
 )
 from app.opip.canonical.schema import connect, initialize_schema
+from app.opip.contracts.events import (
+    FEATURE_BUS_EVENT_TYPES,
+    FEATURE_BUS_PRIORITY,
+    FEATURE_BUS_STREAM,
+    FEATURE_CHECKPOINT_RECORDED,
+    FEATURE_SNAPSHOT_RECORDED,
+    MARKET_OBSERVATION_RECORDED,
+)
 
 MAX_PAYLOAD_BYTES = 16 * 1024
+
+#: Same idempotency key + different semantic payload is integrity corruption.
+#: Feature snapshots and rolling-state checkpoints are included after redacting
+#: volatile clocks so a re-poll that only advances ``evaluated_at_utc`` /
+#: ``created_at_utc`` / receipt stamps stays ``DUPLICATE_OK``, while divergent
+#: values/coverage/retained state fail closed instead of promoting in-memory
+#: state the WAL does not actually hold.
+IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
+    {
+        MARKET_OBSERVATION_RECORDED,
+        FEATURE_CHECKPOINT_RECORDED,
+        FEATURE_SNAPSHOT_RECORDED,
+    }
+)
+
+#: Wall-clock / hash fields that may move on an otherwise identical snapshot.
+_SNAPSHOT_VOLATILE_KEYS = frozenset(
+    {
+        "evaluated_at_utc",
+        "notes",
+        "content_hash",
+        "visible_at_utc",
+    }
+)
+#: Receipt clocks inside availability; keep source_at_utc / source_version as
+#: substantive content so adapter-version or source-time drift fails closed.
+_SNAPSHOT_AVAILABILITY_VOLATILE_KEYS = frozenset(
+    {
+        "ingested_at_utc",
+        "visible_at_utc",
+    }
+)
+#: The only checkpoint field allowed to move between same-key retries is its
+#: creation clock; retained rolling state is substantive evidence.
+_CHECKPOINT_VOLATILE_KEYS = frozenset({"created_at_utc"})
+
+
+def _idempotency_payload_json(event_type: str, payload: object) -> str:
+    """Canonical JSON used for same-key semantic conflict detection."""
+    if not isinstance(payload, dict):
+        raise TypeError("idempotency payload must be a mapping")
+    body: dict = dict(payload)
+    if event_type == FEATURE_SNAPSHOT_RECORDED:
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in _SNAPSHOT_VOLATILE_KEYS
+        }
+        availability = body.get("availability")
+        if isinstance(availability, Mapping):
+            body["availability"] = {
+                key: value
+                for key, value in availability.items()
+                if key not in _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS
+            }
+    elif event_type == FEATURE_CHECKPOINT_RECORDED:
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in _CHECKPOINT_VOLATILE_KEYS
+        }
+    return json.dumps(body, separators=(",", ":"), sort_keys=True)
+
+
+ALERT_GOVERNOR_EVENT_TYPES = frozenset(
+    {
+        "alert_governor.transition.recorded",
+        "alert_governor.reservation.released",
+        "alert_governor.capture_gap.recorded",
+    }
+)
+
+ACCEPTED_EVENT_TYPES = ALERT_GOVERNOR_EVENT_TYPES | FEATURE_BUS_EVENT_TYPES
 
 
 def _utc_now() -> str:
@@ -59,14 +141,27 @@ class CanonicalWriter:
             except ValueError as exc:
                 return WriterAck(status="REJECTED", error_code="INVALID_INTENT", detail=str(exc))
 
-            existing = self._lookup_idempotency(intent.idempotency_key)
+            payload_json = None
+            if intent.event_type in IDEMPOTENT_PAYLOAD_EVENT_TYPES:
+                payload_json = _idempotency_payload_json(
+                    intent.event_type, intent.payload
+                )
+            existing = self._lookup_idempotency(
+                intent.idempotency_key,
+                payload_json=payload_json,
+                event_type=intent.event_type,
+            )
             if existing is not None:
                 return existing
 
             try:
                 return self._commit_new(intent)
             except sqlite3.IntegrityError:
-                existing = self._lookup_idempotency(intent.idempotency_key)
+                existing = self._lookup_idempotency(
+                    intent.idempotency_key,
+                    payload_json=payload_json,
+                    event_type=intent.event_type,
+                )
                 if existing is not None:
                     return existing
                 return WriterAck(status="RETRYABLE", error_code="INTEGRITY_CONFLICT")
@@ -205,13 +300,32 @@ class CanonicalWriter:
                     pass
                 raise
 
-    def _lookup_idempotency(self, key: str) -> WriterAck | None:
+    def _lookup_idempotency(
+        self, key: str, *, payload_json: str | None = None, event_type: str | None = None
+    ) -> WriterAck | None:
         existing = self._conn.execute(
-            "SELECT event_id, history_epoch, local_sequence FROM events WHERE idempotency_key = ?",
+            "SELECT event_id, history_epoch, local_sequence, payload_json "
+            "FROM events WHERE idempotency_key = ?",
             (key,),
         ).fetchone()
         if existing is None:
             return None
+        if payload_json is not None:
+            existing_payload = str(existing["payload_json"])
+            if event_type is not None:
+                try:
+                    existing_payload = _idempotency_payload_json(
+                        event_type, json.loads(existing_payload)
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_payload = str(existing["payload_json"])
+            if existing_payload != payload_json:
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    event_id=str(existing["event_id"]),
+                    detail="idempotency_key already committed with a different payload",
+                )
         return WriterAck(
             status="DUPLICATE_OK",
             event_id=str(existing["event_id"]),
@@ -226,15 +340,19 @@ class CanonicalWriter:
             raise ValueError("invalid priority")
         if not intent.idempotency_key.strip():
             raise ValueError("idempotency_key required")
-        if intent.event_type not in {
-            "alert_governor.transition.recorded",
-            "alert_governor.reservation.released",
-            "alert_governor.capture_gap.recorded",
-        }:
+        if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
         raw = json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
         if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload too large")
+        if intent.event_type in FEATURE_BUS_EVENT_TYPES:
+            # Feature-bus traffic is telemetry. It must not borrow protection or
+            # execution priority, and it never drives an operational handoff.
+            if intent.priority != FEATURE_BUS_PRIORITY:
+                raise ValueError("feature bus events must use LOW priority")
+            if intent.ops_handoff is not None:
+                raise ValueError("feature bus events must not carry ops_handoff")
+            return
         if intent.event_type == "alert_governor.capture_gap.recorded":
             if intent.ops_handoff is not None:
                 raise ValueError("capture_gap must not carry ops_handoff")
@@ -270,6 +388,10 @@ class CanonicalWriter:
         state_file = STATE_FAMILY_EARLY_WATCH
         operation = str(handoff.get("operation") or "")
         is_gap = intent.event_type == "alert_governor.capture_gap.recorded"
+        is_feature_bus = intent.event_type in FEATURE_BUS_EVENT_TYPES
+        # Separate watermark streams: feature-bus progress can never rewind or
+        # advance Early Watch alert-control progress, or the reverse.
+        stream = FEATURE_BUS_STREAM if is_feature_bus else STREAM_EARLY_WATCH
 
         self._conn.execute("BEGIN IMMEDIATE")
         meta = self._conn.execute(
@@ -351,9 +473,9 @@ class CanonicalWriter:
                 local_sequence = excluded.local_sequence,
                 updated_at = excluded.updated_at
             """,
-            (STREAM_EARLY_WATCH, history_epoch, local_sequence, now),
+            (stream, history_epoch, local_sequence, now),
         )
-        if not is_gap:
+        if not is_gap and not is_feature_bus:
             self._conn.execute(
                 """
                 INSERT INTO alert_ops_handoffs (
