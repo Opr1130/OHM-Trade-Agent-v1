@@ -1,0 +1,194 @@
+{
+  "template_version": "1.0",
+  "record_kind": "passive_engineering_workflow",
+  "executable": false,
+  "task_id": null,
+  "state": "RESEARCH",
+  "status": "active",
+  "blocked_reason": null,
+  "policy_ref": "AGENTS.md",
+  "states": [
+    "RESEARCH",
+    "PLAN",
+    "IMPLEMENT",
+    "TEST",
+    "REVIEW",
+    "FIX",
+    "RETEST",
+    "PR",
+    "FINAL_REVIEW",
+    "INTEGRATE",
+    "DEPLOY",
+    "VERIFY"
+  ],
+  "transitions": {
+    "RESEARCH": [
+      "PLAN"
+    ],
+    "PLAN": [
+      "IMPLEMENT"
+    ],
+    "IMPLEMENT": [
+      "TEST"
+    ],
+    "TEST": [
+      "REVIEW"
+    ],
+    "REVIEW": [
+      "FIX"
+    ],
+    "FIX": [
+      "RETEST"
+    ],
+    "RETEST": [
+      "FIX",
+      "PR"
+    ],
+    "PR": [
+      "FINAL_REVIEW"
+    ],
+    "FINAL_REVIEW": [
+      "FIX",
+      "INTEGRATE"
+    ],
+    "INTEGRATE": [
+      "DEPLOY"
+    ],
+    "DEPLOY": [
+      "VERIFY"
+    ],
+    "VERIFY": []
+  },
+  "workspace": {
+    "branch": null,
+    "dirty_baseline_ref": null,
+    "initial_head_sha": null,
+    "root": null,
+    "worktree_isolated": false,
+    "agent": null
+  },
+  "scope": {
+    "pr237_isolation_checked": false,
+    "stateful_change": null,
+    "summary": null,
+    "behavioral_change": null,
+    "authorization_ref": null,
+    "non_goals": []
+  },
+  "architecture": {
+    "version": null,
+    "source_sha": null,
+    "missing_context": [],
+    "v142_present": null,
+    "path": null
+  },
+  "stateful_checks": {
+    "idempotency": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "replay_determinism": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "duplicate_out_of_order_delivery": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "concurrency_transactions": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "crash_recovery_partial_writes": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "fail_open_non_authority": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "fail_closed_safety": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "point_in_time_no_future_leakage": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    },
+    "canonical_history_no_duplicate_evidence": {
+      "evidence_ids": [],
+      "rationale": null,
+      "result": "pending"
+    }
+  },
+  "validation": {
+    "unresolved_findings": [],
+    "tested_sha": null,
+    "working_diff_evidence_id": null,
+    "evidence_ids": []
+  },
+  "pull_request": {
+    "base_sha": null,
+    "url": null,
+    "integration_evidence_ids": [],
+    "reviewed_sha": null,
+    "head_sha": null,
+    "required_checks_evidence_ids": [],
+    "remote_verified_at": null,
+    "merge_sha": null
+  },
+  "approvals": {
+    "merge_ref": null,
+    "deployment_ref": null,
+    "deployment_approved_sha": null,
+    "promotion_ref": null,
+    "commit_push_ref": null,
+    "destructive_migration_ref": null,
+    "merge_approved_sha": null
+  },
+  "deployment": {
+    "rollback_triggers": [],
+    "pre_health_evidence_ids": [],
+    "rollback_release_sha": null,
+    "running_sha": null,
+    "post_health_evidence_ids": [],
+    "rollback_procedure_ref": null,
+    "control_plane_ref": null,
+    "disposition": "not_requested",
+    "migration_compatibility_ref": null,
+    "rollback_outcome_ref": null,
+    "learning_alignment_evidence_ids": [],
+    "release_sha": null
+  },
+  "evidence": [],
+  "evidence_entry_template": {
+    "id": null,
+    "source_sha": null,
+    "recorded_at": null,
+    "canonical_uri": null,
+    "result": "pending"
+  },
+  "history": [],
+  "history_entry_template": {
+    "from": null,
+    "evidence_ids": [],
+    "rationale": null,
+    "timestamp": null,
+    "actor": null,
+    "source_sha": null,
+    "to": null
+  },
+  "completion": {
+    "disposition": null,
+    "scope_ref": null,
+    "verified_at": null
+  }
+}
