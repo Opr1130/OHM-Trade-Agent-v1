@@ -23,6 +23,10 @@ from app.opip.market.aggregates import DEFAULT_INTERVAL_SECONDS
 from app.opip.market.observations import aggregate_content_fingerprint
 
 
+class RevisionLedgerIntegrityError(ValueError):
+    """Committed observation/revision payload is corrupt or non-reconstructable."""
+
+
 @dataclass(frozen=True)
 class CommittedObservationRevision:
     """One durable observation revision known to be in canonical history."""
@@ -119,7 +123,13 @@ def load_revision_ledger(
     db_path: Path | None = None,
     since_interval_epoch: int | None = None,
 ) -> RevisionLedger:
-    """Rebuild the ledger from committed market.observation.recorded events."""
+    """Rebuild the ledger from committed market.observation.recorded events.
+
+    Committed payloads that are not JSON objects, or matching-instrument
+    aggregate rows missing required identity/provenance fields, fail closed.
+    Other instruments and other aggregate cadences are filtered out without
+    reinterpretation.
+    """
     from app.opip.canonical.schema import connect
 
     if db_path is None:
@@ -153,32 +163,70 @@ def load_revision_ledger(
     for row in rows:
         payload = json.loads(str(row["payload_json"]))
         if not isinstance(payload, dict):
-            continue
+            raise RevisionLedgerIntegrityError(
+                "committed market.observation.recorded payload_json did not "
+                f"decode to a JSON object (got {type(payload).__name__}); "
+                "refusing to silently skip malformed canonical evidence"
+            )
         if str(payload.get("instrument_version_id") or "") != instrument_version_id:
             continue
         if int(payload.get("aggregate_interval_seconds") or 0) != step:
             continue
-        source = str(payload.get("source_event_time") or "")
-        if not source:
-            continue
+        source = payload.get("source_event_time")
+        if source is None or str(source).strip() == "":
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} missing source_event_time; "
+                "refusing to skip or invent revision provenance"
+            )
         try:
             from datetime import datetime
 
-            moment = datetime.fromisoformat(source.replace("Z", "+00:00"))
+            moment = datetime.fromisoformat(str(source).replace("Z", "+00:00"))
             epoch = int(moment.timestamp())
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} has unparseable source_event_time "
+                f"{source!r}; refusing to skip malformed evidence"
+            ) from exc
         if since_interval_epoch is not None and epoch < int(since_interval_epoch):
             continue
-        values = payload.get("values") or {}
+        values = payload.get("values")
         if not isinstance(values, Mapping):
-            continue
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has non-object "
+                "values; refusing to skip or invent a content fingerprint"
+            )
         fingerprint = aggregate_content_fingerprint(dict(values))
-        revision = int(payload.get("revision") or 1)
-        observation_id = str(payload.get("observation_id") or "")
+        raw_revision = payload.get("revision")
+        if raw_revision is None:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} missing revision; "
+                "refusing to default revision numbers"
+            )
+        try:
+            revision = int(raw_revision)
+        except (TypeError, ValueError) as exc:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has non-integer "
+                f"revision {raw_revision!r}"
+            ) from exc
+        if revision < 1:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has invalid "
+                f"revision {revision}"
+            )
+        observation_id = str(payload.get("observation_id") or "").strip()
         if not observation_id:
-            observation_id = (
-                f"OBS:{instrument_version_id}:{step}s:{epoch}:{revision}"
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} missing "
+                "observation_id; refusing to synthesize durable identity"
             )
         incoming = CommittedObservationRevision(
             interval_epoch=epoch,
@@ -204,5 +252,6 @@ def load_revision_ledger(
 __all__ = [
     "CommittedObservationRevision",
     "RevisionLedger",
+    "RevisionLedgerIntegrityError",
     "load_revision_ledger",
 ]

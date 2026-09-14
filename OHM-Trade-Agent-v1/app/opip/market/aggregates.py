@@ -369,10 +369,11 @@ def aggregate_trades_to_minutes(
     always fold to the same bar regardless of arrival order.
 
     Every TRADE observation must already carry the requested instrument
-    version's identity. A trade minted under a different
-    ``instrument_version_id`` is never aggregated, bucketed, or renormalized
-    under this instrument: mixing instruments here would let another
-    instrument's prices and volume become canonical evidence for this one.
+    identity: ``instrument_version_id``, ``venue``, and
+    ``venue_instrument_id``. A trade minted under a different identity is
+    never aggregated, bucketed, or renormalized under this instrument:
+    mixing instruments here would let another instrument's prices and
+    volume become canonical evidence for this one.
     """
     buckets: dict[int, dict[str, float]] = {}
     ordered = sorted(
@@ -384,18 +385,29 @@ def aggregate_trades_to_minutes(
         key=lambda trade: (trade.source_event_time, trade.ingestion_order),
     )
     expected_instrument_version_id = instrument_version.instrument_version_id
-    mismatched = [
-        trade
-        for trade in ordered
-        if trade.instrument_version_id != expected_instrument_version_id
-    ]
-    if mismatched:
-        raise ValueError(
-            "trade observation instrument_version_id "
-            f"{mismatched[0].instrument_version_id!r} != "
-            f"{expected_instrument_version_id!r}; refusing to aggregate "
-            "mixed-instrument trades"
-        )
+    expected_venue = instrument_version.venue
+    expected_venue_instrument_id = instrument_version.venue_instrument_id
+    for trade in ordered:
+        if trade.instrument_version_id != expected_instrument_version_id:
+            raise ValueError(
+                "trade observation instrument_version_id "
+                f"{trade.instrument_version_id!r} != "
+                f"{expected_instrument_version_id!r}; refusing to aggregate "
+                "mixed-instrument trades"
+            )
+        if trade.venue != expected_venue:
+            raise ValueError(
+                f"trade observation venue {trade.venue!r} != "
+                f"{expected_venue!r}; refusing to aggregate "
+                "mixed-instrument trades"
+            )
+        if trade.venue_instrument_id != expected_venue_instrument_id:
+            raise ValueError(
+                "trade observation venue_instrument_id "
+                f"{trade.venue_instrument_id!r} != "
+                f"{expected_venue_instrument_id!r}; refusing to aggregate "
+                "mixed-instrument trades"
+            )
     for trade in ordered:
         price = trade.values.get("price")
         quantity = trade.values.get("quantity")

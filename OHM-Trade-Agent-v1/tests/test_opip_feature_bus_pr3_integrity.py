@@ -2229,6 +2229,7 @@ def _trade(
     price: float,
     quantity: float = 1.0,
     ingestion_order: int = 1,
+    venue: str = "kraken",
     base: datetime = CUTOFF - timedelta(minutes=2),
 ):
     from app.opip.contracts.enums import PayloadKind
@@ -2236,7 +2237,7 @@ def _trade(
 
     return Observation(
         instrument_version_id=instrument_version_id,
-        venue="kraken",
+        venue=venue,
         venue_instrument_id=venue_instrument_id,
         source_event_time=base + timedelta(seconds=offset_seconds),
         receipt_time=NOW,
@@ -2480,3 +2481,142 @@ def test_valid_dict_payload_still_reconstructs_successfully(
         observed_at_utc=NOW + timedelta(minutes=1),
     )
     assert again.version == 1
+
+
+def test_trade_venue_mismatch_fails_closed():
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    trades = [
+        _trade(
+            instrument_version_id=instrument.instrument_version_id,
+            venue_instrument_id="SOLUSD",
+            venue="binance",
+            offset_seconds=1,
+            price=100.0,
+        )
+    ]
+    with pytest.raises(ValueError, match="venue"):
+        aggregate_trades_to_minutes(
+            trades,
+            instrument_version=instrument,
+            receipt_time=NOW,
+            now=NOW,
+            source_label="trades",
+            source_sequence_prefix="trade-1m",
+        )
+
+
+def test_trade_venue_instrument_mismatch_fails_closed():
+    from app.opip.market.aggregates import aggregate_trades_to_minutes
+
+    instrument = _instrument()
+    trades = [
+        _trade(
+            instrument_version_id=instrument.instrument_version_id,
+            venue_instrument_id="ETHUSD",
+            offset_seconds=1,
+            price=100.0,
+        )
+    ]
+    with pytest.raises(ValueError, match="venue_instrument_id"):
+        aggregate_trades_to_minutes(
+            trades,
+            instrument_version=instrument,
+            receipt_time=NOW,
+            now=NOW,
+            source_label="trades",
+            source_sequence_prefix="trade-1m",
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed_json",
+    ["[]", '"string"', "123", "true", "null"],
+    ids=["list", "string", "number", "boolean", "null"],
+)
+def test_malformed_committed_checkpoint_fails_closed(
+    canonical_env, writer_server, malformed_json
+):
+    from app.opip.contracts.events import FEATURE_CHECKPOINT_RECORDED
+    from app.opip.features.checkpoint_store import (
+        CheckpointIntegrityError,
+        load_latest_checkpoint_payload,
+    )
+
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload_json=malformed_json,
+    )
+    with pytest.raises(CheckpointIntegrityError):
+        load_latest_checkpoint_payload(
+            _instrument().instrument_version_id,
+            db_path=canonical_env["db"],
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed_json",
+    ["[]", '"string"', "123", "true", "null"],
+    ids=["list", "string", "number", "boolean", "null"],
+)
+def test_malformed_committed_observation_ledger_fails_closed(
+    canonical_env, writer_server, malformed_json
+):
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload_json=malformed_json,
+    )
+    with pytest.raises(RevisionLedgerIntegrityError):
+        load_revision_ledger(
+            _instrument().instrument_version_id,
+            db_path=canonical_env["db"],
+        )
+
+
+def test_matching_observation_missing_revision_fails_closed(
+    canonical_env, writer_server
+):
+    import json
+
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    instrument = _instrument()
+    payload = {
+        "instrument_version_id": instrument.instrument_version_id,
+        "aggregate_interval_seconds": 60,
+        "source_event_time": CUTOFF.isoformat().replace("+00:00", "Z"),
+        "observation_id": (
+            f"OBS:{instrument.instrument_version_id}:60s:"
+            f"{int(CUTOFF.timestamp())}:1"
+        ),
+        "values": {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        },
+    }
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload_json=json.dumps(payload),
+    )
+    with pytest.raises(RevisionLedgerIntegrityError, match="revision"):
+        load_revision_ledger(
+            instrument.instrument_version_id,
+            db_path=canonical_env["db"],
+        )

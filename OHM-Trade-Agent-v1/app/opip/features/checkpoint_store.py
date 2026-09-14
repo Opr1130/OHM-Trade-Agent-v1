@@ -18,6 +18,10 @@ from app.opip.contracts.temporal import require_utc
 from app.opip.features.state import RollingState, from_checkpoint
 
 
+class CheckpointIntegrityError(ValueError):
+    """Committed checkpoint payload is corrupt or non-reconstructable."""
+
+
 def checkpoint_from_payload(payload: Mapping[str, Any]) -> FeatureStateCheckpoint:
     """Rebuild a FeatureStateCheckpoint from a committed canonical payload."""
     created = payload.get("created_at_utc")
@@ -56,6 +60,10 @@ def load_latest_checkpoint_payload(
     When ``feature_version`` is provided, older-version checkpoints are ignored
     so a feature-engine bump cold-starts instead of restoring incompatible
     retained-window assumptions under a new snapshot stamp.
+
+    A committed ``payload_json`` that does not decode to a JSON object is
+    corrupt canonical evidence. Hydration fails closed immediately instead of
+    silently skipping it.
     """
     from app.opip.canonical.schema import connect
 
@@ -83,7 +91,11 @@ def load_latest_checkpoint_payload(
     for row in rows:
         payload = json.loads(str(row["payload_json"]))
         if not isinstance(payload, dict):
-            continue
+            raise CheckpointIntegrityError(
+                "committed feature checkpoint payload_json did not decode to "
+                f"a JSON object (got {type(payload).__name__}); refusing to "
+                "silently skip malformed canonical evidence"
+            )
         if str(payload.get("instrument_version_id") or "") != instrument_version_id:
             continue
         if feature_version is not None and str(payload.get("feature_version") or "") != feature_version:
@@ -113,6 +125,7 @@ def load_rolling_state(
 
 
 __all__ = [
+    "CheckpointIntegrityError",
     "checkpoint_from_payload",
     "load_latest_checkpoint_payload",
     "load_rolling_state",
