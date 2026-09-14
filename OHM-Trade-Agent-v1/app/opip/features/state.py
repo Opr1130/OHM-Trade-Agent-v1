@@ -286,9 +286,11 @@ def plan_revisions(
                     )
 
         if ledger_entry is not None and ledger_entry.content_fingerprint == incoming_fp:
-            # Already-durable tip re-polls are coverage evidence only: they must
-            # not enter the snapshot receipt/late-arrival series with a fresh
-            # poll timestamp, or availability would claim new ingestion.
+            # Durable match: keep tip re-polls that already sit in retained state
+            # as coverage-only so fresh receipts cannot rewrite availability.
+            # When there is no equivalent retained slot (ledger-only restart after
+            # a dependent failure), fold into evidence so the rolling window can
+            # rebuild from committed history.
             committed = replace(
                 observation,
                 revision=int(ledger_entry.revision),
@@ -303,8 +305,11 @@ def plan_revisions(
                 ),
                 commit_order=ledger_entry.commit_watermark,
             )
-            coverage_only.append(committed)
             already_committed.add(committed.observation_id)
+            if in_window and retained_fp and retained_fp == incoming_fp:
+                coverage_only.append(committed)
+            else:
+                evidence.append(committed)
             continue
 
         # Retained content match is coverage-only only when the ledger does not

@@ -2678,6 +2678,87 @@ def test_ledger_matched_repoll_stays_coverage_only_for_snapshot_receipts():
     assert result.snapshot.availability.visible_at_utc != late_receipt
 
 
+def test_ledger_only_restart_folds_matches_into_evidence():
+    base = _observations(_rows(count=5, end_before=CUTOFF))
+    tip = base[-1]
+    tip_epoch = int(tip.source_event_time.timestamp())
+    tip_fp = aggregate_content_fingerprint(dict(tip.values))
+    ledger = RevisionLedger(
+        instrument_version_id=_instrument().instrument_version_id,
+        interval_seconds=60,
+        entries={
+            tip_epoch: CommittedObservationRevision(
+                interval_epoch=tip_epoch,
+                revision=1,
+                content_fingerprint=tip_fp,
+                observation_id=tip.observation_id,
+                commit_watermark=ConsumedInputWatermark(1, 5),
+            )
+        },
+    )
+    cold = initial_state(_instrument())
+    plan = plan_revisions((tip,), cold, ledger=ledger)
+    assert plan.coverage_only == ()
+    assert len(plan.evidence) == 1
+    assert plan.evidence[0].observation_id in plan.already_committed_ids
+    result = run_cycle(
+        (tip,),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=cold,
+        revision_ledger=ledger,
+        source_version="test",
+    )
+    assert result.state.interval_count >= 1
+    assert result.alignment.observations
+
+
+def test_same_revision_conflicting_fingerprints_fail_closed(canonical_env, writer_server):
+    import json
+
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    instrument = _instrument()
+    epoch = int(CUTOFF.timestamp()) - 60
+    source = (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    obs_id = f"OBS:{instrument.instrument_version_id}:60s:{epoch}:1"
+    for index, close in enumerate((1.0, 2.0), start=1):
+        payload = {
+            "instrument_version_id": instrument.instrument_version_id,
+            "aggregate_interval_seconds": 60,
+            "revision": 1,
+            "source_event_time": source,
+            "observation_id": obs_id,
+            "values": {
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1.0,
+            },
+        }
+        _insert_raw_event(
+            writer_server.writer._conn,
+            event_type=MARKET_OBSERVATION_RECORDED,
+            payload_json=json.dumps(payload),
+            local_sequence=index,
+        )
+    with pytest.raises(RevisionLedgerIntegrityError, match="conflicting content"):
+        load_revision_ledger(
+            instrument.instrument_version_id,
+            db_path=canonical_env["db"],
+        )
+
+
 def test_mismatched_committed_observation_id_fails_closed(canonical_env, writer_server):
     import json
 

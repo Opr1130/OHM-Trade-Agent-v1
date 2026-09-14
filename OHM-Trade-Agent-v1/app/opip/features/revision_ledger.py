@@ -251,6 +251,17 @@ def load_revision_ledger(
         prior = updated.get(epoch)
         if prior is not None and int(prior.revision) > revision:
             continue
+        if (
+            prior is not None
+            and int(prior.revision) == revision
+            and prior.content_fingerprint != fingerprint
+        ):
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} revision {revision} "
+                "has conflicting content fingerprints; refusing to hide "
+                "incompatible canonical evidence"
+            )
         updated[epoch] = incoming
     return RevisionLedger(
         instrument_version_id=instrument_version_id,

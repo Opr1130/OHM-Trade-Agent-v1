@@ -36,7 +36,13 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
 )
 
 _SNAPSHOT_VOLATILE_KEYS = frozenset(
-    {"evaluated_at_utc", "availability", "notes", "content_hash"}
+    {
+        "evaluated_at_utc",
+        "availability",
+        "notes",
+        "content_hash",
+        "visible_at_utc",
+    }
 )
 
 
