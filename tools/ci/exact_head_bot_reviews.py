@@ -20,7 +20,6 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 CODEX_LOGINS = frozenset({"chatgpt-codex-connector[bot]"})
@@ -129,6 +128,34 @@ def _coderabbit_format_ok(evidence: BotReviewEvidence) -> list[str]:
     return errors
 
 
+def _collect_exact_head_reviews(
+    reviews: Sequence[Mapping[str, Any]],
+    head_sha: str,
+) -> tuple[list[BotReviewEvidence], list[BotReviewEvidence], list[str]]:
+    """Partition eligible reviews without granting authority to lookalike bots."""
+    codex_hits: list[BotReviewEvidence] = []
+    rabbit_hits: list[BotReviewEvidence] = []
+    ambiguous_logins: list[str] = []
+
+    for raw in reviews:
+        evidence = _as_review(raw)
+        if evidence is None:
+            continue
+        if evidence.state not in COMPLETED_REVIEW_STATES:
+            continue
+        if evidence.commit_id != head_sha:
+            continue
+        login = evidence.login
+        if _matches_login(login, CODEX_LOGINS):
+            codex_hits.append(evidence)
+        elif _matches_login(login, CODERABBIT_LOGINS):
+            rabbit_hits.append(evidence)
+        elif "codex" in login.lower() or "coderabbit" in login.lower():
+            ambiguous_logins.append(login)
+
+    return codex_hits, rabbit_hits, ambiguous_logins
+
+
 def select_exact_head_reviews(
     reviews: Sequence[Mapping[str, Any]],
     *,
@@ -143,26 +170,9 @@ def select_exact_head_reviews(
         "resolved or that the PR is merge-clean. "
         f"Findings disposition: {result.findings_disposition}."
     )
-
-    codex_hits: list[BotReviewEvidence] = []
-    rabbit_hits: list[BotReviewEvidence] = []
-    ambiguous_logins: list[str] = []
-
-    for raw in reviews:
-        evidence = _as_review(raw)
-        if evidence is None:
-            continue
-        if evidence.state not in COMPLETED_REVIEW_STATES:
-            continue
-        if evidence.commit_id != head:
-            continue
-        login = evidence.login
-        if _matches_login(login, CODEX_LOGINS):
-            codex_hits.append(evidence)
-        elif _matches_login(login, CODERABBIT_LOGINS):
-            rabbit_hits.append(evidence)
-        elif "codex" in login.lower() or "coderabbit" in login.lower():
-            ambiguous_logins.append(login)
+    codex_hits, rabbit_hits, ambiguous_logins = _collect_exact_head_reviews(
+        reviews, head
+    )
 
     if ambiguous_logins:
         result.ok = False
@@ -275,17 +285,17 @@ def evaluate_from_env() -> GateResult:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--reviews-json",
-        help="Optional path to a reviews API JSON fixture (skips network)",
+        "--reviews-stdin",
+        action="store_true",
+        help="Read a reviews API JSON fixture from stdin (skips network)",
     )
     parser.add_argument("--head-sha", help="Exact PR HEAD SHA (40-char)")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if args.reviews_json:
+    if args.reviews_stdin:
         if not args.head_sha:
-            raise SystemExit("--head-sha is required with --reviews-json")
-        path = Path(args.reviews_json)
-        payload = json.loads(path.read_text(encoding="utf-8"))
+            raise SystemExit("--head-sha is required with --reviews-stdin")
+        payload = json.load(sys.stdin)
         if not isinstance(payload, list):
             raise SystemExit("reviews JSON must be a list")
         result = select_exact_head_reviews(payload, head_sha=args.head_sha)

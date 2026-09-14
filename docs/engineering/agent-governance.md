@@ -51,6 +51,19 @@ Workflow: `.github/workflows/agent-governance-contract.yml`
 
 Script: `tools/ci/exact_head_bot_reviews.py`
 
+The gate refreshes on pull-request opening/updates and on review submission,
+editing, or dismissal for PRs targeting `main`. A shared per-PR concurrency
+group cancels older evaluations when a new event arrives. Both events supply
+the PR's head SHA, not the synthetic merge SHA. Missing or dismissed reviews
+still fail closed; a later valid review can satisfy the check without a new push.
+See [GitHub review events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review).
+
+Each job receives only its required read permissions. Test dependencies are
+pinned in `tools/ci/requirements-test.txt`. Offline fixture checks accept JSON
+on standard input with `--reviews-stdin --head-sha <full-sha>`; the helper does
+not accept a filesystem path. This is for local validation only and does not
+publish review evidence or replace the authenticated GitHub review gate.
+
 **Verified identities (exact login match only):**
 
 | Bot | GitHub login | User id (observed) |

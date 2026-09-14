@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = Path(__file__).resolve().parent / "exact_head_bot_reviews.py"
@@ -16,7 +19,8 @@ def _load_module():
     spec = importlib.util.spec_from_file_location(
         "exact_head_bot_reviews", MODULE_PATH
     )
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -207,7 +211,7 @@ def test_coderabbit_empty_body_is_ambiguous():
     assert any("empty" in e.lower() for e in result.errors)
 
 
-def test_cli_fixture_path():
+def test_cli_fixture_stdin(monkeypatch):
     payload = [
         _review(
             login="chatgpt-codex-connector[bot]",
@@ -220,10 +224,74 @@ def test_cli_fixture_path():
             body=_rabbit_body(),
         ),
     ]
-    path = Path(__file__).resolve().parent / "_fixture_reviews.json"
-    try:
-        path.write_text(__import__("json").dumps(payload), encoding="utf-8")
-        assert gate.main(["--reviews-json", str(path), "--head-sha", HEAD]) == 0
-    finally:
-        if path.exists():
-            path.unlink()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert gate.main(["--reviews-stdin", "--head-sha", HEAD]) == 0
+
+
+def test_cli_rejects_file_input():
+    with pytest.raises(SystemExit) as error:
+        gate.main(["--reviews-json", "../../private.json", "--head-sha", HEAD])
+    assert error.value.code == 2
+
+
+def test_cli_stdin_requires_exact_head():
+    with pytest.raises(SystemExit, match="--head-sha is required"):
+        gate.main(["--reviews-stdin"])
+
+
+def test_cli_stdin_rejects_non_list(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    with pytest.raises(SystemExit, match="must be a list"):
+        gate.main(["--reviews-stdin", "--head-sha", HEAD])
+
+
+def test_review_submission_and_dismissal_change_result():
+    codex = _review(
+        login="chatgpt-codex-connector[bot]", commit_id=HEAD, body=_codex_body()
+    )
+    rabbit = _review(
+        login="coderabbitai[bot]", commit_id=HEAD, body=_rabbit_body()
+    )
+    assert not gate.select_exact_head_reviews([codex], head_sha=HEAD).ok
+    assert gate.select_exact_head_reviews([codex, rabbit], head_sha=HEAD).ok
+    rabbit["state"] = "DISMISSED"
+    assert not gate.select_exact_head_reviews([codex, rabbit], head_sha=HEAD).ok
+
+
+def test_latest_review_edit_revokes_valid_format():
+    codex = _review(
+        login="chatgpt-codex-connector[bot]", commit_id=HEAD, body=_codex_body()
+    )
+    rabbit = _review(
+        login="coderabbitai[bot]", commit_id=HEAD, body=_rabbit_body()
+    )
+    edited = dict(codex, body="invalid", submitted_at="2026-09-14T06:00:00Z")
+    assert not gate.select_exact_head_reviews([edited, rabbit, codex], head_sha=HEAD).ok
+
+
+def test_workflow_refreshes_gate_on_review_lifecycle():
+    # BaseLoader treats GitHub's YAML `on` key as a string, not YAML 1.1 true.
+    workflow = yaml.load(
+        (REPO_ROOT / ".github/workflows/agent-governance-contract.yml").read_text(
+            encoding="utf-8"
+        ), Loader=yaml.BaseLoader
+    )
+    assert set(workflow["on"]["pull_request_review"]["types"]) == {
+        "submitted", "edited", "dismissed"
+    }
+    job = workflow["jobs"]["exact-head-bot-reviews"]
+    condition = " ".join(job["if"].split())
+    assert condition == (
+        "(github.event_name == 'pull_request' || github.event_name == 'pull_request_review') && "
+        "github.event.pull_request.base.ref == 'main'"
+    )
+    assert workflow["permissions"] == {}
+    assert job["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert workflow["jobs"]["agent-instruction-contract"]["permissions"] == {"contents": "read"}
+    assert workflow["concurrency"]["cancel-in-progress"] == "true"
+    assert workflow["concurrency"]["group"] == (
+        "agent-governance-${{ github.event.pull_request.number || github.ref }}"
+    )
+    check = next(step for step in job["steps"] if "env" in step)
+    assert check["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert check["env"]["PR_NUMBER"] == "${{ github.event.pull_request.number }}"

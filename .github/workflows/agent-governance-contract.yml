@@ -12,6 +12,8 @@ name: agent-governance-contract
 on:
   pull_request:
     branches: [main]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
   push:
     branches: [main]
     paths:
@@ -25,15 +27,25 @@ on:
       - "docs/engineering/branch-protection-proposal.md"
       - "tools/ci/exact_head_bot_reviews.py"
       - "tools/ci/test_exact_head_bot_reviews.py"
+      - "tools/ci/requirements-test.txt"
+      - "docs/engineering/README.md"
+      - "docs/engineering/workflow.template.json"
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: {}
+
+# Reviews can arrive while the opening/synchronize run is still evaluating.
+# Cancel the older snapshot so it cannot finish after the newer review event.
+concurrency:
+  group: agent-governance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   agent-instruction-contract:
     name: agent-instruction-contract
+    if: github.event_name != 'pull_request_review' || github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +67,9 @@ jobs:
             docs/engineering/branch-protection-proposal.md
             tools/ci/exact_head_bot_reviews.py
             tools/ci/test_exact_head_bot_reviews.py
+            tools/ci/requirements-test.txt
+            docs/engineering/README.md
+            docs/engineering/workflow.template.json
           )
           for path in "${required[@]}"; do
             if [[ ! -f "$path" ]]; then
@@ -127,13 +142,18 @@ jobs:
       - name: Exact-head bot review unit tests
         run: |
           set -euo pipefail
-          python -m pip install --quiet pytest
+          python -m pip install --quiet -r tools/ci/requirements-test.txt
           python -m pytest tools/ci/test_exact_head_bot_reviews.py -q --noconftest
 
   exact-head-bot-reviews:
     name: exact-head-bot-reviews
-    if: github.event_name == 'pull_request'
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'pull_request_review') &&
+      github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
