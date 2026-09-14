@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -36,6 +37,10 @@ class CommittedObservationRevision:
     content_fingerprint: str
     observation_id: str
     commit_watermark: ConsumedInputWatermark
+    #: Durable receipt from the committed WAL payload. Used when a ledger-only
+    #: restart rebuilds rolling state so re-poll wall clocks cannot rewrite
+    #: snapshot availability / late-arrival provenance.
+    receipt_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,7 @@ class RevisionLedger:
                 content_fingerprint=fingerprint,
                 observation_id=observation.observation_id,
                 commit_watermark=outcome.watermark,
+                receipt_time=observation.receipt_time,
             )
             prior = updated.get(epoch)
             if prior is not None and int(prior.revision) > int(incoming.revision):
@@ -159,6 +165,10 @@ def load_revision_ledger(
         conn.close()
 
     updated: dict[int, CommittedObservationRevision] = {}
+    # Fingerprints for every (epoch, revision) seen in commit order. Selection
+    # keeps only the highest revision per epoch, but conflicting evidence for a
+    # superseded lower revision must still fail closed.
+    seen_fingerprints: dict[tuple[int, int], str] = {}
     step = int(interval_seconds)
     for row in rows:
         payload = json.loads(str(row["payload_json"]))
@@ -180,8 +190,6 @@ def load_revision_ledger(
                 "refusing to skip or invent revision provenance"
             )
         try:
-            from datetime import datetime
-
             moment = datetime.fromisoformat(str(source).replace("Z", "+00:00"))
             epoch = int(moment.timestamp())
         except (TypeError, ValueError) as exc:
@@ -238,6 +246,29 @@ def load_revision_ledger(
                 f"{observation_id!r} != expected {expected_observation_id!r}; "
                 "refusing to trust mismatched durable identity"
             )
+        raw_receipt = payload.get("receipt_time")
+        receipt_time: datetime | None = None
+        if raw_receipt is not None and str(raw_receipt).strip() != "":
+            try:
+                receipt_time = datetime.fromisoformat(
+                    str(raw_receipt).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError) as exc:
+                raise RevisionLedgerIntegrityError(
+                    "committed observation for "
+                    f"{instrument_version_id} at epoch {epoch} has "
+                    f"unparseable receipt_time {raw_receipt!r}"
+                ) from exc
+        revision_key = (epoch, revision)
+        prior_fp = seen_fingerprints.get(revision_key)
+        if prior_fp is not None and prior_fp != fingerprint:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} revision {revision} "
+                "has conflicting content fingerprints; refusing to hide "
+                "incompatible canonical evidence"
+            )
+        seen_fingerprints[revision_key] = fingerprint
         incoming = CommittedObservationRevision(
             interval_epoch=epoch,
             revision=revision,
@@ -247,6 +278,7 @@ def load_revision_ledger(
                 history_epoch=int(row["history_epoch"]),
                 local_sequence=int(row["local_sequence"]),
             ),
+            receipt_time=receipt_time,
         )
         prior = updated.get(epoch)
         if prior is not None and int(prior.revision) > revision:

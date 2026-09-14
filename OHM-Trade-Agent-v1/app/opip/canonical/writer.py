@@ -8,6 +8,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Mapping
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
 from app.opip.canonical.paths import (
@@ -35,12 +36,20 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     {MARKET_OBSERVATION_RECORDED, FEATURE_SNAPSHOT_RECORDED}
 )
 
+#: Wall-clock / hash fields that may move on an otherwise identical snapshot.
 _SNAPSHOT_VOLATILE_KEYS = frozenset(
     {
         "evaluated_at_utc",
-        "availability",
         "notes",
         "content_hash",
+        "visible_at_utc",
+    }
+)
+#: Receipt clocks inside availability; keep source_at_utc / source_version as
+#: substantive content so adapter-version or source-time drift fails closed.
+_SNAPSHOT_AVAILABILITY_VOLATILE_KEYS = frozenset(
+    {
+        "ingested_at_utc",
         "visible_at_utc",
     }
 )
@@ -57,6 +66,13 @@ def _idempotency_payload_json(event_type: str, payload: object) -> str:
             for key, value in body.items()
             if key not in _SNAPSHOT_VOLATILE_KEYS
         }
+        availability = body.get("availability")
+        if isinstance(availability, Mapping):
+            body["availability"] = {
+                key: value
+                for key, value in availability.items()
+                if key not in _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS
+            }
     return json.dumps(body, separators=(",", ":"), sort_keys=True)
 
 

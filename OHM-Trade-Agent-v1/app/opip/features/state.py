@@ -291,6 +291,11 @@ def plan_revisions(
             # When there is no equivalent retained slot (ledger-only restart after
             # a dependent failure), fold into evidence so the rolling window can
             # rebuild from committed history.
+            durable_receipt = (
+                ledger_entry.receipt_time
+                if ledger_entry.receipt_time is not None
+                else observation.receipt_time
+            )
             committed = replace(
                 observation,
                 revision=int(ledger_entry.revision),
@@ -304,6 +309,7 @@ def plan_revisions(
                     )
                 ),
                 commit_order=ledger_entry.commit_watermark,
+                receipt_time=durable_receipt,
             )
             already_committed.add(committed.observation_id)
             if in_window and retained_fp and retained_fp == incoming_fp:

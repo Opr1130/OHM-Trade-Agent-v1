@@ -2683,6 +2683,7 @@ def test_ledger_only_restart_folds_matches_into_evidence():
     tip = base[-1]
     tip_epoch = int(tip.source_event_time.timestamp())
     tip_fp = aggregate_content_fingerprint(dict(tip.values))
+    durable_receipt = tip.receipt_time
     ledger = RevisionLedger(
         instrument_version_id=_instrument().instrument_version_id,
         interval_seconds=60,
@@ -2693,16 +2694,21 @@ def test_ledger_only_restart_folds_matches_into_evidence():
                 content_fingerprint=tip_fp,
                 observation_id=tip.observation_id,
                 commit_watermark=ConsumedInputWatermark(1, 5),
+                receipt_time=durable_receipt,
             )
         },
     )
     cold = initial_state(_instrument())
-    plan = plan_revisions((tip,), cold, ledger=ledger)
+    late_receipt = NOW + timedelta(minutes=9)
+    repoll = replace(tip, receipt_time=late_receipt)
+    plan = plan_revisions((repoll,), cold, ledger=ledger)
     assert plan.coverage_only == ()
     assert len(plan.evidence) == 1
     assert plan.evidence[0].observation_id in plan.already_committed_ids
+    assert plan.evidence[0].receipt_time == durable_receipt
+    assert plan.evidence[0].receipt_time != late_receipt
     result = run_cycle(
-        (tip,),
+        (repoll,),
         instrument_version=_instrument(),
         evaluation_cutoff=CUTOFF,
         evaluated_at_utc=NOW,
@@ -2712,6 +2718,9 @@ def test_ledger_only_restart_folds_matches_into_evidence():
     )
     assert result.state.interval_count >= 1
     assert result.alignment.observations
+    assert result.snapshot is not None
+    assert result.snapshot.availability.visible_at_utc == durable_receipt
+    assert result.snapshot.availability.visible_at_utc != late_receipt
 
 
 def test_same_revision_conflicting_fingerprints_fail_closed(canonical_env, writer_server):
@@ -2751,6 +2760,57 @@ def test_same_revision_conflicting_fingerprints_fail_closed(canonical_env, write
             event_type=MARKET_OBSERVATION_RECORDED,
             payload_json=json.dumps(payload),
             local_sequence=index,
+        )
+    with pytest.raises(RevisionLedgerIntegrityError, match="conflicting content"):
+        load_revision_ledger(
+            instrument.instrument_version_id,
+            db_path=canonical_env["db"],
+        )
+
+
+def test_superseded_revision_fingerprint_conflict_fails_closed(
+    canonical_env, writer_server
+):
+    """Rev1/A, Rev2/C, then Rev1/B must fail even though selection keeps rev2."""
+    import json
+
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    instrument = _instrument()
+    epoch = int(CUTOFF.timestamp()) - 120
+    source = (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    seq = 0
+    for revision, close in ((1, 1.0), (2, 3.0), (1, 9.0)):
+        seq += 1
+        payload = {
+            "instrument_version_id": instrument.instrument_version_id,
+            "aggregate_interval_seconds": 60,
+            "revision": revision,
+            "source_event_time": source,
+            "observation_id": (
+                f"OBS:{instrument.instrument_version_id}:60s:{epoch}:{revision}"
+            ),
+            "values": {
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1.0,
+            },
+        }
+        _insert_raw_event(
+            writer_server.writer._conn,
+            event_type=MARKET_OBSERVATION_RECORDED,
+            payload_json=json.dumps(payload),
+            local_sequence=seq,
         )
     with pytest.raises(RevisionLedgerIntegrityError, match="conflicting content"):
         load_revision_ledger(
@@ -2826,6 +2886,40 @@ def test_snapshot_idempotency_rejects_semantic_conflict(canonical_env, writer_se
     clock_only = replace(dry.snapshot, evaluated_at_utc=NOW + timedelta(seconds=9))
     third = publisher.publish(snapshot_intent(clock_only))
     assert third.status == "DUPLICATE_OK"
+
+
+def test_snapshot_idempotency_rejects_source_version_drift(
+    canonical_env, writer_server
+):
+    from app.opip.features.publisher import snapshot_intent
+
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(
+        client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS
+    )
+    dry = run_cycle(
+        _observations(_rows(count=MINIMUM_WARMUP_INTERVALS + 5, end_before=CUTOFF)),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        source_version="adapter-v1",
+    )
+    first = publisher.publish_snapshot(dry.snapshot)
+    assert first.committed
+    drifted = replace(
+        dry.snapshot,
+        availability=AvailabilityStamp(
+            source_at_utc=dry.snapshot.availability.source_at_utc,
+            ingested_at_utc=dry.snapshot.availability.ingested_at_utc,
+            visible_at_utc=dry.snapshot.availability.visible_at_utc,
+            source_version="adapter-v2",
+        ),
+        evaluated_at_utc=NOW + timedelta(seconds=3),
+    )
+    assert snapshot_idempotency_key(drifted) == snapshot_idempotency_key(dry.snapshot)
+    second = publisher.publish(snapshot_intent(drifted))
+    assert second.status == "REJECTED"
+    assert second.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
 
 
 def test_feature_snapshot_rejects_source_after_cutoff():
