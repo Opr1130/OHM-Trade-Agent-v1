@@ -1988,6 +1988,7 @@ def test_observation_nested_values_are_immutable_and_round_trip_as_json():
     )
 
     identity = observation._content_identity()
+    first_serialized = observation.to_dict()
     nested["metadata"]["tags"].append("mutated")
     assert observation.values["metadata"]["tags"] == (
         "trade",
@@ -1996,12 +1997,16 @@ def test_observation_nested_values_are_immutable_and_round_trip_as_json():
     with pytest.raises(TypeError):
         observation.values["metadata"]["tags"][1]["confidence"] = 2
 
-    serialized = observation.to_dict()
-    assert isinstance(serialized["values"], dict)
-    assert isinstance(serialized["values"]["metadata"]["tags"], list)
-    serialized["values"]["metadata"]["tags"].append("serialized")
+    assert isinstance(first_serialized["values"], dict)
+    assert isinstance(first_serialized["values"]["metadata"]["tags"], list)
+    second_serialized = observation.to_dict()
+    expected_values = {"metadata": {"tags": ["trade", {"confidence": 1}]}}
+    assert first_serialized["values"] == expected_values
+    assert second_serialized["values"] == expected_values
+    assert first_serialized == second_serialized
+    first_serialized["values"]["metadata"]["tags"].append("serialized")
+    assert second_serialized["values"] == expected_values
     assert observation._content_identity() == identity
-    assert observation.to_dict() == observation.to_dict()
 
 
 def test_aggregate_observation_id_remains_stable_after_nested_input_mutation():
