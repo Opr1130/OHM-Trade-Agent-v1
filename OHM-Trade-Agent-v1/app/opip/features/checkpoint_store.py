@@ -61,9 +61,9 @@ def load_latest_checkpoint_payload(
     so a feature-engine bump cold-starts instead of restoring incompatible
     retained-window assumptions under a new snapshot stamp.
 
-    A committed ``payload_json`` that does not decode to a JSON object is
-    corrupt canonical evidence. Hydration fails closed immediately instead of
-    silently skipping it.
+    Structurally malformed committed checkpoint payloads fail closed before
+    identity/version filtering so corrupt history cannot be hidden behind an
+    older apparently valid checkpoint.
     """
     from app.opip.canonical.schema import connect
 
@@ -96,9 +96,24 @@ def load_latest_checkpoint_payload(
                 f"a JSON object (got {type(payload).__name__}); refusing to "
                 "silently skip malformed canonical evidence"
             )
-        if str(payload.get("instrument_version_id") or "") != instrument_version_id:
+        payload_instrument_id = payload.get("instrument_version_id")
+        payload_feature_version = payload.get("feature_version")
+        if (
+            not isinstance(payload_instrument_id, str)
+            or not payload_instrument_id.strip()
+            or not isinstance(payload_feature_version, str)
+            or not payload_feature_version.strip()
+        ):
+            raise CheckpointIntegrityError(
+                "committed feature checkpoint must declare non-empty string "
+                "instrument_version_id and feature_version"
+            )
+        if payload_instrument_id != instrument_version_id:
             continue
-        if feature_version is not None and str(payload.get("feature_version") or "") != feature_version:
+        if (
+            feature_version is not None
+            and payload_feature_version != feature_version
+        ):
             continue
         latest = payload
     return latest
