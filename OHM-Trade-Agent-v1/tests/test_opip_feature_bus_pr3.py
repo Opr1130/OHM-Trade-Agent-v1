@@ -830,8 +830,10 @@ def test_features_package_does_not_import_scoring_decisions():
 
 
 def test_feature_dag_hash_is_stable_and_identity_bearing():
-    assert feature_dag_hash() == feature_dag_hash()
-    assert len(feature_dag_hash()) >= 16
+    first = feature_dag_hash()
+    second = feature_dag_hash()
+    assert first == second
+    assert len(first) >= 16
 
 
 # --------------------------------------------------------------------------- #

@@ -318,6 +318,7 @@ def compute_features(
     *,
     instrument_version: InstrumentVersion,
     evaluated_at_utc: datetime,
+    evaluation_cutoff: datetime | None = None,
     freshness_alignment: AlignmentResult | None = None,
 ) -> FeatureComputation:
     """Compute the IGNITION-oriented feature set from aligned minute bars.
@@ -461,7 +462,8 @@ def compute_features(
     staleness: float | None = None
     if tail:
         end = tail[-1].interval_end or tail[-1].source_event_time
-        staleness = (evaluated_at_utc - end).total_seconds()
+        staleness_boundary = evaluation_cutoff or end
+        staleness = (staleness_boundary - end).total_seconds()
     acc.number("staleness_seconds", staleness)
 
     for name in ("book_depth_imbalance", "trade_tape_intensity"):
@@ -529,6 +531,7 @@ def build_feature_snapshot(
         alignment,
         instrument_version=instrument_version,
         evaluated_at_utc=evaluated_at_utc,
+        evaluation_cutoff=evaluation_cutoff,
         freshness_alignment=coverage_alignment,
     )
     # Prefer real receipts from this cycle's present bars when available;

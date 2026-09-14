@@ -22,6 +22,7 @@ from app.opip.contracts.events import (
     FEATURE_BUS_EVENT_TYPES,
     FEATURE_BUS_PRIORITY,
     FEATURE_BUS_STREAM,
+    FEATURE_CHECKPOINT_RECORDED,
     FEATURE_SNAPSHOT_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
@@ -29,11 +30,17 @@ from app.opip.contracts.events import (
 MAX_PAYLOAD_BYTES = 16 * 1024
 
 #: Same idempotency key + different semantic payload is integrity corruption.
-#: Feature snapshots are included after redacting evaluation wall clocks so a
-#: re-poll that only advances ``evaluated_at_utc`` / receipt stamps stays
-#: ``DUPLICATE_OK``, while divergent values/coverage/missingness fail closed.
+#: Feature snapshots and rolling-state checkpoints are included after redacting
+#: volatile clocks so a re-poll that only advances ``evaluated_at_utc`` /
+#: ``created_at_utc`` / receipt stamps stays ``DUPLICATE_OK``, while divergent
+#: values/coverage/retained state fail closed instead of promoting in-memory
+#: state the WAL does not actually hold.
 IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
-    {MARKET_OBSERVATION_RECORDED, FEATURE_SNAPSHOT_RECORDED}
+    {
+        MARKET_OBSERVATION_RECORDED,
+        FEATURE_CHECKPOINT_RECORDED,
+        FEATURE_SNAPSHOT_RECORDED,
+    }
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -53,6 +60,9 @@ _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS = frozenset(
         "visible_at_utc",
     }
 )
+#: The only checkpoint field allowed to move between same-key retries is its
+#: creation clock; retained rolling state is substantive evidence.
+_CHECKPOINT_VOLATILE_KEYS = frozenset({"created_at_utc"})
 
 
 def _idempotency_payload_json(event_type: str, payload: object) -> str:
@@ -73,6 +83,12 @@ def _idempotency_payload_json(event_type: str, payload: object) -> str:
                 for key, value in availability.items()
                 if key not in _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS
             }
+    elif event_type == FEATURE_CHECKPOINT_RECORDED:
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in _CHECKPOINT_VOLATILE_KEYS
+        }
     return json.dumps(body, separators=(",", ":"), sort_keys=True)
 
 

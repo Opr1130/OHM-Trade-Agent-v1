@@ -15,7 +15,9 @@ from app.opip.contracts.events import (
 from app.opip.features.checkpoint_store import (
     CheckpointIntegrityError,
     load_latest_checkpoint_payload,
+    load_rolling_state,
 )
+from app.opip.features.engine import FEATURE_VERSION
 from app.opip.features.revision_ledger import (
     RevisionLedgerIntegrityError,
     load_revision_ledger,
@@ -122,3 +124,61 @@ def test_revision_ledger_rejects_coerced_revision_types(canonical_db, raw_revisi
     )
     with pytest.raises(RevisionLedgerIntegrityError, match="non-integer revision"):
         load_revision_ledger(INSTRUMENT_ID, db_path=db_path)
+
+
+@pytest.mark.parametrize(
+    "source_event_time",
+    ["2026-09-12T10:00:00", "2026-09-12T11:00:00+01:00"],
+)
+def test_revision_ledger_rejects_non_utc_source_event_time(
+    canonical_db, source_event_time
+):
+    server, db_path = canonical_db
+    epoch = 1789207200
+    payload = {
+        "instrument_version_id": INSTRUMENT_ID,
+        "aggregate_interval_seconds": 60,
+        "source_event_time": source_event_time,
+        "revision": 1,
+        "observation_id": f"OBS:{INSTRUMENT_ID}:60s:{epoch}:1",
+        "receipt_time": datetime.fromtimestamp(epoch + 60, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "values": {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 10.0,
+        },
+    }
+    _insert_raw_event(
+        server.writer._conn,
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload=payload,
+    )
+    with pytest.raises(RevisionLedgerIntegrityError, match="timezone|UTC"):
+        load_revision_ledger(INSTRUMENT_ID, db_path=db_path)
+
+
+@pytest.mark.parametrize("component", ["history_epoch", "local_sequence"])
+@pytest.mark.parametrize("raw_value", [True, 1.0, "1"])
+def test_checkpoint_hydration_rejects_coerced_watermark_components(
+    canonical_db, component, raw_value
+):
+    server, db_path = canonical_db
+    watermark: dict[str, object] = {"history_epoch": 4, "local_sequence": 7}
+    watermark[component] = raw_value
+    payload = {
+        "instrument_version_id": INSTRUMENT_ID,
+        "venue_instrument_id": "SOLUSD",
+        "feature_version": FEATURE_VERSION,
+        "consumed_input_watermark": watermark,
+    }
+    _insert_raw_event(
+        server.writer._conn,
+        event_type=FEATURE_CHECKPOINT_RECORDED,
+        payload=payload,
+    )
+    with pytest.raises(CheckpointIntegrityError, match="exact integer"):
+        load_rolling_state(INSTRUMENT_ID, db_path=db_path)

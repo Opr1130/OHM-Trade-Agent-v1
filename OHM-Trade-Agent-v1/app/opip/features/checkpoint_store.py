@@ -22,8 +22,37 @@ class CheckpointIntegrityError(ValueError):
     """Committed checkpoint payload is corrupt or non-reconstructable."""
 
 
+def _require_exact_watermark(raw: Any) -> ConsumedInputWatermark:
+    """Rebuild the commit watermark, rejecting coerced components.
+
+    A committed payload storing ``history_epoch``/``local_sequence`` as a
+    boolean, float, or numeric string would otherwise be silently normalized
+    by ``int()`` into a commit position that was never declared as an integer.
+    """
+    if not isinstance(raw, Mapping):
+        raise CheckpointIntegrityError(
+            "committed feature checkpoint consumed_input_watermark must be a "
+            "JSON object declaring history_epoch and local_sequence"
+        )
+    for name in ("history_epoch", "local_sequence"):
+        value = raw.get(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise CheckpointIntegrityError(
+                "committed feature checkpoint consumed_input_watermark."
+                f"{name} must be an exact integer (got {value!r}); refusing "
+                "to normalize a coerced commit position"
+            )
+    return ConsumedInputWatermark(
+        history_epoch=raw["history_epoch"],
+        local_sequence=raw["local_sequence"],
+    )
+
+
 def checkpoint_from_payload(payload: Mapping[str, Any]) -> FeatureStateCheckpoint:
     """Rebuild a FeatureStateCheckpoint from a committed canonical payload."""
+    consumed_input_watermark = _require_exact_watermark(
+        payload.get("consumed_input_watermark")
+    )
     created = payload.get("created_at_utc")
     created_at = None
     if created is not None:
@@ -35,9 +64,7 @@ def checkpoint_from_payload(payload: Mapping[str, Any]) -> FeatureStateCheckpoin
         instrument_version_id=str(payload["instrument_version_id"]),
         venue_instrument_id=str(payload["venue_instrument_id"]),
         feature_version=str(payload["feature_version"]),
-        consumed_input_watermark=ConsumedInputWatermark.from_dict(
-            dict(payload.get("consumed_input_watermark") or {})
-        ),
+        consumed_input_watermark=consumed_input_watermark,
         rolling_state=dict(payload.get("rolling_state") or {}),
         restart_state=RestartState(str(payload["restart_state"])),
         reconstruction_dependencies=tuple(

@@ -10,7 +10,10 @@ import pytest
 from app.opip.canonical.client import InProcessWriterClient
 from app.opip.canonical.server import CanonicalWriterServer
 from app.opip.contracts.enums import CoverageState, Missingness, RestartState
-from app.opip.contracts.events import snapshot_idempotency_key
+from app.opip.contracts.events import (
+    checkpoint_idempotency_key,
+    snapshot_idempotency_key,
+)
 from app.opip.contracts.features import FeatureSnapshot
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.contracts.temporal import AvailabilityStamp
@@ -492,7 +495,7 @@ def test_canonical_first_defers_promotion_when_observation_uncommitted(status, w
     )
     assert result.disposition == DISPOSITION_DEFERRED_UNCOMMITTED
     assert result.promoted is False
-    assert result.state is previous or result.state.interval_count == previous.interval_count
+    assert result.state == previous
     assert result.state.consumed_input_watermark == previous.consumed_input_watermark
     assert result.restart_recorded is False
     assert not any(
@@ -2995,6 +2998,74 @@ def test_snapshot_idempotency_rejects_source_version_drift(
     second = publisher.publish(snapshot_intent(drifted))
     assert second.status == "REJECTED"
     assert second.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+
+
+def test_checkpoint_idempotency_rejects_semantic_conflict(
+    canonical_env, writer_server
+):
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(
+        client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS
+    )
+    state = advance_state(
+        initial_state(_instrument()),
+        _observations(_rows(count=5, end_before=CUTOFF), commit_from=None),
+    ).state
+    checkpoint = to_checkpoint(state, created_at_utc=NOW)
+    first = publisher.publish_checkpoint(checkpoint)
+    assert first.committed
+    altered = replace(
+        checkpoint,
+        rolling_state={
+            **dict(checkpoint.rolling_state),
+            "persistence_intervals": 99,
+        },
+        created_at_utc=NOW + timedelta(seconds=5),
+    )
+    assert checkpoint_idempotency_key(altered) == checkpoint_idempotency_key(
+        checkpoint
+    )
+    second = publisher.publish_checkpoint(altered)
+    assert second.status == "REJECTED"
+    assert second.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+    clock_only = replace(checkpoint, created_at_utc=NOW + timedelta(seconds=9))
+    third = publisher.publish_checkpoint(clock_only)
+    assert third.status == "DUPLICATE_OK"
+
+
+def test_same_cutoff_retry_keeps_snapshot_staleness_and_payload_stable(
+    canonical_env, writer_server
+):
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(
+        client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS
+    )
+    alignment = align_minute_observations(
+        _observations(_rows(count=MINIMUM_WARMUP_INTERVALS + 5, end_before=CUTOFF)),
+        cutoff=CUTOFF,
+    )
+    first = build_feature_snapshot(
+        alignment,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        consumed_input_watermark=ConsumedInputWatermark(1, 1),
+        source_version="test",
+    )
+    retry = build_feature_snapshot(
+        alignment,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW + timedelta(seconds=45),
+        consumed_input_watermark=ConsumedInputWatermark(1, 1),
+        source_version="test",
+    )
+    assert retry.values["staleness_seconds"] == first.values["staleness_seconds"]
+    assert snapshot_idempotency_key(retry) == snapshot_idempotency_key(first)
+    assert publisher.publish_snapshot(first).committed
+    duplicate = publisher.publish_snapshot(retry)
+    assert duplicate.status == "DUPLICATE_OK"
+    assert duplicate.committed
 
 
 def test_feature_snapshot_rejects_source_after_cutoff():

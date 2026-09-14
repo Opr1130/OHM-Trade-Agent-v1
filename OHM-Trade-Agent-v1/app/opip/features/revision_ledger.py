@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -198,6 +198,19 @@ def load_revision_ledger(
                 f"{instrument_version_id} has unparseable source_event_time "
                 f"{source!r}; refusing to skip malformed evidence"
             ) from exc
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at source_event_time {source!r} "
+                "has a timezone-naive timestamp; durable provenance must be "
+                "timezone-aware UTC"
+            )
+        if moment.utcoffset() != timedelta(0) or moment.tzinfo != timezone.utc:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at source_event_time {source!r} "
+                "is not expressed in UTC; durable provenance must use UTC"
+            )
         if since_interval_epoch is not None and epoch < int(since_interval_epoch):
             continue
         values = payload.get("values")

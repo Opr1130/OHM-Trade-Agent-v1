@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
-import random
 from typing import Any
 
 from app.opip.contracts.identity import InstrumentVersion
@@ -115,13 +114,12 @@ def _synthetic_observations(
     intervals: int,
     now: datetime,
 ) -> Any:
-    random.seed(11)
     first = cutoff - timedelta(minutes=intervals)
     epoch = int(first.timestamp())
     price = 147.0
     rows: list[IntervalRow] = []
     for index in range(intervals):
-        price *= 1.0 + random.uniform(-0.0015, 0.0018)
+        price *= 1.0 + (((index * 17) % 29) - 14) / 10000.0
         rows.append(
             IntervalRow(
                 interval_start_epoch=epoch + 60 * index,
@@ -129,7 +127,7 @@ def _synthetic_observations(
                 high=price * 1.001,
                 low=price * 0.999,
                 close=price,
-                volume=100.0 + random.random() * 50.0,
+                volume=100.0 + float((index * 23 + 11) % 51),
                 vwap=price,
                 trade_count=20 + index % 7,
             )
