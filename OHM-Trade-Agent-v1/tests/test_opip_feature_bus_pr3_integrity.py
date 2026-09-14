@@ -1971,6 +1971,68 @@ def test_non_aggregate_observation_id_stable_across_ingestion_order():
     assert "ingest-" not in a.observation_id
 
 
+def test_observation_nested_values_are_immutable_and_round_trip_as_json():
+    from app.opip.contracts.enums import PayloadKind
+    from app.opip.contracts.observation import Observation
+
+    nested = {"metadata": {"tags": ["trade", {"confidence": 1}]}}
+    observation = Observation(
+        instrument_version_id="INSTR:kraken:SOL:USD:1",
+        venue="kraken",
+        venue_instrument_id="SOLUSD",
+        source_event_time=CUTOFF,
+        receipt_time=NOW,
+        ingestion_order=1,
+        payload_kind=PayloadKind.TRADE,
+        values=nested,
+    )
+
+    identity = observation._content_identity()
+    nested["metadata"]["tags"].append("mutated")
+    assert observation.values["metadata"]["tags"] == (
+        "trade",
+        {"confidence": 1},
+    )
+    with pytest.raises(TypeError):
+        observation.values["metadata"]["tags"][1]["confidence"] = 2
+
+    serialized = observation.to_dict()
+    assert isinstance(serialized["values"], dict)
+    assert isinstance(serialized["values"]["metadata"]["tags"], list)
+    serialized["values"]["metadata"]["tags"].append("serialized")
+    assert observation._content_identity() == identity
+    assert observation.to_dict() == observation.to_dict()
+
+
+def test_aggregate_observation_id_remains_stable_after_nested_input_mutation():
+    from app.opip.contracts.enums import PayloadKind
+    from app.opip.contracts.observation import Observation
+
+    values = {
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.5,
+        "volume": 10.0,
+        "metadata": {"source": ["kraken"]},
+    }
+    observation = Observation(
+        instrument_version_id="INSTR:kraken:SOL:USD:1",
+        venue="kraken",
+        venue_instrument_id="SOLUSD",
+        source_event_time=CUTOFF,
+        receipt_time=NOW,
+        ingestion_order=1,
+        payload_kind=PayloadKind.FIXED_INTERVAL_AGGREGATE,
+        aggregate_interval_seconds=60,
+        values=values,
+    )
+    observation_id = observation.observation_id
+    values["metadata"]["source"].append("mutated")
+    assert observation.observation_id == observation_id
+    assert observation.to_dict()["values"]["metadata"]["source"] == ["kraken"]
+
+
 def test_publishing_non_aggregate_without_source_sequence_fails_closed():
     from app.opip.contracts.enums import PayloadKind
     from app.opip.contracts.observation import Observation

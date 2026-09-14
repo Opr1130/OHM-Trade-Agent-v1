@@ -36,6 +36,24 @@ AGGREGATE_REQUIRED_KEYS = ("open", "high", "low", "close", "volume")
 AGGREGATE_OPTIONAL_KEYS = ("vwap", "trade_count")
 
 
+def _freeze_jsonish(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_jsonish(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_jsonish(item) for item in value)
+    return value
+
+
+def _thaw_jsonish(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_jsonish(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_jsonish(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class SourceWatermark:
     """How far a market source has been consumed for one instrument.
@@ -155,11 +173,11 @@ class Observation:
         object.__setattr__(self, "receipt_time", receipt)
         object.__setattr__(self, "ingestion_order", int(self.ingestion_order))
         object.__setattr__(self, "revision", int(self.revision))
-        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        object.__setattr__(self, "values", _freeze_jsonish(self.values))
         object.__setattr__(
             self,
             "provenance",
-            MappingProxyType(
+            _freeze_jsonish(
                 {str(key): str(value) for key, value in dict(self.provenance).items()}
             ),
         )
@@ -242,8 +260,8 @@ class Observation:
             "observation_id": self.observation_id,
             "revision": self.revision,
             "interval_forming": self.interval_forming,
-            "values": dict(self.values),
-            "provenance": dict(sorted(self.provenance.items())),
+            "values": _thaw_jsonish(self.values),
+            "provenance": _thaw_jsonish(dict(sorted(self.provenance.items()))),
         }
 
 
