@@ -2009,6 +2009,54 @@ def test_revision_ledger_hydrates_from_canonical_observations(tmp_path):
         assert entry is not None
         assert entry.revision == 1
         assert entry.observation_id == item.observation_id
+        assert entry.receipt_time == item.receipt_time
+
+
+@pytest.mark.parametrize(
+    "raw_receipt",
+    [None, "", "not-a-timestamp", "2026-09-14T00:00:00"],
+    ids=["missing", "empty", "unparseable", "timezone-naive"],
+)
+def test_revision_ledger_rejects_invalid_durable_receipt_time(
+    canonical_env, writer_server, raw_receipt
+):
+    import json
+
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    instrument = _instrument()
+    epoch = int(CUTOFF.timestamp()) - 60
+    payload = {
+        "instrument_version_id": instrument.instrument_version_id,
+        "aggregate_interval_seconds": 60,
+        "revision": 1,
+        "source_event_time": datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "observation_id": f"OBS:{instrument.instrument_version_id}:60s:{epoch}:1",
+        "receipt_time": raw_receipt,
+        "values": {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        },
+    }
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload_json=json.dumps(payload),
+    )
+    with pytest.raises(RevisionLedgerIntegrityError, match="receipt_time"):
+        load_revision_ledger(
+            instrument.instrument_version_id,
+            db_path=canonical_env["db"],
+        )
 
 
 def test_stale_retained_match_vs_ledger_ahead_mints_next_revision():
@@ -2723,6 +2771,31 @@ def test_ledger_only_restart_folds_matches_into_evidence():
     assert result.snapshot.availability.visible_at_utc != late_receipt
 
 
+def test_ledger_only_restart_without_durable_receipt_fails_closed():
+    from app.opip.features.revision_ledger import RevisionLedgerIntegrityError
+
+    tip = _observations(_rows(count=1, end_before=CUTOFF))[0]
+    tip_epoch = int(tip.source_event_time.timestamp())
+    ledger = RevisionLedger(
+        instrument_version_id=_instrument().instrument_version_id,
+        interval_seconds=60,
+        entries={
+            tip_epoch: CommittedObservationRevision(
+                interval_epoch=tip_epoch,
+                revision=1,
+                content_fingerprint=aggregate_content_fingerprint(dict(tip.values)),
+                observation_id=tip.observation_id,
+                commit_watermark=ConsumedInputWatermark(1, 1),
+                receipt_time=None,
+            )
+        },
+    )
+    cold = initial_state(_instrument())
+    repoll = replace(tip, receipt_time=NOW + timedelta(minutes=9))
+    with pytest.raises(RevisionLedgerIntegrityError, match="durable receipt_time"):
+        plan_revisions((repoll,), cold, ledger=ledger)
+
+
 def test_same_revision_conflicting_fingerprints_fail_closed(canonical_env, writer_server):
     import json
 
@@ -2747,6 +2820,7 @@ def test_same_revision_conflicting_fingerprints_fail_closed(canonical_env, write
             "revision": 1,
             "source_event_time": source,
             "observation_id": obs_id,
+            "receipt_time": NOW.isoformat().replace("+00:00", "Z"),
             "values": {
                 "open": close,
                 "high": close,
@@ -2798,6 +2872,7 @@ def test_superseded_revision_fingerprint_conflict_fails_closed(
             "observation_id": (
                 f"OBS:{instrument.instrument_version_id}:60s:{epoch}:{revision}"
             ),
+            "receipt_time": NOW.isoformat().replace("+00:00", "Z"),
             "values": {
                 "open": close,
                 "high": close,

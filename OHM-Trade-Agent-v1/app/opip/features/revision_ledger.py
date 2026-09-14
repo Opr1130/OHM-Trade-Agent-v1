@@ -247,18 +247,29 @@ def load_revision_ledger(
                 "refusing to trust mismatched durable identity"
             )
         raw_receipt = payload.get("receipt_time")
-        receipt_time: datetime | None = None
-        if raw_receipt is not None and str(raw_receipt).strip() != "":
-            try:
-                receipt_time = datetime.fromisoformat(
-                    str(raw_receipt).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError) as exc:
-                raise RevisionLedgerIntegrityError(
-                    "committed observation for "
-                    f"{instrument_version_id} at epoch {epoch} has "
-                    f"unparseable receipt_time {raw_receipt!r}"
-                ) from exc
+        if raw_receipt is None or str(raw_receipt).strip() == "":
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} missing durable "
+                "receipt_time; refusing to reconstruct provenance from a re-poll"
+            )
+        try:
+            receipt_time = datetime.fromisoformat(
+                str(raw_receipt).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has "
+                f"unparseable receipt_time {raw_receipt!r}"
+            ) from exc
+        if receipt_time.tzinfo is None or receipt_time.utcoffset() is None:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has timezone-naive "
+                f"receipt_time {raw_receipt!r}; durable receipt provenance "
+                "must be timezone-aware"
+            )
         revision_key = (epoch, revision)
         prior_fp = seen_fingerprints.get(revision_key)
         if prior_fp is not None and prior_fp != fingerprint:

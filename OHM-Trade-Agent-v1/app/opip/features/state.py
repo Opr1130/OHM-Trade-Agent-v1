@@ -291,11 +291,22 @@ def plan_revisions(
             # When there is no equivalent retained slot (ledger-only restart after
             # a dependent failure), fold into evidence so the rolling window can
             # rebuild from committed history.
-            durable_receipt = (
-                ledger_entry.receipt_time
-                if ledger_entry.receipt_time is not None
-                else observation.receipt_time
+            durable_receipt = ledger_entry.receipt_time
+            retained_match = (
+                in_window and retained_fp and retained_fp == incoming_fp
             )
+            if durable_receipt is None and not retained_match:
+                from app.opip.features.revision_ledger import (
+                    RevisionLedgerIntegrityError,
+                )
+
+                raise RevisionLedgerIntegrityError(
+                    "ledger-only rebuild requires durable receipt_time for "
+                    f"{state.instrument_version_id} at epoch {epoch}; refusing "
+                    "to substitute transient re-poll provenance"
+                )
+            if durable_receipt is None:
+                durable_receipt = observation.receipt_time
             committed = replace(
                 observation,
                 revision=int(ledger_entry.revision),
