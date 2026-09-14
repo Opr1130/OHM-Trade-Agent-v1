@@ -141,8 +141,6 @@ def _collect_exact_head_reviews(
         evidence = _as_review(raw)
         if evidence is None:
             continue
-        if evidence.state not in COMPLETED_REVIEW_STATES:
-            continue
         if evidence.commit_id != head_sha:
             continue
         login = evidence.login
@@ -192,7 +190,10 @@ def select_exact_head_reviews(
         # Prefer the latest submission if multiple completed reviews exist.
         codex_hits.sort(key=lambda item: item.submitted_at or "")
         result.codex = codex_hits[-1]
-        result.errors.extend(_codex_format_ok(result.codex, head))
+        if result.codex.state not in COMPLETED_REVIEW_STATES:
+            result.errors.append("Latest Codex review is not completed (or was dismissed)")
+        else:
+            result.errors.extend(_codex_format_ok(result.codex, head))
 
     if not rabbit_hits:
         result.ok = False
@@ -204,7 +205,10 @@ def select_exact_head_reviews(
     else:
         rabbit_hits.sort(key=lambda item: item.submitted_at or "")
         result.coderabbit = rabbit_hits[-1]
-        result.errors.extend(_coderabbit_format_ok(result.coderabbit))
+        if result.coderabbit.state not in COMPLETED_REVIEW_STATES:
+            result.errors.append("Latest CodeRabbit review is not completed (or was dismissed)")
+        else:
+            result.errors.extend(_coderabbit_format_ok(result.coderabbit))
 
     if result.errors:
         result.ok = False

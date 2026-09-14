@@ -269,6 +269,31 @@ def test_latest_review_edit_revokes_valid_format():
     assert not gate.select_exact_head_reviews([edited, rabbit, codex], head_sha=HEAD).ok
 
 
+@pytest.mark.parametrize("login", ["chatgpt-codex-connector[bot]", "coderabbitai[bot]"])
+def test_latest_dismissal_revokes_earlier_completed_review(login):
+    codex = _review(
+        login="chatgpt-codex-connector[bot]", commit_id=HEAD, body=_codex_body()
+    )
+    rabbit = _review(
+        login="coderabbitai[bot]", commit_id=HEAD, body=_rabbit_body()
+    )
+    dismissed = _review(
+        login=login, commit_id=HEAD, state="DISMISSED",
+        submitted_at="2026-09-14T06:00:00Z"
+    )
+    # Out-of-order inputs must not revive an older review after revocation.
+    result = gate.select_exact_head_reviews([dismissed, rabbit, codex], head_sha=HEAD)
+    assert not result.ok
+    assert any("dismissed" in error for error in result.errors)
+    replacement = dict(
+        dismissed, state="COMMENTED", submitted_at="2026-09-14T07:00:00Z",
+        body=_codex_body() if login.startswith("chatgpt") else _rabbit_body()
+    )
+    assert gate.select_exact_head_reviews(
+        [replacement, dismissed, rabbit, codex], head_sha=HEAD
+    ).ok
+
+
 def test_workflow_refreshes_gate_on_review_lifecycle():
     # BaseLoader treats GitHub's YAML `on` key as a string, not YAML 1.1 true.
     workflow = yaml.load(

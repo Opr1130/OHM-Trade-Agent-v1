@@ -59,7 +59,8 @@ still fail closed; a later valid review can satisfy the check without a new push
 See [GitHub review events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request_review).
 
 Each job receives only its required read permissions. Test dependencies are
-pinned in `tools/ci/requirements-test.txt`. Offline fixture checks accept JSON
+hash-locked in `tools/ci/requirements-test.txt` for Python 3.12 on Linux x86_64
+and Windows x86_64. Offline fixture checks accept JSON
 on standard input with `--reviews-stdin --head-sha <full-sha>`; the helper does
 not accept a filesystem path. This is for local validation only and does not
 publish review evidence or replace the authenticated GitHub review gate.
@@ -73,6 +74,8 @@ publish review evidence or replace the authenticated GitHub review gate.
 
 **Completed review states accepted:** `COMMENTED`, `APPROVED`, `CHANGES_REQUESTED`.  
 `PENDING`, `DISMISSED`, and issue-comment `@codex` / `@coderabbitai` **requests** do not count.
+The latest review from each bot on that HEAD is selected before its state is
+validated; dismissing the latest review cannot revive an older completed one.
 
 **Format requirements (fail closed if ambiguous):**
 

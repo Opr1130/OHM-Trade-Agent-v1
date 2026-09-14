@@ -139,10 +139,14 @@ jobs:
               print(f"ok adapter: {path}")
           PY
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Exact-head bot review unit tests
         run: |
           set -euo pipefail
-          python -m pip install --quiet -r tools/ci/requirements-test.txt
+          python -m pip install --quiet --require-hashes -r tools/ci/requirements-test.txt
           python -m pytest tools/ci/test_exact_head_bot_reviews.py -q --noconftest
 
   exact-head-bot-reviews:
