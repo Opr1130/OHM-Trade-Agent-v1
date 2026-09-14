@@ -209,20 +209,13 @@ def load_revision_ledger(
             )
         fingerprint = aggregate_content_fingerprint(dict(values))
         raw_revision = payload.get("revision")
-        if raw_revision is None:
-            raise RevisionLedgerIntegrityError(
-                "committed observation for "
-                f"{instrument_version_id} at epoch {epoch} missing revision; "
-                "refusing to default revision numbers"
-            )
-        try:
-            revision = int(raw_revision)
-        except (TypeError, ValueError) as exc:
+        if isinstance(raw_revision, bool) or not isinstance(raw_revision, int):
             raise RevisionLedgerIntegrityError(
                 "committed observation for "
                 f"{instrument_version_id} at epoch {epoch} has non-integer "
                 f"revision {raw_revision!r}"
-            ) from exc
+            )
+        revision = raw_revision
         if revision < 1:
             raise RevisionLedgerIntegrityError(
                 "committed observation for "
