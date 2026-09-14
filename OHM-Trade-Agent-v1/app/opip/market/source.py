@@ -161,9 +161,9 @@ def _expected_tip_window_epochs(
 ) -> tuple[int, ...] | None:
     """Closed interval starts expected when resuming from a tip watermark.
 
-    Cold starts (no through_utc) return None — completeness is then contiguous
-    non-empty closed rows only. Resumed polls must cover tip through the latest
-    closed cutoff at ``now``, or coverage stays incomplete.
+    Cold starts (no through_utc) still require the returned tip to equal the
+    latest closed interval at ``now``. Resumed polls must cover tip through that
+    same latest closed cutoff, or coverage stays incomplete.
     """
     if previous.through_utc is None:
         return None
@@ -199,6 +199,12 @@ def _coverage_for_completed(
         previous, now=now, interval_seconds=interval_seconds
     )
     if expected is None:
+        # Cold start: still require the returned tip to reach the latest closed
+        # interval at ``now``. A stale contiguous fragment must not report COMPLETE.
+        cutoff = latest_closed_cutoff(now, interval_seconds=interval_seconds)
+        last_start = cutoff - timedelta(seconds=interval_seconds)
+        if epochs[-1] != int(last_start.timestamp()):
+            return CoverageState.INCOMPLETE_COVERAGE
         return CoverageState.COMPLETE
     if not expected:
         return CoverageState.COMPLETE

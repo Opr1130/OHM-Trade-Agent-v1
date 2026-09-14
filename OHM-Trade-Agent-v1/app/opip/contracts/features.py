@@ -123,6 +123,13 @@ class FeatureSnapshot:
         # Collapsing them would reject every honest snapshot, because a closed
         # one-minute interval only becomes visible some milliseconds after the
         # grid instant it belongs to.
+        source_at = self.availability.source_at_utc
+        if source_at is not None:
+            source_utc = require_utc(source_at, field_name="availability.source_at_utc")
+            if source_utc > cutoff:
+                raise TemporalIntegrityError(
+                    "availability.source_at_utc cannot be later than evaluation_cutoff"
+                )
         assert_point_in_time((self.availability,), decision_at_utc=evaluated_at)
 
         missingness = {

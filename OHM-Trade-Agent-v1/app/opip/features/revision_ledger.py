@@ -228,6 +228,16 @@ def load_revision_ledger(
                 f"{instrument_version_id} at epoch {epoch} missing "
                 "observation_id; refusing to synthesize durable identity"
             )
+        expected_observation_id = (
+            f"OBS:{instrument_version_id}:{step}s:{epoch}:{revision}"
+        )
+        if observation_id != expected_observation_id:
+            raise RevisionLedgerIntegrityError(
+                "committed observation for "
+                f"{instrument_version_id} at epoch {epoch} has observation_id "
+                f"{observation_id!r} != expected {expected_observation_id!r}; "
+                "refusing to trust mismatched durable identity"
+            )
         incoming = CommittedObservationRevision(
             interval_epoch=epoch,
             revision=revision,

@@ -2620,3 +2620,197 @@ def test_matching_observation_missing_revision_fails_closed(
             instrument.instrument_version_id,
             db_path=canonical_env["db"],
         )
+
+
+def test_ledger_matched_repoll_stays_coverage_only_for_snapshot_receipts():
+    base = _observations(_rows(count=5, end_before=CUTOFF))
+    previous = advance_state(initial_state(_instrument()), base).state
+    tip = base[-1]
+    tip_epoch = int(tip.source_event_time.timestamp())
+    tip_fp = aggregate_content_fingerprint(dict(tip.values))
+    ledger = RevisionLedger(
+        instrument_version_id=_instrument().instrument_version_id,
+        interval_seconds=60,
+        entries={
+            tip_epoch: CommittedObservationRevision(
+                interval_epoch=tip_epoch,
+                revision=1,
+                content_fingerprint=tip_fp,
+                observation_id=tip.observation_id,
+                commit_watermark=ConsumedInputWatermark(1, 5),
+            )
+        },
+    )
+    late_receipt = NOW + timedelta(minutes=3)
+    tip_start = datetime.fromtimestamp(tip_epoch, tz=timezone.utc)
+    same = (
+        replace(
+            tip,
+            receipt_time=late_receipt,
+            ingestion_order=tip.ingestion_order + 50,
+        ),
+    )
+    baseline = run_cycle(
+        (),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        state=previous,
+        revision_ledger=ledger,
+        source_version="test",
+        window_start=tip_start,
+    )
+    result = run_cycle(
+        same,
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=late_receipt,
+        state=previous,
+        revision_ledger=ledger,
+        source_version="test",
+        window_start=tip_start,
+    )
+    assert result.alignment.observations == ()
+    assert len(result.alignment.coverage_only) == 1
+    assert result.snapshot.availability.visible_at_utc == (
+        baseline.snapshot.availability.visible_at_utc
+    )
+    assert result.snapshot.availability.visible_at_utc != late_receipt
+
+
+def test_mismatched_committed_observation_id_fails_closed(canonical_env, writer_server):
+    import json
+
+    from app.opip.contracts.events import MARKET_OBSERVATION_RECORDED
+    from app.opip.features.revision_ledger import (
+        RevisionLedgerIntegrityError,
+        load_revision_ledger,
+    )
+
+    instrument = _instrument()
+    epoch = int(CUTOFF.timestamp()) - 60
+    payload = {
+        "instrument_version_id": instrument.instrument_version_id,
+        "aggregate_interval_seconds": 60,
+        "revision": 1,
+        "source_event_time": datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "observation_id": f"OBS:{instrument.instrument_version_id}:60s:{epoch}:99",
+        "values": {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        },
+    }
+    _insert_raw_event(
+        writer_server.writer._conn,
+        event_type=MARKET_OBSERVATION_RECORDED,
+        payload_json=json.dumps(payload),
+    )
+    with pytest.raises(RevisionLedgerIntegrityError, match="observation_id"):
+        load_revision_ledger(
+            instrument.instrument_version_id,
+            db_path=canonical_env["db"],
+        )
+
+
+def test_snapshot_idempotency_rejects_semantic_conflict(canonical_env, writer_server):
+    from app.opip.features.publisher import snapshot_intent
+
+    client = InProcessWriterClient(writer_server)
+    publisher = FeatureBusPublisher(
+        client, enabled=True, settings=SHADOW_CAPTURE_SETTINGS
+    )
+    dry = run_cycle(
+        _observations(_rows(count=MINIMUM_WARMUP_INTERVALS + 5, end_before=CUTOFF)),
+        instrument_version=_instrument(),
+        evaluation_cutoff=CUTOFF,
+        evaluated_at_utc=NOW,
+        source_version="test",
+    )
+    first = publisher.publish_snapshot(dry.snapshot)
+    assert first.committed
+    altered = replace(
+        dry.snapshot,
+        values={**dict(dry.snapshot.values), "close_return_1m": 0.42},
+        evaluated_at_utc=NOW + timedelta(seconds=5),
+    )
+    assert snapshot_idempotency_key(altered) == snapshot_idempotency_key(dry.snapshot)
+    second = publisher.publish(snapshot_intent(altered))
+    assert second.status == "REJECTED"
+    assert second.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+    clock_only = replace(dry.snapshot, evaluated_at_utc=NOW + timedelta(seconds=9))
+    third = publisher.publish(snapshot_intent(clock_only))
+    assert third.status == "DUPLICATE_OK"
+
+
+def test_feature_snapshot_rejects_source_after_cutoff():
+    from app.opip.contracts.temporal import TemporalIntegrityError
+
+    with pytest.raises(TemporalIntegrityError, match="evaluation_cutoff"):
+        FeatureSnapshot(
+            instrument_version_id=_instrument().instrument_version_id,
+            venue_instrument_id=_instrument().venue_instrument_id,
+            feature_version="test-fv",
+            evaluation_cutoff=CUTOFF,
+            evaluated_at_utc=NOW + timedelta(seconds=30),
+            consumed_input_watermark=ConsumedInputWatermark(1, 1),
+            values={"x": 1.0},
+            availability=AvailabilityStamp(
+                source_at_utc=CUTOFF + timedelta(seconds=20),
+                ingested_at_utc=NOW + timedelta(seconds=30),
+                visible_at_utc=NOW + timedelta(seconds=30),
+                source_version="test",
+            ),
+            missingness={},
+            coverage=CoverageState.COMPLETE,
+            restart_state=RestartState.WARM,
+            feature_schema_version="1",
+            feature_calc_version="1",
+            feature_dag_hash=feature_dag_hash(),
+        )
+
+
+def test_cold_start_stale_tip_is_incomplete_coverage():
+    from app.opip.market.source import latest_closed_cutoff
+
+    tip = int(CUTOFF.timestamp()) - 600
+    rows = [
+        IntervalRow(
+            interval_start_epoch=tip,
+            open=1.0,
+            high=1.1,
+            low=0.9,
+            close=1.05,
+            volume=2.0,
+            vwap=1.05,
+            trade_count=3,
+        ),
+        IntervalRow(
+            interval_start_epoch=tip + 60,
+            open=1.05,
+            high=1.2,
+            low=1.0,
+            close=1.1,
+            volume=2.0,
+            vwap=1.1,
+            trade_count=3,
+        ),
+    ]
+
+    def fetcher(venue_instrument_id, *, interval_minutes, since_epoch):
+        return rows
+
+    source = PolledMinuteBarSource(
+        fetcher,
+        venue="kraken",
+        source_label="test",
+        sequence_prefix="t",
+    )
+    batch = source.fetch_through(_instrument(), watermark=None, now=CUTOFF)
+    assert latest_closed_cutoff(CUTOFF).timestamp() == CUTOFF.timestamp()
+    assert batch.coverage is CoverageState.INCOMPLETE_COVERAGE
+

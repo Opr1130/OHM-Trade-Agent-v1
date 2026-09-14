@@ -21,15 +21,38 @@ from app.opip.contracts.events import (
     FEATURE_BUS_EVENT_TYPES,
     FEATURE_BUS_PRIORITY,
     FEATURE_BUS_STREAM,
+    FEATURE_SNAPSHOT_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
 
 MAX_PAYLOAD_BYTES = 16 * 1024
 
-#: Observation identities are immutable facts. Same key + different payload is
-#: integrity corruption. Snapshot/checkpoint/restart intentionally omit this
-#: check because their payloads carry re-evaluation wall clocks.
-IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset({MARKET_OBSERVATION_RECORDED})
+#: Same idempotency key + different semantic payload is integrity corruption.
+#: Feature snapshots are included after redacting evaluation wall clocks so a
+#: re-poll that only advances ``evaluated_at_utc`` / receipt stamps stays
+#: ``DUPLICATE_OK``, while divergent values/coverage/missingness fail closed.
+IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
+    {MARKET_OBSERVATION_RECORDED, FEATURE_SNAPSHOT_RECORDED}
+)
+
+_SNAPSHOT_VOLATILE_KEYS = frozenset(
+    {"evaluated_at_utc", "availability", "notes", "content_hash"}
+)
+
+
+def _idempotency_payload_json(event_type: str, payload: object) -> str:
+    """Canonical JSON used for same-key semantic conflict detection."""
+    if not isinstance(payload, dict):
+        raise TypeError("idempotency payload must be a mapping")
+    body: dict = dict(payload)
+    if event_type == FEATURE_SNAPSHOT_RECORDED:
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in _SNAPSHOT_VOLATILE_KEYS
+        }
+    return json.dumps(body, separators=(",", ":"), sort_keys=True)
+
 
 ALERT_GOVERNOR_EVENT_TYPES = frozenset(
     {
@@ -82,11 +105,13 @@ class CanonicalWriter:
 
             payload_json = None
             if intent.event_type in IDEMPOTENT_PAYLOAD_EVENT_TYPES:
-                payload_json = json.dumps(
-                    intent.payload, separators=(",", ":"), sort_keys=True
+                payload_json = _idempotency_payload_json(
+                    intent.event_type, intent.payload
                 )
             existing = self._lookup_idempotency(
-                intent.idempotency_key, payload_json=payload_json
+                intent.idempotency_key,
+                payload_json=payload_json,
+                event_type=intent.event_type,
             )
             if existing is not None:
                 return existing
@@ -95,7 +120,9 @@ class CanonicalWriter:
                 return self._commit_new(intent)
             except sqlite3.IntegrityError:
                 existing = self._lookup_idempotency(
-                    intent.idempotency_key, payload_json=payload_json
+                    intent.idempotency_key,
+                    payload_json=payload_json,
+                    event_type=intent.event_type,
                 )
                 if existing is not None:
                     return existing
@@ -236,7 +263,7 @@ class CanonicalWriter:
                 raise
 
     def _lookup_idempotency(
-        self, key: str, *, payload_json: str | None = None
+        self, key: str, *, payload_json: str | None = None, event_type: str | None = None
     ) -> WriterAck | None:
         existing = self._conn.execute(
             "SELECT event_id, history_epoch, local_sequence, payload_json "
@@ -245,13 +272,22 @@ class CanonicalWriter:
         ).fetchone()
         if existing is None:
             return None
-        if payload_json is not None and str(existing["payload_json"]) != payload_json:
-            return WriterAck(
-                status="REJECTED",
-                error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
-                event_id=str(existing["event_id"]),
-                detail="idempotency_key already committed with a different payload",
-            )
+        if payload_json is not None:
+            existing_payload = str(existing["payload_json"])
+            if event_type is not None:
+                try:
+                    existing_payload = _idempotency_payload_json(
+                        event_type, json.loads(existing_payload)
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_payload = str(existing["payload_json"])
+            if existing_payload != payload_json:
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    event_id=str(existing["event_id"]),
+                    detail="idempotency_key already committed with a different payload",
+                )
         return WriterAck(
             status="DUPLICATE_OK",
             event_id=str(existing["event_id"]),

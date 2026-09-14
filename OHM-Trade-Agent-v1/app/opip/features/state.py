@@ -286,6 +286,9 @@ def plan_revisions(
                     )
 
         if ledger_entry is not None and ledger_entry.content_fingerprint == incoming_fp:
+            # Already-durable tip re-polls are coverage evidence only: they must
+            # not enter the snapshot receipt/late-arrival series with a fresh
+            # poll timestamp, or availability would claim new ingestion.
             committed = replace(
                 observation,
                 revision=int(ledger_entry.revision),
@@ -300,7 +303,7 @@ def plan_revisions(
                 ),
                 commit_order=ledger_entry.commit_watermark,
             )
-            evidence.append(committed)
+            coverage_only.append(committed)
             already_committed.add(committed.observation_id)
             continue
 
