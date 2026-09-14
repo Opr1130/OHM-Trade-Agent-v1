@@ -1,0 +1,121 @@
+name: agent-governance-contract
+
+# Structural contract for shared agent instruction adapters.
+# Does not grant trading, deploy, or merge authority.
+# Keeps AGENTS.md as the single policy authority and fails closed if
+# required entry points or non-weakening adapter language drift away.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "AGENTS.md"
+      - "CLAUDE.md"
+      - "GEMINI.md"
+      - ".github/copilot-instructions.md"
+      - ".cursor/rules/**"
+      - ".github/workflows/agent-governance-contract.yml"
+      - "docs/engineering/agent-governance.md"
+  push:
+    branches: [main]
+    paths:
+      - "AGENTS.md"
+      - "CLAUDE.md"
+      - "GEMINI.md"
+      - ".github/copilot-instructions.md"
+      - ".cursor/rules/**"
+      - ".github/workflows/agent-governance-contract.yml"
+      - "docs/engineering/agent-governance.md"
+
+permissions:
+  contents: read
+
+jobs:
+  agent-instruction-contract:
+    name: agent-instruction-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required instruction files exist
+        run: |
+          set -euo pipefail
+          required=(
+            AGENTS.md
+            CLAUDE.md
+            GEMINI.md
+            .github/copilot-instructions.md
+            .cursor/rules/opip-shared-governance.mdc
+            .cursor/rules/opip-trading-execution-safety.mdc
+            .cursor/rules/opip-secrets-data-planes.mdc
+            .cursor/rules/opip-git-ci-change-discipline.mdc
+            .cursor/rules/opip-evidence-high-impact.mdc
+            .cursor/rules/opip-learning-consumption.mdc
+          )
+          for path in "${required[@]}"; do
+            if [[ ! -f "$path" ]]; then
+              echo "::error::Missing required instruction file: $path"
+              exit 1
+            fi
+            echo "ok: $path"
+          done
+
+      - name: AGENTS.md remains canonical authority language
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          agents = Path("AGENTS.md").read_text(encoding="utf-8")
+          required_phrases = [
+              "Never commit directly to `main`",
+              "Never deploy to production unless explicitly authorized",
+              "Never enable live trading",
+              "coding automation has no trading authority",
+              "Never expose, print, copy into source, log, or commit secrets",
+              "Do not create or push commits until explicitly instructed",
+              "Do not merge PRs or run deployment commands unless explicitly instructed",
+              "PR #237",
+              "paper-only",
+          ]
+          missing = [p for p in required_phrases if p not in agents]
+          if missing:
+              raise SystemExit(
+                  "AGENTS.md missing required governance phrases:\n- "
+                  + "\n- ".join(missing)
+              )
+          print("AGENTS.md canonical phrases present")
+          PY
+
+      - name: Adapter files defer to AGENTS.md and do not grant authority
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          adapters = {
+              "CLAUDE.md": ("AGENTS.md", "cannot grant trading authority"),
+              "GEMINI.md": ("AGENTS.md", "canonical shared engineering"),
+              ".github/copilot-instructions.md": ("AGENTS.md", "no independent"),
+              ".cursor/rules/opip-shared-governance.mdc": (
+                  "AGENTS.md",
+                  "no independent authority",
+              ),
+          }
+          banned = (
+              "place orders",
+              "live trading enabled",
+              "increase trading authority",
+              "bypass risk",
+          )
+          for path, needles in adapters.items():
+              text = Path(path).read_text(encoding="utf-8")
+              lower = text.lower()
+              for needle in needles:
+                  if needle not in text:
+                      raise SystemExit(f"{path} missing required phrase: {needle}")
+              for bad in banned:
+                  if bad in lower:
+                      raise SystemExit(f"{path} contains banned authority phrase: {bad}")
+              print(f"ok adapter: {path}")
+          PY
