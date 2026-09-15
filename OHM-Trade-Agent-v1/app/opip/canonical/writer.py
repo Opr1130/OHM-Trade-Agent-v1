@@ -168,14 +168,31 @@ class CanonicalWriter:
         self._conn = connect(self.db_path, read_only=False)
         initialize_schema(self._conn, now_iso=_utc_now())
         self._request_lifecycle_projection: dict[str, str] = {}
+        self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
         self._role_result_idempotency_by_id: dict[str, str] = {}
         self._hydrate_request_lifecycle_projection()
         self._hydrate_role_result_identity_projection()
 
+    def _apply_persisted_request_transition(
+        self,
+        payload: Mapping[str, object],
+    ) -> None:
+        if payload.get("supersedes_id") is not None:
+            return
+        request_id = str(payload["request_id"])
+        current = self._request_lifecycle_projection.get(
+            request_id, "ELIGIBLE"
+        )
+        if payload["from_state"] != current:
+            raise ValueError("persisted transition history is invalid")
+        self._request_lifecycle_projection[request_id] = str(
+            payload["to_state"]
+        )
+
     def _hydrate_request_lifecycle_projection(self) -> None:
         rows = self._conn.execute(
             """
-            SELECT payload_json
+            SELECT history_epoch, local_sequence, payload_json
             FROM events
             WHERE event_type = ?
             ORDER BY history_epoch ASC, local_sequence ASC
@@ -187,13 +204,47 @@ class CanonicalWriter:
                 DECISION_INTELLIGENCE_TRANSITION_RECORDED,
                 json.loads(str(row["payload_json"])),
             )
-            if payload.get("supersedes_id") is not None:
-                continue
-            request_id = payload["request_id"]
-            current = self._request_lifecycle_projection.get(request_id, "ELIGIBLE")
-            if payload["from_state"] != current:
-                raise ValueError("persisted transition history is invalid")
-            self._request_lifecycle_projection[request_id] = payload["to_state"]
+            self._apply_persisted_request_transition(payload)
+            self._request_lifecycle_projection_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+
+    def _refresh_request_lifecycle_projection(self) -> None:
+        history_epoch, local_sequence = (
+            self._request_lifecycle_projection_watermark
+        )
+        rows = self._conn.execute(
+            """
+            SELECT history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ?
+              AND (
+                    history_epoch > ?
+                    OR (
+                        history_epoch = ?
+                        AND local_sequence > ?
+                    )
+                  )
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (
+                DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                history_epoch,
+                history_epoch,
+                local_sequence,
+            ),
+        ).fetchall()
+        for row in rows:
+            payload = validate_di_payload(
+                DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                json.loads(str(row["payload_json"])),
+            )
+            self._apply_persisted_request_transition(payload)
+            self._request_lifecycle_projection_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
 
     def _hydrate_role_result_identity_projection(self) -> None:
         rows = self._conn.execute(
@@ -807,6 +858,7 @@ class CanonicalWriter:
             )
             return
 
+        self._refresh_request_lifecycle_projection()
         current_state = self._request_lifecycle_projection.get(
             request_id, "ELIGIBLE"
         )
@@ -1183,13 +1235,15 @@ class CanonicalWriter:
             (local_sequence + 1, now),
         )
         self._conn.commit()
-        if (
-            intent.event_type == DECISION_INTELLIGENCE_TRANSITION_RECORDED
-            and payload.get("supersedes_id") is None
-        ):
-            self._request_lifecycle_projection[payload["request_id"]] = payload[
-                "to_state"
-            ]
+        if intent.event_type == DECISION_INTELLIGENCE_TRANSITION_RECORDED:
+            self._request_lifecycle_projection_watermark = (
+                history_epoch,
+                local_sequence,
+            )
+            if payload.get("supersedes_id") is None:
+                self._request_lifecycle_projection[payload["request_id"]] = payload[
+                    "to_state"
+                ]
         if intent.event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
             self._role_result_idempotency_by_id[payload["result_id"]] = (
                 intent.idempotency_key
