@@ -3041,3 +3041,85 @@ def test_context_decision_link_rejects_boolean_decision_schema_version():
             architecture_disposition="LINK_ONLY",
             provenance=_provenance(),
         )
+
+
+
+def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
+    from app.opip.canonical.schema import connect
+    from app.opip.canonical.writer import CanonicalWriter
+
+    db = tmp_path / "canonical.sqlite3"
+    writer_a = CanonicalWriter(db)
+    try:
+        request_id = _seed_di_ancestry(writer_a, value=31)
+        writer_b = CanonicalWriter(db)
+        try:
+            selected = _transition_payload(
+                request_id=request_id,
+                from_state="ELIGIBLE",
+                to_state="SELECTED",
+                transition_time="2026-01-02T03:06:00Z",
+            )
+            skipped = _transition_payload(
+                request_id=request_id,
+                from_state="ELIGIBLE",
+                to_state="SKIPPED_BUDGET",
+                transition_time="2026-01-02T03:07:00Z",
+            )
+
+            selected_ack = writer_a.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                        selected,
+                    ),
+                    event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                    payload=selected,
+                )
+            )
+            skipped_ack = writer_b.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                        skipped,
+                    ),
+                    event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                    payload=skipped,
+                )
+            )
+        finally:
+            writer_b.close()
+    finally:
+        writer_a.close()
+
+    assert selected_ack.status == "OK"
+    assert skipped_ack.status == "REJECTED"
+    assert skipped_ack.error_code == "INVALID_INTENT"
+
+    conn = connect(db, read_only=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (DECISION_INTELLIGENCE_TRANSITION_RECORDED,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    persisted = json.loads(rows[0]["payload_json"])
+    assert persisted["to_state"] == "SELECTED"
+
+    restarted = CanonicalWriter(db)
+    try:
+        assert restarted._request_lifecycle_projection[request_id] == "SELECTED"
+    finally:
+        restarted.close()
