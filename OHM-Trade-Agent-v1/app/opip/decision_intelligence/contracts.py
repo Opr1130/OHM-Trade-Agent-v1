@@ -10,6 +10,30 @@ from app.opip.decision_intelligence.identity import DecisionContext, Provenance
 from app.opip.decision_intelligence.serialization import require_utc
 
 
+_INVALID_AS_OF_WATERMARK = "invalid as_of_watermark"
+_WATERMARK_KEYS = {"history_epoch", "local_sequence"}
+
+
+def _coerce_as_of_watermark(value: object) -> ConsumedInputWatermark:
+    if isinstance(value, ConsumedInputWatermark):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError("as_of_watermark must be a watermark object")
+    if set(value) != _WATERMARK_KEYS:
+        raise ValueError(_INVALID_AS_OF_WATERMARK)
+
+    history_epoch = value["history_epoch"]
+    local_sequence = value["local_sequence"]
+    if type(history_epoch) is not int or type(local_sequence) is not int:
+        raise ValueError(_INVALID_AS_OF_WATERMARK)
+    if history_epoch < 0 or local_sequence < 0:
+        raise ValueError(_INVALID_AS_OF_WATERMARK)
+    return ConsumedInputWatermark(
+        history_epoch=history_epoch,
+        local_sequence=local_sequence,
+    )
+
+
 class RequestState(str, Enum):
     ELIGIBLE = "ELIGIBLE"
     SELECTED = "SELECTED"
@@ -394,23 +418,11 @@ class ComparisonRecord:
         )
         if self.evaluation_window_end < self.evaluation_window_start:
             raise ValueError("evaluation_window_end must be >= evaluation_window_start")
-        watermark = self.as_of_watermark
-        if not isinstance(watermark, ConsumedInputWatermark):
-            if not isinstance(watermark, Mapping):
-                raise ValueError("as_of_watermark must be a watermark object")
-            if set(watermark) != {"history_epoch", "local_sequence"}:
-                raise ValueError("invalid as_of_watermark")
-            history_epoch = watermark["history_epoch"]
-            local_sequence = watermark["local_sequence"]
-            if type(history_epoch) is not int or type(local_sequence) is not int:
-                raise ValueError("invalid as_of_watermark")
-            if history_epoch < 0 or local_sequence < 0:
-                raise ValueError("invalid as_of_watermark")
-            watermark = ConsumedInputWatermark(
-                history_epoch=history_epoch,
-                local_sequence=local_sequence,
-            )
-            object.__setattr__(self, "as_of_watermark", watermark)
+        object.__setattr__(
+            self,
+            "as_of_watermark",
+            _coerce_as_of_watermark(self.as_of_watermark),
+        )
         if type(self.timeliness_eligibility) is not bool:
             raise ValueError("timeliness_eligibility must be a boolean")
         if (
