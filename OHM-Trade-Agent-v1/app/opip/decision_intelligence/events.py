@@ -443,7 +443,7 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
         raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
     if "schema_version" not in payload:
         raise ValueError("DI payload schema_version is required")
-    if payload["schema_version"] != 1:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
         raise ValueError("unsupported DI payload schema_version")
 
     data = _strict_payload(payload, record_type)
@@ -476,7 +476,16 @@ class DIEventEnvelope:
             raise ValueError("DI event provenance is required")
         if self.event_type not in DECISION_INTELLIGENCE_EVENT_TYPES:
             raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
-        if int(self.payload.get("schema_version", -1)) != self.payload_schema_version:
+        if (
+            type(self.payload_schema_version) is not int
+            or self.payload_schema_version != 1
+        ):
+            raise ValueError("unsupported DI event payload_schema_version")
+        payload_version = self.payload.get("schema_version")
+        if (
+            type(payload_version) is not int
+            or payload_version != self.payload_schema_version
+        ):
             raise ValueError("DI payload schema_version is required")
         validate_di_payload(self.event_type, self.payload)
 
