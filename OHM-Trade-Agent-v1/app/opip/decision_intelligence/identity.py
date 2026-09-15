@@ -29,6 +29,8 @@ class Provenance:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("unsupported Provenance schema_version")
         object.__setattr__(self, "producing_component", str(self.producing_component).strip())
         object.__setattr__(self, "artifact_or_build_id", str(self.artifact_or_build_id).strip())
         if not self.producing_component or not self.artifact_or_build_id:
