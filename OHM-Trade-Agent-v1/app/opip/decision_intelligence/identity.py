@@ -37,9 +37,15 @@ class Provenance:
         object.__setattr__(self, "emitted_at", require_utc(self.emitted_at, field_name="emitted_at"))
         if not self.process_instance_id:
             raise ValueError("provenance process_instance_id is required")
-        refs = tuple(str(ref) for ref in self.source_record_refs)
+        if not isinstance(self.source_record_refs, (list, tuple)):
+            raise ValueError("provenance source_record_refs must be an array")
+        refs = tuple(self.source_record_refs)
         if not refs:
             raise ValueError("provenance source_record_refs is required")
+        if any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            raise ValueError(
+                "provenance source_record_refs entries must be non-empty strings"
+            )
         object.__setattr__(self, "source_record_refs", refs)
 
     def semantic_identity(self) -> dict[str, Any]:
@@ -99,12 +105,19 @@ class DecisionContext:
         else:
             if not isinstance(self.consumed_input_watermark, Mapping):
                 raise ValueError("consumed_input_watermark must be a watermark object")
-            try:
-                watermark = ConsumedInputWatermark.from_dict(
-                    self.consumed_input_watermark
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("invalid consumed_input_watermark") from exc
+            raw_watermark = self.consumed_input_watermark
+            if set(raw_watermark) != {"history_epoch", "local_sequence"}:
+                raise ValueError("invalid consumed_input_watermark")
+            history_epoch = raw_watermark["history_epoch"]
+            local_sequence = raw_watermark["local_sequence"]
+            if type(history_epoch) is not int or type(local_sequence) is not int:
+                raise ValueError("invalid consumed_input_watermark")
+            if history_epoch < 0 or local_sequence < 0:
+                raise ValueError("invalid consumed_input_watermark")
+            watermark = ConsumedInputWatermark(
+                history_epoch=history_epoch,
+                local_sequence=local_sequence,
+            )
         object.__setattr__(self, "consumed_input_watermark", watermark)
 
         normalized_manifest: dict[str, Any] = {}
