@@ -33,6 +33,7 @@ from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_REQUEST_RECORDED,
     DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
     DECISION_INTELLIGENCE_STREAM,
+    DECISION_INTELLIGENCE_TRANSITION_RECORDED,
     canonical_di_idempotency_key,
     context_idempotency_key,
     request_idempotency_key,
