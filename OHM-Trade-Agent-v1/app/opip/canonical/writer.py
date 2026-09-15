@@ -483,6 +483,12 @@ class CanonicalWriter:
         ):
             raise ValueError("request/context snapshot mismatch")
 
+    def _load_context_by_id(self, context_id: str) -> dict:
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            idempotency_key=context_idempotency_key(context_id=context_id),
+        )
+
     def _load_request_context_for_id(
         self, request_id: str
     ) -> tuple[dict, dict]:
@@ -631,6 +637,18 @@ class CanonicalWriter:
             return
         if not isinstance(supersedes_id, str) or not supersedes_id:
             raise ValueError("supersedes_id is invalid")
+
+        if event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED:
+            self._load_context_by_id(supersedes_id)
+            return
+
+        if event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:
+            superseded, _ = self._load_request_context_for_id(supersedes_id)
+            context_id = self._require_string_ref(payload, "context_id")
+            if superseded.get("context_id") != context_id:
+                raise ValueError("request supersession context mismatch")
+            self._load_context_by_id(context_id)
+            return
 
         if event_type == DECISION_INTELLIGENCE_INVOCATION_RECORDED:
             superseded = self._load_invocation_by_id(supersedes_id)
