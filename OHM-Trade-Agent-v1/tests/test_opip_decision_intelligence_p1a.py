@@ -1019,7 +1019,11 @@ def test_di_identity_is_epoch_invariant_and_request_varies_by_model():
         {"components": ["ctx-1"]},
     )
     assert context_key == expected_context_key
-    assert request_idempotency_key(request_id="req-1") == request_idempotency_key(request_id="req-1")
+    assert request_idempotency_key(
+        request_id="req-1"
+    ) != request_idempotency_key(
+        request_id="req-2"
+    )
     assert role_result_idempotency_key(
         request_id="req-1", role="REGIME_ANALYST", role_version="role-1",
         route_version="r1", prompt_version="p1", attempt=1, model_version="m1",
