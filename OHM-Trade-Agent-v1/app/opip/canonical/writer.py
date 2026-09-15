@@ -28,14 +28,18 @@ from app.opip.contracts.events import (
 )
 from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
+    DECISION_INTELLIGENCE_COMPARISON_RECORDED,
     DECISION_INTELLIGENCE_CONTEXT_RECORDED,
     DECISION_INTELLIGENCE_EVENT_TYPES,
+    DECISION_INTELLIGENCE_INVOCATION_RECORDED,
     DECISION_INTELLIGENCE_REQUEST_RECORDED,
     DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
     DECISION_INTELLIGENCE_STREAM,
     DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+    assessment_idempotency_key,
     canonical_di_idempotency_key,
     context_idempotency_key,
+    invocation_idempotency_key,
     request_idempotency_key,
     transition_idempotency_key,
     validate_di_payload,
@@ -163,7 +167,9 @@ class CanonicalWriter:
         self._conn = connect(self.db_path, read_only=False)
         initialize_schema(self._conn, now_iso=_utc_now())
         self._request_lifecycle_projection: dict[str, str] = {}
+        self._role_result_idempotency_by_id: dict[str, str] = {}
         self._hydrate_request_lifecycle_projection()
+        self._hydrate_role_result_identity_projection()
 
     def _hydrate_request_lifecycle_projection(self) -> None:
         rows = self._conn.execute(
@@ -187,6 +193,30 @@ class CanonicalWriter:
             if payload["from_state"] != current:
                 raise ValueError("persisted transition history is invalid")
             self._request_lifecycle_projection[request_id] = payload["to_state"]
+
+    def _hydrate_role_result_identity_projection(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT idempotency_key, payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,),
+        ).fetchall()
+        for row in rows:
+            payload = validate_di_payload(
+                DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+                json.loads(str(row["payload_json"])),
+            )
+            result_id = payload.get("result_id")
+            if not isinstance(result_id, str) or not result_id:
+                raise ValueError("persisted role result has invalid result_id")
+            idempotency_key = str(row["idempotency_key"])
+            existing = self._role_result_idempotency_by_id.get(result_id)
+            if existing is not None and existing != idempotency_key:
+                raise ValueError("persisted role result identity is not unique")
+            self._role_result_idempotency_by_id[result_id] = idempotency_key
 
     def close(self) -> None:
         with self._lock:
@@ -452,6 +482,138 @@ class CanonicalWriter:
         ):
             raise ValueError("request/context snapshot mismatch")
 
+    def _load_request_context_for_id(
+        self, request_id: str
+    ) -> tuple[dict, dict]:
+        request_payload = self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_REQUEST_RECORDED,
+            idempotency_key=request_idempotency_key(request_id=request_id),
+        )
+        context_id = request_payload.get("context_id")
+        if not isinstance(context_id, str) or not context_id:
+            raise ValueError("persisted request has no valid context_id")
+        context_payload = self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            idempotency_key=context_idempotency_key(context_id=context_id),
+        )
+        if request_payload.get("frozen_snapshot_hash") != context_payload.get(
+            "snapshot_hash"
+        ):
+            raise ValueError("persisted request/context snapshot mismatch")
+        return request_payload, context_payload
+
+    def _load_invocation_by_id(self, invocation_id: str) -> dict:
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED,
+            idempotency_key=invocation_idempotency_key(
+                invocation_id=invocation_id
+            ),
+        )
+
+    def _load_assessment_by_id(self, assessment_id: str) -> dict:
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
+            idempotency_key=assessment_idempotency_key(
+                assessment_id=assessment_id
+            ),
+        )
+
+    def _load_role_result_by_id(self, result_id: str) -> dict:
+        idempotency_key = self._role_result_idempotency_by_id.get(result_id)
+        if idempotency_key is None:
+            raise ValueError(
+                "required decision_intelligence.role_result.recorded "
+                "record is missing for ancestry validation"
+            )
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+            idempotency_key=idempotency_key,
+        )
+
+    @staticmethod
+    def _require_string_ref(payload: Mapping[str, object], field_name: str) -> str:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field_name} is required for ancestry validation")
+        return value
+
+    @staticmethod
+    def _require_string_ref_list(
+        payload: Mapping[str, object], field_name: str
+    ) -> list[str]:
+        value = payload.get(field_name)
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be a canonical array")
+        if any(not isinstance(item, str) or not item for item in value):
+            raise ValueError(f"{field_name} must contain string references")
+        return value
+
+    def _validate_di_downstream_ancestry(
+        self, event_type: str, payload: Mapping[str, object]
+    ) -> None:
+        if event_type == DECISION_INTELLIGENCE_INVOCATION_RECORDED:
+            request_id = self._require_string_ref(payload, "request_id")
+            self._load_request_context_for_id(request_id)
+            return
+
+        if event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
+            request_id = self._require_string_ref(payload, "request_id")
+            self._load_request_context_for_id(request_id)
+            invocation_ref = payload.get("invocation_ref")
+            if invocation_ref is None:
+                return
+            if not isinstance(invocation_ref, str) or not invocation_ref:
+                raise ValueError("invocation_ref is invalid")
+            invocation = self._load_invocation_by_id(invocation_ref)
+            if invocation.get("request_id") != request_id:
+                raise ValueError("role result invocation request mismatch")
+            return
+
+        if event_type == DECISION_INTELLIGENCE_ASSESSMENT_RECORDED:
+            request_id = self._require_string_ref(payload, "request_id")
+            self._load_request_context_for_id(request_id)
+            for result_id in self._require_string_ref_list(
+                payload, "referenced_role_result_ids"
+            ):
+                role_result = self._load_role_result_by_id(result_id)
+                if role_result.get("request_id") != request_id:
+                    raise ValueError("assessment role result request mismatch")
+            for invocation_id in self._require_string_ref_list(
+                payload, "invocation_references"
+            ):
+                invocation = self._load_invocation_by_id(invocation_id)
+                if invocation.get("request_id") != request_id:
+                    raise ValueError("assessment invocation request mismatch")
+            return
+
+        if event_type != DECISION_INTELLIGENCE_COMPARISON_RECORDED:
+            return
+
+        request_id = self._require_string_ref(payload, "committee_request_id")
+        context_id = self._require_string_ref(payload, "decision_context_id")
+        assessment_id = self._require_string_ref(
+            payload, "committee_assessment_id"
+        )
+        request_payload, context_payload = self._load_request_context_for_id(
+            request_id
+        )
+        if request_payload.get("context_id") != context_id:
+            raise ValueError("comparison request/context mismatch")
+        if context_payload.get("context_id") != context_id:
+            raise ValueError("comparison context mismatch")
+        if payload.get("experiment_id") != request_payload.get("experiment_id"):
+            raise ValueError("comparison experiment/request mismatch")
+
+        assessment = self._load_assessment_by_id(assessment_id)
+        if assessment.get("request_id") != request_id:
+            raise ValueError("comparison assessment request mismatch")
+        for invocation_id in self._require_string_ref_list(
+            payload, "invocation_refs"
+        ):
+            invocation = self._load_invocation_by_id(invocation_id)
+            if invocation.get("request_id") != request_id:
+                raise ValueError("comparison invocation request mismatch")
+
     @staticmethod
     def _evidence_manifest_and_cutoff(
         context_payload: Mapping[str, object],
@@ -650,6 +812,10 @@ class CanonicalWriter:
         )
         if intent.event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:
             self._validate_request_context_ancestry(normalized)
+        self._validate_di_downstream_ancestry(
+            intent.event_type,
+            normalized,
+        )
         return normalized
 
     @staticmethod
@@ -938,6 +1104,10 @@ class CanonicalWriter:
             self._request_lifecycle_projection[payload["request_id"]] = payload[
                 "to_state"
             ]
+        if intent.event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
+            self._role_result_idempotency_by_id[payload["result_id"]] = (
+                intent.idempotency_key
+            )
         return WriterAck(
             status="OK",
             event_id=event_id,
