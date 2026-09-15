@@ -43,15 +43,69 @@ DECISION_INTELLIGENCE_EVENT_TYPES = frozenset(
 
 _decision_intelligence_event_types = DECISION_INTELLIGENCE_EVENT_TYPES
 
+_UNSUPPORTED_DI_EVENT_TYPE = "unsupported decision intelligence event type"
+_RECORD_TYPES = {
+    DECISION_INTELLIGENCE_CONTEXT_RECORDED: DecisionContext,
+    DECISION_INTELLIGENCE_REQUEST_RECORDED: CommitteeRequest,
+    DECISION_INTELLIGENCE_TRANSITION_RECORDED: CommitteeRequestTransition,
+    DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED: CommitteeRoleResult,
+    DECISION_INTELLIGENCE_ASSESSMENT_RECORDED: CommitteeAssessmentSummary,
+    DECISION_INTELLIGENCE_INVOCATION_RECORDED: ModelInvocation,
+    DECISION_INTELLIGENCE_COMPARISON_RECORDED: ComparisonRecord,
+}
+_ENUM_FIELDS = {
+    "from_state": RequestState,
+    "to_state": RequestState,
+    "result_disposition": ResultDisposition,
+    "stance": AdvisoryStance,
+    "advisory_stance": AdvisoryStance,
+    "advisory_disposition": ResultDisposition,
+    "role": CommitteeRole,
+}
+_EXTRA_TIMESTAMP_FIELDS = {
+    "evaluation_time",
+    "evidence_cutoff",
+    "transition_time",
+    "started_at",
+    "completed_at",
+    "completion_time",
+    "commit_time",
+    "evaluation_window_start",
+    "evaluation_window_end",
+}
+_REPEATED_STRING_FIELDS = (
+    "risks",
+    "evidence_refs",
+    "missing_evidence",
+    "referenced_role_result_ids",
+    "unsupported_claims",
+    "invocation_references",
+    "invocation_refs",
+)
+_IDENTITY_BUILDERS = {
+    DecisionContext: lambda payload: context_identity(payload),
+    CommitteeRequest: lambda payload: request_identity(payload),
+    CommitteeRequestTransition: lambda payload: transition_identity(payload),
+    CommitteeRoleResult: lambda payload: role_result_identity(payload),
+    CommitteeAssessmentSummary: lambda payload: assessment_identity(payload),
+    ModelInvocation: lambda payload: invocation_identity(payload),
+    ComparisonRecord: lambda payload: comparison_identity(payload),
+}
+_IDENTITY_FIELDS = {
+    DecisionContext: "context_id",
+    CommitteeRequest: "request_id",
+    CommitteeRequestTransition: "transition_id",
+    CommitteeRoleResult: "result_id",
+    CommitteeAssessmentSummary: "assessment_id",
+    ModelInvocation: "invocation_id",
+    ComparisonRecord: "comparison_id",
+}
+
 def _identity(event_type: str, *parts: object) -> str:
     return stable_hash(event_type, {"components": list(parts)})
 
 
-def context_idempotency_key(
-    *,
-    context_id: str,
-    watermark: ConsumedInputWatermark | dict[str, int] | None = None,
-) -> str:
+def context_idempotency_key(*, context_id: str) -> str:
     return _identity(DECISION_INTELLIGENCE_CONTEXT_RECORDED, context_id)
 
 
@@ -165,7 +219,7 @@ def canonical_di_idempotency_key(
         return comparison_idempotency_key(
             comparison_id=str(payload["comparison_id"])
         )
-    raise ValueError("unsupported decision intelligence event type")
+    raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
 
 
 def context_identity(context: Mapping[str, Any]) -> str:
@@ -312,105 +366,94 @@ def _strict_payload(payload: Mapping[str, Any], record_type: Type[Any]) -> dict[
     return dict(payload)
 
 
-def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
-    if not isinstance(payload, Mapping):
-        raise ValueError("DI payload must be an object")
-    record_types = {
-        DECISION_INTELLIGENCE_CONTEXT_RECORDED: DecisionContext,
-        DECISION_INTELLIGENCE_REQUEST_RECORDED: CommitteeRequest,
-        DECISION_INTELLIGENCE_TRANSITION_RECORDED: CommitteeRequestTransition,
-        DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED: CommitteeRoleResult,
-        DECISION_INTELLIGENCE_ASSESSMENT_RECORDED: CommitteeAssessmentSummary,
-        DECISION_INTELLIGENCE_INVOCATION_RECORDED: ModelInvocation,
-        DECISION_INTELLIGENCE_COMPARISON_RECORDED: ComparisonRecord,
-    }
-    record_type = record_types.get(event_type)
-    if record_type is None:
-        raise ValueError("unsupported decision intelligence event type")
-    if "schema_version" not in payload:
-        raise ValueError("DI payload schema_version is required")
-    if payload["schema_version"] != 1:
-        raise ValueError("unsupported DI payload schema_version")
-    data = _strict_payload(payload, record_type)
-    data["provenance"] = _provenance(data["provenance"])
-    enum_fields = {"from_state": RequestState, "to_state": RequestState, "result_disposition": ResultDisposition, "stance": AdvisoryStance, "advisory_stance": AdvisoryStance, "advisory_disposition": ResultDisposition, "role": CommitteeRole}
-    for name, enum_type in enum_fields.items():
+def _normalize_enum_fields(data: dict[str, Any]) -> None:
+    for name, enum_type in _ENUM_FIELDS.items():
         if name not in data:
             continue
         if name == "advisory_disposition" and data[name] is None:
             continue
-        if not isinstance(data[name], enum_type):
-            try:
-                data[name] = enum_type(data[name])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid {name}") from exc
+        if isinstance(data[name], enum_type):
+            continue
+        try:
+            data[name] = enum_type(data[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid {name}") from exc
+
+
+def _normalize_timestamp_fields(
+    data: dict[str, Any], record_type: Type[Any]
+) -> None:
     timestamp_names = {
-        field.name for field in fields(record_type)
-        if field.name.endswith("_at") or field.name in {
-            "evaluation_time",
-            "evidence_cutoff",
-            "transition_time",
-            "started_at",
-            "completed_at",
-            "completion_time",
-            "commit_time",
-            "evaluation_window_start",
-            "evaluation_window_end",
-        }
+        field.name
+        for field in fields(record_type)
+        if field.name.endswith("_at") or field.name in _EXTRA_TIMESTAMP_FIELDS
     }
     for name in timestamp_names:
         if name in data:
             data[name] = _timestamp(data[name], name)
-    for name in (
-        "risks",
-        "evidence_refs",
-        "missing_evidence",
-        "referenced_role_result_ids",
-        "unsupported_claims",
-        "invocation_references",
-        "invocation_refs",
-    ):
+
+
+def _normalize_repeated_string_fields(data: dict[str, Any]) -> None:
+    for name in _REPEATED_STRING_FIELDS:
         if name in data:
             data[name] = _string_tuple(data[name], name)
+
+
+def _normalize_watermark_fields(
+    data: dict[str, Any], record_type: Type[Any]
+) -> None:
     if record_type is ComparisonRecord:
         data["as_of_watermark"] = _watermark(
             data.get("as_of_watermark"), "as_of_watermark"
         )
-    if record_type is DecisionContext:
+    elif record_type is DecisionContext:
         data["consumed_input_watermark"] = _watermark(
             data.get("consumed_input_watermark"),
             "consumed_input_watermark",
         )
-    record = record_type(**data)
-    if isinstance(record, DecisionContext):
-        normalized = record.as_dict()
-    else:
-        normalized = asdict(record)
-    normalized = _canonical_payload(normalized)
 
-    identity_builders = {
-        DecisionContext: context_identity,
-        CommitteeRequest: request_identity,
-        CommitteeRequestTransition: transition_identity,
-        CommitteeRoleResult: role_result_identity,
-        CommitteeAssessmentSummary: assessment_identity,
-        ModelInvocation: invocation_identity,
-        ComparisonRecord: comparison_identity,
-    }
-    identity_field = {
-        DecisionContext: "context_id",
-        CommitteeRequest: "request_id",
-        CommitteeRequestTransition: "transition_id",
-        CommitteeRoleResult: "result_id",
-        CommitteeAssessmentSummary: "assessment_id",
-        ModelInvocation: "invocation_id",
-        ComparisonRecord: "comparison_id",
-    }[record_type]
-    expected_id = identity_builders[record_type](normalized)
+
+def _normalized_record_payload(
+    record_type: Type[Any], data: dict[str, Any]
+) -> dict[str, Any]:
+    record = record_type(**data)
+    normalized = (
+        record.as_dict() if isinstance(record, DecisionContext) else asdict(record)
+    )
+    return _canonical_payload(normalized)
+
+
+def _validate_content_identity(
+    record_type: Type[Any], normalized: Mapping[str, Any]
+) -> None:
+    identity_field = _IDENTITY_FIELDS[record_type]
+    expected_id = _IDENTITY_BUILDERS[record_type](normalized)
     if normalized[identity_field] != expected_id:
         raise ValueError(
             f"{identity_field} does not match content-derived identity"
         )
+
+
+def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
+    if not isinstance(payload, Mapping):
+        raise ValueError("DI payload must be an object")
+    record_type = _RECORD_TYPES.get(event_type)
+    if record_type is None:
+        raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
+    if "schema_version" not in payload:
+        raise ValueError("DI payload schema_version is required")
+    if payload["schema_version"] != 1:
+        raise ValueError("unsupported DI payload schema_version")
+
+    data = _strict_payload(payload, record_type)
+    data["provenance"] = _provenance(data["provenance"])
+    _normalize_enum_fields(data)
+    _normalize_timestamp_fields(data, record_type)
+    _normalize_repeated_string_fields(data)
+    _normalize_watermark_fields(data, record_type)
+
+    normalized = _normalized_record_payload(record_type, data)
+    _validate_content_identity(record_type, normalized)
     return normalized
 
 
@@ -431,7 +474,7 @@ class DIEventEnvelope:
         if not isinstance(self.provenance, Provenance):
             raise ValueError("DI event provenance is required")
         if self.event_type not in DECISION_INTELLIGENCE_EVENT_TYPES:
-            raise ValueError("unsupported decision intelligence event type")
+            raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
         if int(self.payload.get("schema_version", -1)) != self.payload_schema_version:
             raise ValueError("DI payload schema_version is required")
         validate_di_payload(self.event_type, self.payload)
