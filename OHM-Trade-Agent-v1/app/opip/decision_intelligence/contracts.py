@@ -401,7 +401,7 @@ class ComparisonRecord:
             object.__setattr__(self, "as_of_watermark", watermark)
         if self.timeliness_eligibility and self.advisory_disposition is not ResultDisposition.ON_TIME:
             raise ValueError(
-                "timely comparison evidence requires explicit ON_TIME advisory disposition"
+                "LATE or unknown evidence cannot be timely; explicit ON_TIME advisory disposition required"
             )
 
 

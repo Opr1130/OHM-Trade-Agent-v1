@@ -187,7 +187,17 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
                 raise ValueError(f"invalid {name}") from exc
     timestamp_names = {
         field.name for field in fields(record_type)
-        if field.name.endswith("_at") or field.name in {"evaluation_time", "evidence_cutoff", "transition_time", "started_at", "completed_at", "evaluation_window_start", "evaluation_window_end"}
+        if field.name.endswith("_at") or field.name in {
+            "evaluation_time",
+            "evidence_cutoff",
+            "transition_time",
+            "started_at",
+            "completed_at",
+            "completion_time",
+            "commit_time",
+            "evaluation_window_start",
+            "evaluation_window_end",
+        }
     }
     for name in timestamp_names:
         if name in data:
