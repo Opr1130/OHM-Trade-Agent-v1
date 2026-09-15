@@ -2831,3 +2831,207 @@ def test_context_supersession_accepts_existing_context_target(tmp_path):
         writer.close()
 
     assert correction_ack.status == "OK"
+
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    [
+        "role_attempt",
+        "invocation_attempt",
+        "request_budget",
+        "role_score_schema",
+        "comparison_horizon",
+    ],
+)
+def test_writer_rejects_boolean_values_for_di_integer_semantics(
+    tmp_path, record_kind
+):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import comparison_identity
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        if record_kind == "request_budget":
+            context = _context_payload("ctx-int-budget")
+            context_ack = writer.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        DECISION_INTELLIGENCE_CONTEXT_RECORDED, context
+                    ),
+                    event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                    payload=context,
+                )
+            )
+            assert context_ack.status == "OK"
+            payload = _request_payload(context)
+            payload["budget_reservation"] = True
+            payload["request_id"] = request_identity(payload)
+            event_type = "decision_intelligence.request.recorded"
+
+        elif record_kind in {"role_attempt", "role_score_schema"}:
+            request_id = _seed_di_ancestry(writer, value=11)
+            payload = _role_result_payload(request_id=request_id)
+            field_name = (
+                "attempt"
+                if record_kind == "role_attempt"
+                else "score_schema_version"
+            )
+            payload[field_name] = True
+            payload["result_id"] = role_result_identity(payload)
+            event_type = "decision_intelligence.role_result.recorded"
+
+        elif record_kind == "invocation_attempt":
+            request_id = _seed_di_ancestry(writer, value=12)
+            payload = _invocation_payload(
+                "inv-bool-attempt",
+                request_id=request_id,
+            )
+            payload["attempt"] = True
+            payload["invocation_id"] = invocation_identity(payload)
+            event_type = "decision_intelligence.invocation.recorded"
+
+        else:
+            ancestry = _seed_complete_di_ancestry(writer, value=13)
+            payload = _valid_comparison_payload_for_regression(
+                decision_context_id=ancestry["context"]["context_id"],
+                committee_assessment_id=ancestry["assessment"]["assessment_id"],
+                committee_request_id=ancestry["request"]["request_id"],
+                experiment_id=ancestry["request"]["experiment_id"],
+                invocation_refs=[ancestry["invocation"]["invocation_id"]],
+            )
+            payload["common_outcome_horizon"] = True
+            payload["comparison_id"] = comparison_identity(payload)
+            event_type = "decision_intelligence.comparison.recorded"
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(event_type, payload),
+                event_type=event_type,
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "field_name"),
+    [
+        ("invocation", "input_tokens"),
+        ("invocation", "latency_micros"),
+        ("invocation", "billed_cost_microunits"),
+        ("comparison", "ai_cost_attributed"),
+        ("comparison", "baseline_trading_net"),
+    ],
+)
+def test_writer_rejects_non_integer_values_across_remaining_di_integer_fields(
+    tmp_path, record_kind, field_name
+):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import comparison_identity
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ancestry = _seed_complete_di_ancestry(writer, value=14)
+        request_id = ancestry["request"]["request_id"]
+
+        if record_kind == "invocation":
+            payload = _invocation_payload(
+                f"inv-bad-{field_name}",
+                request_id=request_id,
+            )
+            payload[field_name] = 1.5
+            payload["invocation_id"] = invocation_identity(payload)
+            event_type = "decision_intelligence.invocation.recorded"
+        else:
+            payload = _valid_comparison_payload_for_regression(
+                decision_context_id=ancestry["context"]["context_id"],
+                committee_assessment_id=ancestry["assessment"]["assessment_id"],
+                committee_request_id=request_id,
+                experiment_id=ancestry["request"]["experiment_id"],
+                invocation_refs=[ancestry["invocation"]["invocation_id"]],
+            )
+            payload[field_name] = 1.5
+            payload["comparison_id"] = comparison_identity(payload)
+            event_type = "decision_intelligence.comparison.recorded"
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(event_type, payload),
+                event_type=event_type,
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_boolean_role_attempt_cannot_block_valid_integer_attempt(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        request_id = _seed_di_ancestry(writer, value=15)
+
+        valid = _role_result_payload(request_id=request_id)
+        valid_key = _di_key(
+            "decision_intelligence.role_result.recorded",
+            valid,
+        )
+
+        malformed = dict(valid)
+        malformed["attempt"] = True
+        malformed["result_id"] = role_result_identity(malformed)
+
+        malformed_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=valid_key,
+                event_type="decision_intelligence.role_result.recorded",
+                payload=malformed,
+            )
+        )
+        valid_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=valid_key,
+                event_type="decision_intelligence.role_result.recorded",
+                payload=valid,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert malformed_ack.status == "REJECTED"
+    assert malformed_ack.error_code == "INVALID_INTENT"
+    assert valid_ack.status == "OK"
+
+
+def test_context_decision_link_rejects_boolean_decision_schema_version():
+    from app.opip.decision_intelligence import ContextDecisionLink
+
+    with pytest.raises(ValueError, match="decision_schema_version"):
+        ContextDecisionLink(
+            link_id="link-bool-schema",
+            context_id="ctx",
+            decision_id="decision",
+            decision_record_type="AdmissionDecisionV2",
+            decision_schema_version=True,
+            architecture_disposition="LINK_ONLY",
+            provenance=_provenance(),
+        )
