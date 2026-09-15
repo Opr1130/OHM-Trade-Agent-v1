@@ -200,6 +200,13 @@ class CanonicalWriter:
 
             try:
                 return self._commit_new(intent, normalized_payload=normalized_payload)
+            except (TypeError, ValueError) as exc:
+                self._conn.rollback()
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="INVALID_INTENT",
+                    detail=str(exc),
+                )
             except sqlite3.IntegrityError:
                 existing = self._lookup_idempotency(
                     intent.idempotency_key,
