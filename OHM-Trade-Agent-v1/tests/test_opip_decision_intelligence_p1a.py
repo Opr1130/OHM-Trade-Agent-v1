@@ -2374,6 +2374,8 @@ def test_role_result_invocation_must_belong_to_same_request(tmp_path):
         request_a = _seed_di_ancestry(writer)
 
         context_b = _context_payload("ctx-other-request", value=2)
+        context_b["candidate_id"] = "candidate-other-request"
+        context_b["context_id"] = context_identity(context_b)
         context_b_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -2465,6 +2467,8 @@ def test_assessment_references_must_exist_and_match_request(tmp_path):
         )
 
         context_b = _context_payload("ctx-assessment-other", value=3)
+        context_b["candidate_id"] = "candidate-assessment-other"
+        context_b["context_id"] = context_identity(context_b)
         context_b_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -3072,10 +3076,10 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
                     schema_version=1,
                     priority="LOW",
                     idempotency_key=_di_key(
-                        DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                        "decision_intelligence.transition.recorded",
                         selected,
                     ),
-                    event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                    event_type="decision_intelligence.transition.recorded",
                     payload=selected,
                 )
             )
@@ -3084,10 +3088,10 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
                     schema_version=1,
                     priority="LOW",
                     idempotency_key=_di_key(
-                        DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                        "decision_intelligence.transition.recorded",
                         skipped,
                     ),
-                    event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                    event_type="decision_intelligence.transition.recorded",
                     payload=skipped,
                 )
             )
@@ -3109,7 +3113,7 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
             WHERE event_type = ?
             ORDER BY history_epoch ASC, local_sequence ASC
             """,
-            (DECISION_INTELLIGENCE_TRANSITION_RECORDED,),
+            ("decision_intelligence.transition.recorded",),
         ).fetchall()
     finally:
         conn.close()
