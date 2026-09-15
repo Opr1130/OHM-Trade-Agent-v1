@@ -64,7 +64,21 @@ def transition_idempotency_key(*, transition_id: str) -> str:
 
 
 def transition_identity(transition: Mapping[str, Any]) -> str:
-    return stable_hash("DI-TRANSITION", {key: transition.get(key) for key in ("request_id", "from_state", "to_state", "transition_time", "supersedes_id", "supersession_reason")})
+    identity = {
+        key: transition.get(key)
+        for key in (
+            "request_id",
+            "from_state",
+            "to_state",
+            "transition_time",
+            "supersedes_id",
+            "supersession_reason",
+        )
+    }
+    identity["transition_time"] = _timestamp(
+        identity["transition_time"], "transition_time"
+    )
+    return stable_hash("DI-TRANSITION", identity)
 
 
 def role_result_idempotency_key(
@@ -110,7 +124,25 @@ def context_identity(context: Mapping[str, Any]) -> str:
 
 
 def request_identity(request: Mapping[str, Any]) -> str:
-    return stable_hash("DI-REQUEST", {key: request[key] for key in ("context_id", "experiment_id", "cohort_selection_rule_version", "frozen_snapshot_hash", "route_version", "prompt_version", "role_configuration_version", "eligibility_at", "deadline_at", "budget_reservation", "result_selection_rule_version")})
+    identity = {
+        key: request[key]
+        for key in (
+            "context_id",
+            "experiment_id",
+            "cohort_selection_rule_version",
+            "frozen_snapshot_hash",
+            "route_version",
+            "prompt_version",
+            "role_configuration_version",
+            "eligibility_at",
+            "deadline_at",
+            "budget_reservation",
+            "result_selection_rule_version",
+        )
+    }
+    for field_name in ("eligibility_at", "deadline_at"):
+        identity[field_name] = _timestamp(identity[field_name], field_name)
+    return stable_hash("DI-REQUEST", identity)
 
 
 def role_result_identity(result: Mapping[str, Any]) -> str:
@@ -242,11 +274,11 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
     data["provenance"] = _provenance(data["provenance"])
     enum_fields = {"from_state": RequestState, "to_state": RequestState, "result_disposition": ResultDisposition, "stance": AdvisoryStance, "advisory_stance": AdvisoryStance, "advisory_disposition": ResultDisposition, "role": CommitteeRole}
     for name, enum_type in enum_fields.items():
-        if (
-            name in data
-            and data[name] is not None
-            and not isinstance(data[name], enum_type)
-        ):
+        if name not in data:
+            continue
+        if name == "advisory_disposition" and data[name] is None:
+            continue
+        if not isinstance(data[name], enum_type):
             try:
                 data[name] = enum_type(data[name])
             except (TypeError, ValueError) as exc:
