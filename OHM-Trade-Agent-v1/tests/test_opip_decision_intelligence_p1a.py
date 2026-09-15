@@ -43,6 +43,7 @@ from app.opip.decision_intelligence.serialization import canonical_serialize
 from app.opip.decision_intelligence.serialization import stable_hash
 from app.opip.decision_intelligence.events import (
     context_identity,
+    request_identity,
     role_result_identity,
     assessment_identity,
     invocation_identity,
@@ -106,6 +107,59 @@ def _context_payload(context_id: str, *, value: int = 1):
     return payload
 
 
+def _request_payload(context_payload: dict) -> dict:
+    payload = {
+        "request_id": "pending",
+        "context_id": context_payload["context_id"],
+        "experiment_id": "experiment-1",
+        "cohort_selection_rule_version": "cohort-1",
+        "frozen_snapshot_hash": context_payload["snapshot_hash"],
+        "route_version": "route-1",
+        "prompt_version": "prompt-1",
+        "role_configuration_version": "roles-1",
+        "eligibility_at": "2026-01-02T03:04:00Z",
+        "deadline_at": "2026-01-02T03:10:00Z",
+        "budget_reservation": 1,
+        "enqueue_time": "2026-01-02T03:04:00Z",
+        "result_selection_rule_version": "selection-1",
+        "schema_version": 1,
+        "provenance": _provenance_payload(),
+    }
+    payload["request_id"] = request_identity(payload)
+    return payload
+
+
+def _seed_di_ancestry(writer) -> str:
+    context = _context_payload("ctx-ancestry")
+    context_ack = writer.submit(
+        WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                "decision_intelligence.context.recorded", context
+            ),
+            event_type="decision_intelligence.context.recorded",
+            payload=context,
+        )
+    )
+    assert context_ack.status in {"OK", "DUPLICATE_OK"}
+
+    request = _request_payload(context)
+    request_ack = writer.submit(
+        WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                "decision_intelligence.request.recorded", request
+            ),
+            event_type="decision_intelligence.request.recorded",
+            payload=request,
+        )
+    )
+    assert request_ack.status in {"OK", "DUPLICATE_OK"}
+    return request["request_id"]
+
+
 def _invocation_payload(invocation_id: str, *, cost=None, supersedes_id=None, supersession_reason=None):
     payload = {
         "invocation_id": invocation_id,
@@ -141,10 +195,18 @@ def _invocation_payload(invocation_id: str, *, cost=None, supersedes_id=None, su
     return payload
 
 
-def _assessment_payload(*, synthesis="synthesis", stance="WATCH", completeness=7500, supersedes_id=None, supersession_reason=None):
+def _assessment_payload(
+    *,
+    synthesis="synthesis",
+    stance="WATCH",
+    completeness=7500,
+    supersedes_id=None,
+    supersession_reason=None,
+    request_id="request-1",
+):
     payload = {
         "assessment_id": "assessment-1",
-        "request_id": "request-1",
+        "request_id": request_id,
         "referenced_role_result_ids": ["result-1"],
         "synthesis": synthesis,
         "advisory_stance": stance,
@@ -167,10 +229,16 @@ def _assessment_payload(*, synthesis="synthesis", stance="WATCH", completeness=7
     return payload
 
 
-def _transition_payload(*, reason="selected", supersedes_id=None, supersession_reason=None):
+def _transition_payload(
+    *,
+    reason="selected",
+    supersedes_id=None,
+    supersession_reason=None,
+    request_id="request-1",
+):
     payload = {
         "transition_id": "pending",
-        "request_id": "request-1",
+        "request_id": request_id,
         "from_state": "ELIGIBLE",
         "to_state": "SELECTED",
         "reason": reason,
@@ -185,10 +253,17 @@ def _transition_payload(*, reason="selected", supersedes_id=None, supersession_r
     return payload
 
 
-def _role_result_payload(*, thesis="thesis", stance="SUPPORT", supersedes_id=None, supersession_reason=None):
+def _role_result_payload(
+    *,
+    thesis="thesis",
+    stance="SUPPORT",
+    supersedes_id=None,
+    supersession_reason=None,
+    request_id="request-1",
+):
     payload = {
         "result_id": "pending",
-        "request_id": "request-1",
+        "request_id": request_id,
         "role": "REGIME_ANALYST",
         "role_version": "role-1",
         "attempt": 1,
@@ -668,8 +743,13 @@ def test_assessment_completeness_basis_points_support_duplicate_and_conflict(tmp
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        assessment = _assessment_payload()
-        changed_assessment = _assessment_payload(stance="OPPOSE", completeness=8000)
+        request_id = _seed_di_ancestry(writer)
+        assessment = _assessment_payload(request_id=request_id)
+        changed_assessment = _assessment_payload(
+            stance="OPPOSE",
+            completeness=8000,
+            request_id=request_id,
+        )
         assessment_key = _di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, assessment)
         first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=assessment_key, event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=assessment))
         duplicate = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=assessment_key, event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=assessment))
@@ -686,10 +766,17 @@ def test_assessment_supersession_persists_original_and_new_identity(tmp_path):
     from app.opip.canonical.writer import CanonicalWriter
     from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_ASSESSMENT_RECORDED
 
-    original = _assessment_payload()
-    correction = _assessment_payload(stance="OPPOSE", completeness=8000, supersedes_id=original["assessment_id"], supersession_reason="review correction")
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
+        request_id = _seed_di_ancestry(writer)
+        original = _assessment_payload(request_id=request_id)
+        correction = _assessment_payload(
+            stance="OPPOSE",
+            completeness=8000,
+            supersedes_id=original["assessment_id"],
+            supersession_reason="review correction",
+            request_id=request_id,
+        )
         first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, original), event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=original))
         second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, correction), event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=correction))
     finally:
@@ -742,10 +829,15 @@ def test_role_attempt_semantics_conflict_under_same_derived_identity(tmp_path):
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first_payload = _role_result_payload()
+        request_id = _seed_di_ancestry(writer)
+        first_payload = _role_result_payload(request_id=request_id)
         role_key = _di_key(DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, first_payload)
         first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=role_key, event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=first_payload))
-        changed = _role_result_payload(thesis="changed thesis", stance="OPPOSE")
+        changed = _role_result_payload(
+            thesis="changed thesis",
+            stance="OPPOSE",
+            request_id=request_id,
+        )
         duplicate_or_conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=role_key, event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=changed))
     finally:
         writer.close()
@@ -767,11 +859,20 @@ def test_transition_reason_conflicts_and_supersession_persists_both(tmp_path):
     from app.opip.canonical.writer import CanonicalWriter
     from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_TRANSITION_RECORDED
 
-    original = _transition_payload()
-    changed_reason = _transition_payload(reason="different reason")
-    correction = _transition_payload(reason="corrected", supersedes_id=original["transition_id"], supersession_reason="review correction")
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
+        request_id = _seed_di_ancestry(writer)
+        original = _transition_payload(request_id=request_id)
+        changed_reason = _transition_payload(
+            reason="different reason",
+            request_id=request_id,
+        )
+        correction = _transition_payload(
+            reason="corrected",
+            supersedes_id=original["transition_id"],
+            supersession_reason="review correction",
+            request_id=request_id,
+        )
         original_key = _di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, original)
         first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=original_key, event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=original))
         conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=original_key, event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=changed_reason))
@@ -1644,6 +1745,14 @@ def test_role_result_idempotency_distinguishes_version_and_supersession(tmp_path
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
+        request_id = _seed_di_ancestry(writer)
+        first = _role_result_payload(request_id=request_id)
+        correction = _role_result_payload(
+            thesis="corrected thesis",
+            supersedes_id=first["result_id"],
+            supersession_reason="correction",
+            request_id=request_id,
+        )
         first_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -1809,15 +1918,21 @@ def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path
     from app.opip.canonical.schema import connect
     from app.opip.canonical.writer import CanonicalWriter
 
-    first_payload = _role_result_payload(thesis="first thesis")
-    same_payload = dict(first_payload)
-    conflict_payload = {**first_payload, "thesis": "conflicting thesis"}
-
-    canonical_key = _di_key(
-        "decision_intelligence.role_result.recorded", first_payload
-    )
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
+        request_id = _seed_di_ancestry(writer)
+        first_payload = _role_result_payload(
+            thesis="first thesis",
+            request_id=request_id,
+        )
+        same_payload = dict(first_payload)
+        conflict_payload = {
+            **first_payload,
+            "thesis": "conflicting thesis",
+        }
+        canonical_key = _di_key(
+            "decision_intelligence.role_result.recorded", first_payload
+        )
         first = writer.submit(
             WriterIntent(
                 schema_version=1,
