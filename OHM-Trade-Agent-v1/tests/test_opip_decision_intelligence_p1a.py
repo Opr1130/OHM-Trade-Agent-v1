@@ -1682,3 +1682,59 @@ def test_canonical_mapping_keys_are_nfc_normalized_and_collisions_rejected():
     )
     with pytest.raises(ValueError, match="collide after NFC normalization"):
         canonical_serialize({nfc_key: 1, nfd_key: 2})
+
+
+def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path):
+    from app.opip.canonical.schema import connect
+    from app.opip.canonical.writer import CanonicalWriter
+
+    first_payload = _role_result_payload(thesis="first thesis")
+    same_payload = dict(first_payload)
+    conflict_payload = {**first_payload, "thesis": "conflicting thesis"}
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        first = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:role:arbitrary-a",
+                event_type="decision_intelligence.role_result.recorded",
+                payload=first_payload,
+            )
+        )
+        duplicate = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:role:arbitrary-b",
+                event_type="decision_intelligence.role_result.recorded",
+                payload=same_payload,
+            )
+        )
+        conflict = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:role:arbitrary-c",
+                event_type="decision_intelligence.role_result.recorded",
+                payload=conflict_payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert first.status == "OK"
+    assert duplicate.status == "DUPLICATE_OK"
+    assert duplicate.event_id == first.event_id
+    assert conflict.status == "REJECTED"
+    assert conflict.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+
+    conn = connect(tmp_path / "canonical.sqlite3", read_only=True)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = ?",
+            ("decision_intelligence.role_result.recorded",),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
