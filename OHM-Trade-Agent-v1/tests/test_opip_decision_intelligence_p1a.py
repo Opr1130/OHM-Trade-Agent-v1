@@ -136,8 +136,8 @@ def _request_payload(context_payload: dict) -> dict:
     return payload
 
 
-def _seed_di_ancestry(writer) -> str:
-    context = _context_payload("ctx-ancestry")
+def _seed_di_ancestry(writer, *, value: int = 1) -> str:
+    context = _context_payload("ctx-ancestry", value=value)
     context_ack = writer.submit(
         WriterIntent(
             schema_version=1,
@@ -167,10 +167,10 @@ def _seed_di_ancestry(writer) -> str:
     return request["request_id"]
 
 
-def _seed_complete_di_ancestry(writer) -> dict:
-    context = _context_payload("ctx-ancestry")
+def _seed_complete_di_ancestry(writer, *, value: int = 1) -> dict:
+    context = _context_payload("ctx-ancestry", value=value)
     request = _request_payload(context)
-    request_id = _seed_di_ancestry(writer)
+    request_id = _seed_di_ancestry(writer, value=value)
     assert request_id == request["request_id"]
 
     invocation = _invocation_payload(
@@ -1750,6 +1750,8 @@ def _valid_comparison_payload_for_regression(
     committee_request_id="request-regression",
     experiment_id="experiment-regression",
     invocation_refs=None,
+    supersedes_id=None,
+    supersession_reason=None,
 ):
     from app.opip.decision_intelligence.events import comparison_identity
 
@@ -1790,6 +1792,12 @@ def _valid_comparison_payload_for_regression(
         "uncertainty_result": "UNKNOWN",
         "provenance": _provenance_payload(),
         "advisory_disposition": None,
+        **({"supersedes_id": supersedes_id} if supersedes_id else {}),
+        **(
+            {"supersession_reason": supersession_reason}
+            if supersession_reason
+            else {}
+        ),
     }
     payload["comparison_id"] = comparison_identity(payload)
     return payload
@@ -2514,6 +2522,158 @@ def test_comparison_requires_complete_canonical_ancestry(
                     "decision_intelligence.comparison.recorded", payload
                 ),
                 event_type="decision_intelligence.comparison.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    ["invocation", "role_result", "assessment", "comparison"],
+)
+def test_non_transition_supersession_requires_existing_target(
+    tmp_path, record_kind
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ancestry = _seed_complete_di_ancestry(writer)
+        request_id = ancestry["request"]["request_id"]
+        reason = "correction"
+        if record_kind == "invocation":
+            event_type = "decision_intelligence.invocation.recorded"
+            payload = _invocation_payload(
+                "inv-missing-supersession",
+                request_id=request_id,
+                supersedes_id="missing-invocation",
+                supersession_reason=reason,
+            )
+        elif record_kind == "role_result":
+            event_type = "decision_intelligence.role_result.recorded"
+            payload = _role_result_payload(
+                request_id=request_id,
+                supersedes_id="missing-role-result",
+                supersession_reason=reason,
+            )
+        elif record_kind == "assessment":
+            event_type = "decision_intelligence.assessment.recorded"
+            payload = _assessment_payload(
+                request_id=request_id,
+                supersedes_id="missing-assessment",
+                supersession_reason=reason,
+            )
+        else:
+            event_type = "decision_intelligence.comparison.recorded"
+            payload = _valid_comparison_payload_for_regression(
+                decision_context_id=ancestry["context"]["context_id"],
+                committee_assessment_id=ancestry["assessment"]["assessment_id"],
+                committee_request_id=request_id,
+                experiment_id=ancestry["request"]["experiment_id"],
+                invocation_refs=[ancestry["invocation"]["invocation_id"]],
+                supersedes_id="missing-comparison",
+                supersession_reason=reason,
+            )
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(event_type, payload),
+                event_type=event_type,
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    ["invocation", "role_result", "assessment", "comparison"],
+)
+def test_non_transition_supersession_rejects_cross_request_target(
+    tmp_path, record_kind
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        current = _seed_complete_di_ancestry(writer, value=1)
+        other = _seed_complete_di_ancestry(writer, value=2)
+
+        other_comparison = _valid_comparison_payload_for_regression(
+            decision_context_id=other["context"]["context_id"],
+            committee_assessment_id=other["assessment"]["assessment_id"],
+            committee_request_id=other["request"]["request_id"],
+            experiment_id=other["request"]["experiment_id"],
+            invocation_refs=[other["invocation"]["invocation_id"]],
+        )
+        other_comparison_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.comparison.recorded",
+                    other_comparison,
+                ),
+                event_type="decision_intelligence.comparison.recorded",
+                payload=other_comparison,
+            )
+        )
+        assert other_comparison_ack.status == "OK"
+
+        request_id = current["request"]["request_id"]
+        reason = "cross-lineage correction"
+        if record_kind == "invocation":
+            event_type = "decision_intelligence.invocation.recorded"
+            payload = _invocation_payload(
+                "inv-cross-request",
+                request_id=request_id,
+                supersedes_id=other["invocation"]["invocation_id"],
+                supersession_reason=reason,
+            )
+        elif record_kind == "role_result":
+            event_type = "decision_intelligence.role_result.recorded"
+            payload = _role_result_payload(
+                request_id=request_id,
+                supersedes_id=other["role_result"]["result_id"],
+                supersession_reason=reason,
+            )
+        elif record_kind == "assessment":
+            event_type = "decision_intelligence.assessment.recorded"
+            payload = _assessment_payload(
+                request_id=request_id,
+                supersedes_id=other["assessment"]["assessment_id"],
+                supersession_reason=reason,
+            )
+        else:
+            event_type = "decision_intelligence.comparison.recorded"
+            payload = _valid_comparison_payload_for_regression(
+                decision_context_id=current["context"]["context_id"],
+                committee_assessment_id=current["assessment"]["assessment_id"],
+                committee_request_id=request_id,
+                experiment_id=current["request"]["experiment_id"],
+                invocation_refs=[current["invocation"]["invocation_id"]],
+                supersedes_id=other_comparison["comparison_id"],
+                supersession_reason=reason,
+            )
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(event_type, payload),
+                event_type=event_type,
                 payload=payload,
             )
         )
