@@ -2320,7 +2320,7 @@ def test_role_result_invocation_must_belong_to_same_request(tmp_path):
     try:
         request_a = _seed_di_ancestry(writer)
 
-        context_b = _context_payload("ctx-other-request")
+        context_b = _context_payload("ctx-other-request", value=2)
         context_b_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -2411,7 +2411,7 @@ def test_assessment_references_must_exist_and_match_request(tmp_path):
             )
         )
 
-        context_b = _context_payload("ctx-assessment-other")
+        context_b = _context_payload("ctx-assessment-other", value=3)
         context_b_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
