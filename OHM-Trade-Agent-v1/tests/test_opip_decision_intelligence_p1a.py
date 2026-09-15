@@ -235,14 +235,17 @@ def _transition_payload(
     supersedes_id=None,
     supersession_reason=None,
     request_id="request-1",
+    from_state="ELIGIBLE",
+    to_state="SELECTED",
+    transition_time="2026-01-02T03:00:00Z",
 ):
     payload = {
         "transition_id": "pending",
         "request_id": request_id,
-        "from_state": "ELIGIBLE",
-        "to_state": "SELECTED",
+        "from_state": from_state,
+        "to_state": to_state,
         "reason": reason,
-        "transition_time": "2026-01-02T03:00:00Z",
+        "transition_time": transition_time,
         "provenance": _provenance_payload(),
         "schema_version": 1,
         **({"supersedes_id": supersedes_id} if supersedes_id else {}),
@@ -1845,6 +1848,103 @@ def test_only_optional_advisory_disposition_accepts_explicit_null(tmp_path):
 
     assert valid_ack.status == "OK"
     assert invalid_ack.error_code == "INVALID_INTENT"
+
+
+def test_empty_evidence_role_result_still_requires_persisted_ancestry(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    payload = _role_result_payload(request_id="missing-request")
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded",
+                    payload,
+                ),
+                event_type="decision_intelligence.role_result.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_transition_must_match_persisted_request_state(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        request_id = _seed_di_ancestry(writer)
+        selected = _transition_payload(
+            request_id=request_id,
+            from_state="ELIGIBLE",
+            to_state="SELECTED",
+            transition_time="2026-01-02T03:05:00Z",
+        )
+        completed = _transition_payload(
+            request_id=request_id,
+            from_state="SELECTED",
+            to_state="COMPLETED",
+            reason="completed",
+            transition_time="2026-01-02T03:06:00Z",
+        )
+        contradictory = _transition_payload(
+            request_id=request_id,
+            from_state="SELECTED",
+            to_state="FAILED",
+            reason="late failure",
+            transition_time="2026-01-02T03:07:00Z",
+        )
+
+        selected_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.transition.recorded",
+                    selected,
+                ),
+                event_type="decision_intelligence.transition.recorded",
+                payload=selected,
+            )
+        )
+        completed_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.transition.recorded",
+                    completed,
+                ),
+                event_type="decision_intelligence.transition.recorded",
+                payload=completed,
+            )
+        )
+        contradictory_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.transition.recorded",
+                    contradictory,
+                ),
+                event_type="decision_intelligence.transition.recorded",
+                payload=contradictory,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert selected_ack.status == "OK"
+    assert completed_ack.status == "OK"
+    assert contradictory_ack.status == "REJECTED"
+    assert contradictory_ack.error_code == "INVALID_INTENT"
 
 
 def test_request_and_transition_identity_normalize_equivalent_offsets():
