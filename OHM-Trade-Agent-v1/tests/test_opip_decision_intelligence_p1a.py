@@ -167,10 +167,83 @@ def _seed_di_ancestry(writer) -> str:
     return request["request_id"]
 
 
-def _invocation_payload(invocation_id: str, *, cost=None, supersedes_id=None, supersession_reason=None):
+def _seed_complete_di_ancestry(writer) -> dict:
+    context = _context_payload("ctx-ancestry")
+    request = _request_payload(context)
+    request_id = _seed_di_ancestry(writer)
+    assert request_id == request["request_id"]
+
+    invocation = _invocation_payload(
+        "inv-seed",
+        request_id=request_id,
+    )
+    invocation_ack = writer.submit(
+        WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                "decision_intelligence.invocation.recorded", invocation
+            ),
+            event_type="decision_intelligence.invocation.recorded",
+            payload=invocation,
+        )
+    )
+    assert invocation_ack.status in {"OK", "DUPLICATE_OK"}
+
+    role_result = _role_result_payload(
+        request_id=request_id,
+        invocation_ref=invocation["invocation_id"],
+    )
+    role_ack = writer.submit(
+        WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                "decision_intelligence.role_result.recorded", role_result
+            ),
+            event_type="decision_intelligence.role_result.recorded",
+            payload=role_result,
+        )
+    )
+    assert role_ack.status in {"OK", "DUPLICATE_OK"}
+
+    assessment = _assessment_payload(
+        request_id=request_id,
+        referenced_role_result_ids=[role_result["result_id"]],
+        invocation_references=[invocation["invocation_id"]],
+    )
+    assessment_ack = writer.submit(
+        WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                "decision_intelligence.assessment.recorded", assessment
+            ),
+            event_type="decision_intelligence.assessment.recorded",
+            payload=assessment,
+        )
+    )
+    assert assessment_ack.status in {"OK", "DUPLICATE_OK"}
+    return {
+        "context": context,
+        "request": request,
+        "invocation": invocation,
+        "role_result": role_result,
+        "assessment": assessment,
+    }
+
+
+def _invocation_payload(
+    invocation_id: str,
+    *,
+    cost=None,
+    supersedes_id=None,
+    supersession_reason=None,
+    request_id="request-1",
+):
     payload = {
         "invocation_id": invocation_id,
-        "request_id": "request-1",
+        "request_id": request_id,
         "role": "REGIME_ANALYST",
         "attempt": 1,
         "provider": "provider-1",
@@ -210,11 +283,13 @@ def _assessment_payload(
     supersedes_id=None,
     supersession_reason=None,
     request_id="request-1",
+    referenced_role_result_ids=None,
+    invocation_references=None,
 ):
     payload = {
         "assessment_id": "assessment-1",
         "request_id": request_id,
-        "referenced_role_result_ids": ["result-1"],
+        "referenced_role_result_ids": list(referenced_role_result_ids or ()),
         "synthesis": synthesis,
         "advisory_stance": stance,
         "disagreement": False,
@@ -226,7 +301,7 @@ def _assessment_payload(
         "result_selection_rule_version": "selection-1",
         "completion_time": "2026-01-02T03:04:00Z",
         "commit_time": "2026-01-02T03:05:00Z",
-        "invocation_references": ["inv-1"],
+        "invocation_references": list(invocation_references or ()),
         "schema_version": 1,
         "provenance": _provenance_payload(),
         **({"supersedes_id": supersedes_id} if supersedes_id else {}),
@@ -270,6 +345,7 @@ def _role_result_payload(
     supersedes_id=None,
     supersession_reason=None,
     request_id="request-1",
+    invocation_ref=None,
 ):
     payload = {
         "result_id": "pending",
@@ -280,7 +356,7 @@ def _role_result_payload(
         "route_version": "route-1",
         "prompt_version": "prompt-1",
         "model_version": "model-1",
-        "invocation_ref": None,
+        "invocation_ref": invocation_ref,
         "status": "COMPLETED",
         "result_disposition": "ON_TIME",
         "stance": stance,
@@ -1346,10 +1422,20 @@ def test_acceptance_model_invocation_correction_is_append_only_canonical_path(tm
     from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_INVOCATION_RECORDED
 
     db = tmp_path / "canonical.sqlite3"
-    original = _invocation_payload("inv-original")
-    correction = _invocation_payload("inv-correction", cost=11, supersedes_id=original["invocation_id"], supersession_reason="billing reconciliation")
     writer = CanonicalWriter(db)
     try:
+        request_id = _seed_di_ancestry(writer)
+        original = _invocation_payload(
+            "inv-original",
+            request_id=request_id,
+        )
+        correction = _invocation_payload(
+            "inv-correction",
+            cost=11,
+            supersedes_id=original["invocation_id"],
+            supersession_reason="billing reconciliation",
+            request_id=request_id,
+        )
         first = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_INVOCATION_RECORDED, original), event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=original))
         second = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_INVOCATION_RECORDED, correction), event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=correction))
     finally:
@@ -1657,17 +1743,24 @@ def test_acceptance_assessment_summary_is_request_and_synthesis_grain():
     assert summary.synthesis == "synthesis"
 
 
-def _valid_comparison_payload_for_regression():
+def _valid_comparison_payload_for_regression(
+    *,
+    decision_context_id="ctx-regression",
+    committee_assessment_id="assessment-regression",
+    committee_request_id="request-regression",
+    experiment_id="experiment-regression",
+    invocation_refs=None,
+):
     from app.opip.decision_intelligence.events import comparison_identity
 
     payload = {
         "schema_version": 1,
         "comparison_id": "placeholder",
-        "decision_context_id": "ctx-regression",
+        "decision_context_id": decision_context_id,
         "baseline_decision_id": "baseline-regression",
-        "committee_assessment_id": "assessment-regression",
-        "committee_request_id": "request-regression",
-        "experiment_id": "experiment-regression",
+        "committee_assessment_id": committee_assessment_id,
+        "committee_request_id": committee_request_id,
+        "experiment_id": experiment_id,
         "variant_version": "v1",
         "environment": "paper",
         "research_account_id": "research",
@@ -1683,7 +1776,7 @@ def _valid_comparison_payload_for_regression():
         "attribution_method_version": "attr",
         "cost_allocation_version": "cost",
         "currency": "USD",
-        "invocation_refs": [],
+        "invocation_refs": list(invocation_refs or ()),
         "ai_cost_attributed": None,
         "other_incremental_operating_cost": None,
         "cost_reconciliation_status": "UNKNOWN",
@@ -1707,7 +1800,14 @@ def test_valid_comparison_persists_after_watermark_normalization(tmp_path):
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        payload = _valid_comparison_payload_for_regression()
+        ancestry = _seed_complete_di_ancestry(writer)
+        payload = _valid_comparison_payload_for_regression(
+            decision_context_id=ancestry["context"]["context_id"],
+            committee_assessment_id=ancestry["assessment"]["assessment_id"],
+            committee_request_id=ancestry["request"]["request_id"],
+            experiment_id=ancestry["request"]["experiment_id"],
+            invocation_refs=[ancestry["invocation"]["invocation_id"]],
+        )
         ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -1909,14 +2009,20 @@ def test_writer_rejects_non_boolean_timeliness_eligibility(tmp_path):
 def test_only_optional_advisory_disposition_accepts_explicit_null(tmp_path):
     from app.opip.canonical.writer import CanonicalWriter
 
-    comparison = _valid_comparison_payload_for_regression()
-    assert comparison["advisory_disposition"] is None
-
     invalid_role = _role_result_payload()
     invalid_role["role"] = None
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
+        ancestry = _seed_complete_di_ancestry(writer)
+        comparison = _valid_comparison_payload_for_regression(
+            decision_context_id=ancestry["context"]["context_id"],
+            committee_assessment_id=ancestry["assessment"]["assessment_id"],
+            committee_request_id=ancestry["request"]["request_id"],
+            experiment_id=ancestry["request"]["experiment_id"],
+            invocation_refs=[ancestry["invocation"]["invocation_id"]],
+        )
+        assert comparison["advisory_disposition"] is None
         valid_ack = writer.submit(
             WriterIntent(
                 schema_version=1,
@@ -2181,3 +2287,238 @@ def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path
         ).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_invocation_requires_persisted_request_ancestry(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    payload = _invocation_payload("inv-missing", request_id="missing-request")
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.invocation.recorded", payload
+                ),
+                event_type="decision_intelligence.invocation.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_role_result_invocation_must_belong_to_same_request(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        request_a = _seed_di_ancestry(writer)
+
+        context_b = _context_payload("ctx-other-request")
+        context_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.context.recorded", context_b
+                ),
+                event_type="decision_intelligence.context.recorded",
+                payload=context_b,
+            )
+        )
+        assert context_b_ack.status == "OK"
+        request_b_payload = _request_payload(context_b)
+        request_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.request.recorded", request_b_payload
+                ),
+                event_type="decision_intelligence.request.recorded",
+                payload=request_b_payload,
+            )
+        )
+        assert request_b_ack.status == "OK"
+
+        invocation_b = _invocation_payload(
+            "inv-other",
+            request_id=request_b_payload["request_id"],
+        )
+        invocation_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.invocation.recorded", invocation_b
+                ),
+                event_type="decision_intelligence.invocation.recorded",
+                payload=invocation_b,
+            )
+        )
+        assert invocation_b_ack.status == "OK"
+
+        role_result = _role_result_payload(
+            request_id=request_a,
+            invocation_ref=invocation_b["invocation_id"],
+        )
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded", role_result
+                ),
+                event_type="decision_intelligence.role_result.recorded",
+                payload=role_result,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_assessment_references_must_exist_and_match_request(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ancestry = _seed_complete_di_ancestry(writer)
+        request_id = ancestry["request"]["request_id"]
+
+        missing = _assessment_payload(
+            request_id=request_id,
+            referenced_role_result_ids=["missing-role-result"],
+            invocation_references=[],
+        )
+        missing_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.assessment.recorded", missing
+                ),
+                event_type="decision_intelligence.assessment.recorded",
+                payload=missing,
+            )
+        )
+
+        context_b = _context_payload("ctx-assessment-other")
+        context_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.context.recorded", context_b
+                ),
+                event_type="decision_intelligence.context.recorded",
+                payload=context_b,
+            )
+        )
+        assert context_b_ack.status == "OK"
+        request_b = _request_payload(context_b)
+        request_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.request.recorded", request_b
+                ),
+                event_type="decision_intelligence.request.recorded",
+                payload=request_b,
+            )
+        )
+        assert request_b_ack.status == "OK"
+        invocation_b = _invocation_payload(
+            "inv-assessment-other",
+            request_id=request_b["request_id"],
+        )
+        invocation_b_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.invocation.recorded", invocation_b
+                ),
+                event_type="decision_intelligence.invocation.recorded",
+                payload=invocation_b,
+            )
+        )
+        assert invocation_b_ack.status == "OK"
+
+        mismatched = _assessment_payload(
+            request_id=request_id,
+            referenced_role_result_ids=[],
+            invocation_references=[invocation_b["invocation_id"]],
+        )
+        mismatch_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.assessment.recorded", mismatched
+                ),
+                event_type="decision_intelligence.assessment.recorded",
+                payload=mismatched,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert missing_ack.status == "REJECTED"
+    assert missing_ack.error_code == "INVALID_INTENT"
+    assert mismatch_ack.status == "REJECTED"
+    assert mismatch_ack.error_code == "INVALID_INTENT"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("decision_context_id", "missing-context"),
+        ("committee_request_id", "missing-request"),
+        ("committee_assessment_id", "missing-assessment"),
+        ("invocation_refs", ["missing-invocation"]),
+    ],
+)
+def test_comparison_requires_complete_canonical_ancestry(
+    tmp_path, field_name, bad_value
+):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import comparison_identity
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ancestry = _seed_complete_di_ancestry(writer)
+        payload = _valid_comparison_payload_for_regression(
+            decision_context_id=ancestry["context"]["context_id"],
+            committee_assessment_id=ancestry["assessment"]["assessment_id"],
+            committee_request_id=ancestry["request"]["request_id"],
+            experiment_id=ancestry["request"]["experiment_id"],
+            invocation_refs=[ancestry["invocation"]["invocation_id"]],
+        )
+        payload[field_name] = bad_value
+        payload["comparison_id"] = comparison_identity(payload)
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.comparison.recorded", payload
+                ),
+                event_type="decision_intelligence.comparison.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
