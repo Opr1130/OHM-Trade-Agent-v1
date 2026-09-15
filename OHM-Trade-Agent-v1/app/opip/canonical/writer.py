@@ -44,6 +44,11 @@ from app.opip.decision_intelligence.events import (
 from app.opip.decision_intelligence.serialization import canonical_serialize
 
 MAX_PAYLOAD_BYTES = 16 * 1024
+_UTC_OFFSET = "+00:00"
+_UTC_Z = "Z"
+_ALERT_CAPTURE_GAP_RECORDED = "alert_governor.capture_gap.recorded"
+_ALERT_RESERVATION_RELEASED = "alert_governor.reservation.released"
+_ALERT_TRANSITION_RECORDED = "alert_governor.transition.recorded"
 
 #: Same idempotency key + different semantic payload is integrity corruption.
 #: Feature snapshots and rolling-state checkpoints are included after redacting
@@ -131,7 +136,19 @@ ACCEPTED_EVENT_TYPES = (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace(_UTC_OFFSET, _UTC_Z)
+    )
+
+
+def _parse_aware_iso_timestamp(value: str, *, field_name: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace(_UTC_Z, _UTC_OFFSET))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field_name} is not aware")
+    return parsed
 
 
 def _new_event_id() -> str:
@@ -351,20 +368,24 @@ class CanonicalWriter:
             ) from exc
         return validate_di_payload(event_type, raw_payload)
 
-    def _validate_di_evidence_eligibility(
+    def _di_evidence_refs(
         self, event_type: str, payload: Mapping[str, object]
-    ) -> None:
+    ) -> list[str] | None:
         if event_type not in {
             DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
             DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
         }:
-            return
+            return None
         evidence_refs = payload.get("evidence_refs")
         if not evidence_refs:
-            return
+            return None
         if not isinstance(evidence_refs, list):
             raise ValueError("evidence_refs must be a canonical array")
+        return evidence_refs
 
+    def _load_di_context_for_evidence(
+        self, payload: Mapping[str, object]
+    ) -> dict:
         request_id = payload.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("request_id required for evidence validation")
@@ -383,39 +404,66 @@ class CanonicalWriter:
             "snapshot_hash"
         ):
             raise ValueError("persisted request/context snapshot mismatch")
+        return context_payload
 
+    @staticmethod
+    def _evidence_manifest_and_cutoff(
+        context_payload: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], datetime]:
         manifest = context_payload.get("evidence_eligibility_manifest")
         if not isinstance(manifest, Mapping):
             raise ValueError("persisted context evidence manifest is invalid")
         cutoff_raw = context_payload.get("evidence_cutoff")
         if not isinstance(cutoff_raw, str):
             raise ValueError("persisted context evidence_cutoff is invalid")
-        cutoff = datetime.fromisoformat(cutoff_raw.replace("Z", "+00:00"))
-        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
-            raise ValueError("persisted context evidence_cutoff is not aware")
+        cutoff = _parse_aware_iso_timestamp(
+            cutoff_raw,
+            field_name="persisted context evidence_cutoff",
+        )
+        return manifest, cutoff
 
-        for evidence_ref in evidence_refs:
-            if evidence_ref not in manifest:
-                raise ValueError(
-                    f"evidence reference is not in frozen manifest: {evidence_ref}"
-                )
-            entry = manifest[evidence_ref]
-            if not isinstance(entry, Mapping):
-                raise ValueError("persisted evidence manifest entry is invalid")
-            available_at_raw = entry.get("available_at")
-            if available_at_raw is None:
-                continue
-            if not isinstance(available_at_raw, str):
-                raise ValueError("persisted evidence availability is invalid")
-            available_at = datetime.fromisoformat(
-                available_at_raw.replace("Z", "+00:00")
+    @staticmethod
+    def _validate_evidence_ref(
+        evidence_ref: str,
+        *,
+        manifest: Mapping[str, object],
+        cutoff: datetime,
+    ) -> None:
+        if evidence_ref not in manifest:
+            raise ValueError(
+                f"evidence reference is not in frozen manifest: {evidence_ref}"
             )
-            if available_at.tzinfo is None or available_at.utcoffset() is None:
-                raise ValueError("persisted evidence availability is not aware")
-            if available_at > cutoff:
-                raise ValueError(
-                    "evidence reference is unavailable at evidence_cutoff"
-                )
+        entry = manifest[evidence_ref]
+        if not isinstance(entry, Mapping):
+            raise ValueError("persisted evidence manifest entry is invalid")
+        available_at_raw = entry.get("available_at")
+        if available_at_raw is None:
+            return
+        if not isinstance(available_at_raw, str):
+            raise ValueError("persisted evidence availability is invalid")
+        available_at = _parse_aware_iso_timestamp(
+            available_at_raw,
+            field_name="persisted evidence availability",
+        )
+        if available_at > cutoff:
+            raise ValueError(
+                "evidence reference is unavailable at evidence_cutoff"
+            )
+
+    def _validate_di_evidence_eligibility(
+        self, event_type: str, payload: Mapping[str, object]
+    ) -> None:
+        evidence_refs = self._di_evidence_refs(event_type, payload)
+        if evidence_refs is None:
+            return
+        context_payload = self._load_di_context_for_evidence(payload)
+        manifest, cutoff = self._evidence_manifest_and_cutoff(context_payload)
+        for evidence_ref in evidence_refs:
+            self._validate_evidence_ref(
+                evidence_ref,
+                manifest=manifest,
+                cutoff=cutoff,
+            )
 
     def _lookup_idempotency(
         self, key: str, *, payload_json: str | None = None, event_type: str | None = None
@@ -450,6 +498,76 @@ class CanonicalWriter:
             local_sequence=int(existing["local_sequence"]),
         )
 
+    @staticmethod
+    def _serialized_intent_payload(intent: WriterIntent) -> str:
+        if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+            return canonical_serialize(intent.payload)
+        return json.dumps(
+            intent.payload,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _validate_feature_bus_intent(intent: WriterIntent) -> dict:
+        if intent.priority != FEATURE_BUS_PRIORITY:
+            raise ValueError("feature bus events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError("feature bus events must not carry ops_handoff")
+        return intent.payload
+
+    def _validate_decision_intelligence_intent(
+        self, intent: WriterIntent
+    ) -> dict:
+        if intent.priority != "LOW":
+            raise ValueError(
+                "decision intelligence events must use LOW priority"
+            )
+        if intent.ops_handoff is not None:
+            raise ValueError(
+                "decision intelligence events must not carry ops_handoff"
+            )
+        normalized = validate_di_payload(intent.event_type, intent.payload)
+        expected_key = canonical_di_idempotency_key(
+            intent.event_type,
+            normalized,
+        )
+        if intent.idempotency_key != expected_key:
+            raise ValueError(
+                "decision intelligence idempotency_key does not match "
+                "canonical record identity"
+            )
+        self._validate_di_evidence_eligibility(
+            intent.event_type,
+            normalized,
+        )
+        return normalized
+
+    @staticmethod
+    def _validate_alert_ops_intent(intent: WriterIntent) -> None:
+        if intent.event_type == _ALERT_CAPTURE_GAP_RECORDED:
+            if intent.ops_handoff is not None:
+                raise ValueError("capture_gap must not carry ops_handoff")
+            return
+        if intent.ops_handoff is None:
+            raise ValueError("ops_handoff required")
+
+        op = str(intent.ops_handoff.get("operation") or "")
+        if op not in {"RECORD", "RELEASE"}:
+            raise ValueError("invalid ops_handoff.operation")
+        if intent.event_type == _ALERT_RESERVATION_RELEASED and op != "RELEASE":
+            raise ValueError("released event requires RELEASE handoff")
+        if intent.event_type == _ALERT_TRANSITION_RECORDED and op != "RECORD":
+            raise ValueError("recorded event requires RECORD handoff")
+
+        family = str(
+            intent.ops_handoff.get("state_family")
+            or intent.ops_handoff.get("state_file")
+            or ""
+        ).strip()
+        if family not in {STATE_FAMILY_EARLY_WATCH}:
+            raise ValueError("unsupported ops_handoff.state_family")
+
     def _validate_intent(self, intent: WriterIntent) -> dict:
         if intent.schema_version != SCHEMA_VERSION:
             raise ValueError("schema_version mismatch")
@@ -459,97 +577,169 @@ class CanonicalWriter:
             raise ValueError("idempotency_key required")
         if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
-        raw = (
-            canonical_serialize(intent.payload)
-            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
-            else json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
-        )
+
+        raw = self._serialized_intent_payload(intent)
         if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload too large")
-        if intent.event_type in FEATURE_BUS_EVENT_TYPES:
-            # Feature-bus traffic is telemetry. It must not borrow protection or
-            # execution priority, and it never drives an operational handoff.
-            if intent.priority != FEATURE_BUS_PRIORITY:
-                raise ValueError("feature bus events must use LOW priority")
-            if intent.ops_handoff is not None:
-                raise ValueError("feature bus events must not carry ops_handoff")
-            return intent.payload
-        if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
-            if intent.priority != "LOW":
-                raise ValueError("decision intelligence events must use LOW priority")
-            if intent.ops_handoff is not None:
-                raise ValueError("decision intelligence events must not carry ops_handoff")
-            normalized = validate_di_payload(intent.event_type, intent.payload)
-            expected_key = canonical_di_idempotency_key(
-                intent.event_type, normalized
-            )
-            if intent.idempotency_key != expected_key:
-                raise ValueError(
-                    "decision intelligence idempotency_key does not match "
-                    "canonical record identity"
-                )
-            self._validate_di_evidence_eligibility(
-                intent.event_type, normalized
-            )
-            return normalized
-        if intent.event_type == "alert_governor.capture_gap.recorded":
-            if intent.ops_handoff is not None:
-                raise ValueError("capture_gap must not carry ops_handoff")
-            return intent.payload
-        if intent.ops_handoff is None:
-            raise ValueError("ops_handoff required")
-        op = str(intent.ops_handoff.get("operation") or "")
-        if op not in {"RECORD", "RELEASE"}:
-            raise ValueError("invalid ops_handoff.operation")
-        if intent.event_type == "alert_governor.reservation.released" and op != "RELEASE":
-            raise ValueError("released event requires RELEASE handoff")
-        if intent.event_type == "alert_governor.transition.recorded" and op != "RECORD":
-            raise ValueError("recorded event requires RECORD handoff")
-        family = str(
-            intent.ops_handoff.get("state_family")
-            or intent.ops_handoff.get("state_file")
-            or ""
-        ).strip()
-        if family not in {STATE_FAMILY_EARLY_WATCH}:
-            raise ValueError("unsupported ops_handoff.state_family")
 
-    def _commit_new(self, intent: WriterIntent, *, normalized_payload: dict | None = None) -> WriterAck:
+        if intent.event_type in FEATURE_BUS_EVENT_TYPES:
+            return self._validate_feature_bus_intent(intent)
+        if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+            return self._validate_decision_intelligence_intent(intent)
+
+        self._validate_alert_ops_intent(intent)
+        return intent.payload
+
+    @staticmethod
+    def _serialized_committed_payload(
+        event_type: str, payload: dict
+    ) -> str:
+        if event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+            return canonical_serialize(payload)
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+    @staticmethod
+    def _stream_for_event(event_type: str) -> str:
+        if event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+            return DECISION_INTELLIGENCE_STREAM
+        if event_type in FEATURE_BUS_EVENT_TYPES:
+            return FEATURE_BUS_STREAM
+        return STREAM_EARLY_WATCH
+
+    @staticmethod
+    def _requires_ops_handoff(event_type: str) -> bool:
+        return (
+            event_type != _ALERT_CAPTURE_GAP_RECORDED
+            and event_type not in FEATURE_BUS_EVENT_TYPES
+            and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
+        )
+
+    def _upsert_alert_identity_projection(
+        self,
+        *,
+        intent: WriterIntent,
+        event_id: str,
+        history_epoch: int,
+        local_sequence: int,
+        now: str,
+        identity: str,
+        transition_key: str,
+        action: str,
+        message_id: object,
+    ) -> None:
+        if intent.event_type != _ALERT_TRANSITION_RECORDED:
+            return
+        normalized_message_id = (
+            int(message_id) if message_id is not None else None
+        )
+        self._conn.execute(
+            """
+            INSERT INTO alert_identity_projection (
+                state_family, identity, transition_key, last_action, message_id,
+                last_event_id, last_history_epoch, last_local_sequence, updated_at
+            ) VALUES ('early_watch', ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(state_family, identity) DO UPDATE SET
+                transition_key = excluded.transition_key,
+                last_action = excluded.last_action,
+                message_id = excluded.message_id,
+                last_event_id = excluded.last_event_id,
+                last_history_epoch = excluded.last_history_epoch,
+                last_local_sequence = excluded.last_local_sequence,
+                updated_at = excluded.updated_at
+            """,
+            (
+                identity,
+                transition_key,
+                action,
+                normalized_message_id,
+                event_id,
+                history_epoch,
+                local_sequence,
+                now,
+            ),
+        )
+
+    def _insert_ops_handoff(
+        self,
+        *,
+        intent: WriterIntent,
+        event_id: str,
+        now: str,
+        handoff: Mapping[str, object],
+        identity: str,
+        transition_key: str,
+        message_id: object,
+        reservation_token: object,
+        operation: str,
+    ) -> None:
+        if not self._requires_ops_handoff(intent.event_type):
+            return
+        normalized_message_id = (
+            int(message_id) if message_id is not None else None
+        )
+        normalized_reservation_token = (
+            str(reservation_token) if reservation_token else None
+        )
+        self._conn.execute(
+            """
+            INSERT INTO alert_ops_handoffs (
+                event_id, operation, identity, transition_key, message_id,
+                created_new, reservation_token, state_file, status, created_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, NULL)
+            """,
+            (
+                event_id,
+                operation,
+                identity,
+                transition_key,
+                normalized_message_id,
+                1 if bool(handoff.get("created_new")) else 0,
+                normalized_reservation_token,
+                STATE_FAMILY_EARLY_WATCH,
+                now,
+            ),
+        )
+
+    def _commit_new(
+        self,
+        intent: WriterIntent,
+        *,
+        normalized_payload: dict | None = None,
+    ) -> WriterAck:
         now = _utc_now()
         event_id = _new_event_id()
-        payload = normalized_payload if normalized_payload is not None else intent.payload
-        payload_json = (
-            canonical_serialize(payload)
-            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
-            else json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload = (
+            normalized_payload
+            if normalized_payload is not None
+            else intent.payload
+        )
+        payload_json = self._serialized_committed_payload(
+            intent.event_type,
+            payload,
         )
         handoff = intent.ops_handoff or {}
         action = "CREATE" if bool(handoff.get("created_new")) else "EDIT"
-        identity = str(handoff.get("identity") or payload.get("identity") or "")
+        identity = str(
+            handoff.get("identity") or payload.get("identity") or ""
+        )
         transition_key = str(handoff.get("transition_key") or "")
         message_id = handoff.get("message_id")
         reservation_token = handoff.get("reservation_token")
-        # Persist bounded family id only — never an arbitrary filesystem path.
-        state_file = STATE_FAMILY_EARLY_WATCH
         operation = str(handoff.get("operation") or "")
-        is_gap = intent.event_type == "alert_governor.capture_gap.recorded"
-        is_feature_bus = intent.event_type in FEATURE_BUS_EVENT_TYPES
-        is_decision_intelligence = intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
-        # Separate watermark streams: feature-bus progress can never rewind or
-        # advance Early Watch alert-control progress, or the reverse.
-        stream = (
-            DECISION_INTELLIGENCE_STREAM
-            if is_decision_intelligence
-            else FEATURE_BUS_STREAM if is_feature_bus else STREAM_EARLY_WATCH
-        )
+        stream = self._stream_for_event(intent.event_type)
 
         self._conn.execute("BEGIN IMMEDIATE")
         meta = self._conn.execute(
-            "SELECT history_epoch, next_local_sequence, schema_version FROM meta WHERE id = 1"
+            "SELECT history_epoch, next_local_sequence, schema_version "
+            "FROM meta WHERE id = 1"
         ).fetchone()
         assert meta is not None
         if int(meta["schema_version"]) != SCHEMA_VERSION:
             self._conn.rollback()
-            return WriterAck(status="REJECTED", error_code="DB_SCHEMA_MISMATCH")
+            return WriterAck(
+                status="REJECTED",
+                error_code="DB_SCHEMA_MISMATCH",
+            )
 
         history_epoch = int(meta["history_epoch"])
         local_sequence = int(meta["next_local_sequence"])
@@ -584,34 +774,17 @@ class CanonicalWriter:
             (intent.idempotency_key, event_id, now),
         )
 
-        # RELEASE and capture_gap never upsert identity projection.
-        if intent.event_type == "alert_governor.transition.recorded":
-            self._conn.execute(
-                """
-                INSERT INTO alert_identity_projection (
-                    state_family, identity, transition_key, last_action, message_id,
-                    last_event_id, last_history_epoch, last_local_sequence, updated_at
-                ) VALUES ('early_watch', ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(state_family, identity) DO UPDATE SET
-                    transition_key = excluded.transition_key,
-                    last_action = excluded.last_action,
-                    message_id = excluded.message_id,
-                    last_event_id = excluded.last_event_id,
-                    last_history_epoch = excluded.last_history_epoch,
-                    last_local_sequence = excluded.last_local_sequence,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    identity,
-                    transition_key,
-                    action,
-                    int(message_id) if message_id is not None else None,
-                    event_id,
-                    history_epoch,
-                    local_sequence,
-                    now,
-                ),
-            )
+        self._upsert_alert_identity_projection(
+            intent=intent,
+            event_id=event_id,
+            history_epoch=history_epoch,
+            local_sequence=local_sequence,
+            now=now,
+            identity=identity,
+            transition_key=transition_key,
+            action=action,
+            message_id=message_id,
+        )
 
         self._conn.execute(
             """
@@ -624,26 +797,17 @@ class CanonicalWriter:
             """,
             (stream, history_epoch, local_sequence, now),
         )
-        if not is_gap and not is_feature_bus and not is_decision_intelligence:
-            self._conn.execute(
-                """
-                INSERT INTO alert_ops_handoffs (
-                    event_id, operation, identity, transition_key, message_id,
-                    created_new, reservation_token, state_file, status, created_at, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, NULL)
-                """,
-                (
-                    event_id,
-                    operation,
-                    identity,
-                    transition_key,
-                    int(message_id) if message_id is not None else None,
-                    1 if bool(handoff.get("created_new")) else 0,
-                    str(reservation_token) if reservation_token else None,
-                    state_file,
-                    now,
-                ),
-            )
+        self._insert_ops_handoff(
+            intent=intent,
+            event_id=event_id,
+            now=now,
+            handoff=handoff,
+            identity=identity,
+            transition_key=transition_key,
+            message_id=message_id,
+            reservation_token=reservation_token,
+            operation=operation,
+        )
         self._conn.execute(
             """
             UPDATE meta
