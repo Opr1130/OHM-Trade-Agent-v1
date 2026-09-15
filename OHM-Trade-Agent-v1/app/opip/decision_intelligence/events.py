@@ -195,7 +195,7 @@ def canonical_di_idempotency_key(
             role_version=str(payload["role_version"]),
             route_version=str(payload["route_version"]),
             prompt_version=str(payload["prompt_version"]),
-            attempt=int(payload["attempt"]),
+            attempt=payload["attempt"],
             model_version=str(payload["model_version"]),
             supersedes_id=(
                 str(payload["supersedes_id"])
