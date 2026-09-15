@@ -67,8 +67,30 @@ def transition_identity(transition: Mapping[str, Any]) -> str:
     return stable_hash("DI-TRANSITION", {key: transition.get(key) for key in ("request_id", "from_state", "to_state", "transition_time", "supersedes_id", "supersession_reason")})
 
 
-def role_result_idempotency_key(*, request_id: str, role: str, route_version: str, prompt_version: str, attempt: int, model_version: str) -> str:
-    return _identity(DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, request_id, role, route_version, prompt_version, attempt, model_version)
+def role_result_idempotency_key(
+    *,
+    request_id: str,
+    role: str,
+    role_version: str,
+    route_version: str,
+    prompt_version: str,
+    attempt: int,
+    model_version: str,
+    supersedes_id: str | None = None,
+    supersession_reason: str | None = None,
+) -> str:
+    return _identity(
+        DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+        request_id,
+        role,
+        role_version,
+        route_version,
+        prompt_version,
+        attempt,
+        model_version,
+        supersedes_id,
+        supersession_reason,
+    )
 
 
 def assessment_idempotency_key(*, assessment_id: str) -> str:
@@ -104,7 +126,27 @@ def invocation_identity(invocation: Mapping[str, Any]) -> str:
 
 
 def comparison_identity(comparison: Mapping[str, Any]) -> str:
-    return stable_hash("DI-COMPARISON", {key: comparison.get(key) for key in ("decision_context_id", "baseline_decision_id", "committee_assessment_id", "committee_request_id", "experiment_id", "variant_version", "as_of_watermark", "attribution_method_version", "cost_allocation_version", "uncertainty_method_version", "supersedes_id", "supersession_reason")})
+    identity = {
+        key: comparison.get(key)
+        for key in (
+            "decision_context_id",
+            "baseline_decision_id",
+            "committee_assessment_id",
+            "committee_request_id",
+            "experiment_id",
+            "variant_version",
+            "as_of_watermark",
+            "attribution_method_version",
+            "cost_allocation_version",
+            "uncertainty_method_version",
+            "supersedes_id",
+            "supersession_reason",
+        )
+    }
+    watermark = identity["as_of_watermark"]
+    if isinstance(watermark, ConsumedInputWatermark):
+        identity["as_of_watermark"] = watermark.to_dict()
+    return stable_hash("DI-COMPARISON", identity)
 
 
 def _timestamp(value: Any, field_name: str) -> datetime:
@@ -127,8 +169,19 @@ def _provenance(value: Any) -> Provenance:
         raise ValueError("provenance fields are incomplete or unknown")
     data = dict(value)
     data["emitted_at"] = _timestamp(data["emitted_at"], "provenance.emitted_at")
-    data["source_record_refs"] = tuple(data["source_record_refs"])
+    data["source_record_refs"] = _string_tuple(
+        data["source_record_refs"], "provenance.source_record_refs"
+    )
     return Provenance(**data)
+
+
+def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be an array")
+    items = tuple(value)
+    if any(not isinstance(item, str) or not item.strip() for item in items):
+        raise ValueError(f"{field_name} entries must be non-empty strings")
+    return items
 
 
 def _watermark(value: Any, field_name: str) -> ConsumedInputWatermark:
@@ -136,10 +189,19 @@ def _watermark(value: Any, field_name: str) -> ConsumedInputWatermark:
         return value
     if not isinstance(value, Mapping):
         raise ValueError(f"{field_name} must be a watermark object")
-    try:
-        return ConsumedInputWatermark.from_dict(value)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid {field_name}") from exc
+    required = {"history_epoch", "local_sequence"}
+    if set(value) != required:
+        raise ValueError(f"invalid {field_name}")
+    history_epoch = value["history_epoch"]
+    local_sequence = value["local_sequence"]
+    if type(history_epoch) is not int or type(local_sequence) is not int:
+        raise ValueError(f"invalid {field_name}")
+    if history_epoch < 0 or local_sequence < 0:
+        raise ValueError(f"invalid {field_name}")
+    return ConsumedInputWatermark(
+        history_epoch=history_epoch,
+        local_sequence=local_sequence,
+    )
 
 
 def _strict_payload(payload: Mapping[str, Any], record_type: Type[Any]) -> dict[str, Any]:
@@ -202,9 +264,17 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
     for name in timestamp_names:
         if name in data:
             data[name] = _timestamp(data[name], name)
-    for name in ("risks", "evidence_refs", "missing_evidence", "referenced_role_result_ids", "unsupported_claims", "invocation_references", "invocation_refs"):
+    for name in (
+        "risks",
+        "evidence_refs",
+        "missing_evidence",
+        "referenced_role_result_ids",
+        "unsupported_claims",
+        "invocation_references",
+        "invocation_refs",
+    ):
         if name in data:
-            data[name] = tuple(data[name])
+            data[name] = _string_tuple(data[name], name)
     if record_type is ComparisonRecord:
         data["as_of_watermark"] = _watermark(
             data.get("as_of_watermark"), "as_of_watermark"
