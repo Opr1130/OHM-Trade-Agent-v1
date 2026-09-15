@@ -81,7 +81,7 @@ def _provenance_payload():
 def _context_payload(context_id: str, *, value: int = 1):
     payload = {
         "context_id": context_id,
-        "candidate_id": "candidate-1",
+        "candidate_id": f"candidate-{value}",
         "episode_id": "episode-1",
         "evaluation_id": "evaluation-1",
         "instrument_version": "instrument-1",
