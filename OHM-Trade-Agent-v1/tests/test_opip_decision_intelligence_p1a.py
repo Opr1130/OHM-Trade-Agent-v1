@@ -657,9 +657,12 @@ def test_assessment_completeness_basis_points_support_duplicate_and_conflict(tmp
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:assessment:1", event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=_assessment_payload()))
-        duplicate = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:assessment:1", event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=_assessment_payload()))
-        conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:assessment:1", event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=_assessment_payload(stance="OPPOSE", completeness=8000)))
+        assessment = _assessment_payload()
+        changed_assessment = _assessment_payload(stance="OPPOSE", completeness=8000)
+        assessment_key = _di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, assessment)
+        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=assessment_key, event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=assessment))
+        duplicate = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=assessment_key, event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=assessment))
+        conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=assessment_key, event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=changed_assessment))
     finally:
         writer.close()
     assert first.status == "OK"
@@ -676,8 +679,8 @@ def test_assessment_supersession_persists_original_and_new_identity(tmp_path):
     correction = _assessment_payload(stance="OPPOSE", completeness=8000, supersedes_id=original["assessment_id"], supersession_reason="review correction")
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:assessment:original", event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=original))
-        second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:assessment:correction", event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=correction))
+        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, original), event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=original))
+        second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, correction), event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=correction))
     finally:
         writer.close()
     assert first.status == "OK" and second.status == "OK"
@@ -757,9 +760,10 @@ def test_transition_reason_conflicts_and_supersession_persists_both(tmp_path):
     correction = _transition_payload(reason="corrected", supersedes_id=original["transition_id"], supersession_reason="review correction")
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:transition:1", event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=original))
-        conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:transition:1", event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=changed_reason))
-        second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:transition:2", event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=correction))
+        original_key = _di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, original)
+        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=original_key, event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=original))
+        conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=original_key, event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=changed_reason))
+        second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, correction), event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=correction))
     finally:
         writer.close()
     assert first.status == "OK"
@@ -1092,8 +1096,8 @@ def test_acceptance_model_invocation_correction_is_append_only_canonical_path(tm
     correction = _invocation_payload("inv-correction", cost=11, supersedes_id=original["invocation_id"], supersession_reason="billing reconciliation")
     writer = CanonicalWriter(db)
     try:
-        first = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:inv:original", event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=original))
-        second = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:inv:correction", event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=correction))
+        first = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_INVOCATION_RECORDED, original), event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=original))
+        second = writer.submit(WriterIntent(schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_INVOCATION_RECORDED, correction), event_type=DECISION_INTELLIGENCE_INVOCATION_RECORDED, payload=correction))
     finally:
         writer.close()
     assert first.status == "OK"
