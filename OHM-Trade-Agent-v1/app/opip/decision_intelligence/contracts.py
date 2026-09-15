@@ -142,7 +142,7 @@ class CommitteeRequest:
             raise ValueError("CommitteeRequest.frozen_snapshot_hash must match DecisionContext.snapshot_hash")
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported CommitteeRequest schema_version")
         for field_name in ("request_id", "context_id", "experiment_id"):
             if not str(getattr(self, field_name)).strip():
@@ -173,7 +173,7 @@ class CommitteeRequestTransition:
     supersession_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported transition schema_version")
         if not isinstance(self.transition_id, str) or not isinstance(
             self.request_id, str
@@ -224,7 +224,7 @@ class CommitteeRoleResult:
     supersession_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported role result schema_version")
         for field_name in ("result_id", "request_id"):
             if not str(getattr(self, field_name)).strip():
@@ -264,7 +264,7 @@ class CommitteeAssessmentSummary:
     supersession_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported assessment schema_version")
         for field_name in ("assessment_id", "request_id"):
             if not str(getattr(self, field_name)).strip():
@@ -324,7 +324,7 @@ class ModelInvocation:
     supersession_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported invocation schema_version")
         for field_name in ("invocation_id", "request_id"):
             if not str(getattr(self, field_name)).strip():
@@ -392,7 +392,7 @@ class ComparisonRecord:
     advisory_disposition: ResultDisposition | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported comparison schema_version")
         required = (
             "comparison_id", "decision_context_id", "baseline_decision_id",
