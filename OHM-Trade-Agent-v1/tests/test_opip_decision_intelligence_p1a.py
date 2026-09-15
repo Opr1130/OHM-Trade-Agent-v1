@@ -2682,3 +2682,113 @@ def test_non_transition_supersession_rejects_cross_request_target(
 
     assert ack.status == "REJECTED"
     assert ack.error_code == "INVALID_INTENT"
+
+
+
+@pytest.mark.parametrize("record_kind", ["context", "request"])
+def test_root_record_supersession_requires_existing_same_type_target(
+    tmp_path, record_kind
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ancestry = _seed_complete_di_ancestry(writer, value=1)
+        if record_kind == "context":
+            payload = _context_payload("ctx-root-correction", value=3)
+            payload["supersedes_id"] = ancestry["request"]["request_id"]
+            payload["supersession_reason"] = "invalid wrong-type correction"
+            payload["context_id"] = context_identity(payload)
+            event_type = "decision_intelligence.context.recorded"
+        else:
+            payload = _request_payload(ancestry["context"])
+            payload["supersedes_id"] = "missing-request"
+            payload["supersession_reason"] = "invalid missing correction"
+            payload["request_id"] = request_identity(payload)
+            event_type = "decision_intelligence.request.recorded"
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(event_type, payload),
+                event_type=event_type,
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_request_supersession_rejects_cross_context_target(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        current = _seed_complete_di_ancestry(writer, value=1)
+        other = _seed_complete_di_ancestry(writer, value=2)
+
+        payload = _request_payload(current["context"])
+        payload["supersedes_id"] = other["request"]["request_id"]
+        payload["supersession_reason"] = "cross-context correction"
+        payload["request_id"] = request_identity(payload)
+
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.request.recorded", payload
+                ),
+                event_type="decision_intelligence.request.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_context_supersession_accepts_existing_context_target(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        original = _context_payload("ctx-root-original", value=1)
+        original_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.context.recorded", original
+                ),
+                event_type="decision_intelligence.context.recorded",
+                payload=original,
+            )
+        )
+        assert original_ack.status == "OK"
+
+        correction = _context_payload("ctx-root-correction", value=4)
+        correction["supersedes_id"] = original["context_id"]
+        correction["supersession_reason"] = "context metadata correction"
+        correction["context_id"] = context_identity(correction)
+        correction_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.context.recorded", correction
+                ),
+                event_type="decision_intelligence.context.recorded",
+                payload=correction,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert correction_ack.status == "OK"
