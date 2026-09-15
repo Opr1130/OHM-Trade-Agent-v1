@@ -151,6 +151,10 @@ class CommitteeRequestTransition:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ValueError("unsupported transition schema_version")
+        if not isinstance(self.transition_id, str) or not isinstance(
+            self.request_id, str
+        ):
+            raise ValueError("transition_id and request_id must be strings")
         if not self.transition_id.strip() or not self.request_id.strip():
             raise ValueError("transition_id and request_id are required")
         if self.from_state == self.to_state:
