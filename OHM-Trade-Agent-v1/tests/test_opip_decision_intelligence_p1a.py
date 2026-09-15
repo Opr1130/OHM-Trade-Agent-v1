@@ -1580,3 +1580,105 @@ def test_writer_rejects_non_boolean_timeliness_eligibility(tmp_path):
         writer.close()
 
     assert ack.error_code == "INVALID_INTENT"
+
+
+def test_only_optional_advisory_disposition_accepts_explicit_null(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    comparison = _valid_comparison_payload_for_regression()
+    assert comparison["advisory_disposition"] is None
+
+    invalid_role = _role_result_payload()
+    invalid_role["role"] = None
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        valid_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:comparison:optional-null",
+                event_type="decision_intelligence.comparison.recorded",
+                payload=comparison,
+            )
+        )
+        invalid_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:role:required-null",
+                event_type="decision_intelligence.role_result.recorded",
+                payload=invalid_role,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert valid_ack.status == "OK"
+    assert invalid_ack.error_code == "INVALID_INTENT"
+
+
+def test_request_and_transition_identity_normalize_equivalent_offsets():
+    from app.opip.decision_intelligence.events import (
+        request_identity,
+        transition_identity,
+    )
+
+    request_z = {
+        "context_id": "ctx",
+        "experiment_id": "exp",
+        "cohort_selection_rule_version": "cohort-1",
+        "frozen_snapshot_hash": "snapshot",
+        "route_version": "route-1",
+        "prompt_version": "prompt-1",
+        "role_configuration_version": "roles-1",
+        "eligibility_at": "2026-01-02T01:00:00Z",
+        "deadline_at": "2026-01-02T02:00:00Z",
+        "budget_reservation": 1,
+        "result_selection_rule_version": "select-1",
+    }
+    request_offset = {
+        **request_z,
+        "eligibility_at": "2026-01-02T03:00:00+02:00",
+        "deadline_at": "2026-01-02T04:00:00+02:00",
+    }
+    assert request_identity(request_z) == request_identity(request_offset)
+
+    transition_z = {
+        "request_id": "req",
+        "from_state": "ELIGIBLE",
+        "to_state": "SELECTED",
+        "transition_time": "2026-01-02T01:00:00Z",
+        "supersedes_id": None,
+        "supersession_reason": None,
+    }
+    transition_offset = {
+        **transition_z,
+        "transition_time": "2026-01-02T03:00:00+02:00",
+    }
+    assert transition_identity(transition_z) == transition_identity(
+        transition_offset
+    )
+
+
+@pytest.mark.parametrize("schema_version", [2, True, "1"])
+def test_provenance_schema_version_requires_exact_integer_one(schema_version):
+    with pytest.raises(ValueError, match="unsupported Provenance schema_version"):
+        Provenance(
+            producing_component="component",
+            artifact_or_build_id="build",
+            process_instance_id="process",
+            emitted_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            source_record_refs=("source:1",),
+            schema_version=schema_version,
+        )
+
+
+def test_canonical_mapping_keys_are_nfc_normalized_and_collisions_rejected():
+    nfc_key = "\u00e9"
+    nfd_key = "e\u0301"
+    assert canonical_serialize({nfc_key: "value"}) == canonical_serialize(
+        {nfd_key: "value"}
+    )
+    with pytest.raises(ValueError, match="collide after NFC normalization"):
+        canonical_serialize({nfc_key: 1, nfd_key: 2})
