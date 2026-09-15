@@ -197,10 +197,10 @@ def request_identity(request: Mapping[str, Any]) -> str:
             "deadline_at",
             "budget_reservation",
             "result_selection_rule_version",
-            "supersedes_id",
-            "supersession_reason",
         )
     }
+    identity["supersedes_id"] = request.get("supersedes_id")
+    identity["supersession_reason"] = request.get("supersession_reason")
     for field_name in ("eligibility_at", "deadline_at"):
         identity[field_name] = _timestamp(identity[field_name], field_name)
     return stable_hash("DI-REQUEST", identity)
