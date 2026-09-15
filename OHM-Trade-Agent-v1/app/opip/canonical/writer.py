@@ -36,6 +36,7 @@ from app.opip.decision_intelligence.events import (
     canonical_di_idempotency_key,
     context_idempotency_key,
     request_idempotency_key,
+    transition_idempotency_key,
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
@@ -375,7 +376,7 @@ class CanonicalWriter:
             return None
         evidence_refs = payload.get("evidence_refs")
         if not evidence_refs:
-            return None
+            return []
         if not isinstance(evidence_refs, list):
             raise ValueError("evidence_refs must be a canonical array")
         return evidence_refs
@@ -460,6 +461,91 @@ class CanonicalWriter:
                 evidence_ref,
                 manifest=manifest,
                 cutoff=cutoff,
+            )
+
+    def _load_transition_by_id(self, transition_id: str) -> dict:
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+            idempotency_key=transition_idempotency_key(
+                transition_id=transition_id
+            ),
+        )
+
+    def _latest_ordinary_transition_state(self, request_id: str) -> str:
+        row = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+              AND json_extract(payload_json, '$.request_id') = ?
+              AND json_extract(payload_json, '$.supersedes_id') IS NULL
+            ORDER BY history_epoch DESC, local_sequence DESC
+            LIMIT 1
+            """,
+            (DECISION_INTELLIGENCE_TRANSITION_RECORDED, request_id),
+        ).fetchone()
+        if row is None:
+            return "ELIGIBLE"
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "persisted transition payload is invalid JSON"
+            ) from exc
+        to_state = payload.get("to_state")
+        if not isinstance(to_state, str) or not to_state:
+            raise ValueError("persisted transition has no valid to_state")
+        return to_state
+
+    def _validate_transition_supersession(
+        self,
+        payload: Mapping[str, object],
+        supersedes_id: str,
+    ) -> None:
+        superseded = self._load_transition_by_id(supersedes_id)
+        for field_name in (
+            "request_id",
+            "from_state",
+            "to_state",
+            "transition_time",
+        ):
+            if payload.get(field_name) != superseded.get(field_name):
+                raise ValueError(
+                    "transition supersession must preserve lifecycle "
+                    f"coordinate {field_name}"
+                )
+
+    def _validate_di_transition_for_commit(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if event_type != DECISION_INTELLIGENCE_TRANSITION_RECORDED:
+            return
+
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("transition request_id is required")
+        self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_REQUEST_RECORDED,
+            idempotency_key=request_idempotency_key(request_id=request_id),
+        )
+
+        supersedes_id = payload.get("supersedes_id")
+        if supersedes_id is not None:
+            if not isinstance(supersedes_id, str) or not supersedes_id:
+                raise ValueError("transition supersedes_id is invalid")
+            self._validate_transition_supersession(
+                payload,
+                supersedes_id,
+            )
+            return
+
+        current_state = self._latest_ordinary_transition_state(request_id)
+        from_state = payload.get("from_state")
+        if from_state != current_state:
+            raise ValueError(
+                "transition from_state does not match persisted request state"
             )
 
     def _lookup_idempotency(
@@ -740,6 +826,11 @@ class CanonicalWriter:
 
         history_epoch = int(meta["history_epoch"])
         local_sequence = int(meta["next_local_sequence"])
+
+        self._validate_di_transition_for_commit(
+            intent.event_type,
+            payload,
+        )
 
         self._conn.execute(
             """
