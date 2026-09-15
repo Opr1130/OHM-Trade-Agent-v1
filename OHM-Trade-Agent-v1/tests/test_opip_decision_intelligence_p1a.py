@@ -3127,3 +3127,73 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
         assert restarted._request_lifecycle_projection[request_id] == "SELECTED"
     finally:
         restarted.close()
+
+
+
+def test_losing_idempotency_race_rolls_back_for_next_submit(
+    tmp_path, monkeypatch
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    db = tmp_path / "canonical.sqlite3"
+    writer_a = CanonicalWriter(db)
+    writer_b = CanonicalWriter(db)
+    try:
+        payload = _context_payload("ctx-idempotency-race")
+        intent = WriterIntent(
+            schema_version=1,
+            priority="LOW",
+            idempotency_key=_di_key(
+                DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload,
+            ),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+        )
+
+        winning_ack = writer_a.submit(intent)
+        assert winning_ack.status == "OK"
+
+        original_lookup = writer_b._lookup_idempotency
+        lookup_calls = 0
+
+        def stale_once(key, *, payload_json=None, event_type=None):
+            nonlocal lookup_calls
+            lookup_calls += 1
+            if lookup_calls == 1:
+                return None
+            return original_lookup(
+                key,
+                payload_json=payload_json,
+                event_type=event_type,
+            )
+
+        monkeypatch.setattr(
+            writer_b,
+            "_lookup_idempotency",
+            stale_once,
+        )
+
+        losing_ack = writer_b.submit(intent)
+        assert losing_ack.status == "DUPLICATE_OK"
+
+        next_payload = _context_payload("ctx-after-idempotency-race")
+        next_payload["candidate_id"] = "candidate-after-idempotency-race"
+        next_payload["context_id"] = context_identity(next_payload)
+        next_ack = writer_b.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                    next_payload,
+                ),
+                event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload=next_payload,
+            )
+        )
+    finally:
+        writer_b.close()
+        writer_a.close()
+
+    assert next_ack.status == "OK"
