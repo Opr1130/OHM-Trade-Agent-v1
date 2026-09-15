@@ -242,7 +242,11 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
     data["provenance"] = _provenance(data["provenance"])
     enum_fields = {"from_state": RequestState, "to_state": RequestState, "result_disposition": ResultDisposition, "stance": AdvisoryStance, "advisory_stance": AdvisoryStance, "advisory_disposition": ResultDisposition, "role": CommitteeRole}
     for name, enum_type in enum_fields.items():
-        if name in data and not isinstance(data[name], enum_type):
+        if (
+            name in data
+            and data[name] is not None
+            and not isinstance(data[name], enum_type)
+        ):
             try:
                 data[name] = enum_type(data[name])
             except (TypeError, ValueError) as exc:
