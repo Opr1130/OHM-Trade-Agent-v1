@@ -251,32 +251,37 @@ def test_provenance_excludes_operational_metadata_from_semantic_identity():
 
 def test_evidence_available_after_cutoff_is_rejected():
     cutoff = datetime(2026, 1, 2, 3, 5, tzinfo=timezone.utc)
+    values = {
+        "context_id": "ctx-2",
+        "candidate_id": "cand-2",
+        "episode_id": "ep-2",
+        "evaluation_id": "eval-2",
+        "instrument_version": "instr-v2",
+        "snapshot_id": "snap-2",
+        "snapshot_hash": "snap-hash-2",
+        "evaluation_time": cutoff,
+        "evidence_cutoff": cutoff,
+        "consumed_input_watermark": {"history_epoch": 1, "local_sequence": 1},
+        "feature_version": "fv-1",
+        "policy_version": "pv-1",
+        "detector_version": "dv-1",
+        "forecast_version": "fcast-1",
+        "candidate_set_ref": "set:1",
+        "portfolio_version_ref": None,
+        "environment": "paper",
+        "eligibility": True,
+        "missingness": {},
+        "source_availability_times": {
+            "e1": cutoff + timedelta(seconds=5)
+        },
+        "evidence_eligibility_manifest": {
+            "e1": {"available_at": cutoff - timedelta(seconds=1)}
+        },
+        "schema_version": 1,
+        "provenance": _provenance(),
+    }
     with pytest.raises(ValueError, match="evidence_cutoff"):
-        DecisionContext(
-            context_id="ctx-2",
-            candidate_id="cand-2",
-            episode_id="ep-2",
-            evaluation_id="eval-2",
-            instrument_version="instr-v2",
-            snapshot_id="snap-2",
-            snapshot_hash="snap-hash-2",
-            evaluation_time=cutoff,
-            evidence_cutoff=cutoff,
-            consumed_input_watermark={"history_epoch": 1, "local_sequence": 1},
-            feature_version="fv-1",
-            policy_version="pv-1",
-            detector_version="dv-1",
-            forecast_version="fcast-1",
-            candidate_set_ref="set:1",
-            portfolio_version_ref=None,
-            environment="paper",
-            eligibility=True,
-            missingness={},
-            source_availability_times={"e1": cutoff + timedelta(seconds=5)},
-            evidence_eligibility_manifest={"e1": {"available_at": cutoff - timedelta(seconds=1)}},
-            schema_version=1,
-            provenance=_provenance(),
-        )
+        DecisionContext(**values)
 
 
 def test_writer_rejects_non_low_priority_and_ops_handoff_for_di_event():
@@ -288,9 +293,11 @@ def test_writer_rejects_non_low_priority_and_ops_handoff_for_di_event():
         payload={"schema_version": 1, **_context_payload("ctx-1")},
         ops_handoff=None,
     )
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter.__new__(CanonicalWriter)
     with pytest.raises(ValueError, match="LOW priority"):
-        from app.opip.canonical.writer import CanonicalWriter
-        CanonicalWriter._validate_intent(CanonicalWriter.__new__(CanonicalWriter), intent)
+        CanonicalWriter._validate_intent(writer, intent)
 
     # Low priority is accepted; no ops_handoff; exact event type is allowed.
     assert DECISION_INTELLIGENCE_CONTEXT_RECORDED in _decision_intelligence_event_types
@@ -312,25 +319,26 @@ def test_request_state_has_exactly_expected_values():
 
 
 def test_committee_request_frozen_snapshot_hash_must_match_context():
+    values = {
+        "request_id": "req-1",
+        "context_id": "ctx-1",
+        "experiment_id": "exp-1",
+        "cohort_selection_rule_version": "v1",
+        "frozen_snapshot_hash": "bad-hash",
+        "route_version": "r1",
+        "prompt_version": "p1",
+        "role_configuration_version": "rc1",
+        "eligibility_at": datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc),
+        "deadline_at": datetime(2026, 1, 2, 4, 4, tzinfo=timezone.utc),
+        "budget_reservation": 10,
+        "enqueue_time": datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc),
+        "result_selection_rule_version": "rs1",
+        "schema_version": 1,
+        "provenance": _provenance(),
+        "context_snapshot_hash": "good-hash",
+    }
     with pytest.raises(ValueError, match="frozen_snapshot_hash"):
-        CommitteeRequest(
-            request_id="req-1",
-            context_id="ctx-1",
-            experiment_id="exp-1",
-            cohort_selection_rule_version="v1",
-            frozen_snapshot_hash="bad-hash",
-            route_version="r1",
-            prompt_version="p1",
-            role_configuration_version="rc1",
-            eligibility_at=datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc),
-            deadline_at=datetime(2026, 1, 2, 4, 4, tzinfo=timezone.utc),
-            budget_reservation=10,
-            enqueue_time=datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc),
-            result_selection_rule_version="rs1",
-            schema_version=1,
-            provenance=_provenance(),
-            context_snapshot_hash="good-hash",
-        )
+        CommitteeRequest(**values)
 
 
 def test_timely_evidence_requires_at_least_one_on_time_result():
@@ -538,6 +546,8 @@ def test_result_disposition_enforces_late_not_earlier_feasibility():
 
 
 def test_request_transition_rejects_undeclared_state_move():
+    transition_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    provenance = _provenance()
     with pytest.raises(ValueError):
         RequestTransition(
             transition_id="transition-1",
@@ -545,9 +555,9 @@ def test_request_transition_rejects_undeclared_state_move():
             from_state=RequestState.ELIGIBLE,
             to_state=RequestState.COMPLETED,
             reason="invalid transition",
-            transition_time=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            transition_time=transition_time,
             schema_version=1,
-            provenance=_provenance(),
+            provenance=provenance,
         )
 
 
@@ -643,11 +653,12 @@ def test_di_envelope_is_low_only_and_requires_schema_and_provenance():
     intent = envelope.to_writer_intent(idempotency_key="di:envelope:1")
     assert intent.priority == "LOW"
     assert intent.ops_handoff is None
+    invalid_provenance = _provenance()
     with pytest.raises(ValueError, match="schema_version"):
         DIEventEnvelope(
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
             payload={"context_id": "missing-schema"},
-            provenance=_provenance(),
+            provenance=invalid_provenance,
         )
 
 
@@ -683,7 +694,8 @@ def test_assessment_supersession_persists_original_and_new_identity(tmp_path):
         second = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, correction), event_type=DECISION_INTELLIGENCE_ASSESSMENT_RECORDED, payload=correction))
     finally:
         writer.close()
-    assert first.status == "OK" and second.status == "OK"
+    assert first.status == "OK"
+    assert second.status == "OK"
     conn = connect(tmp_path / "canonical.sqlite3", read_only=True)
     try:
         rows = conn.execute("SELECT payload_json FROM events WHERE event_type = ? ORDER BY local_sequence", (DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,)).fetchall()
@@ -842,9 +854,16 @@ def test_nested_aware_datetimes_are_canonicalized_and_naive_rejected(tmp_path):
     finally:
         conn.close()
     assert "2026-01-02T01:04:00Z" in stored
-    payload["source_availability_times"] = {"source": datetime(2026, 1, 2, 3, 4)}
+    payload["source_availability_times"] = {
+        "source": datetime(2026, 1, 2, 3, 4)
+    }
+    provenance = _provenance()
     with pytest.raises(ValueError, match="timezone-aware"):
-        DIEventEnvelope(event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload, provenance=_provenance())
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+            provenance=provenance,
+        )
 
 
 def test_content_derived_identities_ignore_external_ids_and_provenance():
@@ -859,25 +878,35 @@ def test_raw_writer_rejects_authority_fields_and_invalid_role():
     from app.opip.canonical.writer import CanonicalWriter
 
     payload = {**_context_payload("ctx-authority"), "trade_authority": True}
+    writer = CanonicalWriter.__new__(CanonicalWriter)
+    authority_intent = WriterIntent(
+        schema_version=1,
+        priority="LOW",
+        idempotency_key="di:authority",
+        event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+        payload=payload,
+    )
     with pytest.raises(ValueError, match="unknown fields"):
-        CanonicalWriter._validate_intent(
-            CanonicalWriter.__new__(CanonicalWriter),
-            WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:authority", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload),
-        )
+        CanonicalWriter._validate_intent(writer, authority_intent)
+
     invalid_role = _invocation_payload("inv-invalid")
     invalid_role["role"] = "EXECUTION"
+    role_intent = WriterIntent(
+        schema_version=1,
+        priority="LOW",
+        idempotency_key="di:role",
+        event_type="decision_intelligence.invocation.recorded",
+        payload=invalid_role,
+    )
     with pytest.raises(ValueError, match="invalid role"):
-        CanonicalWriter._validate_intent(
-            CanonicalWriter.__new__(CanonicalWriter),
-            WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:role", event_type="decision_intelligence.invocation.recorded", payload=invalid_role),
-        )
+        CanonicalWriter._validate_intent(writer, role_intent)
 
 
 def test_di_identity_is_epoch_invariant_and_request_varies_by_model():
-    assert context_idempotency_key(
-        context_id="ctx-1"
-    ) == context_idempotency_key(
-        context_id="ctx-1"
+    context_key = context_idempotency_key(context_id="ctx-1")
+    assert context_key == _identity(
+        DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+        "ctx-1",
     )
     assert request_idempotency_key(request_id="req-1") == request_idempotency_key(request_id="req-1")
     assert role_result_idempotency_key(
@@ -997,14 +1026,40 @@ def test_acceptance_lifecycle_table_and_terminal_states():
     }
     assert not hasattr(RequestState, "LATE")
     assert ResultDisposition.LATE.value == "LATE"
+    transition_time = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    provenance = _provenance()
     for terminal in {
         RequestState.SKIPPED_BUDGET, RequestState.SKIPPED_CAPACITY, RequestState.EXPIRED,
         RequestState.FAILED, RequestState.INVALID, RequestState.COMPLETED,
     }:
         with pytest.raises(ValueError, match="terminal"):
-            RequestTransition(transition_id="t", request_id="req", from_state=terminal, to_state=RequestState.ELIGIBLE, reason="invalid", transition_time=datetime(2026, 1, 2, tzinfo=timezone.utc), provenance=_provenance())
-    RequestTransition(transition_id="t1", request_id="req", from_state=RequestState.ELIGIBLE, to_state=RequestState.SELECTED, reason="selected", transition_time=datetime(2026, 1, 2, tzinfo=timezone.utc), provenance=_provenance())
-    RequestTransition(transition_id="t2", request_id="req", from_state=RequestState.SELECTED, to_state=RequestState.COMPLETED, reason="done", transition_time=datetime(2026, 1, 2, tzinfo=timezone.utc), provenance=_provenance())
+            RequestTransition(
+                transition_id="t",
+                request_id="req",
+                from_state=terminal,
+                to_state=RequestState.ELIGIBLE,
+                reason="invalid",
+                transition_time=transition_time,
+                provenance=provenance,
+            )
+    RequestTransition(
+        transition_id="t1",
+        request_id="req",
+        from_state=RequestState.ELIGIBLE,
+        to_state=RequestState.SELECTED,
+        reason="selected",
+        transition_time=transition_time,
+        provenance=provenance,
+    )
+    RequestTransition(
+        transition_id="t2",
+        request_id="req",
+        from_state=RequestState.SELECTED,
+        to_state=RequestState.COMPLETED,
+        reason="done",
+        transition_time=transition_time,
+        provenance=provenance,
+    )
 
 
 def test_acceptance_superseding_correction_preserves_original_record():
@@ -1128,16 +1183,20 @@ def test_acceptance_backfill_cannot_revise_context_and_snapshot_link_is_frozen()
         provenance=_provenance(),
     )
     request.validate_against_context(context)
+    changed_context = _context_for_acceptance(snapshot_hash="changed")
     with pytest.raises(ValueError, match="snapshot_hash"):
-        request.validate_against_context(_context_for_acceptance(snapshot_hash="changed"))
+        request.validate_against_context(changed_context)
 
 
 def test_acceptance_typed_provenance_and_semantic_exclusion():
     assert isinstance(_provenance(), Provenance)
+    emitted_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
     with pytest.raises(ValueError, match="required"):
         Provenance(
-            producing_component="", artifact_or_build_id="build",
-            process_instance_id="proc", emitted_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            producing_component="",
+            artifact_or_build_id="build",
+            process_instance_id="proc",
+            emitted_at=emitted_at,
             source_record_refs=("source",),
         )
     first = _provenance(artifact_or_build_id="build-1", process_instance_id="proc-1")
@@ -1326,18 +1385,37 @@ def test_acceptance_links_and_materialized_comparison_contracts():
 
 def test_acceptance_golden_serialization_and_timezone_naive_failure():
     assert canonical_serialize({"b": 2, "a": [True, 1]}) == '{"a":[true,1],"b":2}'
+    values = {
+        "context_id": "ctx-naive",
+        "candidate_id": "candidate",
+        "episode_id": "episode",
+        "evaluation_id": "evaluation",
+        "instrument_version": "instrument",
+        "snapshot_id": "snapshot",
+        "snapshot_hash": "hash",
+        "evaluation_time": datetime(2026, 1, 2, 3, 4),
+        "evidence_cutoff": datetime(
+            2026, 1, 2, 3, 4, tzinfo=timezone.utc
+        ),
+        "consumed_input_watermark": {
+            "history_epoch": 1,
+            "local_sequence": 1,
+        },
+        "feature_version": "features",
+        "policy_version": "policy",
+        "detector_version": "detector",
+        "forecast_version": "forecast",
+        "candidate_set_ref": "set",
+        "portfolio_version_ref": None,
+        "environment": "paper",
+        "eligibility": True,
+        "missingness": {},
+        "source_availability_times": {},
+        "evidence_eligibility_manifest": {},
+        "provenance": _provenance(),
+    }
     with pytest.raises(ValueError, match="timezone-aware"):
-        _context_for_acceptance().__class__(
-            context_id="ctx-naive", candidate_id="candidate", episode_id="episode",
-            evaluation_id="evaluation", instrument_version="instrument", snapshot_id="snapshot",
-            snapshot_hash="hash", evaluation_time=datetime(2026, 1, 2, 3, 4),
-            evidence_cutoff=datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc),
-            consumed_input_watermark={"history_epoch": 1, "local_sequence": 1},
-            feature_version="features", policy_version="policy", detector_version="detector",
-            forecast_version="forecast", candidate_set_ref="set", portfolio_version_ref=None,
-            environment="paper", eligibility=True, missingness={}, source_availability_times={},
-            evidence_eligibility_manifest={}, provenance=_provenance(),
-        )
+        DecisionContext(**values)
 
 
 def test_acceptance_authority_fields_are_not_part_of_di_contracts():
@@ -1704,12 +1782,13 @@ def test_request_and_transition_identity_normalize_equivalent_offsets():
 
 @pytest.mark.parametrize("schema_version", [2, True, "1"])
 def test_provenance_schema_version_requires_exact_integer_one(schema_version):
+    emitted_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
     with pytest.raises(ValueError, match="unsupported Provenance schema_version"):
         Provenance(
             producing_component="component",
             artifact_or_build_id="build",
             process_instance_id="process",
-            emitted_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            emitted_at=emitted_at,
             source_record_refs=("source:1",),
             schema_version=schema_version,
         )
