@@ -47,7 +47,11 @@ def _identity(event_type: str, *parts: object) -> str:
     return stable_hash(event_type, {"components": list(parts)})
 
 
-def context_idempotency_key(*, context_id: str, watermark: ConsumedInputWatermark | dict[str, int]) -> str:
+def context_idempotency_key(
+    *,
+    context_id: str,
+    watermark: ConsumedInputWatermark | dict[str, int] | None = None,
+) -> str:
     return _identity(DECISION_INTELLIGENCE_CONTEXT_RECORDED, context_id)
 
 
@@ -119,8 +123,63 @@ def comparison_idempotency_key(*, comparison_id: str) -> str:
     return _identity(DECISION_INTELLIGENCE_COMPARISON_RECORDED, comparison_id)
 
 
+
+def canonical_di_idempotency_key(
+    event_type: str, payload: Mapping[str, Any]
+) -> str:
+    if event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED:
+        return context_idempotency_key(context_id=str(payload["context_id"]))
+    if event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:
+        return request_idempotency_key(request_id=str(payload["request_id"]))
+    if event_type == DECISION_INTELLIGENCE_TRANSITION_RECORDED:
+        return transition_idempotency_key(transition_id=str(payload["transition_id"]))
+    if event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
+        return role_result_idempotency_key(
+            request_id=str(payload["request_id"]),
+            role=str(payload["role"]),
+            role_version=str(payload["role_version"]),
+            route_version=str(payload["route_version"]),
+            prompt_version=str(payload["prompt_version"]),
+            attempt=int(payload["attempt"]),
+            model_version=str(payload["model_version"]),
+            supersedes_id=(
+                str(payload["supersedes_id"])
+                if payload.get("supersedes_id") is not None
+                else None
+            ),
+            supersession_reason=(
+                str(payload["supersession_reason"])
+                if payload.get("supersession_reason") is not None
+                else None
+            ),
+        )
+    if event_type == DECISION_INTELLIGENCE_ASSESSMENT_RECORDED:
+        return assessment_idempotency_key(
+            assessment_id=str(payload["assessment_id"])
+        )
+    if event_type == DECISION_INTELLIGENCE_INVOCATION_RECORDED:
+        return invocation_idempotency_key(
+            invocation_id=str(payload["invocation_id"])
+        )
+    if event_type == DECISION_INTELLIGENCE_COMPARISON_RECORDED:
+        return comparison_idempotency_key(
+            comparison_id=str(payload["comparison_id"])
+        )
+    raise ValueError("unsupported decision intelligence event type")
+
+
 def context_identity(context: Mapping[str, Any]) -> str:
-    return stable_hash("DI-CONTEXT", {key: context[key] for key in ("candidate_id", "episode_id", "evaluation_id", "snapshot_hash", "feature_version", "policy_version")})
+    identity = {
+        "candidate_id": str(context["candidate_id"]).strip(),
+        "episode_id": str(context["episode_id"]).strip(),
+        "evaluation_id": str(context["evaluation_id"]).strip(),
+        "snapshot_hash": str(context["snapshot_hash"]).strip(),
+        "feature_version": context["feature_version"],
+        "policy_version": context["policy_version"],
+        "supersedes_id": context.get("supersedes_id"),
+        "supersession_reason": context.get("supersession_reason"),
+    }
+    return stable_hash("DI-CONTEXT", identity)
 
 
 def request_identity(request: Mapping[str, Any]) -> str:
@@ -138,6 +197,8 @@ def request_identity(request: Mapping[str, Any]) -> str:
             "deadline_at",
             "budget_reservation",
             "result_selection_rule_version",
+            "supersedes_id",
+            "supersession_reason",
         )
     }
     for field_name in ("eligibility_at", "deadline_at"):
@@ -320,6 +381,13 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
             data.get("consumed_input_watermark"),
             "consumed_input_watermark",
         )
+    record = record_type(**data)
+    if isinstance(record, DecisionContext):
+        normalized = record.as_dict()
+    else:
+        normalized = asdict(record)
+    normalized = _canonical_payload(normalized)
+
     identity_builders = {
         DecisionContext: context_identity,
         CommitteeRequest: request_identity,
@@ -329,22 +397,21 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
         ModelInvocation: invocation_identity,
         ComparisonRecord: comparison_identity,
     }
-    if record_type in identity_builders:
-        identity_field = {
-            DecisionContext: "context_id", CommitteeRequest: "request_id",
-            CommitteeRequestTransition: "transition_id", CommitteeRoleResult: "result_id",
-            CommitteeAssessmentSummary: "assessment_id", ModelInvocation: "invocation_id",
-            ComparisonRecord: "comparison_id",
-        }[record_type]
-        expected_id = identity_builders[record_type](data)
-        if data[identity_field] != expected_id:
-            raise ValueError(f"{identity_field} does not match content-derived identity")
-    record = record_type(**data)
-    if isinstance(record, DecisionContext):
-        normalized = record.as_dict()
-    else:
-        normalized = asdict(record)
-    return _canonical_payload(normalized)
+    identity_field = {
+        DecisionContext: "context_id",
+        CommitteeRequest: "request_id",
+        CommitteeRequestTransition: "transition_id",
+        CommitteeRoleResult: "result_id",
+        CommitteeAssessmentSummary: "assessment_id",
+        ModelInvocation: "invocation_id",
+        ComparisonRecord: "comparison_id",
+    }[record_type]
+    expected_id = identity_builders[record_type](normalized)
+    if normalized[identity_field] != expected_id:
+        raise ValueError(
+            f"{identity_field} does not match content-derived identity"
+        )
+    return normalized
 
 
 def _canonical_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -416,6 +483,7 @@ __all__ = [
     "assessment_idempotency_key",
     "invocation_idempotency_key",
     "comparison_idempotency_key",
+    "canonical_di_idempotency_key",
     "validate_di_payload",
     "context_identity",
     "request_identity",
