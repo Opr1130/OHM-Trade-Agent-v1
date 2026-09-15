@@ -1569,7 +1569,9 @@ def test_role_result_idempotency_distinguishes_version_and_supersession(tmp_path
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key=key_v1,
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded", first
+                ),
                 event_type="decision_intelligence.role_result.recorded",
                 payload=first,
             )
@@ -1578,7 +1580,9 @@ def test_role_result_idempotency_distinguishes_version_and_supersession(tmp_path
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key=correction_key,
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded", correction
+                ),
                 event_type="decision_intelligence.role_result.recorded",
                 payload=correction,
             )
@@ -1729,18 +1733,30 @@ def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path
     same_payload = dict(first_payload)
     conflict_payload = {**first_payload, "thesis": "conflicting thesis"}
 
+    canonical_key = _di_key(
+        "decision_intelligence.role_result.recorded", first_payload
+    )
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
         first = writer.submit(
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key="di:role:arbitrary-a",
+                idempotency_key=canonical_key,
                 event_type="decision_intelligence.role_result.recorded",
                 payload=first_payload,
             )
         )
         duplicate = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=canonical_key,
+                event_type="decision_intelligence.role_result.recorded",
+                payload=same_payload,
+            )
+        )
+        arbitrary = writer.submit(
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
@@ -1753,7 +1769,7 @@ def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key="di:role:arbitrary-c",
+                idempotency_key=canonical_key,
                 event_type="decision_intelligence.role_result.recorded",
                 payload=conflict_payload,
             )
@@ -1764,6 +1780,7 @@ def test_di_record_identity_is_unique_across_different_idempotency_keys(tmp_path
     assert first.status == "OK"
     assert duplicate.status == "DUPLICATE_OK"
     assert duplicate.event_id == first.event_id
+    assert arbitrary.error_code == "INVALID_INTENT"
     assert conflict.status == "REJECTED"
     assert conflict.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
 
