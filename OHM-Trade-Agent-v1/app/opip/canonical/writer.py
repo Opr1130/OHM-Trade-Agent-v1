@@ -162,6 +162,31 @@ class CanonicalWriter:
         self._lock = threading.Lock()
         self._conn = connect(self.db_path, read_only=False)
         initialize_schema(self._conn, now_iso=_utc_now())
+        self._request_lifecycle_projection: dict[str, str] = {}
+        self._hydrate_request_lifecycle_projection()
+
+    def _hydrate_request_lifecycle_projection(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (DECISION_INTELLIGENCE_TRANSITION_RECORDED,),
+        ).fetchall()
+        for row in rows:
+            payload = validate_di_payload(
+                DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+                json.loads(str(row["payload_json"])),
+            )
+            if payload.get("supersedes_id") is not None:
+                continue
+            request_id = payload["request_id"]
+            current = self._request_lifecycle_projection.get(request_id, "ELIGIBLE")
+            if payload["from_state"] != current:
+                raise ValueError("persisted transition history is invalid")
+            self._request_lifecycle_projection[request_id] = payload["to_state"]
 
     def close(self) -> None:
         with self._lock:
@@ -412,6 +437,21 @@ class CanonicalWriter:
             raise ValueError("persisted request/context snapshot mismatch")
         return context_payload
 
+    def _validate_request_context_ancestry(
+        self, payload: Mapping[str, object]
+    ) -> None:
+        context_id = payload.get("context_id")
+        if not isinstance(context_id, str) or not context_id:
+            raise ValueError("request context_id is required")
+        context_payload = self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            idempotency_key=context_idempotency_key(context_id=context_id),
+        )
+        if payload.get("frozen_snapshot_hash") != context_payload.get(
+            "snapshot_hash"
+        ):
+            raise ValueError("request/context snapshot mismatch")
+
     @staticmethod
     def _evidence_manifest_and_cutoff(
         context_payload: Mapping[str, object],
@@ -479,32 +519,6 @@ class CanonicalWriter:
             ),
         )
 
-    def _latest_ordinary_transition_state(self, request_id: str) -> str:
-        row = self._conn.execute(
-            """
-            SELECT payload_json
-            FROM events
-            WHERE event_type = ?
-              AND json_extract(payload_json, '$.request_id') = ?
-              AND json_extract(payload_json, '$.supersedes_id') IS NULL
-            ORDER BY history_epoch DESC, local_sequence DESC
-            LIMIT 1
-            """,
-            (DECISION_INTELLIGENCE_TRANSITION_RECORDED, request_id),
-        ).fetchone()
-        if row is None:
-            return "ELIGIBLE"
-        try:
-            payload = json.loads(str(row["payload_json"]))
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "persisted transition payload is invalid JSON"
-            ) from exc
-        to_state = payload.get("to_state")
-        if not isinstance(to_state, str) or not to_state:
-            raise ValueError("persisted transition has no valid to_state")
-        return to_state
-
     def _validate_transition_supersession(
         self,
         payload: Mapping[str, object],
@@ -549,7 +563,9 @@ class CanonicalWriter:
             )
             return
 
-        current_state = self._latest_ordinary_transition_state(request_id)
+        current_state = self._request_lifecycle_projection.get(
+            request_id, "ELIGIBLE"
+        )
         from_state = payload.get("from_state")
         if from_state != current_state:
             raise ValueError(
@@ -632,6 +648,8 @@ class CanonicalWriter:
             intent.event_type,
             normalized,
         )
+        if intent.event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:
+            self._validate_request_context_ancestry(normalized)
         return normalized
 
     @staticmethod
@@ -913,6 +931,13 @@ class CanonicalWriter:
             (local_sequence + 1, now),
         )
         self._conn.commit()
+        if (
+            intent.event_type == DECISION_INTELLIGENCE_TRANSITION_RECORDED
+            and payload.get("supersedes_id") is None
+        ):
+            self._request_lifecycle_projection[payload["request_id"]] = payload[
+                "to_state"
+            ]
         return WriterAck(
             status="OK",
             event_id=event_id,

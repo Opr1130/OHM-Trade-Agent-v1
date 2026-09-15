@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import ast
+import inspect
 import json
 import threading
 from datetime import datetime, timedelta, timezone
@@ -815,6 +816,89 @@ def test_raw_binary_float_is_rejected_as_ack_not_exception(tmp_path):
         writer.close()
     assert ack.status == "REJECTED"
     assert ack.error_code == "INVALID_INTENT"
+
+
+def test_request_requires_persisted_context_and_matching_snapshot(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        missing = _request_payload(_context_payload("ctx-missing"))
+        missing_ack = writer.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key("decision_intelligence.request.recorded", missing),
+            event_type="decision_intelligence.request.recorded", payload=missing,
+        ))
+        context = _context_payload("ctx-existing")
+        context_ack = writer.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key("decision_intelligence.context.recorded", context),
+            event_type="decision_intelligence.context.recorded", payload=context,
+        ))
+        mismatch = _request_payload(context)
+        mismatch["frozen_snapshot_hash"] = "wrong-snapshot"
+        mismatch_ack = writer.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key("decision_intelligence.request.recorded", mismatch),
+            event_type="decision_intelligence.request.recorded", payload=mismatch,
+        ))
+        matching = _request_payload(context)
+        matching_ack = writer.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key("decision_intelligence.request.recorded", matching),
+            event_type="decision_intelligence.request.recorded", payload=matching,
+        ))
+        duplicate_ack = writer.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key("decision_intelligence.request.recorded", matching),
+            event_type="decision_intelligence.request.recorded", payload=matching,
+        ))
+    finally:
+        writer.close()
+    assert missing_ack.error_code == "INVALID_INTENT"
+    assert context_ack.status == "OK"
+    assert mismatch_ack.error_code == "INVALID_INTENT"
+    assert matching_ack.status == "OK"
+    assert duplicate_ack.status == "DUPLICATE_OK"
+
+
+def test_transition_projection_hydrates_on_restart_and_avoids_json_scan(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_TRANSITION_RECORDED
+
+    db = tmp_path / "canonical.sqlite3"
+    writer = CanonicalWriter(db)
+    request_id = _seed_di_ancestry(writer)
+    selected = _transition_payload(request_id=request_id, from_state="ELIGIBLE", to_state="SELECTED")
+    completed = _transition_payload(request_id=request_id, from_state="SELECTED", to_state="COMPLETED", transition_time="2026-01-02T03:01:00Z")
+    for payload in (selected, completed):
+        key = _di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload)
+        ack = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=key, event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=payload))
+        assert ack.status == "OK"
+    writer.close()
+    restarted = CanonicalWriter(db)
+    try:
+        rejected = restarted.submit(WriterIntent(
+            schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, _transition_payload(request_id=request_id, from_state="SELECTED", to_state="FAILED", transition_time="2026-01-02T03:02:00Z")),
+            event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+            payload=_transition_payload(request_id=request_id, from_state="SELECTED", to_state="FAILED", transition_time="2026-01-02T03:02:00Z"),
+        ))
+    finally:
+        restarted.close()
+    assert rejected.error_code == "INVALID_INTENT"
+    assert "json_extract(payload_json, '$.request_id')" not in inspect.getsource(CanonicalWriter)
+
+
+def test_transition_supersession_does_not_advance_projection(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_TRANSITION_RECORDED
+
+    db = tmp_path / "canonical.sqlite3"
+    writer = CanonicalWriter(db)
+    request_id = _seed_di_ancestry(writer)
+    original = _transition_payload(request_id=request_id, from_state="ELIGIBLE", to_state="SELECTED")
+    assert writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, original), event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=original)).status == "OK"
+    correction = _transition_payload(request_id=request_id, from_state="ELIGIBLE", to_state="SELECTED", reason="corrected", supersedes_id=original["transition_id"], supersession_reason="review")
+    assert writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, correction), event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=correction)).status == "OK"
+    completed = _transition_payload(request_id=request_id, from_state="SELECTED", to_state="COMPLETED", transition_time="2026-01-02T03:01:00Z")
+    result = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_TRANSITION_RECORDED, completed), event_type=DECISION_INTELLIGENCE_TRANSITION_RECORDED, payload=completed))
+    writer.close()
+    assert result.status == "OK"
 
 
 def test_content_derived_context_id_is_required_at_writer_boundary(tmp_path):
