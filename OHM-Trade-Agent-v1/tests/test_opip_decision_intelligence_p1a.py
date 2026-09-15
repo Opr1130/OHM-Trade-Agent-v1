@@ -34,6 +34,7 @@ from app.opip.decision_intelligence import (
 from app.opip.decision_intelligence.events import DECISION_INTELLIGENCE_CONTEXT_RECORDED
 from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_STREAM,
+    canonical_di_idempotency_key,
     context_idempotency_key,
     request_idempotency_key,
     role_result_idempotency_key,
@@ -46,6 +47,10 @@ from app.opip.decision_intelligence.events import (
     assessment_identity,
     invocation_identity,
 )
+
+
+def _di_key(event_type: str, payload: dict) -> str:
+    return canonical_di_idempotency_key(event_type, payload)
 
 
 def _provenance(**overrides):
