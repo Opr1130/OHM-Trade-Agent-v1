@@ -1087,13 +1087,52 @@ def test_di_schema_version_is_explicit_and_exactly_one(tmp_path):
     try:
         missing = dict(_context_payload("ctx-schema-missing"))
         missing.pop("schema_version")
-        unsupported = {**_context_payload("ctx-schema-unsupported"), "schema_version": 2}
-        missing_ack = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:schema:missing", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=missing))
-        unsupported_ack = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:schema:unsupported", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=unsupported))
+        unsupported = {
+            **_context_payload("ctx-schema-unsupported"),
+            "schema_version": 2,
+        }
+        missing_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:schema:missing",
+                event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload=missing,
+            )
+        )
+        unsupported_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:schema:unsupported",
+                event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload=unsupported,
+            )
+        )
+        malformed_acks = []
+        for index, bad_version in enumerate((True, "1", 1.0)):
+            malformed = {
+                **_context_payload(f"ctx-schema-malformed-{index}"),
+                "schema_version": bad_version,
+            }
+            malformed_acks.append(
+                writer.submit(
+                    WriterIntent(
+                        schema_version=1,
+                        priority="LOW",
+                        idempotency_key=f"di:schema:malformed:{index}",
+                        event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                        payload=malformed,
+                    )
+                )
+            )
     finally:
         writer.close()
+
     assert missing_ack.error_code == "INVALID_INTENT"
     assert unsupported_ack.error_code == "INVALID_INTENT"
+    assert all(ack.status == "REJECTED" for ack in malformed_acks)
+    assert all(ack.error_code == "INVALID_INTENT" for ack in malformed_acks)
 
 
 def test_collision_safe_identities_and_golden_hash_vector():
