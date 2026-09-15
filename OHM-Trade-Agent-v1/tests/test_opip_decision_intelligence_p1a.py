@@ -558,12 +558,15 @@ def test_di_writer_duplicate_conflict_is_semantic_and_isolated(tmp_path):
     db = tmp_path / "canonical.sqlite3"
     writer = CanonicalWriter(db)
     try:
+        base_payload = {"schema_version": 1, **_context_payload("ctx-1", value=1)}
         base = WriterIntent(
             schema_version=SCHEMA_VERSION,
             priority="LOW",
-            idempotency_key="di:context:ctx-1",
+            idempotency_key=_di_key(
+                DECISION_INTELLIGENCE_CONTEXT_RECORDED, base_payload
+            ),
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-            payload={"schema_version": 1, **_context_payload("ctx-1", value=1)},
+            payload=base_payload,
         )
         first = writer.submit(base)
         duplicate = writer.submit(base)
@@ -611,16 +614,16 @@ def test_di_writer_ignores_operational_provenance_but_rejects_substantive_confli
     try:
         payload = {"schema_version": 1, **_context_payload("ctx-provenance", value=1)}
         first = writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:prov:1",
+            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload),
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload,
         ))
         changed_provenance = {**payload, "provenance": {**payload["provenance"], "artifact_or_build_id": "build-99", "emitted_at": "2026-01-02T04:00:00Z", "process_instance_id": "proc-99"}}
         duplicate = writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:prov:1",
+            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, changed_provenance),
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=changed_provenance,
         ))
         conflict = writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:prov:1",
+            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, changed_provenance),
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
             payload={**changed_provenance, "missingness": {"value": 2}},
         ))
@@ -710,7 +713,8 @@ def test_content_derived_context_id_is_required_at_writer_boundary(tmp_path):
     try:
         wrong = {**_context_payload("ctx-wrong"), "context_id": "arbitrary"}
         rejected = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:id:wrong", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=wrong))
-        accepted = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:id:right", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=_context_payload("ctx-right")))
+        accepted_payload = _context_payload("ctx-right")
+        accepted = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, accepted_payload), event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=accepted_payload))
     finally:
         writer.close()
     assert rejected.error_code == "INVALID_INTENT"
@@ -723,9 +727,11 @@ def test_role_attempt_semantics_conflict_under_same_derived_identity(tmp_path):
 
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:role:1", event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=_role_result_payload()))
+        first_payload = _role_result_payload()
+        role_key = _di_key(DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, first_payload)
+        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=role_key, event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=first_payload))
         changed = _role_result_payload(thesis="changed thesis", stance="OPPOSE")
-        duplicate_or_conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:role:1", event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=changed))
+        duplicate_or_conflict = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=role_key, event_type=DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED, payload=changed))
     finally:
         writer.close()
     assert first.status == "OK"
@@ -779,8 +785,9 @@ def test_equivalent_offset_timestamps_dedupe_after_normalization(tmp_path):
     second_payload["evidence_cutoff"] = "2026-01-02T01:00:00Z"
     writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
     try:
-        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:offset:1", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=first_payload))
-        duplicate = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:offset:1", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=second_payload))
+        offset_key = _di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, first_payload)
+        first = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=offset_key, event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=first_payload))
+        duplicate = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=offset_key, event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=second_payload))
     finally:
         writer.close()
     assert first.status == "OK"
@@ -821,7 +828,7 @@ def test_nested_aware_datetimes_are_canonicalized_and_naive_rejected(tmp_path):
     db = tmp_path / "canonical.sqlite3"
     writer = CanonicalWriter(db)
     try:
-        ack = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key="di:nested:1", event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload))
+        ack = writer.submit(WriterIntent(schema_version=1, priority="LOW", idempotency_key=_di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload), event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload))
     finally:
         writer.close()
     assert ack.status == "OK"
