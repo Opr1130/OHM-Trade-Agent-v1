@@ -21,6 +21,16 @@ EventType = Literal[
     "feature.checkpoint.recorded",
     "coverage.gap.recorded",
     "feature.restart.recorded",
+    # P1A decision intelligence foundation. Kept isolated to its own stream and
+    # does not mutate the physical schema. The runtime connector only allows the
+    # canonical writer to accept the event names below.
+    "decision_intelligence.context.recorded",
+    "decision_intelligence.request.recorded",
+    "decision_intelligence.transition.recorded",
+    "decision_intelligence.role_result.recorded",
+    "decision_intelligence.assessment.recorded",
+    "decision_intelligence.invocation.recorded",
+    "decision_intelligence.comparison.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]
