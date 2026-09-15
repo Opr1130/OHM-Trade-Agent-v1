@@ -1,0 +1,6 @@
+---
+description: Canonical O'Pip engineering governance for every repository task
+alwaysApply: true
+---
+
+Read repository-root `AGENTS.md` before work. It is the canonical shared engineering policy, including architecture authority, PR #237 isolation, paper-only authority, point-in-time integrity, canonical evidence, DeepSeek worktree isolation, and release gates. Existing focused Cursor rules supplement it and must not weaken it. This adapter grants no independent authority.
