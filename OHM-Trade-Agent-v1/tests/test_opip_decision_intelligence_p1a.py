@@ -1153,10 +1153,11 @@ def test_acceptance_backup_restore_preserves_payload_hash_and_increments_epoch(t
     backup = tmp_path / "backup.sqlite3"
     restored = tmp_path / "restored.sqlite3"
     payload = {"schema_version": 1, **_context_payload("ctx-restore")}
+    restore_key = _di_key(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
     writer = CanonicalWriter(live)
     try:
         ack = writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:restore:1",
+            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=restore_key,
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload,
         ))
         assert ack.status == "OK"
@@ -1165,7 +1166,10 @@ def test_acceptance_backup_restore_preserves_payload_hash_and_increments_epoch(t
         writer.close()
     before_conn = connect(live, read_only=True)
     try:
-        before_payload_json = before_conn.execute("SELECT payload_json FROM events WHERE idempotency_key = 'di:restore:1'").fetchone()["payload_json"]
+        before_payload_json = before_conn.execute(
+            "SELECT payload_json FROM events WHERE idempotency_key = ?",
+            (restore_key,),
+        ).fetchone()["payload_json"]
     finally:
         before_conn.close()
     before_payload_hash = hashlib.sha256(before_payload_json.encode("utf-8")).hexdigest()
@@ -1177,7 +1181,10 @@ def test_acceptance_backup_restore_preserves_payload_hash_and_increments_epoch(t
     assert result["history_epoch"] == 2
     conn = connect(restored, read_only=True)
     try:
-        row = conn.execute("SELECT payload_json FROM events WHERE idempotency_key = 'di:restore:1'").fetchone()
+        row = conn.execute(
+            "SELECT payload_json FROM events WHERE idempotency_key = ?",
+            (restore_key,),
+        ).fetchone()
         epoch = conn.execute("SELECT history_epoch FROM meta WHERE id = 1").fetchone()[0]
     finally:
         conn.close()
@@ -1194,7 +1201,7 @@ def test_acceptance_backup_restore_preserves_payload_hash_and_increments_epoch(t
     restored_writer = CanonicalWriter(restored)
     try:
         duplicate = restored_writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:restore:1",
+            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key=restore_key,
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload=payload,
         ))
     finally:
@@ -1207,10 +1214,15 @@ def test_acceptance_concurrent_same_key_commits_one_logical_event(tmp_path):
     from app.opip.canonical.writer import CanonicalWriter
 
     db = tmp_path / "canonical.sqlite3"
+    concurrent_payload = {"schema_version": 1, **_context_payload("ctx-concurrent")}
     intent = WriterIntent(
-        schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:concurrent:1",
+        schema_version=SCHEMA_VERSION,
+        priority="LOW",
+        idempotency_key=_di_key(
+            DECISION_INTELLIGENCE_CONTEXT_RECORDED, concurrent_payload
+        ),
         event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-        payload={"schema_version": 1, **_context_payload("ctx-concurrent")},
+        payload=concurrent_payload,
     )
     writer = CanonicalWriter(db)
     acks = []
@@ -1248,10 +1260,15 @@ def test_acceptance_schema_and_authority_boundaries_are_unchanged(tmp_path):
         }
     try:
         before = schema_map(writer._conn)
+        schema_payload = {"schema_version": 1, **_context_payload("ctx-schema")}
         ack = writer.submit(WriterIntent(
-            schema_version=SCHEMA_VERSION, priority="LOW", idempotency_key="di:schema:1",
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=_di_key(
+                DECISION_INTELLIGENCE_CONTEXT_RECORDED, schema_payload
+            ),
             event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-            payload={"schema_version": 1, **_context_payload("ctx-schema")},
+            payload=schema_payload,
         ))
         assert ack.status == "OK"
     finally:
@@ -1418,7 +1435,9 @@ def test_valid_comparison_persists_after_watermark_normalization(tmp_path):
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key="di:comparison:valid-regression",
+                idempotency_key=_di_key(
+                    "decision_intelligence.comparison.recorded", payload
+                ),
                 event_type="decision_intelligence.comparison.recorded",
                 payload=payload,
             )
@@ -1613,7 +1632,9 @@ def test_only_optional_advisory_disposition_accepts_explicit_null(tmp_path):
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
-                idempotency_key="di:comparison:optional-null",
+                idempotency_key=_di_key(
+                    "decision_intelligence.comparison.recorded", comparison
+                ),
                 event_type="decision_intelligence.comparison.recorded",
                 payload=comparison,
             )
