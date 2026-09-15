@@ -522,6 +522,10 @@ def test_comparison_timely_requires_explicit_on_time_disposition():
     record = ComparisonRecord(**values)
     assert record.timeliness_eligibility is True
 
+    values["timeliness_eligibility"] = "false"
+    with pytest.raises(ValueError, match="must be a boolean"):
+        ComparisonRecord(**values)
+
 
 def test_result_disposition_enforces_late_not_earlier_feasibility():
     assert ResultDisposition.ON_TIME.value == "ON_TIME"
@@ -861,11 +865,11 @@ def test_di_identity_is_epoch_invariant_and_request_varies_by_model():
     )
     assert request_idempotency_key(request_id="req-1") == request_idempotency_key(request_id="req-1")
     assert role_result_idempotency_key(
-        request_id="req-1", role="REGIME_ANALYST", route_version="r1",
-        prompt_version="p1", attempt=1, model_version="m1",
+        request_id="req-1", role="REGIME_ANALYST", role_version="role-1",
+        route_version="r1", prompt_version="p1", attempt=1, model_version="m1",
     ) != role_result_idempotency_key(
-        request_id="req-1", role="REGIME_ANALYST", route_version="r1",
-        prompt_version="p1", attempt=1, model_version="m2",
+        request_id="req-1", role="REGIME_ANALYST", role_version="role-1",
+        route_version="r1", prompt_version="p1", attempt=1, model_version="m2",
     )
 
 
@@ -1341,3 +1345,238 @@ def test_acceptance_assessment_summary_is_request_and_synthesis_grain():
     )
     assert summary.request_id == "req-1"
     assert summary.synthesis == "synthesis"
+
+
+def _valid_comparison_payload_for_regression():
+    from app.opip.decision_intelligence.events import comparison_identity
+
+    payload = {
+        "schema_version": 1,
+        "comparison_id": "placeholder",
+        "decision_context_id": "ctx-regression",
+        "baseline_decision_id": "baseline-regression",
+        "committee_assessment_id": "assessment-regression",
+        "committee_request_id": "request-regression",
+        "experiment_id": "experiment-regression",
+        "variant_version": "v1",
+        "environment": "paper",
+        "research_account_id": "research",
+        "evaluation_window_start": "2026-01-02T03:00:00Z",
+        "evaluation_window_end": "2026-01-02T04:00:00Z",
+        "common_outcome_horizon": 1,
+        "as_of_watermark": {"history_epoch": 1, "local_sequence": 7},
+        "timeliness_eligibility": False,
+        "baseline_policy_version": "policy",
+        "simulated_policy_ref": None,
+        "execution_model_version": "exec",
+        "fee_policy_version": "fee",
+        "attribution_method_version": "attr",
+        "cost_allocation_version": "cost",
+        "currency": "USD",
+        "invocation_refs": [],
+        "ai_cost_attributed": None,
+        "other_incremental_operating_cost": None,
+        "cost_reconciliation_status": "UNKNOWN",
+        "cost_completeness": "UNKNOWN",
+        "baseline_trading_net": 0,
+        "variant_trading_net": 0,
+        "incremental_trading_net": 0,
+        "incremental_operating_net": 0,
+        "coverage_grade": "UNKNOWN",
+        "uncertainty_method_version": "u1",
+        "uncertainty_result": "UNKNOWN",
+        "provenance": _provenance_payload(),
+        "advisory_disposition": None,
+    }
+    payload["comparison_id"] = comparison_identity(payload)
+    return payload
+
+
+def test_valid_comparison_persists_after_watermark_normalization(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        payload = _valid_comparison_payload_for_regression()
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:comparison:valid-regression",
+                event_type="decision_intelligence.comparison.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.status == "OK"
+    assert ack.error_code is None
+
+
+@pytest.mark.parametrize(
+    "watermark",
+    [
+        {"history_epoch": True, "local_sequence": 1},
+        {"history_epoch": "01", "local_sequence": 1},
+        {"history_epoch": 1.0, "local_sequence": 1},
+        {"history_epoch": 1, "local_sequence": False},
+        {"history_epoch": 1, "local_sequence": "7"},
+    ],
+)
+def test_di_watermark_coordinates_require_exact_non_boolean_integers(
+    tmp_path, watermark
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        context = _context_payload("ctx-strict-watermark")
+        context["consumed_input_watermark"] = watermark
+        context_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=f"di:strict-watermark:{repr(watermark)}",
+                event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload=context,
+            )
+        )
+
+        comparison = _valid_comparison_payload_for_regression()
+        comparison["as_of_watermark"] = watermark
+        comparison_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=f"di:comparison-watermark:{repr(watermark)}",
+                event_type="decision_intelligence.comparison.recorded",
+                payload=comparison,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert context_ack.error_code == "INVALID_INTENT"
+    assert comparison_ack.error_code == "INVALID_INTENT"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("risks", "risk-one"),
+        ("evidence_refs", "EVT:one"),
+        ("missing_evidence", {"source": "missing"}),
+    ],
+)
+def test_role_result_repeated_fields_reject_scalar_or_mapping(
+    tmp_path, field_name, bad_value
+):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    payload = _role_result_payload()
+    payload[field_name] = bad_value
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=f"di:bad-array:{field_name}",
+                event_type="decision_intelligence.role_result.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.error_code == "INVALID_INTENT"
+
+
+def test_role_result_idempotency_distinguishes_version_and_supersession(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    common = {
+        "request_id": "request-1",
+        "role": "REGIME_ANALYST",
+        "route_version": "route-1",
+        "prompt_version": "prompt-1",
+        "attempt": 1,
+        "model_version": "model-1",
+    }
+    key_v1 = role_result_idempotency_key(
+        **common,
+        role_version="role-1",
+    )
+    key_v2 = role_result_idempotency_key(
+        **common,
+        role_version="role-2",
+    )
+    assert key_v1 != key_v2
+
+    first = _role_result_payload()
+    correction = _role_result_payload(
+        thesis="corrected thesis",
+        supersedes_id=first["result_id"],
+        supersession_reason="correction",
+    )
+    correction_key = role_result_idempotency_key(
+        **common,
+        role_version="role-1",
+        supersedes_id=first["result_id"],
+        supersession_reason="correction",
+    )
+    assert correction_key != key_v1
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        first_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=key_v1,
+                event_type="decision_intelligence.role_result.recorded",
+                payload=first,
+            )
+        )
+        correction_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=correction_key,
+                event_type="decision_intelligence.role_result.recorded",
+                payload=correction,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert first_ack.status == "OK"
+    assert correction_ack.status == "OK"
+    assert correction_ack.event_id != first_ack.event_id
+
+
+def test_writer_rejects_non_boolean_timeliness_eligibility(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+    from app.opip.decision_intelligence.events import comparison_identity
+
+    payload = _valid_comparison_payload_for_regression()
+    payload["timeliness_eligibility"] = "false"
+    payload["advisory_disposition"] = "ON_TIME"
+    payload["comparison_id"] = comparison_identity(payload)
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:comparison:bad-timeliness-bool",
+                event_type="decision_intelligence.comparison.recorded",
+                payload=payload,
+            )
+        )
+    finally:
+        writer.close()
+
+    assert ack.error_code == "INVALID_INTENT"
