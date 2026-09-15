@@ -117,10 +117,16 @@ def _request_payload(context_payload: dict) -> dict:
         "route_version": "route-1",
         "prompt_version": "prompt-1",
         "role_configuration_version": "roles-1",
-        "eligibility_at": "2026-01-02T03:04:00Z",
-        "deadline_at": "2026-01-02T03:10:00Z",
+        "eligibility_at": datetime(
+            2026, 1, 2, 3, 4, tzinfo=timezone.utc
+        ),
+        "deadline_at": datetime(
+            2026, 1, 2, 3, 10, tzinfo=timezone.utc
+        ),
         "budget_reservation": 1,
-        "enqueue_time": "2026-01-02T03:04:00Z",
+        "enqueue_time": datetime(
+            2026, 1, 2, 3, 4, tzinfo=timezone.utc
+        ),
         "result_selection_rule_version": "selection-1",
         "schema_version": 1,
         "provenance": _provenance_payload(),
