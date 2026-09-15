@@ -247,7 +247,7 @@ class DecisionContext:
             "missingness",
             _freeze_nested(dict(self.missingness)),
         )
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported Decision Intelligence schema_version")
 
     def as_dict(self) -> dict[str, Any]:
