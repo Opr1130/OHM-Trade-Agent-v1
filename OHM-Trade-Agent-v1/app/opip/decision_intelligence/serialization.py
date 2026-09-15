@@ -31,12 +31,13 @@ def canonical_data(value: Any) -> Any:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("mapping keys must be strings")
-            cleaned[key] = canonical_data(item)
+            normalized_key = unicodedata.normalize("NFC", key)
+            if normalized_key in cleaned:
+                raise ValueError("mapping keys collide after NFC normalization")
+            cleaned[normalized_key] = canonical_data(item)
         return {key: cleaned[key] for key in sorted(cleaned)}
     if isinstance(value, (list, tuple)):
         return [canonical_data(item) for item in value]
-    if isinstance(value, dict):
-        return canonical_data(dict(value))
     if hasattr(value, "as_dict") and callable(value.as_dict):
         return canonical_data(value.as_dict())
     raise TypeError(f"unsupported canonical data type: {type(value).__name__}")
