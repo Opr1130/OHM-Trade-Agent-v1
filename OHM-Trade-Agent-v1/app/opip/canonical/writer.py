@@ -38,6 +38,7 @@ from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_TRANSITION_RECORDED,
     assessment_idempotency_key,
     canonical_di_idempotency_key,
+    comparison_idempotency_key,
     context_idempotency_key,
     invocation_idempotency_key,
     request_idempotency_key,
@@ -518,6 +519,14 @@ class CanonicalWriter:
             ),
         )
 
+    def _load_comparison_by_id(self, comparison_id: str) -> dict:
+        return self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_COMPARISON_RECORDED,
+            idempotency_key=comparison_idempotency_key(
+                comparison_id=comparison_id
+            ),
+        )
+
     def _load_role_result_by_id(self, result_id: str) -> dict:
         idempotency_key = self._role_result_idempotency_by_id.get(result_id)
         if idempotency_key is None:
@@ -613,6 +622,61 @@ class CanonicalWriter:
             invocation = self._load_invocation_by_id(invocation_id)
             if invocation.get("request_id") != request_id:
                 raise ValueError("comparison invocation request mismatch")
+
+    def _validate_di_record_supersession(
+        self, event_type: str, payload: Mapping[str, object]
+    ) -> None:
+        supersedes_id = payload.get("supersedes_id")
+        if supersedes_id is None:
+            return
+        if not isinstance(supersedes_id, str) or not supersedes_id:
+            raise ValueError("supersedes_id is invalid")
+
+        if event_type == DECISION_INTELLIGENCE_INVOCATION_RECORDED:
+            superseded = self._load_invocation_by_id(supersedes_id)
+            request_id = self._require_string_ref(payload, "request_id")
+            if superseded.get("request_id") != request_id:
+                raise ValueError("invocation supersession request mismatch")
+            self._load_request_context_for_id(request_id)
+            return
+
+        if event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
+            superseded = self._load_role_result_by_id(supersedes_id)
+            request_id = self._require_string_ref(payload, "request_id")
+            if superseded.get("request_id") != request_id:
+                raise ValueError("role result supersession request mismatch")
+            self._load_request_context_for_id(request_id)
+            return
+
+        if event_type == DECISION_INTELLIGENCE_ASSESSMENT_RECORDED:
+            superseded = self._load_assessment_by_id(supersedes_id)
+            request_id = self._require_string_ref(payload, "request_id")
+            if superseded.get("request_id") != request_id:
+                raise ValueError("assessment supersession request mismatch")
+            self._load_request_context_for_id(request_id)
+            return
+
+        if event_type == DECISION_INTELLIGENCE_COMPARISON_RECORDED:
+            superseded = self._load_comparison_by_id(supersedes_id)
+            request_id = self._require_string_ref(
+                payload, "committee_request_id"
+            )
+            context_id = self._require_string_ref(
+                payload, "decision_context_id"
+            )
+            if superseded.get("committee_request_id") != request_id:
+                raise ValueError("comparison supersession request mismatch")
+            if superseded.get("decision_context_id") != context_id:
+                raise ValueError("comparison supersession context mismatch")
+            request_payload, context_payload = (
+                self._load_request_context_for_id(request_id)
+            )
+            if request_payload.get("context_id") != context_id:
+                raise ValueError(
+                    "comparison supersession request/context mismatch"
+                )
+            if context_payload.get("context_id") != context_id:
+                raise ValueError("comparison supersession context mismatch")
 
     @staticmethod
     def _evidence_manifest_and_cutoff(
@@ -813,6 +877,10 @@ class CanonicalWriter:
         if intent.event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:
             self._validate_request_context_ancestry(normalized)
         self._validate_di_downstream_ancestry(
+            intent.event_type,
+            normalized,
+        )
+        self._validate_di_record_supersession(
             intent.event_type,
             normalized,
         )
