@@ -15,6 +15,18 @@ def require_utc(value: datetime, *, field_name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _canonical_mapping(value: Mapping[Any, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError("mapping keys must be strings")
+        normalized_key = unicodedata.normalize("NFC", key)
+        if normalized_key in cleaned:
+            raise ValueError("mapping keys collide after NFC normalization")
+        cleaned[normalized_key] = canonical_data(item)
+    return {key: cleaned[key] for key in sorted(cleaned)}
+
+
 def canonical_data(value: Any) -> Any:
     if isinstance(value, Enum):
         return canonical_data(value.value)
@@ -27,15 +39,7 @@ def canonical_data(value: Any) -> Any:
     if isinstance(value, datetime):
         return require_utc(value, field_name="timestamp").isoformat().replace("+00:00", "Z")
     if isinstance(value, Mapping):
-        cleaned: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("mapping keys must be strings")
-            normalized_key = unicodedata.normalize("NFC", key)
-            if normalized_key in cleaned:
-                raise ValueError("mapping keys collide after NFC normalization")
-            cleaned[normalized_key] = canonical_data(item)
-        return {key: cleaned[key] for key in sorted(cleaned)}
+        return _canonical_mapping(value)
     if isinstance(value, (list, tuple)):
         return [canonical_data(item) for item in value]
     if hasattr(value, "as_dict") and callable(value.as_dict):
