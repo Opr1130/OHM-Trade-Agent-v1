@@ -65,6 +65,7 @@ _ENUM_FIELDS = {
 _EXTRA_TIMESTAMP_FIELDS = {
     "evaluation_time",
     "evidence_cutoff",
+    "enqueue_time",
     "transition_time",
     "started_at",
     "completed_at",
