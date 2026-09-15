@@ -315,6 +315,7 @@ class CanonicalWriter:
                     detail=str(exc),
                 )
             except sqlite3.IntegrityError:
+                self._conn.rollback()
                 existing = self._lookup_idempotency(
                     intent.idempotency_key,
                     payload_json=payload_json,
