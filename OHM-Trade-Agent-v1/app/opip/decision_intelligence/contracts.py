@@ -394,12 +394,25 @@ class ComparisonRecord:
         if not isinstance(watermark, ConsumedInputWatermark):
             if not isinstance(watermark, Mapping):
                 raise ValueError("as_of_watermark must be a watermark object")
-            try:
-                watermark = ConsumedInputWatermark.from_dict(watermark)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("invalid as_of_watermark") from exc
+            if set(watermark) != {"history_epoch", "local_sequence"}:
+                raise ValueError("invalid as_of_watermark")
+            history_epoch = watermark["history_epoch"]
+            local_sequence = watermark["local_sequence"]
+            if type(history_epoch) is not int or type(local_sequence) is not int:
+                raise ValueError("invalid as_of_watermark")
+            if history_epoch < 0 or local_sequence < 0:
+                raise ValueError("invalid as_of_watermark")
+            watermark = ConsumedInputWatermark(
+                history_epoch=history_epoch,
+                local_sequence=local_sequence,
+            )
             object.__setattr__(self, "as_of_watermark", watermark)
-        if self.timeliness_eligibility and self.advisory_disposition is not ResultDisposition.ON_TIME:
+        if type(self.timeliness_eligibility) is not bool:
+            raise ValueError("timeliness_eligibility must be a boolean")
+        if (
+            self.timeliness_eligibility
+            and self.advisory_disposition is not ResultDisposition.ON_TIME
+        ):
             raise ValueError(
                 "LATE or unknown evidence cannot be timely; explicit ON_TIME advisory disposition required"
             )
