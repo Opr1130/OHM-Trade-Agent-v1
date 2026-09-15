@@ -36,6 +36,9 @@ from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
     DECISION_INTELLIGENCE_STREAM,
     DECISION_INTELLIGENCE_TRANSITION_RECORDED,
+    canonical_di_idempotency_key,
+    context_idempotency_key,
+    request_idempotency_key,
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
@@ -77,17 +80,6 @@ _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS = frozenset(
 #: The only checkpoint field allowed to move between same-key retries is its
 #: creation clock; retained rolling state is substantive evidence.
 _CHECKPOINT_VOLATILE_KEYS = frozenset({"created_at_utc"})
-
-_DI_IDENTITY_FIELD_BY_EVENT = {
-    DECISION_INTELLIGENCE_CONTEXT_RECORDED: "context_id",
-    DECISION_INTELLIGENCE_REQUEST_RECORDED: "request_id",
-    DECISION_INTELLIGENCE_TRANSITION_RECORDED: "transition_id",
-    DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED: "result_id",
-    DECISION_INTELLIGENCE_ASSESSMENT_RECORDED: "assessment_id",
-    DECISION_INTELLIGENCE_INVOCATION_RECORDED: "invocation_id",
-    DECISION_INTELLIGENCE_COMPARISON_RECORDED: "comparison_id",
-}
-
 
 def _idempotency_payload_json(event_type: str, payload: object) -> str:
     """Canonical JSON used for same-key semantic conflict detection."""
@@ -182,14 +174,6 @@ class CanonicalWriter:
                 payload_json = _idempotency_payload_json(
                     intent.event_type, normalized_payload
                 )
-            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
-                existing_identity = self._lookup_di_record_identity(
-                    intent.event_type,
-                    normalized_payload,
-                    payload_json=payload_json,
-                )
-                if existing_identity is not None:
-                    return existing_identity
             existing = self._lookup_idempotency(
                 intent.idempotency_key,
                 payload_json=payload_json,
@@ -344,69 +328,94 @@ class CanonicalWriter:
                     pass
                 raise
 
-    def _lookup_di_record_identity(
-        self,
-        event_type: str,
-        payload: Mapping[str, object],
-        *,
-        payload_json: str | None,
-    ) -> WriterAck | None:
-        """Enforce one immutable canonical event per content-derived DI identity."""
-        identity_field = _DI_IDENTITY_FIELD_BY_EVENT.get(event_type)
-        if identity_field is None:
-            return None
-        identity = payload.get(identity_field)
-        if not isinstance(identity, str) or not identity:
-            raise ValueError(f"{identity_field} required")
-
-        rows = self._conn.execute(
+    def _load_di_payload(
+        self, *, event_type: str, idempotency_key: str
+    ) -> dict:
+        row = self._conn.execute(
             """
-            SELECT event_id, history_epoch, local_sequence, payload_json
+            SELECT payload_json
             FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch DESC, local_sequence DESC
+            WHERE event_type = ? AND idempotency_key = ?
             """,
-            (event_type,),
-        ).fetchall()
-        for row in rows:
-            try:
-                existing_payload = json.loads(str(row["payload_json"]))
-            except json.JSONDecodeError:
-                return WriterAck(
-                    status="REJECTED",
-                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
-                    event_id=str(row["event_id"]),
-                    detail="existing DI event payload is not valid JSON",
+            (event_type, idempotency_key),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"required {event_type} record is missing for evidence validation"
+            )
+        try:
+            raw_payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"persisted {event_type} payload is invalid JSON"
+            ) from exc
+        return validate_di_payload(event_type, raw_payload)
+
+    def _validate_di_evidence_eligibility(
+        self, event_type: str, payload: Mapping[str, object]
+    ) -> None:
+        if event_type not in {
+            DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+            DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
+        }:
+            return
+        evidence_refs = payload.get("evidence_refs")
+        if not evidence_refs:
+            return
+        if not isinstance(evidence_refs, list):
+            raise ValueError("evidence_refs must be a canonical array")
+
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id required for evidence validation")
+        request_payload = self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_REQUEST_RECORDED,
+            idempotency_key=request_idempotency_key(request_id=request_id),
+        )
+        context_id = request_payload.get("context_id")
+        if not isinstance(context_id, str) or not context_id:
+            raise ValueError("persisted request has no valid context_id")
+        context_payload = self._load_di_payload(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            idempotency_key=context_idempotency_key(context_id=context_id),
+        )
+        if request_payload.get("frozen_snapshot_hash") != context_payload.get(
+            "snapshot_hash"
+        ):
+            raise ValueError("persisted request/context snapshot mismatch")
+
+        manifest = context_payload.get("evidence_eligibility_manifest")
+        if not isinstance(manifest, Mapping):
+            raise ValueError("persisted context evidence manifest is invalid")
+        cutoff_raw = context_payload.get("evidence_cutoff")
+        if not isinstance(cutoff_raw, str):
+            raise ValueError("persisted context evidence_cutoff is invalid")
+        cutoff = datetime.fromisoformat(cutoff_raw.replace("Z", "+00:00"))
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("persisted context evidence_cutoff is not aware")
+
+        for evidence_ref in evidence_refs:
+            if evidence_ref not in manifest:
+                raise ValueError(
+                    f"evidence reference is not in frozen manifest: {evidence_ref}"
                 )
-            if not isinstance(existing_payload, dict):
-                return WriterAck(
-                    status="REJECTED",
-                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
-                    event_id=str(row["event_id"]),
-                    detail="existing DI event payload is not an object",
-                )
-            if existing_payload.get(identity_field) != identity:
+            entry = manifest[evidence_ref]
+            if not isinstance(entry, Mapping):
+                raise ValueError("persisted evidence manifest entry is invalid")
+            available_at_raw = entry.get("available_at")
+            if available_at_raw is None:
                 continue
-            existing_semantic = _idempotency_payload_json(
-                event_type, existing_payload
+            if not isinstance(available_at_raw, str):
+                raise ValueError("persisted evidence availability is invalid")
+            available_at = datetime.fromisoformat(
+                available_at_raw.replace("Z", "+00:00")
             )
-            if payload_json is not None and existing_semantic != payload_json:
-                return WriterAck(
-                    status="REJECTED",
-                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
-                    event_id=str(row["event_id"]),
-                    detail=(
-                        f"{identity_field} already committed with a different "
-                        "semantic payload"
-                    ),
+            if available_at.tzinfo is None or available_at.utcoffset() is None:
+                raise ValueError("persisted evidence availability is not aware")
+            if available_at > cutoff:
+                raise ValueError(
+                    "evidence reference is unavailable at evidence_cutoff"
                 )
-            return WriterAck(
-                status="DUPLICATE_OK",
-                event_id=str(row["event_id"]),
-                history_epoch=int(row["history_epoch"]),
-                local_sequence=int(row["local_sequence"]),
-            )
-        return None
 
     def _lookup_idempotency(
         self, key: str, *, payload_json: str | None = None, event_type: str | None = None
@@ -470,7 +479,19 @@ class CanonicalWriter:
                 raise ValueError("decision intelligence events must use LOW priority")
             if intent.ops_handoff is not None:
                 raise ValueError("decision intelligence events must not carry ops_handoff")
-            return validate_di_payload(intent.event_type, intent.payload)
+            normalized = validate_di_payload(intent.event_type, intent.payload)
+            expected_key = canonical_di_idempotency_key(
+                intent.event_type, normalized
+            )
+            if intent.idempotency_key != expected_key:
+                raise ValueError(
+                    "decision intelligence idempotency_key does not match "
+                    "canonical record identity"
+                )
+            self._validate_di_evidence_eligibility(
+                intent.event_type, normalized
+            )
+            return normalized
         if intent.event_type == "alert_governor.capture_gap.recorded":
             if intent.ops_handoff is not None:
                 raise ValueError("capture_gap must not carry ops_handoff")
