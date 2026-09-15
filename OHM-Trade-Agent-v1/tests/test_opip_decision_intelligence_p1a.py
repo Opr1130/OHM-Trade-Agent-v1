@@ -3197,3 +3197,102 @@ def test_losing_idempotency_race_rolls_back_for_next_submit(
         writer_a.close()
 
     assert next_ack.status == "OK"
+
+
+
+def test_second_writer_refreshes_role_result_for_assessment(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    db = tmp_path / "canonical.sqlite3"
+    writer_a = CanonicalWriter(db)
+    try:
+        request_id = _seed_di_ancestry(writer_a, value=41)
+        writer_b = CanonicalWriter(db)
+        try:
+            role_result = _role_result_payload(request_id=request_id)
+            role_ack = writer_a.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        "decision_intelligence.role_result.recorded",
+                        role_result,
+                    ),
+                    event_type="decision_intelligence.role_result.recorded",
+                    payload=role_result,
+                )
+            )
+            assert role_ack.status == "OK"
+
+            assessment = _assessment_payload(
+                request_id=request_id,
+                referenced_role_result_ids=[role_result["result_id"]],
+                invocation_references=[],
+            )
+            assessment_ack = writer_b.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        "decision_intelligence.assessment.recorded",
+                        assessment,
+                    ),
+                    event_type="decision_intelligence.assessment.recorded",
+                    payload=assessment,
+                )
+            )
+        finally:
+            writer_b.close()
+    finally:
+        writer_a.close()
+
+    assert assessment_ack.status == "OK"
+
+
+def test_second_writer_refreshes_role_result_for_correction(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    db = tmp_path / "canonical.sqlite3"
+    writer_a = CanonicalWriter(db)
+    try:
+        request_id = _seed_di_ancestry(writer_a, value=42)
+        writer_b = CanonicalWriter(db)
+        try:
+            original = _role_result_payload(request_id=request_id)
+            original_ack = writer_a.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        "decision_intelligence.role_result.recorded",
+                        original,
+                    ),
+                    event_type="decision_intelligence.role_result.recorded",
+                    payload=original,
+                )
+            )
+            assert original_ack.status == "OK"
+
+            correction = _role_result_payload(
+                request_id=request_id,
+                supersedes_id=original["result_id"],
+                supersession_reason="role result correction",
+            )
+            correction_ack = writer_b.submit(
+                WriterIntent(
+                    schema_version=1,
+                    priority="LOW",
+                    idempotency_key=_di_key(
+                        "decision_intelligence.role_result.recorded",
+                        correction,
+                    ),
+                    event_type="decision_intelligence.role_result.recorded",
+                    payload=correction,
+                )
+            )
+        finally:
+            writer_b.close()
+    finally:
+        writer_a.close()
+
+    assert correction_ack.status == "OK"
