@@ -904,10 +904,11 @@ def test_raw_writer_rejects_authority_fields_and_invalid_role():
 
 def test_di_identity_is_epoch_invariant_and_request_varies_by_model():
     context_key = context_idempotency_key(context_id="ctx-1")
-    assert context_key == _identity(
+    expected_context_key = stable_hash(
         DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-        "ctx-1",
+        {"components": ["ctx-1"]},
     )
+    assert context_key == expected_context_key
     assert request_idempotency_key(request_id="req-1") == request_idempotency_key(request_id="req-1")
     assert role_result_idempotency_key(
         request_id="req-1", role="REGIME_ANALYST", role_version="role-1",
