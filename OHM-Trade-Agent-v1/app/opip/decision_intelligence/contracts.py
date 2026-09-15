@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Mapping
+
 from app.opip.contracts.identity import ConsumedInputWatermark
 from app.opip.decision_intelligence.identity import DecisionContext, Provenance
+from app.opip.decision_intelligence.serialization import require_utc
 
 
 class RequestState(str, Enum):
@@ -25,7 +27,10 @@ class ResultDisposition(str, Enum):
 
 
 def timely_evidence_eligible(dispositions: Iterable[ResultDisposition]) -> bool:
-    return all(disposition is ResultDisposition.ON_TIME for disposition in dispositions)
+    values = tuple(dispositions)
+    return bool(values) and all(
+        disposition is ResultDisposition.ON_TIME for disposition in values
+    )
 
 
 class AdvisoryStance(str, Enum):
@@ -120,11 +125,12 @@ class CommitteeRequest:
                 raise ValueError(f"{field_name} is required")
         if self.context_snapshot_hash is not None and self.frozen_snapshot_hash != self.context_snapshot_hash:
             raise ValueError("CommitteRequest.frozen_snapshot_hash must equal DecisionContext.snapshot_hash")
-        for value, name in ((self.eligibility_at, "eligibility_at"), (self.deadline_at, "deadline_at"), (self.enqueue_time, "enqueue_time")):
-            if value.tzinfo is None or value.utcoffset() is None:
-                raise ValueError(f"{name} must be timezone-aware UTC")
-            if value.astimezone(timezone.utc) != value:
-                raise ValueError(f"{name} must be UTC")
+        for field_name in ("eligibility_at", "deadline_at", "enqueue_time"):
+            object.__setattr__(
+                self,
+                field_name,
+                require_utc(getattr(self, field_name), field_name=field_name),
+            )
         if self.deadline_at < self.eligibility_at:
             raise ValueError("deadline_at must be >= eligibility_at")
 
@@ -153,8 +159,11 @@ class CommitteeRequestTransition:
             raise ValueError("terminal state cannot transition")
         if self.to_state not in LEGAL_REQUEST_TRANSITIONS.get(self.from_state, frozenset()):
             raise ValueError("undeclared transition")
-        if self.transition_time.tzinfo is None or self.transition_time.utcoffset() is None:
-            raise ValueError("transition_time must be timezone-aware UTC")
+        object.__setattr__(
+            self,
+            "transition_time",
+            require_utc(self.transition_time, field_name="transition_time"),
+        )
 
 
 @dataclass(frozen=True)
@@ -236,6 +245,18 @@ class CommitteeAssessmentSummary:
             raise ValueError("invalid advisory stance")
         if self.completeness is not None and (type(self.completeness) is not int or not 0 <= self.completeness <= 10000):
             raise ValueError("completeness must be integer basis points from 0 to 10000")
+        object.__setattr__(
+            self,
+            "completion_time",
+            require_utc(self.completion_time, field_name="completion_time"),
+        )
+        object.__setattr__(
+            self,
+            "commit_time",
+            require_utc(self.commit_time, field_name="commit_time"),
+        )
+        if self.commit_time < self.completion_time:
+            raise ValueError("commit_time must be >= completion_time")
 
     def idempotency_key(self) -> str:
         from app.opip.decision_intelligence.events import assessment_idempotency_key
@@ -287,6 +308,18 @@ class ModelInvocation:
         if self.billed_cost_microunits is None and self.estimated_cost_microunits is None:
             if self.cost_completeness not in {"UNKNOWN", "INCOMPLETE"}:
                 raise ValueError("unknown invocation cost must be marked UNKNOWN or INCOMPLETE")
+        object.__setattr__(
+            self,
+            "started_at",
+            require_utc(self.started_at, field_name="started_at"),
+        )
+        object.__setattr__(
+            self,
+            "completed_at",
+            require_utc(self.completed_at, field_name="completed_at"),
+        )
+        if self.completed_at < self.started_at:
+            raise ValueError("completed_at must be >= started_at")
 
 
 @dataclass(frozen=True)
@@ -339,8 +372,37 @@ class ComparisonRecord:
         )
         if any(not str(getattr(self, name)).strip() for name in required):
             raise ValueError("comparison references are required")
-        if self.advisory_disposition is ResultDisposition.LATE and self.timeliness_eligibility:
-            raise ValueError("LATE evidence cannot be timely comparison evidence")
+        object.__setattr__(
+            self,
+            "evaluation_window_start",
+            require_utc(
+                self.evaluation_window_start,
+                field_name="evaluation_window_start",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "evaluation_window_end",
+            require_utc(
+                self.evaluation_window_end,
+                field_name="evaluation_window_end",
+            ),
+        )
+        if self.evaluation_window_end < self.evaluation_window_start:
+            raise ValueError("evaluation_window_end must be >= evaluation_window_start")
+        watermark = self.as_of_watermark
+        if not isinstance(watermark, ConsumedInputWatermark):
+            if not isinstance(watermark, Mapping):
+                raise ValueError("as_of_watermark must be a watermark object")
+            try:
+                watermark = ConsumedInputWatermark.from_dict(watermark)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid as_of_watermark") from exc
+            object.__setattr__(self, "as_of_watermark", watermark)
+        if self.timeliness_eligibility and self.advisory_disposition is not ResultDisposition.ON_TIME:
+            raise ValueError(
+                "timely comparison evidence requires explicit ON_TIME advisory disposition"
+            )
 
 
 RequestTransition = CommitteeRequestTransition

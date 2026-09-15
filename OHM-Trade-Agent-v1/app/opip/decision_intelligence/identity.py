@@ -2,10 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.contracts.identity import ConsumedInputWatermark
 from app.opip.decision_intelligence.serialization import canonicalize_nested, require_utc, stable_hash
+
+
+def _freeze_nested(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_nested(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_nested(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -86,30 +97,67 @@ class DecisionContext:
         if isinstance(self.consumed_input_watermark, ConsumedInputWatermark):
             watermark = self.consumed_input_watermark
         else:
-            raw_watermark = dict(self.consumed_input_watermark)
-            watermark = ConsumedInputWatermark(
-                history_epoch=int(raw_watermark["history_epoch"]),
-                local_sequence=int(raw_watermark["local_sequence"]),
-            )
+            if not isinstance(self.consumed_input_watermark, Mapping):
+                raise ValueError("consumed_input_watermark must be a watermark object")
+            try:
+                watermark = ConsumedInputWatermark.from_dict(
+                    self.consumed_input_watermark
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("invalid consumed_input_watermark") from exc
         object.__setattr__(self, "consumed_input_watermark", watermark)
+
+        normalized_manifest: dict[str, Any] = {}
         for evidence_id, entry in dict(self.evidence_eligibility_manifest).items():
+            if not isinstance(entry, Mapping):
+                raise ValueError("evidence manifest entries must be objects")
             item = dict(entry)
             available_at = item.get("available_at")
-            if available_at is None:
-                continue
-            if not isinstance(available_at, datetime):
-                available_at = datetime.fromisoformat(str(available_at).replace("Z", "+00:00"))
-            available_at = require_utc(available_at, field_name="evidence.available_at")
-            if available_at > self.evidence_cutoff:
-                raise ValueError("evidence_cutoff rejects evidence available after cutoff")
-        for availability in dict(self.source_availability_times).values():
-            if availability is None:
-                continue
-            if not isinstance(availability, datetime):
-                availability = datetime.fromisoformat(str(availability).replace("Z", "+00:00"))
-            availability = require_utc(availability, field_name="source_availability_time")
-            if availability > self.evidence_cutoff:
-                raise ValueError("evidence_cutoff rejects evidence available after cutoff")
+            if available_at is not None:
+                if not isinstance(available_at, datetime):
+                    available_at = datetime.fromisoformat(
+                        str(available_at).replace("Z", "+00:00")
+                    )
+                available_at = require_utc(
+                    available_at, field_name="evidence.available_at"
+                )
+                if available_at > self.evidence_cutoff:
+                    raise ValueError(
+                        "evidence_cutoff rejects evidence available after cutoff"
+                    )
+                item["available_at"] = available_at
+            normalized_manifest[str(evidence_id)] = _freeze_nested(item)
+        object.__setattr__(
+            self,
+            "evidence_eligibility_manifest",
+            MappingProxyType(normalized_manifest),
+        )
+
+        normalized_availability: dict[str, Any] = {}
+        for source, availability in dict(self.source_availability_times).items():
+            if availability is not None:
+                if not isinstance(availability, datetime):
+                    availability = datetime.fromisoformat(
+                        str(availability).replace("Z", "+00:00")
+                    )
+                availability = require_utc(
+                    availability, field_name="source_availability_time"
+                )
+                if availability > self.evidence_cutoff:
+                    raise ValueError(
+                        "evidence_cutoff rejects evidence available after cutoff"
+                    )
+            normalized_availability[str(source)] = availability
+        object.__setattr__(
+            self,
+            "source_availability_times",
+            MappingProxyType(normalized_availability),
+        )
+        object.__setattr__(
+            self,
+            "missingness",
+            _freeze_nested(dict(self.missingness)),
+        )
         if self.schema_version != 1:
             raise ValueError("unsupported Decision Intelligence schema_version")
 

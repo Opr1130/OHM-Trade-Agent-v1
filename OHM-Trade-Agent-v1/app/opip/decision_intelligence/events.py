@@ -131,6 +131,17 @@ def _provenance(value: Any) -> Provenance:
     return Provenance(**data)
 
 
+def _watermark(value: Any, field_name: str) -> ConsumedInputWatermark:
+    if isinstance(value, ConsumedInputWatermark):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a watermark object")
+    try:
+        return ConsumedInputWatermark.from_dict(value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {field_name}") from exc
+
+
 def _strict_payload(payload: Mapping[str, Any], record_type: Type[Any]) -> dict[str, Any]:
     allowed = {field.name for field in fields(record_type)}
     if set(payload) - allowed:
@@ -184,11 +195,15 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
     for name in ("risks", "evidence_refs", "missing_evidence", "referenced_role_result_ids", "unsupported_claims", "invocation_references", "invocation_refs"):
         if name in data:
             data[name] = tuple(data[name])
-    if record_type is ComparisonRecord and isinstance(data.get("as_of_watermark"), Mapping):
-        data["as_of_watermark"] = ConsumedInputWatermark.from_dict(data["as_of_watermark"])
+    if record_type is ComparisonRecord:
+        data["as_of_watermark"] = _watermark(
+            data.get("as_of_watermark"), "as_of_watermark"
+        )
     if record_type is DecisionContext:
-        if not isinstance(data.get("consumed_input_watermark"), ConsumedInputWatermark):
-            data["consumed_input_watermark"] = ConsumedInputWatermark.from_dict(data["consumed_input_watermark"])
+        data["consumed_input_watermark"] = _watermark(
+            data.get("consumed_input_watermark"),
+            "consumed_input_watermark",
+        )
     identity_builders = {
         DecisionContext: context_identity,
         CommitteeRequest: request_identity,

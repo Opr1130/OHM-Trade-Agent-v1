@@ -328,6 +328,201 @@ def test_committee_request_frozen_snapshot_hash_must_match_context():
         )
 
 
+def test_timely_evidence_requires_at_least_one_on_time_result():
+    assert timely_evidence_eligible(()) is False
+    assert timely_evidence_eligible((ResultDisposition.ON_TIME,)) is True
+    assert timely_evidence_eligible((ResultDisposition.LATE,)) is False
+
+
+def test_public_contract_datetimes_are_normalized_to_utc():
+    offset = timezone(timedelta(hours=2))
+    request = CommitteeRequest(
+        request_id="req-time",
+        context_id="ctx-time",
+        experiment_id="exp-time",
+        cohort_selection_rule_version="v1",
+        frozen_snapshot_hash="hash",
+        route_version="r1",
+        prompt_version="p1",
+        role_configuration_version="roles1",
+        eligibility_at=datetime(2026, 1, 2, 5, 0, tzinfo=offset),
+        deadline_at=datetime(2026, 1, 2, 6, 0, tzinfo=offset),
+        budget_reservation=1,
+        enqueue_time=datetime(2026, 1, 2, 5, 5, tzinfo=offset),
+        result_selection_rule_version="select1",
+        provenance=_provenance(),
+    )
+    assert request.eligibility_at.utcoffset() == timedelta(0)
+    assert request.eligibility_at.hour == 3
+
+    transition = RequestTransition(
+        transition_id="transition-time",
+        request_id="req-time",
+        from_state=RequestState.ELIGIBLE,
+        to_state=RequestState.SELECTED,
+        reason="selected",
+        transition_time=datetime(2026, 1, 2, 5, 0, tzinfo=offset),
+        provenance=_provenance(),
+    )
+    assert transition.transition_time.utcoffset() == timedelta(0)
+    assert transition.transition_time.hour == 3
+
+
+def test_context_freezes_manifest_and_availability_inputs():
+    cutoff = datetime(2026, 1, 2, 3, 4, tzinfo=timezone.utc)
+    manifest = {"e1": {"available_at": cutoff, "label": ["original"]}}
+    availability = {"source": cutoff}
+    context = DecisionContext(
+        context_id="ctx-freeze",
+        candidate_id="candidate",
+        episode_id="episode",
+        evaluation_id="evaluation",
+        instrument_version="instrument",
+        snapshot_id="snapshot",
+        snapshot_hash="hash",
+        evaluation_time=cutoff,
+        evidence_cutoff=cutoff,
+        consumed_input_watermark={"history_epoch": 1, "local_sequence": 1},
+        feature_version="features",
+        policy_version="policy",
+        detector_version="detector",
+        forecast_version="forecast",
+        candidate_set_ref="set",
+        portfolio_version_ref=None,
+        environment="paper",
+        eligibility=True,
+        missingness={},
+        source_availability_times=availability,
+        evidence_eligibility_manifest=manifest,
+        provenance=_provenance(),
+    )
+    manifest["backfill"] = {"available_at": cutoff}
+    manifest["e1"]["label"].append("mutated")
+    availability["other"] = cutoff
+    with pytest.raises(ValueError, match="not in frozen manifest"):
+        context.validate_evidence_refs(("backfill",))
+    assert context.evidence_eligibility_manifest["e1"]["label"] == ("original",)
+    assert "other" not in context.source_availability_times
+
+
+def test_malformed_watermarks_fail_closed_at_writer_boundary(tmp_path):
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        malformed_context = _context_payload("ctx-bad-watermark")
+        malformed_context["consumed_input_watermark"] = {}
+        context_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:bad-watermark:context",
+                event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                payload=malformed_context,
+            )
+        )
+        malformed_comparison = {
+            "schema_version": 1,
+            "comparison_id": "placeholder",
+            "decision_context_id": "ctx",
+            "baseline_decision_id": "baseline",
+            "committee_assessment_id": "assessment",
+            "committee_request_id": "request",
+            "experiment_id": "experiment",
+            "variant_version": "v1",
+            "environment": "paper",
+            "research_account_id": "research",
+            "evaluation_window_start": "2026-01-02T03:00:00Z",
+            "evaluation_window_end": "2026-01-02T04:00:00Z",
+            "common_outcome_horizon": 1,
+            "as_of_watermark": "garbage",
+            "timeliness_eligibility": False,
+            "baseline_policy_version": "policy",
+            "simulated_policy_ref": None,
+            "execution_model_version": "exec",
+            "fee_policy_version": "fee",
+            "attribution_method_version": "attr",
+            "cost_allocation_version": "cost",
+            "currency": "USD",
+            "invocation_refs": [],
+            "ai_cost_attributed": None,
+            "other_incremental_operating_cost": None,
+            "cost_reconciliation_status": "UNKNOWN",
+            "cost_completeness": "UNKNOWN",
+            "baseline_trading_net": 0,
+            "variant_trading_net": 0,
+            "incremental_trading_net": 0,
+            "incremental_operating_net": 0,
+            "coverage_grade": "UNKNOWN",
+            "uncertainty_method_version": "u1",
+            "uncertainty_result": "UNKNOWN",
+            "provenance": _provenance_payload(),
+            "advisory_disposition": None,
+        }
+        from app.opip.decision_intelligence.events import comparison_identity
+        malformed_comparison["comparison_id"] = comparison_identity(
+            malformed_comparison
+        )
+        comparison_ack = writer.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key="di:bad-watermark:comparison",
+                event_type="decision_intelligence.comparison.recorded",
+                payload=malformed_comparison,
+            )
+        )
+    finally:
+        writer.close()
+    assert context_ack.error_code == "INVALID_INTENT"
+    assert comparison_ack.error_code == "INVALID_INTENT"
+
+
+def test_comparison_timely_requires_explicit_on_time_disposition():
+    values = {
+        "comparison_id": "comparison-direct",
+        "decision_context_id": "context",
+        "baseline_decision_id": "baseline",
+        "committee_assessment_id": "assessment",
+        "committee_request_id": "request",
+        "experiment_id": "experiment",
+        "variant_version": "v1",
+        "environment": "paper",
+        "research_account_id": "research",
+        "evaluation_window_start": datetime(2026, 1, 2, 3, tzinfo=timezone.utc),
+        "evaluation_window_end": datetime(2026, 1, 2, 4, tzinfo=timezone.utc),
+        "common_outcome_horizon": 1,
+        "as_of_watermark": {"history_epoch": 1, "local_sequence": 1},
+        "timeliness_eligibility": True,
+        "baseline_policy_version": "policy",
+        "simulated_policy_ref": None,
+        "execution_model_version": "exec",
+        "fee_policy_version": "fee",
+        "attribution_method_version": "attr",
+        "cost_allocation_version": "cost",
+        "currency": "USD",
+        "invocation_refs": (),
+        "ai_cost_attributed": None,
+        "other_incremental_operating_cost": None,
+        "cost_reconciliation_status": "UNKNOWN",
+        "cost_completeness": "UNKNOWN",
+        "baseline_trading_net": 0,
+        "variant_trading_net": 0,
+        "incremental_trading_net": 0,
+        "incremental_operating_net": 0,
+        "coverage_grade": "UNKNOWN",
+        "uncertainty_method_version": "u1",
+        "uncertainty_result": "UNKNOWN",
+        "provenance": _provenance(),
+        "advisory_disposition": None,
+    }
+    with pytest.raises(ValueError, match="explicit ON_TIME"):
+        ComparisonRecord(**values)
+    values["advisory_disposition"] = ResultDisposition.ON_TIME
+    record = ComparisonRecord(**values)
+    assert record.timeliness_eligibility is True
+
+
 def test_result_disposition_enforces_late_not_earlier_feasibility():
     assert ResultDisposition.ON_TIME.value == "ON_TIME"
     assert ResultDisposition.LATE.value == "LATE"
