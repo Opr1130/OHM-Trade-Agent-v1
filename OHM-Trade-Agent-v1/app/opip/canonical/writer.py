@@ -27,8 +27,15 @@ from app.opip.contracts.events import (
     MARKET_OBSERVATION_RECORDED,
 )
 from app.opip.decision_intelligence.events import (
+    DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
+    DECISION_INTELLIGENCE_COMPARISON_RECORDED,
+    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
     DECISION_INTELLIGENCE_EVENT_TYPES,
+    DECISION_INTELLIGENCE_INVOCATION_RECORDED,
+    DECISION_INTELLIGENCE_REQUEST_RECORDED,
+    DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
     DECISION_INTELLIGENCE_STREAM,
+    DECISION_INTELLIGENCE_TRANSITION_RECORDED,
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
@@ -70,6 +77,16 @@ _SNAPSHOT_AVAILABILITY_VOLATILE_KEYS = frozenset(
 #: The only checkpoint field allowed to move between same-key retries is its
 #: creation clock; retained rolling state is substantive evidence.
 _CHECKPOINT_VOLATILE_KEYS = frozenset({"created_at_utc"})
+
+_DI_IDENTITY_FIELD_BY_EVENT = {
+    DECISION_INTELLIGENCE_CONTEXT_RECORDED: "context_id",
+    DECISION_INTELLIGENCE_REQUEST_RECORDED: "request_id",
+    DECISION_INTELLIGENCE_TRANSITION_RECORDED: "transition_id",
+    DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED: "result_id",
+    DECISION_INTELLIGENCE_ASSESSMENT_RECORDED: "assessment_id",
+    DECISION_INTELLIGENCE_INVOCATION_RECORDED: "invocation_id",
+    DECISION_INTELLIGENCE_COMPARISON_RECORDED: "comparison_id",
+}
 
 
 def _idempotency_payload_json(event_type: str, payload: object) -> str:
@@ -165,6 +182,14 @@ class CanonicalWriter:
                 payload_json = _idempotency_payload_json(
                     intent.event_type, normalized_payload
                 )
+            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+                existing_identity = self._lookup_di_record_identity(
+                    intent.event_type,
+                    normalized_payload,
+                    payload_json=payload_json,
+                )
+                if existing_identity is not None:
+                    return existing_identity
             existing = self._lookup_idempotency(
                 intent.idempotency_key,
                 payload_json=payload_json,
@@ -318,6 +343,70 @@ class CanonicalWriter:
                 except sqlite3.Error:
                     pass
                 raise
+
+    def _lookup_di_record_identity(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+        *,
+        payload_json: str | None,
+    ) -> WriterAck | None:
+        """Enforce one immutable canonical event per content-derived DI identity."""
+        identity_field = _DI_IDENTITY_FIELD_BY_EVENT.get(event_type)
+        if identity_field is None:
+            return None
+        identity = payload.get(identity_field)
+        if not isinstance(identity, str) or not identity:
+            raise ValueError(f"{identity_field} required")
+
+        rows = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch DESC, local_sequence DESC
+            """,
+            (event_type,),
+        ).fetchall()
+        for row in rows:
+            try:
+                existing_payload = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    event_id=str(row["event_id"]),
+                    detail="existing DI event payload is not valid JSON",
+                )
+            if not isinstance(existing_payload, dict):
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    event_id=str(row["event_id"]),
+                    detail="existing DI event payload is not an object",
+                )
+            if existing_payload.get(identity_field) != identity:
+                continue
+            existing_semantic = _idempotency_payload_json(
+                event_type, existing_payload
+            )
+            if payload_json is not None and existing_semantic != payload_json:
+                return WriterAck(
+                    status="REJECTED",
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    event_id=str(row["event_id"]),
+                    detail=(
+                        f"{identity_field} already committed with a different "
+                        "semantic payload"
+                    ),
+                )
+            return WriterAck(
+                status="DUPLICATE_OK",
+                event_id=str(row["event_id"]),
+                history_epoch=int(row["history_epoch"]),
+                local_sequence=int(row["local_sequence"]),
+            )
+        return None
 
     def _lookup_idempotency(
         self, key: str, *, payload_json: str | None = None, event_type: str | None = None
