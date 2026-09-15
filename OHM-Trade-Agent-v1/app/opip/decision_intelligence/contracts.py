@@ -14,6 +14,34 @@ _INVALID_AS_OF_WATERMARK = "invalid as_of_watermark"
 _WATERMARK_KEYS = {"history_epoch", "local_sequence"}
 
 
+def _require_exact_int(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int | None = None,
+) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{field_name} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field_name} must be >= {minimum}")
+    return value
+
+
+def _require_optional_exact_int(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int | None = None,
+) -> int | None:
+    if value is None:
+        return None
+    return _require_exact_int(
+        value,
+        field_name=field_name,
+        minimum=minimum,
+    )
+
+
 def _coerce_as_of_watermark(value: object) -> ConsumedInputWatermark:
     if isinstance(value, ConsumedInputWatermark):
         return value
@@ -113,6 +141,15 @@ class ContextDecisionLink:
     supersedes_id: str | None = None
     supersession_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("unsupported ContextDecisionLink schema_version")
+        _require_exact_int(
+            self.decision_schema_version,
+            field_name="decision_schema_version",
+            minimum=1,
+        )
+
 
 @dataclass(frozen=True)
 class CommitteeRequest:
@@ -144,6 +181,11 @@ class CommitteeRequest:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported CommitteeRequest schema_version")
+        _require_exact_int(
+            self.budget_reservation,
+            field_name="budget_reservation",
+            minimum=0,
+        )
         for field_name in ("request_id", "context_id", "experiment_id"):
             if not str(getattr(self, field_name)).strip():
                 raise ValueError(f"{field_name} is required")
@@ -229,8 +271,16 @@ class CommitteeRoleResult:
         for field_name in ("result_id", "request_id"):
             if not str(getattr(self, field_name)).strip():
                 raise ValueError(f"{field_name} is required")
-        if self.attempt < 1:
-            raise ValueError("attempt must be >= 1")
+        _require_exact_int(
+            self.attempt,
+            field_name="attempt",
+            minimum=1,
+        )
+        _require_exact_int(
+            self.score_schema_version,
+            field_name="score_schema_version",
+            minimum=1,
+        )
         if not isinstance(self.role, CommitteeRole):
             raise ValueError("invalid committee role")
         if not isinstance(self.stance, AdvisoryStance):
@@ -271,6 +321,8 @@ class CommitteeAssessmentSummary:
                 raise ValueError(f"{field_name} is required")
         if not isinstance(self.advisory_stance, AdvisoryStance):
             raise ValueError("invalid advisory stance")
+        if type(self.disagreement) is not bool:
+            raise ValueError("disagreement must be a boolean")
         if self.completeness is not None and (type(self.completeness) is not int or not 0 <= self.completeness <= 10000):
             raise ValueError("completeness must be integer basis points from 0 to 10000")
         object.__setattr__(
@@ -329,8 +381,26 @@ class ModelInvocation:
         for field_name in ("invocation_id", "request_id"):
             if not str(getattr(self, field_name)).strip():
                 raise ValueError(f"{field_name} is required")
-        if self.attempt < 1:
-            raise ValueError("attempt must be >= 1")
+        _require_exact_int(
+            self.attempt,
+            field_name="attempt",
+            minimum=1,
+        )
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "latency_micros",
+            "queue_time_micros",
+            "provider_time_micros",
+            "billed_cost_microunits",
+            "estimated_cost_microunits",
+        ):
+            _require_optional_exact_int(
+                getattr(self, field_name),
+                field_name=field_name,
+                minimum=0,
+            )
         if not isinstance(self.role, CommitteeRole):
             raise ValueError("invalid committee role")
         if self.billed_cost_microunits is None and self.estimated_cost_microunits is None:
@@ -394,6 +464,30 @@ class ComparisonRecord:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported comparison schema_version")
+        _require_exact_int(
+            self.common_outcome_horizon,
+            field_name="common_outcome_horizon",
+            minimum=1,
+        )
+        for field_name in (
+            "ai_cost_attributed",
+            "other_incremental_operating_cost",
+        ):
+            _require_optional_exact_int(
+                getattr(self, field_name),
+                field_name=field_name,
+                minimum=0,
+            )
+        for field_name in (
+            "baseline_trading_net",
+            "variant_trading_net",
+            "incremental_trading_net",
+            "incremental_operating_net",
+        ):
+            _require_exact_int(
+                getattr(self, field_name),
+                field_name=field_name,
+            )
         required = (
             "comparison_id", "decision_context_id", "baseline_decision_id",
             "committee_assessment_id", "committee_request_id", "experiment_id",
