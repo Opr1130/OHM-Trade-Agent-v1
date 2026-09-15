@@ -81,7 +81,7 @@ def _provenance_payload():
 def _context_payload(context_id: str, *, value: int = 1):
     payload = {
         "context_id": context_id,
-        "candidate_id": f"candidate-{value}",
+        "candidate_id": "candidate-1",
         "episode_id": "episode-1",
         "evaluation_id": "evaluation-1",
         "instrument_version": "instrument-1",
@@ -138,6 +138,9 @@ def _request_payload(context_payload: dict) -> dict:
 
 def _seed_di_ancestry(writer, *, value: int = 1) -> str:
     context = _context_payload("ctx-ancestry", value=value)
+    if value != 1:
+        context["candidate_id"] = f"candidate-{value}"
+        context["context_id"] = context_identity(context)
     context_ack = writer.submit(
         WriterIntent(
             schema_version=1,
@@ -169,6 +172,9 @@ def _seed_di_ancestry(writer, *, value: int = 1) -> str:
 
 def _seed_complete_di_ancestry(writer, *, value: int = 1) -> dict:
     context = _context_payload("ctx-ancestry", value=value)
+    if value != 1:
+        context["candidate_id"] = f"candidate-{value}"
+        context["context_id"] = context_identity(context)
     request = _request_payload(context)
     request_id = _seed_di_ancestry(writer, value=value)
     assert request_id == request["request_id"]
