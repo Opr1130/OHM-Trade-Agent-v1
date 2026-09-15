@@ -16,10 +16,10 @@ def require_utc(value: datetime, *, field_name: str) -> datetime:
 
 
 def canonical_data(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
-        return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
     if isinstance(value, Enum):
         return canonical_data(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
     if isinstance(value, Decimal):
         return format(value, "f")
     if isinstance(value, float):
