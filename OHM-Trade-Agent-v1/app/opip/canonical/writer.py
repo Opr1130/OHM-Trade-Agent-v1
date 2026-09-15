@@ -170,6 +170,7 @@ class CanonicalWriter:
         self._request_lifecycle_projection: dict[str, str] = {}
         self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
         self._role_result_idempotency_by_id: dict[str, str] = {}
+        self._role_result_projection_watermark: tuple[int, int] = (0, -1)
         self._hydrate_request_lifecycle_projection()
         self._hydrate_role_result_identity_projection()
 
@@ -246,10 +247,24 @@ class CanonicalWriter:
                 int(row["local_sequence"]),
             )
 
+    def _apply_persisted_role_result(
+        self,
+        *,
+        idempotency_key: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        result_id = payload.get("result_id")
+        if not isinstance(result_id, str) or not result_id:
+            raise ValueError("persisted role result has invalid result_id")
+        existing = self._role_result_idempotency_by_id.get(result_id)
+        if existing is not None and existing != idempotency_key:
+            raise ValueError("persisted role result identity is not unique")
+        self._role_result_idempotency_by_id[result_id] = idempotency_key
+
     def _hydrate_role_result_identity_projection(self) -> None:
         rows = self._conn.execute(
             """
-            SELECT idempotency_key, payload_json
+            SELECT history_epoch, local_sequence, idempotency_key, payload_json
             FROM events
             WHERE event_type = ?
             ORDER BY history_epoch ASC, local_sequence ASC
@@ -261,14 +276,51 @@ class CanonicalWriter:
                 DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
                 json.loads(str(row["payload_json"])),
             )
-            result_id = payload.get("result_id")
-            if not isinstance(result_id, str) or not result_id:
-                raise ValueError("persisted role result has invalid result_id")
-            idempotency_key = str(row["idempotency_key"])
-            existing = self._role_result_idempotency_by_id.get(result_id)
-            if existing is not None and existing != idempotency_key:
-                raise ValueError("persisted role result identity is not unique")
-            self._role_result_idempotency_by_id[result_id] = idempotency_key
+            self._apply_persisted_role_result(
+                idempotency_key=str(row["idempotency_key"]),
+                payload=payload,
+            )
+            self._role_result_projection_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
+
+    def _refresh_role_result_identity_projection(self) -> None:
+        history_epoch, local_sequence = self._role_result_projection_watermark
+        rows = self._conn.execute(
+            """
+            SELECT history_epoch, local_sequence, idempotency_key, payload_json
+            FROM events
+            WHERE event_type = ?
+              AND (
+                    history_epoch > ?
+                    OR (
+                        history_epoch = ?
+                        AND local_sequence > ?
+                    )
+                  )
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (
+                DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+                history_epoch,
+                history_epoch,
+                local_sequence,
+            ),
+        ).fetchall()
+        for row in rows:
+            payload = validate_di_payload(
+                DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+                json.loads(str(row["payload_json"])),
+            )
+            self._apply_persisted_role_result(
+                idempotency_key=str(row["idempotency_key"]),
+                payload=payload,
+            )
+            self._role_result_projection_watermark = (
+                int(row["history_epoch"]),
+                int(row["local_sequence"]),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -587,6 +639,9 @@ class CanonicalWriter:
 
     def _load_role_result_by_id(self, result_id: str) -> dict:
         idempotency_key = self._role_result_idempotency_by_id.get(result_id)
+        if idempotency_key is None:
+            self._refresh_role_result_identity_projection()
+            idempotency_key = self._role_result_idempotency_by_id.get(result_id)
         if idempotency_key is None:
             raise ValueError(
                 "required decision_intelligence.role_result.recorded "
@@ -1162,6 +1217,19 @@ class CanonicalWriter:
             intent.event_type,
             payload,
         )
+        if intent.event_type in {
+            DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
+            DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
+        }:
+            self._refresh_role_result_identity_projection()
+            self._validate_di_downstream_ancestry(
+                intent.event_type,
+                payload,
+            )
+            self._validate_di_record_supersession(
+                intent.event_type,
+                payload,
+            )
 
         self._conn.execute(
             """
@@ -1248,6 +1316,10 @@ class CanonicalWriter:
         if intent.event_type == DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED:
             self._role_result_idempotency_by_id[payload["result_id"]] = (
                 intent.idempotency_key
+            )
+            self._role_result_projection_watermark = (
+                history_epoch,
+                local_sequence,
             )
         return WriterAck(
             status="OK",
