@@ -26,6 +26,12 @@ from app.opip.contracts.events import (
     FEATURE_SNAPSHOT_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
+from app.opip.decision_intelligence.events import (
+    DECISION_INTELLIGENCE_EVENT_TYPES,
+    DECISION_INTELLIGENCE_STREAM,
+    validate_di_payload,
+)
+from app.opip.decision_intelligence.serialization import canonical_serialize
 
 MAX_PAYLOAD_BYTES = 16 * 1024
 
@@ -41,6 +47,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
         FEATURE_CHECKPOINT_RECORDED,
         FEATURE_SNAPSHOT_RECORDED,
     }
+    | DECISION_INTELLIGENCE_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -70,6 +77,15 @@ def _idempotency_payload_json(event_type: str, payload: object) -> str:
     if not isinstance(payload, dict):
         raise TypeError("idempotency payload must be a mapping")
     body: dict = dict(payload)
+    if event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+        provenance = body.get("provenance")
+        if isinstance(provenance, Mapping):
+            body["provenance"] = {
+                key: value
+                for key, value in provenance.items()
+                if key not in {"artifact_or_build_id", "emitted_at", "process_instance_id", "host_identity", "history_epoch"}
+            }
+        return canonical_serialize(body)
     if event_type == FEATURE_SNAPSHOT_RECORDED:
         body = {
             key: value
@@ -100,7 +116,9 @@ ALERT_GOVERNOR_EVENT_TYPES = frozenset(
     }
 )
 
-ACCEPTED_EVENT_TYPES = ALERT_GOVERNOR_EVENT_TYPES | FEATURE_BUS_EVENT_TYPES
+ACCEPTED_EVENT_TYPES = (
+    ALERT_GOVERNOR_EVENT_TYPES | FEATURE_BUS_EVENT_TYPES | DECISION_INTELLIGENCE_EVENT_TYPES
+)
 
 
 def _utc_now() -> str:
@@ -136,15 +154,16 @@ class CanonicalWriter:
 
     def submit(self, intent: WriterIntent) -> WriterAck:
         with self._lock:
+            normalized_payload = intent.payload
             try:
-                self._validate_intent(intent)
-            except ValueError as exc:
+                normalized_payload = self._validate_intent(intent)
+            except (TypeError, ValueError) as exc:
                 return WriterAck(status="REJECTED", error_code="INVALID_INTENT", detail=str(exc))
 
             payload_json = None
             if intent.event_type in IDEMPOTENT_PAYLOAD_EVENT_TYPES:
                 payload_json = _idempotency_payload_json(
-                    intent.event_type, intent.payload
+                    intent.event_type, normalized_payload
                 )
             existing = self._lookup_idempotency(
                 intent.idempotency_key,
@@ -155,7 +174,7 @@ class CanonicalWriter:
                 return existing
 
             try:
-                return self._commit_new(intent)
+                return self._commit_new(intent, normalized_payload=normalized_payload)
             except sqlite3.IntegrityError:
                 existing = self._lookup_idempotency(
                     intent.idempotency_key,
@@ -333,7 +352,7 @@ class CanonicalWriter:
             local_sequence=int(existing["local_sequence"]),
         )
 
-    def _validate_intent(self, intent: WriterIntent) -> None:
+    def _validate_intent(self, intent: WriterIntent) -> dict:
         if intent.schema_version != SCHEMA_VERSION:
             raise ValueError("schema_version mismatch")
         if intent.priority not in {"HIGH", "NORMAL", "LOW"}:
@@ -342,7 +361,11 @@ class CanonicalWriter:
             raise ValueError("idempotency_key required")
         if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
-        raw = json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
+        raw = (
+            canonical_serialize(intent.payload)
+            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
+            else json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
+        )
         if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise ValueError("payload too large")
         if intent.event_type in FEATURE_BUS_EVENT_TYPES:
@@ -352,11 +375,17 @@ class CanonicalWriter:
                 raise ValueError("feature bus events must use LOW priority")
             if intent.ops_handoff is not None:
                 raise ValueError("feature bus events must not carry ops_handoff")
-            return
+            return intent.payload
+        if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
+            if intent.priority != "LOW":
+                raise ValueError("decision intelligence events must use LOW priority")
+            if intent.ops_handoff is not None:
+                raise ValueError("decision intelligence events must not carry ops_handoff")
+            return validate_di_payload(intent.event_type, intent.payload)
         if intent.event_type == "alert_governor.capture_gap.recorded":
             if intent.ops_handoff is not None:
                 raise ValueError("capture_gap must not carry ops_handoff")
-            return
+            return intent.payload
         if intent.ops_handoff is None:
             raise ValueError("ops_handoff required")
         op = str(intent.ops_handoff.get("operation") or "")
@@ -374,13 +403,18 @@ class CanonicalWriter:
         if family not in {STATE_FAMILY_EARLY_WATCH}:
             raise ValueError("unsupported ops_handoff.state_family")
 
-    def _commit_new(self, intent: WriterIntent) -> WriterAck:
+    def _commit_new(self, intent: WriterIntent, *, normalized_payload: dict | None = None) -> WriterAck:
         now = _utc_now()
         event_id = _new_event_id()
-        payload_json = json.dumps(intent.payload, separators=(",", ":"), sort_keys=True)
+        payload = normalized_payload if normalized_payload is not None else intent.payload
+        payload_json = (
+            canonical_serialize(payload)
+            if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
+            else json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        )
         handoff = intent.ops_handoff or {}
         action = "CREATE" if bool(handoff.get("created_new")) else "EDIT"
-        identity = str(handoff.get("identity") or intent.payload.get("identity") or "")
+        identity = str(handoff.get("identity") or payload.get("identity") or "")
         transition_key = str(handoff.get("transition_key") or "")
         message_id = handoff.get("message_id")
         reservation_token = handoff.get("reservation_token")
@@ -389,9 +423,14 @@ class CanonicalWriter:
         operation = str(handoff.get("operation") or "")
         is_gap = intent.event_type == "alert_governor.capture_gap.recorded"
         is_feature_bus = intent.event_type in FEATURE_BUS_EVENT_TYPES
+        is_decision_intelligence = intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES
         # Separate watermark streams: feature-bus progress can never rewind or
         # advance Early Watch alert-control progress, or the reverse.
-        stream = FEATURE_BUS_STREAM if is_feature_bus else STREAM_EARLY_WATCH
+        stream = (
+            DECISION_INTELLIGENCE_STREAM
+            if is_decision_intelligence
+            else FEATURE_BUS_STREAM if is_feature_bus else STREAM_EARLY_WATCH
+        )
 
         self._conn.execute("BEGIN IMMEDIATE")
         meta = self._conn.execute(
@@ -475,7 +514,7 @@ class CanonicalWriter:
             """,
             (stream, history_epoch, local_sequence, now),
         )
-        if not is_gap and not is_feature_bus:
+        if not is_gap and not is_feature_bus and not is_decision_intelligence:
             self._conn.execute(
                 """
                 INSERT INTO alert_ops_handoffs (
