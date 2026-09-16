@@ -92,6 +92,14 @@ frozen ``evidence_eligibility_manifest`` or not available at its
 ``evidence_cutoff`` (re-derived by reusing the ``DecisionContext`` contract's
 own validation, not trusted).
 
+Every one of those references is additionally required to have been committed
+*before* the referencing event. The writer validates ancestry against already
+committed evidence, so a target whose commit coordinate is not strictly earlier
+than the source event is corrupt evidence, not history. Precedence uses the
+repository's authoritative commit order ``(history_epoch, local_sequence)``
+(``ConsumedInputWatermark``), never a payload or wall-clock timestamp: snapshot
+membership alone can never admit a forward reference.
+
 Failure semantics
 -----------------
 Fail closed (raise, never silently skip) when the source of truth is
@@ -808,6 +816,7 @@ def _reconstruct(
     unknown_events: list[UnknownDIEvidenceEvent] = []
     anomalies: list[DIEvidenceAnomaly] = []
     event_id_by_record_id: dict[str, str] = {}
+    coordinate_by_record_id: dict[str, ConsumedInputWatermark] = {}
     edge_drafts: list[tuple[str, str, type, Any, ConsumedInputWatermark]] = []
     transitions_in_order: list[CommitteeRequestTransition] = []
     transitions_by_request: dict[str, list[CommitteeRequestTransition]] = {}
@@ -863,6 +872,7 @@ def _reconstruct(
             )
         store[record_id] = record
         event_id_by_record_id[record_id] = event_id
+        coordinate_by_record_id[record_id] = coordinate
         events.append(
             DIEvidenceEvent(
                 event_id=event_id,
@@ -887,13 +897,14 @@ def _reconstruct(
     requests = by_type[CommitteeRequest]
 
     # Fail closed on impossible known-record relationships, frozen-manifest
-    # evidence eligibility, and supersession before any of that evidence is
-    # classified or exposed. Supersession is resolved before lifecycle
-    # reconstruction so a malformed correction can never be admitted into a
-    # request's corrected-transition history.
+    # evidence eligibility, commit-order precedence, and supersession before any
+    # of that evidence is classified or exposed. Supersession is resolved before
+    # lifecycle reconstruction so a malformed correction can never be admitted
+    # into a request's corrected-transition history.
     _assert_known_record_integrity(
         by_type=by_type,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
     _assert_evidence_ref_eligibility(
         by_type=by_type,
@@ -902,11 +913,14 @@ def _reconstruct(
     supersession_edges = _resolve_supersession_edges(
         edge_drafts=edge_drafts,
         by_type=by_type,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
     lifecycles = _reconstruct_lifecycles(
         requests=requests,
         transitions_in_order=transitions_in_order,
         transitions_by_request=transitions_by_request,
+        coordinate_by_record_id=coordinate_by_record_id,
+        event_id_by_record_id=event_id_by_record_id,
     )
     anomalies.extend(_supersession_fork_anomalies(supersession_edges))
 
@@ -945,6 +959,8 @@ def _reconstruct_lifecycles(
     requests: Mapping[str, CommitteeRequest],
     transitions_in_order: list[CommitteeRequestTransition],
     transitions_by_request: Mapping[str, list[CommitteeRequestTransition]],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
+    event_id_by_record_id: Mapping[str, str],
 ) -> dict[str, RequestLifecycle]:
     for transition in transitions_in_order:
         if transition.request_id not in requests:
@@ -953,6 +969,18 @@ def _reconstruct_lifecycles(
                 f"request {transition.request_id} with no recorded "
                 "request.recorded event"
             )
+        # Membership alone cannot establish history: the request must already
+        # have been recorded when the transition commits.
+        _assert_committed_before(
+            field_name="CommitteeRequestTransition.request_id",
+            source_id=transition.transition_id,
+            target_id=transition.request_id,
+            source_coordinate=coordinate_by_record_id[transition.transition_id],
+            target_coordinate=coordinate_by_record_id[transition.request_id],
+            origin=_record_origin(
+                event_id_by_record_id, transition.transition_id
+            ),
+        )
 
     lifecycles: dict[str, RequestLifecycle] = {}
     for request_id in requests:
@@ -1006,6 +1034,38 @@ def _record_origin(
     return f" (event {event_id})" if event_id else ""
 
 
+def _assert_committed_before(
+    *,
+    field_name: str,
+    source_id: str,
+    target_id: str,
+    source_coordinate: ConsumedInputWatermark,
+    target_coordinate: ConsumedInputWatermark,
+    origin: str,
+) -> None:
+    """Fail closed when a reference points forward in canonical commit order.
+
+    The canonical writer requires every ancestry and supersession target to be
+    already recorded when the source event commits, so a target committed at or
+    after the source coordinate is corrupt evidence, not a reconstruction.
+
+    Ordering is the repository's authoritative commit order
+    ``(history_epoch, local_sequence)`` (``ConsumedInputWatermark``), never a
+    payload or wall-clock timestamp. Canonical coordinates are unique per event
+    (``UNIQUE (history_epoch, local_sequence)``), so ``<`` means strictly
+    committed earlier and a self-reference can never pass.
+    """
+    if target_coordinate < source_coordinate:
+        return
+    raise DIEvidenceIntegrityError(
+        f"{field_name} of {source_id} references {target_id}, committed at "
+        f"{target_coordinate.to_dict()}, which is not earlier than the source "
+        f"event commit coordinate {source_coordinate.to_dict()}{origin}; the "
+        "canonical writer only accepts a reference that is already recorded "
+        "when the source event commits"
+    )
+
+
 def _require_recorded_target(
     store: Mapping[str, Any],
     *,
@@ -1014,8 +1074,14 @@ def _require_recorded_target(
     source_id: str,
     target_kind: str,
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> Any:
-    """Return a referenced record, or fail closed on an unrecorded reference."""
+    """Return a referenced record, or fail closed on an invalid reference.
+
+    Frozen-snapshot membership alone is insufficient: the target must also have
+    been committed before the source event, matching the writer's ancestry
+    guarantee.
+    """
     target = store.get(target_id)
     if target is None:
         raise DIEvidenceIntegrityError(
@@ -1024,6 +1090,14 @@ def _require_recorded_target(
             f"{_record_origin(event_id_by_record_id, source_id)}; the canonical "
             "writer rejects an unrecorded reference at commit time"
         )
+    _assert_committed_before(
+        field_name=field_name,
+        source_id=source_id,
+        target_id=target_id,
+        source_coordinate=coordinate_by_record_id[source_id],
+        target_coordinate=coordinate_by_record_id[target_id],
+        origin=_record_origin(event_id_by_record_id, source_id),
+    )
     return target
 
 
@@ -1050,6 +1124,7 @@ def _assert_request_context_integrity(
     contexts: Mapping[str, Any],
     requests: Mapping[str, Any],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """CommitteeRequest -> DecisionContext, including the frozen snapshot link."""
     for request in requests.values():
@@ -1060,6 +1135,7 @@ def _assert_request_context_integrity(
             source_id=request.request_id,
             target_kind="DecisionContext",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         try:
             request.validate_against_context(context)
@@ -1076,6 +1152,7 @@ def _assert_invocation_request_integrity(
     invocations: Mapping[str, Any],
     requests: Mapping[str, Any],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """ModelInvocation -> CommitteeRequest."""
     for invocation in invocations.values():
@@ -1086,6 +1163,7 @@ def _assert_invocation_request_integrity(
             source_id=invocation.invocation_id,
             target_kind="CommitteeRequest",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
 
 
@@ -1095,6 +1173,7 @@ def _assert_role_result_integrity(
     requests: Mapping[str, Any],
     invocations: Mapping[str, Any],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """CommitteeRoleResult -> request, and its invocation owns the request."""
     for result in role_results.values():
@@ -1105,6 +1184,7 @@ def _assert_role_result_integrity(
             source_id=result.result_id,
             target_kind="CommitteeRequest",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         if result.invocation_ref is None:
             continue
@@ -1115,6 +1195,7 @@ def _assert_role_result_integrity(
             source_id=result.result_id,
             target_kind="ModelInvocation",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         _require_owning_request(
             target=invocation,
@@ -1133,6 +1214,7 @@ def _assert_assessment_integrity(
     role_results: Mapping[str, Any],
     invocations: Mapping[str, Any],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """CommitteeAssessmentSummary -> request, role results, and invocations."""
     for assessment in assessments.values():
@@ -1143,6 +1225,7 @@ def _assert_assessment_integrity(
             source_id=assessment.assessment_id,
             target_kind="CommitteeRequest",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         for result_id in assessment.referenced_role_result_ids:
             role_result = _require_recorded_target(
@@ -1154,6 +1237,7 @@ def _assert_assessment_integrity(
                 source_id=assessment.assessment_id,
                 target_kind="CommitteeRoleResult",
                 event_id_by_record_id=event_id_by_record_id,
+                coordinate_by_record_id=coordinate_by_record_id,
             )
             _require_owning_request(
                 target=role_result,
@@ -1173,6 +1257,7 @@ def _assert_assessment_integrity(
                 source_id=assessment.assessment_id,
                 target_kind="ModelInvocation",
                 event_id_by_record_id=event_id_by_record_id,
+                coordinate_by_record_id=coordinate_by_record_id,
             )
             _require_owning_request(
                 target=invocation,
@@ -1192,6 +1277,7 @@ def _assert_comparison_integrity(
     assessments: Mapping[str, Any],
     invocations: Mapping[str, Any],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """ComparisonRecord -> request, context, and its request/context link."""
     for comparison in comparisons.values():
@@ -1202,6 +1288,7 @@ def _assert_comparison_integrity(
             source_id=comparison.comparison_id,
             target_kind="CommitteeRequest",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         _require_recorded_target(
             contexts,
@@ -1210,6 +1297,7 @@ def _assert_comparison_integrity(
             source_id=comparison.comparison_id,
             target_kind="DecisionContext",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         if request.context_id != comparison.decision_context_id:
             raise DIEvidenceIntegrityError(
@@ -1234,6 +1322,7 @@ def _assert_comparison_integrity(
             source_id=comparison.comparison_id,
             target_kind="CommitteeAssessmentSummary",
             event_id_by_record_id=event_id_by_record_id,
+            coordinate_by_record_id=coordinate_by_record_id,
         )
         if assessment.request_id != comparison.committee_request_id:
             raise DIEvidenceIntegrityError(
@@ -1251,6 +1340,7 @@ def _assert_comparison_integrity(
                 source_id=comparison.comparison_id,
                 target_kind="ModelInvocation",
                 event_id_by_record_id=event_id_by_record_id,
+                coordinate_by_record_id=coordinate_by_record_id,
             )
             _require_owning_request(
                 target=invocation,
@@ -1266,6 +1356,7 @@ def _assert_known_record_integrity(
     *,
     by_type: Mapping[type, Mapping[str, Any]],
     event_id_by_record_id: Mapping[str, str],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> None:
     """Re-derive the canonical writer's recorded-evidence relationships.
 
@@ -1275,6 +1366,9 @@ def _assert_known_record_integrity(
     failure message so an operator can trace it. Unknown event types are not
     inspected (their payloads stay opaque) and forked supersession branches are
     not failures (they remain explicit ambiguity).
+
+    Every resolved target must also have been committed before the referencing
+    event, so snapshot membership alone never admits a forward reference.
 
     The per-record-kind checks live in small private helpers and are invoked
     here in the same order their record kinds are recorded in.
@@ -1291,6 +1385,7 @@ def _assert_known_record_integrity(
         contexts=contexts,
         requests=requests,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
 
     # ModelInvocation -> CommitteeRequest.
@@ -1298,6 +1393,7 @@ def _assert_known_record_integrity(
         invocations=invocations,
         requests=requests,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
 
     # CommitteeRoleResult -> CommitteeRequest, and its invocation owns the request.
@@ -1306,6 +1402,7 @@ def _assert_known_record_integrity(
         requests=requests,
         invocations=invocations,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
 
     # CommitteeAssessmentSummary -> request, role results, and invocations.
@@ -1315,6 +1412,7 @@ def _assert_known_record_integrity(
         role_results=role_results,
         invocations=invocations,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
 
     # ComparisonRecord -> request, context, and its request/context link.
@@ -1325,6 +1423,7 @@ def _assert_known_record_integrity(
         assessments=assessments,
         invocations=invocations,
         event_id_by_record_id=event_id_by_record_id,
+        coordinate_by_record_id=coordinate_by_record_id,
     )
 
 
@@ -1388,14 +1487,16 @@ def _resolve_supersession_edges(
     *,
     edge_drafts: list[tuple[str, str, type, Any, ConsumedInputWatermark]],
     by_type: Mapping[type, Mapping[str, Any]],
+    coordinate_by_record_id: Mapping[str, ConsumedInputWatermark],
 ) -> tuple[SupersessionEdge, ...]:
     """Resolve recorded supersession edges, mirroring the writer's guards.
 
     The writer requires a supersession target to be an already-recorded record
-    of the same kind and to satisfy a per-kind ownership constraint. A target
-    that is absent, or that violates the constraint, is canonical integrity
-    failure, not incompleteness. Every returned edge is therefore resolved;
-    ``resolved`` is retained to record that the check ran.
+    of the same kind, committed before the superseding event, and to satisfy a
+    per-kind ownership constraint. A target that is absent, forwards in commit
+    order, or violates the constraint, is canonical integrity failure, not
+    incompleteness. Every returned edge is therefore resolved; ``resolved`` is
+    retained to record that the check ran.
     """
     edges: list[SupersessionEdge] = []
     for event_id, record_id, record_type, record, coordinate in edge_drafts:
@@ -1410,6 +1511,14 @@ def _resolve_supersession_edges(
                 "the canonical writer rejects an unrecorded supersession target "
                 "at commit time"
             )
+        _assert_committed_before(
+            field_name=f"{record_kind}.supersedes_id",
+            source_id=record_id,
+            target_id=supersedes_id,
+            source_coordinate=coordinate,
+            target_coordinate=coordinate_by_record_id[supersedes_id],
+            origin=f" (event {event_id})",
+        )
         _assert_supersession_ownership(
             record=record,
             target=target,

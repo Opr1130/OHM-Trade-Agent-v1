@@ -2657,6 +2657,262 @@ def test_valid_transition_correction_is_preserved_not_applied(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Commit-order precedence: historical ancestry must be committed earlier
+# --------------------------------------------------------------------------- #
+
+
+def _schema_only(db: Path) -> None:
+    """Create the canonical schema without recording Decision Intelligence."""
+    CanonicalWriter(db).close()
+
+
+def _insert_ordered(db: Path, entries) -> None:
+    """Insert raw DI events at explicit ascending commit coordinates."""
+    for local_sequence, (event_id, event_type, payload) in enumerate(entries, 1):
+        _insert_event(
+            db,
+            event_id=event_id,
+            event_type=event_type,
+            history_epoch=1,
+            local_sequence=local_sequence,
+            payload_json=_payload_json(payload),
+        )
+
+
+def test_valid_backward_ancestry_reference_is_accepted(tmp_path):
+    """Case A: earlier evidence referenced by a later source is valid."""
+    db = tmp_path / "canonical.sqlite3"
+    ancestry = _seed_full_ancestry(db)
+
+    snapshot = read_di_evidence_snapshot(db)
+
+    assert snapshot.boundary == ConsumedInputWatermark(history_epoch=1, local_sequence=5)
+    assert set(snapshot.requests) == {ancestry["request"]["request_id"]}
+    assert set(snapshot.invocations) == {ancestry["invocation"]["invocation_id"]}
+    assert snapshot.anomalies == ()
+    assert snapshot.is_complete is True
+
+
+def test_invocation_referencing_later_request_fails_closed(tmp_path):
+    """Case B: a source event must not reference evidence committed later.
+
+    The canonical writer requires a referenced record to already be recorded
+    when the source event commits, so this ordering is corrupt evidence and
+    must fail closed rather than reconstruct as valid history.
+    """
+    db = tmp_path / "canonical.sqlite3"
+    context = _context_payload()
+    request = _request_payload(context)
+    invocation = _invocation_payload(request_id=request["request_id"])
+    _schema_only(db)
+    _insert_ordered(
+        db,
+        [
+            ("EVT:ctx", _CONTEXT, context),
+            ("EVT:inv", _INVOCATION, invocation),
+            ("EVT:req", _REQUEST, request),
+        ],
+    )
+
+    with pytest.raises(DIEvidenceIntegrityError):
+        read_di_evidence_snapshot(db)
+
+
+def test_valid_supersession_ordering_is_accepted(tmp_path):
+    """Case C: a later record superseding an earlier record is valid."""
+    db = tmp_path / "canonical.sqlite3"
+    context = _context_payload()
+    request = _request_payload(context)
+    original = _assessment_payload(request_id=request["request_id"])
+    correction = _assessment_payload(
+        request_id=request["request_id"],
+        selection_rule="selection-2",
+        synthesis="corrected",
+        supersedes_id=original["assessment_id"],
+        supersession_reason="correction",
+    )
+    _schema_only(db)
+    _insert_ordered(
+        db,
+        [
+            ("EVT:ctx", _CONTEXT, context),
+            ("EVT:req", _REQUEST, request),
+            ("EVT:assess-original", _ASSESSMENT, original),
+            ("EVT:assess-correction", _ASSESSMENT, correction),
+        ],
+    )
+
+    snapshot = read_di_evidence_snapshot(db)
+
+    edges = snapshot.supersessions_of(correction["assessment_id"])
+    assert len(edges) == 1
+    assert edges[0].supersedes_id == original["assessment_id"]
+    assert edges[0].resolved is True
+    assert edges[0].coordinate == ConsumedInputWatermark(
+        history_epoch=1, local_sequence=4
+    )
+    assert snapshot.is_complete is True
+
+
+def test_supersession_of_later_record_fails_closed(tmp_path):
+    """Case D: superseding evidence must not have been committed after its target.
+
+    Here the superseding assessment commits *before* the assessment it claims
+    to supersede, which the canonical writer could never accept.
+    """
+    db = tmp_path / "canonical.sqlite3"
+    context = _context_payload()
+    request = _request_payload(context)
+    original = _assessment_payload(request_id=request["request_id"])
+    correction = _assessment_payload(
+        request_id=request["request_id"],
+        selection_rule="selection-2",
+        synthesis="corrected",
+        supersedes_id=original["assessment_id"],
+        supersession_reason="correction",
+    )
+    _schema_only(db)
+    _insert_ordered(
+        db,
+        [
+            ("EVT:ctx", _CONTEXT, context),
+            ("EVT:req", _REQUEST, request),
+            ("EVT:assess-correction", _ASSESSMENT, correction),
+            ("EVT:assess-original", _ASSESSMENT, original),
+        ],
+    )
+
+    with pytest.raises(DIEvidenceIntegrityError):
+        read_di_evidence_snapshot(db)
+
+
+def test_commit_order_precedence_holds_across_history_epochs(tmp_path):
+    """A later history epoch always dominates, matching commit-order semantics."""
+    db = tmp_path / "canonical.sqlite3"
+    context = _context_payload()
+    request = _request_payload(context)
+    invocation = _invocation_payload(request_id=request["request_id"])
+    _schema_only(db)
+    # The request lands in the restored epoch, after the invocation.
+    _insert_event(
+        db,
+        event_id="EVT:ctx",
+        event_type=_CONTEXT,
+        history_epoch=1,
+        local_sequence=1,
+        payload_json=_payload_json(context),
+    )
+    _insert_event(
+        db,
+        event_id="EVT:inv",
+        event_type=_INVOCATION,
+        history_epoch=1,
+        local_sequence=2,
+        payload_json=_payload_json(invocation),
+    )
+    _insert_event(
+        db,
+        event_id="EVT:req",
+        event_type=_REQUEST,
+        history_epoch=2,
+        local_sequence=1,
+        payload_json=_payload_json(request),
+    )
+
+    with pytest.raises(DIEvidenceIntegrityError):
+        read_di_evidence_snapshot(db)
+
+
+def test_reference_committed_at_the_same_coordinate_is_impossible(tmp_path):
+    """Commit coordinates are unique per event, so a self-reference cannot pass."""
+    db = tmp_path / "canonical.sqlite3"
+    context = _context_payload()
+    request = _request_payload(context)
+    self_superseding = _assessment_payload(
+        request_id=request["request_id"],
+        supersedes_id="DI-ASSESSMENT:self",
+    )
+    _schema_only(db)
+    _insert_ordered(
+        db,
+        [
+            ("EVT:ctx", _CONTEXT, context),
+            ("EVT:req", _REQUEST, request),
+            ("EVT:assess-self", _ASSESSMENT, self_superseding),
+        ],
+    )
+
+    with pytest.raises(DIEvidenceIntegrityError):
+        read_di_evidence_snapshot(db)
+
+
+def test_ordered_reconstruction_is_deterministic_across_reads(tmp_path):
+    """Case E: repeated reconstruction of a valid frozen snapshot is stable."""
+    db = tmp_path / "canonical.sqlite3"
+    ancestry = _seed_full_ancestry(db)
+    request_id = ancestry["request"]["request_id"]
+    _write_di(
+        db,
+        [
+            (
+                _TRANSITION,
+                _transition_payload(
+                    request_id=request_id,
+                    from_state="ELIGIBLE",
+                    to_state="SELECTED",
+                ),
+            )
+        ],
+    )
+
+    first = read_di_evidence_snapshot(db)
+    second = read_di_evidence_snapshot(db)
+    third = read_di_evidence_snapshot(db)
+
+    assert first == second == third
+    assert [event.coordinate for event in first.events] == [
+        event.coordinate for event in third.events
+    ]
+    assert first.boundary == third.boundary
+    assert first.is_complete is True
+
+
+def test_natural_recorded_ordering_remains_accepted(tmp_path):
+    """Case F: the writer's own ordering for the full vocabulary still passes."""
+    db = tmp_path / "canonical.sqlite3"
+    ancestry = _seed_full_ancestry(db)
+    _write_di(
+        db,
+        [
+            (
+                _TRANSITION,
+                _transition_payload(
+                    request_id=ancestry["request"]["request_id"],
+                    from_state="ELIGIBLE",
+                    to_state="SELECTED",
+                ),
+            ),
+            (
+                _COMPARISON,
+                _comparison_payload(
+                    context_id=ancestry["context"]["context_id"],
+                    request_id=ancestry["request"]["request_id"],
+                    assessment_id=ancestry["assessment"]["assessment_id"],
+                    invocation_refs=(ancestry["invocation"]["invocation_id"],),
+                ),
+            ),
+        ],
+    )
+
+    snapshot = read_di_evidence_snapshot(db)
+
+    assert snapshot.unknown_events == ()
+    assert snapshot.anomalies == ()
+    assert snapshot.is_complete is True
+    assert len(snapshot.events) == len(DECISION_INTELLIGENCE_EVENT_TYPES)
+
+
 def test_reader_module_has_no_writer_or_write_schema_coupling():
     from app.opip.decision_intelligence import evidence_reader
 
