@@ -35,10 +35,14 @@ from app.opip.canonical.recovery import restore_from_backup, run_backup_restore_
 from app.opip.canonical.schema import (
     CanonicalCheckpointError,
     CanonicalDbValidationError,
+    CanonicalDurabilityError,
     CanonicalStoreBusyError,
     CanonicalStoreLock,
     checkpoint_wal_strict,
     connect,
+    fsync_directory_required,
+    fsync_file_required,
+    fsync_path,
     initialize_schema,
     store_lock_path,
     validate_canonical_sqlite,
@@ -225,27 +229,46 @@ def test_active_writer_blocks_restore(tmp_path):
 
 
 def test_restore_holds_lock_while_running(tmp_path):
+    """Inside restore's locked section, conflicting ownership is refused.
+
+    This proves restore actually owns the OS lock, rather than merely observing
+    that some new lock object is unheld. Control flow is deterministic: the
+    contention attempt happens inside restore's own checkpoint step.
+    """
     db = tmp_path / "canonical.sqlite3"
     _seed(db)
     backup, manifest_path, _ = _make_backup(db, tmp_path)
 
-    seen: list[bool] = []
+    refusals: list[str] = []
     from app.opip.canonical import recovery as recovery_module
 
     real_checkpoint = recovery_module._checkpoint_live_wal
 
     def _probe(live_db):
-        # Restore must already own the store at this point.
-        seen.append(CanonicalStoreLock(live_db).held)
+        # Restore must already own the live store here.
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalStoreLock(live_db).acquire()
+        refusals.append("lock")
+        # A second writable authority must be refused just as well.
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(live_db)
+        refusals.append("writer")
         return real_checkpoint(live_db)
 
     recovery_module._checkpoint_live_wal = _probe
     try:
-        _restore(db, backup, manifest_path)
+        result = _restore(db, backup, manifest_path)
     finally:
         recovery_module._checkpoint_live_wal = real_checkpoint
-    assert seen == [False]  # a *new* lock cannot be taken while restore owns it
-    assert CanonicalStoreLock(db).held is False
+
+    assert refusals == ["lock", "writer"]
+    assert result["history_epoch"] == 2
+    # Ownership is released once restore completes, so acquisition succeeds.
+    lock = CanonicalStoreLock(db)
+    lock.acquire()
+    lock.release()
+    writer = CanonicalWriter(db)
+    writer.close()
 
 
 def test_restore_failure_releases_lock(tmp_path, monkeypatch):
@@ -422,25 +445,14 @@ def test_backup_replace_failure_preserves_previous_backup(tmp_path, monkeypatch)
 # --------------------------------------------------------------------------- #
 
 
-def test_manifest_publication_is_atomic_and_durable(tmp_path, monkeypatch):
-    import app.opip.canonical.backup as backup_module
-
+def test_manifest_publication_succeeds_and_replaces_prior(tmp_path):
     manifest_path = tmp_path / "manifest.json"
     write_backup_manifest({"schema_version": 1, "value": "first"}, manifest_path)
-
-    fsyncs: list[Path] = []
-    real_fsync_directory = backup_module.fsync_directory
-
-    def _record(path):
-        fsyncs.append(Path(path))
-        return real_fsync_directory(path)
-
-    monkeypatch.setattr(backup_module, "fsync_directory", _record)
     write_backup_manifest({"schema_version": 1, "value": "second"}, manifest_path)
-    monkeypatch.undo()
 
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["value"] == "second"
-    assert fsyncs == [tmp_path]
+    # No partial JSON or temp staging left at the authoritative path.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json"]
 
 
 def test_manifest_replace_failure_preserves_previous_manifest(tmp_path, monkeypatch):
@@ -1094,6 +1106,407 @@ def test_direct_writer_can_be_restored_over_with_new_epoch(tmp_path):
     finally:
         writer.close()
     validate_canonical_sqlite(live)
+
+
+# --------------------------------------------------------------------------- #
+# Constructor failure cleanup (no ownership leak, no masked error)
+# --------------------------------------------------------------------------- #
+
+
+class _HydrationBoom(RuntimeError):
+    """Sentinel for an injected post-lock constructor failure."""
+
+
+def test_constructor_lifecycle_hydration_failure_releases_lock(tmp_path, monkeypatch):
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(self):
+        raise _HydrationBoom("request lifecycle hydration failed")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "_hydrate_request_lifecycle_projection", _boom
+    )
+    with pytest.raises(_HydrationBoom, match="request lifecycle hydration failed"):
+        CanonicalWriter(db)
+    monkeypatch.undo()
+
+    # Ownership was released, so the store is immediately reacquirable.
+    writer = CanonicalWriter(db)
+    writer.close()
+
+
+def test_constructor_role_result_hydration_failure_releases_lock(tmp_path, monkeypatch):
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(self):
+        raise _HydrationBoom("role result hydration failed")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "_hydrate_role_result_identity_projection", _boom
+    )
+    with pytest.raises(_HydrationBoom, match="role result hydration failed"):
+        CanonicalWriter(db)
+    monkeypatch.undo()
+
+    writer = CanonicalWriter(db)
+    writer.close()
+
+
+def test_constructor_projection_refresh_failure_releases_lock(tmp_path, monkeypatch):
+    """The incremental refresh path is also inside the cleanup boundary."""
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(self):
+        raise _HydrationBoom("projection refresh failed")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "_refresh_request_lifecycle_projection", _boom
+    )
+    writer = CanonicalWriter(db)
+    try:
+        # Reaching the refresh path directly must still leave a healthy writer.
+        with pytest.raises(_HydrationBoom, match="projection refresh failed"):
+            writer._refresh_request_lifecycle_projection()
+    finally:
+        writer.close()
+    monkeypatch.undo()
+    CanonicalWriter(db).close()
+
+
+def test_constructor_connection_failure_releases_ownership(tmp_path, monkeypatch):
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(*_a, **_k):
+        raise OSError("connection injected failure")
+
+    monkeypatch.setattr("app.opip.canonical.writer.connect", _boom)
+    with pytest.raises(OSError, match="connection injected failure"):
+        CanonicalWriter(db)
+    monkeypatch.undo()
+
+    CanonicalWriter(db).close()
+
+
+def test_constructor_cleanup_failure_does_not_mask_original_error(tmp_path, monkeypatch):
+    """A failing cleanup must not replace the actionable construction error."""
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(self):
+        raise _HydrationBoom("original construction failure")
+
+    def _cleanup_boom(self):
+        raise RuntimeError("cleanup exploded")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "_hydrate_request_lifecycle_projection", _boom
+    )
+    monkeypatch.setattr(
+        CanonicalWriter, "_close_connection_best_effort", _cleanup_boom
+    )
+    monkeypatch.setattr(
+        CanonicalWriter, "_release_store_lock_best_effort", _cleanup_boom
+    )
+    with pytest.raises(_HydrationBoom, match="original construction failure"):
+        CanonicalWriter(db)
+    monkeypatch.undo()
+
+    CanonicalWriter(db).close()
+
+
+def test_constructor_failure_during_hydration_leaves_store_reacquirable(tmp_path, monkeypatch):
+    """Repeated failures must not accumulate ownership or connections."""
+    db = tmp_path / "canonical.sqlite3"
+    CanonicalWriter(db).close()
+
+    def _boom(self):
+        raise _HydrationBoom("repeated hydration failure")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "_hydrate_role_result_identity_projection", _boom
+    )
+    for _ in range(3):
+        with pytest.raises(_HydrationBoom):
+            CanonicalWriter(db)
+    monkeypatch.undo()
+
+    writer = CanonicalWriter(db)
+    try:
+        ack = writer.submit(_intent("after-hydration-failures", "EARLY_MOVER:HYD"))
+        assert ack.status == "OK"
+    finally:
+        writer.close()
+
+
+# --------------------------------------------------------------------------- #
+# Required durability synchronization (strict, never silently best-effort)
+# --------------------------------------------------------------------------- #
+
+
+def test_required_file_durability_raises_for_missing_file(tmp_path):
+    with pytest.raises(CanonicalDurabilityError, match="cannot open file"):
+        fsync_file_required(tmp_path / "absent.sqlite3")
+
+
+def test_required_directory_durability_raises_for_missing_directory(tmp_path):
+    with pytest.raises(CanonicalDurabilityError, match="cannot open directory"):
+        fsync_directory_required(tmp_path / "absent-directory")
+
+
+def test_required_file_durability_succeeds_on_real_file(tmp_path):
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"durable")
+    fsync_file_required(target)  # real flush, no monkeypatching
+
+
+def test_required_directory_durability_succeeds_on_real_directory(tmp_path):
+    fsync_directory_required(tmp_path)  # real flush, no monkeypatching
+
+
+def test_best_effort_fsync_swallows_while_required_fsync_raises(tmp_path, monkeypatch):
+    """The defect being fixed: best-effort hid real durability failures.
+
+    On Windows a read-only descriptor makes ``os.fsync`` fail (EBADF), so the
+    legacy helper silently performed no durability work. The required helper
+    must surface the same underlying failure.
+    """
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"x")
+
+    def _fsync_boom(_fd):
+        raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr("app.opip.canonical.schema.os.fsync", _fsync_boom)
+    fsync_path(target)  # best-effort: documented to swallow
+    with pytest.raises(CanonicalDurabilityError, match="file durability flush failed"):
+        fsync_file_required(target)
+
+
+def test_required_directory_durability_raises_when_flush_fails(tmp_path, monkeypatch):
+    import app.opip.canonical.schema as schema_module
+
+    flush_name = (
+        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
+    )
+
+    def _boom(_directory):
+        raise CanonicalDurabilityError("directory durability flush failed")
+
+    monkeypatch.setattr(schema_module, flush_name, _boom)
+    with pytest.raises(CanonicalDurabilityError, match="directory durability flush failed"):
+        fsync_directory_required(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uses os.fsync for directory durability")
+def test_required_directory_durability_raises_on_real_syscall_failure(tmp_path, monkeypatch):
+    """POSIX: the real syscall itself fails, so no seam is involved."""
+    monkeypatch.setattr(
+        "app.opip.canonical.schema.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError(5, "I/O error")),
+    )
+    with pytest.raises(CanonicalDurabilityError, match="directory durability flush failed"):
+        fsync_directory_required(tmp_path)
+
+
+def test_backup_fails_when_staged_file_durability_fails(tmp_path, monkeypatch):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup = tmp_path / "backup.sqlite3"
+
+    monkeypatch.setattr(
+        "app.opip.canonical.schema.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError(5, "I/O error")),
+    )
+    with pytest.raises(CanonicalDurabilityError):
+        backup_database(live, backup)
+    monkeypatch.undo()
+
+    # A failed publication must not leave a partial artifact behind.
+    assert not backup.exists()
+
+
+def test_backup_reports_failure_when_parent_directory_durability_fails(tmp_path, monkeypatch):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup = tmp_path / "backup.sqlite3"
+    import app.opip.canonical.schema as schema_module
+
+    flush_name = (
+        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
+    )
+
+    def _boom(_directory):
+        raise CanonicalDurabilityError("parent directory durability failed")
+
+    monkeypatch.setattr(schema_module, flush_name, _boom)
+    with pytest.raises(CanonicalDurabilityError, match="parent directory durability failed"):
+        backup_database(live, backup)
+    monkeypatch.undo()
+
+    # The artifact may already be visible (os.replace happened first); the point
+    # is that durability was NOT reported as success.
+    assert not Path(f"{backup}-wal").exists()
+
+
+def test_restore_fails_when_staged_file_durability_fails(tmp_path, monkeypatch):
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db)
+    backup, manifest_path, _ = _make_backup(db, tmp_path)
+    before = db.read_bytes()
+
+    monkeypatch.setattr(
+        "app.opip.canonical.schema.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError(5, "I/O error")),
+    )
+    with pytest.raises(CanonicalDurabilityError):
+        _restore(db, backup, manifest_path)
+    monkeypatch.undo()
+
+    assert db.read_bytes() == before
+    validate_canonical_sqlite(db)
+    assert CanonicalStoreLock(db).held is False
+
+
+def test_restore_reports_failure_when_parent_durability_fails_after_cutover(
+    tmp_path, monkeypatch
+):
+    """Post-replace directory durability failure must never report success."""
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db, count=1)
+    backup, manifest_path, _ = _make_backup(db, tmp_path)
+    _seed(db, count=1, start=5)
+
+    import app.opip.canonical.schema as schema_module
+
+    flush_name = (
+        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
+    )
+
+    def _boom(_directory):
+        raise CanonicalDurabilityError("post-cutover directory durability failed")
+
+    monkeypatch.setattr(schema_module, flush_name, _boom)
+    with pytest.raises(CanonicalDurabilityError, match="post-cutover"):
+        _restore(db, backup, manifest_path)
+    monkeypatch.undo()
+
+    # Fail-closed: no fake rollback, and ownership is still released.
+    assert CanonicalStoreLock(db).held is False
+    assert Path(f"{db}{'.writer.lock'}").exists()
+
+
+def test_manifest_publication_fails_when_temp_file_durability_fails(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "manifest.json"
+    write_backup_manifest({"schema_version": 1, "value": "keep-me"}, manifest_path)
+
+    monkeypatch.setattr(
+        "os.fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError(5, "I/O error")),
+    )
+    with pytest.raises(OSError, match="I/O error"):
+        write_backup_manifest({"schema_version": 1, "value": "never"}, manifest_path)
+    monkeypatch.undo()
+
+    # Prior valid manifest survives; no partial JSON at the authoritative path.
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["value"] == "keep-me"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json"]
+
+
+def test_manifest_publication_reports_failure_when_directory_durability_fails(
+    tmp_path, monkeypatch
+):
+    manifest_path = tmp_path / "manifest.json"
+    import app.opip.canonical.schema as schema_module
+
+    flush_name = (
+        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
+    )
+
+    def _boom(_directory):
+        raise CanonicalDurabilityError("manifest directory durability failed")
+
+    monkeypatch.setattr(schema_module, flush_name, _boom)
+    with pytest.raises(CanonicalDurabilityError, match="manifest directory"):
+        write_backup_manifest({"schema_version": 1, "value": "x"}, manifest_path)
+
+
+# --------------------------------------------------------------------------- #
+# Ephemeral restore-staging lock cleanup
+# --------------------------------------------------------------------------- #
+
+
+def _staging_lock_artifacts(directory: Path) -> list[Path]:
+    return [
+        path
+        for path in directory.iterdir()
+        if ".restore-staging." in path.name and path.name.endswith(".writer.lock")
+    ]
+
+
+def test_no_staging_lock_remains_after_successful_restore(tmp_path):
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db)
+    backup, manifest_path, _ = _make_backup(db, tmp_path)
+
+    _restore(db, backup, manifest_path)
+
+    assert _staging_lock_artifacts(tmp_path) == []
+    # The live store's own lock file is a different, permanent path.
+    assert store_lock_path(db).exists()
+    assert not list(tmp_path.glob("*.restore-staging.*.sqlite3"))
+
+
+def test_no_staging_lock_remains_after_staging_failure(tmp_path, monkeypatch):
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db)
+    backup, manifest_path, _ = _make_backup(db, tmp_path)
+
+    def _boom(self, minimum_epoch=None):
+        raise RuntimeError("epoch injected failure after staged writer creation")
+
+    monkeypatch.setattr(
+        CanonicalWriter, "advance_history_epoch_for_restore", _boom
+    )
+    with pytest.raises(RuntimeError, match="epoch injected failure"):
+        _restore(db, backup, manifest_path)
+    monkeypatch.undo()
+
+    assert _staging_lock_artifacts(tmp_path) == []
+    assert not list(tmp_path.glob("*.restore-staging.*.sqlite3"))
+    assert store_lock_path(db).exists()
+    assert CanonicalStoreLock(db).held is False
+
+
+def test_staging_lock_cleanup_never_touches_live_lock_file(tmp_path):
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db)
+    backup, manifest_path, _ = _make_backup(db, tmp_path)
+    live_lock = store_lock_path(db)
+
+    _restore(db, backup, manifest_path)
+
+    assert live_lock.exists()
+    # Ownership still works on the permanent path after cleanup ran.
+    writer = CanonicalWriter(db)
+    writer.close()
+
+
+def test_staging_cleanup_helper_refuses_non_staging_paths(tmp_path):
+    """The cleanup helper can never be redirected at a real canonical file."""
+    from app.opip.canonical.recovery import _cleanup_staging_artifacts
+
+    real_db = tmp_path / "opip_canonical_v1.sqlite3"
+    _seed(real_db)
+    live_lock = store_lock_path(real_db)
+
+    _cleanup_staging_artifacts(real_db)
+
+    assert real_db.exists()
+    assert live_lock.exists()
 
 
 def test_initialize_schema_rejects_incompatible_version(tmp_path):

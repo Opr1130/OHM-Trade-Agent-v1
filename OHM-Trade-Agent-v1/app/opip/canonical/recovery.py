@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import time
@@ -28,12 +29,45 @@ from app.opip.canonical.schema import (
     CanonicalStoreLock,
     checkpoint_wal_strict,
     connect,
-    fsync_directory,
-    fsync_path,
+    fsync_directory_required,
+    fsync_file_required,
     remove_sqlite_sidecars,
+    store_lock_path,
     validate_canonical_sqlite,
 )
 from app.opip.canonical.writer import CanonicalWriter
+
+#: Staging artifacts are private to one restore invocation and always share this
+#: marker, which also keeps them distinguishable from any real canonical file.
+_STAGING_MARKER = ".restore-staging."
+
+
+def _cleanup_staging_artifacts(staged: Path) -> None:
+    """Remove artifacts created by this invocation for one private staging path.
+
+    Scoped strictly to the caller's own random staging path: the staged database,
+    its SQLite sidecars, and the *ephemeral* staging ``.writer.lock`` that
+    ``CanonicalWriter(staged)`` creates. The canonical live store's lock file is a
+    different path and is never touched here.
+
+    Best-effort by design: these are private, regenerable scratch artifacts, and
+    failing to delete one must never mask the real error or risk canonical
+    evidence.
+    """
+    if _STAGING_MARKER not in staged.name:
+        # Refuse to delete anything that is not recognisably our own staging
+        # artifact, so this helper can never be pointed at a real canonical file.
+        return
+    with contextlib.suppress(OSError):
+        if staged.exists():
+            staged.unlink()
+    with contextlib.suppress(OSError):
+        remove_sqlite_sidecars(staged)
+    with contextlib.suppress(OSError):
+        staging_lock = store_lock_path(staged)
+        if staging_lock.exists():
+            staging_lock.unlink()
+
 
 
 def _live_history_epoch(live_db: Path) -> int | None:
@@ -233,20 +267,21 @@ def restore_from_backup(
             assert_rollback_journal_backup(staged)
             _assert_no_staged_sidecars(staged)
             validate_canonical_sqlite(staged)
-            fsync_path(staged)
+            # Required durability before cutover: the bytes about to be installed
+            # must be on durable storage, not just in page cache.
+            fsync_file_required(staged)
 
             # Cutover. Safe only because the live WAL was checkpointed above.
             remove_sqlite_sidecars(live_db)
             os.replace(str(staged), str(live_db))
-            remove_sqlite_sidecars(staged)
-            fsync_directory(live_db.parent)
+            # Staged path no longer holds the database; drop its orphaned staging
+            # artifacts (including the ephemeral staging writer lock).
+            _cleanup_staging_artifacts(staged)
+            # Required parent-directory durability so the rename itself survives.
+            fsync_directory_required(live_db.parent)
         except Exception:
-            if staged.exists():
-                try:
-                    staged.unlink()
-                except OSError:
-                    pass
-            remove_sqlite_sidecars(staged)
+            with contextlib.suppress(Exception):
+                _cleanup_staging_artifacts(staged)
             raise
 
         # Prove the installed snapshot is the verified one at the expected epoch.

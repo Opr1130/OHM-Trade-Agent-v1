@@ -99,6 +99,15 @@ class CanonicalCheckpointError(RuntimeError):
     """A WAL checkpoint could not be proven complete and durable."""
 
 
+class CanonicalDurabilityError(RuntimeError):
+    """Required durability synchronization could not be established.
+
+    Raised by the strict durability helpers used by authoritative canonical
+    publication and recovery. These helpers never downgrade to best-effort, so a
+    raised error means the caller must not report success.
+    """
+
+
 #: Sibling file holding the OS advisory lock that proves store ownership.
 CANONICAL_STORE_LOCK_SUFFIX = ".writer.lock"
 
@@ -334,7 +343,13 @@ def validate_canonical_sqlite(db_path: Path) -> None:
 
 
 def fsync_path(path: Path) -> None:
-    """Best-effort fsync of a file for durability before replace."""
+    """Best-effort fsync of a file.
+
+    Retained for compatibility with non-authoritative callers. Note this returns
+    silently when the platform rejects fsync on a read-only descriptor (which is
+    the normal Windows behaviour), so it must never be relied on by canonical
+    publication or recovery. Authoritative paths use ``fsync_file_required``.
+    """
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError:
@@ -353,7 +368,11 @@ def fsync_path(path: Path) -> None:
 
 
 def fsync_directory(path: Path) -> None:
-    """Best-effort directory fsync (may be unsupported on some platforms)."""
+    """Best-effort directory fsync (may be unsupported on some platforms).
+
+    Retained for compatibility with non-authoritative callers; see
+    ``fsync_path``. Authoritative paths use ``fsync_directory_required``.
+    """
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError:
@@ -368,6 +387,131 @@ def fsync_directory(path: Path) -> None:
             os.close(fd)
         except OSError:
             pass
+
+
+def _flush_directory_posix(directory: Path) -> None:
+    """Flush a directory entry's namespace (POSIX ``fsync`` on the dir fd)."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError as exc:
+        raise CanonicalDurabilityError(
+            f"cannot open directory for durability flush: {directory}: {exc}"
+        ) from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise CanonicalDurabilityError(
+            f"directory durability flush failed: {directory}: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _flush_directory_windows(directory: Path) -> None:
+    """Flush a directory entry's namespace on Windows.
+
+    ``os.open`` on a directory fails on Windows, so the supported equivalent is
+    ``CreateFileW`` with ``FILE_FLAG_BACKUP_SEMANTICS`` followed by
+    ``FlushFileBuffers``. Write access is required for a real flush; requesting
+    only read access yields ``ACCESS_DENIED`` rather than durability. A genuine
+    flush is performed, and any failure is raised instead of being swallowed.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    generic_write = 0x40000000
+    share_read = 0x00000001
+    share_write = 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+
+    handle = kernel32.CreateFileW(
+        str(directory),
+        generic_write,
+        share_read | share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    if handle == invalid_handle or handle is None:
+        raise CanonicalDurabilityError(
+            f"cannot open directory for durability flush: {directory} "
+            f"(winerror {ctypes.get_last_error()})"
+        )
+    try:
+        if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle)):
+            raise CanonicalDurabilityError(
+                f"directory durability flush failed: {directory} "
+                f"(winerror {ctypes.get_last_error()})"
+            )
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def fsync_file_required(path: Path) -> None:
+    """Require a file's contents to reach durable storage, or fail.
+
+    Opened with write access because Windows rejects ``fsync`` on a read-only
+    descriptor (``EBADF``); a read-only open is only attempted as a fallback when
+    write access is unavailable. Any open or flush failure raises
+    ``CanonicalDurabilityError``, so callers cannot report durable success
+    without evidence.
+    """
+    target = Path(path)
+    descriptor: int | None = None
+    open_error: OSError | None = None
+    for flags in (os.O_RDWR, os.O_RDONLY):
+        try:
+            descriptor = os.open(str(target), flags)
+            break
+        except OSError as exc:
+            open_error = exc
+    if descriptor is None:
+        raise CanonicalDurabilityError(
+            f"cannot open file for durability flush: {target}: {open_error}"
+        ) from open_error
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise CanonicalDurabilityError(
+            f"file durability flush failed: {target}: {exc}"
+        ) from exc
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def fsync_directory_required(directory: Path) -> None:
+    """Require a directory entry's namespace durability, or fail.
+
+    Used after an atomic ``os.replace`` so publication is not reported before the
+    rename itself is durable. Raises ``CanonicalDurabilityError`` when a real
+    flush cannot be established on the current platform.
+    """
+    target = Path(directory)
+    if os.name == "nt":
+        _flush_directory_windows(target)
+        return
+    _flush_directory_posix(target)
 
 
 def remove_sqlite_sidecars(db_path: Path) -> None:

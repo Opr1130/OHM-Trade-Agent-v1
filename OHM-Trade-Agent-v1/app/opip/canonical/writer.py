@@ -176,22 +176,29 @@ class CanonicalWriter:
         # restore can own the same canonical store concurrently.
         self._store_lock = CanonicalStoreLock(self.db_path)
         self._store_lock.acquire()
+        # Everything after lock acquisition sits inside one deterministic cleanup
+        # boundary. Schema initialization *and* projection hydration can fail on
+        # persisted canonical/DI evidence, and a partially constructed writer must
+        # never keep store ownership or leak a connection. Cleanup runs for any
+        # failure, and the original error always propagates unmasked.
         try:
             self._conn = connect(self.db_path, read_only=False)
             initialize_schema(self._conn, now_iso=_utc_now())
-        except Exception:
-            # A partially constructed writer must not leak the connection or
-            # retain ownership, so the next attempt fails on its real cause
-            # instead of a spurious "busy" store.
-            self._close_connection_best_effort()
-            self._store_lock.release()
+            self._request_lifecycle_projection: dict[str, str] = {}
+            self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
+            self._role_result_idempotency_by_id: dict[str, str] = {}
+            self._role_result_projection_watermark: tuple[int, int] = (0, -1)
+            self._hydrate_request_lifecycle_projection()
+            self._hydrate_role_result_identity_projection()
+        except BaseException:
+            # Cleanup is itself protected: a secondary failure while closing the
+            # connection or releasing ownership must never replace the original
+            # error, which is the only actionable signal for the operator.
+            with contextlib.suppress(Exception):
+                self._close_connection_best_effort()
+            with contextlib.suppress(Exception):
+                self._release_store_lock_best_effort()
             raise
-        self._request_lifecycle_projection: dict[str, str] = {}
-        self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
-        self._role_result_idempotency_by_id: dict[str, str] = {}
-        self._role_result_projection_watermark: tuple[int, int] = (0, -1)
-        self._hydrate_request_lifecycle_projection()
-        self._hydrate_role_result_identity_projection()
 
     def _close_connection_best_effort(self) -> None:
         connection = getattr(self, "_conn", None)
@@ -201,6 +208,11 @@ class CanonicalWriter:
         # be masked by a secondary failure while closing a partial connection.
         with contextlib.suppress(Exception):
             connection.close()
+
+    def _release_store_lock_best_effort(self) -> None:
+        """Return store ownership on a construction failure, without masking it."""
+        with contextlib.suppress(Exception):
+            self._store_lock.release()
 
     def _apply_persisted_request_transition(
         self,

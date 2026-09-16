@@ -16,8 +16,8 @@ from typing import Any, Mapping
 from app.opip.canonical.schema import (
     checkpoint_wal_strict,
     connect,
-    fsync_directory,
-    fsync_path,
+    fsync_directory_required,
+    fsync_file_required,
     remove_sqlite_sidecars,
     sqlite_sidecar_paths,
     validate_canonical_sqlite,
@@ -287,7 +287,9 @@ def backup_database(source_db: Path, dest_db: Path) -> Path:
         _finalize_backup_snapshot(staged)
         assert_rollback_journal_backup(staged)
         validate_canonical_sqlite(staged)
-        fsync_path(staged)
+        # Required durability before the atomic publish: a backup that is
+        # reported as published must have its bytes on durable storage.
+        fsync_file_required(staged)
         os.replace(str(staged), str(dest_db))
         # Only after a successful cutover: any sidecar left beside the
         # destination belonged to the artifact just replaced and can never pair
@@ -295,7 +297,8 @@ def backup_database(source_db: Path, dest_db: Path) -> Path:
         # before the replace would risk corrupting the previous backup if the
         # replace then failed.
         remove_sqlite_sidecars(dest_db)
-        fsync_directory(dest_db.parent)
+        # Required parent-directory durability so the rename itself survives.
+        fsync_directory_required(dest_db.parent)
     except Exception:
         if staged.exists():
             try:
@@ -472,7 +475,7 @@ def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
-        fsync_directory(path.parent)
+        fsync_directory_required(path.parent)
     except Exception:
         try:
             os.unlink(temp_name)
