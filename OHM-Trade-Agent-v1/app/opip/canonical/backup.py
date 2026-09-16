@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import sqlite3
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -258,12 +260,24 @@ def backup_database(source_db: Path, dest_db: Path) -> Path:
     """
     Consistent snapshot via the SQLite backup API (not VACUUM INTO / file copy).
 
-    Never deletes the last known-good final backup until a staged snapshot has
-    been written, closed, finalized into a self-contained file, validated, and
-    atomically published.
+    **Create-only.** This primitive refuses to replace an existing destination,
+    because a published backup is an immutable recovery generation and a
+    previously valid pair (database + matching manifest) must never be destroyed
+    by a new backup attempt. Use :func:`publish_backup_generation` for the
+    authoritative operation; it supplies a unique generation path per attempt.
+
+    The snapshot is written to a private staging file, finalised into a
+    self-contained rollback-journal artifact, validated, durably flushed, and
+    atomically published. Any failure leaves the destination untouched.
     """
     dest_db = Path(dest_db)
     source_db = Path(source_db)
+    if dest_db.exists():
+        raise BackupProvenanceError(
+            "refusing to replace an existing published backup; a published "
+            "generation is immutable and must never be overwritten "
+            f"(destination already exists: {dest_db})"
+        )
     dest_db.parent.mkdir(parents=True, exist_ok=True)
     staged = dest_db.with_name(
         f".{dest_db.name}.staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
@@ -458,6 +472,115 @@ def verify_backup_manifest(
                 f"{recorded} != {facts[field_name]}"
             )
     return dict(manifest)
+
+
+#: Filename marker separating the generation id in published backup artifacts.
+BACKUP_GENERATION_MARKER = ".backup."
+
+#: Default stem for published canonical backup generations.
+DEFAULT_BACKUP_STEM = "opip_canonical_v1"
+
+
+def new_backup_generation_id() -> str:
+    """Return a collision-resistant, non-semantic backup generation identifier.
+
+    Combines a UTC timestamp (readability, sub-minute ordering) with UUID
+    entropy (collision resistance), so it is never a function of second-
+    resolution time alone. It identifies backup *packaging* only and never
+    participates in canonical evidence identity.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return f"{stamp}-{uuid.uuid4().hex[:12]}"
+
+
+def backup_generation_paths(
+    backup_dir: Path,
+    *,
+    generation_id: str,
+    stem: str = DEFAULT_BACKUP_STEM,
+) -> tuple[Path, Path]:
+    """Derive the immutable ``(database, manifest)`` paths for one generation."""
+    directory = Path(backup_dir)
+    database = directory / f"{stem}{BACKUP_GENERATION_MARKER}{generation_id}.sqlite3"
+    manifest = directory / f"{stem}{BACKUP_GENERATION_MARKER}{generation_id}.manifest.json"
+    return database, manifest
+
+
+@dataclass(frozen=True)
+class PublishedBackupGeneration:
+    """Receipt for one committed backup generation.
+
+    Informational only: it is not a persistent authority, and the manifest of the
+    generation it describes remains the commit marker.
+    """
+
+    generation_id: str
+    backup_path: Path
+    manifest_path: Path
+    sha256: str
+    source_release_sha: str
+
+
+def publish_backup_generation(
+    source_db: Path,
+    backup_dir: Path,
+    *,
+    source_release_sha: str | None = None,
+    stem: str = DEFAULT_BACKUP_STEM,
+    generation_id: str | None = None,
+) -> PublishedBackupGeneration:
+    """Publish one immutable, fully verified canonical backup generation.
+
+    A generation is committed **only** once its matching manifest is durably
+    published; a backup database without a matching manifest is never a valid
+    recovery generation. Because each attempt uses a fresh generation path,
+    producing generation N+1 can never destroy or invalidate generation N: the
+    previous pair is untouched until the new pair is complete.
+
+    There is deliberately no mutable "current backup" pointer and no registry —
+    restore already receives an explicit database and manifest path, so the
+    manifest alone is the commit marker.
+    """
+    source_db = Path(source_db)
+    backup_dir = Path(backup_dir)
+    identifier = generation_id or new_backup_generation_id()
+    database_path, manifest_path = backup_generation_paths(
+        backup_dir, generation_id=identifier, stem=stem
+    )
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage 1: publish the immutable generation database (durable on return).
+    backup_database(source_db, database_path)
+
+    # Stage 2: build the manifest from the *finalized* generation database. The
+    # recorded SHA and byte-count facts therefore describe exactly the bytes that
+    # were published, and the recorded filename is the generation filename.
+    try:
+        manifest = build_backup_manifest(
+            backup_path=database_path,
+            source_release_sha=source_release_sha,
+        )
+        # Stage 3: atomic, durable manifest publication commits the generation.
+        write_backup_manifest(manifest, manifest_path)
+    except Exception:
+        # The generation database exists but has no authoritative manifest, so it
+        # is an orphaned, uncommitted artifact. It may be best-effort removed
+        # because this invocation created it; previous generations are never
+        # touched, and no manifest means restore can never authorize it.
+        with contextlib.suppress(OSError):
+            if database_path.exists():
+                database_path.unlink()
+        with contextlib.suppress(OSError):
+            remove_sqlite_sidecars(database_path)
+        raise
+
+    return PublishedBackupGeneration(
+        generation_id=identifier,
+        backup_path=database_path,
+        manifest_path=manifest_path,
+        sha256=str(manifest["sha256"]),
+        source_release_sha=str(manifest["source_release_sha"]),
+    )
 
 
 def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:

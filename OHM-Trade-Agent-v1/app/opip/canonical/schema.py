@@ -112,6 +112,28 @@ class CanonicalDurabilityError(RuntimeError):
 CANONICAL_STORE_LOCK_SUFFIX = ".writer.lock"
 
 
+def canonical_store_path(path: Path) -> Path:
+    """Return the single deterministic identity of a canonical store path.
+
+    Equivalent references to the same store — relative vs absolute, embedded
+    ``.``/``..``, symlink aliases, and on Windows case/separator variants — must
+    all collapse to one path, because store exclusivity is derived from the lock
+    pathname. Two aliases of one store must never yield two independent locks.
+
+    ``Path.resolve`` resolves as much of the hierarchy as exists (including
+    symlinks) and normalises the remainder, so this also works when the database
+    file does not exist yet but its parents do. ``normcase`` supplies the
+    platform's canonical path form: case-insensitive on Windows, identity on
+    POSIX where paths are case-sensitive.
+
+    Inode identity is deliberately *not* used: restore replaces the database
+    inode, while the lock must remain a stable pathname.
+    """
+    target = Path(path).expanduser()
+    resolved = target.resolve()
+    return Path(os.path.normcase(str(resolved)))
+
+
 def store_lock_path(db_path: Path) -> Path:
     """Sibling lock-file path used to prove exclusive canonical-store ownership."""
     target = Path(db_path)
@@ -164,7 +186,10 @@ class CanonicalStoreLock:
     """
 
     def __init__(self, db_path: Path) -> None:
-        self.db_path = Path(db_path)
+        # Ownership identity is the *normalised* canonical path, so relative,
+        # absolute, ``..``, symlink and Windows case aliases of one store cannot
+        # each obtain a separate lock.
+        self.db_path = canonical_store_path(db_path)
         self.lock_path = store_lock_path(self.db_path)
         self._handle: Any | None = None
 

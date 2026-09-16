@@ -15,18 +15,17 @@ from app.opip.canonical.backup import (
     assert_regular_file,
     assert_rollback_journal_backup,
     assert_sidecar_free,
-    backup_database,
-    build_backup_manifest,
     hash_file_sha256,
     normalize_to_rollback_journal,
+    publish_backup_generation,
     read_backup_manifest,
     verify_backup_manifest,
-    write_backup_manifest,
 )
 from app.opip.canonical.schema import (
     CanonicalCheckpointError,
     CanonicalDbValidationError,
     CanonicalStoreLock,
+    canonical_store_path,
     checkpoint_wal_strict,
     connect,
     fsync_directory_required,
@@ -178,7 +177,11 @@ def restore_from_backup(
     """
     started = time.perf_counter()
     backup_db = Path(backup_db)
-    live_db = Path(live_db)
+    # Normalise the live path to its single canonical identity before locking,
+    # epoch inspection, sidecar handling, staging and cutover. Restoring through
+    # a symlink alias must operate on the canonical store target, never replace
+    # the alias entry itself, and must contend on the same lock as any writer.
+    live_db = canonical_store_path(live_db)
     manifest_path = Path(manifest_path)
 
     if not advance_epoch:
@@ -315,8 +318,7 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
 
     drill_release_sha = "808a308cd274d30b55fef47b382c229b761e07df"
     live = work_dir / "live" / "opip_canonical_v1.sqlite3"
-    backup = work_dir / "backup" / "opip_canonical_v1.backup.sqlite3"
-    manifest_path = work_dir / "backup" / "manifest.json"
+    backup_dir = work_dir / "backup"
     restored = work_dir / "restored" / "opip_canonical_v1.sqlite3"
 
     writer = CanonicalWriter(live)
@@ -351,13 +353,15 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
         writer.close()
 
     backup_started = time.perf_counter()
-    backup_database(live, backup)
-    backup_ms = (time.perf_counter() - backup_started) * 1000.0
-    manifest = build_backup_manifest(
-        backup_path=backup,
+    published = publish_backup_generation(
+        live,
+        backup_dir,
         source_release_sha=drill_release_sha,
     )
-    write_backup_manifest(manifest, manifest_path)
+    backup_ms = (time.perf_counter() - backup_started) * 1000.0
+    backup = published.backup_path
+    manifest_path = published.manifest_path
+    manifest = read_backup_manifest(manifest_path)
 
     restore_result = restore_from_backup(
         backup_db=backup,

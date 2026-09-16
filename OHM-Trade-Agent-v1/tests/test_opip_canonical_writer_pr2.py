@@ -15,6 +15,8 @@ from app.opip.canonical.backup import (
     BackupProvenanceError,
     backup_database,
     build_backup_manifest,
+    publish_backup_generation,
+    read_backup_manifest,
 )
 from app.opip.canonical.bridge import (
     durable_record_opportunity_alert,
@@ -650,9 +652,14 @@ def test_backup_manifest_matches_snapshot_after_live_write(canonical_env, tmp_pa
     assert later["sha256"] == manifest["sha256"]
 
 
-def test_backup_manifest_rejects_unverified_release_provenance(canonical_env, tmp_path):
+def test_backup_manifest_rejects_unverified_release_provenance(canonical_env, tmp_path, monkeypatch):
     """A manifest authorizes restore, so it must carry real release provenance."""
     from app.opip.canonical.backup import BackupProvenanceError
+
+    # build_backup_manifest falls back to OPIP_SOURCE_RELEASE_SHA when the
+    # explicit argument is blank; isolate that so the blank/None cases genuinely
+    # exercise the refusal path.
+    monkeypatch.delenv("OPIP_SOURCE_RELEASE_SHA", raising=False)
 
     live = canonical_env["db"]
     CanonicalWriter(live).close()
@@ -842,11 +849,16 @@ def test_backup_preserves_previous_on_backup_api_failure(canonical_env, tmp_path
         return conn
 
     monkeypatch.setattr("app.opip.canonical.backup.connect", _connect)
+    # A failed attempt against a NEW destination leaves nothing behind...
+    failed_dest = tmp_path / "failed.sqlite3"
     with pytest.raises(RuntimeError, match="backup injected failure"):
-        backup_database(live, dest)
-    assert dest.read_bytes() == before
+        backup_database(live, failed_dest)
+    assert not failed_dest.exists()
+    # ...and the published generation is untouched, because the primitive is
+    # create-only and never replaces an existing published backup.
     from app.opip.canonical.schema import validate_canonical_sqlite
 
+    assert dest.read_bytes() == before
     validate_canonical_sqlite(dest)
 
 
@@ -869,35 +881,42 @@ def test_backup_preserves_previous_on_validation_failure(canonical_env, tmp_path
         "app.opip.canonical.backup.validate_canonical_sqlite",
         _bad,
     )
+    failed_dest = tmp_path / "failed2.sqlite3"
     with pytest.raises(RuntimeError, match="validation injected failure"):
-        backup_database(live, dest)
+        backup_database(live, failed_dest)
+    assert not failed_dest.exists()
     assert dest.read_bytes() == before
 
 
-def test_backup_success_replaces_and_passes_integrity(canonical_env, tmp_path):
+def test_backup_generations_coexist_and_remain_immutable(canonical_env, tmp_path):
+    """Distinct generations coexist; producing one never alters another."""
     from app.opip.canonical.schema import validate_canonical_sqlite
 
     live = canonical_env["db"]
-    dest = tmp_path / "snap.sqlite3"
+    backup_dir = tmp_path / "generations"
     writer = CanonicalWriter(live)
     try:
         writer.submit(_record_intent(key="bk:a", identity="EARLY_MOVER:A"))
         writer.checkpoint_wal()
     finally:
         writer.close()
-    backup_database(live, dest)
-    first_sha = dest.read_bytes()
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_bytes = first.backup_path.read_bytes()
+
     writer = CanonicalWriter(live)
     try:
         writer.submit(_record_intent(key="bk:b", identity="EARLY_MOVER:B"))
         writer.checkpoint_wal()
     finally:
         writer.close()
-    backup_database(live, dest)
-    assert dest.read_bytes() != first_sha
-    validate_canonical_sqlite(dest)
-    manifest = build_backup_manifest(backup_path=dest, source_release_sha=RELEASE_SHA)
-    assert manifest["event_count"] == 2
+    second = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    assert first.backup_path != second.backup_path
+    assert first.backup_path.read_bytes() == first_bytes
+    validate_canonical_sqlite(first.backup_path)
+    validate_canonical_sqlite(second.backup_path)
+    assert read_backup_manifest(second.manifest_path)["event_count"] == 2
+    assert read_backup_manifest(first.manifest_path)["event_count"] == 1
 
 
 def _verified_backup(live: Path, tmp_path, *, name: str = "bak"):
@@ -967,9 +986,8 @@ def test_restore_invalid_backup_preserves_live(canonical_env, tmp_path):
     assert live.read_bytes() == before
 
     # Restore the real bytes but corrupt the snapshot so integrity validation
-    # (not provenance) is what rejects it.
-    backup_database(live, backup)
-    manifest = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
+    # (not provenance) is what rejects it. Use a fresh generation (create-only).
+    backup, manifest_path, manifest = _verified_backup(live, tmp_path, name="bak2b")
     manifest["event_count"] = int(manifest["event_count"]) + 99
     from app.opip.canonical.backup import write_backup_manifest
 

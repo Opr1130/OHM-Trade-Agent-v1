@@ -24,10 +24,13 @@ from app.opip.canonical.backup import (
     backup_database,
     build_backup_manifest,
     hash_file_sha256,
+    new_backup_generation_id,
+    publish_backup_generation,
     read_backup_manifest,
     read_sqlite_journal_format,
     verify_backup_manifest,
     write_backup_manifest,
+    backup_generation_paths,
 )
 from app.opip.canonical.models import WriterIntent
 from app.opip.canonical.paths import SCHEMA_VERSION
@@ -38,6 +41,7 @@ from app.opip.canonical.schema import (
     CanonicalDurabilityError,
     CanonicalStoreBusyError,
     CanonicalStoreLock,
+    canonical_store_path,
     checkpoint_wal_strict,
     connect,
     fsync_directory_required,
@@ -403,41 +407,73 @@ def test_backup_manifest_refuses_nonconforming_artifacts(tmp_path):
         build_backup_manifest(backup_path=ok, source_release_sha=RELEASE_SHA)
 
 
-def test_backup_manifest_rejects_unverified_release_provenance(tmp_path):
+def test_backup_manifest_rejects_unverified_release_provenance(tmp_path, monkeypatch):
     live = tmp_path / "canonical.sqlite3"
     _seed(live)
     backup = tmp_path / "backup.sqlite3"
     backup_database(live, backup)
 
+    # build_backup_manifest falls back to OPIP_SOURCE_RELEASE_SHA when the
+    # explicit argument is blank; isolate the environment so the blank/None cases
+    # genuinely exercise the refusal path instead of reading ambient provenance.
+    monkeypatch.delenv("OPIP_SOURCE_RELEASE_SHA", raising=False)
+
     for bad in ("x", "UNVERIFIED", "unknown", "HEAD", "main", "808a308", "g" * 40, ""):
         with pytest.raises(BackupProvenanceError, match="40-character"):
             build_backup_manifest(backup_path=backup, source_release_sha=bad)
+    # Explicit None must also be refused rather than silently accepted.
+    with pytest.raises(BackupProvenanceError, match="40-character"):
+        build_backup_manifest(backup_path=backup, source_release_sha=None)
 
 
-def test_backup_replace_failure_preserves_previous_backup(tmp_path, monkeypatch):
+def test_backup_publish_failure_preserves_previous_generation(tmp_path, monkeypatch):
+    """A failed new generation must not damage the previous committed one."""
     live = tmp_path / "canonical.sqlite3"
     _seed(live, count=1)
-    backup = tmp_path / "backup.sqlite3"
-    backup_database(live, backup)
-    first_hash = hash_file_sha256(backup)
+    backup_dir = tmp_path / "backups"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_db_bytes = first.backup_path.read_bytes()
+    first_manifest_bytes = first.manifest_path.read_bytes()
 
     _seed(live, count=1, start=10)
     import app.opip.canonical.backup as backup_module
 
-    real_replace = backup_module.os.replace
-
-    def _boom(src, dst):
-        if Path(dst) == backup:
-            raise OSError("publish injected failure")
-        return real_replace(src, dst)
+    def _boom(*_a, **_k):
+        raise OSError("publish injected failure")
 
     monkeypatch.setattr(backup_module.os, "replace", _boom)
     with pytest.raises(OSError, match="publish injected failure"):
-        backup_database(live, backup)
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
     monkeypatch.undo()
 
-    assert hash_file_sha256(backup) == first_hash
-    validate_canonical_sqlite(backup)
+    # Previous generation is byte-identical and still verifies.
+    assert first.backup_path.read_bytes() == first_db_bytes
+    assert first.manifest_path.read_bytes() == first_manifest_bytes
+    verify_backup_manifest(
+        read_backup_manifest(first.manifest_path),
+        backup_path=first.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+    # The failed attempt left no partial or orphan artifact behind.
+    assert sorted(p.name for p in backup_dir.iterdir()) == sorted(
+        [first.backup_path.name, first.manifest_path.name]
+    )
+
+
+def test_backup_database_is_create_only(tmp_path):
+    """The primitive refuses to replace an existing published backup."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    published = tmp_path / "published.sqlite3"
+    backup_database(live, published)
+    before = published.read_bytes()
+
+    _seed(live, count=1, start=5)
+    with pytest.raises(BackupProvenanceError, match="immutable|refusing to replace"):
+        backup_database(live, published)
+
+    assert published.read_bytes() == before
+    validate_canonical_sqlite(published)
 
 
 # --------------------------------------------------------------------------- #
@@ -734,13 +770,11 @@ def test_restore_rejects_tampered_backup_and_manifest_without_live_mutation(tmp_
     with pytest.raises(BackupProvenanceError, match="event_count"):
         _restore(live, backup, manifest_path)
 
-    # Tamper release provenance.
-    backup_database(live, backup)
-    manifest = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
-    write_backup_manifest(manifest, manifest_path)
-    _rewrite_manifest(manifest_path, lambda m: m.update(source_release_sha=OTHER_RELEASE_SHA))
+    # Tamper release provenance, using a fresh generation for the clean pair.
+    backup_b, manifest_path_b, _ = _make_backup(live, tmp_path, name="bak-prov")
+    _rewrite_manifest(manifest_path_b, lambda m: m.update(source_release_sha=OTHER_RELEASE_SHA))
     with pytest.raises(BackupProvenanceError, match="expected release"):
-        _restore(live, backup, manifest_path)
+        _restore(live, backup_b, manifest_path_b)
 
     assert live.read_bytes() == before
 
@@ -1507,6 +1541,449 @@ def test_staging_cleanup_helper_refuses_non_staging_paths(tmp_path):
 
     assert real_db.exists()
     assert live_lock.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Canonical store path identity (alias bypass)
+# --------------------------------------------------------------------------- #
+
+
+def test_canonical_store_path_is_idempotent_and_collapses_aliases(tmp_path):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    target = real / "sub" / "canonical.sqlite3"  # does not exist yet
+
+    canonical = canonical_store_path(target)
+    assert canonical == canonical_store_path(canonical)
+    assert canonical == canonical_store_path(real / "." / "sub" / "canonical.sqlite3")
+    assert canonical == canonical_store_path(real / ".." / real.name / "sub" / "canonical.sqlite3")
+    assert canonical == canonical_store_path(str(target))
+    assert canonical.is_absolute()
+
+
+def test_relative_and_absolute_references_share_one_lock(tmp_path, monkeypatch):
+    """A relative reference must contend on the same lock as the absolute one."""
+    real = tmp_path / "store"
+    real.mkdir()
+    absolute = real / "canonical.sqlite3"
+
+    writer = CanonicalWriter(absolute)
+    try:
+        monkeypatch.chdir(tmp_path)
+        relative = Path("store") / "canonical.sqlite3"
+        assert relative != absolute
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(relative)
+    finally:
+        writer.close()
+        monkeypatch.undo()
+
+
+def test_dotdot_alias_shares_one_lock(tmp_path):
+    real = tmp_path / "nested" / "store"
+    real.mkdir(parents=True)
+    absolute = real / "canonical.sqlite3"
+    dotdot_alias = real / ".." / "store" / "canonical.sqlite3"
+    assert dotdot_alias != absolute
+
+    writer = CanonicalWriter(absolute)
+    try:
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(dotdot_alias)
+    finally:
+        writer.close()
+
+    # After release the alias can acquire the same store.
+    alias_writer = CanonicalWriter(dotdot_alias)
+    alias_writer.close()
+
+
+def _make_symlink(link: Path, target: Path, *, directory: bool) -> bool:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+def test_symlink_alias_blocks_in_both_directions(tmp_path):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    alias_root = tmp_path / "alias"
+    if not _make_symlink(alias_root, real, directory=True):
+        pytest.skip("platform/permissions cannot create symlinks")
+    real_db = real / "sub" / "canonical.sqlite3"
+    alias_db = alias_root / "sub" / "canonical.sqlite3"
+    assert alias_db != real_db
+
+    # real -> blocks alias
+    writer = CanonicalWriter(real_db)
+    try:
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(alias_db)
+    finally:
+        writer.close()
+
+    # alias -> blocks real
+    writer = CanonicalWriter(alias_db)
+    try:
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(real_db)
+    finally:
+        writer.close()
+
+
+def test_symlink_alias_cannot_bypass_restore_ownership(tmp_path):
+    """Restore through an alias must contend with a writer on the real path."""
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    alias_root = tmp_path / "alias"
+    if not _make_symlink(alias_root, real, directory=True):
+        pytest.skip("platform/permissions cannot create symlinks")
+    real_db = real / "sub" / "canonical.sqlite3"
+    alias_db = alias_root / "sub" / "canonical.sqlite3"
+
+    _seed(real_db)
+    backup, manifest_path, _ = _make_backup(real_db, tmp_path)
+
+    writer = CanonicalWriter(real_db)
+    before = real_db.read_bytes()
+    try:
+        with pytest.raises(CanonicalStoreBusyError):
+            _restore(alias_db, backup, manifest_path)
+        assert real_db.read_bytes() == before
+    finally:
+        writer.close()
+
+
+def test_restore_through_symlink_alias_replaces_canonical_target(tmp_path):
+    """Cutover must hit the canonical file, never replace the alias entry."""
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    alias_root = tmp_path / "alias"
+    if not _make_symlink(alias_root, real, directory=True):
+        pytest.skip("platform/permissions cannot create symlinks")
+    real_db = real / "sub" / "canonical.sqlite3"
+    alias_db = alias_root / "sub" / "canonical.sqlite3"
+
+    _seed(real_db)
+    backup, manifest_path, _ = _make_backup(real_db, tmp_path)
+
+    result = _restore(alias_db, backup, manifest_path)
+
+    # The canonical target is the restored store...
+    assert result["restored_path"] == str(canonical_store_path(real_db))
+    validate_canonical_sqlite(real_db)
+    assert _epoch_and_seq(real_db)[0] == 2
+    # ...and the alias is still a symlink directory, not a replaced entry.
+    assert alias_root.is_symlink()
+    assert alias_db.exists()
+
+
+def test_windows_case_variant_shares_one_lock(tmp_path):
+    """On case-insensitive filesystems a case variant is the same store."""
+    if os.name != "nt":
+        pytest.skip("case-insensitive path identity is Windows-specific")
+    store = tmp_path / "StoreDir"
+    store.mkdir()
+    lower = tmp_path / "storedir" / "canonical.sqlite3"
+    upper = store / "canonical.sqlite3"
+    assert canonical_store_path(lower) == canonical_store_path(upper)
+
+    writer = CanonicalWriter(upper)
+    try:
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(lower)
+    finally:
+        writer.close()
+
+
+def test_permanent_lock_path_is_stable_and_never_deleted(tmp_path):
+    db = tmp_path / "canonical.sqlite3"
+    expected_lock = store_lock_path(canonical_store_path(db))
+
+    writer = CanonicalWriter(db)
+    writer.close()
+    # The lock pathname is stable across the writer lifecycle and after release.
+    assert expected_lock.exists()
+    assert CanonicalStoreLock(db).lock_path == expected_lock
+    writer = CanonicalWriter(db)
+    writer.close()
+    assert expected_lock.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Backup generations (immutable, manifest-committed pairs)
+# --------------------------------------------------------------------------- #
+
+
+def _generation_files(backup_dir: Path) -> list[str]:
+    return sorted(p.name for p in backup_dir.iterdir())
+
+
+def test_publish_backup_generation_commits_a_verified_pair(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=2)
+    backup_dir = tmp_path / "generations"
+
+    published = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    assert published.backup_path.exists()
+    assert published.manifest_path.exists()
+    assert published.backup_path.name == f"opip_canonical_v1.backup.{published.generation_id}.sqlite3"
+    assert published.manifest_path.name == (
+        f"opip_canonical_v1.backup.{published.generation_id}.manifest.json"
+    )
+    assert_rollback_journal_backup(published.backup_path)
+    assert not Path(f"{published.backup_path}-wal").exists()
+    assert not Path(f"{published.backup_path}-shm").exists()
+
+    manifest = read_backup_manifest(published.manifest_path)
+    assert manifest["backup_file"] == published.backup_path.name
+    assert manifest["sha256"] == hash_file_sha256(published.backup_path)
+    assert manifest["sha256"] == published.sha256
+    assert manifest["event_count"] == 2
+    verify_backup_manifest(
+        manifest, backup_path=published.backup_path, expected_source_release_sha=RELEASE_SHA
+    )
+
+    target = tmp_path / "restored" / "canonical.sqlite3"
+    result = _restore(target, published.backup_path, published.manifest_path)
+    assert result["history_epoch"] == 2
+    validate_canonical_sqlite(target)
+
+
+def test_generation_ids_are_unique_and_not_second_resolution(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup_dir = tmp_path / "generations"
+
+    ids = {
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA).generation_id
+        for _ in range(5)
+    }
+    assert len(ids) == 5
+
+
+def test_second_generation_preserves_first_generation(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_db_bytes = first.backup_path.read_bytes()
+    first_manifest_bytes = first.manifest_path.read_bytes()
+
+    _seed(live, count=1, start=50)
+    second = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    assert first.backup_path != second.backup_path
+    assert first.backup_path.read_bytes() == first_db_bytes
+    assert first.manifest_path.read_bytes() == first_manifest_bytes
+    # Both generations remain independently verifiable and restorable.
+    for generation in (first, second):
+        verify_backup_manifest(
+            read_backup_manifest(generation.manifest_path),
+            backup_path=generation.backup_path,
+            expected_source_release_sha=RELEASE_SHA,
+        )
+    assert read_backup_manifest(first.manifest_path)["event_count"] == 1
+    assert read_backup_manifest(second.manifest_path)["event_count"] == 2
+
+
+def test_generation_failure_before_db_publication_preserves_previous(tmp_path, monkeypatch):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_db_bytes = first.backup_path.read_bytes()
+    files_before = _generation_files(backup_dir)
+
+    import app.opip.canonical.backup as backup_module
+
+    def _boom(*_a, **_k):
+        raise OSError("db publish injected failure")
+
+    monkeypatch.setattr(backup_module.os, "replace", _boom)
+    with pytest.raises(OSError, match="db publish injected failure"):
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    monkeypatch.undo()
+
+    assert first.backup_path.read_bytes() == first_db_bytes
+    assert _generation_files(backup_dir) == files_before
+    verify_backup_manifest(
+        read_backup_manifest(first.manifest_path),
+        backup_path=first.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+
+
+def test_generation_db_without_manifest_is_not_committed(tmp_path, monkeypatch):
+    """Failure between DB publish and manifest publish leaves an orphan, not a backup."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_db_bytes = first.backup_path.read_bytes()
+    first_manifest_bytes = first.manifest_path.read_bytes()
+
+    import app.opip.canonical.backup as backup_module
+
+    real_write = backup_module.write_backup_manifest
+
+    def _boom(*_a, **_k):
+        raise OSError("manifest publish injected failure")
+
+    monkeypatch.setattr(backup_module, "write_backup_manifest", _boom)
+    with pytest.raises(OSError, match="manifest publish injected failure"):
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    monkeypatch.undo()
+    backup_module.write_backup_manifest = real_write
+
+    # Previous generation is fully intact.
+    assert first.backup_path.read_bytes() == first_db_bytes
+    assert first.manifest_path.read_bytes() == first_manifest_bytes
+    verify_backup_manifest(
+        read_backup_manifest(first.manifest_path),
+        backup_path=first.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+
+    # The orphaned new generation database has no manifest, so it is not
+    # committed and best-effort cleanup removed it: only generation A remains.
+    assert _generation_files(backup_dir) == sorted(
+        [first.backup_path.name, first.manifest_path.name]
+    )
+
+    # The acceptance property itself: a database without its manifest can never
+    # be authorized for restore, even if the bytes are perfectly valid.
+    orphan_db = backup_dir / "opip_canonical_v1.backup.ORPHAN.sqlite3"
+    shutil.copy2(first.backup_path, orphan_db)
+    assert_rollback_journal_backup(orphan_db)
+    with pytest.raises(BackupProvenanceError, match="missing or unreadable"):
+        _restore(
+            tmp_path / "target.sqlite3",
+            orphan_db,
+            backup_dir / "opip_canonical_v1.backup.ORPHAN.manifest.json",
+        )
+    # Generation A is still the recoverable one.
+    verify_backup_manifest(
+        read_backup_manifest(first.manifest_path),
+        backup_path=first.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+
+
+def test_generation_preserved_on_manifest_durability_and_replace_failure(
+    tmp_path, monkeypatch
+):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    first_db_bytes = first.backup_path.read_bytes()
+    first_manifest_bytes = first.manifest_path.read_bytes()
+    files_before = _generation_files(backup_dir)
+
+    # (a) manifest atomic replace failure
+    import app.opip.canonical.backup as backup_module
+
+    def _boom(*_a, **_k):
+        raise OSError("manifest replace injected failure")
+
+    monkeypatch.setattr(backup_module.os, "replace", _boom)
+    with pytest.raises(OSError, match="manifest replace injected failure"):
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    monkeypatch.undo()
+
+    # (b) manifest durability (fsync) failure
+    monkeypatch.setattr(
+        "app.opip.canonical.schema.os.fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError(5, "I/O error")),
+    )
+    with pytest.raises(CanonicalDurabilityError):
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+    monkeypatch.undo()
+
+    assert first.backup_path.read_bytes() == first_db_bytes
+    assert first.manifest_path.read_bytes() == first_manifest_bytes
+    assert _generation_files(backup_dir) == files_before
+    verify_backup_manifest(
+        read_backup_manifest(first.manifest_path),
+        backup_path=first.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+
+
+def test_repeated_generations_keep_earlier_ones_valid(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    backup_dir = tmp_path / "generations"
+    published = []
+    for index in range(4):
+        _seed(live, count=1, start=index * 10)
+        published.append(
+            publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+        )
+
+    assert len({g.backup_path for g in published}) == 4
+    for index, generation in enumerate(published):
+        verify_backup_manifest(
+            read_backup_manifest(generation.manifest_path),
+            backup_path=generation.backup_path,
+            expected_source_release_sha=RELEASE_SHA,
+        )
+        assert read_backup_manifest(generation.manifest_path)["event_count"] == index + 1
+
+
+def test_generation_a_manifest_cannot_authorize_generation_b_database(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+    first = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    _seed(live, count=1, start=50)
+    second = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    target = tmp_path / "target.sqlite3"
+    before = live.read_bytes()
+
+    # A's manifest names A's file, so it cannot authorize B's database.
+    with pytest.raises(BackupProvenanceError, match="different file"):
+        _restore(target, second.backup_path, first.manifest_path)
+
+    # And B's manifest cannot authorize A's database.
+    with pytest.raises(BackupProvenanceError, match="different file"):
+        _restore(target, first.backup_path, second.manifest_path)
+
+    assert live.read_bytes() == before
+
+
+def test_generation_publisher_uses_the_authoritative_contract(tmp_path):
+    """The publisher produces a restore-ready pair with no manual manifest work."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=3)
+    backup_dir = tmp_path / "generations"
+
+    published = publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    assert published.source_release_sha == RELEASE_SHA
+    target = tmp_path / "restored" / "canonical.sqlite3"
+    result = _restore(target, published.backup_path, published.manifest_path)
+    assert result["backup_sha256"] == published.sha256
+    assert result["source_release_sha"] == RELEASE_SHA
+    validate_canonical_sqlite(target)
+
+
+def test_backup_generation_paths_are_derived_from_the_generation_id(tmp_path):
+    database, manifest = backup_generation_paths(
+        tmp_path, generation_id="GEN123", stem="custom_stem"
+    )
+    assert database == tmp_path / "custom_stem.backup.GEN123.sqlite3"
+    assert manifest == tmp_path / "custom_stem.backup.GEN123.manifest.json"
+
+
+def test_new_backup_generation_id_is_unique(tmp_path):
+    ids = {new_backup_generation_id() for _ in range(50)}
+    assert len(ids) == 50
 
 
 def test_initialize_schema_rejects_incompatible_version(tmp_path):

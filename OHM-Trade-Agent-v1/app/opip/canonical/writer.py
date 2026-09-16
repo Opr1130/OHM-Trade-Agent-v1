@@ -20,6 +20,7 @@ from app.opip.canonical.paths import (
 )
 from app.opip.canonical.schema import (
     CanonicalStoreLock,
+    canonical_store_path,
     checkpoint_wal_strict,
     connect,
     initialize_schema,
@@ -169,7 +170,10 @@ class CanonicalWriter:
     """Single write authority for the operational SQLite WAL database."""
 
     def __init__(self, db_path: Path) -> None:
-        self.db_path = Path(db_path)
+        # `db_path` is the canonical normalised live-store path, not the
+        # caller's alias, so lock identity, SQLite access, sidecar handling and
+        # restore cutover all agree on one store.
+        self.db_path = canonical_store_path(db_path)
         self._lock = threading.Lock()
         # Exclusivity is acquired before the writable connection is opened, and
         # held for this writer's entire lifetime, so no second writer and no
