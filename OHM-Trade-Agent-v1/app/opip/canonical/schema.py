@@ -436,58 +436,32 @@ def _flush_directory_posix(directory: Path) -> None:
 
 
 def _flush_directory_windows(directory: Path) -> None:
-    """Flush a directory entry's namespace on Windows.
+    """Authoritative directory namespace durability is not provable on Windows.
 
-    ``os.open`` on a directory fails on Windows, so the supported equivalent is
-    ``CreateFileW`` with ``FILE_FLAG_BACKUP_SEMANTICS`` followed by
-    ``FlushFileBuffers``. Write access is required for a real flush; requesting
-    only read access yields ``ACCESS_DENIED`` rather than durability. A genuine
-    flush is performed, and any failure is raised instead of being swallowed.
+    PR-A0 fails closed here rather than reporting a durability guarantee that
+    cannot be established. Microsoft documents ``FlushFileBuffers`` for **file**
+    handles and for **volume** handles, where the volume form explicitly
+    "requires administrative privileges"; it is not among the functions that
+    Microsoft documents as accepting a *directory* handle (see "Obtaining a
+    handle to a directory"). ``FILE_FLAG_BACKUP_SEMANTICS`` only makes it
+    possible to *open* a directory, and a directory handle may fail the flush
+    outright (for example ``ERROR_INVALID_FUNCTION`` through a network
+    redirector). There is therefore no documented, testable way to prove that a
+    directory entry reached durable storage without volume-wide administrative
+    flushing, which this code must not require.
+
+    The previous implementation opened a directory handle and called
+    ``FlushFileBuffers`` on it. That treated undocumented behaviour as proof, so
+    it was removed rather than re-labelled.
     """
-    import ctypes
-    from ctypes import wintypes
-
-    generic_write = 0x40000000
-    share_read = 0x00000001
-    share_write = 0x00000002
-    open_existing = 3
-    file_flag_backup_semantics = 0x02000000
-    invalid_handle = ctypes.c_void_p(-1).value
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-    ]
-
-    handle = kernel32.CreateFileW(
-        str(directory),
-        generic_write,
-        share_read | share_write,
-        None,
-        open_existing,
-        file_flag_backup_semantics,
-        None,
+    raise CanonicalDurabilityError(
+        "authoritative directory namespace durability is unsupported on this "
+        "platform: Windows has no documented primitive that proves a directory "
+        "entry reached durable storage, and the documented volume flush requires "
+        "administrative privileges. Canonical publication and recovery therefore "
+        "cannot report durable success here; refusing rather than claiming an "
+        f"unprovable guarantee (directory: {directory})"
     )
-    if handle == invalid_handle or handle is None:
-        raise CanonicalDurabilityError(
-            f"cannot open directory for durability flush: {directory} "
-            f"(winerror {ctypes.get_last_error()})"
-        )
-    try:
-        if not kernel32.FlushFileBuffers(wintypes.HANDLE(handle)):
-            raise CanonicalDurabilityError(
-                f"directory durability flush failed: {directory} "
-                f"(winerror {ctypes.get_last_error()})"
-            )
-    finally:
-        kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
 def fsync_file_required(path: Path) -> None:
@@ -529,8 +503,20 @@ def fsync_directory_required(directory: Path) -> None:
     """Require a directory entry's namespace durability, or fail.
 
     Used after an atomic ``os.replace`` so publication is not reported before the
-    rename itself is durable. Raises ``CanonicalDurabilityError`` when a real
-    flush cannot be established on the current platform.
+    rename itself is durable. Raises ``CanonicalDurabilityError`` when namespace
+    durability cannot be established on the current platform.
+
+    Platform contract:
+
+    * POSIX — ``os.fsync`` on a real directory descriptor is the production
+      authoritative mechanism, and stays strict: an open or flush failure raises.
+    * Windows — provable directory-entry durability is unsupported (see
+      :func:`_flush_directory_windows`), so this raises rather than reporting an
+      unprovable guarantee.
+
+    There is deliberately **no** best-effort fallback anywhere on this path:
+    canonical backup, manifest and restore publication either establish required
+    durability or fail closed.
     """
     target = Path(directory)
     if os.name == "nt":

@@ -1415,7 +1415,10 @@ def test_required_file_durability_raises_for_missing_file(tmp_path):
 
 
 def test_required_directory_durability_raises_for_missing_directory(tmp_path):
-    with pytest.raises(CanonicalDurabilityError, match="cannot open directory"):
+    # POSIX opens the directory and fails on the open; Windows raises its
+    # unsupported-platform refusal before any filesystem access is attempted.
+    expected = "unsupported" if os.name == "nt" else "cannot open directory"
+    with pytest.raises(CanonicalDurabilityError, match=expected):
         fsync_directory_required(tmp_path / "absent-directory")
 
 
@@ -1425,7 +1428,15 @@ def test_required_file_durability_succeeds_on_real_file(tmp_path):
     fsync_file_required(target)  # real flush, no monkeypatching
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "authoritative directory durability is fail-closed on Windows; "
+        "see test_windows_real_authoritative_directory_durability_is_fail_closed"
+    ),
+)
 def test_required_directory_durability_succeeds_on_real_directory(tmp_path):
+    """POSIX: the production authoritative mechanism really establishes durability."""
     fsync_directory_required(tmp_path)  # real flush, no monkeypatching
 
 
@@ -1448,17 +1459,17 @@ def test_best_effort_fsync_swallows_while_required_fsync_raises(tmp_path, monkey
         fsync_file_required(target)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only: exercises the real os.fsync(dirfd) failure path",
+)
 def test_required_directory_durability_raises_when_flush_fails(tmp_path, monkeypatch):
     import app.opip.canonical.schema as schema_module
-
-    flush_name = (
-        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
-    )
 
     def _boom(_directory):
         raise CanonicalDurabilityError("directory durability flush failed")
 
-    monkeypatch.setattr(schema_module, flush_name, _boom)
+    monkeypatch.setattr(schema_module, "_flush_directory_posix", _boom)
     with pytest.raises(CanonicalDurabilityError, match="directory durability flush failed"):
         fsync_directory_required(tmp_path)
 
@@ -1495,16 +1506,14 @@ def test_backup_reports_failure_when_parent_directory_durability_fails(tmp_path,
     live = tmp_path / "canonical.sqlite3"
     _seed(live)
     backup = tmp_path / "backup.sqlite3"
-    import app.opip.canonical.schema as schema_module
-
-    flush_name = (
-        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
-    )
+    import app.opip.canonical.backup as backup_module
 
     def _boom(_directory):
         raise CanonicalDurabilityError("parent directory durability failed")
 
-    monkeypatch.setattr(schema_module, flush_name, _boom)
+    # Patch the authoritative call-site contract, so this proves the sequencing
+    # invariant on every platform.
+    monkeypatch.setattr(backup_module, "fsync_directory_required", _boom)
     with pytest.raises(CanonicalDurabilityError, match="parent directory durability failed"):
         backup_database(live, backup)
     monkeypatch.undo()
@@ -1542,16 +1551,12 @@ def test_restore_reports_failure_when_parent_durability_fails_after_cutover(
     backup, manifest_path, _ = _make_backup(db, tmp_path)
     _seed(db, count=1, start=5)
 
-    import app.opip.canonical.schema as schema_module
-
-    flush_name = (
-        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
-    )
+    import app.opip.canonical.recovery as recovery_module
 
     def _boom(_directory):
         raise CanonicalDurabilityError("post-cutover directory durability failed")
 
-    monkeypatch.setattr(schema_module, flush_name, _boom)
+    monkeypatch.setattr(recovery_module, "fsync_directory_required", _boom)
     with pytest.raises(CanonicalDurabilityError, match="post-cutover"):
         _restore(db, backup, manifest_path)
     monkeypatch.undo()
@@ -1582,16 +1587,12 @@ def test_manifest_publication_reports_failure_when_directory_durability_fails(
     tmp_path, monkeypatch
 ):
     manifest_path = tmp_path / "manifest.json"
-    import app.opip.canonical.schema as schema_module
-
-    flush_name = (
-        "_flush_directory_windows" if os.name == "nt" else "_flush_directory_posix"
-    )
+    import app.opip.canonical.backup as backup_module
 
     def _boom(_directory):
         raise CanonicalDurabilityError("manifest directory durability failed")
 
-    monkeypatch.setattr(schema_module, flush_name, _boom)
+    monkeypatch.setattr(backup_module, "fsync_directory_required", _boom)
     with pytest.raises(CanonicalDurabilityError, match="manifest directory"):
         write_backup_manifest({"schema_version": 1, "value": "x"}, manifest_path)
 
@@ -2383,6 +2384,87 @@ def test_publish_generation_succeeds_in_deeply_nested_windows_directory(tmp_path
     target = tmp_path / "restored" / "canonical.sqlite3"
     result = _restore(target, published.backup_path, published.manifest_path)
     assert result["history_epoch"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Windows authoritative directory durability is fail-closed (real behaviour)
+#
+# These tests deliberately opt out of the shared Windows durability stub (see the
+# `test_windows_real_*` prefix in tests/conftest.py) so they observe the real
+# primitive, real publication and real restore.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows platform policy test")
+def test_windows_real_authoritative_directory_durability_is_fail_closed(tmp_path):
+    """The authoritative primitive must refuse, not claim an unprovable guarantee."""
+    with pytest.raises(CanonicalDurabilityError) as exc_info:
+        fsync_directory_required(tmp_path)
+
+    message = str(exc_info.value)
+    assert "unsupported" in message
+    assert "Windows" in message
+    # The refusal explains itself precisely rather than reporting a flush failure.
+    assert "directory durability flush failed" not in message
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows platform policy test")
+def test_windows_real_publication_cannot_report_success_without_durability(
+    tmp_path,
+):
+    """Authoritative publication must fail closed rather than claim durability."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=1)
+    backup_dir = tmp_path / "generations"
+
+    # This test opts out of the Windows logic stub, so the real authoritative
+    # primitive is in force for the whole publication path.
+    with pytest.raises(CanonicalDurabilityError):
+        publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
+
+    # No generation was committed and no success receipt exists.
+    manifests = list(backup_dir.glob("*.manifest.json")) if backup_dir.exists() else []
+    assert manifests == []
+    # The live store is untouched.
+    validate_canonical_sqlite(live)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows platform policy test")
+def test_windows_real_restore_failure_preserves_live_store(tmp_path, monkeypatch):
+    """A restore cannot report success, and must leave the live store intact."""
+    db = tmp_path / "canonical.sqlite3"
+    _seed(db, count=2)
+
+    # Build the verified backup pair with durability stubbed: this test is about
+    # the restore cutover, and fixture construction is not the subject.
+    import app.opip.canonical.backup as backup_module
+
+    with monkeypatch.context() as setup_stub:
+        setup_stub.setattr(
+            backup_module, "fsync_directory_required", lambda _directory: None
+        )
+        backup, manifest_path, _ = _make_backup(db, tmp_path)
+
+    before = db.read_bytes()
+    events_before = _event_count(db)
+
+    # Real authoritative durability now applies to the cutover, so the restore
+    # genuinely refuses instead of reporting success.
+    with pytest.raises(CanonicalDurabilityError):
+        _restore(db, backup, manifest_path)
+
+    # Post-replace semantics: the atomic cutover precedes the namespace-durability
+    # step, so the verified snapshot may already be visible. PR-A0 does not fake a
+    # rollback. The invariants that must hold are: no success was reported, the
+    # installed store is a valid canonical database at the restored epoch, and
+    # ownership was released. Byte-equality with the pre-restore file is only the
+    # invariant for failures *before* the replace (covered separately by
+    # test_restore_fails_when_staged_file_durability_fails).
+    assert db.read_bytes() != before
+    assert events_before == 2
+    validate_canonical_sqlite(db)
+    assert _epoch_and_seq(db) == (2, 1)
+    assert CanonicalStoreLock(db).held is False
 
 
 # --------------------------------------------------------------------------- #

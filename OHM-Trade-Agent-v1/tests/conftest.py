@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from app.jobs import scan_opportunities
@@ -64,4 +66,40 @@ def isolate_outcome_registry_with_existing_trade_fixtures(request, monkeypatch):
         attention_budget,
         "STATE_FILE",
         tmp_path / "attention_budget_state.json",
+    )
+
+
+@pytest.fixture(autouse=True)
+def stub_authoritative_directory_durability_on_windows(request, monkeypatch):
+    """Keep Windows logic tests from falsely claiming namespace durability.
+
+    PR-A0 fails closed for authoritative directory durability on Windows, because
+    no documented Windows primitive proves that a directory entry reached durable
+    storage (see ``app.opip.canonical.schema._flush_directory_windows``). Linux CI
+    exercises the real ``os.fsync(dirfd)`` path and is unaffected by this fixture.
+
+    Local Windows runs still need to exercise publication/recovery *sequencing*
+    and ownership/cleanup logic, so on Windows the authoritative primitive is
+    stubbed at its call sites. This is deliberately narrow:
+
+    * only ``backup`` and ``recovery`` call-site references are replaced;
+    * ``app.opip.canonical.schema.fsync_directory_required`` itself is untouched,
+      so tests that call it directly still observe the real fail-closed contract;
+    * tests named ``test_windows_real_*`` opt out entirely to observe real
+      behaviour end-to-end.
+
+    Production code is not weakened by this: on Windows it raises
+    ``CanonicalDurabilityError`` and publication cannot report success.
+    """
+    if os.name != "nt" or request.node.name.startswith("test_windows_real_"):
+        return
+
+    from app.opip.canonical import backup as canonical_backup
+    from app.opip.canonical import recovery as canonical_recovery
+
+    monkeypatch.setattr(
+        canonical_backup, "fsync_directory_required", lambda _directory: None
+    )
+    monkeypatch.setattr(
+        canonical_recovery, "fsync_directory_required", lambda _directory: None
     )
