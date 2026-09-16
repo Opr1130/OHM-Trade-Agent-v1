@@ -527,7 +527,22 @@ def verify_backup_manifest(
             f"{actual_digest} != {recorded_digest}"
         )
 
-    facts = _snapshot_facts(backup_path)
+    try:
+        facts = _snapshot_facts(backup_path)
+    except BackupProvenanceError:
+        # Already the provenance contract; never re-wrap or mask it.
+        raise
+    except Exception as exc:
+        # A file can carry valid SQLite magic and rollback-journal format yet
+        # still be unreadable as a canonical snapshot (missing/irregular meta
+        # table, corrupt pages). Verified provenance is only meaningful for a
+        # readable snapshot, so normalise every such failure onto the public
+        # provenance error contract instead of letting sqlite3.Error or
+        # RuntimeError escape.
+        raise BackupProvenanceError(
+            f"backup snapshot facts are unreadable: {backup_path}: {exc}"
+        ) from exc
+
     for field_name in _SNAPSHOT_FACT_FIELDS:
         recorded = manifest.get(field_name)
         if type(recorded) is not int:

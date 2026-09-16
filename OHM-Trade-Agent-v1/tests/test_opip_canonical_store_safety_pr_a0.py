@@ -704,6 +704,129 @@ def test_verify_manifest_accepts_valid_manifest(tmp_path):
     assert verified["sha256"] == manifest["sha256"]
 
 
+def _rollback_journal_sqlite(path: Path, *, with_meta_row: bool) -> Path:
+    """A structurally valid, rollback-journal SQLite file that is not canonical.
+
+    Passes the header/preflight artifact checks, so it reaches the later
+    snapshot-fact and canonical-validation stages.
+    """
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        if with_meta_row:
+            # Readable by the snapshot-fact query, but without the canonical
+            # `schema_version` column that canonical validation requires.
+            connection.execute(
+                "CREATE TABLE meta ("
+                "id INTEGER PRIMARY KEY, history_epoch INTEGER NOT NULL, "
+                "next_local_sequence INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO meta (id, history_epoch, next_local_sequence) "
+                "VALUES (1, 1, 1)"
+            )
+        else:
+            connection.execute("CREATE TABLE unrelated (x INTEGER)")
+        connection.execute(
+            "CREATE TABLE events (history_epoch INTEGER NOT NULL, "
+            "local_sequence INTEGER NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def test_verify_manifest_raises_provenance_error_for_unreadable_snapshot_facts(tmp_path):
+    """FINDING: snapshot-fact failures must honour the provenance error contract.
+
+    A file with valid SQLite magic and rollback-journal format passes every
+    earlier artifact check, so a malformed/absent canonical schema previously let
+    a raw ``sqlite3.Error`` escape from the public verification path.
+    """
+    backup = _rollback_journal_sqlite(tmp_path / "no-meta.sqlite3", with_meta_row=False)
+    # Earlier artifact checks genuinely pass, proving we reach the facts stage.
+    assert_rollback_journal_backup(backup)
+
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backup_file": backup.name,
+        "sha256": hash_file_sha256(backup),
+        "source_release_sha": RELEASE_SHA,
+        "history_epoch": 1,
+        "next_local_sequence": 1,
+        "max_local_sequence": 0,
+        "event_count": 0,
+    }
+
+    with pytest.raises(BackupProvenanceError, match="snapshot facts are unreadable") as exc_info:
+        verify_backup_manifest(
+            manifest, backup_path=backup, expected_source_release_sha=RELEASE_SHA
+        )
+    # The underlying cause is preserved, not swallowed.
+    assert exc_info.value.__cause__ is not None
+    assert not isinstance(exc_info.value, BackupFormatError)
+
+
+def test_verify_manifest_raises_provenance_error_for_missing_meta_row(tmp_path):
+    """The missing-meta-row path (a RuntimeError source) also fails as provenance."""
+    backup = _rollback_journal_sqlite(tmp_path / "empty-meta.sqlite3", with_meta_row=False)
+    connection = sqlite3.connect(str(backup))
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            "CREATE TABLE meta (id INTEGER PRIMARY KEY, history_epoch INTEGER, "
+            "next_local_sequence INTEGER, schema_version INTEGER)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "backup_file": backup.name,
+        "sha256": hash_file_sha256(backup),
+        "source_release_sha": RELEASE_SHA,
+        "history_epoch": 1,
+        "next_local_sequence": 1,
+        "max_local_sequence": 0,
+        "event_count": 0,
+    }
+
+    with pytest.raises(BackupProvenanceError, match="snapshot facts are unreadable") as exc_info:
+        verify_backup_manifest(
+            manifest, backup_path=backup, expected_source_release_sha=RELEASE_SHA
+        )
+    assert exc_info.value.__cause__ is not None
+
+
+def test_verify_manifest_existing_provenance_errors_are_not_rewrapped(tmp_path):
+    """An existing provenance failure must surface unchanged (not double-wrapped)."""
+    _, backup, _, manifest = _valid_manifest_and_backup(tmp_path)
+    manifest["event_count"] = int(manifest["event_count"]) + 1
+
+    with pytest.raises(BackupProvenanceError, match="event_count") as exc_info:
+        verify_backup_manifest(
+            manifest, backup_path=backup, expected_source_release_sha=RELEASE_SHA
+        )
+    # Field-mismatch errors originate from the comparison, not the facts wrapper.
+    assert "snapshot facts are unreadable" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_verify_manifest_valid_backup_behavior_unchanged(tmp_path):
+    """The tightening must not alter acceptance of a valid backup."""
+    live, backup, _, manifest = _valid_manifest_and_backup(tmp_path)
+    verified = verify_backup_manifest(
+        manifest, backup_path=backup, expected_source_release_sha=RELEASE_SHA
+    )
+    assert verified["sha256"] == manifest["sha256"]
+    assert verified["event_count"] == 2
+    assert verified["history_epoch"] == 1
+    validate_canonical_sqlite(backup)
+    assert live.exists()
+
+
 def test_read_manifest_missing_and_malformed(tmp_path):
     with pytest.raises(BackupProvenanceError, match="missing or unreadable"):
         read_backup_manifest(tmp_path / "absent.json")

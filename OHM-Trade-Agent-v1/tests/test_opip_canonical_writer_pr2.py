@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -13,10 +15,12 @@ import pytest
 
 from app.opip.canonical.backup import (
     BackupProvenanceError,
+    assert_rollback_journal_backup,
     backup_database,
     build_backup_manifest,
     publish_backup_generation,
     read_backup_manifest,
+    verify_backup_manifest,
 )
 from app.opip.canonical.bridge import (
     durable_record_opportunity_alert,
@@ -996,27 +1000,63 @@ def test_restore_invalid_backup_preserves_live(canonical_env, tmp_path):
         _restore(live, backup, manifest_path)
     assert live.read_bytes() == before
 
-    # A genuine non-SQLite file with a manifest that matches it byte-for-byte
-    # must fail closed at staged validation.
-    bad = tmp_path / "bad.sqlite3"
-    bad.write_bytes(b"not-a-sqlite-db")
-    bad_manifest = tmp_path / "bad.manifest.json"
+    # A real SQLite rollback-journal artifact that satisfies every earlier
+    # artifact/provenance check but fails canonical database validation. This
+    # genuinely reaches the staged canonical-validation layer, unlike a
+    # non-SQLite file which is rejected earlier at the rollback-journal preflight.
+    from app.opip.canonical.backup import _snapshot_facts, write_backup_manifest
+
+    not_canonical = tmp_path / "not-canonical.sqlite3"
+    connection = sqlite3.connect(str(not_canonical))
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        # Readable by the snapshot-fact query, but missing the canonical
+        # `schema_version` column that canonical validation requires.
+        connection.execute(
+            "CREATE TABLE meta ("
+            "id INTEGER PRIMARY KEY, history_epoch INTEGER NOT NULL, "
+            "next_local_sequence INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO meta (id, history_epoch, next_local_sequence) VALUES (1, 1, 1)"
+        )
+        connection.execute(
+            "CREATE TABLE events ("
+            "history_epoch INTEGER NOT NULL, local_sequence INTEGER NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # Prove the fixture passes the checks that precede staged canonical
+    # validation, so the assertion below is not a false proof.
+    assert_rollback_journal_backup(not_canonical)
+    assert not Path(f"{not_canonical}-wal").exists()
+
+    not_canonical_manifest = tmp_path / "not-canonical.manifest.json"
     write_backup_manifest(
         {
             "schema_version": 1,
-            "backup_file": bad.name,
-            "sha256": __import__("hashlib").sha256(bad.read_bytes()).hexdigest(),
+            "backup_file": not_canonical.name,
+            "sha256": hashlib.sha256(not_canonical.read_bytes()).hexdigest(),
             "source_release_sha": RELEASE_SHA,
-            "history_epoch": 1,
-            "next_local_sequence": 1,
-            "max_local_sequence": 0,
-            "event_count": 0,
+            **_snapshot_facts(not_canonical),
         },
-        bad_manifest,
+        not_canonical_manifest,
     )
-    with pytest.raises((CanonicalDbValidationError, Exception)):
-        _restore(live, bad, bad_manifest)
+    verify_backup_manifest(
+        read_backup_manifest(not_canonical_manifest),
+        backup_path=not_canonical,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+
+    with pytest.raises(CanonicalDbValidationError):
+        _restore(live, not_canonical, not_canonical_manifest)
     assert live.read_bytes() == before
+    # No destructive cutover and no leftover restore staging artifacts.
+    validate_canonical_sqlite(live)
+    assert not list(tmp_path.glob("*.restore-staging.*"))
+    assert not list(tmp_path.glob(".opip-*"))
 
 
 def test_restore_validation_failure_preserves_live(canonical_env, tmp_path, monkeypatch):
