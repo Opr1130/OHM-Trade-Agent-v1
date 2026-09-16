@@ -2,84 +2,172 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.opip.canonical.schema import (
+    checkpoint_wal_strict,
     connect,
-    fsync_directory,
-    fsync_path,
+    fsync_directory_required,
+    fsync_file_required,
     remove_sqlite_sidecars,
+    sqlite_sidecar_paths,
     validate_canonical_sqlite,
 )
+
+#: Manifest layout this build can verify. Bump only with a matching verifier.
+MANIFEST_SCHEMA_VERSION = 1
+
+_RELEASE_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+#: Fields describing the SQLite snapshot itself, verified against the file.
+_SNAPSHOT_FACT_FIELDS = (
+    "history_epoch",
+    "next_local_sequence",
+    "max_local_sequence",
+    "event_count",
+)
+
+#: SQLite file header facts (offsets 18/19 of a 100-byte header).
+SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+_SQLITE_FORMAT_WRITE_OFFSET = 18
+_SQLITE_FORMAT_READ_OFFSET = 19
+SQLITE_LEGACY_JOURNAL_FORMAT = 1
+SQLITE_WAL_FORMAT = 2
+
+#: The journal mode a published canonical recovery artifact must report.
+BACKUP_JOURNAL_MODE = "delete"
+
+_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+class BackupProvenanceError(RuntimeError):
+    """Backup provenance could not be verified, so recovery is not authorized."""
+
+
+class BackupFormatError(BackupProvenanceError):
+    """A backup artifact is not a self-contained rollback-journal database.
+
+    A non-conforming artifact can never be authorized for recovery, so this is a
+    specialization of provenance refusal with its own diagnosable message.
+    """
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def backup_database(source_db: Path, dest_db: Path) -> Path:
-    """
-    Consistent snapshot via the SQLite backup API (not VACUUM INTO / file copy).
+def hash_file_sha256(path: Path) -> str:
+    """SHA-256 of a file, streamed so a backup is never fully buffered."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    Never deletes the last known-good final backup until a staged snapshot has
-    been written, closed, validated, and atomically published.
+
+def assert_regular_file(path: Path, *, field_name: str, error_type: type[Exception]):
+    """Reject missing, directory, or otherwise non-regular recovery inputs."""
+    target = Path(path)
+    if not target.exists():
+        raise error_type(f"{field_name} does not exist: {target}")
+    if not target.is_file():
+        raise error_type(f"{field_name} is not a regular file: {target}")
+    return target
+
+
+def read_sqlite_journal_format(path: Path) -> tuple[int, int]:
+    """Return SQLite's ``(format write version, format read version)`` bytes.
+
+    Reads the fixed 100-byte file header directly and never opens SQLite, so
+    inspecting a candidate backup cannot itself create ``-wal``/``-shm``
+    sidecars. This is the non-mutating preflight that lets recovery decide
+    whether a backup is a self-contained rollback-journal artifact *before* any
+    connection is made.
     """
-    dest_db = Path(dest_db)
-    source_db = Path(source_db)
-    dest_db.parent.mkdir(parents=True, exist_ok=True)
-    staged = dest_db.with_name(
-        f".{dest_db.name}.staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
+    target = assert_regular_file(
+        path, field_name="backup database", error_type=BackupFormatError
     )
     try:
-        if staged.exists():
-            staged.unlink()
-        remove_sqlite_sidecars(staged)
-
-        source = connect(source_db, read_only=True)
-        try:
-            dest = sqlite3.connect(str(staged))
-            try:
-                source.backup(dest)
-                dest.commit()
-            finally:
-                dest.close()
-        finally:
-            source.close()
-
-        validate_canonical_sqlite(staged)
-        fsync_path(staged)
-        os.replace(str(staged), str(dest_db))
-        fsync_directory(dest_db.parent)
-    except Exception:
-        if staged.exists():
-            try:
-                staged.unlink()
-            except OSError:
-                pass
-        remove_sqlite_sidecars(staged)
-        raise
-    return dest_db
+        with target.open("rb") as handle:
+            header = handle.read(20)
+    except OSError as exc:
+        raise BackupFormatError(f"cannot read SQLite header of {target}: {exc}") from exc
+    if len(header) < 20 or not header.startswith(SQLITE_HEADER_MAGIC):
+        raise BackupFormatError(
+            f"not a SQLite database file (missing header magic): {target}"
+        )
+    return (
+        header[_SQLITE_FORMAT_WRITE_OFFSET],
+        header[_SQLITE_FORMAT_READ_OFFSET],
+    )
 
 
-def build_backup_manifest(
-    *,
-    backup_path: Path,
-    source_release_sha: str | None = None,
-) -> dict[str, Any]:
+def assert_rollback_journal_backup(path: Path) -> None:
+    """Require a backup to be in self-contained rollback-journal format.
+
+    Absence of sidecars is not sufficient: a database can still be marked WAL
+    format while no sidecar happens to exist at that instant, and it would then
+    depend on a WAL the moment it is opened. The artifact itself must be
+    rollback-journal format.
     """
-    Derive manifest metadata from the immutable backup file only.
+    write_format, read_format = read_sqlite_journal_format(path)
+    if write_format != SQLITE_LEGACY_JOURNAL_FORMAT or (
+        read_format != SQLITE_LEGACY_JOURNAL_FORMAT
+    ):
+        raise BackupFormatError(
+            "backup is not a self-contained rollback-journal artifact "
+            f"(file format write/read versions = {write_format}/{read_format}, "
+            f"expected {SQLITE_LEGACY_JOURNAL_FORMAT}/"
+            f"{SQLITE_LEGACY_JOURNAL_FORMAT}); a WAL-format backup cannot be "
+            "restored because its completeness would depend on a sidecar"
+        )
 
-    Never read the live source DB here — post-snapshot writes must not alter
-    the signed snapshot description.
+
+def assert_sidecar_free(path: Path, *, field_name: str, error_type: type[Exception]):
+    """Reject a recovery input that arrives with adjacent WAL/SHM files.
+
+    A compliant canonical backup is a single file. Sidecars are never guessed
+    to be empty, stale, or harmless, and are never deleted to make a
+    non-conforming artifact look acceptable.
     """
-    digest = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    sidecars = sqlite_sidecar_paths(path)
+    if sidecars:
+        raise error_type(
+            f"{field_name} is not self-contained; adjacent SQLite sidecar files "
+            f"are present: {[str(side) for side in sidecars]}"
+        )
+    return Path(path)
+
+
+def require_release_sha(value: Any, *, field_name: str) -> str:
+    """Return a normalized full 40-character hexadecimal git SHA, or fail closed.
+
+    Release provenance is verified locally and deterministically; no network or
+    GitHub lookup is ever performed during recovery.
+    """
+    sha = str(value or "").strip().lower()
+    if not _RELEASE_SHA_PATTERN.fullmatch(sha):
+        raise BackupProvenanceError(
+            f"{field_name} must be a full 40-character hexadecimal git SHA, "
+            f"got {value!r}"
+        )
+    return sha
+
+
+def _snapshot_facts(backup_path: Path) -> dict[str, int]:
+    """Read the snapshot-describing facts from the backup file alone."""
     conn = connect(backup_path, read_only=True)
     try:
         meta = conn.execute(
@@ -99,34 +187,593 @@ def build_backup_manifest(
         ).fetchone()
     finally:
         conn.close()
+    return {
+        "history_epoch": history_epoch,
+        "next_local_sequence": int(meta["next_local_sequence"]),
+        "max_local_sequence": int(max_seq["m"]) if max_seq is not None else 0,
+        "event_count": int(count_row["n"]) if count_row is not None else 0,
+    }
 
-    sha = (
-        str(source_release_sha).strip()
-        if source_release_sha
-        else str(os.environ.get("OPIP_SOURCE_RELEASE_SHA") or "").strip()
+
+def normalize_to_rollback_journal(path: Path) -> None:
+    """Checkpoint a SQLite file and switch it to self-contained ``DELETE`` mode.
+
+    The online backup API can leave part of a snapshot in a WAL, and opening a
+    canonical file read-write forces WAL mode. Both leave a file whose
+    completeness depends on a sidecar, so callers that must produce (or install)
+    an independently recoverable artifact normalize it here.
+
+    Normalization is proven, not assumed — SQLite must report ``delete``, and the
+    file must be free of non-empty sidecars afterwards.
+    """
+    connection = connect(path, read_only=False)
+    try:
+        checkpoint_wal_strict(connection)
+        connection.commit()
+        row = connection.execute(
+            f"PRAGMA journal_mode={BACKUP_JOURNAL_MODE.upper()}"
+        ).fetchone()
+        if row is None:
+            raise BackupFormatError(
+                "journal_mode normalization returned no result for "
+                f"{path}; refusing to treat it as self-contained"
+            )
+        reported = str(row[0]).lower()
+        if reported != BACKUP_JOURNAL_MODE:
+            raise BackupFormatError(
+                "database did not reach the required journal mode: "
+                f"reported {reported!r}, required {BACKUP_JOURNAL_MODE!r} ({path})"
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # A clean close in DELETE mode removes the sidecars. Anything left must be
+    # empty to be ignorable; non-empty leftovers mean the file is not
+    # self-contained.
+    for side in sqlite_sidecar_paths(path):
+        try:
+            size = side.stat().st_size
+        except OSError as exc:
+            raise BackupFormatError(
+                f"cannot inspect SQLite sidecar {side}: {exc}"
+            ) from exc
+        if size:
+            raise BackupFormatError(
+                f"database is not self-contained after normalization: {side} "
+                f"still holds {size} bytes"
+            )
+        try:
+            side.unlink()
+        except OSError as exc:
+            raise BackupFormatError(
+                f"cannot remove empty SQLite sidecar {side}: {exc}"
+            ) from exc
+
+
+def _short_staging_path(directory: Path, *, prefix: str, suffix: str) -> Path:
+    """Build a private staging pathname whose length is bounded and independent.
+
+    The basename deliberately does **not** embed the destination filename or the
+    generation id: a descriptive generation filename re-used in a staging name
+    pushes nested Windows directories past the practical opening limit, where
+    SQLite fails with "unable to open database file". Bounded staging names keep
+    publication working at the same depth the final artifact supports.
+    """
+    return Path(directory) / f"{prefix}{os.getpid()}.{uuid.uuid4().hex[:16]}{suffix}"
+
+
+def _claim_immutable_path(staged: Path, final: Path) -> None:
+    """Publish ``staged`` at ``final`` atomically, refusing to replace anything.
+
+    Uses ``os.link`` — an atomic, directory-entry-level no-replace primitive —
+    instead of ``os.replace``. ``os.replace`` silently overwrites an existing
+    file, which made the previous existence check a TOCTOU window: two
+    publishers could both observe the destination as absent and the later one
+    would destroy the earlier one's committed generation.
+
+    ``FileExistsError`` means another publisher already committed this path: this
+    invocation owns nothing there and must not touch it. There is deliberately
+    **no fallback** to a replace-capable call; if the platform or filesystem
+    cannot provide no-replace semantics, publication fails closed rather than
+    silently weakening immutability. Both paths are in the same directory (same
+    filesystem), which is what makes the link valid.
+    """
+    try:
+        os.link(str(staged), str(final))
+    except FileExistsError as exc:
+        raise BackupProvenanceError(
+            "refusing to overwrite an already published immutable artifact; "
+            f"another publication already committed this path: {final}"
+        ) from exc
+    except OSError as exc:
+        raise BackupProvenanceError(
+            "no-replace publication is not available for this destination; "
+            f"refusing to fall back to a replace-capable call: {final}: {exc}"
+        ) from exc
+
+
+#: Bounded, destination-independent private staging prefixes.
+_DB_STAGING_PREFIX = ".opip-bk."
+_DB_STAGING_SUFFIX = ".sqlite3"
+_MANIFEST_STAGING_PREFIX = ".opip-mf."
+_MANIFEST_STAGING_SUFFIX = ".tmp"
+
+
+def _finalize_backup_snapshot(staged: Path) -> None:
+    """Make a staged backup a genuinely self-contained rollback-journal artifact."""
+    normalize_to_rollback_journal(staged)
+
+
+def backup_database(source_db: Path, dest_db: Path) -> Path:
+    """
+    Consistent snapshot via the SQLite backup API (not VACUUM INTO / file copy).
+
+    **Create-only, race-safe.** The snapshot is written to a short private
+    staging file, finalised into a self-contained rollback-journal artifact,
+    validated, durably flushed, and then published with an atomic no-replace
+    claim (:func:`_claim_immutable_path`). A published backup is an immutable
+    recovery generation, so a concurrent or later attempt can never overwrite it
+    — the conflict surfaces as ``FileExistsError``-derived
+    ``BackupProvenanceError`` instead. Any failure leaves the destination
+    untouched.
+
+    Use :func:`publish_backup_generation` for the authoritative operation; it
+    supplies a unique generation path per attempt.
+    """
+    dest_db = Path(dest_db)
+    source_db = Path(source_db)
+    if dest_db.exists():
+        # Early diagnostic only; the atomic claim below is the authority.
+        raise BackupProvenanceError(
+            "refusing to replace an existing published backup; a published "
+            "generation is immutable and must never be overwritten "
+            f"(destination already exists: {dest_db})"
+        )
+    dest_db.parent.mkdir(parents=True, exist_ok=True)
+    # A stale sidecar beside a never-published path would make the new artifact
+    # ambiguous, so refuse rather than deleting a file this invocation does not own.
+    assert_sidecar_free(
+        dest_db, field_name="backup destination", error_type=BackupFormatError
     )
-    if not sha:
-        sha = "UNVERIFIED"
+
+    staged = _short_staging_path(
+        dest_db.parent, prefix=_DB_STAGING_PREFIX, suffix=_DB_STAGING_SUFFIX
+    )
+    staged_created = False
+    claimed = False
+    try:
+        if staged.exists():
+            staged.unlink()
+        remove_sqlite_sidecars(staged)
+        staged_created = True
+
+        source = connect(source_db, read_only=True)
+        try:
+            dest = sqlite3.connect(str(staged))
+            try:
+                source.backup(dest)
+                dest.commit()
+            finally:
+                dest.close()
+        finally:
+            source.close()
+
+        _finalize_backup_snapshot(staged)
+        assert_rollback_journal_backup(staged)
+        validate_canonical_sqlite(staged)
+        # Required durability before publication: a generation that is reported
+        # as committed must have its bytes on durable storage.
+        fsync_file_required(staged)
+
+        # Atomic no-replace publication. Nothing above this line is visible at
+        # the final pathname, and nothing below can overwrite a peer's artifact.
+        _claim_immutable_path(staged, dest_db)
+        claimed = True
+        # The final link owns the inode now; drop only this invocation's staging
+        # name (the artifact itself remains valid and immutable).
+        with contextlib.suppress(OSError):
+            staged.unlink()
+        fsync_directory_required(dest_db.parent)
+    except Exception:
+        # Ownership-scoped cleanup: only artifacts this invocation definitely
+        # created are removed. If the claim failed, the existing artifact belongs
+        # to another publisher and is left strictly alone.
+        if staged_created:
+            with contextlib.suppress(OSError):
+                if staged.exists():
+                    staged.unlink()
+            with contextlib.suppress(OSError):
+                remove_sqlite_sidecars(staged)
+        if claimed and dest_db.exists():
+            with contextlib.suppress(OSError):
+                dest_db.unlink()
+        raise
+    return dest_db
+
+
+def build_backup_manifest(
+    *,
+    backup_path: Path,
+    source_release_sha: str | None = None,
+) -> dict[str, Any]:
+    """
+    Derive manifest metadata from the immutable backup file only.
+
+    Never read the live source DB here — post-snapshot writes must not alter
+    the signed snapshot description.
+
+    A manifest authorizes restore, so it must carry real provenance and must
+    describe a conforming artifact: a missing or malformed release SHA fails
+    closed instead of emitting ``UNVERIFIED``, and a WAL-format, sidecar-bearing,
+    or non-canonical backup is refused rather than given a valid-looking
+    manifest.
+    """
+    backup_path = Path(backup_path)
+    assert_regular_file(
+        backup_path, field_name="backup database", error_type=BackupFormatError
+    )
+    assert_sidecar_free(
+        backup_path, field_name="backup database", error_type=BackupFormatError
+    )
+    assert_rollback_journal_backup(backup_path)
+    validate_canonical_sqlite(backup_path)
+
+    facts = _snapshot_facts(backup_path)
+    # Computed over the final, normalized artifact: normalization has already
+    # completed and the file bytes are stable at this point.
+    digest = hash_file_sha256(backup_path)
+
+    candidates = source_release_sha
+    if candidates is None or not str(candidates).strip():
+        candidates = os.environ.get("OPIP_SOURCE_RELEASE_SHA")
+    sha = require_release_sha(candidates, field_name="source_release_sha")
 
     return {
-        "schema_version": 1,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "created_at": _utc_now(),
         "backup_file": backup_path.name,
         "sha256": digest,
         "source_release_sha": sha,
-        "history_epoch": history_epoch,
-        "next_local_sequence": int(meta["next_local_sequence"]),
-        "max_local_sequence": int(max_seq["m"]),
-        "event_count": int(count_row["n"]),
+        "history_epoch": facts["history_epoch"],
+        "next_local_sequence": facts["next_local_sequence"],
+        "max_local_sequence": facts["max_local_sequence"],
+        "event_count": facts["event_count"],
         "rpo_target_seconds": 300,
         "rto_target_seconds": 1800,
     }
 
 
-def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+def read_backup_manifest(path: Path) -> dict[str, Any]:
+    """Load a backup manifest, failing closed on missing or malformed content."""
+    target = Path(path)
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BackupProvenanceError(
+            f"backup manifest is missing or unreadable: {target}: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BackupProvenanceError(
+            f"backup manifest is not valid JSON: {target}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise BackupProvenanceError(
+            f"backup manifest must be a JSON object: {target}"
+        )
+    return payload
+
+
+def verify_backup_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    backup_path: Path,
+    expected_source_release_sha: str,
+) -> dict[str, Any]:
+    """Prove the manifest describes exactly this backup, or fail closed.
+
+    Every value describing the SQLite snapshot is re-derived from the backup
+    file and must agree, so a truncated, substituted, or hand-edited backup
+    cannot be restored on the strength of its filename alone.
+    """
+    backup_path = Path(backup_path)
+    assert_regular_file(
+        backup_path, field_name="backup database", error_type=BackupProvenanceError
     )
+    # Provenance is only meaningful for a conforming artifact, and this must be
+    # established before any SQLite connection is opened.
+    assert_sidecar_free(
+        backup_path, field_name="backup database", error_type=BackupProvenanceError
+    )
+    assert_rollback_journal_backup(backup_path)
+
+    version = manifest.get("schema_version")
+    if type(version) is not int or version != MANIFEST_SCHEMA_VERSION:
+        raise BackupProvenanceError(
+            "unsupported backup manifest schema_version: "
+            f"{version!r} (supported {MANIFEST_SCHEMA_VERSION})"
+        )
+
+    expected_sha = require_release_sha(
+        expected_source_release_sha, field_name="expected_source_release_sha"
+    )
+    manifest_sha = require_release_sha(
+        manifest.get("source_release_sha"), field_name="manifest source_release_sha"
+    )
+    if manifest_sha != expected_sha:
+        raise BackupProvenanceError(
+            "backup source_release_sha does not match the expected release: "
+            f"{manifest_sha} != {expected_sha}"
+        )
+
+    recorded_name = str(manifest.get("backup_file") or "")
+    if recorded_name != backup_path.name:
+        raise BackupProvenanceError(
+            "backup manifest was written for a different file: "
+            f"{recorded_name!r} != {backup_path.name!r}"
+        )
+
+    recorded_digest = str(manifest.get("sha256") or "").strip().lower()
+    if not _SHA256_PATTERN.fullmatch(recorded_digest):
+        raise BackupProvenanceError(
+            f"backup manifest sha256 is malformed: {manifest.get('sha256')!r}"
+        )
+    actual_digest = hash_file_sha256(backup_path)
+    if recorded_digest != actual_digest:
+        raise BackupProvenanceError(
+            "backup content does not match the manifest sha256: "
+            f"{actual_digest} != {recorded_digest}"
+        )
+
+    try:
+        facts = _snapshot_facts(backup_path)
+    except BackupProvenanceError:
+        # Already the provenance contract; never re-wrap or mask it.
+        raise
+    except Exception as exc:
+        # A file can carry valid SQLite magic and rollback-journal format yet
+        # still be unreadable as a canonical snapshot (missing/irregular meta
+        # table, corrupt pages). Verified provenance is only meaningful for a
+        # readable snapshot, so normalise every such failure onto the public
+        # provenance error contract instead of letting sqlite3.Error or
+        # RuntimeError escape.
+        raise BackupProvenanceError(
+            f"backup snapshot facts are unreadable: {backup_path}: {exc}"
+        ) from exc
+
+    for field_name in _SNAPSHOT_FACT_FIELDS:
+        recorded = manifest.get(field_name)
+        if type(recorded) is not int:
+            raise BackupProvenanceError(
+                f"backup manifest {field_name} must be an integer, got {recorded!r}"
+            )
+        if recorded != facts[field_name]:
+            raise BackupProvenanceError(
+                f"backup manifest {field_name} does not match the backup: "
+                f"{recorded} != {facts[field_name]}"
+            )
+    return dict(manifest)
+
+
+#: Filename marker separating the generation id in published backup artifacts.
+BACKUP_GENERATION_MARKER = ".backup."
+
+#: Default stem for published canonical backup generations.
+DEFAULT_BACKUP_STEM = "opip_canonical_v1"
+
+
+def new_backup_generation_id() -> str:
+    """Return a collision-resistant, non-semantic backup generation identifier.
+
+    Combines a UTC timestamp (readability, sub-minute ordering) with UUID
+    entropy (collision resistance), so it is never a function of second-
+    resolution time alone. It identifies backup *packaging* only and never
+    participates in canonical evidence identity.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    return f"{stamp}-{uuid.uuid4().hex[:12]}"
+
+
+#: Bound on caller-supplied filename components. Long enough for a timestamped
+#: UUID generation id, short enough that final generation names stay usable in
+#: nested directories.
+MAX_GENERATION_COMPONENT_CHARS = 64
+
+_FORBIDDEN_GENERATION_COMPONENTS = (".", "..")
+
+
+def require_generation_component(value: Any, *, field_name: str) -> str:
+    """Return a safe single-path-segment component, or fail closed.
+
+    Generation ids and stems become part of a filename. A caller-supplied value
+    must not be able to escape the backup directory, address a parent directory,
+    or produce a pathologically long name that would defeat the bounded-staging
+    design.
+    """
+    component = str(value or "").strip()
+    if not component:
+        raise BackupProvenanceError(f"{field_name} must be a non-empty name")
+    if component in _FORBIDDEN_GENERATION_COMPONENTS:
+        raise BackupProvenanceError(
+            f"{field_name} must not be a relative path element: {component!r}"
+        )
+    if any(char in component for char in ("/", "\\", "\x00")):
+        raise BackupProvenanceError(
+            f"{field_name} must not contain a path separator or NUL: {component!r}"
+        )
+    if len(component) > MAX_GENERATION_COMPONENT_CHARS:
+        raise BackupProvenanceError(
+            f"{field_name} must be at most {MAX_GENERATION_COMPONENT_CHARS} "
+            f"characters, got {len(component)}"
+        )
+    return component
+
+
+def backup_generation_paths(
+    backup_dir: Path,
+    *,
+    generation_id: str,
+    stem: str = DEFAULT_BACKUP_STEM,
+) -> tuple[Path, Path]:
+    """Derive the immutable ``(database, manifest)`` paths for one generation."""
+    directory = Path(backup_dir)
+    safe_stem = require_generation_component(stem, field_name="backup stem")
+    safe_generation = require_generation_component(
+        generation_id, field_name="generation_id"
+    )
+    database = directory / f"{safe_stem}{BACKUP_GENERATION_MARKER}{safe_generation}.sqlite3"
+    manifest = (
+        directory / f"{safe_stem}{BACKUP_GENERATION_MARKER}{safe_generation}.manifest.json"
+    )
+    return database, manifest
+
+
+@dataclass(frozen=True)
+class PublishedBackupGeneration:
+    """Receipt for one committed backup generation.
+
+    Informational only: it is not a persistent authority, and the manifest of the
+    generation it describes remains the commit marker.
+    """
+
+    generation_id: str
+    backup_path: Path
+    manifest_path: Path
+    sha256: str
+    source_release_sha: str
+
+
+def publish_backup_generation(
+    source_db: Path,
+    backup_dir: Path,
+    *,
+    source_release_sha: str | None = None,
+    stem: str = DEFAULT_BACKUP_STEM,
+    generation_id: str | None = None,
+) -> PublishedBackupGeneration:
+    """Publish one immutable, fully verified canonical backup generation.
+
+    A generation is committed **only** once its matching manifest is durably
+    published; a backup database without a matching manifest is never a valid
+    recovery generation. Because each attempt uses a fresh generation path,
+    producing generation N+1 can never destroy or invalidate generation N: the
+    previous pair is untouched until the new pair is complete.
+
+    There is deliberately no mutable "current backup" pointer and no registry —
+    restore already receives an explicit database and manifest path, so the
+    manifest alone is the commit marker.
+    """
+    source_db = Path(source_db)
+    backup_dir = Path(backup_dir)
+    identifier = new_backup_generation_id() if generation_id is None else generation_id
+    database_path, manifest_path = backup_generation_paths(
+        backup_dir, generation_id=identifier, stem=stem
+    )
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stage 1: publish the immutable generation database (durable on return).
+    # This is an atomic no-replace claim, so if another publisher already
+    # committed this generation id, this call fails here and owns nothing.
+    backup_database(source_db, database_path)
+    database_claimed = True
+
+    # Stage 2: build the manifest from the *finalized* generation database. The
+    # recorded SHA and byte-count facts therefore describe exactly the bytes that
+    # were published, and the recorded filename is the generation filename.
+    try:
+        manifest = build_backup_manifest(
+            backup_path=database_path,
+            source_release_sha=source_release_sha,
+        )
+        # Stage 3: create-only, durable manifest publication commits the
+        # generation. A manifest must never silently replace a peer's manifest.
+        write_backup_manifest_create_only(manifest, manifest_path)
+    except Exception:
+        # The generation database was claimed by *this* invocation but has no
+        # authoritative manifest, so it is an orphaned, uncommitted artifact.
+        # Cleanup is ownership-scoped: it removes only the artifact this call
+        # claimed, and never touches a peer's committed pair. If the claim above
+        # failed, nothing is removed here.
+        if database_claimed:
+            with contextlib.suppress(OSError):
+                if database_path.exists():
+                    database_path.unlink()
+            with contextlib.suppress(OSError):
+                remove_sqlite_sidecars(database_path)
+        raise
+
+    return PublishedBackupGeneration(
+        generation_id=identifier,
+        backup_path=database_path,
+        manifest_path=manifest_path,
+        sha256=str(manifest["sha256"]),
+        source_release_sha=str(manifest["source_release_sha"]),
+    )
+
+
+def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:
+    """Publish a manifest atomically, replacing any existing file at ``path``.
+
+    This is the **replace-capable** helper. It is retained for callers that
+    legitimately rewrite a manifest, and it does *not* provide create-only
+    semantics: ``os.replace`` silently overwrites an existing file, so it must
+    never be used to publish an immutable generation manifest. Authoritative
+    generation publication uses :func:`write_backup_manifest_create_only`, whose
+    atomic no-replace claim refuses to clobber a peer's committed manifest.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        fsync_directory_required(path.parent)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+def write_backup_manifest_create_only(manifest: dict[str, Any], path: Path) -> Path:
+    """Publish a generation manifest, refusing to replace an existing one.
+
+    The manifest is the commit marker for an immutable backup generation, so a
+    later publication must never silently replace it. Writes to a short private
+    temp file, flushes it, flushes the temp bytes durably, then publishes with
+    the same atomic no-replace claim used for generation databases.
+
+    ``FileExistsError``-derived conflict means this generation is already
+    committed: the existing manifest is left byte-for-byte intact.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = _short_staging_path(
+        path.parent, prefix=_MANIFEST_STAGING_PREFIX, suffix=_MANIFEST_STAGING_SUFFIX
+    )
+    try:
+        with temp_name.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            fsync_file_required(temp_name)
+        _claim_immutable_path(temp_name, path)
+        with contextlib.suppress(OSError):
+            temp_name.unlink()
+        fsync_directory_required(path.parent)
+    except Exception:
+        with contextlib.suppress(OSError):
+            if temp_name.exists():
+                temp_name.unlink()
+        raise
     return path
