@@ -12,25 +12,29 @@ import multiprocessing
 import os
 import shutil
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
 from app.opip.canonical.backup import (
+    DEFAULT_BACKUP_STEM,
     MANIFEST_SCHEMA_VERSION,
     BackupFormatError,
     BackupProvenanceError,
     assert_rollback_journal_backup,
     backup_database,
+    backup_generation_paths,
     build_backup_manifest,
     hash_file_sha256,
     new_backup_generation_id,
     publish_backup_generation,
     read_backup_manifest,
     read_sqlite_journal_format,
+    require_generation_component,
     verify_backup_manifest,
     write_backup_manifest,
-    backup_generation_paths,
+    write_backup_manifest_create_only,
 )
 from app.opip.canonical.models import WriterIntent
 from app.opip.canonical.paths import SCHEMA_VERSION
@@ -441,7 +445,8 @@ def test_backup_publish_failure_preserves_previous_generation(tmp_path, monkeypa
     def _boom(*_a, **_k):
         raise OSError("publish injected failure")
 
-    monkeypatch.setattr(backup_module.os, "replace", _boom)
+    # Inject at the no-replace publication seam (the authoritative step).
+    monkeypatch.setattr(backup_module, "_claim_immutable_path", _boom)
     with pytest.raises(OSError, match="publish injected failure"):
         publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
     monkeypatch.undo()
@@ -1803,7 +1808,7 @@ def test_generation_failure_before_db_publication_preserves_previous(tmp_path, m
     def _boom(*_a, **_k):
         raise OSError("db publish injected failure")
 
-    monkeypatch.setattr(backup_module.os, "replace", _boom)
+    monkeypatch.setattr(backup_module, "_claim_immutable_path", _boom)
     with pytest.raises(OSError, match="db publish injected failure"):
         publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
     monkeypatch.undo()
@@ -1828,16 +1833,16 @@ def test_generation_db_without_manifest_is_not_committed(tmp_path, monkeypatch):
 
     import app.opip.canonical.backup as backup_module
 
-    real_write = backup_module.write_backup_manifest
+    real_write = backup_module.write_backup_manifest_create_only
 
     def _boom(*_a, **_k):
         raise OSError("manifest publish injected failure")
 
-    monkeypatch.setattr(backup_module, "write_backup_manifest", _boom)
+    monkeypatch.setattr(backup_module, "write_backup_manifest_create_only", _boom)
     with pytest.raises(OSError, match="manifest publish injected failure"):
         publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
     monkeypatch.undo()
-    backup_module.write_backup_manifest = real_write
+    backup_module.write_backup_manifest_create_only = real_write
 
     # Previous generation is fully intact.
     assert first.backup_path.read_bytes() == first_db_bytes
@@ -1884,13 +1889,13 @@ def test_generation_preserved_on_manifest_durability_and_replace_failure(
     first_manifest_bytes = first.manifest_path.read_bytes()
     files_before = _generation_files(backup_dir)
 
-    # (a) manifest atomic replace failure
+    # (a) manifest no-replace publication conflict/failure
     import app.opip.canonical.backup as backup_module
 
     def _boom(*_a, **_k):
         raise OSError("manifest replace injected failure")
 
-    monkeypatch.setattr(backup_module.os, "replace", _boom)
+    monkeypatch.setattr(backup_module, "write_backup_manifest_create_only", _boom)
     with pytest.raises(OSError, match="manifest replace injected failure"):
         publish_backup_generation(live, backup_dir, source_release_sha=RELEASE_SHA)
     monkeypatch.undo()
@@ -1984,6 +1989,317 @@ def test_backup_generation_paths_are_derived_from_the_generation_id(tmp_path):
 def test_new_backup_generation_id_is_unique(tmp_path):
     ids = {new_backup_generation_id() for _ in range(50)}
     assert len(ids) == 50
+
+
+# --------------------------------------------------------------------------- #
+# Race-safe immutable publication (no-replace claims)
+# --------------------------------------------------------------------------- #
+
+
+def test_claim_immutable_path_refuses_to_replace(tmp_path):
+    """The publication primitive must never overwrite an existing artifact."""
+    from app.opip.canonical.backup import _claim_immutable_path
+
+    staged = tmp_path / ".staged"
+    final = tmp_path / "final.sqlite3"
+    staged.write_bytes(b"new")
+    final.write_bytes(b"committed")
+
+    with pytest.raises(BackupProvenanceError, match="already published|immutable"):
+        _claim_immutable_path(staged, final)
+
+    # The committed bytes are byte-for-byte intact.
+    assert final.read_bytes() == b"committed"
+    assert staged.read_bytes() == b"new"
+
+
+def test_backup_database_conflict_preserves_existing_bytes(tmp_path):
+    """A second attempt at a published path fails and changes nothing."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    published = tmp_path / "published.sqlite3"
+    backup_database(live, published)
+    before = published.read_bytes()
+
+    _seed(live, count=1, start=50)
+    with pytest.raises(BackupProvenanceError, match="immutable|already exists"):
+        backup_database(live, published)
+    assert published.read_bytes() == before
+    validate_canonical_sqlite(published)
+
+
+def test_manifest_create_only_refuses_to_replace(tmp_path):
+    manifest_path = tmp_path / "gen.manifest.json"
+    write_backup_manifest_create_only({"schema_version": 1, "value": "winner"}, manifest_path)
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(BackupProvenanceError, match="already published|immutable"):
+        write_backup_manifest_create_only({"schema_version": 1, "value": "loser"}, manifest_path)
+
+    assert manifest_path.read_bytes() == before
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["value"] == "winner"
+
+
+def test_concurrent_same_generation_id_publishes_exactly_one_pair(tmp_path):
+    """Two publishers racing on one generation id must yield one valid pair.
+
+    Deterministic: both threads are released at the same point (after staging,
+    immediately before the real no-replace claim), so they genuinely contend on
+    the publication syscall rather than being serialised by a sleep. The
+    no-replace property itself is never mocked.
+    """
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=2)
+    backup_dir = tmp_path / "generations"
+    import app.opip.canonical.backup as backup_module
+
+    real_validate = backup_module.validate_canonical_sqlite
+    barrier = threading.Barrier(2, timeout=30)
+    lock = threading.Lock()
+
+    def _synchronised(path):  # noqa: ANN001
+        # Staging exists and is complete; hold both publishers here so they
+        # reach the claim together.
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:  # pragma: no cover - defensive
+            pass
+        with lock:
+            return real_validate(path)
+
+    monkeypatch_holder = {"module": backup_module}
+    monkeypatch_holder["module"].validate_canonical_sqlite = _synchronised
+
+    results: dict[str, str] = {}
+
+    def _publish(name: str) -> None:
+        try:
+            publish_backup_generation(
+                live, backup_dir, source_release_sha=RELEASE_SHA, generation_id="SAME-ID"
+            )
+            results[name] = "OK"
+        except Exception as exc:  # noqa: BLE001 - classified below
+            results[name] = type(exc).__name__
+
+    threads = [threading.Thread(target=_publish, args=(name,)) for name in ("A", "B")]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    finally:
+        monkeypatch_holder["module"].validate_canonical_sqlite = real_validate
+
+    # Exactly one publisher wins; the other is refused, never silently overwriting.
+    assert sorted(results.values()) == ["BackupProvenanceError", "OK"], results
+
+    database, manifest = backup_generation_paths(backup_dir, generation_id="SAME-ID")
+    assert database.exists() and manifest.exists()
+
+    manifest_payload = read_backup_manifest(manifest)
+    assert manifest_payload["backup_file"] == database.name
+    assert manifest_payload["sha256"] == hash_file_sha256(database)
+    verify_backup_manifest(
+        manifest_payload, backup_path=database, expected_source_release_sha=RELEASE_SHA
+    )
+    # The winning pair is a real, complete generation.
+    assert manifest_payload["event_count"] == 2
+    target = tmp_path / "restored" / "canonical.sqlite3"
+    result = _restore(target, database, manifest)
+    assert result["history_epoch"] == 2
+    validate_canonical_sqlite(target)
+
+
+def test_losing_publisher_does_not_delete_winner_artifacts(tmp_path):
+    """A refused publisher must not clean up a peer's committed pair."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup_dir = tmp_path / "generations"
+    winner = publish_backup_generation(
+        live, backup_dir, source_release_sha=RELEASE_SHA, generation_id="SAME-ID"
+    )
+    db_bytes = winner.backup_path.read_bytes()
+    manifest_bytes = winner.manifest_path.read_bytes()
+
+    # The loser reaches the same generation id and is refused at the DB claim, so
+    # its cleanup path never runs against the winner's artifacts.
+    with pytest.raises(BackupProvenanceError):
+        publish_backup_generation(
+            live, backup_dir, source_release_sha=RELEASE_SHA, generation_id="SAME-ID"
+        )
+
+    assert winner.backup_path.read_bytes() == db_bytes
+    assert winner.manifest_path.read_bytes() == manifest_bytes
+    verify_backup_manifest(
+        read_backup_manifest(winner.manifest_path),
+        backup_path=winner.backup_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
+    assert _generation_files(backup_dir) == sorted(
+        [winner.backup_path.name, winner.manifest_path.name]
+    )
+
+
+def test_manifest_conflict_after_db_claim_does_not_remove_peer_manifest(tmp_path, monkeypatch):
+    """A manifest conflict must not delete a peer's manifest, nor fake success."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup_dir = tmp_path / "generations"
+    database, manifest = backup_generation_paths(backup_dir, generation_id="SAME-ID")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    # Pre-existing manifest for this generation (as if a peer already committed).
+    manifest.write_text(json.dumps({"schema_version": 1, "owner": "peer"}), encoding="utf-8")
+    committed = manifest.read_bytes()
+
+    with pytest.raises(BackupProvenanceError, match="already published|immutable"):
+        publish_backup_generation(
+            live, backup_dir, source_release_sha=RELEASE_SHA, generation_id="SAME-ID"
+        )
+
+    assert manifest.read_bytes() == committed
+    # The peer's manifest was not removed, and no uncommitted DB was left behind.
+    assert not database.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Bounded staging names (long-path safety)
+# --------------------------------------------------------------------------- #
+
+
+def test_staging_basename_is_bounded_and_destination_independent(tmp_path):
+    """Staging length must not depend on stem/generation length."""
+    from app.opip.canonical.backup import (
+        _DB_STAGING_PREFIX,
+        _DB_STAGING_SUFFIX,
+        _MANIFEST_STAGING_PREFIX,
+        _MANIFEST_STAGING_SUFFIX,
+        _short_staging_path,
+    )
+
+    lengths = set()
+    for _ in range(5):
+        staged = _short_staging_path(
+            tmp_path, prefix=_DB_STAGING_PREFIX, suffix=_DB_STAGING_SUFFIX
+        )
+        lengths.add(len(staged.name))
+        assert staged.name.startswith(_DB_STAGING_PREFIX)
+        assert staged.name.endswith(_DB_STAGING_SUFFIX)
+    # Constant across draws, and bounded regardless of any destination name.
+    assert len(lengths) == 1
+    assert lengths.pop() <= 48
+
+    manifest_stage = _short_staging_path(
+        tmp_path, prefix=_MANIFEST_STAGING_PREFIX, suffix=_MANIFEST_STAGING_SUFFIX
+    )
+    assert manifest_stage.name.startswith(_MANIFEST_STAGING_PREFIX)
+    assert len(manifest_stage.name) <= 48
+
+
+def test_staging_name_never_contains_the_generation_filename(tmp_path, monkeypatch):
+    """The actual staging path used by a publish must not embed the destination."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    backup_dir = tmp_path / "generations"
+    import app.opip.canonical.backup as backup_module
+
+    seen: list[str] = []
+    real_validate = backup_module.validate_canonical_sqlite
+
+    def _record(path):  # noqa: ANN001
+        seen.append(Path(path).name)
+        return real_validate(path)
+
+    monkeypatch.setattr(backup_module, "validate_canonical_sqlite", _record)
+    published = publish_backup_generation(
+        live, backup_dir, source_release_sha=RELEASE_SHA, generation_id="GEN-VERY-LONG-" + "X" * 40
+    )
+    monkeypatch.undo()
+
+    staging_names = [name for name in seen if name.startswith(".opip-bk.")]
+    assert staging_names, seen
+    for name in staging_names:
+        assert published.generation_id not in name
+        assert published.backup_path.name not in name
+        assert len(name) <= 48
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path-length limit regression")
+def test_publish_generation_succeeds_in_deeply_nested_windows_directory(tmp_path):
+    """Real SQLite open at a depth where the old staging strategy failed.
+
+    The final generation filename is still usable, but embedding it in the
+    staging name pushed the path past what SQLite could open
+    ("unable to open database file"). The bounded staging name must survive it.
+    """
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live, count=2)
+
+    # Nest deep enough that the old staging strategy would exceed the practical
+    # Windows limit, while the final artifact path itself stays openable.
+    deep = tmp_path / ("d" * 45) / ("e" * 45)
+    deep.mkdir(parents=True, exist_ok=True)
+    assert 150 <= len(str(deep)) < 200
+
+    published = publish_backup_generation(live, deep, source_release_sha=RELEASE_SHA)
+
+    # The final artifact is usable...
+    assert_rollback_journal_backup(published.backup_path)
+    validate_canonical_sqlite(published.backup_path)
+    # ...but the previous staging strategy embedded the full destination name
+    # again and would have pushed the staging path past what SQLite can open.
+    old_style = published.backup_path.with_name(
+        f".{published.backup_path.name}.staging.1234.{'a' * 32}.sqlite3"
+    )
+    assert len(str(old_style)) > 260
+    assert len(str(published.backup_path)) < 260
+
+    manifest = read_backup_manifest(published.manifest_path)
+    verify_backup_manifest(
+        manifest, backup_path=published.backup_path, expected_source_release_sha=RELEASE_SHA
+    )
+    target = tmp_path / "restored" / "canonical.sqlite3"
+    result = _restore(target, published.backup_path, published.manifest_path)
+    assert result["history_epoch"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Generation component validation
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "   ", ".", "..", "a/b", "a\\b", "nul\x00byte", "x" * 65],
+)
+def test_generation_component_validation_rejects_unsafe_values(tmp_path, bad):
+    with pytest.raises(BackupProvenanceError):
+        backup_generation_paths(tmp_path, generation_id=bad)
+
+
+def test_generation_component_validation_rejects_unsafe_stem(tmp_path):
+    with pytest.raises(BackupProvenanceError):
+        backup_generation_paths(tmp_path, generation_id="ok", stem="../escape")
+
+
+def test_publisher_rejects_unsafe_generation_id(tmp_path):
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    for bad in ("../escape", "a/b", "", "x" * 65):
+        with pytest.raises(BackupProvenanceError):
+            publish_backup_generation(
+                live, tmp_path / "generations", source_release_sha=RELEASE_SHA, generation_id=bad
+            )
+
+
+def test_default_generation_id_and_stem_still_work(tmp_path):
+    """Generated defaults are unaffected by the new validation."""
+    live = tmp_path / "canonical.sqlite3"
+    _seed(live)
+    published = publish_backup_generation(live, tmp_path / "generations", source_release_sha=RELEASE_SHA)
+    assert published.backup_path.exists()
+    assert published.manifest_path.exists()
+    require_generation_component(published.generation_id, field_name="generation_id")
+    require_generation_component(DEFAULT_BACKUP_STEM, field_name="stem")
 
 
 def test_initialize_schema_rejects_incompatible_version(tmp_path):

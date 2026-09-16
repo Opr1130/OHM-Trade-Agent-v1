@@ -251,6 +251,55 @@ def normalize_to_rollback_journal(path: Path) -> None:
             ) from exc
 
 
+def _short_staging_path(directory: Path, *, prefix: str, suffix: str) -> Path:
+    """Build a private staging pathname whose length is bounded and independent.
+
+    The basename deliberately does **not** embed the destination filename or the
+    generation id: a descriptive generation filename re-used in a staging name
+    pushes nested Windows directories past the practical opening limit, where
+    SQLite fails with "unable to open database file". Bounded staging names keep
+    publication working at the same depth the final artifact supports.
+    """
+    return Path(directory) / f"{prefix}{os.getpid()}.{uuid.uuid4().hex[:16]}{suffix}"
+
+
+def _claim_immutable_path(staged: Path, final: Path) -> None:
+    """Publish ``staged`` at ``final`` atomically, refusing to replace anything.
+
+    Uses ``os.link`` — an atomic, directory-entry-level no-replace primitive —
+    instead of ``os.replace``. ``os.replace`` silently overwrites an existing
+    file, which made the previous existence check a TOCTOU window: two
+    publishers could both observe the destination as absent and the later one
+    would destroy the earlier one's committed generation.
+
+    ``FileExistsError`` means another publisher already committed this path: this
+    invocation owns nothing there and must not touch it. There is deliberately
+    **no fallback** to a replace-capable call; if the platform or filesystem
+    cannot provide no-replace semantics, publication fails closed rather than
+    silently weakening immutability. Both paths are in the same directory (same
+    filesystem), which is what makes the link valid.
+    """
+    try:
+        os.link(str(staged), str(final))
+    except FileExistsError as exc:
+        raise BackupProvenanceError(
+            "refusing to overwrite an already published immutable artifact; "
+            f"another publication already committed this path: {final}"
+        ) from exc
+    except OSError as exc:
+        raise BackupProvenanceError(
+            "no-replace publication is not available for this destination; "
+            f"refusing to fall back to a replace-capable call: {final}: {exc}"
+        ) from exc
+
+
+#: Bounded, destination-independent private staging prefixes.
+_DB_STAGING_PREFIX = ".opip-bk."
+_DB_STAGING_SUFFIX = ".sqlite3"
+_MANIFEST_STAGING_PREFIX = ".opip-mf."
+_MANIFEST_STAGING_SUFFIX = ".tmp"
+
+
 def _finalize_backup_snapshot(staged: Path) -> None:
     """Make a staged backup a genuinely self-contained rollback-journal artifact."""
     normalize_to_rollback_journal(staged)
@@ -260,32 +309,44 @@ def backup_database(source_db: Path, dest_db: Path) -> Path:
     """
     Consistent snapshot via the SQLite backup API (not VACUUM INTO / file copy).
 
-    **Create-only.** This primitive refuses to replace an existing destination,
-    because a published backup is an immutable recovery generation and a
-    previously valid pair (database + matching manifest) must never be destroyed
-    by a new backup attempt. Use :func:`publish_backup_generation` for the
-    authoritative operation; it supplies a unique generation path per attempt.
+    **Create-only, race-safe.** The snapshot is written to a short private
+    staging file, finalised into a self-contained rollback-journal artifact,
+    validated, durably flushed, and then published with an atomic no-replace
+    claim (:func:`_claim_immutable_path`). A published backup is an immutable
+    recovery generation, so a concurrent or later attempt can never overwrite it
+    — the conflict surfaces as ``FileExistsError``-derived
+    ``BackupProvenanceError`` instead. Any failure leaves the destination
+    untouched.
 
-    The snapshot is written to a private staging file, finalised into a
-    self-contained rollback-journal artifact, validated, durably flushed, and
-    atomically published. Any failure leaves the destination untouched.
+    Use :func:`publish_backup_generation` for the authoritative operation; it
+    supplies a unique generation path per attempt.
     """
     dest_db = Path(dest_db)
     source_db = Path(source_db)
     if dest_db.exists():
+        # Early diagnostic only; the atomic claim below is the authority.
         raise BackupProvenanceError(
             "refusing to replace an existing published backup; a published "
             "generation is immutable and must never be overwritten "
             f"(destination already exists: {dest_db})"
         )
     dest_db.parent.mkdir(parents=True, exist_ok=True)
-    staged = dest_db.with_name(
-        f".{dest_db.name}.staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
+    # A stale sidecar beside a never-published path would make the new artifact
+    # ambiguous, so refuse rather than deleting a file this invocation does not own.
+    assert_sidecar_free(
+        dest_db, field_name="backup destination", error_type=BackupFormatError
     )
+
+    staged = _short_staging_path(
+        dest_db.parent, prefix=_DB_STAGING_PREFIX, suffix=_DB_STAGING_SUFFIX
+    )
+    staged_created = False
+    claimed = False
     try:
         if staged.exists():
             staged.unlink()
         remove_sqlite_sidecars(staged)
+        staged_created = True
 
         source = connect(source_db, read_only=True)
         try:
@@ -301,25 +362,32 @@ def backup_database(source_db: Path, dest_db: Path) -> Path:
         _finalize_backup_snapshot(staged)
         assert_rollback_journal_backup(staged)
         validate_canonical_sqlite(staged)
-        # Required durability before the atomic publish: a backup that is
-        # reported as published must have its bytes on durable storage.
+        # Required durability before publication: a generation that is reported
+        # as committed must have its bytes on durable storage.
         fsync_file_required(staged)
-        os.replace(str(staged), str(dest_db))
-        # Only after a successful cutover: any sidecar left beside the
-        # destination belonged to the artifact just replaced and can never pair
-        # with the new (provably sidecar-free) main file again. Removing it
-        # before the replace would risk corrupting the previous backup if the
-        # replace then failed.
-        remove_sqlite_sidecars(dest_db)
-        # Required parent-directory durability so the rename itself survives.
+
+        # Atomic no-replace publication. Nothing above this line is visible at
+        # the final pathname, and nothing below can overwrite a peer's artifact.
+        _claim_immutable_path(staged, dest_db)
+        claimed = True
+        # The final link owns the inode now; drop only this invocation's staging
+        # name (the artifact itself remains valid and immutable).
+        with contextlib.suppress(OSError):
+            staged.unlink()
         fsync_directory_required(dest_db.parent)
     except Exception:
-        if staged.exists():
-            try:
-                staged.unlink()
-            except OSError:
-                pass
-        remove_sqlite_sidecars(staged)
+        # Ownership-scoped cleanup: only artifacts this invocation definitely
+        # created are removed. If the claim failed, the existing artifact belongs
+        # to another publisher and is left strictly alone.
+        if staged_created:
+            with contextlib.suppress(OSError):
+                if staged.exists():
+                    staged.unlink()
+            with contextlib.suppress(OSError):
+                remove_sqlite_sidecars(staged)
+        if claimed and dest_db.exists():
+            with contextlib.suppress(OSError):
+                dest_db.unlink()
         raise
     return dest_db
 
@@ -493,6 +561,41 @@ def new_backup_generation_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:12]}"
 
 
+#: Bound on caller-supplied filename components. Long enough for a timestamped
+#: UUID generation id, short enough that final generation names stay usable in
+#: nested directories.
+MAX_GENERATION_COMPONENT_CHARS = 64
+
+_FORBIDDEN_GENERATION_COMPONENTS = (".", "..")
+
+
+def require_generation_component(value: Any, *, field_name: str) -> str:
+    """Return a safe single-path-segment component, or fail closed.
+
+    Generation ids and stems become part of a filename. A caller-supplied value
+    must not be able to escape the backup directory, address a parent directory,
+    or produce a pathologically long name that would defeat the bounded-staging
+    design.
+    """
+    component = str(value or "").strip()
+    if not component:
+        raise BackupProvenanceError(f"{field_name} must be a non-empty name")
+    if component in _FORBIDDEN_GENERATION_COMPONENTS:
+        raise BackupProvenanceError(
+            f"{field_name} must not be a relative path element: {component!r}"
+        )
+    if any(char in component for char in ("/", "\\", "\x00")):
+        raise BackupProvenanceError(
+            f"{field_name} must not contain a path separator or NUL: {component!r}"
+        )
+    if len(component) > MAX_GENERATION_COMPONENT_CHARS:
+        raise BackupProvenanceError(
+            f"{field_name} must be at most {MAX_GENERATION_COMPONENT_CHARS} "
+            f"characters, got {len(component)}"
+        )
+    return component
+
+
 def backup_generation_paths(
     backup_dir: Path,
     *,
@@ -501,8 +604,14 @@ def backup_generation_paths(
 ) -> tuple[Path, Path]:
     """Derive the immutable ``(database, manifest)`` paths for one generation."""
     directory = Path(backup_dir)
-    database = directory / f"{stem}{BACKUP_GENERATION_MARKER}{generation_id}.sqlite3"
-    manifest = directory / f"{stem}{BACKUP_GENERATION_MARKER}{generation_id}.manifest.json"
+    safe_stem = require_generation_component(stem, field_name="backup stem")
+    safe_generation = require_generation_component(
+        generation_id, field_name="generation_id"
+    )
+    database = directory / f"{safe_stem}{BACKUP_GENERATION_MARKER}{safe_generation}.sqlite3"
+    manifest = (
+        directory / f"{safe_stem}{BACKUP_GENERATION_MARKER}{safe_generation}.manifest.json"
+    )
     return database, manifest
 
 
@@ -543,14 +652,17 @@ def publish_backup_generation(
     """
     source_db = Path(source_db)
     backup_dir = Path(backup_dir)
-    identifier = generation_id or new_backup_generation_id()
+    identifier = new_backup_generation_id() if generation_id is None else generation_id
     database_path, manifest_path = backup_generation_paths(
         backup_dir, generation_id=identifier, stem=stem
     )
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     # Stage 1: publish the immutable generation database (durable on return).
+    # This is an atomic no-replace claim, so if another publisher already
+    # committed this generation id, this call fails here and owns nothing.
     backup_database(source_db, database_path)
+    database_claimed = True
 
     # Stage 2: build the manifest from the *finalized* generation database. The
     # recorded SHA and byte-count facts therefore describe exactly the bytes that
@@ -560,18 +672,21 @@ def publish_backup_generation(
             backup_path=database_path,
             source_release_sha=source_release_sha,
         )
-        # Stage 3: atomic, durable manifest publication commits the generation.
-        write_backup_manifest(manifest, manifest_path)
+        # Stage 3: create-only, durable manifest publication commits the
+        # generation. A manifest must never silently replace a peer's manifest.
+        write_backup_manifest_create_only(manifest, manifest_path)
     except Exception:
-        # The generation database exists but has no authoritative manifest, so it
-        # is an orphaned, uncommitted artifact. It may be best-effort removed
-        # because this invocation created it; previous generations are never
-        # touched, and no manifest means restore can never authorize it.
-        with contextlib.suppress(OSError):
-            if database_path.exists():
-                database_path.unlink()
-        with contextlib.suppress(OSError):
-            remove_sqlite_sidecars(database_path)
+        # The generation database was claimed by *this* invocation but has no
+        # authoritative manifest, so it is an orphaned, uncommitted artifact.
+        # Cleanup is ownership-scoped: it removes only the artifact this call
+        # claimed, and never touches a peer's committed pair. If the claim above
+        # failed, nothing is removed here.
+        if database_claimed:
+            with contextlib.suppress(OSError):
+                if database_path.exists():
+                    database_path.unlink()
+            with contextlib.suppress(OSError):
+                remove_sqlite_sidecars(database_path)
         raise
 
     return PublishedBackupGeneration(
@@ -584,7 +699,15 @@ def publish_backup_generation(
 
 
 def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:
-    """Publish a manifest atomically so a crash cannot destroy the previous one."""
+    """Publish a manifest atomically, replacing any existing file at ``path``.
+
+    This is the **replace-capable** helper. It is retained for callers that
+    legitimately rewrite a manifest, and it does *not* provide create-only
+    semantics: ``os.replace`` silently overwrites an existing file, so it must
+    never be used to publish an immutable generation manifest. Authoritative
+    generation publication uses :func:`write_backup_manifest_create_only`, whose
+    atomic no-replace claim refuses to clobber a peer's committed manifest.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temp_name = tempfile.mkstemp(
@@ -604,5 +727,38 @@ def write_backup_manifest(manifest: dict[str, Any], path: Path) -> Path:
             os.unlink(temp_name)
         except FileNotFoundError:
             pass
+        raise
+    return path
+
+
+def write_backup_manifest_create_only(manifest: dict[str, Any], path: Path) -> Path:
+    """Publish a generation manifest, refusing to replace an existing one.
+
+    The manifest is the commit marker for an immutable backup generation, so a
+    later publication must never silently replace it. Writes to a short private
+    temp file, flushes it, flushes the temp bytes durably, then publishes with
+    the same atomic no-replace claim used for generation databases.
+
+    ``FileExistsError``-derived conflict means this generation is already
+    committed: the existing manifest is left byte-for-byte intact.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = _short_staging_path(
+        path.parent, prefix=_MANIFEST_STAGING_PREFIX, suffix=_MANIFEST_STAGING_SUFFIX
+    )
+    try:
+        with temp_name.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            fsync_file_required(temp_name)
+        _claim_immutable_path(temp_name, path)
+        with contextlib.suppress(OSError):
+            temp_name.unlink()
+        fsync_directory_required(path.parent)
+    except Exception:
+        with contextlib.suppress(OSError):
+            if temp_name.exists():
+                temp_name.unlink()
         raise
     return path
