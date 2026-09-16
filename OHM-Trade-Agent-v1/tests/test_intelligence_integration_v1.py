@@ -61,7 +61,10 @@ def test_trade_decision_uses_profit_rank_and_guarded_calibration():
         outcomes=[],
     )
     assert decision.quality_score == 85.0
-    assert decision.calibration_status == "INSUFFICIENT_DATA"
+    # PR-A: the neutral reason is now governance, not statistics. Without an
+    # approved promotion, runtime calibration is neutral regardless of how much
+    # or how little learning evidence exists.
+    assert decision.calibration_status == "NO_APPROVED_PROMOTION"
     assert decision.calibration_multiplier == 1.0
     assert decision.allowed
     assert 0 < decision.allocation.recommended_capital <= 2000

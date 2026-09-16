@@ -4,10 +4,12 @@ from dataclasses import asdict, fields
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
+from app.opip.canonical.gap_spool import append_capture_gap
 from app.services.paper_trade_models import (
     NONTERMINAL_STATUSES,
     TERMINAL_STATUSES,
@@ -19,6 +21,17 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 STATE_FILE = Path("/app/data/paper_trading/state.json")
 EVENT_FILE = Path("/app/data/paper_trading/events.jsonl")
+
+#: Paper-plane evidence-gap spool. Reuses the canonical gap-spool mechanism
+#: (identical implementation, non-eviction, fail-closed on corruption) in its
+#: own file so a paper evidence failure can never mark the alert governor's
+#: evidence window incomplete.
+EVIDENCE_GAP_SPOOL_FILE = Path("/app/data/paper_trading/evidence_gap_spool.json")
+
+#: Durable disposition recorded when a paper evidence append cannot be written.
+PAPER_EVENT_APPEND_FAILED = "PAPER_EVENT_APPEND_FAILED"
+
+logger = logging.getLogger(__name__)
 
 
 def _state_lock(path: Path) -> Path:
@@ -88,13 +101,60 @@ def _event_id(trade: PaperTradeLifecycle, event_type: str) -> str:
     return "PTE:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _record_evidence_disposition(
+    trade: PaperTradeLifecycle,
+    event_type: str,
+    *,
+    error_code: str,
+    gap_spool_file: Path = EVIDENCE_GAP_SPOOL_FILE,
+) -> None:
+    """Make a lost paper evidence append durable, visible, and reconcilable.
+
+    A lifecycle row can read CLOSED while its terminal event - the shipper's
+    source and the only durable record of that transition - was never written.
+    Silently returning would leave operational state complete and evidence
+    missing with nothing to repair from, which the repository's learning-
+    consumption invariant treats as a defect.
+
+    This never raises: evidence bookkeeping must not affect paper trading or
+    the production scan cycle.
+    """
+    try:
+        append_capture_gap(
+            idempotency_key=_event_id(trade, event_type),
+            scan_id=str(trade.episode_id or ""),
+            identity=str(trade.paper_trade_id),
+            intended_event_type=str(event_type).upper(),
+            error_code=error_code,
+            path=gap_spool_file,
+        )
+    except Exception as exc:
+        # The spool itself is unavailable or corrupt. Fail closed rather than
+        # silent: a corrupt spool also makes any "evidence window complete"
+        # claim unprovable, so this must be observable.
+        logger.error(
+            "paper evidence disposition failed; evidence window uncertified "
+            "(%s event for %s): %s",
+            event_type,
+            trade.paper_trade_id,
+            exc,
+        )
+
+
 def _append_event(
     trade: PaperTradeLifecycle,
     event_type: str,
     *,
     event_file: Path,
     details: dict[str, Any] | None = None,
-) -> None:
+    gap_spool_file: Path = EVIDENCE_GAP_SPOOL_FILE,
+) -> bool:
+    """Append one durable paper event. Returns False when evidence was lost.
+
+    Returning rather than raising preserves the documented invariant that paper
+    persistence problems never affect live ranking or trading authority, while
+    the recorded disposition keeps the loss from being silent.
+    """
     event = {
         "event_id": _event_id(trade, event_type),
         "event_type": str(event_type).upper(),
@@ -128,7 +188,14 @@ def _append_event(
                 except OSError:
                     pass
     except (OSError, TimeoutError):
-        return
+        _record_evidence_disposition(
+            trade,
+            event_type,
+            error_code=PAPER_EVENT_APPEND_FAILED,
+            gap_spool_file=gap_spool_file,
+        )
+        return False
+    return True
 
 
 def create_lifecycle(

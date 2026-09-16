@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -227,6 +229,29 @@ def _loss_learning(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _profile_content_id(profile: dict[str, Any]) -> str:
+    """Content-derived identity of the runtime-influencing learning content.
+
+    Only multiplier-relevant content participates, so the identity changes
+    exactly when the learned calibration that could affect sizing changes.
+    Clocks and reporting-only sections are deliberately excluded: they move on
+    every refresh and would make an approval meaningless.
+    """
+    calibration = profile.get("trade_calibration")
+    payload = {
+        "version": str(profile.get("version") or ""),
+        "trade_calibration_status": (
+            str(calibration.get("status") or "") if isinstance(calibration, dict) else ""
+        ),
+        "weights": {
+            str(key): value
+            for key, value in sorted((profile.get("weights") or {}).items())
+        },
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return "CALPROF:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 def build_profitability_profile(
     *,
     outcomes: list[dict[str, Any]] | None = None,
@@ -267,6 +292,7 @@ def build_profitability_profile(
             "market_intelligence_min_actual_bucket_samples": MIN_INTELLIGENCE_BUCKET_SAMPLES,
         },
     }
+    profile["profile_id"] = _profile_content_id(profile)
     if persist:
         with registry_lock(LOCK_FILE):
             save_json_atomic(PROFILE_FILE, profile)
@@ -299,3 +325,23 @@ def learned_multiplier(*, direction: str, regime: str | None) -> float:
     if not math.isfinite(result):
         return 1.0
     return round(max(0.75, min(1.25, result)), 4)
+
+
+def active_profile_id() -> str | None:
+    """Return the content identity of the persisted profile, or ``None``.
+
+    A profile written before content identities existed (or any unreadable
+    profile) returns ``None``. Such a profile cannot be proven to match an
+    approval, so it must not influence runtime sizing.
+    """
+    try:
+        with registry_lock(LOCK_FILE):
+            profile = load_json(PROFILE_FILE)
+    except (OSError, TimeoutError, RegistryIOError):
+        return None
+    if not isinstance(profile, dict):
+        return None
+    value = profile.get("profile_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None

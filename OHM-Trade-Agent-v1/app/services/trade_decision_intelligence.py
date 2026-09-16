@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import math
 from typing import Any
 
 from app.services.capital_allocation import CapitalAllocation, recommend_capital
 from app.services.entry_exit_advisor import EntryExitPlan
+from app.services.learning_governance import (
+    NEUTRAL_CALIBRATION_MULTIPLIER,
+    PROMOTION_REASON_NO_APPROVED_PROMOTION,
+    load_approved_calibration_promotion,
+    resolve_calibration_promotion,
+)
 from app.services.portfolio_risk import PortfolioRiskDecision, evaluate_portfolio_risk
-from app.services.profitability_learning import learned_multiplier
-from app.services.self_calibration import calibration_model, calibrated_multiplier
+from app.services.profitability_learning import active_profile_id, learned_multiplier
 from app.services.shadow_learning import record_shadow_candidate
-from app.services.trade_outcome_registry import get_outcomes
 
 
 @dataclass(frozen=True)
@@ -63,24 +69,41 @@ def _capture_shadow(candidate: dict[str, Any], plan: EntryExitPlan, direction: s
 
 def _effective_calibration_multiplier(
     *,
-    legacy_model: dict[str, Any],
     direction: str,
     regime: str | None,
 ) -> tuple[float, str]:
-    """Prefer the persisted net-profit learner once it has enough evidence.
+    """Return runtime calibration influence, authorized only by approval.
 
-    Any profile read/storage failure falls back to the existing model so the
-    self-learning layer can never block or destabilize a live trade decision.
+    Learning evidence never authorizes its own influence. Runtime calibration
+    stays neutral unless a durable, human-approved, versioned, currently
+    effective promotion exists for the exact learned profile content.
+
+    The previous in-memory fallback - recomputing a multiplier from outcome
+    records at decision time - was an approval bypass and is deliberately gone.
+    ``self_calibration`` retains those functions for analysis only.
     """
     try:
-        persisted = learned_multiplier(direction=direction, regime=regime)
+        resolution = resolve_calibration_promotion(
+            promotion=load_approved_calibration_promotion(),
+            active_profile_id=active_profile_id(),
+            now=datetime.now(timezone.utc),
+        )
     except Exception:
-        persisted = 1.0
-    if persisted != 1.0:
-        return persisted, "PROFITABILITY_PROFILE"
+        # Fail neutral: an unprovable approval must never authorize influence.
+        return NEUTRAL_CALIBRATION_MULTIPLIER, PROMOTION_REASON_NO_APPROVED_PROMOTION
+
+    if not resolution.active:
+        return NEUTRAL_CALIBRATION_MULTIPLIER, resolution.reason
+
+    try:
+        multiplier = float(learned_multiplier(direction=direction, regime=regime))
+    except Exception:
+        return NEUTRAL_CALIBRATION_MULTIPLIER, resolution.reason
+    if not math.isfinite(multiplier):
+        return NEUTRAL_CALIBRATION_MULTIPLIER, resolution.reason
     return (
-        calibrated_multiplier(legacy_model, direction=direction, regime=regime),
-        str(legacy_model.get("status") or "UNKNOWN"),
+        max(0.75, min(1.25, multiplier)),
+        f"{resolution.reason}:{resolution.profile_id}",
     )
 
 
@@ -100,10 +123,10 @@ def evaluate_trade_decision(
 
     _capture_shadow(candidate, plan, direction)
 
-    records = outcomes if outcomes is not None else get_outcomes()
-    model = calibration_model(records)
+    # ``outcomes`` is accepted for caller compatibility only. Runtime influence
+    # is authorized solely by an approved promotion, never by decision-time
+    # evidence, so the outcome population is deliberately not consulted here.
     multiplier, calibration_status = _effective_calibration_multiplier(
-        legacy_model=model,
         direction=direction,
         regime=candidate.get("market_regime"),
     )
