@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from app.opip.canonical.paths import SCHEMA_VERSION
 
@@ -88,6 +89,166 @@ class SchemaVersionError(RuntimeError):
 
 class CanonicalDbValidationError(RuntimeError):
     """Staged/canonical SQLite file failed open/schema/integrity validation."""
+
+
+class CanonicalStoreBusyError(RuntimeError):
+    """The canonical store is already owned exclusively by another writer/restore."""
+
+
+class CanonicalCheckpointError(RuntimeError):
+    """A WAL checkpoint could not be proven complete and durable."""
+
+
+#: Sibling file holding the OS advisory lock that proves store ownership.
+CANONICAL_STORE_LOCK_SUFFIX = ".writer.lock"
+
+
+def store_lock_path(db_path: Path) -> Path:
+    """Sibling lock-file path used to prove exclusive canonical-store ownership."""
+    target = Path(db_path)
+    return target.with_name(f"{target.name}{CANONICAL_STORE_LOCK_SUFFIX}")
+
+
+def sqlite_sidecar_paths(db_path: Path) -> tuple[Path, ...]:
+    """Existing ``-wal``/``-shm`` companions of ``db_path`` (possibly empty)."""
+    target = Path(db_path)
+    return tuple(
+        side
+        for side in (Path(f"{target}-wal"), Path(f"{target}-shm"))
+        if side.exists()
+    )
+
+
+def _lock_handle_exclusive(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_handle(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class CanonicalStoreLock:
+    """Process-lifetime exclusive ownership of one canonical SQLite store.
+
+    Ownership is an OS advisory lock on a sibling lock file, held until explicit
+    release or process death. Because ownership is the live OS lock rather than
+    the file's existence, a lock file left behind by a dead process never reads
+    as busy. Advisory locks conflict between separate file descriptions, so a
+    second owner inside the same process is refused as well.
+
+    Acquisition fails closed: there is no wait-and-retry, because restoring or
+    writing against a store whose owner is unknown is never safe.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = Path(db_path)
+        self.lock_path = store_lock_path(self.db_path)
+        self._handle: Any | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            return
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            _lock_handle_exclusive(handle)
+        except OSError as exc:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            raise CanonicalStoreBusyError(
+                "canonical store is already owned exclusively by another "
+                f"writer or restore: {self.db_path}"
+            ) from exc
+        self._handle = handle
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            handle.seek(0)
+            _unlock_handle(handle)
+        except OSError:
+            pass
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def __enter__(self) -> "CanonicalStoreLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.release()
+        return False
+
+
+def checkpoint_wal_strict(connection: sqlite3.Connection) -> None:
+    """Checkpoint the WAL and prove every frame reached the database file.
+
+    ``PRAGMA wal_checkpoint`` returns ``(busy, log_frames, checkpointed_frames)``.
+    Successful SQL execution is not proof of a completed checkpoint, so a busy,
+    incomplete, unreadable, or errored result all fail closed. Callers may
+    therefore treat a return from this helper as evidence that the database file
+    alone is a complete snapshot.
+    """
+    try:
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as exc:
+        raise CanonicalCheckpointError(f"wal_checkpoint failed: {exc}") from exc
+    if row is None:
+        raise CanonicalCheckpointError("wal_checkpoint returned no status row")
+    values = tuple(row)
+    if len(values) < 3:
+        raise CanonicalCheckpointError(
+            f"wal_checkpoint returned an unusable status row: {values!r}"
+        )
+    try:
+        busy = int(values[0])
+        log_frames = int(values[1])
+        checkpointed_frames = int(values[2])
+    except (TypeError, ValueError) as exc:
+        raise CanonicalCheckpointError(
+            f"wal_checkpoint status is ambiguous: {values!r}"
+        ) from exc
+    if busy != 0:
+        raise CanonicalCheckpointError(
+            "wal_checkpoint reported busy; WAL contents are not safely in the "
+            "database file"
+        )
+    if log_frames != checkpointed_frames:
+        raise CanonicalCheckpointError(
+            "wal_checkpoint did not complete: "
+            f"{checkpointed_frames}/{log_frames} frames checkpointed"
+        )
 
 
 def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:

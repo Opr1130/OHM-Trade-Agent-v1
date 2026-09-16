@@ -9,8 +9,25 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.opip.canonical.backup import backup_database, build_backup_manifest, write_backup_manifest
+from app.opip.canonical.backup import (
+    BackupProvenanceError,
+    assert_regular_file,
+    assert_rollback_journal_backup,
+    assert_sidecar_free,
+    backup_database,
+    build_backup_manifest,
+    hash_file_sha256,
+    normalize_to_rollback_journal,
+    read_backup_manifest,
+    verify_backup_manifest,
+    write_backup_manifest,
+)
 from app.opip.canonical.schema import (
+    CanonicalCheckpointError,
+    CanonicalDbValidationError,
+    CanonicalStoreLock,
+    checkpoint_wal_strict,
+    connect,
     fsync_directory,
     fsync_path,
     remove_sqlite_sidecars,
@@ -19,64 +36,238 @@ from app.opip.canonical.schema import (
 from app.opip.canonical.writer import CanonicalWriter
 
 
+def _live_history_epoch(live_db: Path) -> int | None:
+    """Return the live store's current ``history_epoch``, or ``None`` if absent.
+
+    Ambiguity fails closed: if a live database exists but its epoch cannot be
+    read, the caller cannot prove that canonical commit order will not regress,
+    so recovery must not proceed.
+    """
+    if not live_db.is_file():
+        return None
+    try:
+        conn = connect(live_db, read_only=True)
+    except Exception as exc:  # noqa: BLE001 — re-raised as fail-closed provenance
+        raise BackupProvenanceError(
+            f"cannot read the live canonical store to prove epoch monotonicity: "
+            f"{live_db}: {exc}"
+        ) from exc
+    try:
+        row = conn.execute(
+            "SELECT history_epoch FROM meta WHERE id = 1"
+        ).fetchone()
+    except Exception as exc:  # noqa: BLE001 — re-raised as fail-closed provenance
+        raise BackupProvenanceError(
+            f"live canonical meta is unreadable; refusing to restore over an "
+            f"ambiguous live store: {live_db}: {exc}"
+        ) from exc
+    finally:
+        conn.close()
+    if row is None:
+        raise BackupProvenanceError(
+            f"live canonical meta row is missing; refusing to restore over an "
+            f"ambiguous live store: {live_db}"
+        )
+    return int(row["history_epoch"])
+
+
+def _checkpoint_live_wal(live_db: Path) -> None:
+    """Merge committed live WAL frames into the live database file.
+
+    Restore deletes ``-wal``/``-shm`` before the atomic cutover, so the frames
+    must already be in the file: otherwise a failed replacement would leave a
+    live database that has silently lost committed state. Runs before any
+    destructive sidecar handling, and fails closed when the checkpoint cannot be
+    proven complete.
+    """
+    if not live_db.is_file():
+        return
+    try:
+        connection = connect(live_db, read_only=False)
+    except Exception as exc:  # noqa: BLE001 — re-raised as fail-closed
+        raise CanonicalCheckpointError(
+            f"cannot open the live canonical store to checkpoint its WAL: {exc}"
+        ) from exc
+    try:
+        checkpoint_wal_strict(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _assert_no_staged_sidecars(staged: Path) -> None:
+    """A staged cutover source must not still hold unfinalized WAL frames.
+
+    Only the WAL is inspected: ``-shm`` is a shared-memory index that carries no
+    evidence, and a missing WAL is normal for a cleanly checkpointed database.
+    """
+    wal = Path(f"{staged}-wal")
+    if not wal.exists():
+        return
+    try:
+        size = wal.stat().st_size
+    except OSError as exc:
+        raise CanonicalDbValidationError(
+            f"cannot inspect staged SQLite sidecar {wal}: {exc}"
+        ) from exc
+    if size:
+        raise CanonicalCheckpointError(
+            f"staged restore source still holds unfinalized WAL frames: {wal} "
+            f"({size} bytes)"
+        )
+
+
 def restore_from_backup(
     *,
     backup_db: Path,
     live_db: Path,
+    manifest_path: Path,
+    expected_source_release_sha: str,
     advance_epoch: bool = True,
 ) -> dict[str, Any]:
-    """
-    Restore an older snapshot into the live path without destroying live on failure.
+    """Restore a verified backup snapshot into the live canonical path.
 
-    Requires exclusive restore context: the canonical writer process must be
-    stopped and no live SQLite writer may own ``live_db``.
+    Safety semantics, in order:
+
+    1. ``advance_epoch=False`` is refused. Canonical commit order
+       ``(history_epoch, local_sequence)`` must never regress on a live restore.
+    2. The backup must be self-contained; adjacent ``-wal``/``-shm`` files make
+       the snapshot ambiguous and are refused rather than ignored.
+    3. The manifest is loaded and verified against the backup file and the
+       caller's expected release SHA before anything is touched.
+    4. The canonical-store exclusivity lock is acquired, so an active writer
+       (which holds the same lock for its lifetime) blocks restore.
+    5. The live WAL is strictly checkpointed, which both proves the live file is
+       a complete snapshot and makes later sidecar cleanup non-destructive.
+    6. Any failure before the final cutover leaves the previous live database
+       valid and untouched.
     """
     started = time.perf_counter()
     backup_db = Path(backup_db)
     live_db = Path(live_db)
-    live_db.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(manifest_path)
 
+    if not advance_epoch:
+        raise BackupProvenanceError(
+            "advance_epoch=False would leave canonical commit order "
+            "(history_epoch, local_sequence) able to regress; refusing unsafe "
+            "live restore"
+        )
+
+    # Path safety: the restore caller selects the backup, and the manifest may
+    # only confirm that choice. Nothing may redirect recovery onto the live
+    # store or onto another artifacts' path.
+    if backup_db.resolve() == live_db.resolve():
+        raise BackupProvenanceError(
+            "backup database and live database resolve to the same path; "
+            "restoring a store over itself is never a recovery operation"
+        )
+    if manifest_path.resolve() == live_db.resolve():
+        raise BackupProvenanceError(
+            "manifest path resolves to the live database; refusing to use a "
+            "database as a manifest"
+        )
+    assert_regular_file(
+        backup_db, field_name="backup database", error_type=BackupProvenanceError
+    )
+
+    # Non-mutating artifact preflight, before anything opens SQLite: the backup
+    # must be a single self-contained rollback-journal file. Sidecar absence and
+    # the file's own journal format are both required, and neither check creates
+    # ``-wal``/``-shm`` beside the artifact.
+    assert_sidecar_free(
+        backup_db, field_name="backup database", error_type=BackupProvenanceError
+    )
+    assert_rollback_journal_backup(backup_db)
+
+    manifest = read_backup_manifest(manifest_path)
+    verify_backup_manifest(
+        manifest,
+        backup_path=backup_db,
+        expected_source_release_sha=expected_source_release_sha,
+    )
+
+    live_db.parent.mkdir(parents=True, exist_ok=True)
     staged = live_db.with_name(
         f".{live_db.name}.restore-staging.{os.getpid()}.{uuid.uuid4().hex}.sqlite3"
     )
-    epoch = None
+    if staged.resolve() == live_db.resolve():
+        raise BackupProvenanceError("restore staging path collides with the live database")
+
+    store_lock = CanonicalStoreLock(live_db)
+    store_lock.acquire()
     try:
-        if staged.exists():
-            staged.unlink()
-        remove_sqlite_sidecars(staged)
+        # Prove epoch monotonicity and make the live file self-contained before
+        # anything destructive happens to live sidecars.
+        previous_live_epoch = _live_history_epoch(live_db)
+        _checkpoint_live_wal(live_db)
 
-        shutil.copy2(backup_db, staged)
-        validate_canonical_sqlite(staged)
+        try:
+            if staged.exists():
+                staged.unlink()
+            remove_sqlite_sidecars(staged)
 
-        if advance_epoch:
+            shutil.copy2(backup_db, staged)
+            # TOCTOU: the bytes that will actually be installed must match the
+            # manifest, not merely the source bytes inspected earlier.
+            staged_digest = hash_file_sha256(staged)
+            if staged_digest != str(manifest["sha256"]):
+                raise BackupProvenanceError(
+                    "staged restore copy does not match the verified manifest "
+                    f"sha256: {staged_digest} != {manifest['sha256']}"
+                )
+            validate_canonical_sqlite(staged)
+
             writer = CanonicalWriter(staged)
             try:
-                epoch = writer.advance_history_epoch_for_restore()
+                epoch = writer.advance_history_epoch_for_restore(
+                    minimum_epoch=previous_live_epoch
+                )
                 writer.checkpoint_wal()
             finally:
                 writer.close()
+            # The writer forces WAL mode. Normalize the staged artifact back to
+            # self-contained DELETE mode so what gets installed never depends on
+            # a WAL sidecar; the next live writer re-enables WAL on open.
+            normalize_to_rollback_journal(staged)
+            assert_rollback_journal_backup(staged)
+            _assert_no_staged_sidecars(staged)
             validate_canonical_sqlite(staged)
+            fsync_path(staged)
 
-        fsync_path(staged)
+            # Cutover. Safe only because the live WAL was checkpointed above.
+            remove_sqlite_sidecars(live_db)
+            os.replace(str(staged), str(live_db))
+            remove_sqlite_sidecars(staged)
+            fsync_directory(live_db.parent)
+        except Exception:
+            if staged.exists():
+                try:
+                    staged.unlink()
+                except OSError:
+                    pass
+            remove_sqlite_sidecars(staged)
+            raise
 
-        # Exclusive cutover: drop stale live sidecars, then atomic install.
-        remove_sqlite_sidecars(live_db)
-        os.replace(str(staged), str(live_db))
-        remove_sqlite_sidecars(staged)
-        fsync_directory(live_db.parent)
-    except Exception:
-        if staged.exists():
-            try:
-                staged.unlink()
-            except OSError:
-                pass
-        remove_sqlite_sidecars(staged)
-        raise
+        # Prove the installed snapshot is the verified one at the expected epoch.
+        assert_rollback_journal_backup(live_db)
+        installed_epoch = _live_history_epoch(live_db)
+        if installed_epoch != epoch:
+            raise CanonicalDbValidationError(
+                "restored store epoch does not match the epoch written to the "
+                f"staged snapshot: {installed_epoch!r} != {epoch!r}"
+            )
+        validate_canonical_sqlite(live_db)
+    finally:
+        store_lock.release()
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return {
         "restored_path": str(live_db),
         "history_epoch": epoch,
+        "previous_live_epoch": previous_live_epoch,
+        "source_release_sha": str(manifest["source_release_sha"]),
+        "backup_sha256": str(manifest["sha256"]),
         "elapsed_ms": elapsed_ms,
         "rto_budget_ms": 30 * 60 * 1000,
     }
@@ -87,6 +278,7 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
     from app.opip.canonical.models import WriterIntent
     from app.opip.canonical.paths import SCHEMA_VERSION
 
+    drill_release_sha = "808a308cd274d30b55fef47b382c229b761e07df"
     live = work_dir / "live" / "opip_canonical_v1.sqlite3"
     backup = work_dir / "backup" / "opip_canonical_v1.backup.sqlite3"
     manifest_path = work_dir / "backup" / "manifest.json"
@@ -128,13 +320,15 @@ def run_backup_restore_drill(work_dir: Path, *, seed_events: int = 3) -> dict[st
     backup_ms = (time.perf_counter() - backup_started) * 1000.0
     manifest = build_backup_manifest(
         backup_path=backup,
-        source_release_sha="808a308cd274d30b55fef47b382c229b761e07df",
+        source_release_sha=drill_release_sha,
     )
     write_backup_manifest(manifest, manifest_path)
 
     restore_result = restore_from_backup(
         backup_db=backup,
         live_db=restored,
+        manifest_path=manifest_path,
+        expected_source_release_sha=drill_release_sha,
         advance_epoch=True,
     )
     return {

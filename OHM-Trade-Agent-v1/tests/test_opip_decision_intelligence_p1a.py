@@ -11,8 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from app.opip.canonical.backup import backup_database, build_backup_manifest
+from app.opip.canonical.backup import (
+    backup_database,
+    build_backup_manifest,
+    write_backup_manifest,
+)
 from app.opip.canonical.recovery import restore_from_backup
+from app.opip.canonical.schema import CanonicalStoreBusyError
 from app.opip.canonical.paths import SCHEMA_VERSION
 from app.opip.canonical.models import WriterIntent
 from app.opip.decision_intelligence import (
@@ -49,6 +54,10 @@ from app.opip.decision_intelligence.events import (
     assessment_identity,
     invocation_identity,
 )
+
+
+#: A syntactically valid release SHA for restore-authorizing manifests.
+RELEASE_SHA = "808a308cd274d30b55fef47b382c229b761e07df"
 
 
 def _di_key(event_type: str, payload: dict) -> str:
@@ -1564,8 +1573,15 @@ def test_acceptance_backup_restore_preserves_payload_hash_and_increments_epoch(t
     before_payload_hash = hashlib.sha256(before_payload_json.encode("utf-8")).hexdigest()
     backup_database(live, backup)
     before_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
-    manifest = build_backup_manifest(backup_path=backup)
-    result = restore_from_backup(backup_db=backup, live_db=restored)
+    manifest = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
+    manifest_path = backup.with_name("manifest.json")
+    write_backup_manifest(manifest, manifest_path)
+    result = restore_from_backup(
+        backup_db=backup,
+        live_db=restored,
+        manifest_path=manifest_path,
+        expected_source_release_sha=RELEASE_SHA,
+    )
     assert manifest["sha256"] == before_hash
     assert result["history_epoch"] == 2
     conn = connect(restored, read_only=True)
@@ -3049,6 +3065,12 @@ def test_context_decision_link_rejects_boolean_decision_schema_version():
 
 
 def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
+    """Exclusivity prevents a fork: the second writable owner is refused.
+
+    Commit-order integrity used to depend on the second writer failing its
+    ``from_state`` check. It is now structurally impossible for two writable
+    owners to exist for one store, so the fork cannot be attempted at all.
+    """
     from app.opip.canonical.schema import connect
     from app.opip.canonical.writer import CanonicalWriter
 
@@ -3056,53 +3078,31 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
     writer_a = CanonicalWriter(db)
     try:
         request_id = _seed_di_ancestry(writer_a, value=31)
-        writer_b = CanonicalWriter(db)
-        try:
-            selected = _transition_payload(
-                request_id=request_id,
-                from_state="ELIGIBLE",
-                to_state="SELECTED",
-                transition_time="2026-01-02T03:06:00Z",
-            )
-            skipped = _transition_payload(
-                request_id=request_id,
-                from_state="ELIGIBLE",
-                to_state="SKIPPED_BUDGET",
-                transition_time="2026-01-02T03:07:00Z",
-            )
+        with pytest.raises(CanonicalStoreBusyError):
+            CanonicalWriter(db)
 
-            selected_ack = writer_a.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.transition.recorded",
-                        selected,
-                    ),
-                    event_type="decision_intelligence.transition.recorded",
-                    payload=selected,
-                )
+        selected = _transition_payload(
+            request_id=request_id,
+            from_state="ELIGIBLE",
+            to_state="SELECTED",
+            transition_time="2026-01-02T03:06:00Z",
+        )
+        selected_ack = writer_a.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.transition.recorded",
+                    selected,
+                ),
+                event_type="decision_intelligence.transition.recorded",
+                payload=selected,
             )
-            skipped_ack = writer_b.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.transition.recorded",
-                        skipped,
-                    ),
-                    event_type="decision_intelligence.transition.recorded",
-                    payload=skipped,
-                )
-            )
-        finally:
-            writer_b.close()
+        )
     finally:
         writer_a.close()
 
     assert selected_ack.status == "OK"
-    assert skipped_ack.status == "REJECTED"
-    assert skipped_ack.error_code == "INVALID_INTENT"
 
     conn = connect(db, read_only=True)
     try:
@@ -3133,11 +3133,16 @@ def test_two_writers_cannot_fork_request_lifecycle(tmp_path):
 def test_losing_idempotency_race_rolls_back_for_next_submit(
     tmp_path, monkeypatch
 ):
+    """A losing idempotency race must roll back so the next submit can commit.
+
+    Reproduced on a single writable owner (the only legal topology): a stale
+    lookup lets the insert collide, the writer rolls back, re-checks, reports
+    DUPLICATE_OK, and a subsequent distinct submit still succeeds.
+    """
     from app.opip.canonical.writer import CanonicalWriter
 
     db = tmp_path / "canonical.sqlite3"
     writer_a = CanonicalWriter(db)
-    writer_b = CanonicalWriter(db)
     try:
         payload = _context_payload("ctx-idempotency-race")
         intent = WriterIntent(
@@ -3154,7 +3159,7 @@ def test_losing_idempotency_race_rolls_back_for_next_submit(
         winning_ack = writer_a.submit(intent)
         assert winning_ack.status == "OK"
 
-        original_lookup = writer_b._lookup_idempotency
+        original_lookup = writer_a._lookup_idempotency
         lookup_calls = 0
 
         def stale_once(key, *, payload_json=None, event_type=None):
@@ -3169,18 +3174,20 @@ def test_losing_idempotency_race_rolls_back_for_next_submit(
             )
 
         monkeypatch.setattr(
-            writer_b,
+            writer_a,
             "_lookup_idempotency",
             stale_once,
         )
 
-        losing_ack = writer_b.submit(intent)
+        losing_ack = writer_a.submit(intent)
         assert losing_ack.status == "DUPLICATE_OK"
+
+        monkeypatch.undo()
 
         next_payload = _context_payload("ctx-after-idempotency-race")
         next_payload["candidate_id"] = "candidate-after-idempotency-race"
         next_payload["context_id"] = context_identity(next_payload)
-        next_ack = writer_b.submit(
+        next_ack = writer_a.submit(
             WriterIntent(
                 schema_version=1,
                 priority="LOW",
@@ -3193,7 +3200,6 @@ def test_losing_idempotency_race_rolls_back_for_next_submit(
             )
         )
     finally:
-        writer_b.close()
         writer_a.close()
 
     assert next_ack.status == "OK"
@@ -3201,98 +3207,105 @@ def test_losing_idempotency_race_rolls_back_for_next_submit(
 
 
 def test_second_writer_refreshes_role_result_for_assessment(tmp_path):
+    """A restarted writer must hydrate role-result identity from durable history.
+
+    Only one writable owner may exist at a time, so this models the real
+    topology: the writer commits, closes, and a later writer instance hydrates
+    its projections from the store before accepting a dependent assessment.
+    """
     from app.opip.canonical.writer import CanonicalWriter
 
     db = tmp_path / "canonical.sqlite3"
     writer_a = CanonicalWriter(db)
     try:
         request_id = _seed_di_ancestry(writer_a, value=41)
-        writer_b = CanonicalWriter(db)
-        try:
-            role_result = _role_result_payload(request_id=request_id)
-            role_ack = writer_a.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.role_result.recorded",
-                        role_result,
-                    ),
-                    event_type="decision_intelligence.role_result.recorded",
-                    payload=role_result,
-                )
+        role_result = _role_result_payload(request_id=request_id)
+        role_ack = writer_a.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded",
+                    role_result,
+                ),
+                event_type="decision_intelligence.role_result.recorded",
+                payload=role_result,
             )
-            assert role_ack.status == "OK"
-
-            assessment = _assessment_payload(
-                request_id=request_id,
-                referenced_role_result_ids=[role_result["result_id"]],
-                invocation_references=[],
-            )
-            assessment_ack = writer_b.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.assessment.recorded",
-                        assessment,
-                    ),
-                    event_type="decision_intelligence.assessment.recorded",
-                    payload=assessment,
-                )
-            )
-        finally:
-            writer_b.close()
+        )
+        assert role_ack.status == "OK"
     finally:
         writer_a.close()
+
+    writer_b = CanonicalWriter(db)
+    try:
+        assessment = _assessment_payload(
+            request_id=request_id,
+            referenced_role_result_ids=[role_result["result_id"]],
+            invocation_references=[],
+        )
+        assessment_ack = writer_b.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.assessment.recorded",
+                    assessment,
+                ),
+                event_type="decision_intelligence.assessment.recorded",
+                payload=assessment,
+            )
+        )
+    finally:
+        writer_b.close()
 
     assert assessment_ack.status == "OK"
 
 
 def test_second_writer_refreshes_role_result_for_correction(tmp_path):
+    """A restarted writer must resolve a supersession target recorded earlier."""
     from app.opip.canonical.writer import CanonicalWriter
 
     db = tmp_path / "canonical.sqlite3"
     writer_a = CanonicalWriter(db)
     try:
         request_id = _seed_di_ancestry(writer_a, value=42)
-        writer_b = CanonicalWriter(db)
-        try:
-            original = _role_result_payload(request_id=request_id)
-            original_ack = writer_a.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.role_result.recorded",
-                        original,
-                    ),
-                    event_type="decision_intelligence.role_result.recorded",
-                    payload=original,
-                )
+        original = _role_result_payload(request_id=request_id)
+        original_ack = writer_a.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded",
+                    original,
+                ),
+                event_type="decision_intelligence.role_result.recorded",
+                payload=original,
             )
-            assert original_ack.status == "OK"
-
-            correction = _role_result_payload(
-                request_id=request_id,
-                supersedes_id=original["result_id"],
-                supersession_reason="role result correction",
-            )
-            correction_ack = writer_b.submit(
-                WriterIntent(
-                    schema_version=1,
-                    priority="LOW",
-                    idempotency_key=_di_key(
-                        "decision_intelligence.role_result.recorded",
-                        correction,
-                    ),
-                    event_type="decision_intelligence.role_result.recorded",
-                    payload=correction,
-                )
-            )
-        finally:
-            writer_b.close()
+        )
+        assert original_ack.status == "OK"
     finally:
         writer_a.close()
+
+    writer_b = CanonicalWriter(db)
+    try:
+        correction = _role_result_payload(
+            request_id=request_id,
+            supersedes_id=original["result_id"],
+            supersession_reason="role result correction",
+        )
+        correction_ack = writer_b.submit(
+            WriterIntent(
+                schema_version=1,
+                priority="LOW",
+                idempotency_key=_di_key(
+                    "decision_intelligence.role_result.recorded",
+                    correction,
+                ),
+                event_type="decision_intelligence.role_result.recorded",
+                payload=correction,
+            )
+        )
+    finally:
+        writer_b.close()
 
     assert correction_ack.status == "OK"

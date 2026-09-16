@@ -392,6 +392,30 @@ def _comparison_payload(
 # --------------------------------------------------------------------------- #
 
 
+#: A syntactically valid release SHA for restore-authorizing manifests.
+_RELEASE_SHA = "808a308cd274d30b55fef47b382c229b761e07df"
+
+
+def _verified_backup(live: Path, backup: Path, manifest_path: Path):
+    """Produce a self-contained backup plus its verified manifest."""
+    from app.opip.canonical.backup import build_backup_manifest, write_backup_manifest
+
+    backup_database(live, backup)
+    manifest = build_backup_manifest(backup_path=backup, source_release_sha=_RELEASE_SHA)
+    write_backup_manifest(manifest, manifest_path)
+    return manifest
+
+
+def _restore_verified(live: Path, backup: Path, manifest_path: Path) -> dict:
+    """Restore using the tightened provenance-verifying contract."""
+    return restore_from_backup(
+        backup_db=backup,
+        live_db=live,
+        manifest_path=manifest_path,
+        expected_source_release_sha=_RELEASE_SHA,
+    )
+
+
 def _write_di(db: Path, entries) -> None:
     """Commit Decision Intelligence evidence through the canonical writer."""
     writer = CanonicalWriter(db)
@@ -1674,10 +1698,11 @@ def test_restore_and_epoch_advance_keep_di_boundary_consistent(tmp_path):
     request_id = ancestry["request"]["request_id"]
 
     backup = tmp_path / "backup" / "opip_canonical_v1.backup.sqlite3"
-    backup_database(live, backup)
+    manifest_path = tmp_path / "backup" / "manifest.json"
+    _verified_backup(live, backup, manifest_path)
 
     restored = tmp_path / "restored" / "opip_canonical_v1.sqlite3"
-    restore_from_backup(backup_db=backup, live_db=restored, advance_epoch=True)
+    _restore_verified(restored, backup, manifest_path)
 
     # advance_history_epoch_for_restore only moves meta; the frozen DI row
     # still matches the restored file's DI evidence tip.
@@ -3048,12 +3073,13 @@ def test_backup_and_restore_produce_equivalent_snapshot(tmp_path):
     live_snapshot = read_di_evidence_snapshot(live)
 
     backup = tmp_path / "backup" / "opip_canonical_v1.backup.sqlite3"
-    backup_database(live, backup)
+    manifest_path = tmp_path / "backup" / "manifest.json"
+    _verified_backup(live, backup, manifest_path)
     backup_snapshot = read_di_evidence_snapshot(backup)
     assert backup_snapshot == live_snapshot
 
     restored = tmp_path / "restored" / "opip_canonical_v1.sqlite3"
-    restore_from_backup(backup_db=backup, live_db=restored, advance_epoch=True)
+    _restore_verified(restored, backup, manifest_path)
     restored_snapshot = read_di_evidence_snapshot(restored)
 
     assert restored_snapshot == live_snapshot

@@ -11,7 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.opip.canonical.backup import backup_database, build_backup_manifest
+from app.opip.canonical.backup import (
+    BackupProvenanceError,
+    backup_database,
+    build_backup_manifest,
+)
 from app.opip.canonical.bridge import (
     durable_record_opportunity_alert,
     durable_release_opportunity_alert_reservation,
@@ -36,10 +40,16 @@ from app.opip.canonical.paths import (
 )
 from app.opip.canonical.rebuild import rebuild_identity_projection
 from app.opip.canonical.recovery import run_backup_restore_drill
+from app.opip.canonical.schema import connect, validate_canonical_sqlite
 from app.opip.canonical.server import CanonicalWriterServer
 from app.opip.canonical.writer import CanonicalWriter
 from app.services.alert_governor import evaluate_opportunity_alert
 from app.services.registry_io import load_json, save_json_atomic
+
+#: A syntactically valid release SHA for restore-authorizing manifests. Restore
+#: provenance verification requires exactly this shape and an exact match.
+RELEASE_SHA = "808a308cd274d30b55fef47b382c229b761e07df"
+OTHER_RELEASE_SHA = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3"
 
 
 @pytest.fixture
@@ -634,10 +644,24 @@ def test_backup_manifest_matches_snapshot_after_live_write(canonical_env, tmp_pa
     assert manifest["event_count"] == 1
     assert manifest["max_local_sequence"] == 1
     assert manifest["history_epoch"] == 1
-    assert manifest["source_release_sha"].startswith("808a308")
-    later = build_backup_manifest(backup_path=backup, source_release_sha="x")
+    assert manifest["source_release_sha"] == RELEASE_SHA
+    later = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
     assert later["event_count"] == manifest["event_count"]
     assert later["sha256"] == manifest["sha256"]
+
+
+def test_backup_manifest_rejects_unverified_release_provenance(canonical_env, tmp_path):
+    """A manifest authorizes restore, so it must carry real release provenance."""
+    from app.opip.canonical.backup import BackupProvenanceError
+
+    live = canonical_env["db"]
+    CanonicalWriter(live).close()
+    backup = tmp_path / "snap.sqlite3"
+    backup_database(live, backup)
+
+    for bad in ("x", "UNVERIFIED", "", "808a308", "g" * 40, None):
+        with pytest.raises(BackupProvenanceError, match="40-character"):
+            build_backup_manifest(backup_path=backup, source_release_sha=bad)
 
 
 def test_backup_restore_advances_history_epoch(canonical_env, tmp_path):
@@ -872,13 +896,37 @@ def test_backup_success_replaces_and_passes_integrity(canonical_env, tmp_path):
     backup_database(live, dest)
     assert dest.read_bytes() != first_sha
     validate_canonical_sqlite(dest)
-    manifest = build_backup_manifest(backup_path=dest, source_release_sha="x")
+    manifest = build_backup_manifest(backup_path=dest, source_release_sha=RELEASE_SHA)
     assert manifest["event_count"] == 2
 
 
-def test_restore_copy_failure_preserves_live(canonical_env, tmp_path, monkeypatch):
+def _verified_backup(live: Path, tmp_path, *, name: str = "bak"):
+    """Produce a self-contained backup plus its verified manifest path."""
+    from app.opip.canonical.backup import write_backup_manifest
+
+    backup = tmp_path / f"{name}.sqlite3"
+    manifest_path = tmp_path / f"{name}.manifest.json"
+    backup_database(live, backup)
+    manifest = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
+    write_backup_manifest(manifest, manifest_path)
+    return backup, manifest_path, manifest
+
+
+def _restore(live: Path, backup: Path, manifest_path: Path, **overrides):
     from app.opip.canonical.recovery import restore_from_backup
 
+    params = {
+        "backup_db": backup,
+        "live_db": live,
+        "manifest_path": manifest_path,
+        "expected_source_release_sha": RELEASE_SHA,
+        "advance_epoch": True,
+    }
+    params.update(overrides)
+    return restore_from_backup(**params)
+
+
+def test_restore_copy_failure_preserves_live(canonical_env, tmp_path, monkeypatch):
     live = canonical_env["db"]
     writer = CanonicalWriter(live)
     try:
@@ -886,21 +934,20 @@ def test_restore_copy_failure_preserves_live(canonical_env, tmp_path, monkeypatc
         writer.checkpoint_wal()
     finally:
         writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak")
     before = live.read_bytes()
-    backup = tmp_path / "bak.sqlite3"
-    backup_database(live, backup)
 
     def _boom(*_a, **_k):  # noqa: ANN001
         raise OSError("copy injected failure")
 
     monkeypatch.setattr("app.opip.canonical.recovery.shutil.copy2", _boom)
     with pytest.raises(OSError, match="copy injected failure"):
-        restore_from_backup(backup_db=backup, live_db=live, advance_epoch=True)
+        _restore(live, backup, manifest_path)
     assert live.read_bytes() == before
+    validate_canonical_sqlite(live)
 
 
 def test_restore_invalid_backup_preserves_live(canonical_env, tmp_path):
-    from app.opip.canonical.recovery import restore_from_backup
     from app.opip.canonical.schema import CanonicalDbValidationError
 
     live = canonical_env["db"]
@@ -910,17 +957,51 @@ def test_restore_invalid_backup_preserves_live(canonical_env, tmp_path):
         writer.checkpoint_wal()
     finally:
         writer.close()
+    backup, manifest_path, manifest = _verified_backup(live, tmp_path, name="bak2")
     before = live.read_bytes()
+
+    # Same filename and manifest, but the backup bytes are not a SQLite database.
+    backup.write_bytes(b"not-a-sqlite-db")
+    with pytest.raises(BackupProvenanceError):
+        _restore(live, backup, manifest_path)
+    assert live.read_bytes() == before
+
+    # Restore the real bytes but corrupt the snapshot so integrity validation
+    # (not provenance) is what rejects it.
+    backup_database(live, backup)
+    manifest = build_backup_manifest(backup_path=backup, source_release_sha=RELEASE_SHA)
+    manifest["event_count"] = int(manifest["event_count"]) + 99
+    from app.opip.canonical.backup import write_backup_manifest
+
+    write_backup_manifest(manifest, manifest_path)
+    with pytest.raises(BackupProvenanceError, match="event_count"):
+        _restore(live, backup, manifest_path)
+    assert live.read_bytes() == before
+
+    # A genuine non-SQLite file with a manifest that matches it byte-for-byte
+    # must fail closed at staged validation.
     bad = tmp_path / "bad.sqlite3"
     bad.write_bytes(b"not-a-sqlite-db")
+    bad_manifest = tmp_path / "bad.manifest.json"
+    write_backup_manifest(
+        {
+            "schema_version": 1,
+            "backup_file": bad.name,
+            "sha256": __import__("hashlib").sha256(bad.read_bytes()).hexdigest(),
+            "source_release_sha": RELEASE_SHA,
+            "history_epoch": 1,
+            "next_local_sequence": 1,
+            "max_local_sequence": 0,
+            "event_count": 0,
+        },
+        bad_manifest,
+    )
     with pytest.raises((CanonicalDbValidationError, Exception)):
-        restore_from_backup(backup_db=bad, live_db=live, advance_epoch=True)
+        _restore(live, bad, bad_manifest)
     assert live.read_bytes() == before
 
 
 def test_restore_validation_failure_preserves_live(canonical_env, tmp_path, monkeypatch):
-    from app.opip.canonical.recovery import restore_from_backup
-
     live = canonical_env["db"]
     writer = CanonicalWriter(live)
     try:
@@ -928,9 +1009,8 @@ def test_restore_validation_failure_preserves_live(canonical_env, tmp_path, monk
         writer.checkpoint_wal()
     finally:
         writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak3")
     before = live.read_bytes()
-    backup = tmp_path / "bak3.sqlite3"
-    backup_database(live, backup)
     calls = {"n": 0}
     real = __import__(
         "app.opip.canonical.recovery", fromlist=["validate_canonical_sqlite"]
@@ -944,13 +1024,13 @@ def test_restore_validation_failure_preserves_live(canonical_env, tmp_path, monk
 
     monkeypatch.setattr("app.opip.canonical.recovery.validate_canonical_sqlite", _wrap)
     with pytest.raises(RuntimeError, match="validation injected failure"):
-        restore_from_backup(backup_db=backup, live_db=live, advance_epoch=True)
+        _restore(live, backup, manifest_path)
     assert live.read_bytes() == before
+    monkeypatch.undo()
+    validate_canonical_sqlite(live)
 
 
 def test_restore_epoch_advance_failure_preserves_live(canonical_env, tmp_path, monkeypatch):
-    from app.opip.canonical.recovery import restore_from_backup
-
     live = canonical_env["db"]
     writer = CanonicalWriter(live)
     try:
@@ -958,11 +1038,10 @@ def test_restore_epoch_advance_failure_preserves_live(canonical_env, tmp_path, m
         writer.checkpoint_wal()
     finally:
         writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak4")
     before = live.read_bytes()
-    backup = tmp_path / "bak4.sqlite3"
-    backup_database(live, backup)
 
-    def _boom(self):  # noqa: ANN001
+    def _boom(self, minimum_epoch=None):  # noqa: ANN001
         raise RuntimeError("epoch injected failure")
 
     monkeypatch.setattr(
@@ -971,14 +1050,51 @@ def test_restore_epoch_advance_failure_preserves_live(canonical_env, tmp_path, m
         _boom,
     )
     with pytest.raises(RuntimeError, match="epoch injected failure"):
-        restore_from_backup(backup_db=backup, live_db=live, advance_epoch=True)
+        _restore(live, backup, manifest_path)
     assert live.read_bytes() == before
+    monkeypatch.undo()
+    validate_canonical_sqlite(live)
+
+
+def test_restore_failure_during_cutover_preserves_valid_live(canonical_env, tmp_path, monkeypatch):
+    """A failure at the final os.replace must leave the previous live DB valid."""
+    import app.opip.canonical.recovery as recovery_module
+
+    live = canonical_env["db"]
+    writer = CanonicalWriter(live)
+    try:
+        writer.submit(_record_intent(key="rs:cut", identity="EARLY_MOVER:CUT"))
+        writer.checkpoint_wal()
+    finally:
+        writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak-cut")
+    before = live.read_bytes()
+
+    real_replace = recovery_module.os.replace
+
+    def _boom_replace(src, dst):  # noqa: ANN001
+        if Path(dst) == live:
+            raise OSError("cutover injected failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(recovery_module.os, "replace", _boom_replace)
+    with pytest.raises(OSError, match="cutover injected failure"):
+        _restore(live, backup, manifest_path)
+    monkeypatch.undo()
+
+    # Previous live logical database is intact and still passes validation.
+    assert live.read_bytes() == before
+    validate_canonical_sqlite(live)
+    conn = connect(live, read_only=True)
+    try:
+        assert int(
+            conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        ) == 1
+    finally:
+        conn.close()
 
 
 def test_restore_success_advances_epoch_and_handles_sidecars(canonical_env, tmp_path):
-    from app.opip.canonical.recovery import restore_from_backup
-    from app.opip.canonical.schema import connect
-
     live = canonical_env["db"]
     writer = CanonicalWriter(live)
     try:
@@ -986,13 +1102,14 @@ def test_restore_success_advances_epoch_and_handles_sidecars(canonical_env, tmp_
         writer.checkpoint_wal()
     finally:
         writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak5")
     # Simulate exclusive-restore stale sidecars beside live.
     Path(str(live) + "-wal").write_bytes(b"stale-wal")
     Path(str(live) + "-shm").write_bytes(b"stale-shm")
-    backup = tmp_path / "bak5.sqlite3"
-    backup_database(live, backup)
-    result = restore_from_backup(backup_db=backup, live_db=live, advance_epoch=True)
+    result = _restore(live, backup, manifest_path)
     assert result["history_epoch"] == 2
+    assert result["previous_live_epoch"] == 1
+    assert result["source_release_sha"] == RELEASE_SHA
     assert not Path(str(live) + "-wal").exists()
     assert not Path(str(live) + "-shm").exists()
     conn = connect(live, read_only=True)
@@ -1006,8 +1123,58 @@ def test_restore_success_advances_epoch_and_handles_sidecars(canonical_env, tmp_
         conn.close()
 
 
+def test_backup_database_produces_self_contained_snapshot(canonical_env, tmp_path):
+    """A published backup must not depend on adjacent WAL/SHM sidecars."""
+    live = canonical_env["db"]
+    writer = CanonicalWriter(live)
+    try:
+        writer.submit(_record_intent(key="rs:sc", identity="EARLY_MOVER:SC"))
+        writer.checkpoint_wal()
+    finally:
+        writer.close()
+    backup = tmp_path / "self-contained.sqlite3"
+    backup_database(live, backup)
+    assert not Path(str(backup) + "-wal").exists()
+    assert not Path(str(backup) + "-shm").exists()
+    validate_canonical_sqlite(backup)
+
+
+def test_restore_rejects_backup_with_ambiguous_sidecars(canonical_env, tmp_path):
+    live = canonical_env["db"]
+    writer = CanonicalWriter(live)
+    try:
+        writer.submit(_record_intent(key="rs:amb", identity="EARLY_MOVER:AMB"))
+        writer.checkpoint_wal()
+    finally:
+        writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak-amb")
+    before = live.read_bytes()
+    Path(str(backup) + "-wal").write_bytes(b"ambiguous-wal")
+
+    with pytest.raises(BackupProvenanceError, match="self-contained"):
+        _restore(live, backup, manifest_path)
+    assert live.read_bytes() == before
+
+
+def test_restore_refuses_unsafe_epoch_opt_out(canonical_env, tmp_path):
+    """The compatibility flag must fail closed, not permit a rollback."""
+    live = canonical_env["db"]
+    writer = CanonicalWriter(live)
+    try:
+        writer.submit(_record_intent(key="rs:opt", identity="EARLY_MOVER:OPT"))
+        writer.checkpoint_wal()
+    finally:
+        writer.close()
+    backup, manifest_path, _ = _verified_backup(live, tmp_path, name="bak-opt")
+    before = live.read_bytes()
+
+    with pytest.raises(BackupProvenanceError, match="advance_epoch=False"):
+        _restore(live, backup, manifest_path, advance_epoch=False)
+    assert live.read_bytes() == before
+
+
 def test_schema_version_mismatch_fail_closed(canonical_env):
-    from app.opip.canonical.schema import SchemaVersionError, connect, initialize_schema
+    from app.opip.canonical.schema import SchemaVersionError, connect
 
     db = canonical_env["db"]
     writer = CanonicalWriter(db)

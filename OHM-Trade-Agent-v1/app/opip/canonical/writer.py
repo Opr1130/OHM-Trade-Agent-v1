@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -17,7 +18,12 @@ from app.opip.canonical.paths import (
     STATE_FAMILY_EARLY_WATCH,
     STREAM_EARLY_WATCH,
 )
-from app.opip.canonical.schema import connect, initialize_schema
+from app.opip.canonical.schema import (
+    CanonicalStoreLock,
+    checkpoint_wal_strict,
+    connect,
+    initialize_schema,
+)
 from app.opip.contracts.events import (
     FEATURE_BUS_EVENT_TYPES,
     FEATURE_BUS_PRIORITY,
@@ -165,14 +171,36 @@ class CanonicalWriter:
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
         self._lock = threading.Lock()
-        self._conn = connect(self.db_path, read_only=False)
-        initialize_schema(self._conn, now_iso=_utc_now())
+        # Exclusivity is acquired before the writable connection is opened, and
+        # held for this writer's entire lifetime, so no second writer and no
+        # restore can own the same canonical store concurrently.
+        self._store_lock = CanonicalStoreLock(self.db_path)
+        self._store_lock.acquire()
+        try:
+            self._conn = connect(self.db_path, read_only=False)
+            initialize_schema(self._conn, now_iso=_utc_now())
+        except Exception:
+            # A partially constructed writer must not leak the connection or
+            # retain ownership, so the next attempt fails on its real cause
+            # instead of a spurious "busy" store.
+            self._close_connection_best_effort()
+            self._store_lock.release()
+            raise
         self._request_lifecycle_projection: dict[str, str] = {}
         self._request_lifecycle_projection_watermark: tuple[int, int] = (0, -1)
         self._role_result_idempotency_by_id: dict[str, str] = {}
         self._role_result_projection_watermark: tuple[int, int] = (0, -1)
         self._hydrate_request_lifecycle_projection()
         self._hydrate_role_result_identity_projection()
+
+    def _close_connection_best_effort(self) -> None:
+        connection = getattr(self, "_conn", None)
+        if connection is None:
+            return
+        # Construction-time cleanup only: the original error must surface, not
+        # be masked by a secondary failure while closing a partial connection.
+        with contextlib.suppress(Exception):
+            connection.close()
 
     def _apply_persisted_request_transition(
         self,
@@ -325,15 +353,27 @@ class CanonicalWriter:
     def close(self) -> None:
         with self._lock:
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            self._conn.close()
+                # Best-effort only: shutdown must not fail on a busy checkpoint.
+                # Callers that need proof of WAL durability use checkpoint_wal().
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+                self._conn.close()
+            finally:
+                self._store_lock.release()
 
     def checkpoint_wal(self) -> None:
-        """Flush WAL into the main DB file (required before atomic file cutover)."""
+        """Flush the WAL into the main DB file and prove the flush completed.
+
+        Required before an atomic file cutover: a plain ``PRAGMA`` can return
+        successfully while frames remain only in the WAL. Raises
+        ``CanonicalCheckpointError`` when the checkpoint is busy, incomplete,
+        unreadable or errored, so the database file alone is never assumed to be
+        a complete snapshot without evidence.
+        """
         with self._lock:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            checkpoint_wal_strict(self._conn)
             self._conn.commit()
 
     def submit(self, intent: WriterIntent) -> WriterAck:
@@ -475,8 +515,23 @@ class CanonicalWriter:
                 )
             return out
 
-    def advance_history_epoch_for_restore(self) -> int:
-        """Required before accepting writes after restoring an older snapshot."""
+    def advance_history_epoch_for_restore(self, minimum_epoch: int | None = None) -> int:
+        """Required before accepting writes after restoring an older snapshot.
+
+        Canonical commit order is ``(history_epoch, local_sequence)`` and must
+        never regress. A live restore therefore passes the epoch the replaced
+        live store had already reached, and the new epoch is
+        ``max(this_snapshot_epoch, minimum_epoch) + 1`` so restored coordinates
+        always dominate everything already published. Omitting ``minimum_epoch``
+        keeps the historical single-snapshot behaviour
+        (``this_snapshot_epoch + 1``).
+
+        Existing event coordinates and stream watermarks are never rewritten;
+        only ``meta`` advances, so restored history stays historically accurate
+        until new events are written under the new epoch.
+        """
+        if minimum_epoch is not None and int(minimum_epoch) < 0:
+            raise ValueError("minimum_epoch must be non-negative")
         now = _utc_now()
         with self._lock:
             try:
@@ -487,7 +542,13 @@ class CanonicalWriter:
                 if meta is None:
                     self._conn.rollback()
                     raise RuntimeError("canonical meta row missing")
-                new_epoch = int(meta["history_epoch"]) + 1
+                current_epoch = int(meta["history_epoch"])
+                floor = (
+                    current_epoch
+                    if minimum_epoch is None
+                    else max(current_epoch, int(minimum_epoch))
+                )
+                new_epoch = floor + 1
                 self._conn.execute(
                     """
                     UPDATE meta
