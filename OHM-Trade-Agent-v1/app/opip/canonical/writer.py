@@ -1071,7 +1071,7 @@ class CanonicalWriter:
     def _validate_paper_outcome_intent(intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
 
-        Same shape as the feature-bus boundary: telemetry-class priority and no
+        Mirrors the feature-bus boundary: telemetry-class priority and no
         ops handoff. The payload itself is validated by the contract module so
         the writer never has to know what makes paper economics well formed.
         """

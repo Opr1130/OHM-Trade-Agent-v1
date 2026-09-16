@@ -33,7 +33,7 @@ EventType = Literal[
     "decision_intelligence.comparison.recorded",
     # PR-A terminal paper outcome authority. Owned by
     # app.opip.contracts.paper_outcome; restated here because the annotation
-    # cannot be computed from that frozenset. Admission is unchanged in shape:
+    # cannot be computed from that frozenset. Admission is unchanged in form:
     # LOW priority, no ops handoff, validated payload.
     "paper_outcome.terminal.recorded",
 ]

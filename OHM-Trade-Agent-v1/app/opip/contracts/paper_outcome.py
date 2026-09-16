@@ -221,7 +221,7 @@ def _validate_economics(payload: Mapping[str, Any], terminal_status: str) -> Non
     """Enforce the economics the simulator is actually allowed to assert.
 
     The three terminal states carry genuinely different truths, so they are not
-    allowed to share a shape:
+    allowed to share one form:
 
     * ``CLOSED``    - realised economics, with net consistent with gross - fees.
     * ``CANCELLED`` - nothing was realised, so every realised figure is zero.
