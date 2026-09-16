@@ -33,6 +33,12 @@ from app.opip.contracts.events import (
     FEATURE_SNAPSHOT_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
+from app.opip.contracts.paper_outcome import (
+    PAPER_OUTCOME_EVENT_TYPES,
+    PAPER_OUTCOME_PRIORITY,
+    PAPER_OUTCOME_STREAM,
+    validate_terminal_outcome_payload,
+)
 from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
     DECISION_INTELLIGENCE_COMPARISON_RECORDED,
@@ -74,6 +80,12 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
         FEATURE_SNAPSHOT_RECORDED,
     }
     | DECISION_INTELLIGENCE_EVENT_TYPES
+    # Paper outcomes join the full-payload conflict set deliberately. They must
+    # never be routed into any volatile-stripping branch below: economic truth
+    # (realised P/L, costs, quantity, prices, quote currency, terminal reason,
+    # strategy/execution provenance) is exactly what makes two otherwise
+    # identical submissions different facts rather than duplicates.
+    | PAPER_OUTCOME_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -142,7 +154,10 @@ ALERT_GOVERNOR_EVENT_TYPES = frozenset(
 )
 
 ACCEPTED_EVENT_TYPES = (
-    ALERT_GOVERNOR_EVENT_TYPES | FEATURE_BUS_EVENT_TYPES | DECISION_INTELLIGENCE_EVENT_TYPES
+    ALERT_GOVERNOR_EVENT_TYPES
+    | FEATURE_BUS_EVENT_TYPES
+    | DECISION_INTELLIGENCE_EVENT_TYPES
+    | PAPER_OUTCOME_EVENT_TYPES
 )
 
 
@@ -1052,6 +1067,20 @@ class CanonicalWriter:
             raise ValueError("feature bus events must not carry ops_handoff")
         return intent.payload
 
+    @staticmethod
+    def _validate_paper_outcome_intent(intent: WriterIntent) -> dict:
+        """Validate terminal paper economic evidence.
+
+        Same shape as the feature-bus boundary: telemetry-class priority and no
+        ops handoff. The payload itself is validated by the contract module so
+        the writer never has to know what makes paper economics well formed.
+        """
+        if intent.priority != PAPER_OUTCOME_PRIORITY:
+            raise ValueError("paper outcome events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError("paper outcome events must not carry ops_handoff")
+        return validate_terminal_outcome_payload(intent.payload)
+
     def _validate_decision_intelligence_intent(
         self, intent: WriterIntent
     ) -> dict:
@@ -1132,6 +1161,8 @@ class CanonicalWriter:
             return self._validate_feature_bus_intent(intent)
         if intent.event_type in DECISION_INTELLIGENCE_EVENT_TYPES:
             return self._validate_decision_intelligence_intent(intent)
+        if intent.event_type in PAPER_OUTCOME_EVENT_TYPES:
+            return self._validate_paper_outcome_intent(intent)
 
         self._validate_alert_ops_intent(intent)
         return intent.payload
@@ -1150,6 +1181,8 @@ class CanonicalWriter:
             return DECISION_INTELLIGENCE_STREAM
         if event_type in FEATURE_BUS_EVENT_TYPES:
             return FEATURE_BUS_STREAM
+        if event_type in PAPER_OUTCOME_EVENT_TYPES:
+            return PAPER_OUTCOME_STREAM
         return STREAM_EARLY_WATCH
 
     @staticmethod
@@ -1158,6 +1191,7 @@ class CanonicalWriter:
             event_type != _ALERT_CAPTURE_GAP_RECORDED
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
+            and event_type not in PAPER_OUTCOME_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(

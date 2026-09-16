@@ -31,6 +31,11 @@ EventType = Literal[
     "decision_intelligence.assessment.recorded",
     "decision_intelligence.invocation.recorded",
     "decision_intelligence.comparison.recorded",
+    # PR-A terminal paper outcome authority. Owned by
+    # app.opip.contracts.paper_outcome; restated here because the annotation
+    # cannot be computed from that frozenset. Admission is unchanged in shape:
+    # LOW priority, no ops handoff, validated payload.
+    "paper_outcome.terminal.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]
