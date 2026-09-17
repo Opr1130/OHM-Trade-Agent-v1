@@ -22,6 +22,14 @@ REPLICA_DIR_NAME_PATTERN='^canonical_learning_replica\.[0-9a-f]{64}$'
 EXPORT_LOG_TAIL_LINES=100
 EXPORT_LOG_MAX_BYTES=20000
 EXPORT_JOURNAL_MAX_LINES=40
+# A healthy export completes well inside one scheduling interval (2m40s), so an
+# observed holder or process older than this is stalled rather than merely busy.
+# 300s matches the production operational export-freshness threshold and the
+# existing MAX_EXPORT_AGE_SECONDS below.
+EXPORT_STALL_THRESHOLD_SECONDS=300
+# Only O'Pip export-specific syslog/journal records are matched. A generic CRON
+# match would return unrelated system jobs.
+EXPORT_JOURNAL_PATTERN='opip-learning-export|export-opip-learning-evidence|opip-learning-export-trigger\.lock'
 MAX_EXPORT_AGE_SECONDS=300
 MAX_SYNC_AGE_SECONDS=720
 MAX_CAPTURE_AGE_SECONDS=900
@@ -33,7 +41,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in date stat awk git docker flock timeout sha256sum grep find sed tail head tr; do
+for cmd in date stat awk git docker flock timeout sha256sum grep find sed tail head tr readlink; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing diagnostics command: $cmd" >&2
     exit 69
@@ -274,11 +282,12 @@ _report_lock_owner() {
         fi
       fi
     fi
-    if [[ -r "/proc/$pid/cmdline" ]]; then
-      command="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')"
+    if [[ -r "/proc/$pid/comm" ]]; then
+      command="$(head -c 64 "/proc/$pid/comm" 2>/dev/null | tr -d '\n' || true)"
     fi
-    if [[ -z "$command" ]] && command -v ps >/dev/null 2>&1; then
-      command="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ -z "$command" && -L "/proc/$pid/exe" ]]; then
+      command="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+      command="${command##*/}"
     fi
   fi
 
@@ -286,7 +295,8 @@ _report_lock_owner() {
   echo "lock_owner_ppid=${ppid:-UNKNOWN}"
   echo "lock_owner_start_time=${start_time:-UNKNOWN}"
   echo "lock_owner_elapsed=${elapsed:-UNKNOWN}"
-  echo "lock_owner_command=${command:-UNKNOWN}"
+  # Bounded identity only: raw argv is deliberately not emitted.
+  echo "lock_owner_comm=${command:-UNKNOWN}"
 }
 
 if [[ -e "$HOST_CYCLE_LOCK" ]]; then
@@ -297,7 +307,7 @@ if [[ -e "$HOST_CYCLE_LOCK" ]]; then
     echo "lock_owner_ppid=NONE"
     echo "lock_owner_start_time=NONE"
     echo "lock_owner_elapsed=NONE"
-    echo "lock_owner_command=NONE"
+    echo "lock_owner_comm=NONE"
     flock -u "$cycle_lock_fd"
   else
     echo "unified_cycle_host_lock=HELD"
@@ -310,7 +320,7 @@ else
   echo "lock_owner_ppid=ABSENT"
   echo "lock_owner_start_time=ABSENT"
   echo "lock_owner_elapsed=ABSENT"
-  echo "lock_owner_command=ABSENT"
+  echo "lock_owner_comm=ABSENT"
 fi
 
 # Learning coverage epoch is learning-worker local. When this diagnose host
@@ -404,7 +414,7 @@ describe_pid() {
   local prefix="$1"
   local pid="$2"
   local ppid="" start_ticks="" btime="" hz="" start_epoch="" elapsed=""
-  local start_time="" command=""
+  local start_time="" comm="" exe=""
   if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]]; then
     ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
     start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
@@ -419,15 +429,70 @@ describe_pid() {
         fi
       fi
     fi
-    if [[ -r "/proc/$pid/cmdline" ]]; then
-      command="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//' || true)"
+    if [[ -r "/proc/$pid/comm" ]]; then
+      comm="$(head -c 64 "/proc/$pid/comm" 2>/dev/null | tr -d '\n' || true)"
+    fi
+    if [[ -L "/proc/$pid/exe" ]]; then
+      # basename only: the directory layout is not diagnostic here.
+      exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+      exe="${exe##*/}"
+      exe="$(printf '%s' "$exe" | head -c 64)"
     fi
   fi
   echo "${prefix}_pid=${pid:-UNKNOWN}"
   echo "${prefix}_ppid=${ppid:-UNKNOWN}"
+  echo "${prefix}_comm=${comm:-UNKNOWN}"
+  echo "${prefix}_exe_basename=${exe:-UNKNOWN}"
   echo "${prefix}_start_time=${start_time:-UNKNOWN}"
   echo "${prefix}_elapsed_seconds=${elapsed:-UNKNOWN}"
-  echo "${prefix}_command=${command:-UNKNOWN}"
+}
+
+
+pid_elapsed_seconds() {
+  # Elapsed seconds for one pid, or empty when it cannot be proven.
+  local pid="$1"
+  local start_ticks btime hz start_epoch
+  [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 0
+  start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+  [[ "$start_ticks" =~ ^[0-9]+$ ]] || return 0
+  btime="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null || true)"
+  hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  [[ "$btime" =~ ^[0-9]+$ && "$hz" =~ ^[0-9]+$ && "$hz" -gt 0 ]] || return 0
+  start_epoch=$((btime + start_ticks / hz))
+  (( start_epoch <= now_epoch )) || return 0
+  printf '%s' "$((now_epoch - start_epoch))"
+}
+
+
+note_stall_evidence() {
+  # Escalate monotonically: NO -> UNKNOWN -> YES.
+  #
+  # An instantaneous observation can never prove a stall on its own. A healthy
+  # export is legitimately in flight for part of every cycle, so presence alone
+  # is not evidence. Only a duration beyond the operational threshold may raise
+  # the verdict, and an unavailable duration yields UNKNOWN rather than YES.
+  local verdict="$1"
+  case "$verdict" in
+    YES) export_lock_stall_suspected="YES" ;;
+    UNKNOWN)
+      if [[ "$export_lock_stall_suspected" == "NO" ]]; then
+        export_lock_stall_suspected="UNKNOWN"
+      fi
+      ;;
+  esac
+}
+
+
+classify_stall_from_elapsed() {
+  # Map an observed duration onto a stall verdict using the explicit threshold.
+  local elapsed="$1"
+  if [[ ! "$elapsed" =~ ^[0-9]+$ ]]; then
+    printf 'UNKNOWN\n'
+  elif (( elapsed > EXPORT_STALL_THRESHOLD_SECONDS )); then
+    printf 'YES\n'
+  else
+    printf 'NO\n'
+  fi
 }
 
 observe_lock_owner() {
@@ -467,17 +532,21 @@ observe_lock_owner() {
     state="NOT_HELD"
   fi
 
-  # A held export lock at diagnostics time is anomalous: export runs are short.
-  # An outer wrapper lock held across cadences, or an internal/publish lock held
-  # long term, is the signature of a stalled or hanging run.
-  if [[ "$state" == "HELD" || "$state" == "OPENED_UNCONFIRMED" ]]; then
-    export_lock_stall_suspected="YES"
-  fi
-
   echo "${prefix}_lock_file=$exists"
   echo "${prefix}_lock_state=$state"
   echo "${prefix}_lock_owner_source=$how"
+  echo "${prefix}_lock_held_instantaneously=$([[ "$state" == "HELD" ]] && echo YES || echo NO)"
   describe_pid "${prefix}_lock_owner" "$pid"
+
+  # Held at the instant of observation is NOT a stall. Only a duration beyond
+  # EXPORT_STALL_THRESHOLD_SECONDS may be called one, and an unprovable duration
+  # is reported UNKNOWN rather than assumed bad.
+  local verdict="NO"
+  if [[ "$state" == "HELD" || "$state" == "OPENED_UNCONFIRMED" ]]; then
+    verdict="$(classify_stall_from_elapsed "$(pid_elapsed_seconds "$pid")")"
+  fi
+  echo "${prefix}_lock_stall_verdict=$verdict"
+  note_stall_evidence "$verdict"
 }
 
 emit_export_entries() {
@@ -574,13 +643,31 @@ else
   echo "export_cron_matches_release=UNKNOWN"
 fi
 
-# 1C - export log metadata and a bounded, redacted, classified tail.
+# 1C - export log metadata, lifetime counters, and post-manifest evidence.
+#
+# Two distinct things are reported and must not be conflated:
+#
+#   * lifetime counters - descriptive totals across the whole log;
+#   * post-manifest evidence - only events whose own log-line timestamp proves
+#     they occurred after the committed exported_at_utc.
+#
+# The exporter's echoed lines carry no timestamp (the cron wrapper appends them
+# with a plain `>>` redirect), so on the current contract post-manifest event
+# attribution is UNPROVABLE. File mtime is NOT a substitute for event time: it
+# proves only that *something* was written, never which events. When no line
+# carries a parseable timestamp the classification says so rather than inferring
+# chronology, and the active incident is diagnosed from lock/process evidence.
 export_log_exists="NO"
 export_log_activity_class="UNKNOWN"
-export_log_skip_count="0"
-export_log_success_count="0"
-export_log_bundle_ok_count="0"
-export_log_failure_count="0"
+export_log_lifetime_skip_count="0"
+export_log_lifetime_success_count="0"
+export_log_lifetime_bundle_ok_count="0"
+export_log_lifetime_failure_count="0"
+export_log_timestamp_semantics="UNKNOWN"
+export_log_post_manifest_skip_count="0"
+export_log_post_manifest_success_count="0"
+export_log_post_manifest_failure_count="0"
+export_log_post_manifest_evidence="UNKNOWN"
 if [[ -f "$EXPORT_LOG" ]]; then
   export_log_exists="YES"
   log_meta="$(stat -c '%U|%G|%a|%s|%Y' "$EXPORT_LOG" 2>/dev/null || true)"
@@ -589,45 +676,89 @@ if [[ -f "$EXPORT_LOG" ]]; then
   echo "export_log_group=${log_group:-UNKNOWN}"
   echo "export_log_mode=${log_mode:-UNKNOWN}"
   echo "export_log_size_bytes=${log_size:-UNKNOWN}"
+  # Reported as descriptive file metadata only; never used for event attribution.
   echo "export_log_mtime_utc=$(date -u -d "@${log_mtime:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
   [[ "$log_mtime" =~ ^[0-9]+$ ]] || log_mtime=""
   [[ "$log_size" =~ ^[0-9]+$ ]] || log_size=""
 
-  export_log_skip_count="$(grep -c 'already active; skipping' "$EXPORT_LOG" 2>/dev/null || true)"
-  export_log_success_count="$(grep -c "learning evidence export: OK" "$EXPORT_LOG" 2>/dev/null || true)"
-  export_log_bundle_ok_count="$(grep -c 'canonical replica bundle OK' "$EXPORT_LOG" 2>/dev/null || true)"
-  export_log_failure_count="$(grep -cE 'canonical replica export FAILED|canonical replica FAILED|replica collision|Traceback|Permission denied' "$EXPORT_LOG" 2>/dev/null || true)"
-  for counter in export_log_skip_count export_log_success_count export_log_bundle_ok_count export_log_failure_count; do
+  export_log_lifetime_skip_count="$(grep -c 'already active; skipping' "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_lifetime_success_count="$(grep -c "learning evidence export: OK" "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_lifetime_bundle_ok_count="$(grep -c 'canonical replica bundle OK' "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_lifetime_failure_count="$(grep -cE 'canonical replica export FAILED|canonical replica FAILED|replica collision|Traceback|Permission denied' "$EXPORT_LOG" 2>/dev/null || true)"
+  for counter in export_log_lifetime_skip_count export_log_lifetime_success_count export_log_lifetime_bundle_ok_count export_log_lifetime_failure_count; do
     [[ "${!counter}" =~ ^[0-9]+$ ]] || printf -v "$counter" '%s' 0
   done
-  echo "export_log_skip_count=$export_log_skip_count"
-  echo "export_log_success_count=$export_log_success_count"
-  echo "export_log_bundle_ok_count=$export_log_bundle_ok_count"
-  echo "export_log_failure_count=$export_log_failure_count"
+  echo "export_log_lifetime_skip_count=$export_log_lifetime_skip_count"
+  echo "export_log_lifetime_success_count=$export_log_lifetime_success_count"
+  echo "export_log_lifetime_bundle_ok_count=$export_log_lifetime_bundle_ok_count"
+  echo "export_log_lifetime_failure_count=$export_log_lifetime_failure_count"
 
-  if [[ -z "$manifest_epoch" || -z "$log_mtime" ]]; then
-    export_log_activity_class="UNKNOWN"
-  elif (( log_mtime <= manifest_epoch )); then
-    export_log_activity_class="NO_POST_MANIFEST_LOG_ACTIVITY"
-  elif (( export_log_failure_count > 0 )); then
-    export_log_activity_class="POST_MANIFEST_RUNS_FAIL"
-  elif (( export_log_skip_count > 0 )); then
-    export_log_activity_class="POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
-  elif (( export_log_success_count > 0 )); then
-    export_log_activity_class="POST_MANIFEST_RUNS_SUCCEED"
+  # Scan a bounded tail for lines that carry their own ISO-8601 instant. The
+  # tail is bounded so this stays cheap on a very large log, and it is streamed
+  # directly: no temporary file is created, and the log is only ever read.
+  export_log_timestamped_line_count=0
+  export_log_post_manifest_timestamped_count=0
+  if [[ -n "$manifest_epoch" ]]; then
+    while IFS= read -r log_line; do
+      line_stamp="${log_line%% *}"
+      case "$line_stamp" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*)
+          line_epoch="$(date -u -d "${line_stamp%%.*}" +%s 2>/dev/null || true)"
+          [[ "$line_epoch" =~ ^[0-9]+$ ]] || continue
+          export_log_timestamped_line_count=$((export_log_timestamped_line_count + 1))
+          if (( line_epoch > manifest_epoch )); then
+            export_log_post_manifest_timestamped_count=$((export_log_post_manifest_timestamped_count + 1))
+            case "$log_line" in
+              *"already active; skipping"*)
+                export_log_post_manifest_skip_count=$((export_log_post_manifest_skip_count + 1)) ;;
+              *"canonical replica export FAILED"* | *"replica collision"* | *Traceback* | *"Permission denied"*)
+                export_log_post_manifest_failure_count=$((export_log_post_manifest_failure_count + 1)) ;;
+              *"learning evidence export: OK"*)
+                export_log_post_manifest_success_count=$((export_log_post_manifest_success_count + 1)) ;;
+            esac
+          fi
+          ;;
+      esac
+    done < <(tail -n "$EXPORT_LOG_TAIL_LINES" "$EXPORT_LOG" 2>/dev/null \
+      | head -c "$EXPORT_LOG_MAX_BYTES" || true)
+  fi
+
+  echo "export_log_tail_lines_scanned=$EXPORT_LOG_TAIL_LINES"
+  echo "export_log_timestamped_line_count=$export_log_timestamped_line_count"
+  echo "export_log_post_manifest_timestamped_count=$export_log_post_manifest_timestamped_count"
+  echo "export_log_post_manifest_skip_count=$export_log_post_manifest_skip_count"
+  echo "export_log_post_manifest_success_count=$export_log_post_manifest_success_count"
+  echo "export_log_post_manifest_failure_count=$export_log_post_manifest_failure_count"
+
+  if (( export_log_timestamped_line_count > 0 )); then
+    export_log_timestamp_semantics="TIMESTAMPED"
   else
-    export_log_activity_class="POST_MANIFEST_ACTIVITY_UNCLASSIFIED"
+    export_log_timestamp_semantics="UNTIMESTAMPED"
+  fi
+  echo "export_log_timestamp_semantics=$export_log_timestamp_semantics"
+
+  # Classification is driven ONLY by proven post-manifest events.
+  if (( export_log_timestamped_line_count == 0 )); then
+    export_log_activity_class="UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
+    export_log_post_manifest_evidence="UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
+  elif (( export_log_post_manifest_timestamped_count == 0 )); then
+    export_log_activity_class="NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
+    export_log_post_manifest_evidence="NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
+  elif (( export_log_post_manifest_failure_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_FAIL"
+    export_log_post_manifest_evidence="PROVEN"
+  elif (( export_log_post_manifest_skip_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
+    export_log_post_manifest_evidence="PROVEN"
+  elif (( export_log_post_manifest_success_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_SUCCEED"
+    export_log_post_manifest_evidence="PROVEN"
+  else
+    export_log_activity_class="POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED"
+    export_log_post_manifest_evidence="PROVEN"
   fi
   echo "export_log_activity_class=$export_log_activity_class"
-  if [[ -n "$manifest_epoch" && -n "$log_mtime" ]]; then
-    if (( manifest_epoch > log_mtime )); then
-      echo "export_manifest_newer_than_log=YES"
-    else
-      echo "export_manifest_newer_than_log=NO"
-    fi
-  else
-    echo "export_manifest_newer_than_log=UNKNOWN"
-  fi
+  echo "export_log_post_manifest_evidence=$export_log_post_manifest_evidence"
   echo "export_log_tail_lines_requested=$EXPORT_LOG_TAIL_LINES"
   echo "export_log_tail_bytes_limit=$EXPORT_LOG_MAX_BYTES"
   echo "OPIP_EXPORT_LOG_TAIL"
@@ -646,25 +777,38 @@ observe_lock_owner "internal_export" "$EXPORT_INTERNAL_LOCK"
 observe_lock_owner "publish" "$EXPORT_PUBLISH_LOCK"
 
 export_process_count="0"
+export_process_present="NO"
+export_process_max_elapsed_seconds="UNKNOWN"
 export_processes=""
 if command -v pgrep >/dev/null 2>&1; then
-  export_process_count="$(pgrep -fc 'export-opip-learning-evidence.sh|opip-learning-export|canonical_replica export' 2>/dev/null || true)"
+  export_process_count="$(pgrep -fc "$EXPORT_JOURNAL_PATTERN" 2>/dev/null || true)"
   [[ "$export_process_count" =~ ^[0-9]+$ ]] || export_process_count=0
   while IFS= read -r live_pid; do
     [[ -n "$live_pid" ]] || continue
-    live_elapsed=""
-    live_command=""
-    if command -v ps >/dev/null 2>&1; then
-      live_elapsed="$(ps -o etimes= -p "$live_pid" 2>/dev/null | tr -d ' ' || true)"
-      live_command="$(ps -o args= -p "$live_pid" 2>/dev/null | head -c 240 | tr '\n' ' ' || true)"
+    # Safe metadata only: never raw argv. Identity and duration are sufficient to
+    # recognise a stalled run, and command lines can carry credentials.
+    live_elapsed="$(pid_elapsed_seconds "$live_pid")"
+    live_comm=""
+    [[ -r "/proc/$live_pid/comm" ]] \
+      && live_comm="$(head -c 64 "/proc/$live_pid/comm" 2>/dev/null | tr -d '\n' || true)"
+    if [[ "$live_elapsed" =~ ^[0-9]+$ ]]; then
+      if [[ ! "$export_process_max_elapsed_seconds" =~ ^[0-9]+$ ]] \
+        || (( live_elapsed > export_process_max_elapsed_seconds )); then
+        export_process_max_elapsed_seconds="$live_elapsed"
+      fi
     fi
-    export_processes="${export_processes}${export_processes:+,}${live_pid}@${live_elapsed:-?}@${live_command}"
-  done < <(pgrep -f 'export-opip-learning-evidence.sh|opip-learning-export|canonical_replica export' 2>/dev/null || true)
+    export_processes="${export_processes}${export_processes:+,}${live_pid}@${live_elapsed:-?}@${live_comm:-UNKNOWN}"
+  done < <(pgrep -f "$EXPORT_JOURNAL_PATTERN" 2>/dev/null || true)
 fi
 echo "export_process_count=$export_process_count"
+echo "export_process_present=$([[ "$export_process_count" != "0" ]] && echo YES || echo NO)"
+echo "export_process_max_elapsed_seconds=$export_process_max_elapsed_seconds"
 echo "export_processes=${export_processes:-NONE}"
+# Presence is not a stall. Only a duration past the threshold may raise the
+# verdict; if the exporter is present but its age cannot be proven, the verdict
+# is UNKNOWN rather than YES.
 if [[ "$export_process_count" != "0" ]]; then
-  export_lock_stall_suspected="YES"
+  note_stall_evidence "$(classify_stall_from_elapsed "$export_process_max_elapsed_seconds")"
 fi
 
 # 1E - committed export state, the referenced replica directory and the inner
@@ -805,37 +949,50 @@ else
 fi
 
 # Journal / syslog evidence that the daemon is actually invoking the job.
+#
+# Only O'Pip export-specific records are matched. A generic CRON match would pull
+# in unrelated system jobs, and journal lines embed the full command line, so no
+# raw line is emitted: only bounded counts and a boolean are reported.
 export_journal_source="UNAVAILABLE"
 export_journal_matched_lines="UNKNOWN"
-export_journal_last_line="NONE"
+export_journal_export_records_seen="UNKNOWN"
 journal_raw=""
 if command -v journalctl >/dev/null 2>&1; then
   journal_raw="$(journalctl --since '2 hours ago' --no-pager -n 500 2>/dev/null \
-    | grep -Ei 'opip-learning-export|export-opip-learning-evidence|CRON' \
+    | grep -Ei "$EXPORT_JOURNAL_PATTERN" \
     | tail -n "$EXPORT_JOURNAL_MAX_LINES" || true)"
   [[ -n "$journal_raw" ]] && export_journal_source="JOURNALCTL"
 fi
 if [[ "$export_journal_source" == "UNAVAILABLE" && -f /var/log/syslog ]]; then
   journal_raw="$(tail -n 2000 /var/log/syslog 2>/dev/null \
-    | grep -Ei 'opip-learning-export|export-opip-learning-evidence|CRON' \
+    | grep -Ei "$EXPORT_JOURNAL_PATTERN" \
     | tail -n "$EXPORT_JOURNAL_MAX_LINES" || true)"
   [[ -n "$journal_raw" ]] && export_journal_source="SYSLOG"
 fi
 if [[ "$export_journal_source" != "UNAVAILABLE" ]]; then
   export_journal_matched_lines="$(printf '%s\n' "$journal_raw" | grep -c '[^[:space:]]' || true)"
   [[ "$export_journal_matched_lines" =~ ^[0-9]+$ ]] || export_journal_matched_lines="UNKNOWN"
-  export_journal_last_line="$(printf '%s\n' "$journal_raw" | grep '[^[:space:]]' | tail -n 1 | head -c 300 | redact_export_secrets || true)"
+  if [[ "$export_journal_matched_lines" =~ ^[0-9]+$ ]] && (( export_journal_matched_lines > 0 )); then
+    export_journal_export_records_seen="YES"
+  else
+    export_journal_export_records_seen="NO"
+  fi
 fi
 echo "export_journal_source=$export_journal_source"
+echo "export_journal_pattern_scoped=YES"
 echo "export_journal_matched_lines=$export_journal_matched_lines"
-echo "export_journal_last_line=${export_journal_last_line:-NONE}"
+echo "export_journal_export_records_seen=$export_journal_export_records_seen"
 
+echo "export_stall_threshold_seconds=$EXPORT_STALL_THRESHOLD_SECONDS"
 echo "export_lock_stall_suspected=$export_lock_stall_suspected"
 if [[ "$export_lock_stall_suspected" == "YES" ]]; then
   degrade
 fi
+# Only PROVEN post-manifest failure or lock-skipping degrades. An untimestamped
+# log cannot support event attribution, so it is reported as unprovable rather
+# than treated as evidence of a fault.
 case "$export_log_activity_class" in
-  POST_MANIFEST_RUNS_FAIL | POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD | POST_MANIFEST_ACTIVITY_UNCLASSIFIED)
+  POST_MANIFEST_RUNS_FAIL | POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD | POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED)
     degrade
     ;;
 esac

@@ -143,8 +143,9 @@ def test_block_reports_cron_metadata_and_release_artifact_identity():
         "export_cron_job_line=",
         "export_cron_matches_release=",
         "export_journal_source=",
+        "export_journal_pattern_scoped=",
         "export_journal_matched_lines=",
-        "export_journal_last_line=",
+        "export_journal_export_records_seen=",
     ):
         assert field in block
 
@@ -167,14 +168,17 @@ def test_block_reports_all_three_export_locks():
         "${prefix}_lock_file=",
         "${prefix}_lock_state=",
         "${prefix}_lock_owner_source=",
+        "${prefix}_lock_held_instantaneously=",
+        "${prefix}_lock_stall_verdict=",
     ):
         assert template in block
     for template in (
         "${prefix}_pid=",
         "${prefix}_ppid=",
+        "${prefix}_comm=",
+        "${prefix}_exe_basename=",
         "${prefix}_start_time=",
         "${prefix}_elapsed_seconds=",
-        "${prefix}_command=",
     ):
         assert template in block
     # Holder discovery must come from kernel-reported state.
@@ -190,17 +194,36 @@ def test_block_reports_committed_state_log_classification_and_orphans():
         "export_log_size_bytes=",
         "export_log_mtime_utc=",
         "export_log_activity_class=",
-        "export_log_skip_count=",
-        "export_log_success_count=",
-        "export_log_bundle_ok_count=",
-        "export_log_failure_count=",
+        "export_log_timestamp_semantics=",
+        "export_log_post_manifest_evidence=",
+        "export_log_lifetime_skip_count=",
+        "export_log_lifetime_success_count=",
+        "export_log_lifetime_bundle_ok_count=",
+        "export_log_lifetime_failure_count=",
+        "export_log_post_manifest_skip_count=",
+        "export_log_post_manifest_success_count=",
+        "export_log_post_manifest_failure_count=",
+        "export_log_post_manifest_timestamped_count=",
         "export_process_count=",
+        "export_process_present=",
+        "export_process_max_elapsed_seconds=",
         "export_processes=",
         "export_committed_after_release_receipt=",
         "release_receipt_sha=",
         "release_receipt_mtime_utc=",
     ):
         assert field in block
+    # Every classification the block can emit, including the honest
+    # "cannot attribute events" outcome for an untimestamped log.
+    for classification in (
+        "UNPROVABLE_FROM_UNTIMESTAMPED_LOG",
+        "NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE",
+        "POST_MANIFEST_RUNS_FAIL",
+        "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD",
+        "POST_MANIFEST_RUNS_SUCCEED",
+        "POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED",
+    ):
+        assert classification in block
     # Orphan inventory is emitted through one bounded shared printer.
     for prefix, pattern in (
         ("replica_staging", ".canonical_learning_replica.staging.*"),
@@ -210,13 +233,116 @@ def test_block_reports_committed_state_log_classification_and_orphans():
         assert f'emit_export_entries "{prefix}" "{pattern}"' in block
     assert "${prefix}_count=" in block
     assert "${prefix}_entries=" in block
-    for classification in (
-        "NO_POST_MANIFEST_LOG_ACTIVITY",
-        "POST_MANIFEST_RUNS_FAIL",
-        "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD",
-        "POST_MANIFEST_RUNS_SUCCEED",
+
+
+def test_post_manifest_classification_is_time_scoped_not_lifetime():
+    """Lifetime totals must never be used to attribute post-manifest events.
+
+    The regression this guards: counting occurrences across the whole log and
+    then reading them as post-manifest evidence whenever the file mtime is newer
+    than the manifest. Historical failures or skips would contaminate the
+    diagnosis.
+    """
+    block = _block()
+    # The classification decision must read the post-manifest, timestamp-scoped
+    # counters, never the lifetime ones.
+    decision = block[block.index("if (( export_log_timestamped_line_count == 0 ))") :]
+    decision = decision[: decision.index("echo \"export_log_activity_class=")]
+    for scoped in (
+        "export_log_post_manifest_failure_count",
+        "export_log_post_manifest_skip_count",
+        "export_log_post_manifest_success_count",
     ):
-        assert classification in block
+        assert scoped in decision
+    for lifetime in (
+        "export_log_lifetime_failure_count",
+        "export_log_lifetime_skip_count",
+        "export_log_lifetime_success_count",
+    ):
+        assert lifetime not in decision
+    # File mtime may be reported but must not drive the classification.
+    assert "log_mtime" not in decision
+    # Event time comes from each line's own timestamp, never from the file mtime.
+    assert "${log_line%% *}" in block
+    assert "line_epoch > manifest_epoch" in block
+
+
+def test_journal_filter_is_opip_specific():
+    """Generic CRON matches would return unrelated system jobs."""
+    script = _script()
+    block = _block()
+    # The match pattern is O'Pip export-specific and holds no bare CRON token.
+    assert "EXPORT_JOURNAL_PATTERN=" in script
+    pattern_line = next(
+        line for line in script.splitlines() if line.startswith("EXPORT_JOURNAL_PATTERN=")
+    )
+    assert "opip-learning-export" in pattern_line
+    assert "export-opip-learning-evidence" in pattern_line
+    assert "opip-learning-export-trigger" in pattern_line
+    assert not re.search(r"\|CRON", pattern_line)
+    # Both probes use the scoped pattern.
+    assert 'grep -Ei "$EXPORT_JOURNAL_PATTERN"' in block
+    assert block.count('grep -Ei "$EXPORT_JOURNAL_PATTERN"') == 2
+    # No raw journal line is emitted: counts and a boolean only.
+    assert "export_journal_last_line" not in block
+    assert "export_journal_matched_lines=" in block
+    assert "export_journal_export_records_seen=" in block
+    assert "export_journal_pattern_scoped=YES" in block
+
+
+def test_block_emits_no_raw_argv_or_environment():
+    """Process reporting must be bounded identity, never a command line."""
+    block = _block()
+    for forbidden in (
+        "/proc/$pid/cmdline",
+        "cmdline",
+        "ps -o args",
+        "ps -p ",
+        "_command=",
+        "printenv",
+        "os.environ",
+    ):
+        assert forbidden not in block, f"block must not emit raw argv: {forbidden}"
+    # The safe replacements are present instead.
+    assert "/proc/$pid/comm" in block
+    assert "/proc/$pid/exe" in block
+    assert "${prefix}_comm=" in block
+    assert "${prefix}_exe_basename=" in block
+
+
+def test_diagnostics_emits_no_raw_argv_anywhere():
+    """The whole helper, not just the new block, must stay argv-free."""
+    script = _script()
+    assert "cmdline" not in script
+    assert "ps -o args" not in script
+    assert "_command=" not in script
+    assert "lock_owner_comm=" in script
+
+
+def test_stall_requires_a_duration_beyond_the_threshold():
+    """Instantaneous lock presence or process presence is not a stall."""
+    script = _script()
+    block = _block()
+    assert "EXPORT_STALL_THRESHOLD_SECONDS=300" in script
+    assert "EXPORT_STALL_THRESHOLD_SECONDS" in block
+    assert "classify_stall_from_elapsed" in block
+    assert "note_stall_evidence" in block
+    assert "export_stall_threshold_seconds=" in block
+    # The verdict function needs elapsed > threshold, and reports UNKNOWN when
+    # elapsed is unavailable.
+    classifier = block[block.index("classify_stall_from_elapsed() {") :]
+    classifier = classifier[: classifier.index("\n}", classifier.index("printf 'UNKNOWN"))]
+    assert "elapsed > EXPORT_STALL_THRESHOLD_SECONDS" in classifier
+    assert "UNKNOWN" in classifier
+    # Presence alone must never set the verdict, and ownership must not either.
+    assert 'export_lock_stall_suspected="YES"' in block
+    stall_assignments = [
+        line for line in block.splitlines()
+        if 'export_lock_stall_suspected="YES"' in line
+    ]
+    assert len(stall_assignments) == 1
+    # That single assignment lives inside the monotonic escalation helper.
+    assert 'YES) export_lock_stall_suspected="YES" ;;' in block
 
 
 def test_block_is_bounded_and_redacted():
@@ -253,6 +379,7 @@ def test_block_performs_no_mutation_or_signalling():
         "touch ",
         "truncate",
         "install -d",
+        "mktemp",
         "systemctl restart",
         "systemctl stop",
         "systemctl start",
@@ -266,6 +393,18 @@ def test_block_performs_no_mutation_or_signalling():
         "crontab",
     ):
         assert forbidden not in block, f"block must not contain: {forbidden}"
+
+
+def test_block_writes_no_file():
+    """No redirection into any path: the block is read-only in both directions."""
+    block = _block()
+    # `>` and `>>` are only legitimate inside arithmetic comparisons.
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "((" in stripped:
+            continue
+        assert not re.search(r">>?\s*[\"$]", line), line
+        assert not re.search(r">>?\s*\S*\.(log|tmp|env)", line), line
 
 
 def test_block_does_not_open_or_write_any_path():
@@ -350,20 +489,10 @@ REPLICA_NAME = "canonical_learning_replica." + "a" * 64
 
 
 def _fixture(tmp_path: Path, *, replica_dir_name: str = REPLICA_NAME) -> dict:
+    """Build on-disk fixture state and return the paths the block reads."""
     export_root = tmp_path / "export"
     export_root.mkdir()
     manifest = export_root / "manifest.env"
-    manifest.write_text(
-        "schema_version=4\n"
-        "exported_at_utc=2026-09-17T19:00:47Z\n"
-        f"production_deployed_sha={SHA}\n"
-        "p1_shadow_outbox_retired=1\n"
-        "canonical_learning_replica_version=1\n"
-        f"canonical_learning_replica_dir={replica_dir_name}\n"
-        "canonical_learning_replica_bytes=123456\n"
-        "canonical_learning_replica_sha256=" + "b" * 64 + "\n",
-        encoding="utf-8",
-    )
     replica = export_root / replica_dir_name
     if replica_dir_name == REPLICA_NAME:
         replica.mkdir()
@@ -390,6 +519,7 @@ def _fixture(tmp_path: Path, *, replica_dir_name: str = REPLICA_NAME) -> dict:
     return {
         "export_root": export_root,
         "manifest": manifest,
+        "replica_dir_name": replica_dir_name,
         "log": log_path,
         "receipt": receipt,
         "cron": cron,
@@ -400,7 +530,31 @@ def _fixture(tmp_path: Path, *, replica_dir_name: str = REPLICA_NAME) -> dict:
     }
 
 
+def _write_manifest(fx: dict, exported_at: str) -> None:
+    """Write the committed manifest with a chosen exported_at_utc."""
+    replica_dir_name = fx["replica_dir_name"]
+    fx["manifest"].write_text(
+        "schema_version=4\n"
+        f"exported_at_utc={exported_at}\n"
+        f"production_deployed_sha={SHA}\n"
+        "p1_shadow_outbox_retired=1\n"
+        "canonical_learning_replica_version=1\n"
+        f"canonical_learning_replica_dir={replica_dir_name}\n"
+        "canonical_learning_replica_bytes=123456\n"
+        "canonical_learning_replica_sha256=" + "b" * 64 + "\n",
+        encoding="utf-8",
+    )
+
+
 def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
+    """Set ALL fixture state, then execute the block.
+
+    Ordering matters: the manifest's exported_at_utc must be on disk *before*
+    the subprocess runs, otherwise the timestamp under test cannot influence the
+    behaviour being asserted. The block's own echoed exported_at_utc is returned
+    so a test can prove which value it actually observed.
+    """
+    _write_manifest(fx, exported_at)
     prelude = PRELUDE + "\n".join(
         [
             f'current_sha="{SHA}"',
@@ -418,6 +572,9 @@ def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
             "EXPORT_LOG_TAIL_LINES=100",
             "EXPORT_LOG_MAX_BYTES=20000",
             "EXPORT_JOURNAL_MAX_LINES=40",
+            "EXPORT_STALL_THRESHOLD_SECONDS=300",
+            "EXPORT_JOURNAL_PATTERN="
+            "'opip-learning-export|export-opip-learning-evidence|opip-learning-export-trigger\\.lock'",
             "",
         ]
     )
@@ -432,18 +589,152 @@ def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
         if "=" in line and " " not in line.split("=", 1)[0]:
             key, _, value = line.partition("=")
             fields[key] = value
-    # Keep the manifest's own exported_at consistent with the expectation.
-    manifest = fx["manifest"].read_text(encoding="utf-8")
-    fx["manifest"].write_text(
-        re.sub(r"exported_at_utc=\S+", f"exported_at_utc={exported_at}", manifest),
-        encoding="utf-8",
-    )
     return fields
 
 
 pytestmark_posix = pytest.mark.skipif(
     os.name == "nt", reason="POSIX-only: needs flock/lslocks//proc and a normal fork"
 )
+
+
+@pytestmark_posix
+def test_fixture_timestamp_is_written_before_execution(tmp_path):
+    """Finding: the manifest timestamp must exist before the block runs.
+
+    Proven through the block's own output rather than by inspecting the harness:
+    the block echoes the exported_at it read, so this fails if the manifest write
+    is moved after subprocess.run().
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["exported_at_utc"] == "2026-09-17T19:00:47Z"
+
+    # A second run with a different timestamp must observe the new value, proving
+    # the manifest is written per-run and before execution.
+    fields2 = _run_block(tmp_path, fx, "2026-09-17T21:15:00Z")
+    assert fields2["exported_at_utc"] == "2026-09-17T21:15:00Z"
+
+
+@pytestmark_posix
+def test_untimestamped_log_is_never_called_post_manifest(tmp_path):
+    """Production reality: the exporter's echoed lines carry no timestamp.
+
+    The same untimestamped log must never be attributed to a post-manifest
+    window, whatever the manifest timestamp is - not even when the log file's
+    mtime is newer, and not even when it contains failure or skip text.
+    """
+    log_lines = "\n".join(
+        ["O'Pip learning evidence export: OK"]
+        + ["O'Pip learning export already active; skipping"] * 9
+        + ["O'Pip learning export: canonical replica export FAILED (rc=3)"]
+    )
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(log_lines + "\n", encoding="utf-8")
+
+    for exported_at in ("2026-09-17T19:00:47Z", "1999-01-01T00:00:00Z"):
+        fields = _run_block(tmp_path, fx, exported_at)
+        assert fields["export_log_timestamp_semantics"] == "UNTIMESTAMPED"
+        assert fields["export_log_activity_class"] == "UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
+        assert (
+            fields["export_log_post_manifest_evidence"]
+            == "UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
+        )
+        # Lifetime counters remain descriptive.
+        assert fields["export_log_lifetime_skip_count"] == "9"
+        assert fields["export_log_lifetime_failure_count"] == "1"
+        # No event was attributed to the post-manifest window.
+        assert fields["export_log_post_manifest_timestamped_count"] == "0"
+        assert fields["export_log_post_manifest_skip_count"] == "0"
+        assert fields["export_log_post_manifest_failure_count"] == "0"
+
+
+@pytestmark_posix
+def test_timestamped_log_discriminates_post_manifest_events(tmp_path):
+    """Discrimination: identical log, different manifest timestamp.
+
+    This is the assertion that fails if the manifest timestamp does not affect
+    the run - a stale or post-execution write would make both cases identical.
+    """
+    older = "2026-09-17T18:00:00Z"
+    newer = "2026-09-17T20:00:00Z"
+    log_lines = (
+        "2026-09-17T18:30:00Z O'Pip learning export already active; skipping\n"
+        "2026-09-17T19:30:00Z O'Pip learning export already active; skipping\n"
+    )
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(log_lines, encoding="utf-8")
+
+    # Manifest committed before both events: both are post-manifest skips.
+    fields_old = _run_block(tmp_path, fx, older)
+    assert fields_old["export_log_timestamp_semantics"] == "TIMESTAMPED"
+    assert fields_old["export_log_timestamped_line_count"] == "2"
+    assert fields_old["export_log_post_manifest_timestamped_count"] == "2"
+    assert fields_old["export_log_post_manifest_skip_count"] == "2"
+    assert fields_old["export_log_activity_class"] == "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
+    assert fields_old["export_log_post_manifest_evidence"] == "PROVEN"
+
+    # Manifest committed after both events: neither is post-manifest.
+    fields_new = _run_block(tmp_path, fx, newer)
+    assert fields_new["export_log_timestamped_line_count"] == "2"
+    assert fields_new["export_log_post_manifest_timestamped_count"] == "0"
+    assert fields_new["export_log_post_manifest_skip_count"] == "0"
+    assert (
+        fields_new["export_log_activity_class"]
+        == "NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
+    )
+    # Same lifetime totals both times: only the time scoping differs.
+    assert fields_old["export_log_lifetime_skip_count"] == "2"
+    assert fields_new["export_log_lifetime_skip_count"] == "2"
+    # And the two runs genuinely differ, so the timestamp is not inert.
+    assert (
+        fields_old["export_log_activity_class"] != fields_new["export_log_activity_class"]
+    )
+
+
+@pytestmark_posix
+def test_timestamped_log_proves_a_post_manifest_success(tmp_path):
+    """A proven post-manifest success is classified as such."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z O'Pip learning export: canonical replica bundle OK bytes=1\n"
+        "2026-09-17T19:05:00Z O'Pip learning evidence export: OK\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_SUCCEED"
+    assert fields["export_log_post_manifest_success_count"] == "1"
+    assert fields["export_log_lifetime_success_count"] == "2"
+
+
+@pytestmark_posix
+def test_healthy_export_progress_is_not_reported_as_a_stall(tmp_path):
+    """A normal in-flight export must not be called a stall.
+
+    The block is run while this test process holds a lock, which is exactly the
+    "instantaneous presence" shape. Because the holder's age is far below the
+    threshold, the verdict must be NO.
+    """
+    import fcntl
+
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    holder = open(fx["internal"], "w")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    try:
+        fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+        # The lock IS held at the instant of observation...
+        assert fields["internal_export_lock_file"] == "EXISTS"
+        assert fields["internal_export_lock_state"] in {"HELD", "OPENED_UNCONFIRMED"}
+        assert fields["internal_export_lock_held_instantaneously"] == "YES"
+        assert fields["internal_export_lock_owner_pid"] == str(os.getpid())
+        # ...but this process is young, so it is not a stall.
+        assert fields["internal_export_lock_stall_verdict"] == "NO"
+        assert fields["export_lock_stall_suspected"] == "NO"
+        assert fields["export_stall_threshold_seconds"] == "300"
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
 
 
 @pytestmark_posix
@@ -460,12 +751,11 @@ def test_block_classifies_frozen_export_with_lock_skip_spam(tmp_path):
     )
     fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
 
-    # The log mtime is after the manifest, and every post-manifest run skipped on
-    # the internal lock: that is a lock stall, not a scheduler problem.
-    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
-    assert fields["export_log_skip_count"] == "9"
-    assert fields["export_lock_stall_suspected"] == "YES"
-    assert fields["FINAL_STATUS"] == "DEGRADED"
+    # The log carries no timestamps, so no post-manifest event attribution is
+    # claimed; the frozen state is reported through metadata and counts instead.
+    assert fields["export_log_activity_class"] == "UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
+    assert fields["export_log_lifetime_skip_count"] == "9"
+    assert fields["FINAL_STATUS"] == "DEGRADED"  # export committed before the receipt
     # Replica provenance is reported without recomputing any content.
     assert fields["replica_dir_name_valid"] == "YES"
     assert fields["replica_dir_exists"] == "YES"
@@ -476,33 +766,22 @@ def test_block_classifies_frozen_export_with_lock_skip_spam(tmp_path):
     assert fields["replica_staging_count"] == "1"
     assert fields["manifest_tmp_count"] == "1"
     assert fields["export_cron_matches_release"] == "YES"
-
-
-@pytestmark_posix
-def test_block_classifies_healthy_exporter_progress(tmp_path):
-    fx = _fixture(tmp_path)
-    fx["log"].write_text(
-        "O'Pip learning export: canonical replica bundle OK bytes=123456\n"
-        "O'Pip learning evidence export: OK\n",
-        encoding="utf-8",
-    )
-    fields = _run_block(tmp_path, fx, "2026-09-17T23:59:00Z")
-    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_SUCCEED"
-    assert fields["export_log_skip_count"] == "0"
-    assert fields["export_log_bundle_ok_count"] == "1"
+    # No process of this name is running, so no stall is claimed.
+    assert fields["export_process_present"] == "NO"
+    assert fields["export_lock_stall_suspected"] == "NO"
 
 
 @pytestmark_posix
 def test_block_classifies_failing_replica_export(tmp_path):
     fx = _fixture(tmp_path)
     fx["log"].write_text(
-        "O'Pip learning export: canonical replica export FAILED (rc=3)\n"
-        "O'Pip learning evidence export: JSON artifacts OK, canonical replica FAILED\n",
+        "2026-09-17T19:05:00Z O'Pip learning export: canonical replica export FAILED (rc=3)\n"
+        "2026-09-17T19:05:00Z O'Pip learning evidence export: JSON artifacts OK, canonical replica FAILED\n",
         encoding="utf-8",
     )
-    fields = _run_block(tmp_path, fx, "2026-09-17T23:59:00Z")
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
     assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_FAIL"
-    assert int(fields["export_log_failure_count"]) >= 1
+    assert fields["export_log_post_manifest_failure_count"] == "1"
     assert fields["FINAL_STATUS"] == "DEGRADED"
 
 
@@ -514,24 +793,3 @@ def test_block_refuses_a_non_content_addressed_replica_dir(tmp_path):
     assert fields["replica_dir_name_valid"] == "NO"
     assert fields["replica_dir_exists"] == "NOT_REFERENCED"
     assert fields["replica_inner_generation_id"] == "UNKNOWN"
-
-
-@pytestmark_posix
-def test_block_observes_a_held_lock_without_taking_it(tmp_path):
-    """Detection must work from /proc while the lock is genuinely held."""
-    import fcntl
-
-    fx = _fixture(tmp_path)
-    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
-    holder = open(fx["internal"], "w")
-    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
-    try:
-        fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
-        assert fields["internal_export_lock_file"] == "EXISTS"
-        assert fields["internal_export_lock_state"] in {"HELD", "OPENED_UNCONFIRMED"}
-        assert fields["export_lock_stall_suspected"] == "YES"
-        # The observed holder is this test process.
-        assert fields["internal_export_lock_owner_pid"] == str(os.getpid())
-    finally:
-        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
-        holder.close()

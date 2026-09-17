@@ -706,7 +706,8 @@ def test_diagnose_script_exposes_lock_owner_and_epoch_fields():
         "lock_owner_ppid=",
         "lock_owner_start_time=",
         "lock_owner_elapsed=",
-        "lock_owner_command=",
+        # Bounded process identity only: raw argv is deliberately not emitted.
+        "lock_owner_comm=",
         "learning_coverage_epoch_status=",
         "learning_coverage_epoch_boundary_utc=",
         "learning_coverage_epoch_archive=",
@@ -714,6 +715,8 @@ def test_diagnose_script_exposes_lock_owner_and_epoch_fields():
         "Never kill the owner",
     ):
         assert needle in diagnostics
+    assert "lock_owner_command=" not in diagnostics
+    assert "cmdline" not in diagnostics
     assert 'rm -f "$HOST_CYCLE_LOCK"' not in diagnostics
     # Strip the benign `timeout --kill-after=...` option so it cannot mask a
     # real signal-sending command added later.
