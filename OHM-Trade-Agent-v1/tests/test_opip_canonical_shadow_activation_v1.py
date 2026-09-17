@@ -298,8 +298,12 @@ def test_canonical_capture_gate_is_only_consumed_by_evidence_producers():
 
 def test_settings_reject_invalid_capture_mode():
     """An invalid mode must fail parsing rather than silently becoming off."""
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
         Settings(webhook_secret="test-webhook-secret", opip_canonical_writer_mode="alert")
+    with pytest.raises(ValidationError):
+        Settings(webhook_secret="test-webhook-secret", opip_canonical_writer_mode="shadwo")
 
 
 def test_activation_does_not_change_risk_or_sizing_defaults():
