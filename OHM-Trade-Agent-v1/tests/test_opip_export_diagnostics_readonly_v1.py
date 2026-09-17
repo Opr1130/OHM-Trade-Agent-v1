@@ -493,26 +493,32 @@ def test_redactor_structurally_covers_all_credential_forms():
 #: The values are deliberately low-entropy placeholders. A realistic-looking
 #: token here would be indistinguishable from a leaked credential by a secret
 #: scanner, and the advisory gitleaks gate correctly flags high-entropy values
-#: near credential keywords - the first version of this fixture tripped it with
-#: an entropy of 3.69. What the test needs is a distinctive substring that must
-#: not survive; it does not need the substring to look like a real secret, and
-#: keeping it obviously fake avoids both a false-positive finding and any
-#: temptation to add a scanner allowlist entry.
+#: near credential keywords - an earlier version of this fixture tripped it at
+#: entropy 3.69. What the test needs is a distinctive value that must not
+#: survive; it does not need the value to look like a real secret.
 REDACTION_CASES = [
+    # Authorization header, both schemes.
     ("Authorization: Bearer fake0001", "fake0001"),
     ("Authorization: Basic fake0002", "fake0002"),
+    # Standalone scheme tokens outside a header.
     ("Bearer fake0003", "fake0003"),
     ("Basic fake0004", "fake0004"),
+    # Env-style assignments, including the AUTH_ and broader prefixes.
     ("API_TOKEN=fake0005", "fake0005"),
-    ('{"access_token":"fake0006"}', "fake0006"),
-    ('{"password":"fake0007"}', "fake0007"),
+    ("AUTH_TOKEN=fake0006", "fake0006"),
+    ("SESSION_TOKEN=fake0007", "fake0007"),
+    # JSON credential fields.
+    ('{"access_token":"fake0008"}', "fake0008"),
+    ('{"refresh_token":"fake0009"}', "fake0009"),
+    ('{"password":"fake0010"}', "fake0010"),
+    ('{"api_key":"fake0011"}', "fake0011"),
     # Mixed content: a real log-line shape with the credential embedded.
     (
-        "2026-09-17T19:05:00Z INFO Authorization: Bearer fake0008",
-        "fake0008",
+        "2026-09-17T22:00:00Z INFO Authorization: Bearer fake0012",
+        "fake0012",
     ),
-    ("2026-09-17T19:05:00Z WARN Bearer fake0009", "fake0009"),
-    ("2026-09-17T19:05:00Z INFO API_TOKEN=fake0010", "fake0010"),
+    ("2026-09-17T22:00:00Z WARN Bearer fake0013", "fake0013"),
+    ("2026-09-17T22:00:00Z INFO API_TOKEN=fake0014", "fake0014"),
 ]
 
 
@@ -565,19 +571,31 @@ def test_authorization_header_is_redacted_to_end_of_line(tmp_path):
     harness = _redactor_harness(tmp_path)
     for line, secret, expected in (
         (
-            "Authorization: Bearer fake0011",
-            "fake0011",
+            "Authorization: Bearer fake0021",
+            "fake0021",
             "Authorization: <redacted>",
         ),
         (
-            "Authorization: Basic fake0012",
-            "fake0012",
+            "Authorization: Basic fake0022",
+            "fake0022",
             "Authorization: <redacted>",
         ),
         (
-            "2026-09-17T19:05:00Z INFO Authorization: Bearer fake0013",
-            "fake0013",
-            "2026-09-17T19:05:00Z INFO Authorization: <redacted>",
+            "2026-09-17T22:00:00Z INFO Authorization: Bearer fake0023",
+            "fake0023",
+            "2026-09-17T22:00:00Z INFO Authorization: <redacted>",
+        ),
+        # A scheme we do not enumerate must still be redacted: the header rule
+        # must not depend on recognising the scheme.
+        (
+            "Authorization: Digest fake0024",
+            "fake0024",
+            "Authorization: <redacted>",
+        ),
+        (
+            "Authorization: fake0025",
+            "fake0025",
+            "Authorization: <redacted>",
         ),
     ):
         proc = subprocess.run(

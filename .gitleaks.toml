@@ -1,9 +1,39 @@
 # O'Pip Gitleaks configuration (advisory CI).
-# Extends Gitleaks built-in rules. No allowlists yet (full-repo default scan
-# reported zero findings). Add only precise, justified allowlist entries if
-# future false positives appear. Do not add broad path or regex exclusions.
+#
+# Extends Gitleaks built-in rules and scans full history (`gitleaks detect`).
+# Keep allowlists precise and justified. Never add a path-only or repo-wide
+# exclusion, never disable a rule, and never relax the underlying detector.
 
 title = "O'Pip advisory gitleaks config"
 
 [extend]
 useDefault = true
+
+# ---------------------------------------------------------------------------
+# Synthetic fixture text in the redaction test (one historical commit only).
+#
+# `test_opip_export_diagnostics_readonly_v1.py` proves that
+# `redact_export_secrets()` removes credential material from production log
+# output. An early revision of that fixture used values shaped like real tokens,
+# which the generic-api-key rule correctly flags - a true positive against the
+# fixture text, not a scanner defect.
+#
+# Those values have been replaced with obviously synthetic placeholders, so the
+# current tree carries no such finding. The alert persists only because
+# full-history scanning still sees the old blob.
+#
+# Scope is deliberately the narrowest practical form: exactly ONE rule, ONE
+# commit, and ONE file, all required to match. It cannot mask a real credential
+# in another commit, another file, or under another rule, and it does not change
+# the rule's severity or the advisory status of the job.
+#
+# Note on `regexes`: restricting this further to the two flagged values would
+# mean reproducing credential-shaped literals inside the scanner's own
+# configuration, which is self-defeating and could itself be matched. The
+# commit+path+rule conjunction is the narrowest scope that avoids that trap.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Synthetic credential-shaped placeholders in the redaction test fixture at commit 16c493fa (non-functional test data, since replaced with clearly fake values)."
+ruleIDs = ["generic-api-key"]
+commits = ["16c493fa109c26979df0817f9676a2f028643b91"]
+paths = ['''OHM-Trade-Agent-v1/tests/test_opip_export_diagnostics_readonly_v1\.py$''']
