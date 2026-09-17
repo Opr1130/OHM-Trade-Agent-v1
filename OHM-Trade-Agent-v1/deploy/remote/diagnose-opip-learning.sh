@@ -413,14 +413,26 @@ redact_export_secrets() {
   # Bound blast radius if an unexpected credential ever reaches a log line: keep
   # the key or header name for evidence, drop the value. The repository's
   # no-secrets-in-logs contract prohibits any credential form, so this covers
-  # KEY=value assignments, HTTP Authorization headers, Bearer/basic tokens, and
+  # KEY=value assignments, HTTP Authorization headers, Bearer/Basic tokens, and
   # common JSON credential fields.
+  #
+  # Rule order matters. An Authorization header is redacted to the END OF LINE,
+  # rather than just its first token. Redacting only the first token removes the
+  # scheme ("Bearer"/"Basic") and leaves the credential itself in place, and the
+  # standalone rules below cannot rescue it because their scheme anchor is gone:
+  #
+  #   Authorization: Bearer secret123
+  #     -> Authorization: <redacted> secret123     # WRONG: credential survives
+  #     -> Authorization: <redacted>               # correct
+  #
+  # Preserving the authentication scheme is never worth the risk of preserving
+  # credential material, so the whole header value goes.
   sed -E \
     -e 's/((API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SESSION|COOKIE|AUTH)[A-Z_]*)=[^[:space:]]*/\1=<redacted>/Ig' \
-    -e 's/(authorization[[:space:]]*:[[:space:]]*)[^[:space:],;]+/\1<redacted>/Ig' \
+    -e 's/("?(access_?token|refresh_?token|id_?token|api_?key|secret|password|passwd|credential|session_?id|cookie|auth)"?[[:space:]]*[:=][[:space:]]*"?)[^"[:space:],;]+/\1<redacted>/Ig' \
+    -e 's/(authorization[[:space:]]*:).*$/\1 <redacted>/Ig' \
     -e 's/(bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
-    -e 's/(basic[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
-    -e 's/("?(access_?token|refresh_?token|id_?token|api_?key|secret|password|passwd|credential|session_?id|cookie|auth)"?[[:space:]]*[:=][[:space:]]*"?)[^"[:space:],;]+/\1<redacted>/Ig'
+    -e 's/(basic[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig'
 }
 
 describe_pid() {

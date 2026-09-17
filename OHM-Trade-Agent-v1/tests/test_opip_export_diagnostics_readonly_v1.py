@@ -37,6 +37,12 @@ GATEWAY = ROOT / "deploy" / "remote" / "ohm-deploy-ssh"
 BLOCK_START = "# Read-only production export observability."
 BLOCK_END = "\nif docker inspect ohm-trade-agent >/dev/null 2>&1; then"
 
+#: Behavioural POSIX tests execute the real block; they need flock, lslocks,
+#: /proc and a normal fork environment, so they skip on Windows.
+pytestmark_posix = pytest.mark.skipif(
+    os.name == "nt", reason="POSIX-only: needs flock/lslocks//proc and a normal fork"
+)
+
 
 def _script() -> str:
     return SCRIPT.read_text(encoding="utf-8")
@@ -448,23 +454,22 @@ def test_opens_backed_evidence_and_the_opener_fallback_are_distinct():
     assert 'verdict="$(classify_lock_stall_verdict "$state"' in block
 
 
-def test_redaction_covers_header_and_json_credential_forms():
-    """redact_export_secrets must cover more than KEY=value.
+def test_redactor_structurally_covers_all_credential_forms():
+    """Structural check only. The behavioural tests below are the authoritative proof.
 
-    The block does not deliberately emit credentials, but the log-tail probe
-    passes lines through redaction as a defensive contract. The repository's
-    no-secrets-in-logs rule prohibits any credential form, so the redactor is
-    strengthened to also mask Authorization/Bearer headers, common JSON
-    credential fields, and additional common env-style key prefixes.
+    Regex presence is not evidence that a secret disappears - the previous
+    ordering bug passed a structural check while still emitting the credential -
+    so this test only pins which forms the redactor claims to handle.
+    Correctness is proven by test_redactor_removes_secrets_from_real_output.
     """
     body = _function_body("redact_export_secrets")
     # KEY=value assignments, including the broadened prefix set.
     assert "(API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SESSION|COOKIE|AUTH)" in body
-    # HTTP Authorization header.
-    assert "authorization" in body
-    # Bearer and Basic tokens.
-    assert "bearer" in body
-    assert "basic" in body
+    # The HTTP Authorization header rule redacts to end of line.
+    assert "authorization[[:space:]]*:).*$" in body
+    # Standalone Bearer and Basic tokens.
+    assert "bearer[[:space:]]+" in body
+    assert "basic[[:space:]]+" in body
     # Common JSON credential fields.
     for field in (
         "access_?token",
@@ -480,6 +485,117 @@ def test_redaction_covers_header_and_json_credential_forms():
         assert field in body, field
     # Every replacement writes <redacted>, never a passthrough.
     assert body.count("<redacted>") >= 5
+
+
+#: Credential forms that must never survive redaction. Each entry is
+#: (line, the secret substring that must be absent from the output).
+REDACTION_CASES = [
+    ("Authorization: Bearer bearer-secret-123", "bearer-secret-123"),
+    ("Authorization: Basic basic-secret-456", "basic-secret-456"),
+    ("Bearer standalone-secret-789", "standalone-secret-789"),
+    ("Basic standalone-basic-012", "standalone-basic-012"),
+    ("API_TOKEN=env-secret-345", "env-secret-345"),
+    ('{"access_token":"json-secret-678"}', "json-secret-678"),
+    ('{"password":"password-secret-901"}', "password-secret-901"),
+    # Mixed content: a real log-line shape with the credential embedded.
+    (
+        "2026-09-17T19:05:00Z INFO Authorization: Bearer mixed-secret-234",
+        "mixed-secret-234",
+    ),
+    ("2026-09-17T19:05:00Z WARN Bearer mixed2-secret-567", "mixed2-secret-567"),
+    ("2026-09-17T19:05:00Z INFO API_TOKEN=env-mixed-678", "env-mixed-678"),
+]
+
+
+def _redactor_harness(tmp_path: Path) -> Path:
+    """A harness that pipes its argument through the real redact_export_secrets."""
+    harness = tmp_path / "redact.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        + _function_body("redact_export_secrets")
+        + '\nprintf "%s\\n" "$1" | redact_export_secrets\n',
+        encoding="utf-8",
+    )
+    return harness
+
+
+@pytestmark_posix
+@pytest.mark.parametrize(
+    ("line", "secret"), REDACTION_CASES, ids=[c[1] for c in REDACTION_CASES]
+)
+def test_redactor_removes_secrets_from_real_output(tmp_path, line, secret):
+    """Execute the real redact_export_secrets() and prove the secret is gone.
+
+    The primary regression proof for redaction. The previous implementation
+    passed a static regex-presence check while still emitting
+    "Authorization: <redacted> supersecrettoken123", because the header rule
+    consumed only the first token and the standalone rule could no longer match.
+    Only running the function and asserting the *original secret is absent* can
+    catch that, so both `<redacted>` presence and secret absence are asserted.
+    """
+    proc = subprocess.run(
+        ["bash", str(_redactor_harness(tmp_path)), line],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout.rstrip("\n")
+    # The credential must be gone...
+    assert secret not in out, f"credential leaked for {line!r}: {out!r}"
+    # ...and a redaction marker must show something was removed.
+    assert "<redacted>" in out, f"no redaction marker for {line!r}: {out!r}"
+
+
+@pytestmark_posix
+def test_authorization_header_is_redacted_to_end_of_line(tmp_path):
+    """Regression pin for the ordering defect specifically.
+
+    The header rule must consume the whole value. If it regresses to consuming
+    only the first token, the scheme is removed and the standalone rule cannot
+    match, leaving the credential visible - which is what this asserts against.
+    """
+    harness = _redactor_harness(tmp_path)
+    for line, secret, expected in (
+        (
+            "Authorization: Bearer bearer-secret-123",
+            "bearer-secret-123",
+            "Authorization: <redacted>",
+        ),
+        (
+            "Authorization: Basic basic-secret-456",
+            "basic-secret-456",
+            "Authorization: <redacted>",
+        ),
+        (
+            "2026-09-17T19:05:00Z INFO Authorization: Bearer mixed-secret-234",
+            "mixed-secret-234",
+            "2026-09-17T19:05:00Z INFO Authorization: <redacted>",
+        ),
+    ):
+        proc = subprocess.run(
+            ["bash", str(harness), line],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        assert proc.returncode == 0, proc.stderr
+        out = proc.stdout.rstrip("\n")
+        assert secret not in out, out
+        assert out == expected, f"{line!r} -> {out!r}, expected {expected!r}"
+
+
+@pytestmark_posix
+def test_redactor_leaves_benign_export_lines_untouched(tmp_path):
+    """The redactor must not mangle ordinary exporter status lines."""
+    harness = _redactor_harness(tmp_path)
+    for benign in (
+        "O'Pip learning evidence export: OK",
+        "O'Pip learning export: canonical replica bundle OK bytes=123456",
+        "O'Pip learning export already active; skipping",
+    ):
+        proc = subprocess.run(
+            ["bash", str(harness), benign],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.rstrip("\n") == benign, benign
 
 
 def test_process_pattern_is_not_the_journal_pattern():
@@ -768,11 +884,6 @@ def _seam_functions() -> str:
     """
     block = _block()
     return block[block.index("classify_duration_verdict() {") : block.index("observe_lock_owner() {")]
-
-
-pytestmark_posix = pytest.mark.skipif(
-    os.name == "nt", reason="POSIX-only: needs flock/lslocks//proc and a normal fork"
-)
 
 
 @pytestmark_posix
