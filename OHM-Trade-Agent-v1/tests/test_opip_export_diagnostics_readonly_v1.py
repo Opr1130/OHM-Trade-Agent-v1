@@ -488,22 +488,31 @@ def test_redactor_structurally_covers_all_credential_forms():
 
 
 #: Credential forms that must never survive redaction. Each entry is
-#: (line, the secret substring that must be absent from the output).
+#: (line, the value that must be absent from the output).
+#:
+#: The values are deliberately low-entropy placeholders. A realistic-looking
+#: token here would be indistinguishable from a leaked credential by a secret
+#: scanner, and the advisory gitleaks gate correctly flags high-entropy values
+#: near credential keywords - the first version of this fixture tripped it with
+#: an entropy of 3.69. What the test needs is a distinctive substring that must
+#: not survive; it does not need the substring to look like a real secret, and
+#: keeping it obviously fake avoids both a false-positive finding and any
+#: temptation to add a scanner allowlist entry.
 REDACTION_CASES = [
-    ("Authorization: Bearer bearer-secret-123", "bearer-secret-123"),
-    ("Authorization: Basic basic-secret-456", "basic-secret-456"),
-    ("Bearer standalone-secret-789", "standalone-secret-789"),
-    ("Basic standalone-basic-012", "standalone-basic-012"),
-    ("API_TOKEN=env-secret-345", "env-secret-345"),
-    ('{"access_token":"json-secret-678"}', "json-secret-678"),
-    ('{"password":"password-secret-901"}', "password-secret-901"),
+    ("Authorization: Bearer fake0001", "fake0001"),
+    ("Authorization: Basic fake0002", "fake0002"),
+    ("Bearer fake0003", "fake0003"),
+    ("Basic fake0004", "fake0004"),
+    ("API_TOKEN=fake0005", "fake0005"),
+    ('{"access_token":"fake0006"}', "fake0006"),
+    ('{"password":"fake0007"}', "fake0007"),
     # Mixed content: a real log-line shape with the credential embedded.
     (
-        "2026-09-17T19:05:00Z INFO Authorization: Bearer mixed-secret-234",
-        "mixed-secret-234",
+        "2026-09-17T19:05:00Z INFO Authorization: Bearer fake0008",
+        "fake0008",
     ),
-    ("2026-09-17T19:05:00Z WARN Bearer mixed2-secret-567", "mixed2-secret-567"),
-    ("2026-09-17T19:05:00Z INFO API_TOKEN=env-mixed-678", "env-mixed-678"),
+    ("2026-09-17T19:05:00Z WARN Bearer fake0009", "fake0009"),
+    ("2026-09-17T19:05:00Z INFO API_TOKEN=fake0010", "fake0010"),
 ]
 
 
@@ -527,11 +536,11 @@ def test_redactor_removes_secrets_from_real_output(tmp_path, line, secret):
     """Execute the real redact_export_secrets() and prove the secret is gone.
 
     The primary regression proof for redaction. The previous implementation
-    passed a static regex-presence check while still emitting
-    "Authorization: <redacted> supersecrettoken123", because the header rule
-    consumed only the first token and the standalone rule could no longer match.
-    Only running the function and asserting the *original secret is absent* can
-    catch that, so both `<redacted>` presence and secret absence are asserted.
+    passed a static regex-presence check while still emitting the credential
+    after the header name, because the header rule consumed only the first token
+    (the scheme) and the standalone rule could no longer match. Only running the
+    function and asserting the *original value is absent* can catch that, so both
+    `<redacted>` presence and value absence are asserted.
     """
     proc = subprocess.run(
         ["bash", str(_redactor_harness(tmp_path)), line],
@@ -556,18 +565,18 @@ def test_authorization_header_is_redacted_to_end_of_line(tmp_path):
     harness = _redactor_harness(tmp_path)
     for line, secret, expected in (
         (
-            "Authorization: Bearer bearer-secret-123",
-            "bearer-secret-123",
+            "Authorization: Bearer fake0011",
+            "fake0011",
             "Authorization: <redacted>",
         ),
         (
-            "Authorization: Basic basic-secret-456",
-            "basic-secret-456",
+            "Authorization: Basic fake0012",
+            "fake0012",
             "Authorization: <redacted>",
         ),
         (
-            "2026-09-17T19:05:00Z INFO Authorization: Bearer mixed-secret-234",
-            "mixed-secret-234",
+            "2026-09-17T19:05:00Z INFO Authorization: Bearer fake0013",
+            "fake0013",
             "2026-09-17T19:05:00Z INFO Authorization: <redacted>",
         ),
     ):
