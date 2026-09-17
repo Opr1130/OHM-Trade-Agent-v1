@@ -151,10 +151,15 @@ def test_resolution_requires_an_installed_generation_with_manifest():
 
 def test_required_jobs_fail_closed_when_no_replica_is_installed():
     text = _runner_text()
-    assert 'REQUIRE_CANONICAL_REPLICA_JOBS=" readiness outcomes "' in text
+    # Only readiness consumes canonical paper-outcome authority. `outcomes` runs
+    # the Phase 3C cycle and does not read canonical outcomes, so requiring a
+    # replica there would break the existing job contract and the
+    # production-first deployment order.
+    assert 'REQUIRE_CANONICAL_REPLICA_JOBS=" readiness "' in text
     assert "requires a verified canonical replica" in text
     # Missing replica must be a hard stop, never a silent empty mount.
     assert "exit 78" in text
+    assert '" $JOB "' in text
 
 
 def test_readiness_job_is_dispatched_to_the_readiness_module():

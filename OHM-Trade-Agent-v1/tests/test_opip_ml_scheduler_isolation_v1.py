@@ -102,7 +102,23 @@ def test_production_export_is_copy_only_and_locked():
         source,
     )
     assert "mv -f" in source
-    assert "python" not in source
+    # The exporter was originally copy-only shell. The canonical learning-replica
+    # snapshot requires the PR-A0 SQLite online-backup path, which is mandated to
+    # stay in Python rather than being reimplemented in Bash, so the script now
+    # invokes exactly one helper. That helper is the ONLY permitted Python use;
+    # the prohibition on compute belonging to this plane still holds, so ML,
+    # Phase 3C, the canonical writer and raw SQLite access all remain forbidden.
+    assert source.count('"$PYTHON_BIN"') == 1
+    assert "app.opip.learning.canonical_replica export" in source
+    for forbidden in (
+        "app.jobs.run_opip_ml_capture",
+        "run_opportunity_intelligence_cycle",
+        "build_phase3c_forward_outcomes",
+        "app.opip.canonical.writer",
+        "app.opip.canonical.server",
+        "sqlite3 ",
+    ):
+        assert forbidden not in source, f"export must not perform {forbidden}"
     assert "production_empty_export_attestation_eligible" in source
     assert "empty_export_attestation_v1.json" in source
     assert "state_json_is_certified_empty_without_manifest" in source

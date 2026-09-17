@@ -12,10 +12,13 @@ MANIFEST="$DATA_ROOT/manifest.env"
 # if a nested read-only mount also exposed it.
 CANONICAL_REPLICA_ROOT="${OPIP_CANONICAL_REPLICA_ROOT_HOST:-/var/lib/opip-learning/canonical-replica}"
 CANONICAL_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
-# Jobs that consume canonical paper-outcome authority must fail closed when no
-# verified generation is installed. Other jobs still receive the mount read-only
-# for consistency, but their absence of a replica is not an error.
-REQUIRE_CANONICAL_REPLICA_JOBS=" readiness outcomes "
+# Only jobs that actually consume canonical paper-outcome authority must fail
+# closed when no verified generation is installed. `outcomes` runs the Phase 3C
+# opportunity intelligence cycle and does not read canonical paper outcomes, so
+# requiring a replica there would break the existing contract and the
+# production-first deployment order. Other jobs still receive the mount
+# read-only for consistency when it exists.
+REQUIRE_CANONICAL_REPLICA_JOBS=" readiness "
 JOB="${1:-}"
 
 [[ -r "$ENV_FILE" ]] || {
