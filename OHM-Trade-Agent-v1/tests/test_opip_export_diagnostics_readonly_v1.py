@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -319,30 +320,77 @@ def test_diagnostics_emits_no_raw_argv_anywhere():
     assert "lock_owner_comm=" in script
 
 
-def test_stall_requires_a_duration_beyond_the_threshold():
-    """Instantaneous lock presence or process presence is not a stall."""
+def _function_body(name: str) -> str:
+    """Extract one shell function body from the block, up to its closing brace."""
+    block = _block()
+    start = block.index(f"{name}() {{")
+    end = block.index("\n}\n", start)
+    return block[start : end + 2]
+
+
+def test_stall_requires_proven_ownership_and_a_duration_past_threshold():
+    """Instantaneous presence is not a stall, and neither is an unconfirmed opener."""
     script = _script()
     block = _block()
     assert "EXPORT_STALL_THRESHOLD_SECONDS=300" in script
     assert "EXPORT_STALL_THRESHOLD_SECONDS" in block
-    assert "classify_stall_from_elapsed" in block
+    assert "classify_duration_verdict" in block
+    assert "classify_lock_stall_verdict" in block
     assert "note_stall_evidence" in block
     assert "export_stall_threshold_seconds=" in block
-    # The verdict function needs elapsed > threshold, and reports UNKNOWN when
-    # elapsed is unavailable.
-    classifier = block[block.index("classify_stall_from_elapsed() {") :]
-    classifier = classifier[: classifier.index("\n}", classifier.index("printf 'UNKNOWN"))]
-    assert "elapsed > EXPORT_STALL_THRESHOLD_SECONDS" in classifier
-    assert "UNKNOWN" in classifier
-    # Presence alone must never set the verdict, and ownership must not either.
-    assert 'export_lock_stall_suspected="YES"' in block
+    assert "lock_ownership_proven=" in block
+    # The duration seam needs elapsed > threshold, and reports UNKNOWN when the
+    # duration is unavailable.
+    duration = _function_body("classify_duration_verdict")
+    assert "elapsed > EXPORT_STALL_THRESHOLD_SECONDS" in duration
+    assert "printf 'UNKNOWN" in duration
+    # The lock seam dispatches on evidence strength: only HELD reaches the
+    # duration verdict, and an unconfirmed opener is pinned to UNKNOWN.
+    lock_seam = _function_body("classify_lock_stall_verdict")
+    assert "HELD) classify_duration_verdict" in lock_seam
+    assert "OPENED_UNCONFIRMED) printf 'UNKNOWN" in lock_seam
+    assert "NOT_HELD | ABSENT) printf 'NO" in lock_seam
+    # OPENED_UNCONFIRMED must never sit on a path that yields YES. Pin the two
+    # legitimate occurrences (the state assignment and the dispatch case) and
+    # require that no line mentioning it also mentions YES.
+    code_lines = [
+        line.strip()
+        for line in block.splitlines()
+        if "OPENED_UNCONFIRMED" in line and not line.strip().startswith("#")
+    ]
+    assert len(code_lines) == 2, code_lines
+    assert any('state="OPENED_UNCONFIRMED"' in line for line in code_lines)
+    assert any(
+        line.startswith("OPENED_UNCONFIRMED) printf 'UNKNOWN") for line in code_lines
+    )
+    for line in code_lines:
+        assert "YES" not in line, line
+    # Presence and ownership never set the verdict directly: exactly one
+    # assignment of YES exists, inside the monotonic escalation helper.
     stall_assignments = [
         line for line in block.splitlines()
         if 'export_lock_stall_suspected="YES"' in line
     ]
     assert len(stall_assignments) == 1
-    # That single assignment lives inside the monotonic escalation helper.
     assert 'YES) export_lock_stall_suspected="YES" ;;' in block
+
+
+def test_opens_backed_evidence_and_the_opener_fallback_are_distinct():
+    """fuser fallback must be reported, and must never reach the duration path."""
+    block = _block()
+    # Both evidence strengths remain reported.
+    assert "LSLOCKS" in block
+    assert "FUSER_OPENERS" in block
+    assert "OPENED_UNCONFIRMED" in block
+    assert 'state="OPENED_UNCONFIRMED"' in block
+    # The opener metadata is retained as evidence.
+    assert 'describe_pid "${prefix}_lock_owner" "$pid"' in block
+    # The old conflation is gone: no branch classifies both states together.
+    assert not re.search(
+        r'\[\[\s*"\$state"\s*==\s*"HELD"\s*\|\|\s*"\$state"\s*==\s*"OPENED_UNCONFIRMED"\s*\]\]',
+        block,
+    )
+    assert 'verdict="$(classify_lock_stall_verdict "$state"' in block
 
 
 def test_block_is_bounded_and_redacted():
@@ -546,13 +594,15 @@ def _write_manifest(fx: dict, exported_at: str) -> None:
     )
 
 
-def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
+def _run_block(
+    tmp_path: Path, fx: dict, exported_at: str, *, path_prefix: Path | None = None
+) -> dict:
     """Set ALL fixture state, then execute the block.
 
     Ordering matters: the manifest's exported_at_utc must be on disk *before*
     the subprocess runs, otherwise the timestamp under test cannot influence the
-    behaviour being asserted. The block's own echoed exported_at_utc is returned
-    so a test can prove which value it actually observed.
+    behaviour being asserted. ``path_prefix`` prepends a directory to PATH so a
+    test can shim a probe (e.g. hide lslocks to force the fuser fallback).
     """
     _write_manifest(fx, exported_at)
     prelude = PRELUDE + "\n".join(
@@ -575,6 +625,7 @@ def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
             "EXPORT_STALL_THRESHOLD_SECONDS=300",
             "EXPORT_JOURNAL_PATTERN="
             "'opip-learning-export|export-opip-learning-evidence|opip-learning-export-trigger\\.lock'",
+            f'PATH="{path_prefix}:$PATH"' if path_prefix else "",
             "",
         ]
     )
@@ -590,6 +641,18 @@ def _run_block(tmp_path: Path, fx: dict, exported_at: str) -> dict:
             key, _, value = line.partition("=")
             fields[key] = value
     return fields
+
+
+def _seam_functions() -> str:
+    """Extract the evidence-to-verdict seam so its truth table can be tested.
+
+    The decision is factored into these two pure functions precisely so the
+    classification can be tested directly: reliably aging a real process beyond
+    the threshold is impractical in CI, so the >threshold cases are proven here
+    while real lslocks/fuser integration is proven separately.
+    """
+    block = _block()
+    return block[block.index("classify_duration_verdict() {") : block.index("observe_lock_owner() {")]
 
 
 pytestmark_posix = pytest.mark.skipif(
@@ -719,12 +782,131 @@ def test_timestamped_log_proves_a_post_manifest_success(tmp_path):
 
 
 @pytestmark_posix
-def test_healthy_export_progress_is_not_reported_as_a_stall(tmp_path):
-    """A normal in-flight export must not be called a stall.
+def test_lock_stall_truth_table(tmp_path):
+    """Exhaustive truth table for the evidence-to-verdict seam.
 
-    The block is run while this test process holds a lock, which is exactly the
-    "instantaneous presence" shape. Because the holder's age is far below the
-    threshold, the verdict must be NO.
+    The critical row is OPENED_UNCONFIRMED with a large elapsed: opening a file
+    does not prove holding the lock on it, so no duration may upgrade it to YES.
+    """
+    harness = tmp_path / "seam.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        "EXPORT_STALL_THRESHOLD_SECONDS=300\n"
+        + _seam_functions()
+        + '\nprintf "%s" "$(classify_lock_stall_verdict "$1" "$2")"\n',
+        encoding="utf-8",
+    )
+    cases = [
+        # state, elapsed, expected
+        ("HELD", "900", "YES"),
+        ("HELD", "301", "YES"),
+        ("HELD", "300", "NO"),          # threshold is exclusive
+        ("HELD", "100", "NO"),
+        ("HELD", "0", "NO"),
+        ("HELD", "", "UNKNOWN"),        # unprovable duration
+        ("HELD", "UNKNOWN", "UNKNOWN"),
+        # An unconfirmed opener is UNKNOWN whatever its age.
+        ("OPENED_UNCONFIRMED", "900", "UNKNOWN"),
+        ("OPENED_UNCONFIRMED", "999999", "UNKNOWN"),
+        ("OPENED_UNCONFIRMED", "301", "UNKNOWN"),
+        ("OPENED_UNCONFIRMED", "10", "UNKNOWN"),
+        ("OPENED_UNCONFIRMED", "", "UNKNOWN"),
+        ("OPENED_UNCONFIRMED", "UNKNOWN", "UNKNOWN"),
+        ("NOT_HELD", "9999", "NO"),
+        ("NOT_HELD", "", "NO"),
+        ("ABSENT", "9999", "NO"),
+        ("WEIRD", "9999", "UNKNOWN"),
+    ]
+    for state, elapsed, expected in cases:
+        proc = subprocess.run(
+            ["bash", str(harness), state, elapsed],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected, (
+            f"classify_lock_stall_verdict({state!r}, {elapsed!r}) "
+            f"returned {proc.stdout.strip()!r}, expected {expected!r}"
+        )
+
+
+@pytestmark_posix
+def test_duration_verdict_requires_past_threshold(tmp_path):
+    """The duration-only seam (used for a positively identified process)."""
+    harness = tmp_path / "seam.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        "EXPORT_STALL_THRESHOLD_SECONDS=300\n"
+        + _seam_functions()
+        + '\nprintf "%s" "$(classify_duration_verdict "$1")"\n',
+        encoding="utf-8",
+    )
+    for elapsed, expected in (
+        ("900", "YES"),
+        ("301", "YES"),
+        ("300", "NO"),
+        ("0", "NO"),
+        ("", "UNKNOWN"),
+        ("UNKNOWN", "UNKNOWN"),
+    ):
+        proc = subprocess.run(
+            ["bash", str(harness), elapsed],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected, f"{elapsed!r} -> {proc.stdout!r}"
+
+
+@pytestmark_posix
+@pytest.mark.skipif(
+    shutil.which("fuser") is None, reason="fuser (psmisc) required for the fallback path"
+)
+def test_unconfirmed_opener_is_unknown_never_a_stall(tmp_path):
+    """Real integration of the fuser fallback: open without locking.
+
+    ``lslocks`` is shimmed away so the fuser path is genuinely exercised. The
+    opener is this test process, which has the file open but holds no lock on it.
+    The verdict must be UNKNOWN - not NO (the age is meaningful only for proven
+    ownership) and emphatically not YES.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    opener = open(fx["internal"], "w")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    lslocks = shim / "lslocks"
+    lslocks.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    lslocks.chmod(0o755)
+    try:
+        fields = _run_block(
+            tmp_path, fx, "2026-09-17T19:00:47Z", path_prefix=shim
+        )
+        # The fallback was genuinely used, and the file is genuinely open.
+        assert fields["internal_export_lock_file"] == "EXISTS"
+        assert fields["internal_export_lock_owner_source"] == "FUSER_OPENERS"
+        assert fields["internal_export_lock_state"] == "OPENED_UNCONFIRMED"
+        # The opener is real and its identity is reported as evidence.
+        assert fields["internal_export_lock_owner_pid"] == str(os.getpid())
+        assert fields["internal_export_lock_owner_comm"] not in ("", "UNKNOWN")
+        assert fields["internal_export_lock_owner_elapsed_seconds"] not in ("", "UNKNOWN")
+        # Ownership is NOT proven, so no duration can be applied to it.
+        assert fields["internal_export_lock_ownership_proven"] == "NO"
+        assert fields["internal_export_lock_held_instantaneously"] == "NO"
+        assert fields["internal_export_lock_stall_verdict"] == "UNKNOWN"
+        # And the derived decision never becomes YES. At least one lock file
+        # exists but none is provably held, so the overall verdict is UNKNOWN.
+        assert fields["export_lock_stall_suspected"] == "UNKNOWN"
+        assert fields["export_lock_stall_suspected"] != "YES"
+    finally:
+        opener.close()
+
+
+@pytestmark_posix
+def test_true_flock_ownership_is_reported_and_young_holder_is_not_a_stall(tmp_path):
+    """Real integration of the lslocks path: a genuine flock IS ownership.
+
+    Proves the strong evidence path still works end to end. The holder is this
+    test process, so its age is far below the threshold and the verdict is NO -
+    proving a real held lock is observed but not automatically called a stall.
     """
     import fcntl
 
@@ -734,15 +916,16 @@ def test_healthy_export_progress_is_not_reported_as_a_stall(tmp_path):
     fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
     try:
         fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
-        # The lock IS held at the instant of observation...
         assert fields["internal_export_lock_file"] == "EXISTS"
-        assert fields["internal_export_lock_state"] in {"HELD", "OPENED_UNCONFIRMED"}
+        assert fields["internal_export_lock_owner_source"] == "LSLOCKS"
+        assert fields["internal_export_lock_state"] == "HELD"
+        assert fields["internal_export_lock_ownership_proven"] == "YES"
         assert fields["internal_export_lock_held_instantaneously"] == "YES"
         assert fields["internal_export_lock_owner_pid"] == str(os.getpid())
-        # ...but this process is young, so it is not a stall.
+        # A real held lock, but a young holder: observed, not condemned.
         assert fields["internal_export_lock_stall_verdict"] == "NO"
-        assert fields["export_lock_stall_suspected"] == "NO"
         assert fields["export_stall_threshold_seconds"] == "300"
+        assert fields["export_lock_stall_suspected"] == "NO"
     finally:
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()

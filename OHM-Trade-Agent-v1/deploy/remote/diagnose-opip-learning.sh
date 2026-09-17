@@ -483,8 +483,10 @@ note_stall_evidence() {
 }
 
 
-classify_stall_from_elapsed() {
-  # Map an observed duration onto a stall verdict using the explicit threshold.
+classify_duration_verdict() {
+  # Duration-only verdict, for a process whose *identity* is already proven (a
+  # pgrep-matched exporter). Only here is age alone meaningful evidence, and an
+  # unavailable duration yields UNKNOWN rather than YES.
   local elapsed="$1"
   if [[ ! "$elapsed" =~ ^[0-9]+$ ]]; then
     printf 'UNKNOWN\n'
@@ -493,6 +495,37 @@ classify_stall_from_elapsed() {
   else
     printf 'NO\n'
   fi
+}
+
+
+classify_lock_stall_verdict() {
+  # Evidence-strength-aware verdict for one lock observation.
+  #
+  # The two evidence strengths are deliberately not interchangeable:
+  #
+  #   HELD               - the kernel reports that this process owns the lock,
+  #                        so the holder is proven and its age is meaningful
+  #                        evidence;
+  #   OPENED_UNCONFIRMED - the fallback probe proved only that some process has
+  #                        the file *open*. Opening a file is not owning the lock
+  #                        on it, so no elapsed duration may upgrade this to YES.
+  #
+  # Required truth table:
+  #   HELD               + elapsed >  threshold -> YES
+  #   HELD               + elapsed <= threshold -> NO
+  #   HELD               + elapsed unavailable  -> UNKNOWN
+  #   OPENED_UNCONFIRMED + any elapsed          -> UNKNOWN
+  #   NOT_HELD                                  -> NO
+  #   ABSENT                                    -> NO
+  #   anything else                             -> UNKNOWN
+  local state="$1"
+  local elapsed="$2"
+  case "$state" in
+    HELD) classify_duration_verdict "$elapsed" ;;
+    OPENED_UNCONFIRMED) printf 'UNKNOWN\n' ;;
+    NOT_HELD | ABSENT) printf 'NO\n' ;;
+    *) printf 'UNKNOWN\n' ;;
+  esac
 }
 
 observe_lock_owner() {
@@ -536,15 +569,16 @@ observe_lock_owner() {
   echo "${prefix}_lock_state=$state"
   echo "${prefix}_lock_owner_source=$how"
   echo "${prefix}_lock_held_instantaneously=$([[ "$state" == "HELD" ]] && echo YES || echo NO)"
+  # Ownership is proven only by kernel-reported lock ownership. An open file
+  # descriptor is reported, but never treated as proof of owning the lock.
+  echo "${prefix}_lock_ownership_proven=$([[ "$state" == "HELD" ]] && echo YES || echo NO)"
   describe_pid "${prefix}_lock_owner" "$pid"
 
-  # Held at the instant of observation is NOT a stall. Only a duration beyond
-  # EXPORT_STALL_THRESHOLD_SECONDS may be called one, and an unprovable duration
-  # is reported UNKNOWN rather than assumed bad.
-  local verdict="NO"
-  if [[ "$state" == "HELD" || "$state" == "OPENED_UNCONFIRMED" ]]; then
-    verdict="$(classify_stall_from_elapsed "$(pid_elapsed_seconds "$pid")")"
-  fi
+  # Only proven kernel-reported ownership plus a duration past the threshold may
+  # be called a stall. An unconfirmed opener is reported with its age but never
+  # upgraded to YES by it.
+  local verdict
+  verdict="$(classify_lock_stall_verdict "$state" "$(pid_elapsed_seconds "$pid")")"
   echo "${prefix}_lock_stall_verdict=$verdict"
   note_stall_evidence "$verdict"
 }
@@ -809,11 +843,11 @@ echo "export_process_count=$export_process_count"
 echo "export_process_present=$([[ "$export_process_count" != "0" ]] && echo YES || echo NO)"
 echo "export_process_max_elapsed_seconds=$export_process_max_elapsed_seconds"
 echo "export_processes=${export_processes:-NONE}"
-# Presence is not a stall. Only a duration past the threshold may raise the
-# verdict; if the exporter is present but its age cannot be proven, the verdict
-# is UNKNOWN rather than YES.
+# Presence is not a stall, but unlike a lock opener the identity here IS proven:
+# a pgrep match means this is the exporter. Only a duration past the threshold
+# may raise the verdict, and an unproven age yields UNKNOWN rather than YES.
 if [[ "$export_process_count" != "0" ]]; then
-  note_stall_evidence "$(classify_stall_from_elapsed "$export_process_max_elapsed_seconds")"
+  note_stall_evidence "$(classify_duration_verdict "$export_process_max_elapsed_seconds")"
 fi
 
 # 1E - committed export state, the referenced replica directory and the inner
