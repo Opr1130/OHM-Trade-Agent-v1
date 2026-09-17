@@ -30,6 +30,12 @@ EXPORT_STALL_THRESHOLD_SECONDS=300
 # Only O'Pip export-specific syslog/journal records are matched. A generic CRON
 # match would return unrelated system jobs.
 EXPORT_JOURNAL_PATTERN='opip-learning-export|export-opip-learning-evidence|opip-learning-export-trigger\.lock'
+# Process matching must NOT include the log filename or the lock filename: a
+# long-lived `tail`, `less` or similar consumer of the log would otherwise be
+# reported as an exporter and, if its age exceeded the stall threshold, would
+# falsely raise the verdict. Match only the exporter script name, which both
+# the cron flock wrapper and any direct invocation carry on their command line.
+EXPORT_PROCESS_PATTERN='export-opip-learning-evidence\.sh'
 MAX_EXPORT_AGE_SECONDS=300
 MAX_SYNC_AGE_SECONDS=720
 MAX_CAPTURE_AGE_SECONDS=900
@@ -405,8 +411,16 @@ fi
 
 redact_export_secrets() {
   # Bound blast radius if an unexpected credential ever reaches a log line: keep
-  # the key name for evidence, drop the value.
-  sed -E 's/((API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE)[A-Z_]*=)[^[:space:]]+/\1<redacted>/Ig'
+  # the key or header name for evidence, drop the value. The repository's
+  # no-secrets-in-logs contract prohibits any credential form, so this covers
+  # KEY=value assignments, HTTP Authorization headers, Bearer/basic tokens, and
+  # common JSON credential fields.
+  sed -E \
+    -e 's/((API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SESSION|COOKIE|AUTH)[A-Z_]*)=[^[:space:]]*/\1=<redacted>/Ig' \
+    -e 's/(authorization[[:space:]]*:[[:space:]]*)[^[:space:],;]+/\1<redacted>/Ig' \
+    -e 's/(bearer[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
+    -e 's/(basic[[:space:]]+)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
+    -e 's/("?(access_?token|refresh_?token|id_?token|api_?key|secret|password|passwd|credential|session_?id|cookie|auth)"?[[:space:]]*[:=][[:space:]]*"?)[^"[:space:],;]+/\1<redacted>/Ig'
 }
 
 describe_pid() {
@@ -874,7 +888,10 @@ export_process_present="NO"
 export_process_max_elapsed_seconds="UNKNOWN"
 export_processes=""
 if command -v pgrep >/dev/null 2>&1; then
-  export_process_count="$(pgrep -fc "$EXPORT_JOURNAL_PATTERN" 2>/dev/null || true)"
+  # See EXPORT_PROCESS_PATTERN above: the pattern is the exporter script name,
+  # deliberately narrower than the journal pattern so a `tail`/`less`/rotator of
+  # the log or lock file cannot be misread as the exporter.
+  export_process_count="$(pgrep -fc "$EXPORT_PROCESS_PATTERN" 2>/dev/null || true)"
   [[ "$export_process_count" =~ ^[0-9]+$ ]] || export_process_count=0
   while IFS= read -r live_pid; do
     [[ -n "$live_pid" ]] || continue
@@ -891,7 +908,7 @@ if command -v pgrep >/dev/null 2>&1; then
       fi
     fi
     export_processes="${export_processes}${export_processes:+,}${live_pid}@${live_elapsed:-?}@${live_comm:-UNKNOWN}"
-  done < <(pgrep -f "$EXPORT_JOURNAL_PATTERN" 2>/dev/null || true)
+  done < <(pgrep -f "$EXPORT_PROCESS_PATTERN" 2>/dev/null || true)
 fi
 echo "export_process_count=$export_process_count"
 echo "export_process_present=$([[ "$export_process_count" != "0" ]] && echo YES || echo NO)"

@@ -448,6 +448,65 @@ def test_opens_backed_evidence_and_the_opener_fallback_are_distinct():
     assert 'verdict="$(classify_lock_stall_verdict "$state"' in block
 
 
+def test_redaction_covers_header_and_json_credential_forms():
+    """redact_export_secrets must cover more than KEY=value.
+
+    The block does not deliberately emit credentials, but the log-tail probe
+    passes lines through redaction as a defensive contract. The repository's
+    no-secrets-in-logs rule prohibits any credential form, so the redactor is
+    strengthened to also mask Authorization/Bearer headers, common JSON
+    credential fields, and additional common env-style key prefixes.
+    """
+    body = _function_body("redact_export_secrets")
+    # KEY=value assignments, including the broadened prefix set.
+    assert "(API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|SESSION|COOKIE|AUTH)" in body
+    # HTTP Authorization header.
+    assert "authorization" in body
+    # Bearer and Basic tokens.
+    assert "bearer" in body
+    assert "basic" in body
+    # Common JSON credential fields.
+    for field in (
+        "access_?token",
+        "refresh_?token",
+        "id_?token",
+        "api_?key",
+        "secret",
+        "password",
+        "credential",
+        "session_?id",
+        "cookie",
+    ):
+        assert field in body, field
+    # Every replacement writes <redacted>, never a passthrough.
+    assert body.count("<redacted>") >= 5
+
+
+def test_process_pattern_is_not_the_journal_pattern():
+    """pgrep must not match log/lock filenames or system-wide keywords.
+
+    Regression cover for the previous defect: a long-lived `tail`/`less` on
+    /var/log/opip-learning-export.log would have matched the old shared pattern
+    and, at elapsed >300s, falsely raised the stall verdict.
+    """
+    script = _script()
+    assert "EXPORT_PROCESS_PATTERN=" in script
+    pattern_line = next(
+        line for line in script.splitlines() if line.startswith("EXPORT_PROCESS_PATTERN=")
+    )
+    # Deliberately narrow: only the exporter script name.
+    assert "export-opip-learning-evidence" in pattern_line
+    # No log filename or lock filename in the process pattern.
+    assert "log" not in pattern_line
+    assert "trigger" not in pattern_line
+    # And both pgrep sites use the process pattern, never the journal pattern.
+    block = _block()
+    assert 'pgrep -fc "$EXPORT_PROCESS_PATTERN"' in block
+    assert 'pgrep -f "$EXPORT_PROCESS_PATTERN"' in block
+    assert 'pgrep -fc "$EXPORT_JOURNAL_PATTERN"' not in block
+    assert 'pgrep -f "$EXPORT_JOURNAL_PATTERN"' not in block
+
+
 def test_block_is_bounded_and_redacted():
     block = _block()
     assert "EXPORT_LOG_TAIL_LINES=100" in _script()
@@ -680,6 +739,7 @@ def _run_block(
             "EXPORT_STALL_THRESHOLD_SECONDS=300",
             "EXPORT_JOURNAL_PATTERN="
             "'opip-learning-export|export-opip-learning-evidence|opip-learning-export-trigger\\.lock'",
+            "EXPORT_PROCESS_PATTERN='export-opip-learning-evidence\\.sh'",
             f'PATH="{path_prefix}:$PATH"' if path_prefix else "",
             "",
         ]
@@ -1159,6 +1219,43 @@ def test_unconfirmed_opener_is_unknown_never_a_stall(tmp_path):
 
 
 @pytestmark_posix
+def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
+    """A `tail`/`less` on the log file must not appear as an exporter.
+
+    Regression cover: the previous pattern matched the log filename
+    (opip-learning-export.log), so any long-lived tail/less/rotator would be
+    counted by pgrep -f as the exporter. If its elapsed age exceeded the stall
+    threshold, that would falsely set the stall verdict to YES. The pgrep
+    pattern is now the exporter script name only, so this test process spawning
+    a long-lived subprocess that reads the log path must NOT count.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    # A subprocess whose command line contains the log filename but not the
+    # exporter script name. sleep is a harmless long-lived stand-in.
+    consumer = subprocess.Popen(
+        ["sh", "-c", f'exec -a "cat /var/log/opip-learning-export.log" sleep 30'],
+    )
+    try:
+        fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+        assert fields["export_process_count"] == "0"
+        assert fields["export_process_present"] == "NO"
+        # And nothing raises a false stall.
+        assert fields["export_lock_stall_suspected"] != "YES"
+    finally:
+        consumer.terminate()
+        try:
+            consumer.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            consumer.kill()
+            consumer.wait(timeout=5)
+
+
+@pytestmark_posix
+@pytest.mark.skipif(
+    shutil.which("lslocks") is None,
+    reason="lslocks (util-linux) required to observe kernel-reported flock ownership",
+)
 def test_true_flock_ownership_is_reported_and_young_holder_is_not_a_stall(tmp_path):
     """Real integration of the lslocks path: a genuine flock IS ownership.
 
