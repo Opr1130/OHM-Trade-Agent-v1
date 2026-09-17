@@ -147,9 +147,12 @@ def harness(tmp_path_factory):
             f"""\
             #!/usr/bin/env bash
             set -Eeuo pipefail
-            # The sync invokes: ssh <host> "<forced command>"
-            shift  # host
-            export SSH_ORIGINAL_COMMAND="$*"
+            # The sync invokes ssh with options before the destination:
+            #   ssh -i <key> -o BatchMode=yes ... user@host "<forced command>"
+            # By ssh semantics the remote command is the LAST argument, so take
+            # that rather than shifting one positional, which would leave the
+            # options in the command string and make the reader reject it.
+            export SSH_ORIGINAL_COMMAND="${{!#}}"
             exec {READER}
             """
         ),
