@@ -23,11 +23,12 @@ import pytest
 
 from app.opip.canonical.client import InProcessWriterClient
 from app.opip.canonical.models import WriterIntent
-from app.opip.canonical.paths import SCHEMA_VERSION
+from app.opip.canonical.paths import EVENT_SCHEMA_VERSION, SCHEMA_VERSION
 from app.opip.canonical.server import CanonicalWriterServer
 from app.opip.canonical.writer import CanonicalWriter
 from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_PRIORITY,
+    PAPER_OUTCOME_STREAM,
     PAPER_OUTCOME_TERMINAL_RECORDED,
     assert_supersession_consistent,
     build_terminal_outcome_payload,
@@ -689,3 +690,168 @@ def test_end_to_end_reconcile_resolves_gap_without_persisted_gap_id(
     assert load_gap_spool(spool)["unresolved"] == []
     assert evidence_window_incomplete(spool) is False
     outbox.set_writer_client_for_tests(None)
+
+
+# ===========================================================================
+# Finding 7 - the stream tip must be lexicographic, not independent maxima
+# ===========================================================================
+
+
+def _insert_raw_outcome(db, payload, *, epoch, seq):
+    """Insert one committed paper outcome at an exact canonical coordinate."""
+    connection = sqlite3.connect(str(db))
+    try:
+        connection.execute(
+            """
+            INSERT INTO events(
+                event_id, schema_version, event_type, history_epoch, local_sequence,
+                recorded_at, event_time, causation_id, correlation_id,
+                idempotency_key, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                f"EVT:{epoch:04d}{seq:08d}",
+                EVENT_SCHEMA_VERSION,
+                PAPER_OUTCOME_TERMINAL_RECORDED,
+                epoch,
+                seq,
+                "2026-09-16T12:00:00Z",
+                terminal_outcome_idempotency_key(payload["outcome_id"]),
+                json.dumps(payload),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _set_stream_watermark(db, *, epoch, seq):
+    connection = sqlite3.connect(str(db))
+    try:
+        connection.execute(
+            """
+            INSERT INTO watermarks(stream, history_epoch, local_sequence, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(stream) DO UPDATE SET
+                history_epoch = excluded.history_epoch,
+                local_sequence = excluded.local_sequence,
+                updated_at = excluded.updated_at
+            """,
+            (PAPER_OUTCOME_STREAM, epoch, seq, "2026-09-16T12:00:00Z"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _multi_epoch_store(db):
+    """Build a pre-restore ``(1, 40)`` and a post-restore ``(2, 1)``.
+
+    A canonical restore advances ``history_epoch`` and resets
+    ``local_sequence``, so ``(2, 1)`` is the higher coordinate. Independent
+    column maxima would report ``(2, 40)`` - a coordinate that need not exist -
+    and compare it against the correct watermark ``(2, 1)``.
+    """
+    CanonicalWriter(db).close()  # initialize the canonical schema
+    old = _outcome()
+    new = _outcome(paper_trade_id="PAPER:" + "e" * 20, episode_id="EP:2")
+    _insert_raw_outcome(db, old, epoch=1, seq=40)
+    _insert_raw_outcome(db, new, epoch=2, seq=1)
+    _set_stream_watermark(db, epoch=2, seq=1)
+    return old, new
+
+
+def test_multi_epoch_stream_tip_is_lexicographic(canonical_env):
+    """A watermark matching the true tip is not an integrity failure.
+
+    This test fails under the previous independent-MAX implementation, which
+    fabricated ``(2, 40)`` from ``MAX(history_epoch)`` and
+    ``MAX(local_sequence)`` and then reported the correct ``(2, 1)`` watermark
+    as being behind a non-existent event.
+    """
+    old, new = _multi_epoch_store(canonical_env["db"])
+
+    read = read_canonical_paper_outcomes(canonical_env["db"])
+
+    assert read.stream_present is True
+    # Both coordinates are at or before (2, 1), so both reconstruct.
+    assert [(o.history_epoch, o.local_sequence) for o in read.outcomes] == [
+        (1, 40),
+        (2, 1),
+    ]
+    assert [o.outcome_id for o in read.outcomes] == [old["outcome_id"], new["outcome_id"]]
+
+
+def test_multi_epoch_read_is_deterministic(canonical_env):
+    _multi_epoch_store(canonical_env["db"])
+    first = read_canonical_paper_outcomes(canonical_env["db"])
+    second = read_canonical_paper_outcomes(canonical_env["db"])
+    assert [o.outcome_id for o in first.outcomes] == [o.outcome_id for o in second.outcomes]
+
+
+def test_watermark_behind_the_true_tip_fails_closed(canonical_env):
+    _multi_epoch_store(canonical_env["db"])
+    _set_stream_watermark(canonical_env["db"], epoch=2, seq=0)
+    with pytest.raises(PaperOutcomeIntegrityError, match="does not match"):
+        read_canonical_paper_outcomes(canonical_env["db"])
+
+
+def test_watermark_ahead_of_the_true_tip_fails_closed(canonical_env):
+    _multi_epoch_store(canonical_env["db"])
+    _set_stream_watermark(canonical_env["db"], epoch=3, seq=9)
+    with pytest.raises(PaperOutcomeIntegrityError, match="does not match"):
+        read_canonical_paper_outcomes(canonical_env["db"])
+
+
+# ===========================================================================
+# Finding 8 - the read must observe a single consistent snapshot
+# ===========================================================================
+
+
+def test_reader_reads_one_consistent_snapshot(canonical_env, monkeypatch):
+    """An outcome committed mid-read must not corrupt the in-flight read.
+
+    Interleaving is deterministic and placed at the exact hazard point: the
+    commit happens after the boundary watermark has been observed but before the
+    tip is read. No sleeps are used.
+
+    Without a read transaction the reader would combine the pre-commit watermark
+    with the post-commit tip and raise a false integrity error. With one
+    transaction both observations come from the same snapshot.
+    """
+    from app.opip.learning import paper_outcome_reader as reader_mod
+
+    db = canonical_env["db"]
+    CanonicalWriter(db).close()
+    first = _outcome()
+    _seed_events(db, [first])
+
+    later = _outcome(paper_trade_id="PAPER:" + "f" * 20, episode_id="EP:3")
+    original_watermark = reader_mod._read_stream_watermark
+    state = {"interleaved": False}
+
+    def _interleaving_watermark(connection):
+        boundary = original_watermark(connection)
+        if not state["interleaved"]:
+            state["interleaved"] = True
+            # A separate writer connection commits a second outcome here.
+            _seed_events(db, [later])
+        return boundary
+
+    monkeypatch.setattr(
+        reader_mod, "_read_stream_watermark", _interleaving_watermark
+    )
+
+    in_flight = read_canonical_paper_outcomes(db)
+
+    assert state["interleaved"] is True
+    # The tip observed alongside the boundary is the pre-commit tip, so they
+    # still agree and no false integrity error is raised.
+    assert [o.outcome_id for o in in_flight.outcomes] == [first["outcome_id"]]
+
+    # A subsequent fresh read does see the newly committed outcome.
+    fresh = read_canonical_paper_outcomes(db)
+    assert [o.outcome_id for o in fresh.outcomes] == [
+        first["outcome_id"],
+        later["outcome_id"],
+    ]

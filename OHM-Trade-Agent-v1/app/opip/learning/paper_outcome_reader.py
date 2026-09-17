@@ -176,22 +176,39 @@ def _read_stream_watermark(connection) -> tuple[int, int] | None:
 
 
 def _event_count_and_tip(connection) -> tuple[int, tuple[int, int] | None]:
-    row = connection.execute(
+    """Count and true highest coordinate of recorded paper-outcome evidence.
+
+    The tip is read lexicographically, never as independent column maxima. A
+    canonical restore advances ``history_epoch`` and resets
+    ``next_local_sequence`` to 1, so ``(2, 1)`` is a higher coordinate than
+    ``(1, 40)``. Taking ``MAX(history_epoch)`` and ``MAX(local_sequence)``
+    separately would fabricate ``(2, 40)`` - a coordinate that need not exist -
+    and then report a false integrity failure against a correct watermark.
+
+    Scoped to paper-outcome events only: other streams share the global sequence
+    space, so the global event tip is never the right comparison here.
+    """
+    count_row = connection.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE event_type = ?",
+        (PAPER_OUTCOME_TERMINAL_RECORDED,),
+    ).fetchone()
+    count = int(count_row["n"]) if count_row is not None else 0
+    if count == 0:
+        return 0, None
+
+    tip_row = connection.execute(
         """
-        SELECT COUNT(*) AS n,
-               MAX(history_epoch) AS epoch,
-               MAX(local_sequence) AS seq
-        FROM events WHERE event_type = ?
+        SELECT history_epoch, local_sequence
+        FROM events
+        WHERE event_type = ?
+        ORDER BY history_epoch DESC, local_sequence DESC
+        LIMIT 1
         """,
         (PAPER_OUTCOME_TERMINAL_RECORDED,),
     ).fetchone()
-    count = int(row["n"] or 0)
-    if count == 0 or row["epoch"] is None:
+    if tip_row is None:
         return 0, None
-    # MAX over the two columns independently is only a tip when the pair is
-    # monotonic, which the writer's UNIQUE(epoch, sequence) plus single-writer
-    # ordering guarantees. Consistency is asserted by the caller.
-    return count, (int(row["epoch"]), int(row["seq"]))
+    return count, (int(tip_row["history_epoch"]), int(tip_row["local_sequence"]))
 
 
 def read_canonical_paper_outcomes(
@@ -226,42 +243,41 @@ def read_canonical_paper_outcomes(
         ) from exc
 
     try:
-        _assert_interpretable_schema(connection)
-        boundary = _read_stream_watermark(connection)
-        event_count, tip = _event_count_and_tip(connection)
+        try:
+            # One read transaction: the frozen boundary, the true paper-outcome
+            # tip, and the bounded evidence read all observe the same committed
+            # snapshot. Without it each statement could see a different commit,
+            # combining an older watermark with a newer tip and reporting a
+            # false integrity failure. WAL read transactions are the intended
+            # mechanism, so no lock is taken and the writer is never blocked.
+            connection.execute("BEGIN")
+            _assert_interpretable_schema(connection)
+            boundary = _read_stream_watermark(connection)
+            event_count, tip = _event_count_and_tip(connection)
 
-        # Stream consistency, using paper-outcome stream evidence only. A
-        # watermark without its boundary event, or an event beyond the frozen
-        # boundary, means the stream cannot be reconstructed faithfully.
-        if event_count and boundary is None:
-            raise PaperOutcomeIntegrityError(
-                "paper outcome events exist without a paper_outcome.v1 watermark"
-            )
-        if boundary is not None and event_count == 0:
-            raise PaperOutcomeIntegrityError(
-                "paper_outcome.v1 watermark exists with no paper outcome event"
-            )
-        if boundary is not None and tip is not None and tip > boundary:
-            raise PaperOutcomeIntegrityError(
-                "paper outcome events exist beyond the frozen stream watermark"
-            )
-        if boundary is not None and event_count:
-            exists = connection.execute(
-                """
-                SELECT 1 FROM events
-                WHERE event_type = ? AND history_epoch = ? AND local_sequence = ?
-                """,
-                (PAPER_OUTCOME_TERMINAL_RECORDED, int(boundary[0]), int(boundary[1])),
-            ).fetchone()
-            if exists is None:
+            # Boundary invariant, using paper-outcome stream evidence only:
+            # a non-empty stream's watermark must be exactly its true highest
+            # coordinate. Events without a watermark, a watermark without
+            # events, and a watermark that disagrees with the tip in either
+            # direction all mean the stream cannot be reconstructed faithfully.
+            if event_count and boundary is None:
                 raise PaperOutcomeIntegrityError(
-                    "paper_outcome.v1 watermark has no event at its claimed boundary"
+                    "paper outcome events exist without a paper_outcome.v1 watermark"
+                )
+            if boundary is not None and event_count == 0:
+                raise PaperOutcomeIntegrityError(
+                    "paper_outcome.v1 watermark exists with no paper outcome event"
+                )
+            if boundary is not None and tip is not None and boundary != tip:
+                raise PaperOutcomeIntegrityError(
+                    "paper_outcome.v1 watermark does not match the highest "
+                    "committed paper outcome"
                 )
 
-        stream_present = boundary is not None
-        rows = _read_outcome_events(connection, boundary)
-    except PaperOutcomeIntegrityError:
-        raise
+            stream_present = boundary is not None
+            rows = _read_outcome_events(connection, boundary)
+        except PaperOutcomeIntegrityError:
+            raise
     except sqlite3.Error as exc:
         raise PaperOutcomeIntegrityError(
             f"canonical paper outcome read failed: {exc}"
