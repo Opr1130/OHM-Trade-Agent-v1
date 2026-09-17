@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from app.opip.learning.paper_readiness import assess_paper_learning_readiness
@@ -117,54 +119,96 @@ def _capture_health(path: Path) -> tuple[dict[str, Any], int]:
     return _json_object(path)
 
 
-def _canonical_paper_outcomes(
-    db_path: Path | None = None,
-    spool_path: Path | None = None,
-) -> tuple[list[dict[str, Any]], str | None, tuple[str, ...]]:
-    """Read authoritative canonical terminal paper outcomes.
+def _verified_replica_inputs(
+    *,
+    root: Path | None = None,
+    expected_release_sha: str = "",
+    now: datetime | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    str | None,
+    tuple[str, ...],
+    int,
+]:
+    """Verify the canonical replica and read all three of its authority inputs.
 
-    Returns ``(rows, source_error, incomplete_reasons)``.
+    Returns ``(paper_outcome_rows, paper_lifecycle_rows, source_error,
+    incomplete_reasons, lifecycle_malformed_count)``.
 
-    A source that cannot be read is reported as ``source_error`` rather than as
-    zero outcomes: "cannot read" and "legitimately empty" are different states,
-    and conflating them would claim a complete, empty population when the
-    authority plane is simply unavailable.
+    Every input comes from **one** verified generation. That is the whole point
+    of resolving the bundle here rather than probing for a SQLite file: it makes
+    it structurally impossible to read a canonical store from one generation
+    while judging completeness from another generation's lifecycle state or gap
+    spool.
 
-    Unresolved evidence-gap entries make the population conservatively
-    incomplete. A corrupt spool is treated the same way - and is never
-    rewritten or quarantined just to make readiness succeed.
+    A source that cannot be proven is reported as ``source_error`` with no rows
+    at all. It is never reported as zero outcomes, and lifecycle rows from the
+    writable data root are deliberately not substituted - that substitution is
+    exactly what would let mutable local state stand in for an unavailable
+    authority plane.
     """
     import sqlite3
 
-    from app.opip.canonical.gap_spool import GapSpoolError, evidence_window_incomplete
+    from app.opip.learning.canonical_replica import (
+        ReplicaVerificationError,
+        resolve_verified_replica_bundle,
+    )
     from app.opip.learning.paper_outcome_reader import (
         PaperOutcomeIntegrityError,
-        PaperOutcomeSourceUnavailableError,
         read_canonical_paper_outcomes,
     )
-    from app.services.paper_trade_registry import EVIDENCE_GAP_SPOOL_FILE
 
     reasons: list[str] = []
     try:
-        read = read_canonical_paper_outcomes(db_path)
-        rows = [outcome.as_dict() for outcome in read.outcomes]
-        source_error = None
-    except (
-        PaperOutcomeSourceUnavailableError,
-        PaperOutcomeIntegrityError,
-        sqlite3.Error,
-        OSError,
-    ) as exc:
-        return [], f"{type(exc).__name__}: {exc}", ("CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",)
+        bundle = resolve_verified_replica_bundle(
+            root=root,
+            expected_source_release_sha=expected_release_sha,
+            now=now,
+        )
+    except ReplicaVerificationError as exc:
+        return [], [], f"{type(exc).__name__}: {exc}", (exc.reason,), 0
+    except (sqlite3.Error, OSError) as exc:
+        return [], [], f"{type(exc).__name__}: {exc}", (
+            "CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",
+        ), 0
 
-    target = Path(spool_path) if spool_path is not None else EVIDENCE_GAP_SPOOL_FILE
+    if not bundle.completeness_supported:
+        reasons.extend(bundle.completeness_reasons)
+
     try:
-        if evidence_window_incomplete(target):
+        read = read_canonical_paper_outcomes(bundle.canonical_db_path)
+        outcomes = [outcome.as_dict() for outcome in read.outcomes]
+    except (PaperOutcomeIntegrityError, sqlite3.Error, OSError) as exc:
+        return [], [], f"{type(exc).__name__}: {exc}", (
+            "CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",
+        ), 0
+
+    # Lifecycle rows come from this same generation, never from /app/data.
+    lifecycle_rows, lifecycle_malformed = _paper_rows(bundle.paper_state_path)
+    if lifecycle_malformed:
+        # Never let valid surviving rows hide malformed authority state. A mixed
+        # state file cannot certify a complete population for supervised truth.
+        reasons.append("PAPER_OUTCOME_LIFECYCLE_STATE_MALFORMED")
+
+    try:
+        spool = json.loads(bundle.paper_gap_spool_path.read_text(encoding="utf-8"))
+        unresolved = spool.get("unresolved") if isinstance(spool, dict) else None
+        if not isinstance(unresolved, list):
+            raise ValueError("gap spool has no unresolved list")
+        if unresolved:
             reasons.append("PAPER_OUTCOME_EVIDENCE_GAP_UNRESOLVED")
-    except GapSpoolError:
+    except (OSError, ValueError, TypeError):
         # Fail closed: a corrupt spool makes completeness unprovable.
         reasons.append("PAPER_OUTCOME_EVIDENCE_GAP_SPOOL_CORRUPT")
-    return rows, source_error, tuple(sorted(set(reasons)))
+
+    return (
+        outcomes,
+        lifecycle_rows,
+        None,
+        tuple(sorted(set(reasons))),
+        lifecycle_malformed,
+    )
 
 
 def build_production_readiness_report(
@@ -172,24 +216,34 @@ def build_production_readiness_report(
     canonical_path: Path = CANONICAL_EVIDENCE,
     snapshot_dir: Path = ML_SNAPSHOT_DIR,
     phase3c_path: Path = PHASE3C_OUTCOMES,
-    paper_state_path: Path = PAPER_STATE,
     capture_health_path: Path = CAPTURE_HEALTH,
     capture_dead_letter_path: Path = CAPTURE_DEAD_LETTER,
-    canonical_outcome_db_path: Path | None = None,
-    paper_gap_spool_path: Path | None = None,
+    canonical_replica_root: Path | None = None,
+    expected_release_sha: str = "",
+    readiness_now: datetime | None = None,
     long_paper_production_verified: bool = False,
 ) -> dict[str, Any]:
-    """Build one bounded production-evidence readiness snapshot."""
+    """Build one bounded production-evidence readiness snapshot.
+
+    Canonical paper-outcome authority is read exclusively through the verified
+    replica bundle. ``canonical_path`` and friends remain the legacy JSON/JSONL
+    evidence inputs, which are unrelated to canonical outcome authority.
+    """
     canonical_rows, canonical_malformed = _jsonl_rows(canonical_path)
     ml_rows, ml_malformed = _ml_rows(snapshot_dir)
     phase3c_rows, phase3c_malformed = _jsonl_rows(phase3c_path)
-    paper_rows, paper_malformed = _paper_rows(paper_state_path)
     dead_letter_rows, dead_letter_malformed = _jsonl_rows(capture_dead_letter_path)
     (
         paper_outcome_rows,
+        paper_rows,
         paper_outcome_source_error,
         paper_outcome_incomplete_reasons,
-    ) = _canonical_paper_outcomes(canonical_outcome_db_path, paper_gap_spool_path)
+        paper_malformed,
+    ) = _verified_replica_inputs(
+        root=canonical_replica_root,
+        expected_release_sha=expected_release_sha,
+        now=readiness_now,
+    )
     health, health_malformed = _capture_health(capture_health_path)
     health["malformed"] = int(health.get("malformed", 0) or 0) + (
         canonical_malformed
@@ -227,7 +281,9 @@ def build_production_readiness_report(
 
 def main() -> None:
     """Persist and print one readiness report; never schedule/train/promote."""
-    payload = build_production_readiness_report()
+    payload = build_production_readiness_report(
+        expected_release_sha=os.environ.get("OPIP_PRODUCTION_DEPLOYED_SHA", "").strip()
+    )
     save_json_atomic(READINESS_REPORT, payload)
     print(json.dumps(payload, sort_keys=True, allow_nan=False))
 

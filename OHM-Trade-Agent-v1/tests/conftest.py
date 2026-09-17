@@ -96,10 +96,17 @@ def stub_authoritative_directory_durability_on_windows(request, monkeypatch):
 
     from app.opip.canonical import backup as canonical_backup
     from app.opip.canonical import recovery as canonical_recovery
+    from app.opip.learning import canonical_replica as learning_replica
 
     monkeypatch.setattr(
         canonical_backup, "fsync_directory_required", lambda _directory: None
     )
     monkeypatch.setattr(
         canonical_recovery, "fsync_directory_required", lambda _directory: None
+    )
+    # The canonical learning replica publishes its manifest, generation
+    # directory and ``current`` pointer with the same authoritative primitive,
+    # so it is stubbed under exactly the same narrow rule.
+    monkeypatch.setattr(
+        learning_replica, "fsync_directory_required", lambda _directory: None
     )

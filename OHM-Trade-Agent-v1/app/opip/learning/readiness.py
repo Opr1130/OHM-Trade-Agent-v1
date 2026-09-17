@@ -13,9 +13,13 @@ from app.opip.learning.linkage import (
     LinkageStatus,
     OutcomeSourceQuality,
     build_learning_linkage_records,
+    committed_outcome_reconciliation_reasons,
     paper_outcome_population_incomplete,
 )
-from app.opip.contracts.paper_outcome import validate_terminal_outcome_payload
+from app.opip.contracts.paper_outcome import (
+    resolve_effective_outcome_ids,
+    validate_terminal_outcome_payload,
+)
 
 
 class MLReadinessState(str, Enum):
@@ -428,20 +432,45 @@ def build_ml_data_readiness_report(
 
     # Delivery completeness is local evidence about whether the canonical
     # population can be considered whole. A closed lifecycle does not imply
-    # complete evidence. Three independent sources are combined into ONE
+    # complete evidence. Independent sources are combined into ONE
     # authoritative decision, and that decision is enforced on eligibility -
     # not merely displayed in the report:
     #
     #   1. lifecycle delivery envelopes (PENDING / PERMANENT_FAILURE / missing);
     #   2. canonical source readability (an unreadable authority plane cannot
     #      certify a population, and must not be read as "empty");
-    #   3. unresolved or corrupt paper evidence-gap spool entries.
+    #   3. unresolved or corrupt paper evidence-gap spool entries;
+    #   4. cross-artifact reconciliation: every PR-A ``COMMITTED`` claim is
+    #      verified against the canonical outcomes of this SAME generation.
+    #
+    # (4) closes the capture race. The online backup, the lifecycle state file
+    # and the gap spool cannot be captured in one transaction, so a generation
+    # can be hash-valid and provenance-valid while pairing a canonical snapshot
+    # with a newer state file that claims an outcome the snapshot lacks.
+    # ``COMMITTED`` is a claim about canonical authority, so it is verified
+    # rather than trusted.
     outcome_reasons: set[str] = set()
     lifecycle_incomplete, lifecycle_reasons = paper_outcome_population_incomplete(
         paper_safe
     )
     if lifecycle_incomplete:
         outcome_reasons.update(lifecycle_reasons)
+
+    # Effective identities only: a governed correction must not read as a
+    # missing outcome because its superseded predecessor is also stored. An
+    # unreadable identity graph is itself unprovable completeness, so it fails
+    # closed rather than being treated as "no canonical outcomes".
+    try:
+        canonical_effective_ids = set(resolve_effective_outcome_ids(paper_outcome_safe))
+    except ValueError:
+        canonical_effective_ids = set()
+        outcome_reasons.add("CANONICAL_OUTCOME_IDENTITY_INVALID")
+    else:
+        identity_reasons, missing_reasons = committed_outcome_reconciliation_reasons(
+            paper_safe, canonical_effective_ids
+        )
+        outcome_reasons.update(identity_reasons)
+        outcome_reasons.update(missing_reasons)
     outcome_reasons.update(
         str(reason) for reason in paper_outcome_incomplete_reasons if str(reason).strip()
     )

@@ -7,6 +7,11 @@ DATA_ROOT="/var/lib/opip-learning/data"
 STATE_ROOT="/var/lib/opip-learning/state"
 INCOMING="$DATA_ROOT/.incoming"
 ARCHIVE="$DATA_ROOT/.export.tar"
+# Dedicated canonical replica store, deliberately OUTSIDE the writable data
+# root: the data root is mounted writable into learning job containers, so a
+# replica stored beneath it could be reached through a writable alias.
+CANONICAL_REPLICA_ROOT="${OPIP_LEARNING_CANONICAL_REPLICA_ROOT:-/var/lib/opip-learning/canonical-replica}"
+CANONICAL_REPLICA_INCOMING_NAME=""
 
 [[ -r "$ENV_FILE" ]] || {
   echo "missing O'Pip learning environment: $ENV_FILE" >&2
@@ -19,20 +24,44 @@ source "$ENV_FILE"
 : "${OPIP_PRODUCTION_USER:?OPIP_PRODUCTION_USER is required}"
 : "${OPIP_DEPLOYED_SHA:?OPIP_DEPLOYED_SHA is required}"
 : "${OPIP_LEARNING_SSH_KEY:=/root/.ssh/opip-learning}"
+# The application package is guaranteed inside the learning image, not as a
+# host-installed Python package. Replica verification/install must run in the
+# exact configured image rather than a host interpreter.
+: "${OPIP_LEARNING_IMAGE:?OPIP_LEARNING_IMAGE is required}"
 
 [[ "$OPIP_DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
   echo "invalid OPIP_DEPLOYED_SHA" >&2
   exit 78
 }
 
-for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs; do
+for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs docker realpath; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning sync command: $cmd" >&2
     exit 69
   }
 done
 
+# Resolve aliases before enforcing the storage boundary. A lexical check alone
+# is insufficient because a configured path can traverse a symlink into the
+# writable data tree. realpath -m resolves existing symlink components while
+# also supporting a not-yet-created final replica directory.
+DATA_ROOT_RESOLVED="$(realpath -m -- "$DATA_ROOT")"
+CANONICAL_REPLICA_ROOT_RESOLVED="$(realpath -m -- "$CANONICAL_REPLICA_ROOT")"
+case "$CANONICAL_REPLICA_ROOT_RESOLVED/" in
+  "$DATA_ROOT_RESOLVED"/*)
+    echo "O'Pip learning sync: canonical replica root must not resolve beneath the data root" >&2
+    exit 78
+    ;;
+esac
+[[ "$CANONICAL_REPLICA_ROOT_RESOLVED" != "$DATA_ROOT_RESOLVED" ]] || {
+  echo "O'Pip learning sync: canonical replica root must resolve outside the data root" >&2
+  exit 78
+}
+CANONICAL_REPLICA_ROOT="$CANONICAL_REPLICA_ROOT_RESOLVED"
+
 install -d -o root -g root -m 0755 "$DATA_ROOT" "$INCOMING" "$STATE_ROOT"
+# Root-owned and not group/world writable: only this sync script writes here.
+install -d -o root -g root -m 0755 "$CANONICAL_REPLICA_ROOT"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -176,6 +205,152 @@ if [[ "$release_status" == "RELEASE_DRIFT" ]]; then
   echo "O'Pip learning sync: RELEASE_DRIFT worker=$OPIP_DEPLOYED_SHA production=$production_sha (sync allowed; compute blocked)" >&2
 fi
 
+# ---------------------------------------------------------------------------
+# Canonical learning replica.
+#
+# Two distinct write boundaries are at play and must not be conflated:
+#   * this sync script is the trusted administrative installer of replica
+#     generations and the current pointer, so its helper container mounts the
+#     store read-write;
+#   * learning job containers are read-only consumers and never receive a
+#     writable canonical mount.
+# The replica is never promoted to runtime authority while releases differ.
+# ---------------------------------------------------------------------------
+tree_bytes() {
+  find "$1" -type f -printf '%s\n' | awk '{total += $1} END {printf "%d\n", total}'
+}
+tree_sha256() {
+  (
+    cd "$1"
+    find . -type f -print0 | sort -z | xargs -0 -r sha256sum
+  ) | sha256sum | awk '{print $1}'
+}
+
+# Replica work is a one-shot container built on the same security posture as
+# the learning jobs. The image is authoritative for the application code.
+replica_helper() {
+  local -a extra_mounts=()
+  local -a extra_env=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --input-ro) extra_mounts+=(-v "$2:$2:ro"); shift 2 ;;
+      --store-rw) extra_mounts+=(-v "$2:$2:rw"); extra_env+=(-e "OPIP_CANONICAL_REPLICA_STORE=$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
+  docker run --rm \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 128 \
+    --memory 384m \
+    --memory-swap 384m \
+    --cpus 0.60 \
+    --oom-score-adj 700 \
+    --tmpfs /tmp:rw,noexec,nosuid,size=48m \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    "${extra_mounts[@]}" \
+    "${extra_env[@]}" \
+    "$OPIP_LEARNING_IMAGE" \
+    python -m app.opip.learning.canonical_replica "$@"
+}
+
+validate_canonical_replica_outer() {
+  local bundle="$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME"
+  [[ -d "$bundle" ]] || {
+    echo "O'Pip learning sync: marker declares a canonical replica but the bundle is absent" >&2
+    exit 66
+  }
+  local expected_bytes expected_sha actual_bytes actual_sha
+  expected_bytes="$(manifest_value canonical_learning_replica_bytes)"
+  expected_sha="$(manifest_value canonical_learning_replica_sha256)"
+  [[ "$expected_bytes" =~ ^[0-9]+$ ]] || {
+    echo "O'Pip learning sync: canonical replica bytes missing/invalid" >&2
+    exit 65
+  }
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "O'Pip learning sync: canonical replica sha256 missing/invalid" >&2
+    exit 65
+  }
+  [[ "$CANONICAL_REPLICA_INCOMING_NAME" == "canonical_learning_replica.$expected_sha" ]] || {
+    echo "O'Pip learning sync: canonical replica directory is not bound to its outer sha256" >&2
+    exit 65
+  }
+  actual_bytes="$(tree_bytes "$bundle")"
+  if [[ "$actual_bytes" != "$expected_bytes" ]]; then
+    echo "O'Pip learning sync: canonical replica bytes mismatch ($actual_bytes != $expected_bytes)" >&2
+    exit 65
+  fi
+  actual_sha="$(tree_sha256 "$bundle")"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    echo "O'Pip learning sync: canonical replica sha256 mismatch" >&2
+    exit 65
+  fi
+}
+
+# Inner provenance verification. The Python layer is authoritative for replica
+# schema, generation identity, SQLite canonical validity, rollback-journal
+# normalization, sidecar independence, snapshot facts, companion hashes,
+# freshness and source release binding; shell reproduces none of it.
+validate_canonical_replica_inner() {
+  replica_helper \
+    --input-ro "$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME" \
+    verify \
+    --root "$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME" \
+    --release-sha "$production_sha"
+}
+
+# Install the validated generation: immutable generations/<id> plus an atomic
+# current pointer, with bounded retention. A failure here leaves the previous
+# current generation untouched.
+install_canonical_replica() {
+  replica_helper \
+    --input-ro "$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME" \
+    --store-rw "$CANONICAL_REPLICA_ROOT" \
+    install \
+    --staging "$INCOMING/$CANONICAL_REPLICA_INCOMING_NAME" \
+    --host-root "$CANONICAL_REPLICA_ROOT" \
+    --release-sha "$production_sha"
+}
+
+CANONICAL_REPLICA_REQUIRED=0
+REPLICA_MARKER="$(manifest_value canonical_learning_replica_version)"
+case "$REPLICA_MARKER" in
+  "1")
+    # The export declares a canonical generation, so its immutable directory is
+    # mandatory and path-safe. Only the fixed prefix plus its tree SHA is
+    # accepted; slashes, traversal and arbitrary tar member names are rejected.
+    CANONICAL_REPLICA_INCOMING_NAME="$(manifest_value canonical_learning_replica_dir)"
+    [[ "$CANONICAL_REPLICA_INCOMING_NAME" =~ ^canonical_learning_replica\.[0-9a-f]{64}$ ]] || {
+      echo "O'Pip learning sync: canonical replica directory marker missing/invalid" >&2
+      exit 65
+    }
+    CANONICAL_REPLICA_REQUIRED=1
+    [[ "$production_sha" =~ ^[0-9a-f]{40}$ ]] || {
+      echo "O'Pip learning sync: canonical replica requires a valid production_deployed_sha" >&2
+      exit 65
+    }
+    ;;
+  "")
+    # The marker describes the incoming export, never the worker code version.
+    # Worker generation is established from the deployed SHA and release
+    # compatibility, so this is not a circular inference.
+    if [[ "$release_status" == "CURRENT" ]]; then
+      # A current bridge worker must not silently accept a production export
+      # with no canonical replica contract: that would let readiness fall back
+      # to a legacy path while claiming canonical authority is present.
+      echo "O'Pip learning sync: CURRENT release but export declares no canonical replica" >&2
+      exit 65
+    fi
+    echo "O'Pip learning sync: no canonical replica marker (release=$release_status); legacy sync only"
+    ;;
+  *)
+    echo "O'Pip learning sync: unsupported canonical_learning_replica_version=$REPLICA_MARKER" >&2
+    exit 65
+    ;;
+esac
+
 validate_artifact() {
   local name="$1"
   local key="$2"
@@ -255,6 +430,15 @@ validate_archive "opip/qualification/screening_evaluations_archive" "opip_qualif
 validate_archive "opip/qualification/funnel_events_archive" "opip_qualification_funnel_archive"
 validate_archive "opip/qualification/scan_summaries_archive" "opip_qualification_summaries_archive"
 
+# Canonical replica validation happens before ANY publication, so a defective
+# bundle cannot leave the data root half-updated. Outer transport integrity and
+# inner evidence provenance are deliberately separate checks: a bundle can be
+# internally consistent at the tar layer and still be invalid evidence.
+if (( CANONICAL_REPLICA_REQUIRED )); then
+  validate_canonical_replica_outer
+  validate_canonical_replica_inner
+fi
+
 rm -f -- \
   "$DATA_ROOT/p1_shadow_outbox.jsonl" \
   "$DATA_ROOT/p1_shadow_outbox_checkpoint.json" \
@@ -284,7 +468,21 @@ for name in \
   mv -f -- "$INCOMING/$name" "$DATA_ROOT/$name"
 done
 mv -f -- "$INCOMING/manifest.env" "$DATA_ROOT/manifest.env"
+
+# Canonical generation activation comes last, inside the plane lock. No learning
+# consumer can run while this lock is held, so publishing the data manifest
+# before activating the replica cannot expose an uncommitted generation. If
+# activation fails, the previous current generation (or none) remains, and
+# learning fails closed rather than running against a stale-but-claimed replica.
+if (( CANONICAL_REPLICA_REQUIRED )); then
+  install_canonical_replica
+fi
+
 rm -f "$ARCHIVE"
+# Clear attempt-scoped incoming data so failed or repeated syncs cannot
+# accumulate. Scoped to $INCOMING only; the replica store is never touched here.
+rm -rf -- "${INCOMING:?}/"*
+rm -f -- "${INCOMING:?}/".[!.]* 2>/dev/null || true
 
 printf 'last_sync_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   > "$DATA_ROOT/.last_sync"

@@ -7,7 +7,7 @@ READER_STATE_ROOT="/var/lib/opip-learning-reader"
 READER_STATE_FILE="$READER_STATE_ROOT/last_sync_request.env"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
-for cmd in date mv flock tar; do
+for cmd in date mv flock tar awk; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "O'Pip learning reader: missing $cmd" >&2
     exit 69
@@ -142,6 +142,68 @@ else
   exit 126
 fi
 
+# Hold the shared publish lock for the whole of the availability check, the
+# committed-manifest inspection and the tar emission. Taking it before reading
+# the marker is what guarantees the marker (manifest.env) and the canonical
+# replica directory come from one committed production export generation, and
+# that the exporter cannot replace any artifact mid-stream.
+#
+# The forced command is read-only with respect to trading/export artifacts. The
+# only write is a bounded observability heartbeat in the dedicated reader-state
+# directory.
+exec 8<"$PUBLISH_LOCK"
+flock -s 8
+
+# The canonical learning replica is an additive schema-4 feature. Its presence
+# and immutable content-addressed directory are announced by the COMMITTED
+# manifest only; uncommitted staging is never inspected.
+REPLICA_MARKER=""
+CANONICAL_REPLICA_DIR=""
+if [[ -r "$EXPORT_ROOT/manifest.env" ]]; then
+  REPLICA_MARKER="$(awk -F= '$1 == "canonical_learning_replica_version" {sub(/^[^=]*=/, ""); print; exit}' \
+    "$EXPORT_ROOT/manifest.env" 2>/dev/null || true)"
+  CANONICAL_REPLICA_DIR="$(awk -F= '$1 == "canonical_learning_replica_dir" {sub(/^[^=]*=/, ""); print; exit}' \
+    "$EXPORT_ROOT/manifest.env" 2>/dev/null || true)"
+fi
+
+TAR_MEMBERS=(
+  full_market_observations.jsonl
+  p1_evidence_ledger.jsonl
+  intelligence_learning/events.jsonl
+  opip/qualification/screening_evaluations.jsonl
+  opip/qualification/funnel_events.jsonl
+  opip/qualification/scan_summaries.jsonl
+  paper_trading/events.jsonl
+  telegram_delivery_events.jsonl
+  decision_telemetry.jsonl
+  opip_trade_quality_evidence_v1.jsonl
+  candidate_trace.jsonl
+  opip/qualification/screening_evaluations_archive
+  opip/qualification/funnel_events_archive
+  opip/qualification/scan_summaries_archive
+  manifest.env
+)
+
+if [[ -n "$REPLICA_MARKER" ]]; then
+  if [[ "$REPLICA_MARKER" != "1" ]]; then
+    echo "O'Pip learning reader: unsupported canonical replica version: $REPLICA_MARKER" >&2
+    exit 126
+  fi
+  if [[ ! "$CANONICAL_REPLICA_DIR" =~ ^canonical_learning_replica\.[0-9a-f]{64}$ ]]; then
+    echo "O'Pip learning reader: invalid canonical replica directory marker" >&2
+    exit 126
+  fi
+  # The committed manifest claims a canonical generation, so the exact named
+  # directory must be present. Never silently omit it: serving a marker-bearing
+  # manifest without its bundle would let learning believe it has canonical
+  # evidence.
+  if [[ ! -d "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" || ! -r "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" ]]; then
+    echo "O'Pip learning reader: export unavailable: $CANONICAL_REPLICA_DIR" >&2
+    exit 66
+  fi
+  TAR_MEMBERS+=("$CANONICAL_REPLICA_DIR")
+fi
+
 for name in \
   full_market_observations.jsonl \
   p1_evidence_ledger.jsonl \
@@ -164,25 +226,4 @@ for name in \
   fi
 done
 
-# The forced command is read-only with respect to trading/export artifacts.
-# A shared publish lock prevents the exporter from replacing any artifact while
-# the tar stream is emitted. The only write is a bounded observability heartbeat
-# in the dedicated reader-state directory.
-exec 8<"$PUBLISH_LOCK"
-flock -s 8
-exec tar -C "$EXPORT_ROOT" -cf - \
-  full_market_observations.jsonl \
-  p1_evidence_ledger.jsonl \
-  intelligence_learning/events.jsonl \
-  opip/qualification/screening_evaluations.jsonl \
-  opip/qualification/funnel_events.jsonl \
-  opip/qualification/scan_summaries.jsonl \
-  paper_trading/events.jsonl \
-  telegram_delivery_events.jsonl \
-  decision_telemetry.jsonl \
-  opip_trade_quality_evidence_v1.jsonl \
-  candidate_trace.jsonl \
-  opip/qualification/screening_evaluations_archive \
-  opip/qualification/funnel_events_archive \
-  opip/qualification/scan_summaries_archive \
-  manifest.env
+exec tar -C "$EXPORT_ROOT" -cf - "${TAR_MEMBERS[@]}"

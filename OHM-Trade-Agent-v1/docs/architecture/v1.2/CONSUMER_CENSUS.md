@@ -23,8 +23,40 @@ Copy-only export: `deploy/remote/export-opip-learning-evidence.sh`, cron `deploy
 | `opip_trade_quality_evidence_v1.jsonl` | `app/services/trade_quality_evidence_registry.py` | optional | learning export |
 | `candidate_trace.jsonl` | `app/services/candidate_trace.py` | optional | debug/trace |
 | `manifest.env` | export script | yes | learning sync admission |
+| `canonical_learning_replica/` (bundle) | `app.opip.learning.canonical_replica` via the export script | yes when `canonical_learning_replica_version=1` | learning readiness / linkage |
 
 `p1_shadow_outbox.jsonl` is **retired** and must not be recreated or exported.
+
+## Canonical learning replica (PR-A)
+
+The JSONL rows above are non-authoritative for terminal paper outcomes. Those
+travel as a verified copy-only **read-only replica** inside the same generation:
+
+| Path in the bundle | Role | Authority |
+| --- | --- | --- |
+| `opip/canonical/opip_canonical_v1.sqlite3` | terminal paper economic outcomes | replica of the production canonical authority |
+| `paper_trading/state.json` | outbox delivery state | completeness companion |
+| `paper_trading/evidence_gap_spool.json` | unresolved evidence gaps | completeness companion |
+| `replica_manifest.json` | binds the three by hash/size plus snapshot facts | provenance contract |
+
+Three authorities, kept distinct:
+
+- **Production canonical SQLite** — economic evidence authority; the only
+  canonical writer.
+- **Learning replica generation** — read-only replica; authoritative for
+  nothing, and never an execution authority.
+- **Lifecycle state + gap spool** — completeness companions; without them a
+  complete population cannot be certified.
+
+Consumers within one generation must not be mixed: readiness resolves the
+verified bundle first and reads all three inputs from that single object, so a
+canonical row is never judged complete using another generation's state or gap
+spool. Installations are immutable generations addressed by an atomically
+replaced `current` pointer, retaining the active generation plus one previous
+known-good.
+
+Cadence: export ≈ 2 minutes, sync ≈ 2 minutes, freshness limit 1800 seconds.
+Operation detail lives in [deploy/learning/README.md](../../../deploy/learning/README.md).
 
 ## Bounded JSONL (canonical helper)
 

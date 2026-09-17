@@ -102,7 +102,25 @@ def test_production_export_is_copy_only_and_locked():
         source,
     )
     assert "mv -f" in source
-    assert "python" not in source
+    # The exporter was originally copy-only shell. The canonical learning-replica
+    # snapshot requires the PR-A0 SQLite online-backup path, which is mandated to
+    # stay in Python rather than being reimplemented in Bash, so the script now
+    # invokes exactly one helper. Count actual module invocations, not harmless
+    # references such as the executable preflight check.
+    python_invocations = re.findall(
+        r'(?m)^(?!\s*#).*"\$PYTHON_BIN"\s+-m\s+.*$', source
+    )
+    assert len(python_invocations) == 1
+    assert "app.opip.learning.canonical_replica export" in python_invocations[0]
+    for forbidden in (
+        "app.jobs.run_opip_ml_capture",
+        "run_opportunity_intelligence_cycle",
+        "build_phase3c_forward_outcomes",
+        "app.opip.canonical.writer",
+        "app.opip.canonical.server",
+        "sqlite3 ",
+    ):
+        assert forbidden not in source, f"export must not perform {forbidden}"
     assert "production_empty_export_attestation_eligible" in source
     assert "empty_export_attestation_v1.json" in source
     assert "state_json_is_certified_empty_without_manifest" in source
@@ -149,11 +167,15 @@ def test_learning_job_runner_has_clean_entry_and_clean_exit():
     assert "--cap-drop ALL" in source
     assert "trap cleanup EXIT INT TERM" in source
     assert 'docker rm -f "${remaining_ids[@]}"' in source
-    assert source.count('MEMORY_LIMIT="384m"') == 2
+    # Three jobs share the bounded 384m / 512MiB-headroom profile: capture
+    # (and reconcile), outcomes, and readiness. Counted so a new job cannot
+    # silently adopt a different resource envelope.
+    assert source.count('MEMORY_LIMIT="384m"') == 3
     assert 'MODULE="app.jobs.run_opportunity_intelligence_cycle"' in source
     assert "app.jobs.build_phase3c_forward_outcomes" not in source
     assert 'MEMORY_LIMIT="512m"' not in source
-    assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 2
+    assert source.count('MIN_AVAILABLE_KB=$((512 * 1024))') == 3
+    assert 'MODULE="app.jobs.run_opip_ml_data_readiness"' in source
     assert 'P1_SHADOW_OUTBOX_RETIRED="$(manifest_value p1_shadow_outbox_retired)"' in source
     assert 'write_disposition "CONSUMED_EMPTY"' in source
 
