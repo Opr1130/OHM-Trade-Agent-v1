@@ -500,20 +500,56 @@ def test_correction_is_append_only_and_preserves_history(canonical_store):
         original = _payload()
         assert _submit(writer, original).status == "OK"
 
-        corrected = _payload(gross_pnl=-10.0, net_pnl=-14.0)
-        corrected["supersedes_id"] = original["outcome_id"]
-        corrected["supersession_reason"] = "fee model corrected after review"
-        # A correction carries a new identity and therefore a new idempotency key.
-        corrected_key = terminal_outcome_idempotency_key(corrected["outcome_id"] + ":r2")
-        ack = _submit(writer, corrected, key=corrected_key)
+        # A correction is a NEW identity (sequence 1) that names what it
+        # supersedes, so retries of the original stay idempotent.
+        corrected = _payload(
+            gross_pnl=-10.0,
+            net_pnl=-14.0,
+            correction_seq=1,
+            supersedes_id=original["outcome_id"],
+            supersession_reason="fee model corrected after review",
+        )
+        assert corrected["outcome_id"] != original["outcome_id"]
+        ack = _submit(writer, corrected)
         assert ack.status == "OK", ack.detail
 
         rows = _events(canonical_store)
         assert len(rows) == 2
+        # The superseded record is still present: history is never erased.
         assert original["outcome_id"] in rows[0][1]
         assert original["outcome_id"] in rows[1][1]
     finally:
         writer.close()
+
+
+def test_correction_resolves_to_the_effective_record():
+    """Linkage reads the effective outcome, not the superseded history."""
+    from app.opip.learning.linkage import resolve_effective_outcomes
+
+    original = _payload()
+    corrected = _payload(
+        gross_pnl=-10.0,
+        net_pnl=-14.0,
+        correction_seq=1,
+        supersedes_id=original["outcome_id"],
+    )
+    effective = resolve_effective_outcomes([original, corrected])
+    assert [row["outcome_id"] for row in effective] == [corrected["outcome_id"]]
+
+
+def test_sequence_zero_cannot_supersede():
+    with pytest.raises(ValueError, match="cannot supersede"):
+        _payload(supersedes_id="PAPER-OUTCOME:" + "e" * 32)
+
+
+def test_a_correction_must_name_what_it_supersedes():
+    with pytest.raises(ValueError, match="must name the outcome it supersedes"):
+        _payload(correction_seq=1)
+
+    payload = _payload()
+    stripped = {k: v for k, v in payload.items() if k != "correction_seq"}
+    with pytest.raises(ValueError, match="missing keys: correction_seq"):
+        validate_terminal_outcome_payload(stripped)
 
 
 # ---------------------------------------------------------------------------

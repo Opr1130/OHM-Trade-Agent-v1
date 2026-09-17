@@ -272,20 +272,37 @@ def save_lifecycle(
         # lifecycle row and the intent that describes it commit together. The
         # revision is already final here, which is what makes the persisted
         # intent byte-identical on every later retry.
+        #
+        # A lifecycle that already reached a settled delivery keeps its existing
+        # envelope rather than being rebuilt. Rebuilding would embed the new
+        # revision, and since recorded provenance participates in conflict
+        # detection the resubmission would be rejected as a conflict instead of
+        # resolving as a duplicate - turning a harmless re-save into a permanent
+        # evidence failure.
         if terminal:
-            envelope = build_outcome_envelope(
-                trade,
-                terminal_event_type=event_type,
-                terminal_event_id=_event_id(trade, event_type),
+            prior = current.get("outcome_outbox")
+            prior_delivery = (
+                str(prior.get("delivery") or "") if isinstance(prior, dict) else ""
             )
-            if envelope is not None:
-                trade.outcome_outbox = envelope
+            if prior_delivery in {DELIVERY_COMMITTED, DELIVERY_PERMANENT_FAILURE}:
+                envelope = None
+                trade.outcome_outbox = prior
+            else:
+                envelope = build_outcome_envelope(
+                    trade,
+                    terminal_event_type=event_type,
+                    terminal_event_id=_event_id(trade, event_type),
+                )
+                if envelope is not None:
+                    trade.outcome_outbox = envelope
 
         rows[trade.paper_trade_id] = asdict(trade)
         _save_rows(rows, state_file)
 
     # The append is self-recording: `_append_event` durably records its own
-    # evidence gap on failure, so a lost terminal event is already visible.
+    # evidence gap on failure, so a lost terminal event is already visible and
+    # callers do not need to branch on the result. The boolean is intentionally
+    # discarded here.
     _append_event(trade, event_type, event_file=event_file, details=details)
 
     # Delivery happens only after the operational transition is durable, and

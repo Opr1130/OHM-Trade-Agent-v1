@@ -139,6 +139,7 @@ def _canonical_paper_outcomes(
     from app.opip.canonical.gap_spool import GapSpoolError, evidence_window_incomplete
     from app.opip.learning.paper_outcome_reader import (
         PaperOutcomeIntegrityError,
+        PaperOutcomeSourceUnavailableError,
         read_canonical_paper_outcomes,
     )
     from app.services.paper_trade_registry import EVIDENCE_GAP_SPOOL_FILE
@@ -148,7 +149,12 @@ def _canonical_paper_outcomes(
         read = read_canonical_paper_outcomes(db_path)
         rows = [outcome.as_dict() for outcome in read.outcomes]
         source_error = None
-    except (PaperOutcomeIntegrityError, sqlite3.Error, OSError) as exc:
+    except (
+        PaperOutcomeSourceUnavailableError,
+        PaperOutcomeIntegrityError,
+        sqlite3.Error,
+        OSError,
+    ) as exc:
         return [], f"{type(exc).__name__}: {exc}", ("CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",)
 
     target = Path(spool_path) if spool_path is not None else EVIDENCE_GAP_SPOOL_FILE

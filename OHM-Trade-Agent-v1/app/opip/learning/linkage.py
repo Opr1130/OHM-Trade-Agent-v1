@@ -554,10 +554,37 @@ def _paper_by_episode(
     return by_episode
 
 
+def resolve_effective_outcomes(
+    rows: Iterable[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Reduce an append-only outcome set to its currently effective records.
+
+    A governed correction is a *new* identity carrying ``supersedes_id``, so the
+    superseded record remains in canonical storage as history. Linkage must
+    therefore resolve the effective record rather than treating history as a
+    conflict - otherwise every corrected outcome would become unusable.
+
+    A fork (two records superseding the same one) deliberately leaves both in
+    place so the caller's ambiguity handling fails closed rather than letting
+    ordering pick a winner.
+    """
+    materialised = list(rows)
+    superseded = {
+        str(row.get("supersedes_id"))
+        for row in materialised
+        if str(row.get("supersedes_id") or "").strip()
+    }
+    return [
+        row
+        for row in materialised
+        if str(row.get("outcome_id") or "").strip() not in superseded
+    ]
+
+
 def canonical_outcomes_by_episode(
     rows: Iterable[Mapping[str, Any]],
 ) -> dict[str, list[Mapping[str, Any]]]:
-    """Index authoritative canonical outcomes by episode.
+    """Index effective authoritative canonical outcomes by episode.
 
     A duplicate ``outcome_id`` is impossible under the writer's uniqueness
     constraint, so seeing one means the store was tampered with or hand-edited.
@@ -706,7 +733,9 @@ def build_learning_linkage_records(
     phase3c = select_latest_phase3c_outcomes(phase3c_outcome_rows)
     paper_latest = select_latest_paper_trades(paper_trade_rows)
     paper_by_episode = _paper_by_episode(paper_latest)
-    canonical_outcomes = canonical_outcomes_by_episode(paper_outcome_rows)
+    canonical_outcomes = canonical_outcomes_by_episode(
+        resolve_effective_outcomes(paper_outcome_rows)
+    )
     canonical_ids_by_episode: dict[str, list[str]] = {}
     for canonical_snapshot_id, canonical_row in canonical_index.items():
         canonical_episode_id = str(canonical_row.get("episode_id") or "").strip()

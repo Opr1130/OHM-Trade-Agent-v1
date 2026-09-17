@@ -391,6 +391,32 @@ def test_reprocessing_a_closed_lifecycle_does_not_duplicate(canonical_env, paper
     assert json.loads(rows[0][1])["outcome_id"] == first
 
 
+def test_resaving_a_settled_terminal_lifecycle_keeps_its_delivery(canonical_env, paper_env, servers):
+    """A re-save must not rebuild the envelope into a permanent conflict.
+
+    Rebuilding would embed the new revision, and recorded provenance takes part
+    in conflict detection, so the retry would be rejected as a conflict and a
+    settled COMMITTED delivery would degrade into a permanent failure.
+    """
+    outbox.set_writer_client_for_tests(InProcessWriterClient(servers()))
+    trade = _seed_terminal(paper_env)
+    assert _envelope(paper_env)["delivery"] == outbox.DELIVERY_COMMITTED
+    committed_intent = _envelope(paper_env)["intent"]
+
+    registry.save_lifecycle(
+        trade,
+        event_type="CLOSED_STOP",
+        state_file=paper_env["state"],
+        event_file=paper_env["events"],
+    )
+
+    envelope = _envelope(paper_env)
+    assert envelope["delivery"] == outbox.DELIVERY_COMMITTED
+    # The persisted intent is unchanged, so it remains byte-identical on retry.
+    assert envelope["intent"] == committed_intent
+    assert len(_canonical_rows(canonical_env)) == 1
+
+
 # ---------------------------------------------------------------------------
 # Layer 2 - transport failure injection and the disposition table
 # ---------------------------------------------------------------------------

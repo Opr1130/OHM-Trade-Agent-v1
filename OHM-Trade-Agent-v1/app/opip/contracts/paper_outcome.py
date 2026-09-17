@@ -130,6 +130,7 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "economic_model_version",
     "final_revision",
     "terminal_event_id",
+    "correction_seq",
     "lineage_completeness",
     "lineage_missing",
 )
@@ -176,6 +177,7 @@ def terminal_outcome_id(
     paper_trade_id: str,
     terminal_status: str,
     exit_reason: str,
+    correction_seq: int = 0,
 ) -> str:
     """Deterministic identity of one terminal economic outcome.
 
@@ -186,6 +188,12 @@ def terminal_outcome_id(
 
     ``engine`` is included so two engines simulating the same opportunity can
     never alias onto a single outcome.
+
+    ``correction_seq`` is the explicit correction discriminator. The first
+    recorded outcome is sequence 0 and every retry of it reproduces sequence 0,
+    so retries stay idempotent. A governed correction is a *new* identity at
+    sequence 1, 2, ... carrying ``supersedes_id`` - which is what lets readers
+    resolve supersession without erasing history.
     """
     return stable_hash(
         "PAPER-OUTCOME",
@@ -194,6 +202,7 @@ def terminal_outcome_id(
             "paper_trade_id": str(paper_trade_id),
             "terminal_status": str(terminal_status),
             "exit_reason": str(exit_reason),
+            "correction_seq": int(correction_seq),
         },
     )
 
@@ -314,9 +323,19 @@ def validate_terminal_outcome_payload(payload: Mapping[str, Any]) -> dict[str, A
         paper_trade_id=str(payload["paper_trade_id"]),
         terminal_status=terminal_status,
         exit_reason=exit_reason,
+        correction_seq=int(payload["correction_seq"]),
     )
     if str(payload["outcome_id"]) != expected_id:
         raise ValueError("outcome_id does not match its identity")
+
+    correction_seq = payload["correction_seq"]
+    if isinstance(correction_seq, bool) or not isinstance(correction_seq, int) or correction_seq < 0:
+        raise ValueError("correction_seq must be a non-negative integer")
+    supersedes = payload.get("supersedes_id")
+    if correction_seq == 0 and str(supersedes or "").strip():
+        raise ValueError("sequence 0 is the original outcome and cannot supersede")
+    if correction_seq > 0 and not str(supersedes or "").strip():
+        raise ValueError("a correction must name the outcome it supersedes")
 
     if str(payload["economic_model_version"]) != PAPER_SIM_ECONOMIC_MODEL_VERSION:
         raise ValueError("unsupported economic model version")
@@ -401,6 +420,7 @@ def build_terminal_outcome_payload(
     learning_version: str | None = None,
     supersedes_id: str | None = None,
     supersession_reason: str | None = None,
+    correction_seq: int = 0,
 ) -> dict[str, Any]:
     """Construct and validate a terminal outcome payload.
 
@@ -420,6 +440,7 @@ def build_terminal_outcome_payload(
             paper_trade_id=paper_trade_id,
             terminal_status=terminal_status,
             exit_reason=exit_reason,
+            correction_seq=correction_seq,
         ),
         "engine": engine,
         "paper_trade_id": paper_trade_id,
@@ -454,6 +475,7 @@ def build_terminal_outcome_payload(
         "economic_model_version": PAPER_SIM_ECONOMIC_MODEL_VERSION,
         "final_revision": final_revision,
         "terminal_event_id": terminal_event_id,
+        "correction_seq": int(correction_seq),
         "supersedes_id": supersedes_id,
         "supersession_reason": supersession_reason,
     }

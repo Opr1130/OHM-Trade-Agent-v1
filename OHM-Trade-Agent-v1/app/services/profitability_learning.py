@@ -342,6 +342,12 @@ def active_profile_id() -> str | None:
     if not isinstance(profile, dict):
         return None
     value = profile.get("profile_id")
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    stored = value.strip()
+    # Recompute from the multiplier-relevant content rather than trusting the
+    # stored string: a profile must not be able to claim an approved identity
+    # whose content it does not match.
+    if _profile_content_id(profile) != stored:
+        return None
+    return stored
