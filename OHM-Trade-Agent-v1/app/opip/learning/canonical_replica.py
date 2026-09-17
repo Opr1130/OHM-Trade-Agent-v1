@@ -1,43 +1,52 @@
-"""Read-only canonical learning replica contract and verification.
+"""Read-only canonical learning replica contract, export, and installation.
 
 The production canonical SQLite store is the authority for terminal paper
 outcomes. The learning plane needs that evidence to run readiness and learning,
 but it must never become a second authority and must never reach back into
 production to read it.
 
-This module defines the contract for the **copy-only replica** that bridges the
-two planes, and verifies an installed replica before any learning code is
-allowed to treat it as usable authority.
+This module owns the whole **copy-only replica bridge**:
+
+* the one-root bundle layout and path derivation;
+* the cross-artifact manifest that binds all three authority inputs;
+* export (production side), reusing the PR-A0 online-backup machinery;
+* verification and atomic generation installation (learning side);
+* a CLI seam so the shell scripts never reimplement SQLite validation.
 
 Boundary rules:
 
 * The replica is authoritative for **nothing**. Production remains the only
   canonical writer.
-* Verification is provenance-first: a replica is unusable unless it can be tied
-  to one exact production release SHA, hashes to its recorded bytes, is
-  sidecar-free and self-contained, and is not staler than the documented
-  freshness bound.
-* Every failure mode resolves to *unavailable* or *incomplete*, never to
-  *complete*. That direction matters: it is always safe to distrust a replica,
-  and never safe to trust one that cannot be proven.
+* Verification is provenance-first: a replica is unusable unless it is tied to
+  one exact production release SHA, hashes to its recorded bytes, is
+  sidecar-free and self-contained, and is not staler than the documented bound.
+* Every failure resolves to *unavailable* or *incomplete*, never to *complete*.
+  It is always safe to distrust a replica and never safe to trust one that
+  cannot be proven.
 * A legitimately empty outcome stream is not a failure and is not decided here.
   Provenance and emptiness are separate questions; the canonical outcome reader
   owns the latter.
 
-The companion artifacts exist because completeness cannot be decided from the
-database alone. ``paper_trading/state.json`` carries delivery state (COMMITTED /
-PENDING / PERMANENT_FAILURE) and ``paper_trading/evidence_gap_spool.json``
-carries unresolved evidence gaps. A replica missing either one cannot support a
-complete-population claim, so both are bound into the manifest.
+Three authority inputs are bundled, because completeness cannot be decided from
+the database alone: the canonical store, the paper lifecycle/outbox state
+(COMMITTED / PENDING / PERMANENT_FAILURE), and the paper evidence-gap spool.
+Learning must never combine two of them from one generation and the third from
+another.
 """
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import shutil
+import sqlite3
+import sys
 from typing import Any, Mapping
+import uuid
 
 from app.opip.canonical.backup import (
     BackupFormatError,
@@ -45,34 +54,49 @@ from app.opip.canonical.backup import (
     assert_rollback_journal_backup,
     assert_sidecar_free,
     hash_file_sha256,
+    publish_backup_generation,
     require_release_sha,
 )
-from app.opip.canonical.paths import canonical_dir
+from app.opip.canonical.paths import SCHEMA_VERSION
 
-REPLICA_CONTRACT_VERSION = 1
+REPLICA_SCHEMA_VERSION = 1
 
 #: Marker key carried additively in the schema-4 export manifest. Older workers
 #: ignore unknown keys, so its presence does not break the established
 #: ``production first, learning second`` release order.
 REPLICA_MARKER_KEY = "canonical_learning_replica_version"
 
-MANIFEST_FILENAME = "learning_replica_manifest.json"
-CANONICAL_DB_FILENAME = "opip_canonical_v1.sqlite3"
+MANIFEST_FILENAME = "replica_manifest.json"
+CANONICAL_RELATIVE = Path("opip") / "canonical" / "opip_canonical_v1.sqlite3"
+PAPER_STATE_RELATIVE = Path("paper_trading") / "state.json"
+PAPER_GAP_RELATIVE = Path("paper_trading") / "evidence_gap_spool.json"
 
-#: The production export runs every 2 minutes and the learning sync timer runs
-#: every 2 minutes offset from it, so a healthy bridge refreshes the replica at
-#: least twice every 4 minutes. 30 minutes is roughly 15 export cycles: far
-#: enough above the cadence to tolerate transient sync failures without
-#: flapping, and far enough below a daily window to notice a bridge that has
-#: genuinely stopped. Chosen explicitly rather than inherited, because no
-#: existing threshold applies to this artifact (the dashboard freshness policy
-#: in ``data_platform/freshness.py`` governs a different plane and a
-#: 120s/300s scale that would be unusable here).
-DEFAULT_REPLICA_FRESHNESS_SECONDS = 1800
+#: Container-side single configuration root. Everything is derived from this so
+#: a generation cannot be assembled from mismatched path settings.
+DEFAULT_REPLICA_ROOT = Path("/app/canonical-replica")
+
+#: Host-side repository of immutable generations plus the ``current`` pointer.
+HOST_GENERATIONS_DIRNAME = "generations"
+HOST_CURRENT_POINTER = "current"
+
+#: The production export runs every 2 minutes and the learning sync timer every
+#: 2 minutes offset from it, so a healthy bridge refreshes the replica at least
+#: twice every 4 minutes. 30 minutes is roughly 15 export cycles: far enough
+#: above the cadence to tolerate transient sync failures without flapping, and
+#: far enough below a daily window to notice a bridge that has genuinely
+#: stopped. Chosen explicitly rather than inherited, because no existing
+#: threshold applies to this artifact (the dashboard freshness policy in
+#: ``data_platform/freshness.py`` governs a different plane at a 120s/300s
+#: scale that would be unusable here).
+REPLICA_FRESHNESS_SECONDS = 1800
+
+#: Generations retained on the learning host: the active one plus one
+#: known-good fallback. Bounded so the replica cannot grow without limit.
+RETAINED_GENERATIONS = 2
 
 REASON_MANIFEST_MISSING = "CANONICAL_REPLICA_MANIFEST_MISSING"
 REASON_MANIFEST_MALFORMED = "CANONICAL_REPLICA_MANIFEST_MALFORMED"
-REASON_CONTRACT_UNSUPPORTED = "CANONICAL_REPLICA_CONTRACT_UNSUPPORTED"
+REASON_SCHEMA_UNSUPPORTED = "CANONICAL_REPLICA_SCHEMA_UNSUPPORTED"
 REASON_SOURCE_SHA_MISMATCH = "CANONICAL_REPLICA_SOURCE_SHA_MISMATCH"
 REASON_DB_MISSING = "CANONICAL_REPLICA_DB_MISSING"
 REASON_DB_HASH_MISMATCH = "CANONICAL_REPLICA_DB_HASH_MISMATCH"
@@ -83,6 +107,13 @@ REASON_PAPER_STATE_MISMATCH = "CANONICAL_REPLICA_PAPER_STATE_MISMATCH"
 REASON_PAPER_GAP_MISMATCH = "CANONICAL_REPLICA_PAPER_GAP_MISMATCH"
 REASON_STALE = "CANONICAL_REPLICA_STALE"
 REASON_TIMESTAMP_INVALID = "CANONICAL_REPLICA_TIMESTAMP_INVALID"
+REASON_GENERATION_ID_INVALID = "CANONICAL_REPLICA_GENERATION_ID_INVALID"
+
+#: Completeness reason recorded when the bundled lifecycle state is absent.
+#: Absence is certified in the manifest rather than silent, but it still cannot
+#: prove outbox completeness - which is exactly the distinction between
+#: "verified" and "sufficient for supervised truth".
+REASON_PAPER_STATE_ABSENT = "CANONICAL_REPLICA_PAPER_STATE_ABSENT"
 
 
 class ReplicaVerificationError(RuntimeError):
@@ -110,6 +141,142 @@ class ReplicaProvenanceError(ReplicaVerificationError):
     """The replica does not match its recorded provenance."""
 
 
+def iso_z(value: datetime) -> str:
+    """Render a UTC timestamp in the ``Z`` form used across evidence ids."""
+    moment = value.astimezone(timezone.utc)
+    if moment.microsecond == 0:
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond:06d}Z"
+
+
+# ---------------------------------------------------------------------------
+# Layout: one root, everything derived
+# ---------------------------------------------------------------------------
+
+
+def replica_root(root: Path | None = None) -> Path:
+    """Resolve the single replica root.
+
+    ``OPIP_CANONICAL_REPLICA_ROOT`` is the one configuration knob. Every bundle
+    path derives from it so a generation cannot be assembled from mismatched
+    settings.
+    """
+    if root is not None:
+        return Path(root)
+    override = os.environ.get("OPIP_CANONICAL_REPLICA_ROOT", "").strip()
+    return Path(override) if override else DEFAULT_REPLICA_ROOT
+
+
+def replica_manifest_path(root: Path | None = None) -> Path:
+    return replica_root(root) / MANIFEST_FILENAME
+
+
+def replica_db_path(root: Path | None = None) -> Path:
+    return replica_root(root) / CANONICAL_RELATIVE
+
+
+def replica_paper_state_path(root: Path | None = None) -> Path:
+    return replica_root(root) / PAPER_STATE_RELATIVE
+
+
+def replica_paper_gap_path(root: Path | None = None) -> Path:
+    return replica_root(root) / PAPER_GAP_RELATIVE
+
+
+def host_generations_dir(host_root: Path) -> Path:
+    return Path(host_root) / HOST_GENERATIONS_DIRNAME
+
+
+def host_current_pointer(host_root: Path) -> Path:
+    return Path(host_root) / HOST_CURRENT_POINTER
+
+
+# ---------------------------------------------------------------------------
+# Snapshot facts
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SnapshotFacts:
+    """Structural facts read from a canonical snapshot."""
+
+    schema_version: int
+    history_epoch: int
+    next_local_sequence: int
+    max_local_sequence: int | None
+    event_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "history_epoch": self.history_epoch,
+            "next_local_sequence": self.next_local_sequence,
+            "max_local_sequence": self.max_local_sequence,
+            "event_count": self.event_count,
+        }
+
+
+def read_snapshot_facts(db_path: Path) -> SnapshotFacts:
+    """Read meta and event facts from a snapshot, read-only.
+
+    Opened ``mode=ro`` so this can never write to the artifact it inspects. The
+    tip is computed lexicographically for the same reason the outcome reader
+    does: a canonical restore resets ``local_sequence``, so independent column
+    maxima would fabricate a coordinate that need not exist.
+    """
+    if not db_path.exists():
+        raise ReplicaUnavailableError(REASON_DB_MISSING, str(db_path))
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=5.0)
+        connection.row_factory = sqlite3.Row
+        meta = connection.execute(
+            "SELECT schema_version, history_epoch, next_local_sequence FROM meta WHERE id = 1"
+        ).fetchone()
+        if meta is None:
+            raise ReplicaProvenanceError(REASON_DB_NOT_SELF_CONTAINED, "meta row is missing")
+        schema_version = meta["schema_version"]
+        if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
+            raise ReplicaProvenanceError(
+                REASON_SCHEMA_UNSUPPORTED,
+                f"snapshot schema_version={schema_version!r} incompatible with "
+                f"code SCHEMA_VERSION={SCHEMA_VERSION}",
+            )
+        count_row = connection.execute("SELECT COUNT(*) AS n FROM events").fetchone()
+        event_count = int(count_row["n"]) if count_row is not None else 0
+        max_seq: int | None = None
+        if event_count:
+            tip = connection.execute(
+                """
+                SELECT local_sequence FROM events
+                WHERE history_epoch = ?
+                ORDER BY local_sequence DESC LIMIT 1
+                """,
+                (int(meta["history_epoch"]),),
+            ).fetchone()
+            if tip is not None:
+                max_seq = int(tip["local_sequence"])
+        return SnapshotFacts(
+            schema_version=int(schema_version),
+            history_epoch=int(meta["history_epoch"]),
+            next_local_sequence=int(meta["next_local_sequence"]),
+            max_local_sequence=max_seq,
+            event_count=event_count,
+        )
+    except sqlite3.Error as exc:
+        raise ReplicaProvenanceError(
+            REASON_DB_NOT_SELF_CONTAINED, f"snapshot is unreadable: {exc}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class ReplicaArtifact:
     """One artifact bound into the replica manifest."""
@@ -130,46 +297,32 @@ class ReplicaArtifact:
 class CanonicalLearningReplicaManifest:
     """A verified replica manifest."""
 
-    contract_version: int
+    replica_schema_version: int
     source_release_sha: str
     snapshot_created_at_utc: datetime
+    generation_id: str
     canonical: ReplicaArtifact
     paper_state: ReplicaArtifact
     paper_gap_spool: ReplicaArtifact
-    history_epoch: int | None
-    next_local_sequence: int | None
-    max_local_sequence: int | None
-    event_count: int | None
+    facts: SnapshotFacts
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "contract_version": self.contract_version,
+            "replica_schema_version": self.replica_schema_version,
             "source_release_sha": self.source_release_sha,
             "snapshot_created_at_utc": iso_z(self.snapshot_created_at_utc),
-            "canonical": self.canonical.as_dict(),
-            "paper_state": self.paper_state.as_dict(),
-            "paper_gap_spool": self.paper_gap_spool.as_dict(),
-            "history_epoch": self.history_epoch,
-            "next_local_sequence": self.next_local_sequence,
-            "max_local_sequence": self.max_local_sequence,
-            "event_count": self.event_count,
+            "generation_id": self.generation_id,
+            "canonical_db_present": self.canonical.present,
+            "canonical_db_sha256": self.canonical.sha256,
+            "canonical_db_bytes": self.canonical.size_bytes,
+            "paper_state_present": self.paper_state.present,
+            "paper_state_sha256": self.paper_state.sha256,
+            "paper_state_bytes": self.paper_state.size_bytes,
+            "paper_gap_present": self.paper_gap_spool.present,
+            "paper_gap_sha256": self.paper_gap_spool.sha256,
+            "paper_gap_bytes": self.paper_gap_spool.size_bytes,
+            **self.facts.as_dict(),
         }
-
-
-def iso_z(value: datetime) -> str:
-    """Render a UTC timestamp in the ``Z`` form used across evidence ids."""
-    moment = value.astimezone(timezone.utc)
-    if moment.microsecond == 0:
-        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond:06d}Z"
-
-
-def replica_manifest_path(directory: Path | None = None) -> Path:
-    return (Path(directory) if directory is not None else canonical_dir()) / MANIFEST_FILENAME
-
-
-def replica_db_path(directory: Path | None = None) -> Path:
-    return (Path(directory) if directory is not None else canonical_dir()) / CANONICAL_DB_FILENAME
 
 
 def _artifact_facts(path: Path) -> dict[str, Any]:
@@ -194,17 +347,22 @@ def build_replica_manifest(
     canonical_db: Path,
     paper_state: Path | None = None,
     paper_gap_spool: Path | None = None,
+    generation_id: str | None = None,
     snapshot_created_at_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build the replica manifest from the exported artifacts.
+    """Build the cross-artifact manifest for one replica generation.
 
     ``source_release_sha`` must be the exact production release SHA; an empty or
-    malformed value raises rather than producing an unattributable manifest.
-    The caller is responsible for having produced ``canonical_db`` via the
-    canonical online-backup generation path, not a raw file copy.
+    malformed value raises rather than producing an unattributable manifest, and
+    there is no ``UNVERIFIED`` fallback.
+
+    The caller is responsible for having produced ``canonical_db`` through the
+    canonical generation path, not a raw file copy; that is asserted here.
     """
     release_sha = require_release_sha(source_release_sha, field_name="source_release_sha")
     created = snapshot_created_at_utc or datetime.now(timezone.utc)
+    identifier = generation_id or f"gen-{uuid.uuid4().hex[:16]}"
+    require_generation_id(identifier)
 
     if not canonical_db.exists():
         raise ReplicaUnavailableError(
@@ -218,16 +376,16 @@ def build_replica_manifest(
         assert_rollback_journal_backup(canonical_db)
         assert_sidecar_free(canonical_db, field_name="canonical_db", error_type=BackupFormatError)
     except BackupProvenanceError as exc:
-        raise ReplicaProvenanceError(
-            REASON_DB_NOT_SELF_CONTAINED, str(exc)
-        ) from exc
+        raise ReplicaProvenanceError(REASON_DB_NOT_SELF_CONTAINED, str(exc)) from exc
 
-    manifest: dict[str, Any] = {
-        "schema_version": REPLICA_CONTRACT_VERSION,
-        "contract_version": REPLICA_CONTRACT_VERSION,
+    facts = read_snapshot_facts(canonical_db)
+
+    return {
+        "replica_schema_version": REPLICA_SCHEMA_VERSION,
         "source_release_sha": release_sha,
         "snapshot_created_at_utc": iso_z(created),
-        "canonical": _artifact_facts(canonical_db),
+        "generation_id": identifier,
+        "canonical_db": _artifact_facts(canonical_db),
         "paper_state": _artifact_facts(paper_state)
         if paper_state is not None
         else {"present": False, "sha256": None, "size_bytes": None},
@@ -236,8 +394,22 @@ def build_replica_manifest(
         else {"present": False, "sha256": None, "size_bytes": None},
         "journal_mode": "delete",
         "self_contained": True,
+        **facts.as_dict(),
     }
-    return manifest
+
+
+def require_generation_id(value: Any) -> str:
+    """Validate a generation identifier: path-safe and non-empty.
+
+    Rejects path separators and traversal so a manifest cannot name a
+    generation outside the generations directory.
+    """
+    text = str(value or "").strip()
+    if not text or "/" in text or "\\" in text or text in {".", ".."}:
+        raise ReplicaProvenanceError(
+            REASON_GENERATION_ID_INVALID, f"unsafe generation id {value!r}"
+        )
+    return text
 
 
 def read_replica_manifest(path: Path) -> dict[str, Any]:
@@ -255,11 +427,29 @@ def read_replica_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
+def write_replica_manifest(manifest: Mapping[str, Any], path: Path) -> Path:
+    """Write a manifest atomically, then fsync the directory."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, target)
+    except Exception:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+    return target
+
+
 def _parse_utc(value: object, *, field_name: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
-        raise ReplicaProvenanceError(
-            REASON_TIMESTAMP_INVALID, f"{field_name} is missing"
-        )
+        raise ReplicaProvenanceError(REASON_TIMESTAMP_INVALID, f"{field_name} is missing")
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError as exc:
@@ -284,13 +474,12 @@ def _verify_artifact(
 
     Two distinct conditions are deliberately separated:
 
-    * **Recorded absent** (``present: false``) is a positive exporter
-      statement. It is returned as ``present=False`` rather than raised, so a
-      legitimately absent companion is distinguishable from a lost one. Whether
-      absence is *acceptable* is a completeness question for the caller, not a
-      provenance question for this function.
-    * **Recorded present but not installed** is unavailability, and raises.
-      This is the case §9 forbids treating as "no lifecycles".
+    * **Recorded absent** (``present: false``) is a positive exporter statement.
+      It is returned as ``present=False`` rather than raised, so a legitimately
+      absent companion is distinguishable from a lost one. Whether absence is
+      *acceptable* is a completeness question for the caller.
+    * **Recorded present but not installed** is unavailability, and raises. This
+      is the case that must never be read as "no lifecycles".
     """
     if not isinstance(recorded, Mapping):
         raise ReplicaProvenanceError(mismatch_reason, "manifest artifact block is invalid")
@@ -323,28 +512,26 @@ def _verify_artifact(
 def verify_replica_manifest(
     manifest: Mapping[str, Any],
     *,
-    replica_directory: Path | None = None,
+    root: Path | None = None,
     expected_source_release_sha: str,
-    paper_state_path: Path | None = None,
-    paper_gap_spool_path: Path | None = None,
     now: datetime | None = None,
-    max_age_seconds: int = DEFAULT_REPLICA_FRESHNESS_SECONDS,
+    max_age_seconds: int = REPLICA_FRESHNESS_SECONDS,
 ) -> CanonicalLearningReplicaManifest:
-    """Verify an installed replica, raising on any unprovable condition.
+    """Verify a replica bundle at ``root``, raising on any unprovable condition.
 
     ``expected_source_release_sha`` is the production release the learning
-    worker believes is deployed. Making it a required argument is deliberate:
-    a replica can never be accepted merely because it looks internally
-    consistent with itself.
+    worker believes is deployed. Making it a required argument is deliberate: a
+    replica can never be accepted merely because it is internally consistent
+    with itself.
     """
     if not isinstance(manifest, Mapping):
         raise ReplicaProvenanceError(REASON_MANIFEST_MALFORMED, "manifest must be a mapping")
 
-    contract = manifest.get("contract_version")
-    if type(contract) is not int or contract != REPLICA_CONTRACT_VERSION:
+    schema = manifest.get("replica_schema_version")
+    if type(schema) is not int or schema != REPLICA_SCHEMA_VERSION:
         raise ReplicaProvenanceError(
-            REASON_CONTRACT_UNSUPPORTED,
-            f"contract_version={contract!r} unsupported by this build",
+            REASON_SCHEMA_UNSUPPORTED,
+            f"replica_schema_version={schema!r} unsupported by this build",
         )
 
     expected_sha = require_release_sha(
@@ -357,13 +544,16 @@ def verify_replica_manifest(
             f"replica source {recorded_sha!r} != expected production {expected_sha}",
         )
 
-    created = _parse_utc(manifest.get("snapshot_created_at_utc"), field_name="snapshot_created_at_utc")
+    created = _parse_utc(
+        manifest.get("snapshot_created_at_utc"), field_name="snapshot_created_at_utc"
+    )
+    generation_id = require_generation_id(manifest.get("generation_id"))
 
-    directory = Path(replica_directory) if replica_directory is not None else canonical_dir()
-    db_path = replica_db_path(directory)
+    base = replica_root(root)
+    db_path = base / CANONICAL_RELATIVE
 
     canonical = _verify_artifact(
-        manifest.get("canonical"),
+        manifest.get("canonical_db"),
         db_path,
         mismatch_reason=REASON_DB_HASH_MISMATCH,
         missing_reason=REASON_DB_MISSING,
@@ -379,17 +569,39 @@ def verify_replica_manifest(
     except BackupProvenanceError as exc:
         raise ReplicaProvenanceError(REASON_DB_NOT_SELF_CONTAINED, str(exc)) from exc
 
+    # Structural facts are re-derived from the artifact rather than trusted, so
+    # a manifest cannot assert a schema or epoch the snapshot does not have.
+    facts = read_snapshot_facts(db_path)
+    recorded_facts = {
+        "history_epoch": manifest.get("history_epoch"),
+        "next_local_sequence": manifest.get("next_local_sequence"),
+        "max_local_sequence": manifest.get("max_local_sequence"),
+        "event_count": manifest.get("event_count"),
+    }
+    actual_facts = facts.as_dict()
+    for key, recorded in recorded_facts.items():
+        if type(recorded) is not type(actual_facts[key]) and not (
+            recorded is None and actual_facts[key] is None
+        ):
+            raise ReplicaProvenanceError(
+                REASON_DB_NOT_SELF_CONTAINED,
+                f"manifest {key}={recorded!r} does not match snapshot {actual_facts[key]!r}",
+            )
+        if recorded != actual_facts[key]:
+            raise ReplicaProvenanceError(
+                REASON_DB_NOT_SELF_CONTAINED,
+                f"manifest {key}={recorded!r} does not match snapshot {actual_facts[key]!r}",
+            )
+
     paper_state = _verify_artifact(
         manifest.get("paper_state"),
-        Path(paper_state_path) if paper_state_path is not None else Path("/app/data/paper_trading/state.json"),
+        base / PAPER_STATE_RELATIVE,
         mismatch_reason=REASON_PAPER_STATE_MISMATCH,
         missing_reason=REASON_PAPER_STATE_MISSING,
     )
     gap_spool = _verify_artifact(
         manifest.get("paper_gap_spool"),
-        Path(paper_gap_spool_path)
-        if paper_gap_spool_path is not None
-        else Path("/app/data/paper_trading/evidence_gap_spool.json"),
+        base / PAPER_GAP_RELATIVE,
         mismatch_reason=REASON_PAPER_GAP_MISMATCH,
         missing_reason=None,
     )
@@ -400,110 +612,454 @@ def verify_replica_manifest(
     age = (moment - created).total_seconds()
     if age > max_age_seconds:
         raise ReplicaStaleError(
-            REASON_STALE,
-            f"replica is {int(age)}s old, limit {max_age_seconds}s",
+            REASON_STALE, f"replica is {int(age)}s old, limit {max_age_seconds}s"
         )
     if age < -max_age_seconds:
         # A replica stamped well into the future is a provenance defect, not
         # freshness: it cannot have been produced by this production release.
         raise ReplicaProvenanceError(
-            REASON_TIMESTAMP_INVALID,
-            "snapshot timestamp is implausibly in the future",
+            REASON_TIMESTAMP_INVALID, "snapshot timestamp is implausibly in the future"
         )
 
-    def _int_or_none(value: object) -> int | None:
-        return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
-
     return CanonicalLearningReplicaManifest(
-        contract_version=contract,
+        replica_schema_version=schema,
         source_release_sha=expected_sha,
         snapshot_created_at_utc=created,
+        generation_id=generation_id,
         canonical=canonical,
         paper_state=paper_state,
         paper_gap_spool=gap_spool,
-        history_epoch=_int_or_none(manifest.get("history_epoch")),
-        next_local_sequence=_int_or_none(manifest.get("next_local_sequence")),
-        max_local_sequence=_int_or_none(manifest.get("max_local_sequence")),
-        event_count=_int_or_none(manifest.get("event_count")),
+        facts=facts,
     )
 
 
-def replica_supports_completeness(verified: CanonicalLearningReplicaManifest) -> tuple[bool, tuple[str, ...]]:
+def verify_installed_replica(
+    *,
+    expected_source_release_sha: str,
+    root: Path | None = None,
+    now: datetime | None = None,
+    max_age_seconds: int = REPLICA_FRESHNESS_SECONDS,
+) -> CanonicalLearningReplicaManifest:
+    """Read then verify the replica bundle installed at ``root``."""
+    base = replica_root(root)
+    manifest = read_replica_manifest(replica_manifest_path(base))
+    return verify_replica_manifest(
+        manifest,
+        root=base,
+        expected_source_release_sha=expected_source_release_sha,
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
+
+
+def replica_supports_completeness(
+    verified: CanonicalLearningReplicaManifest,
+) -> tuple[bool, tuple[str, ...]]:
     """Whether a verified replica can support a complete-population claim.
 
     Verification establishes *provenance*. This establishes *sufficiency*, and
     it is deliberately a separate step so neither concern can be satisfied by
     the other.
 
-    A replica whose bundled paper lifecycle state is absent cannot prove outbox
-    completeness. That is exactly the condition §9 forbids treating as "all
-    outboxes complete": absence is certified in the manifest, so it is not
-    silent, but it is still insufficient for supervised truth.
+    A bundle whose lifecycle state is absent cannot prove outbox completeness.
+    Absence is certified rather than silent, but it is still insufficient for
+    supervised truth.
 
-    The gap spool is treated asymmetrically on purpose. Its legitimate absence
-    means zero unresolved gaps, which production semantics already accept, so it
-    does not block completeness - but a *recorded present yet missing* spool is
-    already unavailability and never reaches here.
+    The gap spool is asymmetric on purpose: its legitimate absence means zero
+    unresolved gaps, which production semantics already accept, so it does not
+    block completeness. A *recorded present yet missing* spool is already
+    unavailability and never reaches here.
     """
     reasons: list[str] = []
     if not verified.paper_state.present:
-        reasons.append("CANONICAL_REPLICA_PAPER_STATE_ABSENT")
+        reasons.append(REASON_PAPER_STATE_ABSENT)
     return (not reasons, tuple(reasons))
 
 
-def verify_installed_replica(
+# ---------------------------------------------------------------------------
+# Export (production side)
+# ---------------------------------------------------------------------------
+
+
+def export_replica_bundle(
     *,
-    expected_source_release_sha: str,
-    replica_directory: Path | None = None,
-    paper_state_path: Path | None = None,
-    paper_gap_spool_path: Path | None = None,
+    source_db: Path,
+    staging_dir: Path,
+    source_release_sha: str,
+    paper_state_source: Path | None = None,
+    paper_gap_source: Path | None = None,
+    generation_id: str | None = None,
     now: datetime | None = None,
-    max_age_seconds: int = DEFAULT_REPLICA_FRESHNESS_SECONDS,
-) -> CanonicalLearningReplicaManifest:
-    """Convenience entry point: read then verify the installed replica."""
-    directory = Path(replica_directory) if replica_directory is not None else canonical_dir()
-    manifest = read_replica_manifest(replica_manifest_path(directory))
-    return verify_replica_manifest(
+    backup_work_dir: Path | None = None,
+    require_paper_state: bool = True,
+) -> dict[str, Any]:
+    """Stage one complete replica bundle into ``staging_dir``.
+
+    The canonical snapshot is produced by ``publish_backup_generation``, which
+    performs a SQLite online backup and normalizes the artifact to
+    rollback-journal. A raw copy of the live WAL store is never used.
+
+    The bundle is staged as a whole; the caller publishes the export manifest
+    last as the generation commit marker, so a reader can never observe a
+    partially written generation.
+
+    ``require_paper_state`` defaults to True: missing lifecycle state cannot
+    prove outbox completeness, so by default its absence fails the export
+    rather than producing a bundle that can never support supervised truth.
+    """
+    release_sha = require_release_sha(source_release_sha, field_name="source_release_sha")
+    staging = Path(staging_dir)
+    (staging / CANONICAL_RELATIVE).parent.mkdir(parents=True, exist_ok=True)
+    (staging / PAPER_STATE_RELATIVE).parent.mkdir(parents=True, exist_ok=True)
+
+    work = Path(backup_work_dir) if backup_work_dir is not None else staging / ".backup-work"
+    work.mkdir(parents=True, exist_ok=True)
+
+    generation = publish_backup_generation(
+        Path(source_db),
+        work,
+        source_release_sha=release_sha,
+        generation_id=(generation_id or f"gen-{uuid.uuid4().hex[:16]}"),
+    )
+
+    db_target = staging / CANONICAL_RELATIVE
+    shutil.copyfile(generation.backup_path, db_target)
+    # Normalization already happened inside the generation; assert it survived
+    # the copy so the staged artifact is provably self-contained.
+    assert_rollback_journal_backup(db_target)
+    assert_sidecar_free(db_target, field_name="canonical_db", error_type=BackupFormatError)
+
+    state_target = staging / PAPER_STATE_RELATIVE
+    gap_target = staging / PAPER_GAP_RELATIVE
+    state_source = Path(paper_state_source) if paper_state_source is not None else None
+    gap_source = Path(paper_gap_source) if paper_gap_source is not None else None
+
+    state_present = False
+    if state_source is not None and state_source.exists():
+        shutil.copyfile(state_source, state_target)
+        state_present = True
+    elif require_paper_state:
+        raise ReplicaUnavailableError(
+            REASON_PAPER_STATE_MISSING,
+            f"paper lifecycle state not found at {state_source}",
+        )
+
+    if gap_source is not None and gap_source.exists():
+        shutil.copyfile(gap_source, gap_target)
+        gap_source_present = True
+    else:
+        # Legitimately absent: publish a certified empty spool so the artifact
+        # is always a validated, readable contract, AND record in the manifest
+        # that the production source was absent. Together those keep "absent"
+        # distinguishable from "lost during export".
+        gap_target.write_text(
+            json.dumps({"unresolved": [], "updated_at": None}, sort_keys=True),
+            encoding="utf-8",
+        )
+        gap_source_present = False
+
+    manifest = build_replica_manifest(
+        source_release_sha=release_sha,
+        canonical_db=db_target,
+        paper_state=state_target if state_present else None,
+        paper_gap_spool=gap_target if gap_target.exists() else None,
+        generation_id=generation_id,
+        snapshot_created_at_utc=now,
+    )
+    manifest["paper_gap_source_present"] = gap_source_present
+    write_replica_manifest(manifest, staging / MANIFEST_FILENAME)
+
+    # The staging work directory is owned by this attempt; remove it so a
+    # failed export cannot accumulate partial snapshots.
+    shutil.rmtree(work, ignore_errors=True)
+    return manifest
+
+
+def install_replica_generation(
+    *,
+    staging_dir: Path,
+    host_root: Path,
+    expected_source_release_sha: str,
+    now: datetime | None = None,
+    max_age_seconds: int = REPLICA_FRESHNESS_SECONDS,
+    retain: int = RETAINED_GENERATIONS,
+) -> dict[str, Any]:
+    """Validate a staged bundle and publish it as the new current generation.
+
+    Order is deliberate: validate, then install immutably, then flip the
+    pointer atomically. A failure at any point leaves the existing ``current``
+    generation untouched, and a reader can never observe a partial generation.
+
+    Returns a summary dict. Raises on any unprovable condition.
+    """
+    staged = Path(staging_dir)
+    root = Path(host_root)
+    generations = host_generations_dir(root)
+    pointer = host_current_pointer(root)
+
+    manifest = read_replica_manifest(staged / MANIFEST_FILENAME)
+    verified = verify_replica_manifest(
         manifest,
-        replica_directory=directory,
+        root=staged,
         expected_source_release_sha=expected_source_release_sha,
-        paper_state_path=paper_state_path,
-        paper_gap_spool_path=paper_gap_spool_path,
         now=now,
         max_age_seconds=max_age_seconds,
     )
 
+    generation_id = verified.generation_id
+    final = generations / generation_id
+    if final.exists():
+        # A generation id is content-addressed by its manifest; re-installing
+        # the same id is idempotent, not an overwrite.
+        shutil.rmtree(final)
+    generations.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(staged, final)
+
+    # Re-verify in place, so the published generation is proven at its final
+    # immutable location rather than only at the staging path.
+    verify_replica_manifest(
+        read_replica_manifest(final / MANIFEST_FILENAME),
+        root=final,
+        expected_source_release_sha=expected_source_release_sha,
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
+
+    # The pointer is a small atomically-replaced file naming the generation,
+    # not a symlink: ``os.replace`` on a symlink is not portable, and a plain
+    # file is auditable and needs no symlink privilege. Readers resolve it to a
+    # concrete immutable generation directory.
+    temp_pointer = root / f".{HOST_CURRENT_POINTER}.tmp.{os.getpid()}"
+    try:
+        if temp_pointer.exists():
+            temp_pointer.unlink()
+        temp_pointer.write_text(generation_id + "\n", encoding="utf-8")
+        os.replace(temp_pointer, pointer)
+    except Exception:
+        try:
+            temp_pointer.unlink()
+        except OSError:
+            pass
+        raise
+
+    pruned = _prune_generations(generations, keep=retain, active=generation_id)
+
+    return {
+        "installed": generation_id,
+        "source_release_sha": verified.source_release_sha,
+        "snapshot_created_at_utc": iso_z(verified.snapshot_created_at_utc),
+        "pruned": pruned,
+    }
+
+
+def resolve_current_generation(host_root: Path) -> Path:
+    """Resolve the committed ``current`` generation directory.
+
+    Raises when the pointer is missing, malformed, or names a generation that is
+    not installed - so a job never binds a staging directory or the writable
+    parent repository.
+    """
+    root = Path(host_root)
+    pointer = host_current_pointer(root)
+    if not pointer.exists():
+        raise ReplicaUnavailableError(
+            REASON_MANIFEST_MISSING, f"no current replica generation at {pointer}"
+        )
+    try:
+        generation_id = require_generation_id(pointer.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ReplicaUnavailableError(REASON_MANIFEST_MISSING, str(exc)) from exc
+
+    resolved = host_generations_dir(root) / generation_id
+    if not resolved.is_dir():
+        raise ReplicaUnavailableError(
+            REASON_MANIFEST_MISSING,
+            f"current pointer names an uninstalled generation: {generation_id}",
+        )
+    return resolved
+
+
+def _prune_generations(generations: Path, *, keep: int, active: str) -> list[str]:
+    """Remove old generations, never the active one. Bounded retention."""
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    if not generations.is_dir():
+        return []
+    entries = sorted(
+        (p for p in generations.iterdir() if p.is_dir() and not p.name.startswith(".")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    keep_names = {active}
+    for entry in entries:
+        if len(keep_names) >= keep:
+            break
+        keep_names.add(entry.name)
+    removed: list[str] = []
+    for entry in entries:
+        if entry.name in keep_names:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed.append(entry.name)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# CLI seam
+#
+# The shell scripts call these instead of reimplementing SQLite or hash
+# validation. Keeping the logic in Python means one implementation is proven
+# once and reused by both planes.
+# ---------------------------------------------------------------------------
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    manifest = export_replica_bundle(
+        source_db=Path(args.source_db),
+        staging_dir=Path(args.staging),
+        source_release_sha=args.release_sha,
+        paper_state_source=Path(args.paper_state) if args.paper_state else None,
+        paper_gap_source=Path(args.paper_gap) if args.paper_gap else None,
+        backup_work_dir=Path(args.backup_work_dir) if args.backup_work_dir else None,
+    )
+    print(json.dumps(manifest, sort_keys=True))
+    print("O'Pip canonical replica export: OK")
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    verified = verify_installed_replica(
+        expected_source_release_sha=args.release_sha,
+        root=Path(args.root),
+        max_age_seconds=int(args.max_age_seconds),
+    )
+    supports, reasons = replica_supports_completeness(verified)
+    payload = {
+        "generation_id": verified.generation_id,
+        "source_release_sha": verified.source_release_sha,
+        "snapshot_created_at_utc": iso_z(verified.snapshot_created_at_utc),
+        "completeness_supported": supports,
+        "completeness_reasons": list(reasons),
+        "freshness_bound_seconds": int(args.max_age_seconds),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    print("O'Pip canonical replica verify: OK")
+    return 0
+
+
+def _cmd_install(args: argparse.Namespace) -> int:
+    summary = install_replica_generation(
+        staging_dir=Path(args.staging),
+        host_root=Path(args.host_root),
+        expected_source_release_sha=args.release_sha,
+        max_age_seconds=int(args.max_age_seconds),
+    )
+    print(json.dumps(summary, sort_keys=True))
+    print("O'Pip canonical replica install: OK")
+    return 0
+
+
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    print(resolve_current_generation(Path(args.host_root)))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="canonical_replica",
+        description="Canonical learning replica bridge (copy-only, read-only).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    export = sub.add_parser("export", help="stage a replica bundle on production")
+    export.add_argument("--source-db", required=True)
+    export.add_argument("--staging", required=True)
+    export.add_argument("--release-sha", required=True)
+    export.add_argument("--paper-state", default="")
+    export.add_argument("--paper-gap", default="")
+    export.add_argument("--backup-work-dir", default="")
+    export.set_defaults(func=_cmd_export)
+
+    verify = sub.add_parser("verify", help="verify an installed replica bundle")
+    verify.add_argument("--root", required=True)
+    verify.add_argument("--release-sha", required=True)
+    verify.add_argument("--max-age-seconds", default=str(REPLICA_FRESHNESS_SECONDS))
+    verify.set_defaults(func=_cmd_verify)
+
+    install = sub.add_parser("install", help="validate and publish a generation")
+    install.add_argument("--staging", required=True)
+    install.add_argument("--host-root", required=True)
+    install.add_argument("--release-sha", required=True)
+    install.add_argument("--max-age-seconds", default=str(REPLICA_FRESHNESS_SECONDS))
+    install.set_defaults(func=_cmd_install)
+
+    resolve = sub.add_parser("resolve", help="print the committed current generation")
+    resolve.add_argument("--host-root", required=True)
+    resolve.set_defaults(func=_cmd_resolve)
+
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except ReplicaVerificationError as exc:
+        print(f"canonical replica refused: {exc}", file=sys.stderr)
+        return 78
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
 
 __all__ = [
-    "CANONICAL_DB_FILENAME",
+    "CANONICAL_RELATIVE",
     "CanonicalLearningReplicaManifest",
-    "DEFAULT_REPLICA_FRESHNESS_SECONDS",
+    "DEFAULT_REPLICA_ROOT",
+    "HOST_CURRENT_POINTER",
+    "HOST_GENERATIONS_DIRNAME",
     "MANIFEST_FILENAME",
-    "REASON_CONTRACT_UNSUPPORTED",
+    "PAPER_GAP_RELATIVE",
+    "PAPER_STATE_RELATIVE",
     "REASON_DB_HASH_MISMATCH",
     "REASON_DB_MISSING",
     "REASON_DB_NOT_SELF_CONTAINED",
     "REASON_DB_SIZE_MISMATCH",
+    "REASON_GENERATION_ID_INVALID",
     "REASON_MANIFEST_MALFORMED",
     "REASON_MANIFEST_MISSING",
     "REASON_PAPER_GAP_MISMATCH",
+    "REASON_PAPER_STATE_ABSENT",
     "REASON_PAPER_STATE_MISMATCH",
     "REASON_PAPER_STATE_MISSING",
+    "REASON_SCHEMA_UNSUPPORTED",
     "REASON_SOURCE_SHA_MISMATCH",
     "REASON_STALE",
     "REASON_TIMESTAMP_INVALID",
-    "REPLICA_CONTRACT_VERSION",
+    "REPLICA_FRESHNESS_SECONDS",
     "REPLICA_MARKER_KEY",
+    "REPLICA_SCHEMA_VERSION",
+    "RETAINED_GENERATIONS",
     "ReplicaArtifact",
     "ReplicaProvenanceError",
     "ReplicaStaleError",
     "ReplicaUnavailableError",
     "ReplicaVerificationError",
+    "SnapshotFacts",
     "build_replica_manifest",
+    "export_replica_bundle",
+    "host_current_pointer",
+    "host_generations_dir",
+    "install_replica_generation",
+    "iso_z",
     "read_replica_manifest",
+    "read_snapshot_facts",
     "replica_db_path",
     "replica_manifest_path",
+    "replica_paper_gap_path",
+    "replica_paper_state_path",
+    "replica_root",
     "replica_supports_completeness",
+    "require_generation_id",
+    "resolve_current_generation",
     "verify_installed_replica",
     "verify_replica_manifest",
+    "write_replica_manifest",
 ]
