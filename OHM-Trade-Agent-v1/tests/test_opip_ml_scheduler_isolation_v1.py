@@ -105,11 +105,13 @@ def test_production_export_is_copy_only_and_locked():
     # The exporter was originally copy-only shell. The canonical learning-replica
     # snapshot requires the PR-A0 SQLite online-backup path, which is mandated to
     # stay in Python rather than being reimplemented in Bash, so the script now
-    # invokes exactly one helper. That helper is the ONLY permitted Python use;
-    # the prohibition on compute belonging to this plane still holds, so ML,
-    # Phase 3C, the canonical writer and raw SQLite access all remain forbidden.
-    assert source.count('"$PYTHON_BIN"') == 1
-    assert "app.opip.learning.canonical_replica export" in source
+    # invokes exactly one helper. Count actual module invocations, not harmless
+    # references such as the executable preflight check.
+    python_invocations = re.findall(
+        r'(?m)^(?!\s*#).*"\$PYTHON_BIN"\s+-m\s+.*$', source
+    )
+    assert len(python_invocations) == 1
+    assert "app.opip.learning.canonical_replica export" in python_invocations[0]
     for forbidden in (
         "app.jobs.run_opip_ml_capture",
         "run_opportunity_intelligence_cycle",
