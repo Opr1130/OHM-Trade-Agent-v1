@@ -150,6 +150,9 @@ def _ml_rows(snapshot=SNAPSHOT, direction="LONG"):
             "feature_snapshot": {
                 "snapshot_id": "ML:1",
                 "direction": direction,
+                # Required by the readiness report: a wrapper without a
+                # parseable decision clock counts as malformed.
+                "decision_at_utc": ENTER.isoformat().replace("+00:00", "Z"),
                 "features": [{"name": "momentum", "value": 1.0}],
             },
         }

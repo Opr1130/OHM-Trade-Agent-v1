@@ -676,6 +676,56 @@ def replica_supports_completeness(
     return (not reasons, tuple(reasons))
 
 
+@dataclass(frozen=True)
+class VerifiedReplicaBundle:
+    """A verified generation plus the three authority paths it owns.
+
+    Consumers must take all three paths from one instance of this object. That
+    is the type-level guard against the split-generation error, where a
+    canonical store from one generation is combined with lifecycle state or a
+    gap spool from another.
+    """
+
+    root: Path
+    manifest: CanonicalLearningReplicaManifest
+    canonical_db_path: Path
+    paper_state_path: Path
+    paper_gap_spool_path: Path
+    completeness_supported: bool
+    completeness_reasons: tuple[str, ...]
+
+
+def resolve_verified_replica_bundle(
+    *,
+    root: Path | None = None,
+    expected_source_release_sha: str,
+    now: datetime | None = None,
+    max_age_seconds: int = REPLICA_FRESHNESS_SECONDS,
+) -> VerifiedReplicaBundle:
+    """Verify the installed replica and return its three authority paths.
+
+    Readiness must begin here rather than by probing for a SQLite file, so that
+    provenance is established before any evidence is read.
+    """
+    base = replica_root(root)
+    verified = verify_installed_replica(
+        expected_source_release_sha=expected_source_release_sha,
+        root=base,
+        now=now,
+        max_age_seconds=max_age_seconds,
+    )
+    supports, reasons = replica_supports_completeness(verified)
+    return VerifiedReplicaBundle(
+        root=base,
+        manifest=verified,
+        canonical_db_path=base / CANONICAL_RELATIVE,
+        paper_state_path=base / PAPER_STATE_RELATIVE,
+        paper_gap_spool_path=base / PAPER_GAP_RELATIVE,
+        completeness_supported=supports,
+        completeness_reasons=reasons,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Export (production side)
 # ---------------------------------------------------------------------------
@@ -1043,6 +1093,7 @@ __all__ = [
     "ReplicaUnavailableError",
     "ReplicaVerificationError",
     "SnapshotFacts",
+    "VerifiedReplicaBundle",
     "build_replica_manifest",
     "export_replica_bundle",
     "host_current_pointer",
@@ -1059,6 +1110,7 @@ __all__ = [
     "replica_supports_completeness",
     "require_generation_id",
     "resolve_current_generation",
+    "resolve_verified_replica_bundle",
     "verify_installed_replica",
     "verify_replica_manifest",
     "write_replica_manifest",
