@@ -14,6 +14,7 @@ from app.services.paper_trade_registry import (
     EVENT_FILE,
     STATE_FILE,
     get_nonterminal_lifecycles,
+    reconcile_pending_outcomes,
     save_lifecycle,
 )
 from app.services.registry_io import registry_lock
@@ -331,6 +332,14 @@ def _run_paper_trade_monitor_unlocked(
                 f"{trade.paper_trade_id}:{trade.symbol}:"
                 f"{type(exc).__name__}:{exc}"
             )
+
+    # Drain any outcome intents a previous cycle could not deliver. Idempotency
+    # makes this safe, and it reuses this existing cycle rather than adding a
+    # daemon. A failure here must never affect paper monitoring.
+    try:
+        reconcile_pending_outcomes(state_file=state_file)
+    except Exception as exc:
+        failures.append(f"OUTCOME_RECONCILE:{type(exc).__name__}:{exc}")
 
     return PaperMonitorSummary(
         control_enabled=control.enabled,

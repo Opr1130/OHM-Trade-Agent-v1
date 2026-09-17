@@ -7,6 +7,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+from app.opip.contracts.paper_outcome import (
+    ENGINE_OHM_PAPER_SIM,
+    resolve_quote_currency,
+)
+from app.opip.decision.versioning import STRATEGY_VERSION
 from app.services.entry_exit_advisor import EntryExitPlan
 from app.services.paper_trade_control import CONTROL_FILE, paper_trade_enabled
 from app.services.paper_trade_models import PaperTradeLifecycle
@@ -71,6 +76,18 @@ def _paper_id(episode_id: str, symbol: str, direction: str = "LONG") -> str:
     normalized = str(direction or "LONG").strip().upper() or "LONG"
     raw = f"{episode_id}|{symbol.upper()}|{normalized}"
     return "PAPER:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _enrollment_quote_currency(snapshot: Any, symbol: str) -> str | None:
+    """Resolve the quote currency at enrollment, or ``None`` when unprovable.
+
+    Prefers the snapshot's typed quote currency and falls back to the symbol
+    suffix, resolved longest-first so ``BTCUSDT`` is never read as a USD pair.
+    Returning ``None`` rather than defaulting to USD keeps an unprovable
+    currency from being silently recorded as dollars.
+    """
+    declared = getattr(snapshot, "primary_quote_currency", None)
+    return resolve_quote_currency(symbol, quote_currency=declared) or resolve_quote_currency(symbol)
 
 
 def _decision_prices(snapshot: Any) -> tuple[float | None, float | None]:
@@ -272,6 +289,11 @@ def enroll_paper_opportunity(
         last_observed_price=float(reference),
         paper_only=True,
         exchange_write_authority=False,
+        # Provenance captured now, at enrollment. Deriving these at close time
+        # would attribute the trade to whatever is deployed later.
+        quote_currency=_enrollment_quote_currency(snapshot, symbol),
+        strategy_version=STRATEGY_VERSION,
+        execution_engine=ENGINE_OHM_PAPER_SIM,
     )
     try:
         stored = create_lifecycle(

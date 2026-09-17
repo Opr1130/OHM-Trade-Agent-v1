@@ -4,10 +4,22 @@ from dataclasses import asdict, fields
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
+from app.opip.canonical.gap_spool import append_capture_gap
+from app.opip.contracts.paper_outcome import resolve_quote_currency
+from app.services.paper_outcome_outbox import (
+    DELIVERY_COMMITTED,
+    DELIVERY_PERMANENT_FAILURE,
+    DELIVERY_PENDING,
+    build_outcome_envelope,
+    canonical_capture_enabled,
+    settle_envelope,
+    submit_envelope,
+)
 from app.services.paper_trade_models import (
     NONTERMINAL_STATUSES,
     TERMINAL_STATUSES,
@@ -19,6 +31,17 @@ from app.services.registry_io import load_json, registry_lock, save_json_atomic
 
 STATE_FILE = Path("/app/data/paper_trading/state.json")
 EVENT_FILE = Path("/app/data/paper_trading/events.jsonl")
+
+#: Paper-plane evidence-gap spool. Reuses the canonical gap-spool mechanism
+#: (identical implementation, non-eviction, fail-closed on corruption) in its
+#: own file so a paper evidence failure can never mark the alert governor's
+#: evidence window incomplete.
+EVIDENCE_GAP_SPOOL_FILE = Path("/app/data/paper_trading/evidence_gap_spool.json")
+
+#: Durable disposition recorded when a paper evidence append cannot be written.
+PAPER_EVENT_APPEND_FAILED = "PAPER_EVENT_APPEND_FAILED"
+
+logger = logging.getLogger(__name__)
 
 
 def _state_lock(path: Path) -> Path:
@@ -88,13 +111,59 @@ def _event_id(trade: PaperTradeLifecycle, event_type: str) -> str:
     return "PTE:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
+def _record_evidence_disposition(
+    trade: PaperTradeLifecycle,
+    event_type: str,
+    *,
+    error_code: str,
+    gap_spool_file: Path = EVIDENCE_GAP_SPOOL_FILE,
+) -> None:
+    """Make a lost paper evidence append durable, visible, and reconcilable.
+
+    A lifecycle row can read CLOSED while its terminal event - the shipper's
+    source and the only durable record of that transition - was never written.
+    Silently returning would leave operational state complete and evidence
+    missing with nothing to repair from, which the repository's learning-
+    consumption invariant treats as a defect.
+
+    This never raises: evidence bookkeeping must not affect paper trading or
+    the production scan cycle.
+    """
+    try:
+        append_capture_gap(
+            idempotency_key=_event_id(trade, event_type),
+            scan_id=str(trade.episode_id or ""),
+            identity=str(trade.paper_trade_id),
+            intended_event_type=str(event_type).upper(),
+            error_code=error_code,
+            path=gap_spool_file,
+        )
+    except Exception:
+        # The spool itself is unavailable or corrupt. Fail closed rather than
+        # silent: a corrupt spool also makes any "evidence window complete"
+        # claim unprovable, so this must be observable.
+        logger.exception(
+            "paper evidence disposition failed; evidence window uncertified "
+            "(%s event for %s)",
+            event_type,
+            trade.paper_trade_id,
+        )
+
+
 def _append_event(
     trade: PaperTradeLifecycle,
     event_type: str,
     *,
     event_file: Path,
     details: dict[str, Any] | None = None,
-) -> None:
+    gap_spool_file: Path = EVIDENCE_GAP_SPOOL_FILE,
+) -> bool:
+    """Append one durable paper event. Returns False when evidence was lost.
+
+    Returning rather than raising preserves the documented invariant that paper
+    persistence problems never affect live ranking or trading authority, while
+    the recorded disposition keeps the loss from being silent.
+    """
     event = {
         "event_id": _event_id(trade, event_type),
         "event_type": str(event_type).upper(),
@@ -128,7 +197,14 @@ def _append_event(
                 except OSError:
                     pass
     except (OSError, TimeoutError):
-        return
+        _record_evidence_disposition(
+            trade,
+            event_type,
+            error_code=PAPER_EVENT_APPEND_FAILED,
+            gap_spool_file=gap_spool_file,
+        )
+        return False
+    return True
 
 
 def create_lifecycle(
@@ -181,6 +257,8 @@ def save_lifecycle(
         raise ValueError(f"unsupported paper status: {trade.status}")
 
     stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    terminal = trade.status in TERMINAL_STATUSES
+    envelope: dict[str, Any] | None = None
     with registry_lock(_state_lock(state_file)):
         rows = _load_rows(state_file)
         current = rows.get(trade.paper_trade_id)
@@ -188,11 +266,149 @@ def save_lifecycle(
             raise KeyError(f"paper lifecycle not found: {trade.paper_trade_id}")
         trade.revision = int(current.get("revision") or 1) + 1
         trade.updated_at = stamp.isoformat()
+
+        # Build the exact recovery intent BEFORE persisting, so the terminal
+        # lifecycle row and the intent that describes it commit together. The
+        # revision is already final here, which is what makes the persisted
+        # intent byte-identical on every later retry.
+        #
+        # A lifecycle that already reached a settled delivery keeps its existing
+        # envelope rather than being rebuilt. Rebuilding would embed the new
+        # revision, and since recorded provenance participates in conflict
+        # detection the resubmission would be rejected as a conflict instead of
+        # resolving as a duplicate - turning a harmless re-save into a permanent
+        # evidence failure.
+        if terminal:
+            prior = current.get("outcome_outbox")
+            prior_delivery = (
+                str(prior.get("delivery") or "") if isinstance(prior, dict) else ""
+            )
+            if prior_delivery in {DELIVERY_COMMITTED, DELIVERY_PERMANENT_FAILURE}:
+                envelope = None
+                trade.outcome_outbox = prior
+            else:
+                envelope = build_outcome_envelope(
+                    trade,
+                    terminal_event_id=_event_id(trade, event_type),
+                )
+                if envelope is not None:
+                    trade.outcome_outbox = envelope
+
         rows[trade.paper_trade_id] = asdict(trade)
         _save_rows(rows, state_file)
 
+    # The append is self-recording: `_append_event` durably records its own
+    # evidence gap on failure, so a lost terminal event is already visible and
+    # callers do not need to branch on the result. The boolean is intentionally
+    # discarded here.
     _append_event(trade, event_type, event_file=event_file, details=details)
+
+    # Delivery happens only after the operational transition is durable, and
+    # outside the state lock so a slow or unavailable writer can never block
+    # paper monitoring.
+    if envelope is not None:
+        _deliver_outcome(trade, envelope, state_file=state_file)
     return trade
+
+
+def _deliver_outcome(
+    trade: PaperTradeLifecycle,
+    envelope: dict[str, Any],
+    *,
+    state_file: Path,
+) -> dict[str, Any]:
+    """Submit the persisted intent and record the resulting disposition."""
+    if not canonical_capture_enabled():
+        # Canonical outcome capture is off. The envelope stays PENDING with no
+        # gap recorded, so nothing claims an evidence window is complete and no
+        # unactionable failure noise is produced.
+        return envelope
+
+    updated = submit_envelope(dict(envelope))
+    settle_envelope(
+        updated,
+        paper_trade_id=trade.paper_trade_id,
+        episode_id=str(trade.episode_id or ""),
+        spool_file=EVIDENCE_GAP_SPOOL_FILE,
+    )
+    _persist_outbox(trade.paper_trade_id, updated, state_file=state_file)
+    return updated
+
+
+def _persist_outbox(
+    paper_trade_id: str, envelope: dict[str, Any], *, state_file: Path
+) -> None:
+    """Persist a delivery disposition without touching economic fields."""
+    try:
+        with registry_lock(_state_lock(state_file)):
+            rows = _load_rows(state_file)
+            row = rows.get(paper_trade_id)
+            if not isinstance(row, dict):
+                return
+            row["outcome_outbox"] = envelope
+            _save_rows(rows, state_file)
+    except Exception:
+        logger.exception(
+            "could not persist paper outcome disposition for %s", paper_trade_id
+        )
+
+
+def reconcile_pending_outcomes(*, state_file: Path = STATE_FILE) -> dict[str, int]:
+    """Resubmit persisted outcome intents that are still undelivered.
+
+    Idempotency is what makes reconciliation safe: a resubmission of an intent
+    the writer already committed returns ``DUPLICATE_OK`` and resolves the
+    matching gap, so retrying can never create a second economic outcome.
+
+    ``PERMANENT_FAILURE`` envelopes are deliberately skipped - a conflicting or
+    malformed outcome cannot be fixed by trying again, so it stays visibly
+    incomplete instead of looping.
+    """
+    if not canonical_capture_enabled():
+        return {"pending": 0, "committed": 0, "permanent_failure": 0, "skipped": 1}
+
+    with registry_lock(_state_lock(state_file)):
+        rows = _load_rows(state_file)
+
+    targets: list[tuple[str, str, dict[str, Any]]] = []
+    permanent = 0
+    for paper_trade_id, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        envelope = row.get("outcome_outbox")
+        if not isinstance(envelope, dict):
+            continue
+        delivery = str(envelope.get("delivery"))
+        if delivery == DELIVERY_PERMANENT_FAILURE:
+            permanent += 1
+            continue
+        if delivery == DELIVERY_PENDING and isinstance(envelope.get("intent"), dict):
+            targets.append(
+                (str(paper_trade_id), str(row.get("episode_id") or ""), envelope)
+            )
+
+    committed = 0
+    still_pending = 0
+    for paper_trade_id, episode_id, envelope in targets:
+        updated = submit_envelope(dict(envelope))
+        settle_envelope(
+            updated,
+            paper_trade_id=paper_trade_id,
+            episode_id=episode_id,
+            spool_file=EVIDENCE_GAP_SPOOL_FILE,
+        )
+        _persist_outbox(paper_trade_id, updated, state_file=state_file)
+        if str(updated.get("delivery")) == DELIVERY_COMMITTED:
+            committed += 1
+        else:
+            still_pending += 1
+
+    return {
+        "pending": still_pending,
+        "committed": committed,
+        "permanent_failure": permanent,
+        "skipped": 0,
+    }
 
 
 def get_lifecycles(*, state_file: Path = STATE_FILE) -> list[PaperTradeLifecycle]:
@@ -241,6 +457,19 @@ def account_summary(
         for trade in rows
         if trade.status == "CLOSED"
     )
+    realized_by_currency: dict[str, float] = {}
+    for trade in rows:
+        if trade.status != "CLOSED":
+            continue
+        currency = resolve_quote_currency(
+            trade.symbol, quote_currency=trade.quote_currency
+        )
+        if currency is None:
+            # Unprovable currency is never folded into a currency total.
+            currency = "UNKNOWN"
+        realized_by_currency[currency] = round(
+            realized_by_currency.get(currency, 0.0) + float(trade.net_pnl or 0.0), 8
+        )
     reserved = sum(
         float(trade.capital)
         + (
@@ -263,4 +492,5 @@ def account_summary(
         closed_trades=sum(trade.status == "CLOSED" for trade in rows),
         cancelled_setups=sum(trade.status == "CANCELLED" for trade in rows),
         unresolved_trades=sum(trade.status == "UNRESOLVED" for trade in rows),
+        realized_net_pnl_by_currency=realized_by_currency,
     )

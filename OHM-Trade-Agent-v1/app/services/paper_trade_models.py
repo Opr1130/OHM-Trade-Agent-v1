@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from app.opip.contracts.paper_outcome import ENGINE_OHM_PAPER_SIM
 
 
 NONTERMINAL_STATUSES = {"PENDING_ENTRY", "OPEN"}
@@ -72,6 +74,19 @@ class PaperTradeLifecycle:
     paper_only: bool = True
     exchange_write_authority: bool = False
 
+    # Captured at enrollment, never derived at close time. Reconstructing
+    # provenance retrospectively would attribute an old trade either to the
+    # currently deployed strategy or to an assumed quote currency.
+    quote_currency: str | None = None
+    strategy_version: str | None = None
+    execution_engine: str = ENGINE_OHM_PAPER_SIM
+
+    #: Exact canonical WriterIntent recovery envelope for the terminal outcome,
+    #: persisted atomically with the lifecycle row it belongs to. This is what
+    #: makes a retry byte-identical rather than a rebuild from current state,
+    #: and it is why the intent is built before the lifecycle is committed.
+    outcome_outbox: dict | None = None
+
 
 @dataclass(frozen=True)
 class PaperAccountSummary:
@@ -85,3 +100,8 @@ class PaperAccountSummary:
     closed_trades: int
     cancelled_setups: int
     unresolved_trades: int
+    #: Realised net P/L per quote currency. USD and USDT are never combined:
+    #: there is no trusted conversion source for realised P/L, so a single
+    #: total would be a number with no defensible meaning. ``available_capital``
+    #: deliberately keeps its existing single-currency behaviour in this PR.
+    realized_net_pnl_by_currency: dict[str, float] = field(default_factory=dict)
