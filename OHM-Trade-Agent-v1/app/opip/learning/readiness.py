@@ -13,7 +13,9 @@ from app.opip.learning.linkage import (
     LinkageStatus,
     OutcomeSourceQuality,
     build_learning_linkage_records,
+    paper_outcome_population_incomplete,
 )
+from app.opip.contracts.paper_outcome import validate_terminal_outcome_payload
 
 
 class MLReadinessState(str, Enum):
@@ -317,16 +319,27 @@ def build_ml_data_readiness_report(
     ml_snapshot_rows: Iterable[Mapping[str, Any]],
     phase3c_outcome_rows: Iterable[Mapping[str, Any]] = (),
     paper_trade_rows: Iterable[Mapping[str, Any]] = (),
+    paper_outcome_rows: Iterable[Mapping[str, Any]] = (),
+    paper_outcome_source_error: str | None = None,
     capture_health: Mapping[str, Any] | None = None,
     capture_dead_letter_rows: Iterable[Mapping[str, Any]] = (),
     policy: MLReadinessPolicy | None = None,
 ) -> MLDataReadinessReport:
-    """Build the fail-closed readiness gate from immutable O'Pip evidence."""
+    """Build the fail-closed readiness gate from immutable O'Pip evidence.
+
+    ``paper_trade_rows`` remain the operational lifecycle population and keep
+    their existing validation, which requires a lifecycle ``revision``.
+    ``paper_outcome_rows`` are a distinct population: authoritative canonical
+    terminal outcomes, which carry ``final_revision`` and a different contract.
+    They are validated separately and never coerced into impersonating
+    lifecycle rows.
+    """
     active_policy = policy or MLReadinessPolicy()
     canonical_all = list(canonical_rows)
     ml_all = list(ml_snapshot_rows)
     phase_all = list(phase3c_outcome_rows)
     paper_all = list(paper_trade_rows)
+    paper_outcome_all = list(paper_outcome_rows)
     dead_letters = list(capture_dead_letter_rows)
 
     canonical_safe, canonical_malformed = _structurally_valid_canonical(canonical_all)
@@ -390,11 +403,37 @@ def build_ml_data_readiness_report(
             continue
         paper_safe.append(row)
 
+    # Canonical terminal outcomes use their own contract: `final_revision`, not
+    # the lifecycle `revision`. Validating them with lifecycle rules would
+    # reject every valid canonical row.
+    paper_outcome_safe: list[Mapping[str, Any]] = []
+    paper_outcome_malformed = 0
+    for row in paper_outcome_all:
+        try:
+            validated = validate_terminal_outcome_payload(row)
+        except (ValueError, TypeError):
+            paper_outcome_malformed += 1
+            continue
+        paper_outcome_safe.append(validated)
+
+    # Delivery completeness is local evidence about whether the canonical
+    # population can be considered whole. A closed lifecycle does not imply
+    # complete evidence.
+    outcome_incomplete, outcome_incomplete_reasons = (
+        paper_outcome_population_incomplete(paper_safe)
+    )
+    if paper_outcome_source_error:
+        outcome_incomplete = True
+        outcome_incomplete_reasons = tuple(
+            sorted(set(outcome_incomplete_reasons) | {"CANONICAL_OUTCOME_SOURCE_UNAVAILABLE"})
+        )
+
     malformed_records = (
         canonical_malformed
         + feature_malformed
         + phase_malformed
         + paper_malformed
+        + paper_outcome_malformed
         + dead_letter_malformed
         + int(health.get("malformed", 0) or 0)
     )
@@ -407,6 +446,9 @@ def build_ml_data_readiness_report(
             ml_snapshot_rows=ml_safe,
             phase3c_outcome_rows=phase_safe,
             paper_trade_rows=paper_safe,
+            paper_outcome_rows=paper_outcome_safe,
+            paper_outcome_population_incomplete=outcome_incomplete,
+            paper_outcome_incomplete_reasons=outcome_incomplete_reasons,
         )
     except ValueError:
         malformed_records += 1

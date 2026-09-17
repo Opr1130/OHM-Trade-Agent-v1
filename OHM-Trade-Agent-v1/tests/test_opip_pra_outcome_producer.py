@@ -294,8 +294,30 @@ def test_cancelled_outcome_has_zero_realised_economics(canonical_env, paper_env,
     payload = json.loads(_canonical_rows(canonical_env)[0][1])
     assert payload["net_pnl"] == 0.0
     assert payload["gross_pnl"] == 0.0
-    assert payload["capital_committed"] == 0.0
     assert payload["simulated_entry_price"] is None
+
+
+def test_cancelled_outcome_preserves_planned_committed_capital(canonical_env, paper_env, servers):
+    """Planned capital survives a cancellation; realised economics stay zero.
+
+    ``capital_committed`` records what the lifecycle committed, which is true
+    regardless of whether a position was ever realised. Zeroing it would lose
+    the only record of what the setup would have risked.
+    """
+    outbox.set_writer_client_for_tests(InProcessWriterClient(servers()))
+    _seed_terminal(
+        paper_env,
+        status="CANCELLED",
+        event_type="CANCELLED_PENDING_TTL_EXPIRED",
+        capital=1234.5,
+    )
+
+    payload = json.loads(_canonical_rows(canonical_env)[0][1])
+    assert payload["capital_committed"] == pytest.approx(1234.5)
+    assert payload["gross_pnl"] == 0.0
+    assert payload["fees_paid"] == 0.0
+    assert payload["net_pnl"] == 0.0
+    assert payload["net_pnl_pct"] == 0.0
 
 
 def test_unresolved_outcome_asserts_no_economics(canonical_env, paper_env, servers):

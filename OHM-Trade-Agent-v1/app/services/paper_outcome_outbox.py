@@ -188,8 +188,11 @@ def build_outcome_envelope(
             if None in (gross_pnl, net_pnl, net_pnl_pct):
                 raise ValueError("closed lifecycle is missing terminal economics")
         elif status == CANCELLED:
-            # Nothing was realised, and no position meant no market commitment.
-            capital_committed = 0.0
+            # Nothing was realised, so every realised figure is zero. The
+            # committed capital was still committed, though: it is a planned
+            # amount, not a realised result, so it survives as recorded. No
+            # executed quantity or entry price is fabricated - there was none.
+            capital_committed = float(getattr(trade, "capital", 0.0) or 0.0)
             gross_pnl = fees_paid = net_pnl = net_pnl_pct = 0.0
         else:
             capital_committed = None

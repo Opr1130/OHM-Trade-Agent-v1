@@ -117,6 +117,50 @@ def _capture_health(path: Path) -> tuple[dict[str, Any], int]:
     return _json_object(path)
 
 
+def _canonical_paper_outcomes(
+    db_path: Path | None = None,
+    spool_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], str | None, tuple[str, ...]]:
+    """Read authoritative canonical terminal paper outcomes.
+
+    Returns ``(rows, source_error, incomplete_reasons)``.
+
+    A source that cannot be read is reported as ``source_error`` rather than as
+    zero outcomes: "cannot read" and "legitimately empty" are different states,
+    and conflating them would claim a complete, empty population when the
+    authority plane is simply unavailable.
+
+    Unresolved evidence-gap entries make the population conservatively
+    incomplete. A corrupt spool is treated the same way - and is never
+    rewritten or quarantined just to make readiness succeed.
+    """
+    import sqlite3
+
+    from app.opip.canonical.gap_spool import GapSpoolError, evidence_window_incomplete
+    from app.opip.learning.paper_outcome_reader import (
+        PaperOutcomeIntegrityError,
+        read_canonical_paper_outcomes,
+    )
+    from app.services.paper_trade_registry import EVIDENCE_GAP_SPOOL_FILE
+
+    reasons: list[str] = []
+    try:
+        read = read_canonical_paper_outcomes(db_path)
+        rows = [outcome.as_dict() for outcome in read.outcomes]
+        source_error = None
+    except (PaperOutcomeIntegrityError, sqlite3.Error, OSError) as exc:
+        return [], f"{type(exc).__name__}: {exc}", ("CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",)
+
+    target = Path(spool_path) if spool_path is not None else EVIDENCE_GAP_SPOOL_FILE
+    try:
+        if evidence_window_incomplete(target):
+            reasons.append("PAPER_OUTCOME_EVIDENCE_GAP_UNRESOLVED")
+    except GapSpoolError:
+        # Fail closed: a corrupt spool makes completeness unprovable.
+        reasons.append("PAPER_OUTCOME_EVIDENCE_GAP_SPOOL_CORRUPT")
+    return rows, source_error, tuple(sorted(set(reasons)))
+
+
 def build_production_readiness_report(
     *,
     canonical_path: Path = CANONICAL_EVIDENCE,
@@ -125,6 +169,8 @@ def build_production_readiness_report(
     paper_state_path: Path = PAPER_STATE,
     capture_health_path: Path = CAPTURE_HEALTH,
     capture_dead_letter_path: Path = CAPTURE_DEAD_LETTER,
+    canonical_outcome_db_path: Path | None = None,
+    paper_gap_spool_path: Path | None = None,
     long_paper_production_verified: bool = False,
 ) -> dict[str, Any]:
     """Build one bounded production-evidence readiness snapshot."""
@@ -133,6 +179,11 @@ def build_production_readiness_report(
     phase3c_rows, phase3c_malformed = _jsonl_rows(phase3c_path)
     paper_rows, paper_malformed = _paper_rows(paper_state_path)
     dead_letter_rows, dead_letter_malformed = _jsonl_rows(capture_dead_letter_path)
+    (
+        paper_outcome_rows,
+        paper_outcome_source_error,
+        paper_outcome_incomplete_reasons,
+    ) = _canonical_paper_outcomes(canonical_outcome_db_path, paper_gap_spool_path)
     health, health_malformed = _capture_health(capture_health_path)
     health["malformed"] = int(health.get("malformed", 0) or 0) + (
         canonical_malformed
@@ -147,13 +198,20 @@ def build_production_readiness_report(
         ml_snapshot_rows=ml_rows,
         phase3c_outcome_rows=phase3c_rows,
         paper_trade_rows=paper_rows,
+        paper_outcome_rows=paper_outcome_rows,
+        paper_outcome_source_error=paper_outcome_source_error,
         capture_health=health,
         capture_dead_letter_rows=dead_letter_rows,
     )
+    payload = report.as_dict()
+    if paper_outcome_incomplete_reasons:
+        payload["paper_outcome_incomplete_reasons"] = list(
+            paper_outcome_incomplete_reasons
+        )
     return {
         "record_type": "OPIP_ML_DATA_READINESS_V1",
         "schema_version": 1,
-        "ml_data_readiness": report.as_dict(),
+        "ml_data_readiness": payload,
         "paper_learning_readiness": assess_paper_learning_readiness(
             long_production_verified=long_paper_production_verified
         ).as_dict(),
