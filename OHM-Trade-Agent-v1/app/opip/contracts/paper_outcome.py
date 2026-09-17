@@ -76,6 +76,10 @@ EXIT_REASONS: frozenset[str] = frozenset(
     }
 )
 
+#: Trade direction. Direction-scoped learning buckets are meaningless without
+#: it, so an outcome that cannot state its side is not a supervised label.
+DIRECTIONS: frozenset[str] = frozenset({"LONG", "SHORT"})
+
 #: USD and USDT are distinct quote currencies. There is no trusted conversion
 #: source for realised P/L in this repository, so they are never combined into
 #: one canonical figure.
@@ -105,6 +109,7 @@ _REQUIRED_KEYS: tuple[str, ...] = (
     "exchange",
     "native_symbol",
     "base_asset",
+    "direction",
     "quote_currency",
     "intended_entry_low",
     "intended_entry_high",
@@ -300,6 +305,10 @@ def validate_terminal_outcome_payload(payload: Mapping[str, Any]) -> dict[str, A
     if quote_currency not in QUOTE_CURRENCIES:
         raise ValueError(f"unknown quote currency: {quote_currency}")
 
+    direction = str(payload["direction"])
+    if direction not in DIRECTIONS:
+        raise ValueError(f"unsupported direction: {direction}")
+
     expected_id = terminal_outcome_id(
         engine=engine,
         paper_trade_id=str(payload["paper_trade_id"]),
@@ -366,6 +375,7 @@ def build_terminal_outcome_payload(
     exchange: str,
     native_symbol: str,
     base_asset: str,
+    direction: str,
     quote_currency: str,
     terminal_status: str,
     exit_reason: str,
@@ -423,6 +433,7 @@ def build_terminal_outcome_payload(
         "exchange": exchange,
         "native_symbol": native_symbol,
         "base_asset": base_asset,
+        "direction": str(direction).strip().upper(),
         "quote_currency": resolved_quote,
         "intended_entry_low": intended_entry_low,
         "intended_entry_high": intended_entry_high,
@@ -455,6 +466,7 @@ def build_terminal_outcome_payload(
 __all__ = [
     "CANCELLED",
     "CLOSED",
+    "DIRECTIONS",
     "ENGINE_FREQTRADE_DRY_RUN",
     "ENGINE_OHM_PAPER_SIM",
     "EXECUTION_ENGINES",

@@ -216,6 +216,7 @@ def build_outcome_envelope(
             exchange="KRAKEN",
             native_symbol=str(getattr(trade, "symbol", "") or ""),
             base_asset=str(getattr(trade, "base_asset", "") or ""),
+            direction=str(getattr(trade, "direction", "") or "").upper(),
             quote_currency=quote_currency,
             terminal_status=status,
             exit_reason=exit_reason,

@@ -60,6 +60,7 @@ def _payload(**overrides) -> dict:
         "exchange": "KRAKEN",
         "native_symbol": "BTCUSD",
         "base_asset": "BTC",
+        "direction": "LONG",
         "quote_currency": "USD",
         "terminal_status": CLOSED,
         "exit_reason": "STOP",
@@ -195,6 +196,19 @@ def test_unknown_quote_currency_fails_closed():
 def test_payload_rejects_unknown_quote_currency():
     with pytest.raises(ValueError):
         _payload(native_symbol="BTCGBP", quote_currency="GBP")
+
+
+def test_payload_rejects_unknown_direction():
+    """Direction-scoped learning buckets need a real side."""
+    with pytest.raises(ValueError, match="unsupported direction"):
+        _payload(direction="SIDEWAYS")
+
+
+def test_payload_requires_direction():
+    payload = _payload()
+    stripped = {key: value for key, value in payload.items() if key != "direction"}
+    with pytest.raises(ValueError, match="missing keys: direction"):
+        validate_terminal_outcome_payload(stripped)
 
 
 def test_usdt_pair_keeps_usdt_quote_currency():

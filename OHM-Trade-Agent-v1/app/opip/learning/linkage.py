@@ -336,7 +336,24 @@ def normalize_phase3c_outcome(
 def normalize_paper_outcome(
     row: Mapping[str, Any] | None,
 ) -> NormalizedOutcomeEvidence:
-    """Return normalize paper outcome."""
+    """Normalize a paper outcome row.
+
+    Dispatch is by payload form, and canonical form wins:
+
+    * A canonical terminal outcome payload (the authoritative plane) is
+      normalized by :func:`normalize_canonical_paper_outcome`.
+    * A legacy ``paper_trading/state.json`` lifecycle row keeps the original
+      normalization, so existing callers and historical evidence continue to
+      work unchanged.
+
+    This keeps the cutover additive: nothing that previously produced a result
+    stops producing one, and canonical evidence is preferred wherever present.
+    """
+    if isinstance(row, Mapping) and (
+        row.get("outcome_id") is not None or row.get("terminal_status") is not None
+    ):
+        return normalize_canonical_paper_outcome(row)
+
     if row is None:
         return normalize_phase3c_outcome(None)
 
@@ -398,6 +415,93 @@ def normalize_paper_outcome(
             else None
         ),
         terminal_outcome=str(row.get("outcome") or "") or None,
+        net_pnl=net_pnl,
+        net_pnl_pct=net_pnl_pct,
+    )
+
+
+def normalize_canonical_paper_outcome(
+    payload: Mapping[str, Any] | None,
+    *,
+    evidence_complete: bool = True,
+) -> NormalizedOutcomeEvidence:
+    """Normalize an authoritative canonical terminal paper outcome.
+
+    This is the learner cutover. The canonical plane is the outcome authority,
+    so this reads the committed contract payload rather than the mutable
+    ``paper_trading/state.json`` lifecycle row.
+
+    ``evidence_complete`` gates classification. A closed paper lifecycle does
+    not imply complete evidence: if an outcome could not be delivered, the
+    population is genuinely incomplete and a row must never be presented as
+    final supervised truth. Incomplete evidence is returned UNUSABLE, never
+    FINAL_PAPER.
+
+    Structural requirements for FINAL_PAPER, all of which must be positively
+    present rather than defaulted:
+
+    * ``terminal_status`` is ``CLOSED`` - a cancelled setup realised nothing and
+      an unresolved outcome is unknown, so neither is a supervised label.
+    * native economics are present and finite.
+    * a typed quote currency is present, so P/L is never currency-blind.
+    * the execution engine is explicit, so simulator populations are never
+      silently combined.
+    """
+    if payload is None:
+        return normalize_phase3c_outcome(None)
+
+    status = str(payload.get("terminal_status") or "").upper()
+    direction = _direction(payload.get("direction"))
+    net_pnl = _optional_float(payload.get("net_pnl"))
+    net_pnl_pct = _optional_float(payload.get("net_pnl_pct"))
+    quote_currency = str(payload.get("quote_currency") or "").strip().upper()
+    engine = str(payload.get("engine") or "").strip()
+    final = (
+        status == "CLOSED"
+        and direction in {"LONG", "SHORT"}
+        and net_pnl is not None
+        and net_pnl_pct is not None
+        and bool(quote_currency)
+        and bool(engine)
+        and bool(str(payload.get("exit_timestamp") or "").strip())
+        and _optional_float(payload.get("exit_price")) is not None
+    )
+    if final and not evidence_complete:
+        # The outcome is authoritative but the population is not complete, so it
+        # is not yet final supervised truth.
+        final = False
+
+    quality = (
+        OutcomeSourceQuality.FINAL_PAPER
+        if final
+        else OutcomeSourceQuality.UNUSABLE
+    )
+    returns = {"paper_closed": net_pnl_pct} if net_pnl_pct is not None else {}
+
+    return NormalizedOutcomeEvidence(
+        source_quality=quality,
+        source_name="PAPER_OUTCOME_CANONICAL_V1",
+        canonical_snapshot_id=str(payload.get("outcome_id") or "") or None,
+        episode_id=str(payload.get("episode_id") or "") or None,
+        direction=direction,
+        outcome_record_id=str(payload.get("outcome_id") or "") or None,
+        outcome_revision=int(payload.get("final_revision", 0) or 0),
+        paper_trade_id=str(payload.get("paper_trade_id") or "") or None,
+        horizon_returns=returns,
+        mfe=_optional_float(payload.get("mfe_pct")),
+        mae=_optional_float(payload.get("mae_pct")),
+        time_to_mfe_seconds=_optional_float(payload.get("time_to_mfe_seconds")),
+        time_to_mae_seconds=_optional_float(payload.get("time_to_mae_seconds")),
+        censored=status == "UNRESOLVED",
+        data_gap=bool(payload.get("lineage_missing")),
+        execution_path_ambiguous=False,
+        fee_model_version=(
+            str(payload.get("economic_model_version"))
+            if payload.get("economic_model_version")
+            else None
+        ),
+        slippage_model_version=None,
+        terminal_outcome=str(payload.get("exit_reason") or "") or None,
         net_pnl=net_pnl,
         net_pnl_pct=net_pnl_pct,
     )
