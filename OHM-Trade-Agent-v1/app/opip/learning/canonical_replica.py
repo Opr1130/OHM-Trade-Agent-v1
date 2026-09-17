@@ -57,6 +57,7 @@ from app.opip.canonical.backup import (
     publish_backup_generation,
     require_release_sha,
 )
+from app.opip.canonical.schema import fsync_directory_required
 from app.opip.canonical.paths import SCHEMA_VERSION
 
 REPLICA_SCHEMA_VERSION = 1
@@ -429,7 +430,14 @@ def read_replica_manifest(path: Path) -> dict[str, Any]:
 
 
 def write_replica_manifest(manifest: Mapping[str, Any], path: Path) -> Path:
-    """Write a manifest atomically, then fsync the directory."""
+    """Write a manifest atomically, then fsync the directory.
+
+    The file is flushed before the rename, and the containing directory entry is
+    then made durable with the same PR-A0 primitive authoritative publication
+    uses. Without the directory sync the rename itself could be lost on crash,
+    leaving a generation directory whose manifest is absent - which callers would
+    see as unverifiable provenance rather than as the durability shortfall it is.
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.parent / f".{target.name}.tmp.{os.getpid()}"
@@ -445,6 +453,9 @@ def write_replica_manifest(manifest: Mapping[str, Any], path: Path) -> Path:
         except OSError:
             pass
         raise
+    # Before this returns, publication is reported as durable, so the namespace
+    # entry must actually be durable.
+    fsync_directory_required(target.parent)
     return target
 
 
@@ -903,6 +914,9 @@ def install_replica_generation(
         except Exception:
             shutil.rmtree(private, ignore_errors=True)
             raise
+        # The generation directory entry must be durable before it is named as
+        # the current generation.
+        fsync_directory_required(generations)
 
     # The pointer is a small atomically-replaced file naming the generation,
     # not a symlink: ``os.replace`` on a symlink is not portable, and a plain
@@ -920,6 +934,9 @@ def install_replica_generation(
         except OSError:
             pass
         raise
+    # The pointer rename is what makes a generation current, so its directory
+    # entry must be durable before install reports success.
+    fsync_directory_required(root)
 
     pruned = _prune_generations(generations, keep=retain, active=generation_id)
 

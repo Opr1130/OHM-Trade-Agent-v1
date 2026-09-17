@@ -19,6 +19,16 @@ from app.opip.contracts.paper_outcome import resolve_effective_outcome_ids
 
 PROVISIONAL_PHASE3C_SOURCE = "PROVISIONAL_EVENT_SAMPLED_FULL_MARKET_OBSERVATIONS"
 
+#: A PR-A lifecycle asserted ``COMMITTED`` but carried no usable canonical
+#: outcome identity, so its authority claim cannot be checked at all.
+REASON_COMMITTED_IDENTITY_INVALID = "PAPER_OUTCOME_COMMITTED_IDENTITY_INVALID"
+#: A PR-A lifecycle asserted ``COMMITTED`` for an outcome that the canonical
+#: snapshot of the same verified generation does not contain. This is the
+#: cross-artifact capture race; one such row makes the whole population
+#: incomplete, because "committed" is a claim about canonical authority and the
+#: population cannot be certified while any such claim is unbacked.
+REASON_COMMITTED_MISSING_CANONICAL = "PAPER_OUTCOME_COMMITTED_MISSING_CANONICAL"
+
 
 class LearningCohort(str, Enum):
     QUALIFIED_PAPER = "QUALIFIED_PAPER"
@@ -622,6 +632,89 @@ def _outbox_delivery(row: Mapping[str, Any]) -> str | None:
     if not isinstance(outbox, Mapping):
         return None
     return str(outbox.get("delivery") or "") or None
+
+
+def _committed_outcome_id(row: Mapping[str, Any]) -> str | None:
+    """Return the canonical outcome identity a lifecycle claims it committed.
+
+    ``None`` means the claim is unusable: the field is absent, not a string, or
+    blank. A ``COMMITTED`` envelope without a usable identity is a malformed
+    authority claim rather than a satisfied one.
+    """
+    outbox = row.get("outcome_outbox")
+    if not isinstance(outbox, Mapping):
+        return None
+    value = outbox.get("outcome_id")
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def committed_outcome_reconciliation_reasons(
+    paper_trade_rows: Iterable[Mapping[str, Any]],
+    canonical_effective_outcome_ids: Iterable[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Reconcile PR-A ``COMMITTED`` lifecycle claims against canonical authority.
+
+    Cross-artifact capture cannot be one transaction across the canonical
+    SQLite store, the lifecycle state file and the gap spool, so a replica
+    generation can be internally hash-valid and provenance-valid while still
+    pairing a canonical snapshot with a *newer* lifecycle state. The concrete
+    race: the online backup captures outcomes A..N, a new outcome N+1 then
+    commits to the live store, the lifecycle state is persisted with N+1 marked
+    ``COMMITTED``, the gap spool is clear, and only then are state and spool
+    copied.
+
+    The result is a generation whose state asserts a committed outcome the
+    canonical snapshot does not contain. Nothing about that is detectable from
+    hashes or from delivery state alone, because ``COMMITTED`` is a *claim* that
+    the canonical outcome exists - and this function is what verifies that claim.
+
+    Legacy rows remain untouched. A terminal lifecycle with no ``outcome_outbox``
+    predates PR-A outcome production, so it makes no canonical claim and is
+    simply skipped. The rule applies only to PR-A-era rows carrying an outbox.
+
+    ``canonical_effective_outcome_ids`` must be the *effective* identities from
+    the same verified generation, so a governed correction does not read as a
+    missing outcome merely because its superseded predecessor is also stored.
+
+    Returns ``(identity_reasons, missing_reasons)``. Both are non-empty only for
+    genuinely defective authority claims:
+
+    * identity - a ``COMMITTED`` envelope whose ``outcome_id`` is unusable;
+    * missing - a usable identity with no matching effective canonical outcome.
+    """
+    canonical = {str(item) for item in canonical_effective_outcome_ids if str(item)}
+    identity_reasons: set[str] = set()
+    missing_reasons: set[str] = set()
+
+    for row in paper_trade_rows:
+        if str(row.get("status") or "").upper() not in {
+            "CLOSED",
+            "CANCELLED",
+            "UNRESOLVED",
+        }:
+            continue
+        outbox = row.get("outcome_outbox")
+        if not isinstance(outbox, Mapping):
+            # Pre-PR-A legacy terminal row: it makes no canonical claim.
+            continue
+        if _outbox_delivery(row) != "COMMITTED":
+            # PENDING / PERMANENT_FAILURE / unknown are handled by
+            # paper_outcome_population_incomplete.
+            continue
+        outcome_id = _committed_outcome_id(row)
+        if outcome_id is None:
+            identity_reasons.add(REASON_COMMITTED_IDENTITY_INVALID)
+            continue
+        if outcome_id not in canonical:
+            missing_reasons.add(REASON_COMMITTED_MISSING_CANONICAL)
+
+    return (
+        tuple(sorted(identity_reasons)),
+        tuple(sorted(missing_reasons)),
+    )
 
 
 def paper_outcome_population_incomplete(

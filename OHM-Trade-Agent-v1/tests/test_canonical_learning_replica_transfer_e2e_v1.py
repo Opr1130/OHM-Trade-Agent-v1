@@ -286,7 +286,15 @@ def _seed_canonical(outcomes: list[dict], *, delivery: str, gap_unresolved: list
             "net_pnl": payload.get("net_pnl"),
             "net_pnl_pct": payload.get("net_pnl_pct"),
             "outcome": "LOSS",
-            "outcome_outbox": {"delivery": delivery, "gap_id": None},
+            # Production writes the canonical outcome identity into the outbox
+            # envelope before submitting, so the fixture carries it too: a
+            # COMMITTED envelope without an identity is a malformed authority
+            # claim and must not be modelled as a healthy one.
+            "outcome_outbox": {
+                "delivery": delivery,
+                "gap_id": None,
+                "outcome_id": payload["outcome_id"],
+            },
         }
         for payload in outcomes
     }
@@ -402,7 +410,10 @@ def test_export_reader_sync_installs_a_verified_generation(harness):
                 "net_pnl": -29.0,
                 "net_pnl_pct": -2.9,
                 "outcome": "LOSS",
-                "outcome_outbox": {"delivery": "COMMITTED"},
+                "outcome_outbox": {
+                    "delivery": "COMMITTED",
+                    "outcome_id": read.outcomes[0].outcome_id,
+                },
             }
         ],
         paper_outcome_rows=[o.as_dict() for o in read.outcomes],

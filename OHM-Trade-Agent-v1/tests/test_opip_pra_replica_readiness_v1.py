@@ -47,6 +47,7 @@ from app.opip.learning.canonical_replica import (
 )
 from app.opip.learning.paper_outcome_reader import read_canonical_paper_outcomes
 from app.opip.learning.linkage import (
+    REASON_COMMITTED_MISSING_CANONICAL,
     LinkageStatus,
     OutcomeSourceQuality,
     build_learning_linkage_records,
@@ -137,7 +138,7 @@ def _commit_outcome(db: Path, payload: dict) -> None:
         writer.close()
 
 
-def _lifecycle(delivery: str | None) -> dict:
+def _lifecycle(delivery: str | None, outcome_id: str | None = None) -> dict:
     row = {
         "paper_trade_id": PAPER_ID,
         "episode_id": EPISODE,
@@ -153,18 +154,25 @@ def _lifecycle(delivery: str | None) -> dict:
         "outcome": "LOSS",
     }
     if delivery is not None:
-        row["outcome_outbox"] = {"delivery": delivery, "gap_id": None}
+        outbox: dict[str, object] = {"delivery": delivery, "gap_id": None}
+        if outcome_id is not None:
+            # Production writes the canonical identity into the envelope before
+            # submitting, so a faithful fixture carries it too.
+            outbox["outcome_id"] = outcome_id
+        row["outcome_outbox"] = outbox
     return row
 
 
-def _state(path: Path, delivery: str | None = "COMMITTED") -> Path:
+def _state(
+    path: Path, delivery: str | None = "COMMITTED", outcome_id: str | None = None
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "paper_only": True,
-                "lifecycles": {PAPER_ID: _lifecycle(delivery)},
+                "lifecycles": {PAPER_ID: _lifecycle(delivery, outcome_id)},
             },
             sort_keys=True,
         ),
@@ -218,7 +226,14 @@ def _build_generation(
     for payload in outcomes or []:
         _commit_outcome(live, payload)
 
-    state = _state(tmp_path / "src_state.json", delivery=delivery)
+    # The replica's own lifecycle state must make the same canonical claim the
+    # lifecycle rows in the readiness assertion make, otherwise the fixture
+    # would model a state file that cannot back its own COMMITTED disposition.
+    state = _state(
+        tmp_path / "src_state.json",
+        delivery=delivery,
+        outcome_id=(outcomes[0]["outcome_id"] if outcomes else None),
+    )
     spool = _spool(tmp_path / "src_gap.json", unresolved=unresolved)
     staging = tmp_path / f"staging-{generation_id}"
     export_replica_bundle(
@@ -286,7 +301,7 @@ def test_consistent_generation_is_final_paper(tmp_path):
     records = build_learning_linkage_records(
         canonical_rows=_canonical_rows(),
         ml_snapshot_rows=_ml_rows(),
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[_lifecycle("COMMITTED", outcome_rows[0]["outcome_id"])],
         paper_outcome_rows=outcome_rows,
         paper_outcome_incomplete_reasons=(),
         paper_outcome_population_incomplete=False,
@@ -297,7 +312,7 @@ def test_consistent_generation_is_final_paper(tmp_path):
     assert records[0].primary_supervised_eligible is True
 
     report = _readiness(
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[_lifecycle("COMMITTED", outcome_rows[0]["outcome_id"])],
         paper_outcome_rows=outcome_rows,
     )
     assert report.paper_outcome_population_incomplete is False
@@ -361,6 +376,9 @@ def test_state_newer_than_db_is_incomplete(tmp_path):
     """State claims COMMITTED but no canonical outcome was captured.
 
     A lifecycle assertion must never be accepted over an absent authority row.
+    The claim carries a well-formed identity that the canonical snapshot simply
+    does not contain - the cross-artifact capture race - so the failure is
+    "missing canonical", not "malformed identity".
     """
     current = _build_generation(tmp_path, outcomes=[], delivery="COMMITTED")
 
@@ -370,16 +388,22 @@ def test_state_newer_than_db_is_incomplete(tmp_path):
     read = read_canonical_paper_outcomes(bundle.canonical_db_path)
     assert read.outcomes == ()
 
+    claimed = "PAPER-OUTCOME:" + "f" * 32
     report = build_ml_data_readiness_report(
         canonical_rows=_canonical_rows(),
         ml_snapshot_rows=_ml_rows(),
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[_lifecycle("COMMITTED", claimed)],
         paper_outcome_rows=[],
         paper_outcome_incomplete_reasons=(),
     )
     # No canonical row means no supervised truth, regardless of the claim.
     assert report.final_supervised_truth_count == 0
     assert report.primary_supervised_usable_rows == 0
+    assert report.paper_outcome_population_incomplete is True
+    assert (
+        REASON_COMMITTED_MISSING_CANONICAL
+        in report.paper_outcome_incomplete_reasons
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +423,12 @@ def test_unresolved_gap_is_incomplete(tmp_path):
     report = build_ml_data_readiness_report(
         canonical_rows=_canonical_rows(),
         ml_snapshot_rows=_ml_rows(),
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[
+            _lifecycle(
+                "COMMITTED",
+                read_canonical_paper_outcomes(bundle.canonical_db_path).outcomes[0].outcome_id,
+            )
+        ],
         paper_outcome_rows=[
             o.as_dict() for o in read_canonical_paper_outcomes(bundle.canonical_db_path).outcomes
         ],
@@ -587,7 +616,7 @@ def test_ack_loss_then_reconcile_across_generations(tmp_path):
     records = build_learning_linkage_records(
         canonical_rows=_canonical_rows(),
         ml_snapshot_rows=_ml_rows(),
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[_lifecycle("COMMITTED", payload["outcome_id"])],
         paper_outcome_rows=[o.as_dict() for o in outcomes],
         paper_outcome_incomplete_reasons=(),
         paper_outcome_population_incomplete=False,
@@ -596,7 +625,7 @@ def test_ack_loss_then_reconcile_across_generations(tmp_path):
     assert records[0].normalized_outcome.net_pnl == pytest.approx(-29.0)
 
     report2 = _readiness(
-        paper_trade_rows=[_lifecycle("COMMITTED")],
+        paper_trade_rows=[_lifecycle("COMMITTED", payload["outcome_id"])],
         paper_outcome_rows=[o.as_dict() for o in outcomes],
     )
     assert report2.paper_outcome_population_incomplete is False
