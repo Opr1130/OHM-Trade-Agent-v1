@@ -69,15 +69,17 @@ def test_exporter_uses_python_for_snapshot_logic():
     text = _text(EXPORTER)
     assert "app.opip.learning.canonical_replica export" in text
     assert '"$PYTHON_BIN"' in text
+    assert 'PYTHONPATH="$APP_ROOT"' in text
     # No raw SQLite copying anywhere in the exporter.
     for forbidden in ("cp -- \"$DATA_ROOT/opip/canonical", "tar -c .* sqlite3", "sqlite3 "):
         assert not re.search(forbidden, text), f"exporter must not {forbidden}"
 
 
-def test_exporter_declares_python_bin_and_preflights_it():
+def test_exporter_declares_python_bin_and_preflights_exact_interpreter():
     text = _text(EXPORTER)
     assert 'PYTHON_BIN="${OPIP_PYTHON_BIN:-/usr/bin/python3}"' in text
-    assert "python3" in text.split("for cmd in", 1)[1].split("; do", 1)[0]
+    assert '[[ -x "$PYTHON_BIN" ]]' in text
+    assert "missing executable O'Pip Python interpreter" in text
 
 
 def test_exporter_requires_valid_deployed_sha_for_canonical_provenance():
@@ -93,12 +95,16 @@ def test_exporter_requires_valid_deployed_sha_for_canonical_provenance():
     assert "git rev-parse" not in text
 
 
-def test_exporter_publishes_bundle_atomically_and_cleans_own_staging():
+def test_exporter_publishes_content_addressed_bundle_without_deleting_committed_one():
     text = _text(EXPORTER)
     body = text[text.index("REPLICA_EXPORT_NAME=") : text.index("manifest_tmp=")]
-    assert 'mv -f -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"' in body
+    assert 'REPLICA_PUBLISH_NAME="${REPLICA_EXPORT_NAME}.${replica_sha}"' in body
+    assert 'mv -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"' in body
     assert 'rm -rf -- "$REPLICA_STAGING"' in body
-    assert 'rm -rf -- "$REPLICA_PUBLISH_DIR"' in body
+    # The currently committed directory must not be removed before manifest
+    # commit. Old content-addressed directories are pruned only afterwards.
+    assert 'rm -rf -- "$REPLICA_PUBLISH_DIR"' not in body
+    assert "canonical_learning_replica_dir=${REPLICA_PUBLISH_NAME}" in body
 
 
 def test_exporter_failure_does_not_publish_a_v1_marker():
@@ -118,21 +124,26 @@ def test_exporter_tree_helpers_are_defined_before_first_use():
     assert text.index("tree_sha256() {") < text.index("replica_sha=\"$(tree_sha256")
 
 
-def test_exporter_marker_is_written_into_the_manifest_only_when_present():
+def test_exporter_marker_binds_version_directory_bytes_and_digest():
     text = _text(EXPORTER)
-    assert "canonical_learning_replica_version=1" in text
+    for field in (
+        "canonical_learning_replica_version=1",
+        "canonical_learning_replica_dir=${REPLICA_PUBLISH_NAME}",
+        "canonical_learning_replica_bytes=${replica_bytes}",
+        "canonical_learning_replica_sha256=${replica_sha}",
+    ):
+        assert field in text
     # Conditional inclusion keeps legacy readers seeing the same schema.
     assert 'if [[ -n "$REPLICA_MARKER_LINES" ]]; then' in text
     assert 'printf \'%s\\n\' "$REPLICA_MARKER_LINES"' in text
 
 
-def test_exporter_publishes_manifest_last():
+def test_exporter_publishes_manifest_last_then_prunes_old_replica_dirs():
     text = _text(EXPORTER)
-    assert text.index('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"') > text.index(
-        "manifest_tmp="
-    )
-    # The replica bundle is published before the manifest temp is even created.
-    assert text.index("mv -f -- \"$REPLICA_STAGING\"") < text.index("manifest_tmp=")
+    manifest_publish = text.index('mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"')
+    replica_publish = text.index('mv -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"')
+    prune = text.index('old_replica; do')
+    assert replica_publish < manifest_publish < prune
 
 
 def test_exporter_retains_exclusive_publish_lock():
@@ -154,11 +165,11 @@ def test_reader_takes_shared_lock_before_inspecting_the_marker():
     assert text.index("flock -s 8") < text.index("CANONICAL_REPLICA_DIR=")
 
 
-def test_reader_parses_marker_from_the_committed_manifest_only():
+def test_reader_parses_replica_version_and_directory_from_committed_manifest_only():
     text = _text(READER)
     assert 'awk -F= \'$1 == "canonical_learning_replica_version"' in text
+    assert 'awk -F= \'$1 == "canonical_learning_replica_dir"' in text
     assert '"$EXPORT_ROOT/manifest.env"' in text
-    # The marker is read from the export root, never from a staging path.
     assert "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" in text
 
 
@@ -172,11 +183,12 @@ def test_reader_legacy_mode_does_not_require_the_canonical_directory():
     assert "CANONICAL_REPLICA_DIR" not in loop
 
 
-def test_reader_marker_one_requires_the_bundle_or_exits_66():
+def test_reader_marker_one_requires_path_safe_content_addressed_bundle():
     text = _text(READER)
     branch = text[text.index('if [[ -n "$REPLICA_MARKER" ]]') : text.index("for name in")]
     assert 'if [[ "$REPLICA_MARKER" != "1" ]]' in branch
-    assert "exit 126" in branch
+    assert '^canonical_learning_replica\\.[0-9a-f]{64}$' in branch
+    assert "invalid canonical replica directory marker" in branch
     assert "export unavailable: $CANONICAL_REPLICA_DIR" in branch
     assert "exit 66" in branch
 
@@ -211,11 +223,18 @@ def test_sync_replica_root_is_overridable_and_separate_from_data_root():
     assert 'DATA_ROOT="/var/lib/opip-learning/data"' in text
 
 
-def test_sync_rejects_a_replica_root_beneath_the_data_root():
+def test_sync_resolves_aliases_before_rejecting_replica_root_under_data_root():
     text = _text(SYNC)
-    assert 'case "$CANONICAL_REPLICA_ROOT/" in' in text
-    assert '"$DATA_ROOT"/*)' in text
-    assert "must not be beneath the data root" in text
+    assert "realpath" in text.split("for cmd in", 1)[1].split("; do", 1)[0]
+    assert 'DATA_ROOT_RESOLVED="$(realpath -m -- "$DATA_ROOT")"' in text
+    assert (
+        'CANONICAL_REPLICA_ROOT_RESOLVED="$(realpath -m -- "$CANONICAL_REPLICA_ROOT")"'
+        in text
+    )
+    assert 'case "$CANONICAL_REPLICA_ROOT_RESOLVED/" in' in text
+    assert '"$DATA_ROOT_RESOLVED"/*)' in text
+    assert "must not resolve beneath the data root" in text
+    assert 'CANONICAL_REPLICA_ROOT="$CANONICAL_REPLICA_ROOT_RESOLVED"' in text
 
 
 def test_sync_requires_the_learning_image_and_does_not_use_host_python():
@@ -229,10 +248,11 @@ def test_sync_requires_the_learning_image_and_does_not_use_host_python():
             assert "$OPIP_LEARNING_IMAGE" in text[: text.index(line)] or "docker run" in line
 
 
-def test_sync_requires_docker_and_preflights_it():
+def test_sync_requires_docker_and_realpath_and_preflights_them():
     text = _text(SYNC)
     preflight = text.split("for cmd in", 1)[1].split("; do", 1)[0]
     assert "docker" in preflight
+    assert "realpath" in preflight
 
 
 def test_sync_helper_container_uses_the_hardened_posture():
@@ -259,10 +279,12 @@ def test_sync_installer_mounts_store_read_write_but_input_read_only():
     assert "--store-rw" in body
 
 
-def test_sync_marker_admission_covers_all_four_cases():
+def test_sync_marker_admission_binds_dynamic_directory_and_covers_all_cases():
     text = _text(SYNC)
     block = text[text.index("CANONICAL_REPLICA_REQUIRED=0") : text.index("validate_artifact() {")]
     assert 'CANONICAL_REPLICA_REQUIRED=1' in block
+    assert "manifest_value canonical_learning_replica_dir" in block
+    assert '^canonical_learning_replica\\.[0-9a-f]{64}$' in block
     # marker empty + CURRENT must fail closed.
     assert 'if [[ "$release_status" == "CURRENT" ]]; then' in block
     assert "export declares no canonical replica" in block
@@ -281,10 +303,11 @@ def test_sync_marker_is_not_used_to_infer_worker_generation():
     assert "OPIP_DEPLOYED_SHA" not in block or "release compatibility" in block.lower()
 
 
-def test_sync_validates_outer_transport_against_recorded_bytes_and_digest():
+def test_sync_validates_outer_transport_against_directory_bytes_and_digest():
     body = _function_body(_text(SYNC), "validate_canonical_replica_outer")
     assert "manifest_value canonical_learning_replica_bytes" in body
     assert "manifest_value canonical_learning_replica_sha256" in body
+    assert 'canonical_learning_replica.$expected_sha' in body
     assert 'tree_bytes "$bundle"' in body
     assert 'tree_sha256 "$bundle"' in body
     assert "exit 65" in body
