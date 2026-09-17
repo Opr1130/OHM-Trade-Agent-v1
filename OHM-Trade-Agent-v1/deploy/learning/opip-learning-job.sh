@@ -6,6 +6,16 @@ LOCK_FILE="${OPIP_LEARNING_LOCK_FILE:-/var/lock/opip-learning-plane.lock}"
 DATA_ROOT="${OPIP_LEARNING_DATA_ROOT:-/var/lib/opip-learning/data}"
 STATE_ROOT="${OPIP_LEARNING_STATE_ROOT:-/var/lib/opip-learning/state}"
 MANIFEST="$DATA_ROOT/manifest.env"
+# Canonical learning replica repository. This lives OUTSIDE $DATA_ROOT on
+# purpose: the whole data root is mounted writable into job containers, so a
+# replica stored underneath it could be reached through a writable alias even
+# if a nested read-only mount also exposed it.
+CANONICAL_REPLICA_ROOT="${OPIP_CANONICAL_REPLICA_ROOT_HOST:-/var/lib/opip-learning/canonical-replica}"
+CANONICAL_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
+# Jobs that consume canonical paper-outcome authority must fail closed when no
+# verified generation is installed. Other jobs still receive the mount read-only
+# for consistency, but their absence of a replica is not an error.
+REQUIRE_CANONICAL_REPLICA_JOBS=" readiness outcomes "
 JOB="${1:-}"
 
 [[ -r "$ENV_FILE" ]] || {
@@ -56,6 +66,14 @@ case "$JOB" in
     CPU_LIMIT="0.70"
     MIN_AVAILABLE_KB=$((512 * 1024))
     TIMEOUT_SECONDS=480
+    ;;
+  readiness)
+    # Canonical paper-outcome readiness. Consumes the verified replica bundle.
+    MODULE="app.jobs.run_opip_ml_data_readiness"
+    MEMORY_LIMIT="384m"
+    CPU_LIMIT="0.60"
+    MIN_AVAILABLE_KB=$((512 * 1024))
+    TIMEOUT_SECONDS=300
     ;;
   *)
     echo "unsupported O'Pip learning job: $JOB" >&2
@@ -185,6 +203,35 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Resolve the committed replica generation to one immutable directory. The job
+# must bind that exact generation read-only, never the writable parent
+# repository and never a staging directory.
+resolve_canonical_replica_generation() {
+  local pointer="$CANONICAL_REPLICA_ROOT/current"
+  [[ -f "$pointer" && ! -L "$pointer" ]] || return 1
+  local generation
+  generation="$(head -n1 "$pointer" | tr -d '[:space:]')"
+  # Only a bare identifier is accepted: this rejects path traversal, absolute
+  # paths, and anything that could escape the controlled generations root.
+  [[ "$generation" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  local resolved="$CANONICAL_REPLICA_ROOT/generations/$generation"
+  [[ -d "$resolved" ]] || return 1
+  [[ -f "$resolved/replica_manifest.json" ]] || return 1
+  printf '%s\n' "$resolved"
+}
+
+REPLICA_GENERATION=""
+if REPLICA_GENERATION="$(resolve_canonical_replica_generation)"; then
+  REPLICA_MOUNT_ARGS=(-v "$REPLICA_GENERATION:$CANONICAL_REPLICA_CONTAINER_ROOT:ro")
+else
+  REPLICA_GENERATION=""
+  REPLICA_MOUNT_ARGS=()
+  if [[ "$REQUIRE_CANONICAL_REPLICA_JOBS" == *" $JOB "* ]]; then
+    echo "O'Pip learning job '$JOB' requires a verified canonical replica; none installed at $CANONICAL_REPLICA_ROOT" >&2
+    exit 78
+  fi
+fi
+
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set +e
 timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS" \
@@ -207,6 +254,10 @@ timeout --signal=TERM --kill-after=20s "$TIMEOUT_SECONDS" \
     -e OPIP_LEARNING_COVERAGE_DISCONTINUITY_ARCHIVE_PREFIX \
     -e OPIP_LEARNING_COVERAGE_DISCONTINUITY_EXPECTED_STATE_SHA \
     -e PYTHONDONTWRITEBYTECODE=1 \
+    "${REPLICA_MOUNT_ARGS[@]}" \
+    -e OPIP_CANONICAL_REPLICA_ROOT="$CANONICAL_REPLICA_CONTAINER_ROOT" \
+    -e OPIP_CANONICAL_DIR="$CANONICAL_REPLICA_CONTAINER_ROOT/opip/canonical" \
+    -e OPIP_PRODUCTION_DEPLOYED_SHA="$OPIP_DEPLOYED_SHA" \
     -v "$DATA_ROOT:/app/data" \
     "$OPIP_LEARNING_IMAGE" \
     python -m "$MODULE"
