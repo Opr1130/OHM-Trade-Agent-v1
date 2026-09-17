@@ -118,6 +118,7 @@ def test_block_reports_canonical_replica_fields():
         "manifest_production_deployed_sha=",
         "manifest_schema_version=",
         "replica_dir_name_valid=",
+        "replica_dir_rejection_reason=",
         "replica_dir_exists=",
         "replica_inner_manifest=",
         "replica_inner_generation_id=",
@@ -238,6 +239,54 @@ def test_degrade_reads_cron_daemon_active_not_state():
             continue
         for pattern in forbidden_patterns:
             assert pattern not in stripped, stripped
+
+
+def test_failure_recognition_is_bound_to_the_exporter_prefix():
+    """Generic markers must not count as exporter failures.
+
+    Regression cover: `Traceback` and `Permission denied` are generic text that
+    any writer of the shared export log could emit. A timestamp proves when a
+    line was written, not that it is an exporter event, so failure recognition is
+    bound to the exporter's own message prefix.
+    """
+    block = _block()
+    assert '"O\'Pip learning"*"canonical replica export FAILED"*' in block
+    assert '"O\'Pip learning"*"canonical replica FAILED"*' in block
+    assert '"O\'Pip learning"*"replica collision"*' in block
+    # The generic markers must no longer be recognized on their own.
+    recognition_arms = [
+        line for line in block.splitlines()
+        if "recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))" in line
+    ]
+    assert recognition_arms
+    for marker in ('*Traceback*', '*"Permission denied"*'):
+        assert marker not in block, f"generic marker still recognized: {marker}"
+    # The same binding applies to the descriptive lifetime counter.
+    assert "grep -cE \"O'Pip learning.*(canonical replica export FAILED|canonical replica FAILED|replica collision)\"" in block
+
+
+def test_replica_directory_validation_rejects_symlinks():
+    """A valid-looking name is not sufficient; the entry must be a real directory.
+
+    Regression cover: `-d` follows symlinks, so a symlinked entry named like a
+    content-addressed generation could make the probes stat and read an arbitrary
+    target outside EXPORT_ROOT.
+    """
+    block = _block()
+    assert '[[ -L "$replica_dir_candidate" ]]' in block
+    assert 'replica_dir_rejection_reason="SYMLINK_REJECTED"' in block
+    assert 'replica_dir_rejection_reason="OUTSIDE_EXPORT_ROOT"' in block
+    assert 'replica_dir_rejection_reason="PATH_UNRESOLVABLE"' in block
+    assert "realpath -m --" in block
+    # The resolved path must be contained beneath EXPORT_ROOT before it is used.
+    assert '"$resolved_candidate" != "$resolved_root"/*' in block
+    # The symlink check must precede any stat/inner read of the directory.
+    symlink_at = block.index('[[ -L "$replica_dir_candidate" ]]')
+    stat_at = block.index("replica_meta=\"$(stat -c")
+    assert symlink_at < stat_at
+    # Rejection is an anomaly that degrades, not a silent "not referenced".
+    assert 'echo "replica_dir_exists=REJECTED"' in block
+    assert "realpath" in _script()
 
 
 def test_block_reports_committed_state_log_classification_and_orphans():
@@ -1235,6 +1284,105 @@ def test_cron_probe_systemctl_unknown_and_no_pgrep_evidence_stays_unknown(tmp_pa
     assert fields["cron_daemon_active"] == "UNKNOWN"
     # State is the raw systemctl answer (no fabricated PROCESS_PRESENT here).
     assert fields["cron_daemon_state"] == "unknown"
+
+
+@pytestmark_posix
+def test_unrelated_generic_failure_markers_do_not_degrade(tmp_path):
+    """Generic failure-looking text from another writer must not degrade.
+
+    Regression cover for the finding that `Traceback` / `Permission denied` were
+    recognized unconditionally. A post-manifest line carrying them but lacking the
+    exporter's own message prefix is not an exporter event: it is counted as
+    unclassified and must not produce POST_MANIFEST_RUNS_FAIL.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z another-writer Permission denied (not the exporter)\n"
+        "2026-09-17T19:06:00Z Traceback (most recent call last): from another process\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_timestamped_line_count"] == "2"
+    assert fields["export_log_post_manifest_unclassified_line_count"] == "2"
+    assert fields["export_log_post_manifest_recognized_event_count"] == "0"
+    assert fields["export_log_post_manifest_failure_count"] == "0"
+    assert (
+        fields["export_log_activity_class"]
+        == "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
+    )
+    for not_expected in ("POST_MANIFEST_RUNS_FAIL", "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"):
+        assert fields["export_log_activity_class"] != not_expected
+
+
+@pytestmark_posix
+def test_real_exporter_failure_message_is_still_recognized(tmp_path):
+    """The exporter's own failure messages must still be recognized."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z O'Pip learning export: canonical replica export FAILED (rc=3)\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_post_manifest_failure_count"] == "1"
+    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_FAIL"
+
+    # And the second real exporter failure form.
+    fx["log"].write_text(
+        "2026-09-17T19:06:00Z O'Pip learning evidence export: JSON artifacts OK, "
+        "canonical replica FAILED\n",
+        encoding="utf-8",
+    )
+    fields2 = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields2["export_log_post_manifest_failure_count"] == "1"
+    assert fields2["export_log_activity_class"] == "POST_MANIFEST_RUNS_FAIL"
+
+
+@pytestmark_posix
+def test_symlinked_replica_directory_is_rejected(tmp_path):
+    """A symlink named like a generation must be rejected before it is read.
+
+    Regression cover: `-d` follows symlinks, so a symlinked entry could make the
+    probes stat and read metadata from an arbitrary target outside EXPORT_ROOT.
+    """
+    # A real directory elsewhere, holding a manifest that must NOT be reported.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "replica_manifest.json").write_text(
+        json.dumps(
+            {
+                "replica_schema_version": 1,
+                "generation_id": "gen-outside-should-not-be-read",
+                "source_release_sha": SHA,
+                "snapshot_created_at_utc": "2026-09-17T19:00:30Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    fx = _fixture(tmp_path, replica_dir_name=REPLICA_NAME)
+    # Replace the fixture's real replica dir with a symlink of the same valid name.
+    real_replica = fx["export_root"] / REPLICA_NAME
+    shutil.rmtree(real_replica)
+    real_replica.symlink_to(outside, target_is_directory=True)
+
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    # The name passes the content-addressed pattern, but the entry is refused.
+    assert fields["manifest_replica_dir"] == REPLICA_NAME
+    assert fields["replica_dir_name_valid"] == "NO"
+    assert fields["replica_dir_rejection_reason"] == "SYMLINK_REJECTED"
+    assert fields["replica_dir_exists"] == "REJECTED"
+    # Nothing outside was inspected or reported.
+    assert "replica_inner_generation_id" not in fields
+    assert fields["FINAL_STATUS"] == "DEGRADED"
+
+    # Control: the same fixture shape without the symlink resolves normally, so
+    # the rejection is attributable to the symlink and not to the fixture.
+    control_root = tmp_path / "control"
+    control_root.mkdir()
+    fx_ok = _fixture(control_root, replica_dir_name=REPLICA_NAME)
+    fields_ok = _run_block(control_root, fx_ok, "2026-09-17T19:00:47Z")
+    assert fields_ok["replica_dir_name_valid"] == "YES"
+    assert fields_ok["replica_dir_rejection_reason"] == "NONE"
+    assert fields_ok["replica_inner_generation_id"] == "gen-probe-0001"
 
 
 @pytestmark_posix

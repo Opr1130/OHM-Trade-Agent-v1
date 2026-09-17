@@ -47,7 +47,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in date stat awk git docker flock timeout sha256sum grep find sed tail head tr readlink; do
+for cmd in date stat awk git docker flock timeout sha256sum grep find sed tail head tr readlink realpath; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing diagnostics command: $cmd" >&2
     exit 69
@@ -769,7 +769,9 @@ if [[ -f "$EXPORT_LOG" ]]; then
   export_log_lifetime_skip_count="$(grep -c 'already active; skipping' "$EXPORT_LOG" 2>/dev/null || true)"
   export_log_lifetime_success_count="$(grep -c "learning evidence export: OK" "$EXPORT_LOG" 2>/dev/null || true)"
   export_log_lifetime_bundle_ok_count="$(grep -c 'canonical replica bundle OK' "$EXPORT_LOG" 2>/dev/null || true)"
-  export_log_lifetime_failure_count="$(grep -cE 'canonical replica export FAILED|canonical replica FAILED|replica collision|Traceback|Permission denied' "$EXPORT_LOG" 2>/dev/null || true)"
+  # Bound to the exporter's own message prefix, for the same reason as the
+  # post-manifest counter: generic markers would count unrelated writers.
+  export_log_lifetime_failure_count="$(grep -cE "O'Pip learning.*(canonical replica export FAILED|canonical replica FAILED|replica collision)" "$EXPORT_LOG" 2>/dev/null || true)"
   for counter in export_log_lifetime_skip_count export_log_lifetime_success_count export_log_lifetime_bundle_ok_count export_log_lifetime_failure_count; do
     [[ "${!counter}" =~ ^[0-9]+$ ]] || printf -v "$counter" '%s' 0
   done
@@ -811,7 +813,14 @@ if [[ -f "$EXPORT_LOG" ]]; then
                 export_log_post_manifest_skip_count=$((export_log_post_manifest_skip_count + 1))
                 export_log_post_manifest_recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))
                 ;;
-              *"canonical replica export FAILED"* | *"canonical replica FAILED"* | *"replica collision"* | *Traceback* | *"Permission denied"*)
+              # Failure recognition is bound to the exporter's own message
+              # prefix. Generic markers ("Traceback", "Permission denied") are
+              # deliberately NOT recognized: another writer of this shared log
+              # could emit them, and a timestamp proves when a line was written,
+              # not that it is an exporter event.
+              *"O'Pip learning"*"canonical replica export FAILED"* | \
+                *"O'Pip learning"*"canonical replica FAILED"* | \
+                *"O'Pip learning"*"replica collision"*)
                 export_log_post_manifest_failure_count=$((export_log_post_manifest_failure_count + 1))
                 export_log_post_manifest_recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))
                 ;;
@@ -957,14 +966,34 @@ fi
 
 replica_dir_path=""
 replica_dir_name_valid="NO"
+replica_dir_rejection_reason="NONE"
 if [[ -n "$manifest_replica_dir" ]]; then
   # Validate before use so a malformed or traversing name can never be stat'd.
   if [[ "$manifest_replica_dir" =~ $REPLICA_DIR_NAME_PATTERN ]]; then
-    replica_dir_name_valid="YES"
-    replica_dir_path="$EXPORT_ROOT/$manifest_replica_dir"
+    replica_dir_candidate="$EXPORT_ROOT/$manifest_replica_dir"
+    # A valid-looking *name* is not sufficient. `-d` follows symlinks, so a
+    # symlinked directory entry could point outside EXPORT_ROOT and make the
+    # probes below stat and read an arbitrary target's metadata. Reject a
+    # symlink outright, then re-verify that the resolved path is still beneath
+    # EXPORT_ROOT before any metadata is read.
+    if [[ -L "$replica_dir_candidate" ]]; then
+      replica_dir_rejection_reason="SYMLINK_REJECTED"
+    else
+      resolved_candidate="$(realpath -m -- "$replica_dir_candidate" 2>/dev/null || true)"
+      resolved_root="$(realpath -m -- "$EXPORT_ROOT" 2>/dev/null || true)"
+      if [[ -z "$resolved_candidate" || -z "$resolved_root" ]]; then
+        replica_dir_rejection_reason="PATH_UNRESOLVABLE"
+      elif [[ "$resolved_candidate" != "$resolved_root"/* ]]; then
+        replica_dir_rejection_reason="OUTSIDE_EXPORT_ROOT"
+      else
+        replica_dir_name_valid="YES"
+        replica_dir_path="$resolved_candidate"
+      fi
+    fi
   fi
 fi
 echo "replica_dir_name_valid=$replica_dir_name_valid"
+echo "replica_dir_rejection_reason=$replica_dir_rejection_reason"
 if [[ "$replica_dir_name_valid" == "YES" && -d "$replica_dir_path" ]]; then
   replica_meta="$(stat -c '%U|%G|%a|%Y' "$replica_dir_path" 2>/dev/null || true)"
   IFS='|' read -r replica_owner replica_group replica_mode replica_mtime <<<"$replica_meta"
@@ -1041,6 +1070,12 @@ print(
   fi
 elif [[ "$replica_dir_name_valid" == "YES" ]]; then
   echo "replica_dir_exists=NO"
+  degrade
+elif [[ "$replica_dir_rejection_reason" != "NONE" ]]; then
+  # A valid-looking name that is a symlink or escapes EXPORT_ROOT is an
+  # integrity anomaly, not an absent reference: report it and degrade rather
+  # than silently treating it as "not referenced".
+  echo "replica_dir_exists=REJECTED"
   degrade
 else
   echo "replica_dir_exists=NOT_REFERENCED"
