@@ -272,7 +272,14 @@ def test_first_stream_worker_deploy_uses_existing_trusted_reconcile_hook():
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
     core_block = compose.split("  ohm-trade-agent:", 1)[1].split("\n  opip-", 1)[0]
     assert "opip-canonical-writer" not in core_block
-    assert 'OPIP_CANONICAL_WRITER_MODE: "off"' in compose
+    # Assert against the CORE service block specifically. A whole-file substring
+    # check would falsely pass on the writer daemon's own unused value even when
+    # the core (the service that actually reads the gate) is not activated.
+    assert 'OPIP_CANONICAL_WRITER_MODE: "shadow"' in core_block
+    writer_block = compose.split("opip-canonical-writer:", 1)[1]
+    # The daemon does not read this variable; it is retained as a label only and
+    # must never be treated as the activation authority.
+    assert 'OPIP_CANONICAL_WRITER_MODE: "off"' in writer_block
     assert "opip-canonical-writer:" in compose
     assert "app.opip.canonical.writer_service" in compose
     assert "mem_limit: 128m" in compose
