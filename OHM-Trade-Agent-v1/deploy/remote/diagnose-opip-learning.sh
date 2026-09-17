@@ -8,6 +8,20 @@ READER_STATE_ROOT="/var/lib/opip-learning-reader"
 READER_STATE_FILE="$READER_STATE_ROOT/last_sync_request.env"
 MANIFEST="$EXPORT_ROOT/manifest.env"
 EXPORT_CRON="/etc/cron.d/opip-learning-export"
+# Read-only export observability targets. Diagnostics must never acquire,
+# create, release, repair or remove any of these: acquiring a lock here would
+# perturb the exact state under investigation, and holding one could make a real
+# export run skip.
+EXPORT_CRON_SRC="$APP_ROOT/deploy/cron.d/opip-learning-export"
+EXPORT_INTERNAL_LOCK="/var/run/opip-learning-export.lock"
+EXPORT_WRAPPER_LOCK="/var/run/opip-learning-export-trigger.lock"
+EXPORT_PUBLISH_LOCK="$EXPORT_ROOT/.publish.lock"
+EXPORT_LOG="/var/log/opip-learning-export.log"
+EXPORT_RELEASE_RECEIPT="/var/lib/ohm-deploy/last-good-sha"
+REPLICA_DIR_NAME_PATTERN='^canonical_learning_replica\.[0-9a-f]{64}$'
+EXPORT_LOG_TAIL_LINES=100
+EXPORT_LOG_MAX_BYTES=20000
+EXPORT_JOURNAL_MAX_LINES=40
 MAX_EXPORT_AGE_SECONDS=300
 MAX_SYNC_AGE_SECONDS=720
 MAX_CAPTURE_AGE_SECONDS=900
@@ -19,7 +33,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in date stat awk git docker flock timeout; do
+for cmd in date stat awk git docker flock timeout sha256sum grep find sed tail head tr; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing diagnostics command: $cmd" >&2
     exit 69
@@ -356,6 +370,480 @@ else
   echo "learning_coverage_epoch_boundary_utc=UNKNOWN"
   echo "learning_coverage_epoch_archive=UNKNOWN"
   echo "learning_coverage_epoch_reason=UNKNOWN"
+fi
+
+# ---------------------------------------------------------------------------
+# Read-only production export observability.
+#
+# The recurring export can stop committing while production stays otherwise
+# healthy, and committed-manifest age alone cannot separate "the scheduler
+# stopped invoking the exporter" from "an exporter run is stuck holding a lock".
+# These probes distinguish those cases using kernel-reported state only.
+#
+# Invariants, all deliberate:
+#   * no lock is acquired, created, released, repaired or removed anywhere in
+#     this block. Taking a lock to "test" it proves nothing about the holder and
+#     could itself make a real export run skip, destroying the evidence;
+#   * the exporter is never executed, and nothing is signalled, restarted,
+#     stopped, deleted, moved, copied, or has its ownership or mode altered;
+#   * lock ownership is derived from /proc/locks (via lslocks) and /proc
+#     file-descriptor ownership, which report state without taking it;
+#   * log and journal output is line- and byte-bounded and secret-redacted;
+#   * every probe fails soft to UNKNOWN when its tool or path is unavailable, so
+#     diagnostics stay available instead of becoming a new failure mode.
+# ---------------------------------------------------------------------------
+
+redact_export_secrets() {
+  # Bound blast radius if an unexpected credential ever reaches a log line: keep
+  # the key name for evidence, drop the value.
+  sed -E 's/((API|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE)[A-Z_]*=)[^[:space:]]+/\1<redacted>/Ig'
+}
+
+describe_pid() {
+  # Report process provenance from /proc without touching the process.
+  local prefix="$1"
+  local pid="$2"
+  local ppid="" start_ticks="" btime="" hz="" start_epoch="" elapsed=""
+  local start_time="" command=""
+  if [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]]; then
+    ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+    start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+    if [[ "$start_ticks" =~ ^[0-9]+$ ]]; then
+      btime="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null || true)"
+      hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+      if [[ "$btime" =~ ^[0-9]+$ && "$hz" =~ ^[0-9]+$ && "$hz" -gt 0 ]]; then
+        start_epoch=$((btime + start_ticks / hz))
+        start_time="$(date -u -d "@$start_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+        if [[ "$start_epoch" -le "$now_epoch" ]]; then
+          elapsed="$((now_epoch - start_epoch))"
+        fi
+      fi
+    fi
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+      command="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//' || true)"
+    fi
+  fi
+  echo "${prefix}_pid=${pid:-UNKNOWN}"
+  echo "${prefix}_ppid=${ppid:-UNKNOWN}"
+  echo "${prefix}_start_time=${start_time:-UNKNOWN}"
+  echo "${prefix}_elapsed_seconds=${elapsed:-UNKNOWN}"
+  echo "${prefix}_command=${command:-UNKNOWN}"
+}
+
+observe_lock_owner() {
+  # Observe a lock holder. Deliberately never takes the lock.
+  local prefix="$1"
+  local path="$2"
+  local exists="MISSING"
+  [[ -e "$path" ]] && exists="EXISTS"
+
+  local pid="" how="NONE" state="UNKNOWN"
+  if command -v lslocks >/dev/null 2>&1; then
+    local holder
+    holder="$(lslocks -n -o PID,PATH 2>/dev/null | awk -v p="$path" '$2 == p {print $1; exit}' || true)"
+    if [[ "$holder" =~ ^[0-9]+$ ]]; then
+      pid="$holder"
+      how="LSLOCKS"
+    fi
+  fi
+  if [[ -z "$pid" ]] && command -v fuser >/dev/null 2>&1; then
+    # Without -k, fuser only lists openers: it sends no signal and takes no lock.
+    local opener
+    opener="$(fuser "$path" 2>/dev/null | awk '{print $1; exit}' || true)"
+    if [[ "$opener" =~ ^[0-9]+$ ]]; then
+      pid="$opener"
+      how="FUSER_OPENERS"
+    fi
+  fi
+
+  if [[ "$exists" == "MISSING" ]]; then
+    state="ABSENT"
+  elif [[ "$how" == "LSLOCKS" ]]; then
+    state="HELD"
+  elif [[ "$how" == "FUSER_OPENERS" ]]; then
+    # Open but not listed as locked: reported, never asserted to be held.
+    state="OPENED_UNCONFIRMED"
+  elif command -v lslocks >/dev/null 2>&1; then
+    state="NOT_HELD"
+  fi
+
+  # A held export lock at diagnostics time is anomalous: export runs are short.
+  # An outer wrapper lock held across cadences, or an internal/publish lock held
+  # long term, is the signature of a stalled or hanging run.
+  if [[ "$state" == "HELD" || "$state" == "OPENED_UNCONFIRMED" ]]; then
+    export_lock_stall_suspected="YES"
+  fi
+
+  echo "${prefix}_lock_file=$exists"
+  echo "${prefix}_lock_state=$state"
+  echo "${prefix}_lock_owner_source=$how"
+  describe_pid "${prefix}_lock_owner" "$pid"
+}
+
+emit_export_entries() {
+  # Bounded name+timestamp inventory. Lists only; never removes anything.
+  local prefix="$1"
+  local pattern="$2"
+  local count=0
+  local entries=""
+  local entry stamp iso
+  if [[ ! -d "$EXPORT_ROOT" ]]; then
+    echo "${prefix}_count=UNKNOWN"
+    echo "${prefix}_entries=UNKNOWN"
+    return 0
+  fi
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    count=$((count + 1))
+    if (( count <= 20 )); then
+      stamp="$(stat -c '%Y' "$entry" 2>/dev/null || true)"
+      iso="$(date -u -d "@${stamp:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+      entries="${entries}${entries:+,}${entry##*/}@${iso}"
+    fi
+  done < <(find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -name "$pattern" 2>/dev/null || true)
+  echo "${prefix}_count=$count"
+  echo "${prefix}_entries=${entries:-NONE}"
+}
+
+manifest_epoch="$(date -u -d "${exported_at:-}" +%s 2>/dev/null || true)"
+[[ "$manifest_epoch" =~ ^[0-9]+$ ]] || manifest_epoch=""
+
+echo "OPIP_EXPORT_OBSERVABILITY"
+
+# 1A - is the cron daemon actually running and invoking anything?
+cron_daemon_active="UNKNOWN"
+cron_daemon_state="UNKNOWN"
+cron_daemon_pid="UNKNOWN"
+cron_daemon_started_at="UNKNOWN"
+cron_daemon_source="UNKNOWN"
+if command -v systemctl >/dev/null 2>&1; then
+  cron_daemon_source="SYSTEMCTL"
+  cron_daemon_state="$(systemctl is-active cron 2>/dev/null || true)"
+  cron_daemon_state="${cron_daemon_state:-UNKNOWN}"
+  cron_daemon_pid="$(systemctl show -p MainPID --value cron 2>/dev/null || true)"
+  cron_daemon_pid="${cron_daemon_pid:-UNKNOWN}"
+  cron_daemon_started_at="$(systemctl show -p ExecMainStartTimestamp --value cron 2>/dev/null || true)"
+  cron_daemon_started_at="${cron_daemon_started_at:-UNKNOWN}"
+  case "$cron_daemon_state" in
+    active) cron_daemon_active="YES" ;;
+    inactive | failed | deactivating | unknown) cron_daemon_active="NO" ;;
+  esac
+fi
+if [[ "$cron_daemon_active" == "UNKNOWN" ]] && command -v pgrep >/dev/null 2>&1; then
+  cron_fallback_pid="$(pgrep -x cron 2>/dev/null | head -n 1 || true)"
+  if [[ "$cron_fallback_pid" =~ ^[0-9]+$ ]]; then
+    cron_daemon_active="YES"
+    cron_daemon_pid="$cron_fallback_pid"
+    cron_daemon_source="PGREP"
+    if command -v ps >/dev/null 2>&1; then
+      cron_daemon_started_at="$(ps -o lstart= -p "$cron_fallback_pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
+      cron_daemon_started_at="${cron_daemon_started_at:-UNKNOWN}"
+    fi
+  fi
+fi
+echo "cron_daemon_active=$cron_daemon_active"
+echo "cron_daemon_state=$cron_daemon_state"
+echo "cron_daemon_pid=$cron_daemon_pid"
+echo "cron_daemon_started_at=$cron_daemon_started_at"
+echo "cron_daemon_source=$cron_daemon_source"
+
+# 1B - installed cron artifact identity, and whether it matches this release.
+if [[ -e "$EXPORT_CRON" ]]; then
+  cron_meta="$(stat -c '%U|%G|%a|%s|%Y' "$EXPORT_CRON" 2>/dev/null || true)"
+  IFS='|' read -r cron_owner cron_group cron_mode cron_size cron_mtime <<<"$cron_meta"
+  cron_sha="$(sha256sum "$EXPORT_CRON" 2>/dev/null | awk '{print $1}' || true)"
+  echo "export_cron_exists=YES"
+  echo "export_cron_owner=${cron_owner:-UNKNOWN}"
+  echo "export_cron_group=${cron_group:-UNKNOWN}"
+  echo "export_cron_mode=${cron_mode:-UNKNOWN}"
+  echo "export_cron_size_bytes=${cron_size:-UNKNOWN}"
+  echo "export_cron_mtime_utc=$(date -u -d "@${cron_mtime:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  echo "export_cron_sha256=${cron_sha:-UNKNOWN}"
+  cron_job="$(grep -v '=' "$EXPORT_CRON" 2>/dev/null | grep -Ev '^[[:space:]]*(#|$)' | head -n 2 | tr '\n' ';' | head -c 300 || true)"
+  echo "export_cron_job_line=${cron_job:-UNKNOWN}"
+  cron_src_sha="$(sha256sum "$EXPORT_CRON_SRC" 2>/dev/null | awk '{print $1}' || true)"
+  if [[ -z "$cron_src_sha" ]]; then
+    echo "export_cron_matches_release=UNKNOWN"
+  elif [[ "$cron_src_sha" == "$cron_sha" ]]; then
+    echo "export_cron_matches_release=YES"
+  else
+    echo "export_cron_matches_release=NO"
+  fi
+else
+  echo "export_cron_exists=NO"
+  echo "export_cron_matches_release=UNKNOWN"
+fi
+
+# 1C - export log metadata and a bounded, redacted, classified tail.
+export_log_exists="NO"
+export_log_activity_class="UNKNOWN"
+export_log_skip_count="0"
+export_log_success_count="0"
+export_log_bundle_ok_count="0"
+export_log_failure_count="0"
+if [[ -f "$EXPORT_LOG" ]]; then
+  export_log_exists="YES"
+  log_meta="$(stat -c '%U|%G|%a|%s|%Y' "$EXPORT_LOG" 2>/dev/null || true)"
+  IFS='|' read -r log_owner log_group log_mode log_size log_mtime <<<"$log_meta"
+  echo "export_log_owner=${log_owner:-UNKNOWN}"
+  echo "export_log_group=${log_group:-UNKNOWN}"
+  echo "export_log_mode=${log_mode:-UNKNOWN}"
+  echo "export_log_size_bytes=${log_size:-UNKNOWN}"
+  echo "export_log_mtime_utc=$(date -u -d "@${log_mtime:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  [[ "$log_mtime" =~ ^[0-9]+$ ]] || log_mtime=""
+  [[ "$log_size" =~ ^[0-9]+$ ]] || log_size=""
+
+  export_log_skip_count="$(grep -c 'already active; skipping' "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_success_count="$(grep -c "learning evidence export: OK" "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_bundle_ok_count="$(grep -c 'canonical replica bundle OK' "$EXPORT_LOG" 2>/dev/null || true)"
+  export_log_failure_count="$(grep -cE 'canonical replica export FAILED|canonical replica FAILED|replica collision|Traceback|Permission denied' "$EXPORT_LOG" 2>/dev/null || true)"
+  for counter in export_log_skip_count export_log_success_count export_log_bundle_ok_count export_log_failure_count; do
+    [[ "${!counter}" =~ ^[0-9]+$ ]] || printf -v "$counter" '%s' 0
+  done
+  echo "export_log_skip_count=$export_log_skip_count"
+  echo "export_log_success_count=$export_log_success_count"
+  echo "export_log_bundle_ok_count=$export_log_bundle_ok_count"
+  echo "export_log_failure_count=$export_log_failure_count"
+
+  if [[ -z "$manifest_epoch" || -z "$log_mtime" ]]; then
+    export_log_activity_class="UNKNOWN"
+  elif (( log_mtime <= manifest_epoch )); then
+    export_log_activity_class="NO_POST_MANIFEST_LOG_ACTIVITY"
+  elif (( export_log_failure_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_FAIL"
+  elif (( export_log_skip_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
+  elif (( export_log_success_count > 0 )); then
+    export_log_activity_class="POST_MANIFEST_RUNS_SUCCEED"
+  else
+    export_log_activity_class="POST_MANIFEST_ACTIVITY_UNCLASSIFIED"
+  fi
+  echo "export_log_activity_class=$export_log_activity_class"
+  if [[ -n "$manifest_epoch" && -n "$log_mtime" ]]; then
+    if (( manifest_epoch > log_mtime )); then
+      echo "export_manifest_newer_than_log=YES"
+    else
+      echo "export_manifest_newer_than_log=NO"
+    fi
+  else
+    echo "export_manifest_newer_than_log=UNKNOWN"
+  fi
+  echo "export_log_tail_lines_requested=$EXPORT_LOG_TAIL_LINES"
+  echo "export_log_tail_bytes_limit=$EXPORT_LOG_MAX_BYTES"
+  echo "OPIP_EXPORT_LOG_TAIL"
+  tail -n "$EXPORT_LOG_TAIL_LINES" "$EXPORT_LOG" 2>/dev/null | head -c "$EXPORT_LOG_MAX_BYTES" | redact_export_secrets || true
+  echo "OPIP_EXPORT_LOG_TAIL_END"
+else
+  echo "export_log_exists=NO"
+  echo "export_log_activity_class=NO_LOG_FILE"
+fi
+
+# 1D - holder observation for the three distinct export locks, plus live
+#      wrapper/exporter process inventory. Nothing is acquired or signalled.
+export_lock_stall_suspected="NO"
+observe_lock_owner "outer_cron" "$EXPORT_WRAPPER_LOCK"
+observe_lock_owner "internal_export" "$EXPORT_INTERNAL_LOCK"
+observe_lock_owner "publish" "$EXPORT_PUBLISH_LOCK"
+
+export_process_count="0"
+export_processes=""
+if command -v pgrep >/dev/null 2>&1; then
+  export_process_count="$(pgrep -fc 'export-opip-learning-evidence.sh|opip-learning-export|canonical_replica export' 2>/dev/null || true)"
+  [[ "$export_process_count" =~ ^[0-9]+$ ]] || export_process_count=0
+  while IFS= read -r live_pid; do
+    [[ -n "$live_pid" ]] || continue
+    live_elapsed=""
+    live_command=""
+    if command -v ps >/dev/null 2>&1; then
+      live_elapsed="$(ps -o etimes= -p "$live_pid" 2>/dev/null | tr -d ' ' || true)"
+      live_command="$(ps -o args= -p "$live_pid" 2>/dev/null | head -c 240 | tr '\n' ' ' || true)"
+    fi
+    export_processes="${export_processes}${export_processes:+,}${live_pid}@${live_elapsed:-?}@${live_command}"
+  done < <(pgrep -f 'export-opip-learning-evidence.sh|opip-learning-export|canonical_replica export' 2>/dev/null || true)
+fi
+echo "export_process_count=$export_process_count"
+echo "export_processes=${export_processes:-NONE}"
+if [[ "$export_process_count" != "0" ]]; then
+  export_lock_stall_suspected="YES"
+fi
+
+# 1E - committed export state, the referenced replica directory and the inner
+#      replica manifest (the real replica freshness contract).
+manifest_schema_version="$(env_value "$MANIFEST" schema_version)"
+manifest_deployed_sha="$(env_value "$MANIFEST" production_deployed_sha)"
+manifest_replica_version="$(env_value "$MANIFEST" canonical_learning_replica_version)"
+manifest_replica_dir="$(env_value "$MANIFEST" canonical_learning_replica_dir)"
+manifest_replica_bytes="$(env_value "$MANIFEST" canonical_learning_replica_bytes)"
+manifest_replica_tree_sha="$(env_value "$MANIFEST" canonical_learning_replica_sha256)"
+manifest_sha="$(sha256sum "$MANIFEST" 2>/dev/null | awk '{print $1}' || true)"
+echo "manifest_schema_version=${manifest_schema_version:-UNKNOWN}"
+echo "manifest_production_deployed_sha=${manifest_deployed_sha:-UNKNOWN}"
+echo "manifest_sha256=${manifest_sha:-UNKNOWN}"
+echo "manifest_replica_marker_version=${manifest_replica_version:-ABSENT}"
+echo "manifest_replica_dir=${manifest_replica_dir:-ABSENT}"
+echo "manifest_replica_bytes=${manifest_replica_bytes:-ABSENT}"
+echo "manifest_replica_sha256=${manifest_replica_tree_sha:-ABSENT}"
+if [[ "$manifest_replica_version" == "1" ]]; then
+  echo "manifest_replica_marker_present=YES"
+else
+  echo "manifest_replica_marker_present=NO"
+fi
+
+replica_dir_path=""
+replica_dir_name_valid="NO"
+if [[ -n "$manifest_replica_dir" ]]; then
+  # Validate before use so a malformed or traversing name can never be stat'd.
+  if [[ "$manifest_replica_dir" =~ $REPLICA_DIR_NAME_PATTERN ]]; then
+    replica_dir_name_valid="YES"
+    replica_dir_path="$EXPORT_ROOT/$manifest_replica_dir"
+  fi
+fi
+echo "replica_dir_name_valid=$replica_dir_name_valid"
+if [[ "$replica_dir_name_valid" == "YES" && -d "$replica_dir_path" ]]; then
+  replica_meta="$(stat -c '%U|%G|%a|%Y' "$replica_dir_path" 2>/dev/null || true)"
+  IFS='|' read -r replica_owner replica_group replica_mode replica_mtime <<<"$replica_meta"
+  echo "replica_dir_exists=YES"
+  echo "replica_dir_owner=${replica_owner:-UNKNOWN}"
+  echo "replica_dir_group=${replica_group:-UNKNOWN}"
+  echo "replica_dir_mode=${replica_mode:-UNKNOWN}"
+  echo "replica_dir_mtime_utc=$(date -u -d "@${replica_mtime:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  if command -v du >/dev/null 2>&1; then
+    replica_dir_bytes="$(du -sb "$replica_dir_path" 2>/dev/null | awk '{print $1}' || true)"
+    echo "replica_dir_bytes=${replica_dir_bytes:-UNKNOWN}"
+  else
+    echo "replica_dir_bytes=UNKNOWN"
+  fi
+
+  replica_inner="$replica_dir_path/replica_manifest.json"
+  if [[ -f "$replica_inner" ]]; then
+    echo "replica_inner_manifest=EXISTS"
+    inner_fields=""
+    if command -v python3 >/dev/null 2>&1; then
+      inner_fields="$(
+        python3 -c '
+import json
+import sys
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("INVALID||||")
+    raise SystemExit(0)
+if not isinstance(payload, dict):
+    print("INVALID||||")
+    raise SystemExit(0)
+def text(key):
+    value = payload.get(key)
+    return value if isinstance(value, str) else ""
+print(
+    "%s|%s|%s|%s"
+    % (
+        text("generation_id"),
+        text("source_release_sha"),
+        text("snapshot_created_at_utc"),
+        payload.get("replica_schema_version", ""),
+    )
+)
+' "$replica_inner" 2>/dev/null || true
+      )"
+    fi
+    IFS='|' read -r inner_generation inner_release inner_snapshot inner_schema <<<"${inner_fields:-}"
+    echo "replica_inner_generation_id=${inner_generation:-UNKNOWN}"
+    echo "replica_inner_source_release_sha=${inner_release:-UNKNOWN}"
+    echo "replica_inner_snapshot_created_at_utc=${inner_snapshot:-UNKNOWN}"
+    echo "replica_inner_schema_version=${inner_schema:-UNKNOWN}"
+    if [[ -n "${inner_release:-}" && "$inner_release" == "$current_sha" ]]; then
+      echo "replica_inner_release_matches_production=YES"
+    else
+      echo "replica_inner_release_matches_production=NO"
+    fi
+    inner_age="$(age_seconds "${inner_snapshot:-}" || true)"
+    echo "replica_inner_age_seconds=${inner_age:-UNKNOWN}"
+    if [[ "$inner_age" =~ ^[0-9]+$ ]]; then
+      if (( inner_age > 1800 )); then
+        echo "replica_contract_freshness_1800s=FAIL"
+        degrade
+      else
+        echo "replica_contract_freshness_1800s=PASS"
+      fi
+    else
+      echo "replica_contract_freshness_1800s=UNKNOWN"
+      degrade
+    fi
+  else
+    echo "replica_inner_manifest=MISSING"
+    degrade
+  fi
+elif [[ "$replica_dir_name_valid" == "YES" ]]; then
+  echo "replica_dir_exists=NO"
+  degrade
+else
+  echo "replica_dir_exists=NOT_REFERENCED"
+fi
+
+# 1F - staging / orphan inventory (names and timestamps only, nothing removed).
+emit_export_entries "replica_staging" ".canonical_learning_replica.staging.*"
+emit_export_entries "replica_published" "canonical_learning_replica.*"
+emit_export_entries "manifest_tmp" ".manifest.env.tmp.*"
+
+# 1G - release receipt, and whether the export was committed after it.
+if [[ -s "$EXPORT_RELEASE_RECEIPT" ]]; then
+  receipt_sha="$(cat "$EXPORT_RELEASE_RECEIPT" 2>/dev/null | tr -d '[:space:]' || true)"
+  receipt_mtime="$(stat -c '%Y' "$EXPORT_RELEASE_RECEIPT" 2>/dev/null || true)"
+  echo "release_receipt_sha=${receipt_sha:-UNKNOWN}"
+  echo "release_receipt_mtime_utc=$(date -u -d "@${receipt_mtime:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo UNKNOWN)"
+  if [[ ! "$receipt_mtime" =~ ^[0-9]+$ || -z "$manifest_epoch" ]]; then
+    echo "export_committed_after_release_receipt=UNKNOWN"
+  elif (( manifest_epoch > receipt_mtime )); then
+    echo "export_committed_after_release_receipt=YES"
+  else
+    echo "export_committed_after_release_receipt=NO"
+    degrade
+  fi
+else
+  echo "release_receipt_sha=UNAVAILABLE"
+  echo "export_committed_after_release_receipt=UNKNOWN"
+fi
+
+# Journal / syslog evidence that the daemon is actually invoking the job.
+export_journal_source="UNAVAILABLE"
+export_journal_matched_lines="UNKNOWN"
+export_journal_last_line="NONE"
+journal_raw=""
+if command -v journalctl >/dev/null 2>&1; then
+  journal_raw="$(journalctl --since '2 hours ago' --no-pager -n 500 2>/dev/null \
+    | grep -Ei 'opip-learning-export|export-opip-learning-evidence|CRON' \
+    | tail -n "$EXPORT_JOURNAL_MAX_LINES" || true)"
+  [[ -n "$journal_raw" ]] && export_journal_source="JOURNALCTL"
+fi
+if [[ "$export_journal_source" == "UNAVAILABLE" && -f /var/log/syslog ]]; then
+  journal_raw="$(tail -n 2000 /var/log/syslog 2>/dev/null \
+    | grep -Ei 'opip-learning-export|export-opip-learning-evidence|CRON' \
+    | tail -n "$EXPORT_JOURNAL_MAX_LINES" || true)"
+  [[ -n "$journal_raw" ]] && export_journal_source="SYSLOG"
+fi
+if [[ "$export_journal_source" != "UNAVAILABLE" ]]; then
+  export_journal_matched_lines="$(printf '%s\n' "$journal_raw" | grep -c '[^[:space:]]' || true)"
+  [[ "$export_journal_matched_lines" =~ ^[0-9]+$ ]] || export_journal_matched_lines="UNKNOWN"
+  export_journal_last_line="$(printf '%s\n' "$journal_raw" | grep '[^[:space:]]' | tail -n 1 | head -c 300 | redact_export_secrets || true)"
+fi
+echo "export_journal_source=$export_journal_source"
+echo "export_journal_matched_lines=$export_journal_matched_lines"
+echo "export_journal_last_line=${export_journal_last_line:-NONE}"
+
+echo "export_lock_stall_suspected=$export_lock_stall_suspected"
+if [[ "$export_lock_stall_suspected" == "YES" ]]; then
+  degrade
+fi
+case "$export_log_activity_class" in
+  POST_MANIFEST_RUNS_FAIL | POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD | POST_MANIFEST_ACTIVITY_UNCLASSIFIED)
+    degrade
+    ;;
+esac
+if [[ "$export_cron_exists" != "YES" ]]; then
+  degrade
+fi
+if [[ "$cron_daemon_active" == "NO" ]]; then
+  degrade
 fi
 
 if docker inspect ohm-trade-agent >/dev/null 2>&1; then
