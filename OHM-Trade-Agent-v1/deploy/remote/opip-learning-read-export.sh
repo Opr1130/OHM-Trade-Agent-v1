@@ -7,7 +7,7 @@ READER_STATE_ROOT="/var/lib/opip-learning-reader"
 READER_STATE_FILE="$READER_STATE_ROOT/last_sync_request.env"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
-for cmd in date mv flock tar; do
+for cmd in date mv flock tar awk; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "O'Pip learning reader: missing $cmd" >&2
     exit 69
@@ -155,12 +155,14 @@ exec 8<"$PUBLISH_LOCK"
 flock -s 8
 
 # The canonical learning replica is an additive schema-4 feature. Its presence
-# is announced by a marker in the COMMITTED manifest only; uncommitted staging
-# is never inspected.
-CANONICAL_REPLICA_DIR="canonical_learning_replica"
+# and immutable content-addressed directory are announced by the COMMITTED
+# manifest only; uncommitted staging is never inspected.
 REPLICA_MARKER=""
+CANONICAL_REPLICA_DIR=""
 if [[ -r "$EXPORT_ROOT/manifest.env" ]]; then
   REPLICA_MARKER="$(awk -F= '$1 == "canonical_learning_replica_version" {sub(/^[^=]*=/, ""); print; exit}' \
+    "$EXPORT_ROOT/manifest.env" 2>/dev/null || true)"
+  CANONICAL_REPLICA_DIR="$(awk -F= '$1 == "canonical_learning_replica_dir" {sub(/^[^=]*=/, ""); print; exit}' \
     "$EXPORT_ROOT/manifest.env" 2>/dev/null || true)"
 fi
 
@@ -187,10 +189,15 @@ if [[ -n "$REPLICA_MARKER" ]]; then
     echo "O'Pip learning reader: unsupported canonical replica version: $REPLICA_MARKER" >&2
     exit 126
   fi
-  # The committed manifest claims a canonical generation, so the directory must
-  # be present. Never silently omit it: serving a marker-bearing manifest
-  # without the bundle would let learning believe it has canonical evidence.
-  if [[ ! -r "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" ]]; then
+  if [[ ! "$CANONICAL_REPLICA_DIR" =~ ^canonical_learning_replica\.[0-9a-f]{64}$ ]]; then
+    echo "O'Pip learning reader: invalid canonical replica directory marker" >&2
+    exit 126
+  fi
+  # The committed manifest claims a canonical generation, so the exact named
+  # directory must be present. Never silently omit it: serving a marker-bearing
+  # manifest without its bundle would let learning believe it has canonical
+  # evidence.
+  if [[ ! -d "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" || ! -r "$EXPORT_ROOT/$CANONICAL_REPLICA_DIR" ]]; then
     echo "O'Pip learning reader: export unavailable: $CANONICAL_REPLICA_DIR" >&2
     exit 66
   fi
