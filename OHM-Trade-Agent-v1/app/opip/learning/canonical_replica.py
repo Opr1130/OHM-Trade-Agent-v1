@@ -45,7 +45,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 import uuid
 
 from app.opip.canonical.backup import (
@@ -58,6 +58,7 @@ from app.opip.canonical.backup import (
     require_release_sha,
 )
 from app.opip.canonical.schema import fsync_directory_required, fsync_file_required
+from app.opip.contracts.temporal import TemporalIntegrityError, require_utc
 from app.opip.canonical.paths import SCHEMA_VERSION
 
 REPLICA_SCHEMA_VERSION = 1
@@ -143,9 +144,31 @@ class ReplicaProvenanceError(ReplicaVerificationError):
     """The replica does not match its recorded provenance."""
 
 
-def iso_z(value: datetime) -> str:
-    """Render a UTC timestamp in the ``Z`` form used across evidence ids."""
-    moment = value.astimezone(timezone.utc)
+def _require_utc_datetime(value: datetime, *, field_name: str) -> datetime:
+    """Require a timezone-aware datetime, normalized to UTC.
+
+    Replica evidence timestamps and freshness arithmetic are defined in UTC, so a
+    naive datetime must be rejected rather than silently interpreted. Python
+    resolves a naive ``datetime`` against the host local timezone, which would
+    quietly shift a recorded release/freshness timestamp by the host offset - and
+    could even make a stale replica look fresh.
+
+    The awareness invariant is delegated to the shared ``require_utc`` primitive
+    rather than restated here; only the error translation is local, so callers
+    keep the stable replica provenance reason code.
+    """
+    try:
+        return require_utc(value, field_name=field_name)
+    except TemporalIntegrityError as exc:
+        raise ReplicaProvenanceError(REASON_TIMESTAMP_INVALID, str(exc)) from exc
+
+
+def iso_z(value: datetime, *, field_name: str = "snapshot_created_at_utc") -> str:
+    """Render a UTC timestamp in the ``Z`` form used across evidence ids.
+
+    A naive datetime raises rather than being localized to the host timezone.
+    """
+    moment = _require_utc_datetime(value, field_name=field_name)
     if moment.microsecond == 0:
         return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond:06d}Z"
@@ -362,7 +385,15 @@ def build_replica_manifest(
     canonical generation path, not a raw file copy; that is asserted here.
     """
     release_sha = require_release_sha(source_release_sha, field_name="source_release_sha")
-    created = snapshot_created_at_utc or datetime.now(timezone.utc)
+    # An externally supplied timestamp must be timezone-aware; only the
+    # internally created clock below is allowed to be naive-by-construction.
+    created = (
+        _require_utc_datetime(
+            snapshot_created_at_utc, field_name="snapshot_created_at_utc"
+        )
+        if snapshot_created_at_utc is not None
+        else datetime.now(timezone.utc)
+    )
     identifier = generation_id or f"gen-{uuid.uuid4().hex[:16]}"
     require_generation_id(identifier)
 
@@ -469,11 +500,8 @@ def _parse_utc(value: object, *, field_name: str) -> datetime:
         raise ReplicaProvenanceError(
             REASON_TIMESTAMP_INVALID, f"{field_name} is not ISO-8601"
         ) from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ReplicaProvenanceError(
-            REASON_TIMESTAMP_INVALID, f"{field_name} must be timezone-aware"
-        )
-    return parsed.astimezone(timezone.utc)
+    # One awareness invariant for the whole module: parse, then delegate.
+    return _require_utc_datetime(parsed, field_name=field_name)
 
 
 def _verify_artifact(
@@ -619,7 +647,14 @@ def verify_replica_manifest(
         missing_reason=None,
     )
 
-    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    # The verification clock is externally supplied, so it must be aware. A naive
+    # value would be resolved against the host timezone and could turn a stale
+    # replica into a freshness pass.
+    moment = (
+        _require_utc_datetime(now, field_name="now")
+        if now is not None
+        else datetime.now(timezone.utc)
+    )
     if max_age_seconds <= 0:
         raise ValueError("max_age_seconds must be positive")
     age = (moment - created).total_seconds()
@@ -941,12 +976,24 @@ def install_replica_generation(
             temp_pointer.unlink()
         except OSError:
             pass
+        # The generation is already published under its immutable name, and the
+        # normal post-success prune will not run. Reconcile against the committed
+        # pointer so repeated pre-rename failures cannot accumulate generations.
+        _reconcile_retention_quietly(root, keep=retain)
         raise
     # The pointer rename is what makes a generation current, so its directory
     # entry must be durable before install reports success.
-    fsync_directory_required(root)
+    try:
+        fsync_directory_required(root)
+    except Exception:
+        # The rename already happened, so ``current`` may already name this
+        # generation even though durability failed. Reconcile reads the pointer
+        # from disk and protects whatever it names, so this cannot delete a
+        # referenced generation; it only bounds orphans.
+        _reconcile_retention_quietly(root, keep=retain)
+        raise
 
-    pruned = _prune_generations(generations, keep=retain, active=generation_id)
+    pruned = _prune_generations(generations, keep=retain, protected={generation_id})
 
     return {
         "installed": generation_id,
@@ -983,24 +1030,115 @@ def resolve_current_generation(host_root: Path) -> Path:
     return resolved
 
 
-def _prune_generations(generations: Path, *, keep: int, active: str) -> list[str]:
-    """Remove old generations, never the active one. Bounded retention."""
-    if keep < 1:
-        raise ValueError("keep must be at least 1")
+def _owned_generation_dirs(generations: Path) -> list[Path]:
+    """Owned generation directories, newest first.
+
+    A directory is treated as an owned generation only when it holds a manifest:
+    the manifest is what makes it a generation rather than a stray directory that
+    happens to sit under the replica root. Retention therefore never removes
+    something it cannot positively identify, and it never considers the
+    dot-prefixed private staging directories an install publishes through.
+    """
     if not generations.is_dir():
         return []
-    entries = sorted(
-        (p for p in generations.iterdir() if p.is_dir() and not p.name.startswith(".")),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    keep_names = {active}
-    for entry in entries:
+    owned: list[Path] = []
+    for entry in generations.iterdir():
+        if entry.name.startswith(".") or not entry.is_dir():
+            continue
+        if not (entry / MANIFEST_FILENAME).is_file():
+            continue
+        try:
+            owned.append(entry)
+        except OSError:
+            continue
+    try:
+        return sorted(owned, key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return owned
+
+
+def _committed_generation_id(root: Path) -> tuple[str | None, bool]:
+    """Best-effort read of the committed ``current`` pointer.
+
+    Returns ``(generation_id, provable)``. Three states must stay distinct,
+    because retention must never confuse "nothing is referenced" with "the
+    reference could not be read":
+
+    * ``("<id>", True)``  - the pointer names a generation;
+    * ``(None, True)``    - the pointer is provably absent, so nothing is
+      referenced and pruning cannot create a dangling pointer;
+    * ``(None, False)``   - the pointer exists but is unreadable or empty, so the
+      reference is unknown and retention must be conservative.
+    """
+    pointer = host_current_pointer(root)
+    try:
+        if not pointer.is_file():
+            return None, True
+        value = pointer.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, False
+    if not value:
+        # An empty pointer names nothing, but it is not evidence of absence.
+        return None, False
+    return value, True
+
+
+def _reconcile_generation_retention(root: Path, *, keep: int) -> list[str]:
+    """Enforce bounded retention using the *committed* pointer, not a guess.
+
+    This is the failure-path reconciliation. An install publishes a generation
+    under its immutable final name before it touches the pointer, so any failure
+    at pointer-fsync, pointer-rename or post-rename directory-fsync returns
+    without the normal post-success prune ever running. Repeated failures would
+    otherwise accumulate orphaned generations until the disk filled, breaking the
+    bounded "active + previous known-good" contract.
+
+    Safety comes from reading the reference *from disk* rather than trusting the
+    in-flight ``generation_id``. After ``os.replace(temp_pointer, current)`` the
+    live pointer can already name the incoming generation even though directory
+    durability failed, so deleting it because "the install failed" would leave a
+    dangling pointer. Protecting whatever the pointer actually names is what makes
+    this safe to run on every failure, and running it on every retry is what keeps
+    storage bounded.
+    """
+    generations = host_generations_dir(root)
+    active, provable = _committed_generation_id(root)
+    protected: set[str] = {active} if active else set()
+    # An unprovable reference state is never treated as "unreferenced", so retain
+    # one extra generation as margin before removing anything.
+    floor = keep if provable else keep + 1
+    return _prune_generations(generations, keep=floor, protected=protected)
+
+
+def _reconcile_retention_quietly(root: Path, *, keep: int) -> None:
+    """Best-effort retention reconciliation that never masks the real failure."""
+    try:
+        _reconcile_generation_retention(root, keep=keep)
+    except OSError:
+        pass
+
+
+def _prune_generations(
+    generations: Path, *, keep: int, protected: Iterable[str] = ()
+) -> list[str]:
+    """Remove old owned generations, never a protected one. Bounded retention.
+
+    ``protected`` names generations that must survive regardless of the bound -
+    normally the one the committed pointer references. The remaining slots are
+    filled with the most recent generations up to ``keep``. Only directories
+    positively identified as generations are candidates, so an unrecognized
+    directory is left untouched.
+    """
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    owned = _owned_generation_dirs(generations)
+    keep_names = {name for name in protected if name}
+    for entry in owned:
         if len(keep_names) >= keep:
             break
         keep_names.add(entry.name)
     removed: list[str] = []
-    for entry in entries:
+    for entry in owned:
         if entry.name in keep_names:
             continue
         shutil.rmtree(entry, ignore_errors=True)

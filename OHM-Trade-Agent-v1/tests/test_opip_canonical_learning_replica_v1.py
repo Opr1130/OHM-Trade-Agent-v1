@@ -19,7 +19,7 @@ Two seams are used deliberately:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo as _tzinfo
 import json
 import os
 from pathlib import Path
@@ -43,6 +43,7 @@ from app.opip.learning.canonical_replica import (
     REASON_DB_HASH_MISMATCH,
     REASON_DB_MISSING,
     REASON_DB_NOT_SELF_CONTAINED,
+    REASON_GENERATION_ID_COLLISION,
     REASON_GENERATION_ID_INVALID,
     REASON_MANIFEST_MALFORMED,
     REASON_MANIFEST_MISSING,
@@ -59,11 +60,13 @@ from app.opip.learning.canonical_replica import (
     ReplicaProvenanceError,
     ReplicaStaleError,
     ReplicaUnavailableError,
+    _reconcile_generation_retention,
     build_replica_manifest,
     export_replica_bundle,
     host_current_pointer,
     host_generations_dir,
     install_replica_generation,
+    iso_z,
     read_replica_manifest,
     replica_db_path,
     replica_paper_gap_path,
@@ -1044,3 +1047,546 @@ def shutil_copy_tree(source: Path, dest: Path) -> None:
 def test_db_hash_helper_matches_manifest_value(bundle):
     db = bundle["staging"] / CANONICAL_RELATIVE
     assert hash_file_sha256(db) == bundle["manifest"]["canonical_db"]["sha256"]
+
+
+# ---------------------------------------------------------------------------
+# Bounded retention across install failures
+#
+# An install publishes the generation under its immutable final name *before* it
+# touches the pointer, so a failure at pointer-fsync, pointer-rename or the
+# post-rename directory fsync returns without the normal post-success prune ever
+# running. Without failure-path reconciliation, repeated failures accumulate
+# orphaned generations until the disk fills.
+#
+# The safety question is the reverse one: reconciliation must never delete a
+# generation the committed pointer names. After ``os.replace(temp_pointer,
+# current)`` the live pointer can already name the incoming generation even though
+# directory durability failed, so "the install failed" is not evidence that the
+# generation is unreferenced.
+# ---------------------------------------------------------------------------
+
+
+def _owned_generation_names(host: Path) -> list[str]:
+    """Generation directories currently present, excluding private staging dirs."""
+    generations = host_generations_dir(host)
+    if not generations.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in generations.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    )
+
+
+def _install_expecting_failure(*, staging: Path, host: Path, **kwargs):
+    """Install, asserting that it fails, and return the raised exception."""
+    with pytest.raises(CanonicalDurabilityError) as exc:
+        install_replica_generation(
+            staging_dir=staging,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+            **kwargs,
+        )
+    return exc.value
+
+
+def test_first_install_pointer_failure_leaves_no_pointer_and_bounded_state(
+    tmp_path, monkeypatch
+):
+    """Case 1: the very first install fails before the pointer rename.
+
+    No generation is referenced, so nothing may become ``current``, and the
+    published generation must not grow without bound across retries.
+    """
+    staging = _staged_generation(tmp_path, "gen-0001", "one")
+    host = tmp_path / "host"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    _fail_only_on_pointer_file(
+        monkeypatch, real, CanonicalDurabilityError("injected pointer flush failure")
+    )
+    _install_expecting_failure(staging=staging, host=host, retain=2)
+
+    # No pointer was activated.
+    assert not host_current_pointer(host).exists()
+    with pytest.raises(ReplicaUnavailableError) as exc:
+        resolve_current_generation(host)
+    assert exc.value.reason == REASON_MANIFEST_MISSING
+    # The failure path reconciled, so the bound holds even though the success
+    # prune never ran.
+    assert len(_owned_generation_names(host)) <= 2
+
+
+def test_upgrade_pointer_failure_keeps_previous_generation_current(
+    tmp_path, monkeypatch
+):
+    """Case 2: A → B where B fails at the pointer step.
+
+    ``current`` must still be A, A must still verify in place, and B must be
+    either removed or retained only within the bound - never left unbounded.
+    """
+    staging_a = _staged_generation(tmp_path, "gen-a", "a")
+    staging_b = _staged_generation(tmp_path, "gen-b", "b")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging_a,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=2,
+    )
+    assert resolve_current_generation(host).name == "gen-a"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    _fail_only_on_pointer_file(
+        monkeypatch, real, CanonicalDurabilityError("injected pointer flush failure")
+    )
+    _install_expecting_failure(staging=staging_b, host=host, retain=2)
+
+    current = resolve_current_generation(host)
+    assert current.name == "gen-a"
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-a"
+    verified = verify_installed_replica(
+        expected_source_release_sha=RELEASE_SHA, root=current, now=NOW
+    )
+    assert verified.generation_id == "gen-a"
+    assert len(_owned_generation_names(host)) <= 2
+
+
+def test_post_rename_root_fsync_failure_does_not_delete_referenced_generation(
+    tmp_path, monkeypatch
+):
+    """Case 3: the rename happened, then the root directory fsync failed.
+
+    The live pointer may already name the incoming generation, so reconciliation
+    must read the pointer and protect what it names. Deleting it would leave a
+    dangling ``current``.
+    """
+    staging = _staged_generation(tmp_path, "gen-new", "new")
+    host = tmp_path / "host"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_directory_required
+
+    def _boom(directory):
+        if Path(directory) == host:
+            raise CanonicalDurabilityError("injected post-rename directory fault")
+        return real(directory)
+
+    monkeypatch.setattr(replica, "fsync_directory_required", _boom)
+    _install_expecting_failure(staging=staging, host=host, retain=2)
+
+    # The install reported failure, but the rename had already happened, so the
+    # pointer names the generation - which must therefore still exist.
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-new"
+    current = resolve_current_generation(host)
+    assert current.name == "gen-new"
+    verify_installed_replica(
+        expected_source_release_sha=RELEASE_SHA, root=current, now=NOW
+    )
+
+
+def test_repeated_pre_rename_failures_keep_generations_bounded(tmp_path, monkeypatch):
+    """Case 4: B, C, D each fail before the rename. Storage stays bounded.
+
+    Each attempt publishes its generation under its final name, so without the
+    failure-path reconciliation every retry would leave another immutable
+    generation behind forever.
+    """
+    host = tmp_path / "host"
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    _fail_only_on_pointer_file(
+        monkeypatch, real, CanonicalDurabilityError("injected pointer flush failure")
+    )
+    for index, name in enumerate(("b", "c", "d", "e", "f")):
+        staging = _staged_generation(tmp_path, f"gen-{name}", f"{name}{index}")
+        _install_expecting_failure(staging=staging, host=host, retain=2)
+        assert len(_owned_generation_names(host)) <= 2, (
+            f"generations grew past the bound after {name}: "
+            f"{_owned_generation_names(host)}"
+        )
+
+    # No generation is referenced, and the bound held across every retry.
+    assert not host_current_pointer(host).exists()
+    assert len(_owned_generation_names(host)) <= 2
+
+
+def test_repeated_post_rename_failures_never_dangle_and_converge(
+    tmp_path, monkeypatch
+):
+    """Case 5: repeated post-rename durability failures.
+
+    ``current`` must never name a deleted directory, and once a retry succeeds the
+    population must converge back to the retention bound.
+    """
+    host = tmp_path / "host"
+    from app.opip.learning import canonical_replica as replica
+
+    real_dir = replica.fsync_directory_required
+    affected: set[Path] = set()
+
+    def _boom(directory):
+        target = Path(directory)
+        if target in affected:
+            raise CanonicalDurabilityError("injected post-rename directory fault")
+        return real_dir(directory)
+
+    monkeypatch.setattr(replica, "fsync_directory_required", _boom)
+
+    for index in range(4):
+        staging = _staged_generation(tmp_path, f"gen-r{index}", f"r{index}")
+        affected.add(host)
+        _install_expecting_failure(staging=staging, host=host, retain=2)
+        # Whatever the pointer names must still be resolvable and verifiable.
+        current = resolve_current_generation(host)
+        assert current.is_dir()
+        verify_installed_replica(
+            expected_source_release_sha=RELEASE_SHA, root=current, now=NOW
+        )
+        assert len(_owned_generation_names(host)) <= 2
+
+    # A retry with durability restored succeeds and trims back to the bound.
+    monkeypatch.setattr(replica, "fsync_directory_required", real_dir)
+    final = _staged_generation(tmp_path, "gen-final", "final")
+    install_replica_generation(
+        staging_dir=final,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=2,
+    )
+    assert resolve_current_generation(host).name == "gen-final"
+    assert len(_owned_generation_names(host)) <= 2
+
+
+def test_referenced_generation_survives_even_when_oldest_by_mtime(tmp_path):
+    """Protection is by identity, not recency.
+
+    Retention picks survivors by mtime, so a referenced generation that happens to
+    be the oldest must still survive. Forcing mtimes makes this deterministic: a
+    recency-only implementation would delete the referenced generation and leave
+    ``current`` dangling.
+    """
+    import shutil as _shutil
+
+    from app.opip.learning import canonical_replica as replica
+
+    staging = _staged_generation(tmp_path, "gen-ref", "ref")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=2,
+    )
+    generations = host_generations_dir(host)
+    referenced = generations / "gen-ref"
+    assert referenced.is_dir()
+
+    # Three newer, unreferenced generations.
+    orphans = []
+    for index in range(3):
+        orphan = generations / f"gen-orphan{index}"
+        _shutil.copytree(referenced, orphan)
+        orphans.append(orphan)
+
+    base = 1_700_000_000
+    os.utime(referenced, (base, base))
+    for offset, orphan in enumerate(orphans, start=1):
+        stamp = base + offset * 60
+        os.utime(orphan, (stamp, stamp))
+
+    removed = replica._reconcile_generation_retention(host, keep=2)
+
+    # The referenced generation is the oldest, yet it survives.
+    assert referenced.is_dir()
+    assert "gen-ref" not in removed
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-ref"
+    assert resolve_current_generation(host).name == "gen-ref"
+    assert len(_owned_generation_names(host)) <= 2
+
+def test_unrecognized_directory_is_never_removed(tmp_path):
+    """Retention only removes directories it can positively identify."""
+    staging = _staged_generation(tmp_path, "gen-a", "a")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=1,
+    )
+    generations = host_generations_dir(host)
+    # A directory that is not a generation: no manifest, so ownership is not
+    # provable and it must be left alone.
+    foreign = generations / "not-a-generation"
+    foreign.mkdir()
+    (foreign / "notes.txt").write_text("operator scratch", encoding="utf-8")
+
+    removed = _reconcile_generation_retention(host, keep=1)
+
+    assert foreign.is_dir()
+    assert (foreign / "notes.txt").read_text(encoding="utf-8") == "operator scratch"
+    assert "not-a-generation" not in removed
+
+
+def test_unprovable_pointer_state_retains_a_margin(tmp_path):
+    """An unreadable pointer must not be read as "nothing is referenced"."""
+    import shutil as _shutil
+
+    staging = _staged_generation(tmp_path, "gen-a", "a")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=2,
+    )
+    generations = host_generations_dir(host)
+    for index in range(3):
+        _shutil.copytree(generations / "gen-a", generations / f"gen-x{index}")
+
+    # An empty pointer names nothing but proves nothing either, so the reference
+    # state is unprovable and retention keeps one extra generation as margin
+    # rather than pruning to the bare bound.
+    host_current_pointer(host).write_text("", encoding="utf-8")
+    _reconcile_generation_retention(host, keep=2)
+    assert len(_owned_generation_names(host)) == 3
+
+    # With a provable pointer the bound is exact, and the referenced generation
+    # survives even though it was not the newest.
+    survivor = _owned_generation_names(host)[0]
+    host_current_pointer(host).write_text(survivor + "\n", encoding="utf-8")
+    _reconcile_generation_retention(host, keep=2)
+    assert len(_owned_generation_names(host)) == 2
+    assert survivor in _owned_generation_names(host)
+    assert resolve_current_generation(host).name == survivor
+
+
+def test_exact_same_generation_retry_stays_idempotent(tmp_path):
+    """Case 6: retrying the same generation id is idempotent, not an orphan."""
+    staging = _staged_generation(tmp_path, "gen-same", "same")
+    host = tmp_path / "host"
+    for _ in range(3):
+        summary = install_replica_generation(
+            staging_dir=staging,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+            retain=2,
+        )
+        assert summary["installed"] == "gen-same"
+    assert resolve_current_generation(host).name == "gen-same"
+    assert _owned_generation_names(host) == ["gen-same"]
+
+
+def test_same_generation_id_with_different_content_is_still_rejected(tmp_path):
+    """Case 7: a reused id with different content remains a provenance collision.
+
+    The second bundle is genuinely valid on its own - only its recorded snapshot
+    instant differs - so it passes staged verification and the collision is what
+    rejects it. Because the collision is detected before publication, the existing
+    generation must be untouched without the failure-path reconciliation being
+    what protects it.
+    """
+    first = _staged_generation(tmp_path, "gen-clash", "clash1")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=first,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+        retain=2,
+    )
+    installed_manifest = read_replica_manifest(
+        host_generations_dir(host) / "gen-clash" / MANIFEST_FILENAME
+    )
+
+    # Same id, different manifest content: a distinct snapshot instant.
+    live = tmp_path / "live-clash2.sqlite3"
+    _seed_canonical(live)
+    state = _production_state(tmp_path / "state-clash2.json")
+    second = tmp_path / "staging-clash2"
+    export_replica_bundle(
+        source_db=live,
+        staging_dir=second,
+        source_release_sha=RELEASE_SHA,
+        paper_state_source=state,
+        paper_gap_source=None,
+        generation_id="gen-clash",
+        now=NOW + timedelta(seconds=5),
+    )
+    assert read_replica_manifest(second / MANIFEST_FILENAME) != installed_manifest
+
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        install_replica_generation(
+            staging_dir=second,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+            retain=2,
+        )
+    assert exc.value.reason == REASON_GENERATION_ID_COLLISION
+
+    # The installed generation is untouched and still authoritative.
+    assert resolve_current_generation(host).name == "gen-clash"
+    assert read_replica_manifest(
+        host_generations_dir(host) / "gen-clash" / MANIFEST_FILENAME
+    ) == installed_manifest
+
+
+def test_retention_bound_is_enforced_on_the_success_path(tmp_path):
+    """The success path still trims, now protecting the activated generation."""
+    host = tmp_path / "host"
+    for index in range(4):
+        staging = _staged_generation(tmp_path, f"gen-s{index}", f"s{index}")
+        install_replica_generation(
+            staging_dir=staging,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+            retain=2,
+        )
+    assert resolve_current_generation(host).name == "gen-s3"
+    assert len(_owned_generation_names(host)) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Timezone awareness for externally supplied timestamps
+#
+# Replica evidence timestamps and freshness arithmetic are defined in UTC. Python
+# resolves a naive ``datetime`` against the host local timezone, which would
+# silently shift a recorded release timestamp by the host offset - and could make
+# a stale replica look fresh. Naive input is therefore rejected, not localized.
+# ---------------------------------------------------------------------------
+
+
+class _OffsetlessTimezone(_tzinfo):
+    """A tzinfo whose ``utcoffset`` is None, i.e. aware in name only."""
+
+    def utcoffset(self, _dt):  # type: ignore[override]
+        return None
+
+    def dst(self, _dt):  # type: ignore[override]
+        return None
+
+
+def test_naive_snapshot_created_at_is_rejected(bundle):
+    """A naive manifest timestamp must not be silently localized."""
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        build_replica_manifest(
+            source_release_sha=RELEASE_SHA,
+            canonical_db=bundle["staging"] / CANONICAL_RELATIVE,
+            snapshot_created_at_utc=datetime(2026, 9, 17, 3, 30),
+        )
+    assert exc.value.reason == REASON_TIMESTAMP_INVALID
+    assert "timezone-aware" in str(exc.value)
+
+
+def test_naive_verification_now_is_rejected(bundle):
+    """A naive verification clock must not be silently localized."""
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        verify_replica_manifest(
+            bundle["manifest"],
+            root=bundle["staging"],
+            expected_source_release_sha=RELEASE_SHA,
+            now=datetime(2026, 9, 17, 3, 30),
+        )
+    assert exc.value.reason == REASON_TIMESTAMP_INVALID
+
+
+def test_offsetless_timezone_is_rejected(bundle):
+    """``tzinfo`` set but ``utcoffset()`` None is not a usable offset."""
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        verify_replica_manifest(
+            bundle["manifest"],
+            root=bundle["staging"],
+            expected_source_release_sha=RELEASE_SHA,
+            now=datetime(2026, 9, 17, 3, 30, tzinfo=_OffsetlessTimezone()),
+        )
+    assert exc.value.reason == REASON_TIMESTAMP_INVALID
+
+
+def test_aware_non_utc_timestamp_is_normalized_to_utc(bundle):
+    """An aware non-UTC timestamp is converted, not reinterpreted."""
+    manifest = build_replica_manifest(
+        source_release_sha=RELEASE_SHA,
+        canonical_db=bundle["staging"] / CANONICAL_RELATIVE,
+        snapshot_created_at_utc=datetime(
+            2026, 9, 17, 3, 30, tzinfo=timezone(timedelta(hours=-4))
+        ),
+    )
+    # 03:30 at -04:00 is 07:30Z.
+    assert manifest["snapshot_created_at_utc"] == "2026-09-17T07:30:00Z"
+
+
+def test_aware_utc_timestamp_is_semantically_unchanged(bundle):
+    """The aware UTC case keeps its exact instant."""
+    manifest = build_replica_manifest(
+        source_release_sha=RELEASE_SHA,
+        canonical_db=bundle["staging"] / CANONICAL_RELATIVE,
+        snapshot_created_at_utc=datetime(2026, 9, 17, 3, 30, tzinfo=timezone.utc),
+    )
+    assert manifest["snapshot_created_at_utc"] == "2026-09-17T03:30:00Z"
+
+
+def test_aware_non_utc_now_is_normalized_for_freshness(bundle):
+    """An aware non-UTC ``now`` denotes the same instant as its UTC form."""
+    equivalent = datetime(2026, 9, 16, 23, 30, tzinfo=timezone(timedelta(hours=-4)))
+    verify_replica_manifest(
+        bundle["manifest"],
+        root=bundle["staging"],
+        expected_source_release_sha=RELEASE_SHA,
+        now=equivalent,
+    )
+
+
+def test_naive_now_cannot_turn_a_stale_replica_into_a_freshness_pass(bundle):
+    """A naive clock must not be localized into an accepted freshness window.
+
+    ``NOW`` is the bundle's own creation instant. A naive value slightly later
+    would pass a freshness check if it were silently resolved against a host
+    timezone, so it must raise instead - while the aware equivalent is accepted,
+    proving the rejection is about awareness rather than the freshness value.
+    """
+    naive = datetime(2026, 9, 17, 3, 30, 1)
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        verify_replica_manifest(
+            bundle["manifest"],
+            root=bundle["staging"],
+            expected_source_release_sha=RELEASE_SHA,
+            now=naive,
+        )
+    assert exc.value.reason == REASON_TIMESTAMP_INVALID
+
+    verify_replica_manifest(
+        bundle["manifest"],
+        root=bundle["staging"],
+        expected_source_release_sha=RELEASE_SHA,
+        now=datetime(2026, 9, 17, 3, 30, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_iso_z_rejects_naive_input_directly():
+    """``iso_z`` is the shared rendering seam, so it enforces the same rule."""
+    with pytest.raises(ReplicaProvenanceError) as exc:
+        iso_z(datetime(2026, 9, 17, 3, 30))
+    assert exc.value.reason == REASON_TIMESTAMP_INVALID
+    assert iso_z(datetime(2026, 9, 17, 3, 30, tzinfo=timezone.utc)) == (
+        "2026-09-17T03:30:00Z"
+    )
+
+
+def test_timestamp_reason_vocabulary_is_pinned():
+    """The stable reason code is unchanged by this remediation."""
+    assert REASON_TIMESTAMP_INVALID == "CANONICAL_REPLICA_TIMESTAMP_INVALID"
