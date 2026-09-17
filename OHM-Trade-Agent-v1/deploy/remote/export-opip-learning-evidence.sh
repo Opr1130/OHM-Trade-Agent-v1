@@ -7,6 +7,10 @@ set -Eeuo pipefail
 APP_ROOT="/opt/OHM-Trade-Agent-v1/OHM-Trade-Agent-v1"
 DATA_ROOT="$APP_ROOT/data"
 EXPORT_ROOT="/var/lib/opip-learning-export"
+# Canonical replica snapshot/manifest logic lives in Python; this script only
+# orchestrates. Use the same interpreter convention as the rest of the
+# production scripts (python3 on the Debian droplet).
+PYTHON_BIN="${OPIP_PYTHON_BIN:-/usr/bin/python3}"
 TRIGGER_LOCK="/var/run/opip-learning-export.lock"
 PUBLISH_LOCK="$EXPORT_ROOT/.publish.lock"
 READER_GROUP="opiplearn"
@@ -16,7 +20,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr; do
+for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr python3; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required export command: $cmd" >&2
     exit 69
@@ -212,7 +216,8 @@ copy_locked_jsonl "$DATA_ROOT/decision_telemetry.jsonl" "decision_telemetry.json
 copy_locked_jsonl "$DATA_ROOT/opip_trade_quality_evidence_v1.jsonl" "opip_trade_quality_evidence_v1.jsonl"
 copy_locked_jsonl "$DATA_ROOT/candidate_trace.jsonl" "candidate_trace.jsonl"
 
-manifest_tmp="$EXPORT_ROOT/.manifest.env.tmp.$$"
+# Deterministic tree size and digest. Used to bind the canonical replica bundle
+# at the outer transport layer just as archive directories are bound.
 tree_bytes() {
   find "$1" -type f -printf '%s\n' | awk '{total += $1} END {printf "%d\n", total}'
 }
@@ -222,6 +227,18 @@ tree_sha256() {
     find . -type f -print0 | sort -z | xargs -0 -r sha256sum
   ) | sha256sum | awk '{print $1}'
 }
+
+# ---------------------------------------------------------------------------
+# Canonical learning replica bundle.
+#
+# The replica is release-bound evidence, so it requires an authoritative
+# production release SHA. If none exists we deliberately do NOT publish the v1
+# marker: a bundle attributed to an unknown release could never be accepted by
+# learning anyway, and minting provenance with an empty SHA would be a false
+# claim. Legacy artifacts above keep their existing UNVERIFIED behaviour.
+#
+# All snapshot/manifest logic lives in Python. This shell only orchestrates.
+# ---------------------------------------------------------------------------
 production_deployed_sha="$(cat /var/lib/ohm-deploy/last-good-sha 2>/dev/null || true)"
 if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
   # Leave empty so workers report UNVERIFIED and fail closed until the
@@ -229,11 +246,71 @@ if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
   production_deployed_sha=""
 fi
 
+REPLICA_EXPORT_NAME="canonical_learning_replica"
+REPLICA_PUBLISH_DIR="$EXPORT_ROOT/$REPLICA_EXPORT_NAME"
+REPLICA_STAGING="$EXPORT_ROOT/.$REPLICA_EXPORT_NAME.staging.$$"
+REPLICA_MARKER_LINES=""
+
+rm -rf -- "$REPLICA_STAGING"
+
+if [[ -z "$production_deployed_sha" ]]; then
+  echo "O'Pip learning export: canonical replica skipped (no authoritative deployed SHA)"
+  REPLICA_MARKER_LINES=""
+else
+  install -d -m 0700 "$REPLICA_STAGING"
+  replica_rc=0
+  "$PYTHON_BIN" -m app.opip.learning.canonical_replica export \
+    --source-db "$DATA_ROOT/opip/canonical/opip_canonical_v1.sqlite3" \
+    --staging "$REPLICA_STAGING" \
+    --release-sha "$production_deployed_sha" \
+    --paper-state "$DATA_ROOT/paper_trading/state.json" \
+    --paper-gap "$DATA_ROOT/paper_trading/evidence_gap_spool.json" \
+    >/dev/null || replica_rc=$?
+
+  if (( replica_rc != 0 )); then
+    # Fail visibly and publish nothing for the replica. The legacy export
+    # commits as before; no v1 marker is written, so no consumer can believe a
+    # canonical generation exists.
+    echo "O'Pip learning export: canonical replica export FAILED (rc=$replica_rc)" >&2
+    rm -rf -- "$REPLICA_STAGING"
+    echo "O'Pip learning evidence export: JSON artifacts OK, canonical replica FAILED" >&2
+    exit 70
+  fi
+
+  if getent group "$READER_GROUP" >/dev/null 2>&1; then
+    chown -R root:"$READER_GROUP" "$REPLICA_STAGING"
+  else
+    chown -R root:root "$REPLICA_STAGING"
+  fi
+  find "$REPLICA_STAGING" -type d -exec chmod 0750 {} +
+  find "$REPLICA_STAGING" -type f -exec chmod 0640 {} +
+
+  # Publish the whole staged generation as one atomic directory replacement,
+  # under the already-held exclusive publish lock. Readers can never observe
+  # half-built contents.
+  rm -rf -- "$REPLICA_PUBLISH_DIR"
+  mv -f -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"
+
+  replica_bytes="$(tree_bytes "$REPLICA_PUBLISH_DIR")"
+  replica_sha="$(tree_sha256 "$REPLICA_PUBLISH_DIR")"
+  REPLICA_MARKER_LINES="canonical_learning_replica_version=1
+canonical_learning_replica_bytes=${replica_bytes}
+canonical_learning_replica_sha256=${replica_sha}"
+  echo "O'Pip learning export: canonical replica bundle OK bytes=${replica_bytes}"
+fi
+
+manifest_tmp="$EXPORT_ROOT/.manifest.env.tmp.$$"
+
 {
   printf 'schema_version=4\n'
   printf 'exported_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'production_deployed_sha=%s\n' "$production_deployed_sha"
   printf 'p1_shadow_outbox_retired=1\n'
+  # Additive schema-4 extension. Absent when no canonical bundle was published,
+  # so a legacy reader sees exactly the schema it saw before.
+  if [[ -n "$REPLICA_MARKER_LINES" ]]; then
+    printf '%s\n' "$REPLICA_MARKER_LINES"
+  fi
   while IFS='|' read -r name key; do
     path="$EXPORT_ROOT/$name"
     printf '%s_bytes=%s\n' "$key" "$(stat -c '%s' "$path")"
