@@ -30,10 +30,24 @@ def _stage_bundle(
     generation_id: str,
     now: datetime,
     lifecycle_tag: str,
+    malformed_lifecycle: bool = False,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     live = root / "live.sqlite3"
     CanonicalWriter(live).close()
+
+    lifecycles: dict[str, object] = {
+        "PAPER:" + "a" * 20: {
+            "paper_trade_id": "PAPER:" + "a" * 20,
+            "episode_id": "EP:1",
+            "status": "CLOSED",
+            "revision": 1,
+            "tag": lifecycle_tag,
+            "outcome_outbox": {"delivery": "COMMITTED"},
+        }
+    }
+    if malformed_lifecycle:
+        lifecycles["PAPER:BROKEN"] = "not-an-object"
 
     state = root / "state.json"
     state.write_text(
@@ -41,16 +55,7 @@ def _stage_bundle(
             {
                 "schema_version": 1,
                 "paper_only": True,
-                "lifecycles": {
-                    "PAPER:" + "a" * 20: {
-                        "paper_trade_id": "PAPER:" + "a" * 20,
-                        "episode_id": "EP:1",
-                        "status": "CLOSED",
-                        "revision": 1,
-                        "tag": lifecycle_tag,
-                        "outcome_outbox": {"delivery": "COMMITTED"},
-                    }
-                },
+                "lifecycles": lifecycles,
             },
             sort_keys=True,
         ),
@@ -92,6 +97,31 @@ def test_readiness_main_passes_the_deployed_release_sha(monkeypatch, tmp_path, c
 
     assert captured["expected_release_sha"] == RELEASE_SHA
     assert json.loads(capsys.readouterr().out)["record_type"] == "TEST"
+
+
+def test_malformed_lifecycle_row_marks_verified_replica_incomplete(tmp_path):
+    """Valid survivors cannot hide malformed rows in authority state."""
+    staging = _stage_bundle(
+        tmp_path / "malformed",
+        generation_id="gen-review-malformed",
+        now=NOW,
+        lifecycle_tag="A",
+        malformed_lifecycle=True,
+    )
+
+    outcomes, lifecycles, source_error, reasons, malformed = (
+        readiness_job._verified_replica_inputs(
+            root=staging,
+            expected_release_sha=RELEASE_SHA,
+            now=NOW,
+        )
+    )
+
+    assert source_error is None
+    assert outcomes == []
+    assert len(lifecycles) == 1
+    assert malformed == 1
+    assert "PAPER_OUTCOME_LIFECYCLE_STATE_MALFORMED" in reasons
 
 
 def test_same_generation_retry_reuses_verified_directory_without_recopy(
