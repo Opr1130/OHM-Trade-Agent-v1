@@ -124,11 +124,17 @@ def _verified_replica_inputs(
     root: Path | None = None,
     expected_release_sha: str = "",
     now: datetime | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, tuple[str, ...]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    str | None,
+    tuple[str, ...],
+    int,
+]:
     """Verify the canonical replica and read all three of its authority inputs.
 
     Returns ``(paper_outcome_rows, paper_lifecycle_rows, source_error,
-    incomplete_reasons)``.
+    incomplete_reasons, lifecycle_malformed_count)``.
 
     Every input comes from **one** verified generation. That is the whole point
     of resolving the bundle here rather than probing for a SQLite file: it makes
@@ -161,11 +167,11 @@ def _verified_replica_inputs(
             now=now,
         )
     except ReplicaVerificationError as exc:
-        return [], [], f"{type(exc).__name__}: {exc}", (exc.reason,)
+        return [], [], f"{type(exc).__name__}: {exc}", (exc.reason,), 0
     except (sqlite3.Error, OSError) as exc:
         return [], [], f"{type(exc).__name__}: {exc}", (
             "CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",
-        )
+        ), 0
 
     if not bundle.completeness_supported:
         reasons.extend(bundle.completeness_reasons)
@@ -176,10 +182,14 @@ def _verified_replica_inputs(
     except (PaperOutcomeIntegrityError, sqlite3.Error, OSError) as exc:
         return [], [], f"{type(exc).__name__}: {exc}", (
             "CANONICAL_OUTCOME_SOURCE_UNAVAILABLE",
-        )
+        ), 0
 
     # Lifecycle rows come from this same generation, never from /app/data.
-    lifecycle_rows, _malformed = _paper_rows(bundle.paper_state_path)
+    lifecycle_rows, lifecycle_malformed = _paper_rows(bundle.paper_state_path)
+    if lifecycle_malformed:
+        # Never let valid surviving rows hide malformed authority state. A mixed
+        # state file cannot certify a complete population for supervised truth.
+        reasons.append("PAPER_OUTCOME_LIFECYCLE_STATE_MALFORMED")
 
     try:
         spool = json.loads(bundle.paper_gap_spool_path.read_text(encoding="utf-8"))
@@ -192,7 +202,13 @@ def _verified_replica_inputs(
         # Fail closed: a corrupt spool makes completeness unprovable.
         reasons.append("PAPER_OUTCOME_EVIDENCE_GAP_SPOOL_CORRUPT")
 
-    return outcomes, lifecycle_rows, None, tuple(sorted(set(reasons)))
+    return (
+        outcomes,
+        lifecycle_rows,
+        None,
+        tuple(sorted(set(reasons))),
+        lifecycle_malformed,
+    )
 
 
 def build_production_readiness_report(
@@ -222,18 +238,11 @@ def build_production_readiness_report(
         paper_rows,
         paper_outcome_source_error,
         paper_outcome_incomplete_reasons,
+        paper_malformed,
     ) = _verified_replica_inputs(
         root=canonical_replica_root,
         expected_release_sha=expected_release_sha,
         now=readiness_now,
-    )
-    # Malformed lifecycle rows inside a verified generation are an integrity
-    # signal, not a reason to fall back to another source.
-    paper_malformed = sum(
-        1
-        for row in paper_rows
-        if not isinstance(row, dict)
-        or not str(row.get("paper_trade_id") or "").strip()
     )
     health, health_malformed = _capture_health(capture_health_path)
     health["malformed"] = int(health.get("malformed", 0) or 0) + (
