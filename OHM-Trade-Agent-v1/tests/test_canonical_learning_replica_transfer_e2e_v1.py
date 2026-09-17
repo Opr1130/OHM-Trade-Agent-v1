@@ -116,9 +116,20 @@ def harness(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("replica-e2e")
 
     # Application root with a data directory, mirroring the deployed layout.
+    # The exporter takes a per-artifact lock beside each source file
+    # (`<dirname>/.<basename>.lock`), so every parent directory it touches must
+    # exist - in production the application creates them.
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    (DATA_ROOT / "paper_trading").mkdir(parents=True, exist_ok=True)
-    (DATA_ROOT / "opip" / "canonical").mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "paper_trading",
+        "intelligence_learning",
+        "opip/canonical",
+        "opip/qualification",
+        "opip/qualification/screening_evaluations_archive",
+        "opip/qualification/funnel_events_archive",
+        "opip/qualification/scan_summaries_archive",
+    ):
+        (DATA_ROOT / relative).mkdir(parents=True, exist_ok=True)
     DEPLOY_STATE.mkdir(parents=True, exist_ok=True)
     EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
     LEARNING_DATA.mkdir(parents=True, exist_ok=True)
