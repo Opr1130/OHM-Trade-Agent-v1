@@ -132,6 +132,7 @@ def test_block_reports_cron_metadata_and_release_artifact_identity():
     for field in (
         "cron_daemon_active=",
         "cron_daemon_state=",
+        "cron_daemon_source=",
         "cron_daemon_pid=",
         "cron_daemon_started_at=",
         "export_cron_exists=",
@@ -188,6 +189,51 @@ def test_block_reports_all_three_export_locks():
     assert "export_lock_stall_suspected=" in block
 
 
+def test_cron_daemon_state_maps_to_active_without_conflating_unknown():
+    """systemctl "unknown" must NOT map to cron_daemon_active=NO.
+
+    unknown means systemctl could not decide - the unit is unavailable, the name
+    does not resolve, or cron is managed outside that unit. It is a distinct
+    state from proven inactivity, and treating it as NO would skip the pgrep
+    fallback and could degrade diagnostics for a healthy daemon.
+    """
+    block = _block()
+    # The dispatch is by state name, and unknown is neither NO nor YES.
+    assert 'active) cron_daemon_active="YES"' in block
+    assert 'inactive | failed | deactivating) cron_daemon_active="NO"' in block
+    assert '*) cron_daemon_active="UNKNOWN"' in block
+    # The old collapsing "unknown" into NO must be gone.
+    assert 'inactive | failed | deactivating | unknown)' not in block
+    # The pgrep fallback fires only when systemctl was inconclusive, upgrades
+    # cron_daemon_active to YES with source=PGREP, and reports state so the
+    # source of the YES is distinguishable from an authoritative systemctl.
+    assert '[[ "$cron_daemon_active" == "UNKNOWN" ]] && command -v pgrep' in block
+    assert 'cron_daemon_active="YES"' in block
+    assert 'cron_daemon_source="PGREP"' in block
+    assert 'cron_daemon_state="PROCESS_PRESENT"' in block
+    # No unqueryable systemctl result is converted directly to NO anywhere else.
+    for line in block.splitlines():
+        if 'cron_daemon_active="NO"' in line:
+            assert "inactive | failed | deactivating" in line, line
+
+
+def test_degrade_reads_cron_daemon_active_not_state():
+    """The degrade decision must not misread UNKNOWN as inactive."""
+    block = _block()
+    assert 'if [[ "$cron_daemon_active" == "NO" ]]; then' in block
+    # No decision derives inactive from the raw systemctl state string.
+    forbidden_patterns = (
+        '"$cron_daemon_state" == "unknown"',
+        '"$cron_daemon_state" != "active"',
+    )
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        for pattern in forbidden_patterns:
+            assert pattern not in stripped, stripped
+
+
 def test_block_reports_committed_state_log_classification_and_orphans():
     block = _block()
     for field in (
@@ -205,6 +251,8 @@ def test_block_reports_committed_state_log_classification_and_orphans():
         "export_log_post_manifest_success_count=",
         "export_log_post_manifest_failure_count=",
         "export_log_post_manifest_timestamped_count=",
+        "export_log_post_manifest_recognized_event_count=",
+        "export_log_post_manifest_unclassified_line_count=",
         "export_process_count=",
         "export_process_present=",
         "export_process_max_elapsed_seconds=",
@@ -215,16 +263,23 @@ def test_block_reports_committed_state_log_classification_and_orphans():
     ):
         assert field in block
     # Every classification the block can emit, including the honest
-    # "cannot attribute events" outcome for an untimestamped log.
+    # "cannot attribute events" outcomes for an untimestamped log and for a
+    # timestamped log that carries no recognized exporter event.
     for classification in (
         "UNPROVABLE_FROM_UNTIMESTAMPED_LOG",
-        "NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE",
+        "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE",
         "POST_MANIFEST_RUNS_FAIL",
         "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD",
         "POST_MANIFEST_RUNS_SUCCEED",
-        "POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED",
+        "POST_MANIFEST_RECOGNIZED_ACTIVITY_UNCLASSIFIED",
     ):
         assert classification in block
+    # The old enum values used timestamp-only attribution and are retired.
+    for retired in (
+        "POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED",
+        "NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE",
+    ):
+        assert retired not in block
     # Orphan inventory is emitted through one bounded shared printer.
     for prefix, pattern in (
         ("replica_staging", ".canonical_learning_replica.staging.*"),
@@ -746,14 +801,16 @@ def test_timestamped_log_discriminates_post_manifest_events(tmp_path):
     assert fields_old["export_log_activity_class"] == "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"
     assert fields_old["export_log_post_manifest_evidence"] == "PROVEN"
 
-    # Manifest committed after both events: neither is post-manifest.
+    # Manifest committed after both events: neither is post-manifest, and no
+    # recognized post-manifest event exists.
     fields_new = _run_block(tmp_path, fx, newer)
     assert fields_new["export_log_timestamped_line_count"] == "2"
     assert fields_new["export_log_post_manifest_timestamped_count"] == "0"
+    assert fields_new["export_log_post_manifest_recognized_event_count"] == "0"
     assert fields_new["export_log_post_manifest_skip_count"] == "0"
     assert (
         fields_new["export_log_activity_class"]
-        == "NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
+        == "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
     )
     # Same lifetime totals both times: only the time scoping differs.
     assert fields_old["export_log_lifetime_skip_count"] == "2"
@@ -761,6 +818,106 @@ def test_timestamped_log_discriminates_post_manifest_events(tmp_path):
     # And the two runs genuinely differ, so the timestamp is not inert.
     assert (
         fields_old["export_log_activity_class"] != fields_new["export_log_activity_class"]
+    )
+
+
+@pytestmark_posix
+def test_post_manifest_unrelated_line_is_not_degrading(tmp_path):
+    """Case A: an unrelated timestamped line must not degrade diagnostics.
+
+    A post-manifest timestamp proves *when* a line was emitted, not that it is
+    an exporter event. An unrelated line (a benign informational record, another
+    consumer of the log) must be counted for observability but must not feed the
+    classification or the degrade decision.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z something else wrote this line\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_timestamped_line_count"] == "1"
+    assert fields["export_log_post_manifest_timestamped_count"] == "1"
+    assert fields["export_log_post_manifest_unclassified_line_count"] == "1"
+    assert fields["export_log_post_manifest_recognized_event_count"] == "0"
+    assert fields["export_log_post_manifest_skip_count"] == "0"
+    assert fields["export_log_post_manifest_success_count"] == "0"
+    assert fields["export_log_post_manifest_failure_count"] == "0"
+    assert (
+        fields["export_log_activity_class"]
+        == "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
+    )
+    assert (
+        fields["export_log_post_manifest_evidence"]
+        == "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
+    )
+    # The lone reason to degrade below in this scenario is the pre-existing
+    # export_committed_after_release_receipt check (the fixture's manifest was
+    # written before the release receipt). The unrelated line contributed
+    # nothing to that decision; confirm classification is not what degraded.
+    for line in ("POST_MANIFEST_RUNS_FAIL", "POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD"):
+        assert fields["export_log_activity_class"] != line
+
+
+@pytestmark_posix
+def test_post_manifest_unrelated_line_then_success_is_success(tmp_path):
+    """Case B: unrelated line, then a recognized success -> POST_MANIFEST_RUNS_SUCCEED."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z something else wrote this line\n"
+        "2026-09-17T19:06:00Z O'Pip learning evidence export: OK\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_post_manifest_timestamped_count"] == "2"
+    assert fields["export_log_post_manifest_recognized_event_count"] == "1"
+    assert fields["export_log_post_manifest_success_count"] == "1"
+    assert fields["export_log_post_manifest_unclassified_line_count"] == "1"
+    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_SUCCEED"
+
+
+@pytestmark_posix
+def test_post_manifest_unrelated_line_then_failure_is_failure(tmp_path):
+    """Case C: unrelated line, then a recognized failure -> POST_MANIFEST_RUNS_FAIL."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T19:05:00Z something else wrote this line\n"
+        "2026-09-17T19:06:00Z O'Pip learning export: canonical replica export FAILED (rc=3)\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_post_manifest_timestamped_count"] == "2"
+    assert fields["export_log_post_manifest_recognized_event_count"] == "1"
+    assert fields["export_log_post_manifest_failure_count"] == "1"
+    assert fields["export_log_post_manifest_unclassified_line_count"] == "1"
+    assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_FAIL"
+
+
+@pytestmark_posix
+def test_historical_failure_before_manifest_does_not_contaminate(tmp_path):
+    """Case D: a historical recognized failure with only unrelated post-manifest lines.
+
+    The classification must not degrade on account of the historical event: only
+    line_epoch > manifest_epoch can reach the recognized-event counters, so a
+    pre-manifest failure is descriptive (lifetime) but not authoritative.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text(
+        "2026-09-17T18:00:00Z O'Pip learning export: canonical replica export FAILED (rc=3)\n"
+        "2026-09-17T19:05:00Z something else wrote this line\n",
+        encoding="utf-8",
+    )
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    # Lifetime totals still see the historical event...
+    assert fields["export_log_lifetime_failure_count"] == "1"
+    # ...but nothing recognized happened post-manifest.
+    assert fields["export_log_post_manifest_recognized_event_count"] == "0"
+    assert fields["export_log_post_manifest_failure_count"] == "0"
+    assert fields["export_log_post_manifest_timestamped_count"] == "1"
+    assert fields["export_log_post_manifest_unclassified_line_count"] == "1"
+    assert (
+        fields["export_log_activity_class"]
+        == "NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
     )
 
 
@@ -779,6 +936,107 @@ def test_timestamped_log_proves_a_post_manifest_success(tmp_path):
     # Only the terminal-OK line matches; the bundle-OK line is counted separately.
     assert fields["export_log_lifetime_success_count"] == "1"
     assert fields["export_log_lifetime_bundle_ok_count"] == "1"
+
+
+@pytestmark_posix
+def test_cron_probe_systemctl_unknown_is_pgrep_upgraded_to_yes(tmp_path):
+    """systemctl unknown + a real cron process must yield cron_daemon_active=YES.
+
+    The block is executed with shims on PATH that make systemctl return
+    "unknown" and pgrep return a valid pid. The dispatch must map unknown to
+    UNKNOWN (not NO), and the fallback must upgrade to YES.
+    """
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    systemctl = shim / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "is-active cron") echo unknown; exit 0 ;;\n'
+        '  "show -p") echo ""; exit 0 ;;\n'
+        'esac\n'
+        'echo ""\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    pgrep = shim / "pgrep"
+    pgrep.write_text('#!/bin/sh\necho 12345\n', encoding="utf-8")
+    pgrep.chmod(0o755)
+    ps = shim / "ps"
+    ps.write_text("#!/bin/sh\necho 'Thu Sep 17 12:00:00 2026'\n", encoding="utf-8")
+    ps.chmod(0o755)
+
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z", path_prefix=shim)
+    assert fields["cron_daemon_active"] == "YES"
+    assert fields["cron_daemon_source"] == "PGREP"
+    assert fields["cron_daemon_pid"] == "12345"
+    # The state reports where the YES came from so it is not confused with an
+    # authoritative systemctl "active".
+    assert fields["cron_daemon_state"] == "PROCESS_PRESENT"
+    # And the degrade decision does not fire on cron in this case.
+    assert not fields.get("cron_daemon_active", "") == "NO"
+
+
+@pytestmark_posix
+def test_cron_probe_systemctl_inactive_is_no(tmp_path):
+    """systemctl inactive is proof of inactivity - keep mapping it to NO."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    systemctl = shim / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "is-active cron") echo inactive; exit 0 ;;\n'
+        'esac\n'
+        'echo ""\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    # A pgrep that would falsely upgrade is deliberately available, and MUST NOT
+    # be consulted because systemctl was authoritative.
+    pgrep = shim / "pgrep"
+    pgrep.write_text('#!/bin/sh\necho 77777\n', encoding="utf-8")
+    pgrep.chmod(0o755)
+
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z", path_prefix=shim)
+    assert fields["cron_daemon_active"] == "NO"
+    assert fields["cron_daemon_source"] == "SYSTEMCTL"
+    assert fields["cron_daemon_state"] == "inactive"
+    # The fallback is NOT consulted, so the falsely-friendly pgrep pid does not
+    # leak in.
+    assert fields["cron_daemon_pid"] != "77777"
+
+
+@pytestmark_posix
+def test_cron_probe_systemctl_unknown_and_no_pgrep_evidence_stays_unknown(tmp_path):
+    """systemctl unknown + pgrep proves nothing must remain UNKNOWN, not fabricate."""
+    fx = _fixture(tmp_path)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    systemctl = shim / "systemctl"
+    systemctl.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '  "is-active cron") echo unknown; exit 0 ;;\n'
+        'esac\n'
+        'echo ""\n',
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    pgrep = shim / "pgrep"
+    # pgrep proves nothing: empty stdout, non-zero exit.
+    pgrep.write_text('#!/bin/sh\nexit 1\n', encoding="utf-8")
+    pgrep.chmod(0o755)
+
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z", path_prefix=shim)
+    assert fields["cron_daemon_active"] == "UNKNOWN"
+    # State is the raw systemctl answer (no fabricated PROCESS_PRESENT here).
+    assert fields["cron_daemon_state"] == "unknown"
 
 
 @pytestmark_posix

@@ -614,6 +614,18 @@ manifest_epoch="$(date -u -d "${exported_at:-}" +%s 2>/dev/null || true)"
 echo "OPIP_EXPORT_OBSERVABILITY"
 
 # 1A - is the cron daemon actually running and invoking anything?
+#
+# systemctl's is-active carries three distinct answers, and merging them
+# discards evidence:
+#   * active                             -> YES (the daemon is up)
+#   * inactive / failed / deactivating   -> NO  (the daemon is proven not up)
+#   * unknown / empty / anything else    -> UNKNOWN (systemctl cannot decide)
+#
+# "unknown" is not proof of inactivity: the unit may be unavailable to
+# systemctl, the unit name may not resolve, or cron may be managed outside that
+# unit. Collapsing this to NO would skip the pgrep fallback and could degrade
+# diagnostics for a healthy daemon, so a UNKNOWN systemctl answer explicitly
+# allows the observational fallback.
 cron_daemon_active="UNKNOWN"
 cron_daemon_state="UNKNOWN"
 cron_daemon_pid="UNKNOWN"
@@ -629,15 +641,21 @@ if command -v systemctl >/dev/null 2>&1; then
   cron_daemon_started_at="${cron_daemon_started_at:-UNKNOWN}"
   case "$cron_daemon_state" in
     active) cron_daemon_active="YES" ;;
-    inactive | failed | deactivating | unknown) cron_daemon_active="NO" ;;
+    inactive | failed | deactivating) cron_daemon_active="NO" ;;
+    *) cron_daemon_active="UNKNOWN" ;;
   esac
 fi
+# Only when systemctl was inconclusive do we fall back to observing the
+# process directly. A proven cron process upgrades UNKNOWN to YES, records that
+# the answer came from pgrep, and reports state=PROCESS_PRESENT so the source
+# of the YES is distinguishable from an authoritative systemctl "active".
 if [[ "$cron_daemon_active" == "UNKNOWN" ]] && command -v pgrep >/dev/null 2>&1; then
   cron_fallback_pid="$(pgrep -x cron 2>/dev/null | head -n 1 || true)"
   if [[ "$cron_fallback_pid" =~ ^[0-9]+$ ]]; then
     cron_daemon_active="YES"
     cron_daemon_pid="$cron_fallback_pid"
     cron_daemon_source="PGREP"
+    cron_daemon_state="PROCESS_PRESENT"
     if command -v ps >/dev/null 2>&1; then
       cron_daemon_started_at="$(ps -o lstart= -p "$cron_fallback_pid" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
       cron_daemon_started_at="${cron_daemon_started_at:-UNKNOWN}"
@@ -706,6 +724,8 @@ export_log_timestamp_semantics="UNKNOWN"
 export_log_post_manifest_skip_count="0"
 export_log_post_manifest_success_count="0"
 export_log_post_manifest_failure_count="0"
+export_log_post_manifest_recognized_event_count="0"
+export_log_post_manifest_unclassified_line_count="0"
 export_log_post_manifest_evidence="UNKNOWN"
 if [[ -f "$EXPORT_LOG" ]]; then
   export_log_exists="YES"
@@ -732,9 +752,22 @@ if [[ -f "$EXPORT_LOG" ]]; then
   echo "export_log_lifetime_bundle_ok_count=$export_log_lifetime_bundle_ok_count"
   echo "export_log_lifetime_failure_count=$export_log_lifetime_failure_count"
 
-  # Scan a bounded tail for lines that carry their own ISO-8601 instant. The
-  # tail is bounded so this stays cheap on a very large log, and it is streamed
-  # directly: no temporary file is created, and the log is only ever read.
+  # Scan a bounded tail for lines that carry their own ISO-8601 instant.
+  #
+  # Two invariants matter here and are deliberately independent:
+  #
+  #   * a timestamp proves *when* a line was emitted;
+  #   * only a recognized exporter event drives exporter-health classification.
+  #
+  # A line that carries a post-manifest timestamp but is not a recognized event
+  # (e.g. an unrelated informational line written by another consumer of the
+  # log) MUST NOT degrade diagnostics. It is counted descriptively for
+  # observability and nothing more. Only recognized recognized-event counters
+  # drive the classification and any resulting degrade.
+  #
+  # The tail is bounded so this stays cheap on a very large log, and it is
+  # streamed directly: no temporary file is created, and the log is only ever
+  # read.
   export_log_timestamped_line_count=0
   export_log_post_manifest_timestamped_count=0
   if [[ -n "$manifest_epoch" ]]; then
@@ -749,11 +782,22 @@ if [[ -f "$EXPORT_LOG" ]]; then
             export_log_post_manifest_timestamped_count=$((export_log_post_manifest_timestamped_count + 1))
             case "$log_line" in
               *"already active; skipping"*)
-                export_log_post_manifest_skip_count=$((export_log_post_manifest_skip_count + 1)) ;;
-              *"canonical replica export FAILED"* | *"replica collision"* | *Traceback* | *"Permission denied"*)
-                export_log_post_manifest_failure_count=$((export_log_post_manifest_failure_count + 1)) ;;
+                export_log_post_manifest_skip_count=$((export_log_post_manifest_skip_count + 1))
+                export_log_post_manifest_recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))
+                ;;
+              *"canonical replica export FAILED"* | *"canonical replica FAILED"* | *"replica collision"* | *Traceback* | *"Permission denied"*)
+                export_log_post_manifest_failure_count=$((export_log_post_manifest_failure_count + 1))
+                export_log_post_manifest_recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))
+                ;;
               *"learning evidence export: OK"*)
-                export_log_post_manifest_success_count=$((export_log_post_manifest_success_count + 1)) ;;
+                export_log_post_manifest_success_count=$((export_log_post_manifest_success_count + 1))
+                export_log_post_manifest_recognized_event_count=$((export_log_post_manifest_recognized_event_count + 1))
+                ;;
+              *)
+                # Timestamped but not a recognized exporter event: descriptive
+                # only, must not feed classification or degrade.
+                export_log_post_manifest_unclassified_line_count=$((export_log_post_manifest_unclassified_line_count + 1))
+                ;;
             esac
           fi
           ;;
@@ -765,6 +809,8 @@ if [[ -f "$EXPORT_LOG" ]]; then
   echo "export_log_tail_lines_scanned=$EXPORT_LOG_TAIL_LINES"
   echo "export_log_timestamped_line_count=$export_log_timestamped_line_count"
   echo "export_log_post_manifest_timestamped_count=$export_log_post_manifest_timestamped_count"
+  echo "export_log_post_manifest_recognized_event_count=$export_log_post_manifest_recognized_event_count"
+  echo "export_log_post_manifest_unclassified_line_count=$export_log_post_manifest_unclassified_line_count"
   echo "export_log_post_manifest_skip_count=$export_log_post_manifest_skip_count"
   echo "export_log_post_manifest_success_count=$export_log_post_manifest_success_count"
   echo "export_log_post_manifest_failure_count=$export_log_post_manifest_failure_count"
@@ -776,13 +822,18 @@ if [[ -f "$EXPORT_LOG" ]]; then
   fi
   echo "export_log_timestamp_semantics=$export_log_timestamp_semantics"
 
-  # Classification is driven ONLY by proven post-manifest events.
+  # Classification is driven ONLY by recognized post-manifest events. Unrelated
+  # timestamped lines are counted but never contaminate the verdict, and
+  # historical events (before the manifest) cannot appear here at all because
+  # only line_epoch > manifest_epoch reaches these counters.
   if (( export_log_timestamped_line_count == 0 )); then
     export_log_activity_class="UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
     export_log_post_manifest_evidence="UNPROVABLE_FROM_UNTIMESTAMPED_LOG"
-  elif (( export_log_post_manifest_timestamped_count == 0 )); then
-    export_log_activity_class="NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
-    export_log_post_manifest_evidence="NO_POST_MANIFEST_TIMESTAMPED_EVIDENCE"
+  elif (( export_log_post_manifest_recognized_event_count == 0 )); then
+    # Timestamps exist and some may fall after the manifest, but none is a
+    # recognized exporter event, so no exporter-health verdict is claimed.
+    export_log_activity_class="NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
+    export_log_post_manifest_evidence="NO_POST_MANIFEST_RECOGNIZED_EXPORT_EVIDENCE"
   elif (( export_log_post_manifest_failure_count > 0 )); then
     export_log_activity_class="POST_MANIFEST_RUNS_FAIL"
     export_log_post_manifest_evidence="PROVEN"
@@ -793,7 +844,10 @@ if [[ -f "$EXPORT_LOG" ]]; then
     export_log_activity_class="POST_MANIFEST_RUNS_SUCCEED"
     export_log_post_manifest_evidence="PROVEN"
   else
-    export_log_activity_class="POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED"
+    # Belt-and-braces: recognized_event_count > 0 must have matched one of the
+    # cases above. Reaching this branch would mean a recognized event was
+    # counted without a matching sub-counter, which is a bug in the enum.
+    export_log_activity_class="POST_MANIFEST_RECOGNIZED_ACTIVITY_UNCLASSIFIED"
     export_log_post_manifest_evidence="PROVEN"
   fi
   echo "export_log_activity_class=$export_log_activity_class"
@@ -1027,11 +1081,11 @@ echo "export_lock_stall_suspected=$export_lock_stall_suspected"
 if [[ "$export_lock_stall_suspected" == "YES" ]]; then
   degrade
 fi
-# Only PROVEN post-manifest failure or lock-skipping degrades. An untimestamped
-# log cannot support event attribution, so it is reported as unprovable rather
-# than treated as evidence of a fault.
+# Only PROVEN recognized post-manifest failure or lock-skipping degrades. An
+# untimestamped log, timestamped-but-unrelated lines, and a genuinely proven
+# success are all NOT degrading.
 case "$export_log_activity_class" in
-  POST_MANIFEST_RUNS_FAIL | POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD | POST_MANIFEST_TIMESTAMPED_ACTIVITY_UNCLASSIFIED)
+  POST_MANIFEST_RUNS_FAIL | POST_MANIFEST_RUNS_SKIPPED_LOCK_HELD)
     degrade
     ;;
 esac
