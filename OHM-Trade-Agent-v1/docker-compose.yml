@@ -53,9 +53,17 @@ services:
       # Explicit advisory Early Watch channel. Deep-qualified watch cards only;
       # does not re-enable legacy broad-watch/movement alerts or trade authority.
       OPIP_EARLY_WATCH_ALERTS_ENABLED: "true"
-      # PR 2 canonical writer remains off until a separate activation gate.
+      # Canonical shadow evidence capture activated.
+      # Evidence-only: does not grant ranking, trading, sizing, alert
+      # qualification, or funded execution authority.
       # Core must start independently of writer health (no hard depends_on).
-      OPIP_CANONICAL_WRITER_MODE: "off"
+      OPIP_CANONICAL_WRITER_MODE: "shadow"
+      # Feature Bus capture must NOT be activated by the writer activation.
+      # It is dual-gated (feature bus mode AND writer mode), so a stale .env
+      # carrying OPIP_FEATURE_BUS_MODE=shadow would widen the blast radius the
+      # moment the writer is enabled. This explicit override wins over .env,
+      # the same way P1_SHADOW_OUTBOX_ENABLED pins its retired path off.
+      OPIP_FEATURE_BUS_MODE: "off"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -92,15 +100,19 @@ services:
       retries: 3
       start_period: 20s
 
-  # PR 2 shadow writer. Independent of ohm-trade-agent startup. Default mode
-  # on the core remains off; this service may run for readiness drills without
-  # granting production evidence authority until shadow is explicitly enabled.
+  # PR 2 shadow writer. Independent of ohm-trade-agent startup. Production
+  # canonical shadow capture is activated on the core service; this daemon
+  # serves whichever producers submit. Its own OPIP_CANONICAL_WRITER_MODE is
+  # NOT consumed by writer_service.py, so it is retained only as a container
+  # label and must not be read as the activation authority.
   opip-canonical-writer:
     build: .
     container_name: opip-canonical-writer
     restart: unless-stopped
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
+      # Unused by writer_service.py (which never reads this variable). Left
+      # unchanged deliberately: the activation authority is the core service.
       OPIP_CANONICAL_WRITER_MODE: "off"
     command:
       - python

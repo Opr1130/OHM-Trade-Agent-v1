@@ -143,7 +143,13 @@ def test_pr2_capture_boundary() -> None:
     assert "canonical durable ACK" in text
     assert "CONFIRM_OPS_APPLIED" in text
     assert "capture_gap_spool.json" in text
+    # The PR 2 design default is preserved as historical context...
     assert "OPIP_CANONICAL_WRITER_MODE=off" in text
+    # ...and the document must separately record the current activation status,
+    # so the historical default can never be mistaken for production state.
+    assert "## Activation status" in text
+    assert "OPIP_CANONICAL_WRITER_MODE=shadow" in text
+    assert "paper_outcome.terminal.recorded" in text
     incident = _load_fixture("incident_lifecycle.example.json")
     boundary = incident["bounded_reminder_policy"]["pr2_boundary"]
     assert boundary["file"] == "app/services/alert_governor.py"
