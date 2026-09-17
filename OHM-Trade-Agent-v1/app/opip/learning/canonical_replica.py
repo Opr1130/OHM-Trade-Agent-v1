@@ -57,7 +57,7 @@ from app.opip.canonical.backup import (
     publish_backup_generation,
     require_release_sha,
 )
-from app.opip.canonical.schema import fsync_directory_required
+from app.opip.canonical.schema import fsync_directory_required, fsync_file_required
 from app.opip.canonical.paths import SCHEMA_VERSION
 
 REPLICA_SCHEMA_VERSION = 1
@@ -445,7 +445,8 @@ def write_replica_manifest(manifest: Mapping[str, Any], path: Path) -> Path:
         with temp.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            # Same primitive and ordering as the PR-A0 canonical manifest write.
+            fsync_file_required(temp)
         os.replace(temp, target)
     except Exception:
         try:
@@ -927,6 +928,13 @@ def install_replica_generation(
         if temp_pointer.exists():
             temp_pointer.unlink()
         temp_pointer.write_text(generation_id + "\n", encoding="utf-8")
+        # Required durability before activation. ``os.replace`` is atomic, but a
+        # rename re-points a directory entry; it does not make the file's
+        # *contents* durable. Without this flush a crash could leave ``current``
+        # present but empty or partial, so install would have reported a
+        # generation as current while the pointer naming it is unreadable. This
+        # mirrors the PR-A0 publication sequence for the canonical manifest.
+        fsync_file_required(temp_pointer)
         os.replace(temp_pointer, pointer)
     except Exception:
         try:

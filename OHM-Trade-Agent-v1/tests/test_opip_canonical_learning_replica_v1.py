@@ -28,9 +28,15 @@ import sqlite3
 import pytest
 
 from app.opip.canonical.backup import hash_file_sha256, normalize_to_rollback_journal
+from app.opip.canonical.schema import (
+    CanonicalDurabilityError,
+    fsync_directory_required,
+    fsync_file_required,
+)
 from app.opip.canonical.writer import CanonicalWriter
 from app.opip.learning.canonical_replica import (
     CANONICAL_RELATIVE,
+    HOST_CURRENT_POINTER,
     MANIFEST_FILENAME,
     PAPER_GAP_RELATIVE,
     PAPER_STATE_RELATIVE,
@@ -594,6 +600,252 @@ def test_install_refuses_a_stale_bundle(bundle, tmp_path):
             expected_source_release_sha=RELEASE_SHA,
             now=NOW + timedelta(seconds=REPLICA_FRESHNESS_SECONDS + 1),
         )
+
+
+# ---------------------------------------------------------------------------
+# Current-pointer publication durability
+#
+# ``os.replace`` is atomic, but a rename only re-points a directory entry: it
+# does not make the file's *contents* durable. The temporary pointer must
+# therefore be flushed before the rename, or a crash could leave ``current``
+# present but empty or partial - install would have reported a generation as
+# current while the pointer naming it is unreadable.
+# ---------------------------------------------------------------------------
+
+
+def _pointer_temp_prefix() -> str:
+    """The temporary pointer name ``install_replica_generation`` publishes with."""
+    return f".{HOST_CURRENT_POINTER}.tmp."
+
+
+def _staged_generation(tmp_path: Path, generation_id: str, name: str) -> Path:
+    """Export a valid staged bundle under a chosen generation id."""
+    live = tmp_path / f"live-{name}.sqlite3"
+    _seed_canonical(live)
+    state = _production_state(tmp_path / f"state-{name}.json")
+    staging = tmp_path / f"staging-{name}"
+    export_replica_bundle(
+        source_db=live,
+        staging_dir=staging,
+        source_release_sha=RELEASE_SHA,
+        paper_state_source=state,
+        paper_gap_source=None,
+        generation_id=generation_id,
+        now=NOW,
+    )
+    return staging
+
+
+def _fail_only_on_pointer_file(monkeypatch, real, exc: Exception) -> None:
+    """Inject a durability fault for the temporary pointer file alone.
+
+    Scoped deliberately: other publication steps (the generation directory, the
+    manifest) keep using the real primitive, so a failure unambiguously
+    identifies the pointer-contents step.
+    """
+    from app.opip.learning import canonical_replica as replica
+
+    def _boom(path):
+        if Path(path).name.startswith(_pointer_temp_prefix()):
+            raise exc
+        return real(path)
+
+    monkeypatch.setattr(replica, "fsync_file_required", _boom)
+
+
+def test_pointer_contents_are_made_durable_before_the_rename(tmp_path, monkeypatch):
+    """Behavioral ordering proof for the pointer publication sequence.
+
+    Observed at the moment the flush runs: the temporary pointer already holds
+    the incoming generation id, while ``current`` still names the *previous*
+    generation - so the contents were flushed before the rename activated them.
+    An implementation that renamed first (or that never flushed the file) cannot
+    satisfy both observations at once.
+    """
+    staging_old = _staged_generation(tmp_path, "gen-old", "old")
+    staging_new = _staged_generation(tmp_path, "gen-new", "new")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging_old,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+    pointer = host_current_pointer(host)
+    assert pointer.read_text(encoding="utf-8").strip() == "gen-old"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    observed: list[tuple[str, str | None]] = []
+
+    def _spy(path):
+        target = Path(path)
+        if target.name.startswith(_pointer_temp_prefix()):
+            observed.append(
+                (
+                    target.read_text(encoding="utf-8").strip(),
+                    pointer.read_text(encoding="utf-8").strip()
+                    if pointer.exists()
+                    else None,
+                )
+            )
+        return real(path)
+
+    monkeypatch.setattr(replica, "fsync_file_required", _spy)
+    install_replica_generation(
+        staging_dir=staging_new,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+
+    # Flushed exactly once, for the temporary pointer.
+    assert len(observed) == 1
+    temp_contents, pointer_during_flush = observed[0]
+    assert temp_contents == "gen-new"
+    assert pointer_during_flush == "gen-old"
+
+    # Only afterwards was the rename activated.
+    assert pointer.read_text(encoding="utf-8").strip() == "gen-new"
+    assert resolve_current_generation(host).name == "gen-new"
+
+
+def test_pointer_durability_failure_prevents_activation(tmp_path, monkeypatch):
+    """If the temporary pointer cannot be made durable, current must not appear."""
+    staging = _staged_generation(tmp_path, "gen-0001", "one")
+    host = tmp_path / "host"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    _fail_only_on_pointer_file(
+        monkeypatch, real, CanonicalDurabilityError("injected pointer flush failure")
+    )
+
+    with pytest.raises(CanonicalDurabilityError):
+        install_replica_generation(
+            staging_dir=staging,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+        )
+
+    # The rename never ran, so no generation became current...
+    assert not host_current_pointer(host).exists()
+    with pytest.raises(ReplicaUnavailableError) as exc:
+        resolve_current_generation(host)
+    assert exc.value.reason == REASON_MANIFEST_MISSING
+
+    # ...and the abandoned temporary pointer is cleaned up, so a later retry is
+    # not obstructed by a stale temp name.
+    leftovers = [
+        entry.name
+        for entry in host.iterdir()
+        if entry.name.startswith(_pointer_temp_prefix())
+    ]
+    assert leftovers == []
+
+
+def test_failed_pointer_durability_keeps_the_previous_generation_current(
+    tmp_path, monkeypatch
+):
+    """A failed pointer flush must leave the last good generation selected."""
+    staging_old = _staged_generation(tmp_path, "gen-old", "old")
+    staging_new = _staged_generation(tmp_path, "gen-new", "new")
+    host = tmp_path / "host"
+    install_replica_generation(
+        staging_dir=staging_old,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+    assert resolve_current_generation(host).name == "gen-old"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_file_required
+    _fail_only_on_pointer_file(
+        monkeypatch, real, CanonicalDurabilityError("injected pointer flush failure")
+    )
+
+    with pytest.raises(CanonicalDurabilityError):
+        install_replica_generation(
+            staging_dir=staging_new,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+        )
+
+    # The previous good generation stays current and still verifies in place.
+    current = resolve_current_generation(host)
+    assert current.name == "gen-old"
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-old"
+    verified = verify_installed_replica(
+        expected_source_release_sha=RELEASE_SHA, root=current, now=NOW
+    )
+    assert verified.generation_id == "gen-old"
+
+
+def test_post_rename_directory_durability_failure_reports_failure(tmp_path, monkeypatch):
+    """A directory fault after the rename must not be reported as durable success.
+
+    The rename has already happened by then, so the pointer may name the new
+    generation on disk - which is exactly why install must still raise rather
+    than return a summary claiming durable success. The fault is scoped to the
+    host root so it isolates the post-rename directory step.
+    """
+    staging = _staged_generation(tmp_path, "gen-0001", "one")
+    host = tmp_path / "host"
+
+    from app.opip.learning import canonical_replica as replica
+
+    real = replica.fsync_directory_required
+
+    def _boom(directory):
+        if Path(directory) == host:
+            raise CanonicalDurabilityError("injected post-rename directory fault")
+        return real(directory)
+
+    monkeypatch.setattr(replica, "fsync_directory_required", _boom)
+
+    with pytest.raises(CanonicalDurabilityError):
+        install_replica_generation(
+            staging_dir=staging,
+            host_root=host,
+            expected_source_release_sha=RELEASE_SHA,
+            now=NOW,
+        )
+
+    # Documented consequence: the rename is already durable-or-done, so the
+    # pointer can name the generation even though install reported failure. The
+    # caller must not treat this as success, which is why the error propagates.
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-0001"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only directory durability")
+def test_pointer_publication_uses_the_real_posix_primitive(tmp_path):
+    """POSIX: nothing is stubbed, so the real flush and directory sync run.
+
+    Windows cannot prove directory durability and is stubbed by conftest, so the
+    authoritative assertion is POSIX-only. A durability fault here would surface
+    as ``CanonicalDurabilityError`` instead of a silent success.
+    """
+    staging = _staged_generation(tmp_path, "gen-posix-ptr", "ptr")
+    host = tmp_path / "host"
+    from app.opip.learning import canonical_replica as replica
+
+    assert replica.fsync_file_required is fsync_file_required
+    assert replica.fsync_directory_required is fsync_directory_required
+
+    install_replica_generation(
+        staging_dir=staging,
+        host_root=host,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+    assert host_current_pointer(host).read_text(encoding="utf-8").strip() == "gen-posix-ptr"
+    assert resolve_current_generation(host).name == "gen-posix-ptr"
 
 
 def test_retention_is_bounded_and_never_removes_current(tmp_path):
