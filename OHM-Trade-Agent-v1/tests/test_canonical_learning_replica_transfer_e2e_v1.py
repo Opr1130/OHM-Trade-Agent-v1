@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -115,11 +116,14 @@ def harness(tmp_path_factory):
     _cleanup()
     tmp = tmp_path_factory.mktemp("replica-e2e")
 
-    # Application root with a data directory, mirroring the deployed layout.
+    # Application root with code + data, mirroring the deployed layout. The
+    # code symlink is test-only plumbing so the real exporter can be launched
+    # from an unrelated cwd and still prove its production PYTHONPATH contract.
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    (APP_ROOT / "app").symlink_to(REPO_ROOT / "app", target_is_directory=True)
     # The exporter takes a per-artifact lock beside each source file
     # (`<dirname>/.<basename>.lock`), so every parent directory it touches must
     # exist - in production the application creates them.
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
     for relative in (
         "paper_trading",
         "intelligence_learning",
@@ -190,10 +194,17 @@ def harness(tmp_path_factory):
     _cleanup()
 
 
-def _run(script: Path, env: dict, *, check: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    script: Path,
+    env: dict,
+    *,
+    check: bool = True,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(script)],
         env=env,
+        cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
         check=check,
@@ -300,6 +311,12 @@ def _manifest_value(key: str) -> str:
     return ""
 
 
+def _committed_replica_export_dir() -> Path:
+    name = _manifest_value("canonical_learning_replica_dir")
+    assert re.fullmatch(r"canonical_learning_replica\.[0-9a-f]{64}", name), name
+    return EXPORT_ROOT / name
+
+
 # ---------------------------------------------------------------------------
 # Full chain
 # ---------------------------------------------------------------------------
@@ -309,8 +326,10 @@ def test_export_reader_sync_installs_a_verified_generation(harness):
     """The load-bearing test: real transfer, real install, real readiness."""
     _seed_canonical([_outcome()], delivery="COMMITTED", gap_unresolved=None)
 
-    # 1. Real exporter (root-only), exercising the real PR-A0 backup path.
-    export = _run(EXPORTER, harness["env"])
+    # 1. Real exporter (root-only), exercising the real PR-A0 backup path. Run
+    # from / rather than the repository so production PYTHONPATH wiring is
+    # executable evidence, not an assumption inherited from pytest's cwd.
+    export = _run(EXPORTER, harness["env"], cwd=Path("/"))
     assert "deployment succeeded" not in export.stdout  # sanity: right script
     assert "canonical replica bundle OK" in export.stdout, export.stderr
 
@@ -318,7 +337,7 @@ def test_export_reader_sync_installs_a_verified_generation(harness):
     assert _manifest_value("schema_version") == "4"
     assert _manifest_value("canonical_learning_replica_version") == "1"
     assert _manifest_value("production_deployed_sha") == RELEASE_SHA
-    bundle = EXPORT_ROOT / "canonical_learning_replica"
+    bundle = _committed_replica_export_dir()
     assert bundle.is_dir()
     assert (bundle / "replica_manifest.json").is_file()
     assert (bundle / "opip/canonical/opip_canonical_v1.sqlite3").is_file()
@@ -430,9 +449,10 @@ def test_legacy_export_without_marker_still_reads(harness):
     env = dict(harness["env"])
     (DEPLOY_STATE / "last-good-sha").write_text("not-a-sha\n", encoding="utf-8")
     try:
-        export = _run(EXPORTER, env)
+        export = _run(EXPORTER, env, cwd=Path("/"))
         assert "canonical replica skipped" in export.stdout
         assert _manifest_value("canonical_learning_replica_version") == ""
+        assert _manifest_value("canonical_learning_replica_dir") == ""
         assert "canonical_learning_replica_version" not in (
             EXPORT_ROOT / "manifest.env"
         ).read_text(encoding="utf-8")
