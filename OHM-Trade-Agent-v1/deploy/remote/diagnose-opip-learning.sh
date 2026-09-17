@@ -617,7 +617,10 @@ echo "cron_daemon_started_at=$cron_daemon_started_at"
 echo "cron_daemon_source=$cron_daemon_source"
 
 # 1B - installed cron artifact identity, and whether it matches this release.
+export_cron_exists="NO"
+export_cron_matches_release="UNKNOWN"
 if [[ -e "$EXPORT_CRON" ]]; then
+  export_cron_exists="YES"
   cron_meta="$(stat -c '%U|%G|%a|%s|%Y' "$EXPORT_CRON" 2>/dev/null || true)"
   IFS='|' read -r cron_owner cron_group cron_mode cron_size cron_mtime <<<"$cron_meta"
   cron_sha="$(sha256sum "$EXPORT_CRON" 2>/dev/null | awk '{print $1}' || true)"
@@ -634,8 +637,10 @@ if [[ -e "$EXPORT_CRON" ]]; then
   if [[ -z "$cron_src_sha" ]]; then
     echo "export_cron_matches_release=UNKNOWN"
   elif [[ "$cron_src_sha" == "$cron_sha" ]]; then
+    export_cron_matches_release="YES"
     echo "export_cron_matches_release=YES"
   else
+    export_cron_matches_release="NO"
     echo "export_cron_matches_release=NO"
   fi
 else
