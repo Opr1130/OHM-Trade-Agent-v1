@@ -45,7 +45,7 @@ What activation enables:
 
 What activation does **not** enable:
 
-- **Feature Bus capture** — still requires its own independent gate. Feature-bus capture is dual-gated on `OPIP_FEATURE_BUS_MODE=shadow` **and** `OPIP_CANONICAL_WRITER_MODE=shadow`, and fails closed when either is not shadow. Enabling the writer alone cannot activate it.
+- **Feature Bus capture** — still requires its own independent gate and is not activated. Feature-bus capture is dual-gated on `OPIP_FEATURE_BUS_MODE=shadow` **and** `OPIP_CANONICAL_WRITER_MODE=shadow`, and fails closed when either is not shadow. Because the core service loads `env_file: .env`, a stale deployment `.env` carrying `OPIP_FEATURE_BUS_MODE=shadow` could otherwise activate Feature Bus capture the moment the writer became shadow, so the core service now **pins `OPIP_FEATURE_BUS_MODE: "off"` explicitly**. That pin wins over `.env` (the same mechanism `P1_SHADOW_OUTBOX_ENABLED` already uses) and keeps the blast radius reviewable in the repository rather than dependent on a file invisible to review.
 - funded or live trading authority
 - AI execution authority
 - ranking, sizing, or alert-qualification authority

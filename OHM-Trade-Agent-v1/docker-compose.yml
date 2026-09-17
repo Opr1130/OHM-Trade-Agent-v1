@@ -58,6 +58,12 @@ services:
       # qualification, or funded execution authority.
       # Core must start independently of writer health (no hard depends_on).
       OPIP_CANONICAL_WRITER_MODE: "shadow"
+      # Feature Bus capture must NOT be activated by the writer activation.
+      # It is dual-gated (feature bus mode AND writer mode), so a stale .env
+      # carrying OPIP_FEATURE_BUS_MODE=shadow would widen the blast radius the
+      # moment the writer is enabled. This explicit override wins over .env,
+      # the same way P1_SHADOW_OUTBOX_ENABLED pins its retired path off.
+      OPIP_FEATURE_BUS_MODE: "off"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

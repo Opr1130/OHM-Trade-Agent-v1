@@ -64,13 +64,25 @@ def _core_capture_mode() -> str:
     raise AssertionError("core service does not declare OPIP_CANONICAL_WRITER_MODE")
 
 
+def _core_feature_bus_mode() -> str:
+    """Read the pinned Feature Bus mode from the core service block."""
+    for line in _service_block("ohm-trade-agent").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("OPIP_FEATURE_BUS_MODE:"):
+            return stripped.split(":", 1)[1].strip().strip('"')
+    raise AssertionError("core service does not pin OPIP_FEATURE_BUS_MODE")
+
+
 def _production_settings(**overrides) -> Settings:
-    """Settings derived from the *configured* production core capture mode.
+    """Settings derived from the *configured* production core capture modes.
 
     Grounded in the compose file rather than hard-coded, so reverting the
     activation makes the dependent assertions fail instead of quietly passing.
     """
-    values = {"opip_canonical_writer_mode": _core_capture_mode()}
+    values = {
+        "opip_canonical_writer_mode": _core_capture_mode(),
+        "opip_feature_bus_mode": _core_feature_bus_mode(),
+    }
     values.update(overrides)
     return Settings(webhook_secret="test-webhook-secret", **values)
 
@@ -184,23 +196,29 @@ def test_paper_outcome_gate_fails_closed_on_settings_error(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_production_compose_does_not_set_the_feature_bus_gate():
-    """Feature Bus has its own independent gate, which this change never sets."""
-    text = _compose_text()
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        assert not stripped.startswith("OPIP_FEATURE_BUS_MODE:"), (
-            "canonical shadow activation must not set OPIP_FEATURE_BUS_MODE"
-        )
+def test_production_compose_pins_the_feature_bus_gate_off():
+    """Feature Bus isolation must be declarative, not dependent on the .env.
+
+    The core service loads ``env_file: .env``, so a stale deployment ``.env``
+    carrying ``OPIP_FEATURE_BUS_MODE=shadow`` would activate Feature Bus capture
+    the moment the writer is shadow, because that gate is dual-keyed. Pinning
+    the value here makes the blast radius reviewable in the repository instead
+    of resting on a file that is invisible to review. This forbids activation;
+    it does not perform it.
+    """
+    assert _core_feature_bus_mode() == "off"
+
+
+def test_feature_bus_is_not_activated_by_the_activation_itself():
+    """The compose feature-bus pin comes from this change, and it is off."""
+    core = _service_block("ohm-trade-agent")
+    assert 'OPIP_FEATURE_BUS_MODE: "off"' in core
 
 
 def test_feature_bus_stays_disabled_under_production_activation():
-    """Writer=shadow alone must not activate Feature Bus capture.
+    """Writer=shadow plus pinned-off feature bus must not activate capture.
 
-    This is the single most important isolation property of the activation: the
-    production configuration resolves to writer enabled, feature bus disabled.
+    This is the single most important isolation property of the activation.
     """
     from app.opip.features.publisher import (
         feature_bus_capture_enabled,
@@ -208,8 +226,29 @@ def test_feature_bus_stays_disabled_under_production_activation():
     )
 
     settings = _production_settings()
-    assert resolve_feature_bus_mode(settings) == "off"  # unset -> default off
+    assert resolve_feature_bus_mode(settings) == "off"
     assert feature_bus_capture_enabled(settings) is False
+
+
+def test_stale_env_cannot_activate_feature_bus():
+    """A stale .env value is overridden by the compose pin.
+
+    ``env_file`` values are overridden by the service ``environment`` block, so
+    the pinned ``off`` wins. This test asserts the compose declares the pin,
+    which is what makes that override effective.
+    """
+    core = _service_block("ohm-trade-agent")
+    assert 'OPIP_FEATURE_BUS_MODE: "off"' in core
+    # The hazard this defends against: shadow writer + shadow feature bus.
+    from app.opip.features.publisher import feature_bus_capture_enabled
+
+    stale = Settings(
+        webhook_secret="test-webhook-secret",
+        opip_feature_bus_mode="shadow",
+        opip_canonical_writer_mode="shadow",
+    )
+    assert feature_bus_capture_enabled(stale) is True  # the hazard is real
+    assert feature_bus_capture_enabled(_production_settings()) is False  # pinned off
 
 
 def test_feature_bus_requires_both_gates_explicitly():
@@ -281,19 +320,69 @@ def test_decision_modules_do_not_reference_the_capture_gate(module_path):
 
 
 def test_canonical_capture_gate_is_only_consumed_by_evidence_producers():
-    """Constrain the consumers of the gate to known evidence-only producers."""
+    """Constrain the consumers of the gate to known evidence-only producers.
+
+    Scans every gate entry point, not just the two base helpers: a module that
+    consulted the gate through ``canonical_capture_enabled`` or
+    ``feature_bus_capture_enabled`` would otherwise evade this check while still
+    deriving behaviour from canonical capture state.
+
+    Every entry below is an evidence path, never a decision path:
+
+    * ``bridge.py`` - PR2 Early Watch canonical capture + gap reconciliation.
+    * ``publisher.py`` - Feature Bus capture (dual-gated, fails closed).
+    * ``paper_outcome_outbox.py`` - PR-A outbox delivery and reconciliation.
+    * ``paper_trade_registry.py`` - paper lifecycle evidence delivery, which
+      delegates to the outbox gate above.
+    * ``run_feature_bus_pilot.py`` - documentation of the dual gate; it names
+      the variable in a docstring and consults no gate at runtime.
+
+    The scan is textual, so a docstring mention counts. That is deliberate: an
+    over-approximation fails closed by forcing a new consumer to be classified
+    here rather than passing unnoticed.
+    """
+    gate_names = (
+        "shadow_capture_enabled",
+        "resolve_writer_mode",
+        "canonical_capture_enabled",
+        "feature_bus_capture_enabled",
+        "resolve_feature_bus_mode",
+    )
     expected = {
+        "app/jobs/run_feature_bus_pilot.py",
         "app/opip/canonical/bridge.py",
         "app/opip/features/publisher.py",
         "app/services/paper_outcome_outbox.py",
+        "app/services/paper_trade_registry.py",
     }
     root = Path("app")
     actual: set[str] = set()
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        if "shadow_capture_enabled" in text or "resolve_writer_mode" in text:
+        if any(name in text for name in gate_names):
             actual.add(path.as_posix())
     assert actual == expected, f"unexpected gate consumers: {actual ^ expected}"
+
+
+def test_paper_trade_registry_gate_use_is_evidence_only():
+    """The registry consults the gate only to decide whether to emit evidence."""
+    from app.services import paper_trade_registry
+
+    source = inspect.getsource(paper_trade_registry)
+    for line in source.splitlines():
+        if "canonical_capture_enabled(" in line:
+            # Only ever used as a guard before emitting evidence.
+            assert "if not canonical_capture_enabled()" in line.strip()
+
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            # No ranking, sizing, or admission function may consult the gate.
+            assert node.func.id not in {
+                "recommend_capital",
+                "evaluate_trade_decision",
+                "evaluate_portfolio_risk",
+            }
 
 
 def test_settings_reject_invalid_capture_mode():
