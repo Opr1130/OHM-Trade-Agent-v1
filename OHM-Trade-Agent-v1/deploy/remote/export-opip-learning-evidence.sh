@@ -20,12 +20,16 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exit 77
 fi
 
-for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr python3; do
+for cmd in install flock cp mv stat date sha256sum getent chown chmod touch dirname rm find sort xargs awk grep tr; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing required export command: $cmd" >&2
     exit 69
   }
 done
+[[ -x "$PYTHON_BIN" ]] || {
+  echo "missing executable O'Pip Python interpreter: $PYTHON_BIN" >&2
+  exit 69
+}
 
 if getent group "$READER_GROUP" >/dev/null 2>&1; then
   install -d -o root -g "$READER_GROUP" -m 0750 "$EXPORT_ROOT"
@@ -247,8 +251,8 @@ if [[ ! "$production_deployed_sha" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 REPLICA_EXPORT_NAME="canonical_learning_replica"
-REPLICA_PUBLISH_DIR="$EXPORT_ROOT/$REPLICA_EXPORT_NAME"
 REPLICA_STAGING="$EXPORT_ROOT/.$REPLICA_EXPORT_NAME.staging.$$"
+REPLICA_PUBLISH_NAME=""
 REPLICA_MARKER_LINES=""
 
 rm -rf -- "$REPLICA_STAGING"
@@ -259,7 +263,7 @@ if [[ -z "$production_deployed_sha" ]]; then
 else
   install -d -m 0700 "$REPLICA_STAGING"
   replica_rc=0
-  "$PYTHON_BIN" -m app.opip.learning.canonical_replica export \
+  PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica export \
     --source-db "$DATA_ROOT/opip/canonical/opip_canonical_v1.sqlite3" \
     --staging "$REPLICA_STAGING" \
     --release-sha "$production_deployed_sha" \
@@ -269,8 +273,7 @@ else
 
   if (( replica_rc != 0 )); then
     # Fail visibly and publish nothing for the replica. The legacy export
-    # commits as before; no v1 marker is written, so no consumer can believe a
-    # canonical generation exists.
+    # remains uncommitted because manifest.env is the generation commit marker.
     echo "O'Pip learning export: canonical replica export FAILED (rc=$replica_rc)" >&2
     rm -rf -- "$REPLICA_STAGING"
     echo "O'Pip learning evidence export: JSON artifacts OK, canonical replica FAILED" >&2
@@ -285,15 +288,29 @@ else
   find "$REPLICA_STAGING" -type d -exec chmod 0750 {} +
   find "$REPLICA_STAGING" -type f -exec chmod 0640 {} +
 
-  # Publish the whole staged generation as one atomic directory replacement,
-  # under the already-held exclusive publish lock. Readers can never observe
-  # half-built contents.
-  rm -rf -- "$REPLICA_PUBLISH_DIR"
-  mv -f -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"
+  # Publish into a content-addressed directory that has never represented a
+  # different generation. The previously committed directory remains present
+  # until manifest.env has atomically committed the new directory name, so a
+  # crash before the manifest flip cannot destroy the last known-good replica.
+  replica_bytes="$(tree_bytes "$REPLICA_STAGING")"
+  replica_sha="$(tree_sha256 "$REPLICA_STAGING")"
+  REPLICA_PUBLISH_NAME="${REPLICA_EXPORT_NAME}.${replica_sha}"
+  REPLICA_PUBLISH_DIR="$EXPORT_ROOT/$REPLICA_PUBLISH_NAME"
+  if [[ -e "$REPLICA_PUBLISH_DIR" ]]; then
+    existing_bytes="$(tree_bytes "$REPLICA_PUBLISH_DIR")"
+    existing_sha="$(tree_sha256 "$REPLICA_PUBLISH_DIR")"
+    if [[ "$existing_bytes" != "$replica_bytes" || "$existing_sha" != "$replica_sha" ]]; then
+      echo "O'Pip learning export: content-addressed replica collision at $REPLICA_PUBLISH_NAME" >&2
+      rm -rf -- "$REPLICA_STAGING"
+      exit 70
+    fi
+    rm -rf -- "$REPLICA_STAGING"
+  else
+    mv -- "$REPLICA_STAGING" "$REPLICA_PUBLISH_DIR"
+  fi
 
-  replica_bytes="$(tree_bytes "$REPLICA_PUBLISH_DIR")"
-  replica_sha="$(tree_sha256 "$REPLICA_PUBLISH_DIR")"
   REPLICA_MARKER_LINES="canonical_learning_replica_version=1
+canonical_learning_replica_dir=${REPLICA_PUBLISH_NAME}
 canonical_learning_replica_bytes=${replica_bytes}
 canonical_learning_replica_sha256=${replica_sha}"
   echo "O'Pip learning export: canonical replica bundle OK bytes=${replica_bytes}"
@@ -347,5 +364,20 @@ else
   chmod 0600 "$manifest_tmp"
 fi
 mv -f -- "$manifest_tmp" "$EXPORT_ROOT/manifest.env"
+
+# manifest.env is the commit marker. Only after it points at the new immutable
+# directory may older/uncommitted replica directories be removed. Therefore an
+# interrupted pre-commit export always leaves the previous committed directory
+# available to the forced reader.
+if [[ -n "$REPLICA_PUBLISH_NAME" ]]; then
+  while IFS= read -r -d '' old_replica; do
+    [[ "$(basename "$old_replica")" == "$REPLICA_PUBLISH_NAME" ]] && continue
+    rm -rf -- "$old_replica"
+  done < <(find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name "${REPLICA_EXPORT_NAME}.*" -print0)
+else
+  find "$EXPORT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+    -name "${REPLICA_EXPORT_NAME}.*" -exec rm -rf -- {} +
+fi
 
 echo "O'Pip learning evidence export: OK"
