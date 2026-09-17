@@ -108,6 +108,7 @@ REASON_PAPER_GAP_MISMATCH = "CANONICAL_REPLICA_PAPER_GAP_MISMATCH"
 REASON_STALE = "CANONICAL_REPLICA_STALE"
 REASON_TIMESTAMP_INVALID = "CANONICAL_REPLICA_TIMESTAMP_INVALID"
 REASON_GENERATION_ID_INVALID = "CANONICAL_REPLICA_GENERATION_ID_INVALID"
+REASON_GENERATION_ID_COLLISION = "CANONICAL_REPLICA_GENERATION_ID_COLLISION"
 
 #: Completeness reason recorded when the bundled lifecycle state is absent.
 #: Absence is certified in the manifest rather than silent, but it still cannot
@@ -836,9 +837,15 @@ def install_replica_generation(
 ) -> dict[str, Any]:
     """Validate a staged bundle and publish it as the new current generation.
 
-    Order is deliberate: validate, then install immutably, then flip the
-    pointer atomically. A failure at any point leaves the existing ``current``
-    generation untouched, and a reader can never observe a partial generation.
+    Order is deliberate: validate, install under a private directory, re-verify,
+    atomically publish a previously absent generation name, then flip the
+    pointer. A failure at any point leaves the existing ``current`` generation
+    untouched, and a reader can never observe a partial generation.
+
+    A previously installed generation id is immutable. Reinstalling the exact
+    same manifest is idempotent and reuses the verified directory; attempting to
+    reuse the id for different content is a provenance collision and fails
+    closed. In particular, an active generation is never deleted in place.
 
     Returns a summary dict. Raises on any unprovable condition.
     """
@@ -858,22 +865,44 @@ def install_replica_generation(
 
     generation_id = verified.generation_id
     final = generations / generation_id
-    if final.exists():
-        # A generation id is content-addressed by its manifest; re-installing
-        # the same id is idempotent, not an overwrite.
-        shutil.rmtree(final)
     generations.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(staged, final)
 
-    # Re-verify in place, so the published generation is proven at its final
-    # immutable location rather than only at the staging path.
-    verify_replica_manifest(
-        read_replica_manifest(final / MANIFEST_FILENAME),
-        root=final,
-        expected_source_release_sha=expected_source_release_sha,
-        now=now,
-        max_age_seconds=max_age_seconds,
-    )
+    if final.exists():
+        # Generation names are immutable namespace keys. An exact retry may
+        # reuse the already verified directory, but a different manifest under
+        # the same id is a collision and must never overwrite known-good data.
+        existing_manifest = read_replica_manifest(final / MANIFEST_FILENAME)
+        if existing_manifest != manifest:
+            raise ReplicaProvenanceError(
+                REASON_GENERATION_ID_COLLISION,
+                f"generation id {generation_id!r} already exists with different content",
+            )
+        verify_replica_manifest(
+            existing_manifest,
+            root=final,
+            expected_source_release_sha=expected_source_release_sha,
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+    else:
+        private = generations / f".{generation_id}.install.{os.getpid()}.{uuid.uuid4().hex}"
+        try:
+            shutil.copytree(staged, private)
+
+            # Re-verify the private copy before its generation name becomes
+            # visible. If copy or verification fails, current and all published
+            # generation directories are unchanged.
+            verify_replica_manifest(
+                read_replica_manifest(private / MANIFEST_FILENAME),
+                root=private,
+                expected_source_release_sha=expected_source_release_sha,
+                now=now,
+                max_age_seconds=max_age_seconds,
+            )
+            os.replace(private, final)
+        except Exception:
+            shutil.rmtree(private, ignore_errors=True)
+            raise
 
     # The pointer is a small atomically-replaced file naming the generation,
     # not a symlink: ``os.replace`` on a symlink is not portable, and a plain
@@ -1072,6 +1101,7 @@ __all__ = [
     "REASON_DB_MISSING",
     "REASON_DB_NOT_SELF_CONTAINED",
     "REASON_DB_SIZE_MISMATCH",
+    "REASON_GENERATION_ID_COLLISION",
     "REASON_GENERATION_ID_INVALID",
     "REASON_MANIFEST_MALFORMED",
     "REASON_MANIFEST_MISSING",
