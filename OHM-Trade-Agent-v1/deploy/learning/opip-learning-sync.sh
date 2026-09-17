@@ -11,7 +11,7 @@ ARCHIVE="$DATA_ROOT/.export.tar"
 # root: the data root is mounted writable into learning job containers, so a
 # replica stored beneath it could be reached through a writable alias.
 CANONICAL_REPLICA_ROOT="${OPIP_LEARNING_CANONICAL_REPLICA_ROOT:-/var/lib/opip-learning/canonical-replica}"
-CANONICAL_REPLICA_INCOMING_NAME="canonical_learning_replica"
+CANONICAL_REPLICA_INCOMING_NAME=""
 
 [[ -r "$ENV_FILE" ]] || {
   echo "missing O'Pip learning environment: $ENV_FILE" >&2
@@ -34,24 +34,30 @@ source "$ENV_FILE"
   exit 78
 }
 
-# The replica store must never live under the writable data root.
-case "$CANONICAL_REPLICA_ROOT/" in
-  "$DATA_ROOT"/*)
-    echo "O'Pip learning sync: canonical replica root must not be beneath the data root" >&2
-    exit 78
-    ;;
-esac
-[[ "$CANONICAL_REPLICA_ROOT" != "$DATA_ROOT" ]] || {
-  echo "O'Pip learning sync: canonical replica root must differ from the data root" >&2
-  exit 78
-}
-
-for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs docker; do
+for cmd in ssh tar install flock mv date sha256sum stat awk rm find sort xargs docker realpath; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "missing learning sync command: $cmd" >&2
     exit 69
   }
 done
+
+# Resolve aliases before enforcing the storage boundary. A lexical check alone
+# is insufficient because a configured path can traverse a symlink into the
+# writable data tree. realpath -m resolves existing symlink components while
+# also supporting a not-yet-created final replica directory.
+DATA_ROOT_RESOLVED="$(realpath -m -- "$DATA_ROOT")"
+CANONICAL_REPLICA_ROOT_RESOLVED="$(realpath -m -- "$CANONICAL_REPLICA_ROOT")"
+case "$CANONICAL_REPLICA_ROOT_RESOLVED/" in
+  "$DATA_ROOT_RESOLVED"/*)
+    echo "O'Pip learning sync: canonical replica root must not resolve beneath the data root" >&2
+    exit 78
+    ;;
+esac
+[[ "$CANONICAL_REPLICA_ROOT_RESOLVED" != "$DATA_ROOT_RESOLVED" ]] || {
+  echo "O'Pip learning sync: canonical replica root must resolve outside the data root" >&2
+  exit 78
+}
+CANONICAL_REPLICA_ROOT="$CANONICAL_REPLICA_ROOT_RESOLVED"
 
 install -d -o root -g root -m 0755 "$DATA_ROOT" "$INCOMING" "$STATE_ROOT"
 # Root-owned and not group/world writable: only this sync script writes here.
@@ -267,6 +273,10 @@ validate_canonical_replica_outer() {
     echo "O'Pip learning sync: canonical replica sha256 missing/invalid" >&2
     exit 65
   }
+  [[ "$CANONICAL_REPLICA_INCOMING_NAME" == "canonical_learning_replica.$expected_sha" ]] || {
+    echo "O'Pip learning sync: canonical replica directory is not bound to its outer sha256" >&2
+    exit 65
+  }
   actual_bytes="$(tree_bytes "$bundle")"
   if [[ "$actual_bytes" != "$expected_bytes" ]]; then
     echo "O'Pip learning sync: canonical replica bytes mismatch ($actual_bytes != $expected_bytes)" >&2
@@ -308,7 +318,14 @@ CANONICAL_REPLICA_REQUIRED=0
 REPLICA_MARKER="$(manifest_value canonical_learning_replica_version)"
 case "$REPLICA_MARKER" in
   "1")
-    # The export declares a canonical generation, so it is mandatory.
+    # The export declares a canonical generation, so its immutable directory is
+    # mandatory and path-safe. Only the fixed prefix plus its tree SHA is
+    # accepted; slashes, traversal and arbitrary tar member names are rejected.
+    CANONICAL_REPLICA_INCOMING_NAME="$(manifest_value canonical_learning_replica_dir)"
+    [[ "$CANONICAL_REPLICA_INCOMING_NAME" =~ ^canonical_learning_replica\.[0-9a-f]{64}$ ]] || {
+      echo "O'Pip learning sync: canonical replica directory marker missing/invalid" >&2
+      exit 65
+    }
     CANONICAL_REPLICA_REQUIRED=1
     [[ "$production_sha" =~ ^[0-9a-f]{40}$ ]] || {
       echo "O'Pip learning sync: canonical replica requires a valid production_deployed_sha" >&2
