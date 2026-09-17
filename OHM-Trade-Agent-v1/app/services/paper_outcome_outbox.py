@@ -422,7 +422,7 @@ def _record_gap_for(
             error_code=str(envelope.get("last_error") or ERROR_TRANSPORT_FAILURE),
             path=spool_file,
         )
-    except Exception as exc:
+    except Exception:
         # A corrupt spool also makes any completeness claim unprovable, so this
         # must be observable rather than silently swallowed.
         logger.exception(
