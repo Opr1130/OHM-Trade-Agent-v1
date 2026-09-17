@@ -601,19 +601,28 @@ pytestmark_posix = pytest.mark.skipif(
 def test_fixture_timestamp_is_written_before_execution(tmp_path):
     """Finding: the manifest timestamp must exist before the block runs.
 
-    Proven through the block's own output rather than by inspecting the harness:
-    the block echoes the exported_at it read, so this fails if the manifest write
-    is moved after subprocess.run().
+    Proven through the value the block actually read: it reports the sha256 of
+    the committed manifest, so if the manifest were (re)written after
+    subprocess.run() the block would have hashed a different file and the first
+    assertion would fail.
     """
+    import hashlib
+
     fx = _fixture(tmp_path)
     fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
-    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
-    assert fields["exported_at_utc"] == "2026-09-17T19:00:47Z"
 
-    # A second run with a different timestamp must observe the new value, proving
-    # the manifest is written per-run and before execution.
+    fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
+    assert fields["manifest_sha256"] == hashlib.sha256(
+        fx["manifest"].read_bytes()
+    ).hexdigest()
+
     fields2 = _run_block(tmp_path, fx, "2026-09-17T21:15:00Z")
-    assert fields2["exported_at_utc"] == "2026-09-17T21:15:00Z"
+    assert fields2["manifest_sha256"] == hashlib.sha256(
+        fx["manifest"].read_bytes()
+    ).hexdigest()
+    # The two runs genuinely saw different manifests, so the timestamp is written
+    # per run and before execution rather than after it.
+    assert fields["manifest_sha256"] != fields2["manifest_sha256"]
 
 
 @pytestmark_posix
@@ -704,7 +713,9 @@ def test_timestamped_log_proves_a_post_manifest_success(tmp_path):
     fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
     assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_SUCCEED"
     assert fields["export_log_post_manifest_success_count"] == "1"
-    assert fields["export_log_lifetime_success_count"] == "2"
+    # Only the terminal-OK line matches; the bundle-OK line is counted separately.
+    assert fields["export_log_lifetime_success_count"] == "1"
+    assert fields["export_log_lifetime_bundle_ok_count"] == "1"
 
 
 @pytestmark_posix
@@ -792,4 +803,10 @@ def test_block_refuses_a_non_content_addressed_replica_dir(tmp_path):
     fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
     assert fields["replica_dir_name_valid"] == "NO"
     assert fields["replica_dir_exists"] == "NOT_REFERENCED"
-    assert fields["replica_inner_generation_id"] == "UNKNOWN"
+    # Because the name never becomes a path, no inner manifest is inspected at
+    # all: the traversal is refused rather than partially followed.
+    assert "replica_inner_generation_id" not in fields
+    assert "replica_inner_source_release_sha" not in fields
+    assert "replica_contract_freshness_1800s" not in fields
+    # The name is still reported verbatim so the defect is visible.
+    assert fields["manifest_replica_dir"] == "../../etc"
