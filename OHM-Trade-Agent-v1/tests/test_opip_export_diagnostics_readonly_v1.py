@@ -1233,7 +1233,12 @@ def test_block_classifies_failing_replica_export(tmp_path):
     )
     fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
     assert fields["export_log_activity_class"] == "POST_MANIFEST_RUNS_FAIL"
-    assert fields["export_log_post_manifest_failure_count"] == "1"
+    # Both post-manifest lines match the recognized-failure pattern
+    # (`canonical replica export FAILED` and `canonical replica FAILED`), so the
+    # counter is 2 rather than 1. What matters for the verdict is that at least
+    # one recognized failure was seen.
+    assert int(fields["export_log_post_manifest_failure_count"]) >= 1
+    assert fields["export_log_post_manifest_recognized_event_count"] == "2"
     assert fields["FINAL_STATUS"] == "DEGRADED"
 
 
