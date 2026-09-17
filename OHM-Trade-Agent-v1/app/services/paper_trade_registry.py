@@ -138,16 +138,15 @@ def _record_evidence_disposition(
             error_code=error_code,
             path=gap_spool_file,
         )
-    except Exception as exc:
+    except Exception:
         # The spool itself is unavailable or corrupt. Fail closed rather than
         # silent: a corrupt spool also makes any "evidence window complete"
         # claim unprovable, so this must be observable.
-        logger.error(
+        logger.exception(
             "paper evidence disposition failed; evidence window uncertified "
-            "(%s event for %s): %s",
+            "(%s event for %s)",
             event_type,
             trade.paper_trade_id,
-            exc,
         )
 
 
@@ -290,7 +289,6 @@ def save_lifecycle(
             else:
                 envelope = build_outcome_envelope(
                     trade,
-                    terminal_event_type=event_type,
                     terminal_event_id=_event_id(trade, event_type),
                 )
                 if envelope is not None:
@@ -349,9 +347,9 @@ def _persist_outbox(
                 return
             row["outcome_outbox"] = envelope
             _save_rows(rows, state_file)
-    except Exception as exc:
-        logger.error(
-            "could not persist paper outcome disposition for %s: %s", paper_trade_id, exc
+    except Exception:
+        logger.exception(
+            "could not persist paper outcome disposition for %s", paper_trade_id
         )
 
 

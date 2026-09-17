@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import math
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import require_utc
@@ -207,6 +207,96 @@ def terminal_outcome_id(
     )
 
 
+def assert_supersession_consistent(
+    *,
+    correction: Mapping[str, Any],
+    superseded: Mapping[str, Any],
+) -> None:
+    """Prove a correction legitimately supersedes the record it names.
+
+    ``resolve_effective_outcomes`` removes a superseded record from the
+    effective set on the strength of this relationship alone, so the
+    relationship has to be proven rather than trusted. Without this a correction
+    could supersede a different trade's outcome, a different engine's outcome,
+    or a record that does not exist at all.
+
+    A correction corrects the *economics* of one terminal event. Everything that
+    identifies which terminal event it is - the trade, the episode, the engine,
+    the terminal status, the exit reason, and the quote currency - must therefore
+    be identical. Only the economics and sequence may differ.
+
+    Raises ``ValueError`` on any violation.
+    """
+    if not isinstance(correction, Mapping) or not isinstance(superseded, Mapping):
+        raise ValueError("supersession requires two paper outcome records")
+
+    target = str(correction.get("supersedes_id") or "").strip()
+    if not target:
+        raise ValueError("a correction must name the outcome it supersedes")
+    if target != str(superseded.get("outcome_id") or ""):
+        raise ValueError("supersession target does not match the loaded record")
+
+    for field in ("paper_trade_id", "episode_id", "engine"):
+        if str(correction.get(field) or "") != str(superseded.get(field) or ""):
+            raise ValueError(f"cross-{field} supersession is not permitted")
+
+    for field in ("terminal_status", "exit_reason", "quote_currency"):
+        if str(correction.get(field) or "") != str(superseded.get(field) or ""):
+            raise ValueError(
+                f"a correction cannot change {field}: it corrects economics only"
+            )
+
+    expected_seq = int(superseded.get("correction_seq") or 0) + 1
+    if int(correction.get("correction_seq") or 0) != expected_seq:
+        raise ValueError(
+            "correction_seq must follow the superseded record contiguously "
+            f"(expected {expected_seq})"
+        )
+
+
+def resolve_effective_outcome_ids(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Return the effective outcome per supersession chain root.
+
+    Re-derives the supersession graph and validates every edge, so a tampered or
+    hand-edited store fails closed instead of silently dropping a superseded
+    record on an unverified claim.
+    """
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        outcome_id = str(row.get("outcome_id") or "").strip()
+        if not outcome_id:
+            continue
+        if outcome_id in by_id:
+            # The writer's uniqueness constraint makes this impossible, so it
+            # means tampering. Fail closed rather than silently keeping one.
+            raise ValueError(f"duplicate canonical outcome identity: {outcome_id}")
+        by_id[outcome_id] = row
+
+    effective: dict[str, Mapping[str, Any]] = {}
+    for outcome_id, row in by_id.items():
+        target = str(row.get("supersedes_id") or "").strip()
+        if not target:
+            effective[outcome_id] = row
+            continue
+        superseded = by_id.get(target)
+        if superseded is None:
+            raise ValueError(f"supersession target not found: {target}")
+        assert_supersession_consistent(correction=row, superseded=superseded)
+
+    superseded_ids = {
+        str(row.get("supersedes_id")).strip()
+        for row in by_id.values()
+        if str(row.get("supersedes_id") or "").strip()
+    }
+    return {
+        outcome_id: row
+        for outcome_id, row in by_id.items()
+        if outcome_id not in superseded_ids
+    }
+
+
 def terminal_outcome_idempotency_key(outcome_id: str) -> str:
     """Canonical writer idempotency key for one terminal outcome."""
     return f"{PAPER_OUTCOME_TERMINAL_RECORDED}:{outcome_id}"
@@ -231,6 +321,53 @@ def _parse_timestamp(value: Any, *, field_name: str) -> datetime:
     return require_utc(parsed, field_name=field_name)
 
 
+def _require_no_economics(payload: Mapping[str, Any]) -> None:
+    """UNRESOLVED asserts nothing: zero would be a false claim of break-even."""
+    offending = sorted(
+        [key for key in _REALISED_ECONOMIC_KEYS if payload.get(key) is not None]
+        + ([CAPITAL_KEY] if payload.get(CAPITAL_KEY) is not None else [])
+    )
+    if offending:
+        raise ValueError(
+            "UNRESOLVED outcomes must not assert economics: " + ", ".join(offending)
+        )
+
+
+def _require_committed_capital(payload: Mapping[str, Any]) -> float:
+    committed = _require_finite_number(payload.get(CAPITAL_KEY), field_name=CAPITAL_KEY)
+    if committed < 0:
+        raise ValueError(f"{CAPITAL_KEY} must not be negative")
+    return committed
+
+
+def _realised_numbers(payload: Mapping[str, Any]) -> dict[str, float]:
+    return {
+        key: _require_finite_number(payload.get(key), field_name=key)
+        for key in _REALISED_ECONOMIC_KEYS
+    }
+
+
+def _require_zero_realised(numbers: Mapping[str, float]) -> None:
+    """CANCELLED realises nothing, so every realised figure must be exactly zero.
+
+    Non-zero is tested by truthiness rather than equality: for a float, ``0.0``
+    and ``-0.0`` are the only falsy values, which is precisely "nothing was
+    realised", and it avoids a floating-point equality comparison. A tolerance
+    would be wrong here - it would accept a tiny non-zero as nothing realised.
+    """
+    non_zero = sorted(key for key, value in numbers.items() if value)
+    if non_zero:
+        raise ValueError(
+            "CANCELLED outcomes must have zero realised economics: " + ", ".join(non_zero)
+        )
+
+
+def _require_consistent_net(numbers: Mapping[str, float]) -> None:
+    expected_net = numbers["gross_pnl"] - numbers["fees_paid"]
+    if abs(numbers["net_pnl"] - expected_net) > _NET_PNL_TOLERANCE:
+        raise ValueError("net_pnl must equal gross_pnl - fees_paid for a CLOSED outcome")
+
+
 def _validate_economics(payload: Mapping[str, Any], terminal_status: str) -> None:
     """Enforce the economics the simulator is actually allowed to assert.
 
@@ -241,42 +378,20 @@ def _validate_economics(payload: Mapping[str, Any], terminal_status: str) -> Non
     * ``CANCELLED`` - nothing was realised, so every realised figure is zero.
       The committed capital was still committed, so it stays as recorded.
     * ``UNRESOLVED``- the result is unknowable, so every economic figure is
-      ``None``. Zero would be a false claim of break-even.
+      ``None``.
     """
-    realised = {key: payload.get(key) for key in _REALISED_ECONOMIC_KEYS}
-    capital = payload.get(CAPITAL_KEY)
-
     if terminal_status == UNRESOLVED:
-        offending = sorted(
-            [key for key, value in realised.items() if value is not None]
-            + ([CAPITAL_KEY] if capital is not None else [])
-        )
-        if offending:
-            raise ValueError(
-                "UNRESOLVED outcomes must not assert economics: " + ", ".join(offending)
-            )
+        _require_no_economics(payload)
         return
 
-    committed = _require_finite_number(capital, field_name=CAPITAL_KEY)
-    if committed < 0:
-        raise ValueError(f"{CAPITAL_KEY} must not be negative")
+    _require_committed_capital(payload)
+    numbers = _realised_numbers(payload)
 
-    numbers = {
-        key: _require_finite_number(value, field_name=key)
-        for key, value in realised.items()
-    }
     if terminal_status == CANCELLED:
-        non_zero = sorted(key for key, value in numbers.items() if value != 0.0)
-        if non_zero:
-            raise ValueError(
-                "CANCELLED outcomes must have zero realised economics: "
-                + ", ".join(non_zero)
-            )
+        _require_zero_realised(numbers)
         return
 
-    expected_net = numbers["gross_pnl"] - numbers["fees_paid"]
-    if abs(numbers["net_pnl"] - expected_net) > _NET_PNL_TOLERANCE:
-        raise ValueError("net_pnl must equal gross_pnl - fees_paid for a CLOSED outcome")
+    _require_consistent_net(numbers)
 
 
 def validate_terminal_outcome_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -359,7 +474,9 @@ def validate_terminal_outcome_payload(payload: Mapping[str, Any]) -> dict[str, A
         raise ValueError("COMPLETE lineage cannot list missing fields")
     if completeness == LINEAGE_INCOMPLETE and not lineage_missing:
         raise ValueError("INCOMPLETE lineage must name the missing fields")
-    unknown_missing = sorted(set(str(item) for item in lineage_missing) - set(OPTIONAL_LINEAGE_FIELDS))
+    unknown_missing = sorted(
+        {str(item) for item in lineage_missing} - set(OPTIONAL_LINEAGE_FIELDS)
+    )
     if unknown_missing:
         raise ValueError(
             "lineage_missing names unsupported fields: " + ", ".join(unknown_missing)
@@ -505,7 +622,9 @@ __all__ = [
     "QUOTE_CURRENCIES",
     "TERMINAL_STATUSES",
     "UNRESOLVED",
+    "assert_supersession_consistent",
     "build_terminal_outcome_payload",
+    "resolve_effective_outcome_ids",
     "resolve_quote_currency",
     "terminal_outcome_id",
     "terminal_outcome_idempotency_key",

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
@@ -272,12 +272,11 @@ def rollback_calibration_promotion(
     rolled_back_at_utc: datetime,
 ) -> ApprovedCalibrationPromotion:
     """Return a rolled-back copy. History is added to, never rewritten."""
-    from dataclasses import replace
-
-    return replace(
+    updated: ApprovedCalibrationPromotion = replace(
         promotion,
         rolled_back_at_utc=_as_utc(rolled_back_at_utc, field_name="rolled_back_at_utc"),
     )
+    return updated
 
 
 def supersede_calibration_promotion(
@@ -286,11 +285,12 @@ def supersede_calibration_promotion(
     superseded_by: str,
 ) -> ApprovedCalibrationPromotion:
     """Return a superseded copy so an older approval cannot remain active."""
-    from dataclasses import replace
-
     if not str(superseded_by or "").strip():
         raise ValueError("superseded_by is required")
-    return replace(promotion, superseded_by=str(superseded_by))
+    updated: ApprovedCalibrationPromotion = replace(
+        promotion, superseded_by=str(superseded_by)
+    )
+    return updated
 
 
 def resolve_calibration_promotion(

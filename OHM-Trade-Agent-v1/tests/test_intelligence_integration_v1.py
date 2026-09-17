@@ -58,7 +58,6 @@ def test_trade_decision_uses_profit_rank_and_guarded_calibration():
         plan=_plan(),
         account_capital=10000.0,
         active_trades=[],
-        outcomes=[],
     )
     assert decision.quality_score == 85.0
     # PR-A: the neutral reason is now governance, not statistics. Without an

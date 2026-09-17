@@ -206,18 +206,14 @@ def build_production_readiness_report(
         paper_trade_rows=paper_rows,
         paper_outcome_rows=paper_outcome_rows,
         paper_outcome_source_error=paper_outcome_source_error,
+        paper_outcome_incomplete_reasons=paper_outcome_incomplete_reasons,
         capture_health=health,
         capture_dead_letter_rows=dead_letter_rows,
     )
-    payload = report.as_dict()
-    if paper_outcome_incomplete_reasons:
-        payload["paper_outcome_incomplete_reasons"] = list(
-            paper_outcome_incomplete_reasons
-        )
     return {
         "record_type": "OPIP_ML_DATA_READINESS_V1",
         "schema_version": 1,
-        "ml_data_readiness": payload,
+        "ml_data_readiness": report.as_dict(),
         "paper_learning_readiness": assess_paper_learning_readiness(
             long_production_verified=long_paper_production_verified
         ).as_dict(),

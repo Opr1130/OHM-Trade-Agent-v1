@@ -126,8 +126,10 @@ def _assert_interpretable_schema(connection) -> None:
         )
 
 
-def _read_outcome_events(connection) -> list[Any]:
-    """Read committed paper-outcome events in canonical commit order."""
+def _read_outcome_events(connection, boundary) -> list[Any]:
+    """Read committed paper-outcome events at or before the frozen boundary."""
+    if boundary is None:
+        return []
     return list(
         connection.execute(
             """
@@ -135,18 +137,61 @@ def _read_outcome_events(connection) -> list[Any]:
                    recorded_at, idempotency_key, payload_json
             FROM events
             WHERE event_type = ?
+              AND (history_epoch, local_sequence) <= (?, ?)
             ORDER BY history_epoch ASC, local_sequence ASC
             """,
-            (PAPER_OUTCOME_TERMINAL_RECORDED,),
+            (
+                PAPER_OUTCOME_TERMINAL_RECORDED,
+                int(boundary[0]),
+                int(boundary[1]),
+            ),
         )
     )
 
 
-def _stream_present(connection) -> bool:
+def _read_stream_watermark(connection) -> tuple[int, int] | None:
+    """Read the frozen ``paper_outcome.v1`` watermark coordinate.
+
+    The writer records a stream watermark in the same transaction as the event
+    it describes, so this coordinate is the last committed paper-outcome event,
+    not the global event tip. Using it as the read boundary is what makes a
+    reconstructed read deterministic.
+    """
     row = connection.execute(
-        "SELECT 1 FROM watermarks WHERE stream = ?", (PAPER_OUTCOME_STREAM,)
+        "SELECT history_epoch, local_sequence FROM watermarks WHERE stream = ?",
+        (PAPER_OUTCOME_STREAM,),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return None
+    history_epoch = row["history_epoch"]
+    local_sequence = row["local_sequence"]
+    if (
+        type(history_epoch) is not int
+        or type(local_sequence) is not int
+        or history_epoch < 0
+        or local_sequence < 0
+    ):
+        raise PaperOutcomeIntegrityError("paper outcome watermark row is invalid")
+    return (history_epoch, local_sequence)
+
+
+def _event_count_and_tip(connection) -> tuple[int, tuple[int, int] | None]:
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS n,
+               MAX(history_epoch) AS epoch,
+               MAX(local_sequence) AS seq
+        FROM events WHERE event_type = ?
+        """,
+        (PAPER_OUTCOME_TERMINAL_RECORDED,),
+    ).fetchone()
+    count = int(row["n"] or 0)
+    if count == 0 or row["epoch"] is None:
+        return 0, None
+    # MAX over the two columns independently is only a tip when the pair is
+    # monotonic, which the writer's UNIQUE(epoch, sequence) plus single-writer
+    # ordering guarantees. Consistency is asserted by the caller.
+    return count, (int(row["epoch"]), int(row["seq"]))
 
 
 def read_canonical_paper_outcomes(
@@ -182,8 +227,39 @@ def read_canonical_paper_outcomes(
 
     try:
         _assert_interpretable_schema(connection)
-        rows = _read_outcome_events(connection)
-        stream_present = _stream_present(connection)
+        boundary = _read_stream_watermark(connection)
+        event_count, tip = _event_count_and_tip(connection)
+
+        # Stream consistency, using paper-outcome stream evidence only. A
+        # watermark without its boundary event, or an event beyond the frozen
+        # boundary, means the stream cannot be reconstructed faithfully.
+        if event_count and boundary is None:
+            raise PaperOutcomeIntegrityError(
+                "paper outcome events exist without a paper_outcome.v1 watermark"
+            )
+        if boundary is not None and event_count == 0:
+            raise PaperOutcomeIntegrityError(
+                "paper_outcome.v1 watermark exists with no paper outcome event"
+            )
+        if boundary is not None and tip is not None and tip > boundary:
+            raise PaperOutcomeIntegrityError(
+                "paper outcome events exist beyond the frozen stream watermark"
+            )
+        if boundary is not None and event_count:
+            exists = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE event_type = ? AND history_epoch = ? AND local_sequence = ?
+                """,
+                (PAPER_OUTCOME_TERMINAL_RECORDED, int(boundary[0]), int(boundary[1])),
+            ).fetchone()
+            if exists is None:
+                raise PaperOutcomeIntegrityError(
+                    "paper_outcome.v1 watermark has no event at its claimed boundary"
+                )
+
+        stream_present = boundary is not None
+        rows = _read_outcome_events(connection, boundary)
     except PaperOutcomeIntegrityError:
         raise
     except sqlite3.Error as exc:

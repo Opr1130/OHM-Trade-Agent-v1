@@ -337,7 +337,7 @@ def active_profile_id() -> str | None:
     try:
         with registry_lock(LOCK_FILE):
             profile = load_json(PROFILE_FILE)
-    except (OSError, TimeoutError, RegistryIOError):
+    except (OSError, RegistryIOError):
         return None
     if not isinstance(profile, dict):
         return None

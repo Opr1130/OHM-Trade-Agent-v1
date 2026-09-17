@@ -37,6 +37,9 @@ from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_EVENT_TYPES,
     PAPER_OUTCOME_PRIORITY,
     PAPER_OUTCOME_STREAM,
+    PAPER_OUTCOME_TERMINAL_RECORDED,
+    assert_supersession_consistent,
+    terminal_outcome_idempotency_key,
     validate_terminal_outcome_payload,
 )
 from app.opip.decision_intelligence.events import (
@@ -1067,19 +1070,58 @@ class CanonicalWriter:
             raise ValueError("feature bus events must not carry ops_handoff")
         return intent.payload
 
-    @staticmethod
-    def _validate_paper_outcome_intent(intent: WriterIntent) -> dict:
+    def _validate_paper_outcome_intent(self, intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
 
         Mirrors the feature-bus boundary: telemetry-class priority and no
         ops handoff. The payload itself is validated by the contract module so
         the writer never has to know what makes paper economics well formed.
+        A correction additionally has its supersession relationship proven here,
+        so an unverifiable claim can never be committed.
         """
         if intent.priority != PAPER_OUTCOME_PRIORITY:
             raise ValueError("paper outcome events must use LOW priority")
         if intent.ops_handoff is not None:
             raise ValueError("paper outcome events must not carry ops_handoff")
-        return validate_terminal_outcome_payload(intent.payload)
+        normalized = validate_terminal_outcome_payload(intent.payload)
+        self._validate_paper_outcome_supersession(normalized)
+        return normalized
+
+    def _load_paper_outcome_by_id(self, outcome_id: str) -> dict:
+        """Load one committed terminal paper outcome by its canonical identity."""
+        row = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (
+                PAPER_OUTCOME_TERMINAL_RECORDED,
+                terminal_outcome_idempotency_key(outcome_id),
+            ),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"supersession target not found: {outcome_id}")
+        try:
+            raw = json.loads(row["payload_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"superseded paper outcome is unreadable: {outcome_id}"
+            ) from exc
+        return validate_terminal_outcome_payload(raw)
+
+    def _validate_paper_outcome_supersession(self, payload: Mapping[str, object]) -> None:
+        """Prove a correction legitimately supersedes what it names.
+
+        The correction is append-only and keeps the superseded record intact, so
+        the only thing that makes it safe is that the relationship is real. A
+        correction that supersedes another trade's outcome would silently remove
+        that trade's evidence from the effective set.
+        """
+        supersedes_id = str(payload.get("supersedes_id") or "").strip()
+        if not supersedes_id:
+            return
+        superseded = self._load_paper_outcome_by_id(supersedes_id)
+        assert_supersession_consistent(correction=payload, superseded=superseded)
 
     def _validate_decision_intelligence_intent(
         self, intent: WriterIntent

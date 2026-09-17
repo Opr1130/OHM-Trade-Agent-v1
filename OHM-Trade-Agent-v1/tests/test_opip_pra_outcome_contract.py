@@ -564,6 +564,7 @@ def test_paper_modules_never_instantiate_the_canonical_writer():
     ``CanonicalWriterClient`` contains the forbidden name as a substring.
     """
     from app.services import (
+        paper_outcome_outbox,
         paper_trade_control,
         paper_trade_engine,
         paper_trade_models,
@@ -574,6 +575,7 @@ def test_paper_modules_never_instantiate_the_canonical_writer():
 
     offenders: list[str] = []
     for module in (
+        paper_outcome_outbox,
         paper_trade_control,
         paper_trade_engine,
         paper_trade_models,
@@ -587,7 +589,24 @@ def test_paper_modules_never_instantiate_the_canonical_writer():
                 if node.func.id == "CanonicalWriter":
                     offenders.append(f"{module.__name__}:{node.lineno}")
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [alias.name for alias in node.names]
-                if any(name == "CanonicalWriter" for name in names):
-                    offenders.append(f"{module.__name__}: imports CanonicalWriter")
+                for alias in node.names:
+                    if alias.name == "CanonicalWriter":
+                        offenders.append(f"{module.__name__}: imports CanonicalWriter")
+                    # A module-import of the writer module itself is equally a
+                    # boundary violation.
+                    if alias.name == "app.opip.canonical.writer":
+                        offenders.append(f"{module.__name__}: imports canonical.writer")
     assert offenders == [], f"paper modules must not own the canonical store: {offenders}"
+
+
+def test_paper_outcome_reader_never_owns_the_store():
+    """The canonical reader is read-only and must not construct a writer."""
+    from app.opip.learning import paper_outcome_reader
+
+    tree = ast.parse(inspect.getsource(paper_outcome_reader))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id != "CanonicalWriter"
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                assert alias.name != "CanonicalWriter"

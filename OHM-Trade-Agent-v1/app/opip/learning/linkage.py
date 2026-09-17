@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from app.opip.contracts.paper_outcome import resolve_effective_outcome_ids
+
 
 PROVISIONAL_PHASE3C_SOURCE = "PROVISIONAL_EVENT_SAMPLED_FULL_MARKET_OBSERVATIONS"
 
@@ -564,21 +566,13 @@ def resolve_effective_outcomes(
     therefore resolve the effective record rather than treating history as a
     conflict - otherwise every corrected outcome would become unusable.
 
-    A fork (two records superseding the same one) deliberately leaves both in
-    place so the caller's ambiguity handling fails closed rather than letting
+    The graph is re-derived and every edge re-validated here, so a tampered or
+    hand-edited store fails closed instead of having a superseded record removed
+    on an unverified claim. A fork (two records superseding the same one) leaves
+    both in place so the caller's ambiguity handling decides, rather than letting
     ordering pick a winner.
     """
-    materialised = list(rows)
-    superseded = {
-        str(row.get("supersedes_id"))
-        for row in materialised
-        if str(row.get("supersedes_id") or "").strip()
-    }
-    return [
-        row
-        for row in materialised
-        if str(row.get("outcome_id") or "").strip() not in superseded
-    ]
+    return list(resolve_effective_outcome_ids(list(rows)).values())
 
 
 def canonical_outcomes_by_episode(
@@ -909,11 +903,18 @@ def build_learning_linkage_records(
                 paper_trade_id = None
             elif len(matching_paper) == 1:
                 paper_row = matching_paper[0]
-                if not _legacy_fallback_allowed(paper_row):
-                    # PR-A-era lifecycle whose canonical delivery is unresolved
-                    # or failed. Its local lifecycle economics must not be
-                    # promoted to final truth: falling back would use mutable
-                    # state to mask a delivery defect.
+                if not _legacy_fallback_allowed(paper_row) or paper_outcome_population_incomplete:
+                    # Two distinct refusals, one outcome: neither may produce
+                    # final supervised truth.
+                    #
+                    # 1. The row is PR-A-era (it carries a delivery envelope),
+                    #    so its local lifecycle economics must not be promoted:
+                    #    falling back would use mutable state to mask a delivery
+                    #    defect.
+                    # 2. The paper-outcome population is not certifiably whole -
+                    #    the canonical source may be unreadable, delivery may be
+                    #    unresolved, or the gap spool may be corrupt. A legacy
+                    #    row must not rescue an unavailable authority plane.
                     outcome = NormalizedOutcomeEvidence(
                         source_quality=OutcomeSourceQuality.UNUSABLE,
                         source_name="PAPER_TRADE_V1",
@@ -938,8 +939,11 @@ def build_learning_linkage_records(
                         net_pnl_pct=None,
                     )
                     status = LinkageStatus.FEATURE_LINKED_NO_OUTCOME
-                    delivery = _outbox_delivery(paper_row) or "UNKNOWN"
-                    reasons.append(f"PAPER_OUTCOME_DELIVERY_{delivery}")
+                    if not _legacy_fallback_allowed(paper_row):
+                        delivery = _outbox_delivery(paper_row) or "UNKNOWN"
+                        reasons.append(f"PAPER_OUTCOME_DELIVERY_{delivery}")
+                    if paper_outcome_population_incomplete:
+                        reasons.extend(paper_outcome_incomplete_reasons)
                     paper_trade_id = None
                     primary = False
                 else:

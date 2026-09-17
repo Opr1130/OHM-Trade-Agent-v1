@@ -113,7 +113,6 @@ def evaluate_trade_decision(
     plan: EntryExitPlan,
     account_capital: float,
     active_trades: list[Any],
-    outcomes: list[dict[str, Any]] | None = None,
 ) -> TradeDecisionIntelligence:
     direction = str(candidate.get("direction") or plan.direction or "LONG").upper()
     leverage = float(candidate.get("margin_leverage") or (2.0 if direction == "SHORT" else 1.0))
@@ -123,9 +122,9 @@ def evaluate_trade_decision(
 
     _capture_shadow(candidate, plan, direction)
 
-    # ``outcomes`` is accepted for caller compatibility only. Runtime influence
-    # is authorized solely by an approved promotion, never by decision-time
-    # evidence, so the outcome population is deliberately not consulted here.
+    # No outcome population is consulted. Runtime influence is authorized solely
+    # by an approved promotion, so there is deliberately no parameter through
+    # which decision-time evidence could reach sizing.
     multiplier, calibration_status = _effective_calibration_multiplier(
         direction=direction,
         regime=candidate.get("market_regime"),

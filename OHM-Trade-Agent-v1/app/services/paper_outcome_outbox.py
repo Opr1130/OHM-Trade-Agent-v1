@@ -134,7 +134,6 @@ def _normalized_exit_reason(trade: Any) -> str:
 def build_outcome_envelope(
     trade: Any,
     *,
-    terminal_event_type: str,
     terminal_event_id: str,
 ) -> dict[str, Any] | None:
     """Build the durable recovery envelope for a terminal lifecycle.
@@ -354,22 +353,50 @@ def submit_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         )
     return envelope
 
-
 # ---------------------------------------------------------------------------
 # Evidence-gap spool: descriptor only, never the payload
 # ---------------------------------------------------------------------------
 
 
 def _resolve_gap_for(envelope: dict[str, Any], *, spool_file: Path) -> None:
+    """Resolve this envelope's evidence gap.
+
+    Uses the stored ``gap_id`` when present. It can be absent durably even when a
+    descriptor was written: if ``_persist_outbox`` fails after the gap append,
+    ``state.json`` still holds ``gap_id=None``. Falling back to an exact
+    ``idempotency_key`` match recovers that case instead of leaving the
+    descriptor unresolved forever.
+
+    Matching is exact-key only - never symbol or time proximity - and an
+    ambiguous match fails closed rather than removing an arbitrary descriptor.
+    """
     gap_id = envelope.get("gap_id")
-    if not gap_id:
-        return
+    key = str(envelope.get("idempotency_key") or "")
     try:
-        resolve_gap(str(gap_id), path=spool_file)
-    except Exception as exc:
-        logger.error("could not resolve paper evidence gap %s: %s", gap_id, exc)
-        return
-    envelope["gap_id"] = None
+        if gap_id:
+            resolve_gap(str(gap_id), path=spool_file)
+            envelope["gap_id"] = None
+            return
+        if not key:
+            return
+        matches = [
+            str(row.get("gap_id"))
+            for row in load_gap_spool(spool_file)["unresolved"]
+            if str(row.get("idempotency_key") or "") == key
+        ]
+        if not matches:
+            return
+        if len(matches) > 1:
+            logger.error(
+                "ambiguous paper evidence gaps for one outcome key %s: %s",
+                key,
+                matches,
+            )
+            return
+        resolve_gap(matches[0], path=spool_file)
+        envelope["gap_id"] = None
+    except Exception:
+        logger.exception("could not resolve paper evidence gap for %s", key or gap_id)
 
 
 def _record_gap_for(
@@ -398,10 +425,9 @@ def _record_gap_for(
     except Exception as exc:
         # A corrupt spool also makes any completeness claim unprovable, so this
         # must be observable rather than silently swallowed.
-        logger.error(
-            "paper outcome evidence-gap disposition failed for %s: %s",
+        logger.exception(
+            "paper outcome evidence-gap disposition failed for %s",
             paper_trade_id,
-            exc,
         )
 
 

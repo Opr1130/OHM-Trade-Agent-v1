@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.opip.learning.linkage import (
     LearningCohort,
@@ -96,6 +96,12 @@ class MLDataReadinessReport:
     primary_supervised_usable_rows: int
     exclusion_reason_counts: Mapping[str, int]
     policy: MLReadinessPolicy
+    #: Authoritative paper-outcome population completeness. True means the
+    #: population cannot be treated as whole, so no row from it may become
+    #: final supervised truth. The reasons are enforced on eligibility and also
+    #: surfaced here so operators can see why.
+    paper_outcome_population_incomplete: bool = False
+    paper_outcome_incomplete_reasons: tuple[str, ...] = ()
     measurement_only: bool = True
     affects_live_decisions: bool = False
     automatic_training_allowed: bool = False
@@ -112,6 +118,9 @@ class MLDataReadinessReport:
             for key, value in sorted(self.missingness_by_feature.items())
         }
         row["policy"] = asdict(self.policy)
+        row["paper_outcome_incomplete_reasons"] = list(
+            self.paper_outcome_incomplete_reasons
+        )
         row["direction_coverage"] = dict(sorted(self.direction_coverage.items()))
         row["lane_coverage"] = dict(sorted(self.lane_coverage.items()))
         row["regime_coverage"] = dict(sorted(self.regime_coverage.items()))
@@ -321,6 +330,7 @@ def build_ml_data_readiness_report(
     paper_trade_rows: Iterable[Mapping[str, Any]] = (),
     paper_outcome_rows: Iterable[Mapping[str, Any]] = (),
     paper_outcome_source_error: str | None = None,
+    paper_outcome_incomplete_reasons: Sequence[str] = (),
     capture_health: Mapping[str, Any] | None = None,
     capture_dead_letter_rows: Iterable[Mapping[str, Any]] = (),
     policy: MLReadinessPolicy | None = None,
@@ -418,15 +428,27 @@ def build_ml_data_readiness_report(
 
     # Delivery completeness is local evidence about whether the canonical
     # population can be considered whole. A closed lifecycle does not imply
-    # complete evidence.
-    outcome_incomplete, outcome_incomplete_reasons = (
-        paper_outcome_population_incomplete(paper_safe)
+    # complete evidence. Three independent sources are combined into ONE
+    # authoritative decision, and that decision is enforced on eligibility -
+    # not merely displayed in the report:
+    #
+    #   1. lifecycle delivery envelopes (PENDING / PERMANENT_FAILURE / missing);
+    #   2. canonical source readability (an unreadable authority plane cannot
+    #      certify a population, and must not be read as "empty");
+    #   3. unresolved or corrupt paper evidence-gap spool entries.
+    outcome_reasons: set[str] = set()
+    lifecycle_incomplete, lifecycle_reasons = paper_outcome_population_incomplete(
+        paper_safe
+    )
+    if lifecycle_incomplete:
+        outcome_reasons.update(lifecycle_reasons)
+    outcome_reasons.update(
+        str(reason) for reason in paper_outcome_incomplete_reasons if str(reason).strip()
     )
     if paper_outcome_source_error:
-        outcome_incomplete = True
-        outcome_incomplete_reasons = tuple(
-            sorted(set(outcome_incomplete_reasons) | {"CANONICAL_OUTCOME_SOURCE_UNAVAILABLE"})
-        )
+        outcome_reasons.add("CANONICAL_OUTCOME_SOURCE_UNAVAILABLE")
+    outcome_incomplete = bool(outcome_reasons)
+    outcome_incomplete_reasons = tuple(sorted(outcome_reasons))
 
     malformed_records = (
         canonical_malformed
@@ -535,6 +557,11 @@ def build_ml_data_readiness_report(
         structural = True
     if provisional > 0 and final_truth == 0:
         blockers.append("PROVISIONAL_OUTCOMES_ONLY")
+    if outcome_incomplete:
+        # The paper-outcome population cannot be certified whole, so readiness
+        # must not claim a complete supervised population.
+        blockers.append("PAPER_OUTCOME_POPULATION_INCOMPLETE")
+        structural = True
     if linkage_rate < active_policy.minimum_exact_linkage_rate:
         blockers.append("EXACT_OUTCOME_LINKAGE_BELOW_POLICY")
     if usable < active_policy.minimum_primary_supervised_rows:
@@ -586,4 +613,6 @@ def build_ml_data_readiness_report(
         primary_supervised_usable_rows=usable,
         exclusion_reason_counts=dict(exclusions),
         policy=active_policy,
+        paper_outcome_population_incomplete=outcome_incomplete,
+        paper_outcome_incomplete_reasons=outcome_incomplete_reasons,
     )
