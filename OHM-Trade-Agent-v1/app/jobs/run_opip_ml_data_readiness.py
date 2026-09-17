@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -271,7 +272,9 @@ def build_production_readiness_report(
 
 def main() -> None:
     """Persist and print one readiness report; never schedule/train/promote."""
-    payload = build_production_readiness_report()
+    payload = build_production_readiness_report(
+        expected_release_sha=os.environ.get("OPIP_PRODUCTION_DEPLOYED_SHA", "").strip()
+    )
     save_json_atomic(READINESS_REPORT, payload)
     print(json.dumps(payload, sort_keys=True, allow_nan=False))
 
