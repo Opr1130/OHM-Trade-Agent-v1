@@ -486,7 +486,7 @@ def test_existing_malformed_terminal_envelope_is_not_rebuilt_from_later_state(
 
     assert _envelope(paper_env) == malformed
     assert client.calls == 0
-    assert _canonical_rows(canonical_env) == []
+    assert not canonical_env["db"].exists()
 
 
 def test_reprocessing_a_closed_lifecycle_does_not_duplicate(canonical_env, paper_env, servers):
