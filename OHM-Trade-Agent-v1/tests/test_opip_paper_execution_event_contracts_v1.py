@@ -261,6 +261,26 @@ def test_counterfactual_population_cannot_enter_qualified_intent_stream():
         )
 
 
+def test_actual_realized_population_cannot_enter_qualified_intent_stream():
+    payload = _admission()
+    payload["evaluation_population"] = "ACTUAL_REALIZED"
+    with pytest.raises(ValueError, match="QUALIFIED_INTENT"):
+        validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            payload,
+        )
+
+
+def test_opportunity_disposition_rejects_unsupported_quote_currency():
+    payload = _admission()
+    payload["quote_currency"] = "EUR"
+    with pytest.raises(ValueError, match="quote_currency"):
+        validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            payload,
+        )
+
+
 def test_market_order_cannot_smuggle_limit_price():
     payload = _order_intent()
     payload["limit_price"] = 199.0
@@ -303,6 +323,19 @@ def test_final_reconciliation_requires_flat_zero_remaining_and_exact_economics()
     payload["realized_net_pnl"] = 91.0
     with pytest.raises(ValueError, match="realized_net_pnl"):
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
+
+
+def test_flat_awaiting_reconciliation_requires_flat_zero_remaining():
+    payload = _reconciliation()
+    payload["terminal_reconciliation_state"] = "FLAT_AWAITING_RECONCILIATION"
+    payload["position_state"] = "OPEN"
+    payload["remaining_quantity"] = 1.0
+    with pytest.raises(ValueError, match="FLAT_AWAITING_RECONCILIATION"):
+        validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
+
+    payload["position_state"] = "FLAT"
+    payload["remaining_quantity"] = 0.0
+    assert validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
 
 def test_unresolved_reconciliation_requires_explicit_reason():
