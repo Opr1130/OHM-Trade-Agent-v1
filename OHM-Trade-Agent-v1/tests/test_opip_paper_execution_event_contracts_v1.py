@@ -9,6 +9,10 @@ from app.opip.contracts.paper_execution import (
     PAPER_PROTECTION_MODEL_VERSION,
     QualifiedOpportunityDisposition,
 )
+from app.opip.contracts.paper_execution_runtime import (
+    PAPER_QUOTE_EVIDENCE_RECORDED,
+)
+
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_EXECUTION_EVENT_TYPES,
@@ -592,10 +596,35 @@ def test_unresolved_reconciliation_requires_explicit_reason():
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
 
-def test_paper_v2_event_contract_is_not_registered_with_writer_yet():
+def test_paper_v2_writer_registration_stays_within_bc1_boundary():
     from app.opip.canonical.writer import ACCEPTED_EVENT_TYPES
 
-    assert PAPER_EXECUTION_EVENT_TYPES.isdisjoint(ACCEPTED_EVENT_TYPES)
+    # B/C-1 may persist only the evidence families needed for execution lineage.
+    assert {
+        PAPER_QUOTE_EVIDENCE_RECORDED,
+        PAPER_ORDER_INTENT_RECORDED,
+        PAPER_EXECUTION_ATTEMPT_RECORDED,
+        PAPER_FILL_RECORDED,
+    } <= ACCEPTED_EVENT_TYPES
+
+    # Qualified disposition remains writer-owned through the atomic admission
+    # RPC, so a generic WriterIntent cannot bypass version/capital reservation.
+    assert PAPER_OPPORTUNITY_DISPOSITION_RECORDED not in ACCEPTED_EVENT_TYPES
+
+    # Protection/runtime reconciliation stays frozen out until B/C-2.
+    assert {
+        PAPER_PROTECTION_PLAN_RECORDED,
+        PAPER_PROTECTION_STATE_RECORDED,
+        PAPER_PROTECTION_TRIGGER_RECORDED,
+        PAPER_RECONCILIATION_RECORDED,
+    }.isdisjoint(ACCEPTED_EVENT_TYPES)
+
+    registered_frozen_events = PAPER_EXECUTION_EVENT_TYPES & ACCEPTED_EVENT_TYPES
+    assert registered_frozen_events == {
+        PAPER_ORDER_INTENT_RECORDED,
+        PAPER_EXECUTION_ATTEMPT_RECORDED,
+        PAPER_FILL_RECORDED,
+    }
 
 
 # ---------------------------------------------------------------------------

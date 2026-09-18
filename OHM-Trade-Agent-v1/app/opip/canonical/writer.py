@@ -31,7 +31,34 @@ from app.opip.contracts.events import (
     FEATURE_BUS_STREAM,
     FEATURE_CHECKPOINT_RECORDED,
     FEATURE_SNAPSHOT_RECORDED,
+    MARKET_INSTRUMENT_VERSION_RECORDED,
     MARKET_OBSERVATION_RECORDED,
+)
+from app.opip.contracts.paper_execution import ExecutionState
+from app.opip.contracts.paper_execution_events import (
+    PAPER_EXECUTION_ATTEMPT_RECORDED,
+    PAPER_EXECUTION_PRIORITY,
+    PAPER_EXECUTION_STREAM,
+    PAPER_FILL_RECORDED,
+    PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+    PAPER_ORDER_INTENT_RECORDED,
+    event_contract as paper_event_contract,
+    paper_evidence_idempotency_key,
+    validate_paper_evidence_payload,
+)
+from app.opip.contracts.paper_execution_runtime import (
+    PAPER_ADMISSION_REQUEST_RECORDED,
+    PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
+    PAPER_QUOTE_EVIDENCE_RECORDED,
+    PaperAdmissionAck,
+    PaperAdmissionRequest,
+    admission_request_idempotency_key,
+    admission_result_identities,
+    quote_evidence_idempotency_key,
+    resolve_capital_policy,
+    validate_admission_request,
+    validate_admission_request_record_payload,
+    validate_quote_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_EVENT_TYPES,
@@ -62,6 +89,7 @@ from app.opip.decision_intelligence.events import (
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
+from app.opip.market.instrument_version_store import instrument_version_from_payload
 
 MAX_PAYLOAD_BYTES = 16 * 1024
 _UTC_OFFSET = "+00:00"
@@ -89,6 +117,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # strategy/execution provenance) is exactly what makes two otherwise
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
+    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -161,6 +190,7 @@ ACCEPTED_EVENT_TYPES = (
     | FEATURE_BUS_EVENT_TYPES
     | DECISION_INTELLIGENCE_EVENT_TYPES
     | PAPER_OUTCOME_EVENT_TYPES
+    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
 )
 
 
@@ -453,6 +483,455 @@ class CanonicalWriter:
             except sqlite3.Error as exc:
                 self._conn.rollback()
                 return WriterAck(status="RETRYABLE", error_code="SQLITE_ERROR", detail=str(exc))
+
+    def _insert_event_row_in_transaction(
+        self,
+        *,
+        event_type: str,
+        idempotency_key: str,
+        payload: Mapping[str, object],
+        history_epoch: int,
+        local_sequence: int,
+        now: str,
+        causation_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> str:
+        event_id = _new_event_id()
+        payload_json = json.dumps(
+            dict(payload),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._conn.execute(
+            """
+            INSERT INTO events (
+                event_id, schema_version, event_type, history_epoch, local_sequence,
+                recorded_at, event_time, causation_id, correlation_id,
+                idempotency_key, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                EVENT_SCHEMA_VERSION,
+                event_type,
+                history_epoch,
+                local_sequence,
+                now,
+                causation_id,
+                correlation_id,
+                idempotency_key,
+                payload_json,
+            ),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO idempotency_keys (idempotency_key, event_id, committed_at)
+            VALUES (?, ?, ?)
+            """,
+            (idempotency_key, event_id, now),
+        )
+        return event_id
+
+    def _existing_admission_result(
+        self,
+        request: PaperAdmissionRequest,
+        *,
+        request_payload: Mapping[str, object],
+    ) -> PaperAdmissionAck | None:
+        request_key = admission_request_idempotency_key(request.disposition_id)
+        row = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_ADMISSION_REQUEST_RECORDED, request_key),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = validate_admission_request_record_payload(
+                json.loads(str(row["payload_json"]))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+
+        stored_request = {key: stored.get(key) for key in request_payload}
+        expected_json = json.dumps(
+            dict(request_payload),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        stored_json = json.dumps(
+            stored_request,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if stored_json != expected_json:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                detail=(
+                    "disposition identity already committed with a different "
+                    "admission request payload"
+                ),
+            )
+
+        observed_version = stored.get("observed_portfolio_version")
+        if type(observed_version) is not int or observed_version < 0:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+        guard_result = stored.get("guard_result")
+        if guard_result == "STALE_PORTFOLIO_VERSION":
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                history_epoch=int(row["history_epoch"]),
+                local_sequence=int(row["local_sequence"]),
+                portfolio_version=observed_version,
+                error_code="STALE_PORTFOLIO_VERSION",
+                detail=(
+                    f"expected portfolio version {request.expected_portfolio_version}; "
+                    f"observed {observed_version}"
+                ),
+            )
+        if guard_result != "ELIGIBLE":
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+
+        disposition_key = paper_evidence_idempotency_key(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            {"disposition_id": request.disposition_id},
+        )
+        result_row = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_OPPORTUNITY_DISPOSITION_RECORDED, disposition_key),
+        ).fetchone()
+        if result_row is None:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_TRANSACTION_INCOMPLETE",
+            )
+        try:
+            result = validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                json.loads(str(result_row["payload_json"])),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                disposition_event_id=str(result_row["event_id"]),
+                error_code="ADMISSION_RESULT_CORRUPT",
+            )
+        disposition = str(result["disposition"])
+        portfolio_version = observed_version + (1 if disposition == "ADMITTED" else 0)
+        return PaperAdmissionAck(
+            status="DUPLICATE_OK",
+            disposition=disposition,
+            request_event_id=str(row["event_id"]),
+            disposition_event_id=str(result_row["event_id"]),
+            history_epoch=int(result_row["history_epoch"]),
+            local_sequence=int(result_row["local_sequence"]),
+            portfolio_version=portfolio_version,
+            paper_trade_id=(
+                str(result["paper_trade_id"])
+                if result.get("paper_trade_id") is not None
+                else None
+            ),
+            reservation_id=(
+                str(result["reservation_id"])
+                if result.get("reservation_id") is not None
+                else None
+            ),
+        )
+
+    def admit_paper_opportunity(
+        self,
+        request: PaperAdmissionRequest,
+    ) -> PaperAdmissionAck:
+        """Atomically decide Paper v2 capital/capacity and record the disposition."""
+
+        with self._lock:
+            # Resolve the authoritative policy first so an unsupported version is
+            # reported precisely and can never fall through to a decision. The
+            # effective limits below come from this policy, never from the request,
+            # so a producer cannot widen the portfolio gate by supplying values.
+            try:
+                capital_policy = resolve_capital_policy(
+                    request.capital_policy_version
+                )
+            except (TypeError, ValueError) as exc:
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="UNSUPPORTED_CAPITAL_POLICY_VERSION",
+                    detail=str(exc),
+                )
+
+            if (
+                request.portfolio_equity_limit != capital_policy.portfolio_equity_limit
+                or request.portfolio_position_limit
+                != capital_policy.portfolio_position_limit
+            ):
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="CAPITAL_POLICY_MISMATCH",
+                    detail=(
+                        "admission limits do not match the authoritative capital "
+                        f"policy {capital_policy.policy_version}: expected "
+                        f"equity={capital_policy.portfolio_equity_limit} "
+                        f"positions={capital_policy.portfolio_position_limit}"
+                    ),
+                )
+
+            try:
+                request_payload = validate_admission_request(request)
+            except (TypeError, ValueError) as exc:
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="INVALID_ADMISSION_REQUEST",
+                    detail=str(exc),
+                )
+
+            existing = self._existing_admission_result(
+                request,
+                request_payload=request_payload,
+            )
+            if existing is not None:
+                return existing
+
+            now = _utc_now()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                meta = self._conn.execute(
+                    "SELECT history_epoch, next_local_sequence, schema_version "
+                    "FROM meta WHERE id = 1"
+                ).fetchone()
+                if meta is None:
+                    raise ValueError("canonical meta row missing")
+                if int(meta["schema_version"]) != SCHEMA_VERSION:
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DB_SCHEMA_MISMATCH",
+                    )
+
+                # The decision context must already be canonical and must itself
+                # authorize Paper v2 evaluation. Admission never invents or
+                # reconstructs upstream eligibility/environment ancestry.
+                context = self._load_context_by_id(request.decision_context_id)
+                if context.get("eligibility") is not True:
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DECISION_CONTEXT_INELIGIBLE",
+                    )
+                if context.get("environment") != "paper":
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DECISION_CONTEXT_NOT_PAPER",
+                    )
+
+                history_epoch = int(meta["history_epoch"])
+                local_sequence = int(meta["next_local_sequence"])
+                current_version, reserved_capital, active_reservations = (
+                    self._portfolio_state(request.quote_currency)
+                )
+
+                guard_result = (
+                    "ELIGIBLE"
+                    if request.expected_portfolio_version == current_version
+                    else "STALE_PORTFOLIO_VERSION"
+                )
+                request_record = validate_admission_request_record_payload(
+                    {
+                        **request_payload,
+                        "guard_result": guard_result,
+                        "observed_portfolio_version": current_version,
+                    }
+                )
+                request_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_ADMISSION_REQUEST_RECORDED,
+                    idempotency_key=admission_request_idempotency_key(
+                        request.disposition_id
+                    ),
+                    payload=request_record,
+                    history_epoch=history_epoch,
+                    local_sequence=local_sequence,
+                    now=now,
+                    correlation_id=request.decision_context_id,
+                )
+
+                if guard_result == "STALE_PORTFOLIO_VERSION":
+                    self._conn.execute(
+                        """
+                        INSERT INTO watermarks (
+                            stream, history_epoch, local_sequence, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(stream) DO UPDATE SET
+                            history_epoch = excluded.history_epoch,
+                            local_sequence = excluded.local_sequence,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            PAPER_EXECUTION_STREAM,
+                            history_epoch,
+                            local_sequence,
+                            now,
+                        ),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE meta
+                        SET next_local_sequence = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (local_sequence + 1, now),
+                    )
+                    self._conn.commit()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        request_event_id=request_event_id,
+                        history_epoch=history_epoch,
+                        local_sequence=local_sequence,
+                        portfolio_version=current_version,
+                        error_code="STALE_PORTFOLIO_VERSION",
+                        detail=(
+                            f"expected portfolio version "
+                            f"{request.expected_portfolio_version}; "
+                            f"observed {current_version}"
+                        ),
+                    )
+
+                if active_reservations >= capital_policy.portfolio_position_limit:
+                    disposition = "CAPACITY_REJECTED"
+                    reason_code = "PORTFOLIO_POSITION_LIMIT"
+                elif (
+                    reserved_capital + request.requested_reservation_amount
+                    > capital_policy.portfolio_equity_limit + 1e-9
+                ):
+                    disposition = "CAPITAL_REJECTED"
+                    reason_code = "PORTFOLIO_CAPITAL_LIMIT"
+                else:
+                    disposition = "ADMITTED"
+                    reason_code = "CAPITAL_AND_CAPACITY_ADMITTED"
+
+                disposition_payload = {
+                    **request_payload,
+                    "disposition": disposition,
+                    "reason_code": reason_code,
+                }
+                paper_trade_id: str | None = None
+                reservation_id: str | None = None
+                if disposition == "ADMITTED":
+                    paper_trade_id, reservation_id = admission_result_identities(
+                        request.disposition_id
+                    )
+                    disposition_payload["paper_trade_id"] = paper_trade_id
+                    disposition_payload["reservation_id"] = reservation_id
+
+                normalized = validate_paper_evidence_payload(
+                    PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                    disposition_payload,
+                )
+                disposition_sequence = local_sequence + 1
+                disposition_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                        normalized,
+                    ),
+                    payload=normalized,
+                    history_epoch=history_epoch,
+                    local_sequence=disposition_sequence,
+                    now=now,
+                    causation_id=request_event_id,
+                    correlation_id=request.decision_context_id,
+                )
+
+                self._conn.execute(
+                    """
+                    INSERT INTO watermarks (
+                        stream, history_epoch, local_sequence, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stream) DO UPDATE SET
+                        history_epoch = excluded.history_epoch,
+                        local_sequence = excluded.local_sequence,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        PAPER_EXECUTION_STREAM,
+                        history_epoch,
+                        disposition_sequence,
+                        now,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE meta
+                    SET next_local_sequence = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (disposition_sequence + 1, now),
+                )
+                self._conn.commit()
+                resulting_version = current_version + (
+                    1 if disposition == "ADMITTED" else 0
+                )
+                return PaperAdmissionAck(
+                    status="OK",
+                    disposition=disposition,
+                    request_event_id=request_event_id,
+                    disposition_event_id=disposition_event_id,
+                    history_epoch=history_epoch,
+                    local_sequence=disposition_sequence,
+                    portfolio_version=resulting_version,
+                    paper_trade_id=paper_trade_id,
+                    reservation_id=reservation_id,
+                )
+            except (TypeError, ValueError) as exc:
+                self._conn.rollback()
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="INVALID_ADMISSION_REQUEST",
+                    detail=str(exc),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                existing = self._existing_admission_result(
+                    request,
+                    request_payload=request_payload,
+                )
+                if existing is not None:
+                    return existing
+                return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="INTEGRITY_CONFLICT",
+                )
+            except sqlite3.Error as exc:
+                self._conn.rollback()
+                return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         now = _utc_now()
@@ -1070,6 +1549,560 @@ class CanonicalWriter:
             raise ValueError("feature bus events must not carry ops_handoff")
         return intent.payload
 
+    def _load_paper_event_by_identity(
+        self,
+        event_type: str,
+        identity: str,
+    ) -> dict:
+        contract = paper_event_contract(event_type)
+        key = paper_evidence_idempotency_key(
+            event_type,
+            {contract.identity_field: identity},
+        )
+        row = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (event_type, key),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"required {event_type} record is missing for ancestry validation"
+            )
+        try:
+            raw = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"persisted {event_type} payload is invalid JSON") from exc
+        return validate_paper_evidence_payload(event_type, raw)
+
+    def _load_quote_evidence_by_id(self, quote_evidence_id: str) -> dict:
+        key = f"{PAPER_QUOTE_EVIDENCE_RECORDED}:{quote_evidence_id}"
+        row = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_QUOTE_EVIDENCE_RECORDED, key),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "required Level-1 quote evidence is missing for execution validation"
+            )
+        try:
+            raw = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError("persisted quote evidence payload is invalid JSON") from exc
+        return validate_quote_evidence_payload(raw)
+
+    def _load_instrument_version_by_id(self, instrument_version_id: str) -> dict:
+        """Resolve a canonical instrument version, failing closed when unprovable.
+
+        The authoritative mapping already exists: instrument versions are
+        committed to this same canonical store as ``MARKET_INSTRUMENT_VERSION_``
+        events. Reusing it avoids inventing a parallel instrument registry, and
+        the payload is rebuilt through the canonical verifier so a committed row
+        whose declared identity disagrees with its own reference data is rejected
+        instead of being trusted.
+        """
+        wanted = str(instrument_version_id or "").strip()
+        if not wanted:
+            raise ValueError("decision context instrument_version is required")
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (MARKET_INSTRUMENT_VERSION_RECORDED,),
+        ).fetchall()
+        resolved: dict | None = None
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "persisted instrument version payload is invalid JSON"
+                ) from exc
+            if str(raw.get("instrument_version_id") or "").strip() != wanted:
+                continue
+            try:
+                version = instrument_version_from_payload(raw)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ValueError(
+                    "canonical instrument version payload is not verifiable"
+                ) from exc
+            candidate = {
+                "instrument_version_id": version.instrument_version_id,
+                "venue": version.venue,
+                "base_asset": version.base_asset,
+                "quote_currency": version.quote_currency,
+                "venue_instrument_id": version.venue_instrument_id,
+            }
+            if resolved is not None and resolved != candidate:
+                raise ValueError(
+                    "canonical instrument version identity is ambiguous"
+                )
+            resolved = candidate
+        if resolved is None:
+            raise ValueError(
+                "decision context instrument_version is not a registered "
+                "canonical instrument version"
+            )
+        return resolved
+
+    def _committed_sibling_sequences(
+        self,
+        *,
+        event_type: str,
+        parent_field: str,
+        parent_value: str,
+        sequence_field: str,
+        identity_field: str,
+        identity_value: str,
+    ) -> list[int]:
+        """Sequences already committed for one canonical sibling scope.
+
+        The incoming event is excluded by identity so an idempotent retry of an
+        already-committed record is never treated as a duplicate of itself. The
+        caller runs inside the write transaction, so concurrent siblings cannot
+        both observe the same predecessor set.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (event_type,),
+        ).fetchall()
+        sequences: list[int] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"persisted {event_type} payload is invalid JSON"
+                ) from exc
+            if str(raw.get(parent_field) or "") != parent_value:
+                continue
+            if str(raw.get(identity_field) or "") == identity_value:
+                continue
+            sequences.append(int(raw[sequence_field]))
+        return sequences
+
+    def _require_monotonic_sibling_sequence(
+        self,
+        *,
+        event_type: str,
+        payload: Mapping[str, object],
+        parent_field: str,
+        parent_value: str,
+        sequence_field: str,
+        identity_field: str,
+        scope: str,
+    ) -> None:
+        """Enforce one unambiguous ordering for a sibling sequence.
+
+        Sequences must strictly increase within their canonical parent scope, so
+        neither a duplicate nor a regressing value can be committed and the field
+        keeps a single deterministic interpretation for downstream consumers.
+        """
+        candidate = int(payload[sequence_field])  # type: ignore[arg-type]
+        existing = self._committed_sibling_sequences(
+            event_type=event_type,
+            parent_field=parent_field,
+            parent_value=parent_value,
+            sequence_field=sequence_field,
+            identity_field=identity_field,
+            identity_value=str(payload.get(identity_field) or ""),
+        )
+        if candidate in existing:
+            raise ValueError(
+                f"{sequence_field} {candidate} is already committed for this {scope}"
+            )
+        if existing and candidate < max(existing):
+            raise ValueError(
+                f"{sequence_field} {candidate} regresses behind a committed "
+                f"sibling sequence for this {scope}"
+            )
+
+    def _admitted_dispositions(self, quote_currency: str | None = None) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (PAPER_OPPORTUNITY_DISPOSITION_RECORDED,),
+        ).fetchall()
+        admitted: list[dict] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("persisted Paper v2 disposition is invalid JSON") from exc
+            payload = validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                raw,
+            )
+            if payload.get("disposition") != "ADMITTED":
+                continue
+            if quote_currency is not None and payload.get("quote_currency") != quote_currency:
+                continue
+            admitted.append(payload)
+        return admitted
+
+    def _portfolio_state(self, quote_currency: str) -> tuple[int, float, int]:
+        """Return version, reserved capital, active reservation count.
+
+        In B/C-1 a committed ADMITTED disposition is the reservation authority.
+        Reservation release is deliberately deferred to B/C-2, so the version is
+        exactly the number of admissions for the quote-currency portfolio.
+        """
+        admitted = self._admitted_dispositions(quote_currency)
+        reserved = sum(
+            float(item["requested_reservation_amount"])
+            for item in admitted
+        )
+        return len(admitted), reserved, len(admitted)
+
+    def _admission_for_reservation(self, reservation_id: str) -> dict:
+        matches = [
+            item
+            for item in self._admitted_dispositions()
+            if item.get("reservation_id") == reservation_id
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise ValueError("reservation ancestry is missing")
+            raise ValueError("reservation ancestry is ambiguous")
+        return matches[0]
+
+    def _validate_quote_matches_lineage(
+        self,
+        quote: Mapping[str, object],
+        *,
+        context: Mapping[str, object],
+        admission: Mapping[str, object],
+    ) -> None:
+        """Bind quote evidence to the canonical execution instrument identity.
+
+        Comparing self-declared strings alone is insufficient: a producer could
+        copy a compatible ``instrument_version`` while recording a different venue
+        or native symbol. The authoritative identity is therefore resolved from
+        the canonical instrument-version registry the decision context names, and
+        the quote must match it on every identity dimension. If the instrument
+        cannot be proven canonically, the evidence is rejected rather than trusted.
+        """
+        instrument_version_id = str(context.get("instrument_version") or "")
+        if quote.get("instrument_version") != instrument_version_id:
+            raise ValueError("quote evidence instrument_version does not match decision context")
+
+        instrument = self._load_instrument_version_by_id(instrument_version_id)
+        canonical_venue = str(instrument.get("venue") or "").strip().upper()
+        if str(quote.get("venue") or "").strip().upper() != canonical_venue:
+            raise ValueError(
+                "quote evidence venue does not match the canonical instrument version"
+            )
+        canonical_native_symbol = str(
+            instrument.get("venue_instrument_id") or ""
+        ).strip()
+        if str(quote.get("native_symbol") or "").strip() != canonical_native_symbol:
+            raise ValueError(
+                "quote evidence native_symbol does not match the canonical "
+                "instrument version"
+            )
+        canonical_quote_currency = str(
+            instrument.get("quote_currency") or ""
+        ).strip().upper()
+        if str(quote.get("quote_currency") or "").strip().upper() != canonical_quote_currency:
+            raise ValueError(
+                "quote evidence quote_currency does not match the canonical "
+                "instrument version"
+            )
+        if quote.get("quote_currency") != admission.get("quote_currency"):
+            raise ValueError("quote evidence quote_currency does not match reservation")
+
+    @staticmethod
+    def _temporal_bounds(
+        evidence: object,
+        *,
+        field_name: str,
+    ) -> tuple[datetime, datetime]:
+        if not isinstance(evidence, Mapping):
+            raise ValueError(f"{field_name} must be temporal evidence")
+        precision = str(evidence.get("precision") or "")
+        if precision == "EXACT":
+            raw = evidence.get("occurred_at")
+            if not isinstance(raw, str):
+                raise ValueError(f"{field_name}.occurred_at is required")
+            moment = _parse_aware_iso_timestamp(raw, field_name=field_name)
+            return moment, moment
+        if precision == "BOUNDED":
+            raw_start = evidence.get("window_start")
+            raw_end = evidence.get("window_end")
+            if not isinstance(raw_start, str) or not isinstance(raw_end, str):
+                raise ValueError(f"{field_name} bounded window is incomplete")
+            start = _parse_aware_iso_timestamp(raw_start, field_name=field_name)
+            end = _parse_aware_iso_timestamp(raw_end, field_name=field_name)
+            if end < start:
+                raise ValueError(f"{field_name} bounded window is inverted")
+            return start, end
+        raise ValueError(
+            f"{field_name} must be EXACT or BOUNDED for execution evidence"
+        )
+
+    def _validate_quote_causality(
+        self,
+        quote: Mapping[str, object],
+        *,
+        execution_time: object,
+        execution_time_field: str,
+    ) -> None:
+        # For bounded evidence, preserve uncertainty and fail closed unless the
+        # entire quote interval is no later than the earliest possible execution
+        # time. Overlapping intervals cannot prove the quote was already known.
+        _, quote_end = self._temporal_bounds(
+            quote.get("quote_time"),
+            field_name="quote_time",
+        )
+        execution_start, _ = self._temporal_bounds(
+            execution_time,
+            field_name=execution_time_field,
+        )
+        if quote_end > execution_start:
+            raise ValueError(
+                "Level-1 quote evidence is not proven available before execution"
+            )
+
+    def _validate_paper_execution_ancestry(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
+            return
+
+        if event_type == PAPER_ORDER_INTENT_RECORDED:
+            context_id = self._require_string_ref(payload, "decision_context_id")
+            context = self._load_context_by_id(context_id)
+            reservation_id = self._require_string_ref(payload, "reservation_id")
+            admission = self._admission_for_reservation(reservation_id)
+            if admission.get("decision_context_id") != context_id:
+                raise ValueError("order intent decision context does not match reservation")
+            if admission.get("paper_trade_id") != payload.get("paper_trade_id"):
+                raise ValueError("order intent paper_trade_id does not match reservation")
+            if context.get("context_id") != context_id:
+                raise ValueError("order intent decision context ancestry is invalid")
+            if payload.get("intent_role") == "ENTRY" and (
+                float(payload["requested_notional"])
+                > float(admission["requested_reservation_amount"]) + 1e-9
+            ):
+                raise ValueError("entry requested_notional exceeds reserved capital")
+            return
+
+        if event_type == PAPER_EXECUTION_ATTEMPT_RECORDED:
+            order_id = self._require_string_ref(payload, "order_intent_id")
+            order = self._load_paper_event_by_identity(
+                PAPER_ORDER_INTENT_RECORDED,
+                order_id,
+            )
+            if order.get("paper_trade_id") != payload.get("paper_trade_id"):
+                raise ValueError("execution attempt paper_trade_id does not match order intent")
+            # Attempts are sequenced within their parent order intent, so the
+            # order is the sibling scope that gives attempt_seq one meaning.
+            self._require_monotonic_sibling_sequence(
+                event_type=PAPER_EXECUTION_ATTEMPT_RECORDED,
+                payload=payload,
+                parent_field="order_intent_id",
+                parent_value=order_id,
+                sequence_field="attempt_seq",
+                identity_field="execution_attempt_id",
+                scope="order intent",
+            )
+            admission = self._admission_for_reservation(str(order["reservation_id"]))
+            context = self._load_context_by_id(str(order["decision_context_id"]))
+            state = ExecutionState(str(payload["execution_state"]))
+            fillable_states = {
+                ExecutionState.ACCEPTED,
+                ExecutionState.WORKING,
+                ExecutionState.PARTIALLY_FILLED,
+                ExecutionState.FILLED,
+            }
+            accepted_quantity = payload.get("accepted_quantity")
+            if state in fillable_states:
+                if not isinstance(accepted_quantity, (int, float)) or isinstance(
+                    accepted_quantity, bool
+                ):
+                    raise ValueError(
+                        "fillable execution attempt requires accepted_quantity"
+                    )
+                accepted = float(accepted_quantity)
+                if accepted <= 0:
+                    raise ValueError(
+                        "fillable execution attempt requires positive accepted_quantity"
+                    )
+                if accepted > float(order["requested_quantity"]) + 1e-9:
+                    raise ValueError(
+                        "execution attempt accepted_quantity exceeds requested order quantity"
+                    )
+
+            quote_ref = payload.get("market_evidence_ref")
+            quote_required = state in fillable_states
+            if quote_required and not isinstance(quote_ref, str):
+                raise ValueError(
+                    "execution attempt state requires exact Level-1 market_evidence_ref"
+                )
+            if quote_ref is not None:
+                if not isinstance(quote_ref, str) or not quote_ref:
+                    raise ValueError("market_evidence_ref is invalid")
+                quote = self._load_quote_evidence_by_id(quote_ref)
+                self._validate_quote_matches_lineage(
+                    quote,
+                    context=context,
+                    admission=admission,
+                )
+                self._validate_quote_causality(
+                    quote,
+                    execution_time=payload.get("attempt_time"),
+                    execution_time_field="attempt_time",
+                )
+            return
+
+        if event_type != PAPER_FILL_RECORDED:
+            return
+
+        attempt_id = self._require_string_ref(payload, "execution_attempt_id")
+        order_id = self._require_string_ref(payload, "order_intent_id")
+        attempt = self._load_paper_event_by_identity(
+            PAPER_EXECUTION_ATTEMPT_RECORDED,
+            attempt_id,
+        )
+        order = self._load_paper_event_by_identity(
+            PAPER_ORDER_INTENT_RECORDED,
+            order_id,
+        )
+        if attempt.get("order_intent_id") != order_id:
+            raise ValueError("fill execution attempt does not belong to order intent")
+        if attempt.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("fill paper_trade_id does not match execution attempt")
+        if order.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("fill paper_trade_id does not match order intent")
+        if order.get("side") != payload.get("side"):
+            raise ValueError("fill side does not match order intent")
+
+        attempt_state = ExecutionState(str(attempt["execution_state"]))
+        fillable_states = {
+            ExecutionState.ACCEPTED,
+            ExecutionState.WORKING,
+            ExecutionState.PARTIALLY_FILLED,
+            ExecutionState.FILLED,
+        }
+        if attempt_state not in fillable_states:
+            raise ValueError("fill cannot reference a non-fillable execution attempt")
+        # Fills are sequenced within their parent execution attempt, which is the
+        # scope the frozen fill contract already defines for fill_seq.
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_FILL_RECORDED,
+            payload=payload,
+            parent_field="execution_attempt_id",
+            parent_value=attempt_id,
+            sequence_field="fill_seq",
+            identity_field="fill_id",
+            scope="execution attempt",
+        )
+        accepted_quantity = attempt.get("accepted_quantity")
+        if not isinstance(accepted_quantity, (int, float)) or isinstance(
+            accepted_quantity, bool
+        ):
+            raise ValueError("fill parent attempt is missing accepted_quantity")
+        accepted_quantity = float(accepted_quantity)
+        if accepted_quantity <= 0:
+            raise ValueError("fill parent attempt accepted_quantity must be positive")
+
+        quote_ref = payload.get("market_evidence_ref")
+        if not isinstance(quote_ref, str) or not quote_ref:
+            raise ValueError("fill requires exact Level-1 market_evidence_ref")
+        admission = self._admission_for_reservation(str(order["reservation_id"]))
+        context = self._load_context_by_id(str(order["decision_context_id"]))
+        quote = self._load_quote_evidence_by_id(quote_ref)
+        self._validate_quote_matches_lineage(
+            quote,
+            context=context,
+            admission=admission,
+        )
+        self._validate_quote_causality(
+            quote,
+            execution_time=payload.get("fill_time"),
+            execution_time_field="fill_time",
+        )
+
+        prior_rows = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (PAPER_FILL_RECORDED,),
+        ).fetchall()
+        prior_order_quantity = 0.0
+        prior_attempt_quantity = 0.0
+        for row in prior_rows:
+            raw = json.loads(str(row["payload_json"]))
+            prior = validate_paper_evidence_payload(PAPER_FILL_RECORDED, raw)
+            quantity = float(prior["quantity"])
+            if prior.get("order_intent_id") == order_id:
+                prior_order_quantity += quantity
+            if prior.get("execution_attempt_id") == attempt_id:
+                prior_attempt_quantity += quantity
+
+        fill_quantity = float(payload["quantity"])
+        if prior_attempt_quantity + fill_quantity > accepted_quantity + 1e-9:
+            raise ValueError(
+                "aggregate fill quantity exceeds execution attempt accepted_quantity"
+            )
+        if (
+            prior_order_quantity + fill_quantity
+            > float(order["requested_quantity"]) + 1e-9
+        ):
+            raise ValueError("aggregate fill quantity exceeds requested order quantity")
+
+    def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
+        """Validate B/C-1 producer-submitted Paper v2 evidence.
+
+        Opportunity disposition is intentionally absent here: admission must go
+        through admit_paper_opportunity so the portfolio version check,
+        capital/capacity decision, reservation identity and disposition commit
+        share one canonical transaction.
+        """
+        if intent.priority != PAPER_EXECUTION_PRIORITY:
+            raise ValueError("Paper v2 execution events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError("Paper v2 execution events must not carry ops_handoff")
+
+        if intent.event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
+            normalized = validate_quote_evidence_payload(intent.payload)
+            expected_key = quote_evidence_idempotency_key(normalized)
+        else:
+            if intent.event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+                raise ValueError("Paper v2 event is not registered in B/C-1")
+            normalized = validate_paper_evidence_payload(
+                intent.event_type,
+                intent.payload,
+            )
+            expected_key = paper_evidence_idempotency_key(
+                intent.event_type,
+                normalized,
+            )
+        if intent.idempotency_key != expected_key:
+            raise ValueError(
+                "Paper v2 idempotency_key does not match canonical record identity"
+            )
+        return normalized
+
     def _validate_paper_outcome_intent(self, intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
 
@@ -1205,6 +2238,8 @@ class CanonicalWriter:
             return self._validate_decision_intelligence_intent(intent)
         if intent.event_type in PAPER_OUTCOME_EVENT_TYPES:
             return self._validate_paper_outcome_intent(intent)
+        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            return self._validate_paper_execution_intent(intent)
 
         self._validate_alert_ops_intent(intent)
         return intent.payload
@@ -1225,6 +2260,8 @@ class CanonicalWriter:
             return FEATURE_BUS_STREAM
         if event_type in PAPER_OUTCOME_EVENT_TYPES:
             return PAPER_OUTCOME_STREAM
+        if event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            return PAPER_EXECUTION_STREAM
         return STREAM_EARLY_WATCH
 
     @staticmethod
@@ -1234,6 +2271,7 @@ class CanonicalWriter:
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
+            and event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(
@@ -1370,6 +2408,11 @@ class CanonicalWriter:
             intent.event_type,
             payload,
         )
+        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            self._validate_paper_execution_ancestry(
+                intent.event_type,
+                payload,
+            )
         if intent.event_type in {
             DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
             DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
