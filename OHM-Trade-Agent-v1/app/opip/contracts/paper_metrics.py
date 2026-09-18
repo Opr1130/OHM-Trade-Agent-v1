@@ -231,6 +231,12 @@ _PAPER_METRICS = {
 }
 
 
+for key, metric in _PAPER_METRICS.items():
+    if key != metric.metric_id:
+        raise ValueError(
+            f"metric key {key!r} does not match metric_id {metric.metric_id!r}"
+        )
+
 PAPER_METRICS: Mapping[str, MetricDefinition] = MappingProxyType(_PAPER_METRICS)
 
 
