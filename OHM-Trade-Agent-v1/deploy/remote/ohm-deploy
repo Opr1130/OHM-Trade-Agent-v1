@@ -509,11 +509,39 @@ elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica
 fi
 echo "OPIP_LEARNING_READINESS=$learning_readiness"
 
+# ---------------------------------------------------------------------------
+# POST-COMMIT OBSERVATIONS.
+#
+# The core release is already committed above. Every command from here on is
+# diagnostic, so none of them may abort the script: under `set -e` an unguarded
+# nonzero `docker`/`curl` would end the process nonzero, and the workflow would
+# then report a committed, healthy core as SERVER DEPLOY FAILED. Each command is
+# therefore captured and folded into one structured health marker, and the script
+# always exits 0 once the core is committed.
+# ---------------------------------------------------------------------------
 # Learning computation is remote-only. Production performs only the lightweight
 # bounded evidence export installed by reconcile-scheduler.sh.
 echo "O'Pip deployment succeeded"
 echo "sha=$TARGET_SHA"
-docker compose ps
-docker compose -f "$PAPER_COMPOSE" ps
-curl --fail --silent --show-error http://127.0.0.1:8000/health
-echo
+
+postcommit_problems=0
+compose_ps_out="$(docker compose ps 2>&1)" || postcommit_problems=1
+printf '%s\n' "$compose_ps_out"
+paper_ps_out="$(docker compose -f "$PAPER_COMPOSE" ps 2>&1)" || postcommit_problems=1
+printf '%s\n' "$paper_ps_out"
+if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
+  echo
+else
+  echo "O'Pip post-commit core health probe failed" >&2
+  postcommit_problems=1
+fi
+
+if (( postcommit_problems == 0 )); then
+  echo "OPIP_CORE_POSTCOMMIT_HEALTH=OK"
+else
+  echo "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED"
+fi
+
+# The core release is committed, so this process must not report failure on its
+# way out. Anything genuinely wrong is carried by the structured markers above.
+exit 0

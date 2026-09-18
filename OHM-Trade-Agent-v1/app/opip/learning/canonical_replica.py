@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1165,6 +1166,9 @@ MANIFEST_ENV_FILENAME = "manifest.env"
 #: ``canonical_learning_replica.<tree sha256>``.
 EXPORT_REPLICA_DIR_PATTERN = re.compile(r"^canonical_learning_replica\.[0-9a-f]{64}$")
 
+#: A bare lowercase SHA-256, used for recorded digests.
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
 #: Deploy-time freshness bound for the committed export. Derived from the export
 #: schedule (2 minutes + 40s offset, so ~160s per cycle) with margin: two full
 #: cycles plus slack, so one missed tick does not flap the gate while a genuinely
@@ -1187,6 +1191,7 @@ REASON_EXPORT_STALE = "LEARNING_EXPORT_STALE"
 REASON_EXPORT_REPLICA_MARKER_MISSING = "LEARNING_EXPORT_REPLICA_MARKER_MISSING"
 REASON_EXPORT_REPLICA_DIR_INVALID = "LEARNING_EXPORT_REPLICA_DIR_INVALID"
 REASON_EXPORT_REPLICA_MISMATCH = "LEARNING_EXPORT_REPLICA_PROVENANCE_MISMATCH"
+REASON_EXPORT_OUTER_ADDRESS_INVALID = "LEARNING_EXPORT_OUTER_CONTENT_ADDRESS_INVALID"
 REASON_EXPORT_READY = "LEARNING_EXPORT_READY"
 
 
@@ -1333,9 +1338,66 @@ def _evaluate_committed_export(
             facts,
         )
 
-    # 5. The inner replica manifest is the real provenance contract: it proves
-    #    hashes, release binding and snapshot freshness for the immutable
-    #    generation the manifest points at.
+    # 5. The OUTER content address must be proven, not merely present. The marker
+    #    claims a tree digest and a byte count; both are recomputed from the
+    #    referenced tree with the same implementation the exporter used, and the
+    #    directory's own name must agree with the claimed digest. Without this the
+    #    manifest could name a directory whose contents were not what was
+    #    published - the inner manifest alone cannot detect that, because its
+    #    recorded hashes travel inside the same tree.
+    recorded_tree_sha = (manifest.get("canonical_learning_replica_sha256", "") or "").strip()
+    recorded_tree_bytes = (manifest.get("canonical_learning_replica_bytes", "") or "").strip()
+    facts["manifest_replica_tree_sha256"] = recorded_tree_sha
+    facts["manifest_replica_tree_bytes"] = recorded_tree_bytes
+    if not _SHA256_PATTERN.match(recorded_tree_sha):
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            f"manifest canonical_learning_replica_sha256 is not a sha256: {recorded_tree_sha!r}",
+            facts,
+        )
+    if not recorded_tree_bytes.isdigit():
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "manifest canonical_learning_replica_bytes is not a non-negative integer: "
+            f"{recorded_tree_bytes!r}",
+            facts,
+        )
+    claimed_bytes = int(recorded_tree_bytes)
+    if dir_name.rsplit(".", 1)[-1] != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "referenced directory name does not match the manifest tree digest "
+            f"({dir_name.rsplit('.', 1)[-1]} != {recorded_tree_sha})",
+            facts,
+        )
+    try:
+        actual_tree_sha, actual_tree_bytes = replica_tree_digest(replica_dir)
+    except ReplicaUnavailableError as exc:
+        return False, exc.reason, str(exc), facts
+    facts["actual_replica_tree_sha256"] = actual_tree_sha
+    facts["actual_replica_tree_bytes"] = actual_tree_bytes
+    if actual_tree_sha != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree digest does not match the manifest "
+            f"({actual_tree_sha} != {recorded_tree_sha})",
+            facts,
+        )
+    if actual_tree_bytes != claimed_bytes:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree byte count does not match the manifest "
+            f"({actual_tree_bytes} != {claimed_bytes})",
+            facts,
+        )
+
+    # 6. Finally the inner replica manifest, which proves hashes, release binding
+    #    and snapshot freshness for the immutable generation just content-addressed.
     try:
         inner = read_replica_manifest(replica_dir / MANIFEST_FILENAME)
         verified = verify_replica_manifest(
@@ -1441,6 +1503,78 @@ def _cmd_verify_export(args: argparse.Namespace) -> int:
     )
     print(f"  {readiness.detail}", file=sys.stderr)
     return 3
+
+
+# ---------------------------------------------------------------------------
+# Replica content address (single implementation)
+#
+# The published replica directory is content-addressed:
+# ``canonical_learning_replica.<tree sha256>``. The exporter names the directory
+# from this digest and records it in ``manifest.env`` as
+# ``canonical_learning_replica_sha256`` / ``canonical_learning_replica_bytes``;
+# the deploy-side verifier recomputes it and requires agreement.
+#
+# There is exactly ONE implementation, used by both sides, so the two cannot
+# silently drift. The ordering is defined as a byte-sort of each file's
+# ``./relative/path`` record. That is deliberate: the shell version this replaces
+# sorted with the ambient locale, which makes a content address depend on the
+# environment that produced it. A content address must be a pure function of the
+# content.
+# ---------------------------------------------------------------------------
+
+
+def _iter_tree_files(root: Path) -> list[tuple[bytes, Path]]:
+    """Regular files under ``root`` as ``(record, path)``, symlinks excluded.
+
+    Mirrors ``find . -type f``: a symlink is not a regular file, so it is not
+    part of the content address. Symlinked directories are never traversed.
+    """
+    entries: list[tuple[bytes, Path]] = []
+    for current, dirnames, filenames in os.walk(Path(root), followlinks=False):
+        # Prune symlinked directories so a link can never pull an outside tree in.
+        dirnames[:] = [
+            name for name in dirnames if not (Path(current) / name).is_symlink()
+        ]
+        for name in filenames:
+            path = Path(current) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            entries.append((f"./{relative}".encode("utf-8"), path))
+    return entries
+
+
+def replica_tree_digest(root: Path) -> tuple[str, int]:
+    """Return ``(tree_sha256, total_bytes)`` for a replica tree.
+
+    ``total_bytes`` is the sum of regular-file sizes. ``tree_sha256`` is the
+    SHA-256 of the concatenated ``<file sha256>  <record>\\n`` lines, in
+    byte-sorted record order - the same line format ``sha256sum`` emits, so the
+    digest is reproducible and auditable from the tree alone.
+    """
+    base = Path(root)
+    if not base.is_dir():
+        raise ReplicaUnavailableError(
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"replica tree is not a directory: {base}",
+        )
+    total = 0
+    digests: list[tuple[bytes, bytes]] = []
+    for record, path in _iter_tree_files(base):
+        total += path.stat().st_size
+        digests.append((record, hash_file_sha256(path).encode("ascii")))
+
+    outer = hashlib.sha256()
+    for record, file_sha in sorted(digests, key=lambda item: item[0]):
+        outer.update(file_sha + b"  " + record + b"\n")
+    return outer.hexdigest(), total
+
+
+def _cmd_tree_digest(args: argparse.Namespace) -> int:
+    digest, total = replica_tree_digest(Path(args.root))
+    print(f"OPIP_REPLICA_TREE_SHA256={digest}")
+    print(f"OPIP_REPLICA_TREE_BYTES={total}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1555,6 +1689,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     verify_export.set_defaults(func=_cmd_verify_export)
 
+    tree_digest = sub.add_parser(
+        "tree-digest",
+        help="content address a replica tree (single implementation, exporter + verifier)",
+    )
+    tree_digest.add_argument("--root", required=True)
+    tree_digest.set_defaults(func=_cmd_tree_digest)
+
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
@@ -1585,6 +1726,7 @@ __all__ = [
     "REASON_DB_NOT_SELF_CONTAINED",
     "REASON_DB_SIZE_MISMATCH",
     "REASON_EXPORT_MANIFEST_MISSING",
+    "REASON_EXPORT_OUTER_ADDRESS_INVALID",
     "REASON_EXPORT_READY",
     "REASON_EXPORT_RELEASE_SHA_MISMATCH",
     "REASON_EXPORT_REPLICA_DIR_INVALID",
@@ -1624,6 +1766,7 @@ __all__ = [
     "read_replica_manifest",
     "read_snapshot_facts",
     "replica_db_path",
+    "replica_tree_digest",
     "replica_manifest_path",
     "replica_paper_gap_path",
     "replica_paper_state_path",

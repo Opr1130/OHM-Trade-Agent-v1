@@ -232,6 +232,23 @@ tree_sha256() {
   ) | sha256sum | awk '{print $1}'
 }
 
+read_replica_tree_digest() {
+  # Content address ONE replica tree using the single shared implementation.
+  #
+  # The exporter and the deploy-side verifier must never drift, so neither
+  # recomputes the digest itself: both call the same module. Note the ordering is
+  # a byte-sort of each file's record, defined in Python, rather than the
+  # locale-dependent shell sort this replaced - a content address must be a pure
+  # function of content, not of the environment that produced it.
+  local root="$1"
+  local out
+  out="$(PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica \
+    tree-digest --root "$root" 2>/dev/null)" || return 1
+  TREE_SHA256="$(printf '%s\n' "$out" | awk -F= '$1 == "OPIP_REPLICA_TREE_SHA256" {print $2; exit}')"
+  TREE_BYTES="$(printf '%s\n' "$out" | awk -F= '$1 == "OPIP_REPLICA_TREE_BYTES" {print $2; exit}')"
+  [[ "$TREE_SHA256" =~ ^[0-9a-f]{64}$ && "$TREE_BYTES" =~ ^[0-9]+$ ]]
+}
+
 # ---------------------------------------------------------------------------
 # Canonical learning replica bundle.
 #
@@ -292,13 +309,23 @@ else
   # different generation. The previously committed directory remains present
   # until manifest.env has atomically committed the new directory name, so a
   # crash before the manifest flip cannot destroy the last known-good replica.
-  replica_bytes="$(tree_bytes "$REPLICA_STAGING")"
-  replica_sha="$(tree_sha256 "$REPLICA_STAGING")"
+  if ! read_replica_tree_digest "$REPLICA_STAGING"; then
+    echo "O'Pip learning export: canonical replica content address failed (rc=70)" >&2
+    rm -rf -- "$REPLICA_STAGING"
+    exit 70
+  fi
+  replica_bytes="$TREE_BYTES"
+  replica_sha="$TREE_SHA256"
   REPLICA_PUBLISH_NAME="${REPLICA_EXPORT_NAME}.${replica_sha}"
   REPLICA_PUBLISH_DIR="$EXPORT_ROOT/$REPLICA_PUBLISH_NAME"
   if [[ -e "$REPLICA_PUBLISH_DIR" ]]; then
-    existing_bytes="$(tree_bytes "$REPLICA_PUBLISH_DIR")"
-    existing_sha="$(tree_sha256 "$REPLICA_PUBLISH_DIR")"
+    if ! read_replica_tree_digest "$REPLICA_PUBLISH_DIR"; then
+      echo "O'Pip learning export: existing replica content address failed at $REPLICA_PUBLISH_NAME" >&2
+      rm -rf -- "$REPLICA_STAGING"
+      exit 70
+    fi
+    existing_bytes="$TREE_BYTES"
+    existing_sha="$TREE_SHA256"
     if [[ "$existing_bytes" != "$replica_bytes" || "$existing_sha" != "$replica_sha" ]]; then
       echo "O'Pip learning export: content-addressed replica collision at $REPLICA_PUBLISH_NAME" >&2
       rm -rf -- "$REPLICA_STAGING"

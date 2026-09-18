@@ -118,10 +118,18 @@ def test_exporter_failure_does_not_publish_a_v1_marker():
 
 
 def test_exporter_tree_helpers_are_defined_before_first_use():
-    """bash would fail at runtime if the helpers were defined after use."""
+    """bash would fail at runtime if a helper were defined after its first use.
+
+    The replica content address moved into the shared Python module so the
+    exporter and the deploy verifier cannot drift, but the qualification archives
+    still use the shell helpers, so this contract still applies to them. The check
+    now locates each helper's actual first use rather than one hardcoded line.
+    """
     text = _text(EXPORTER)
-    assert text.index("tree_bytes() {") < text.index("replica_bytes=\"$(tree_bytes")
-    assert text.index("tree_sha256() {") < text.index("replica_sha=\"$(tree_sha256")
+    for helper in ("tree_bytes", "tree_sha256"):
+        defined = text.index(f"{helper}() {{")
+        first_use = text.index(f"$({helper} ")
+        assert defined < first_use, helper
 
 
 def test_exporter_marker_binds_version_directory_bytes_and_digest():

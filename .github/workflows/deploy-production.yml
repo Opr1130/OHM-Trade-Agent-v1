@@ -142,95 +142,177 @@ jobs:
         run: |
           set +e
           PORT="${OHM_DEPLOY_PORT:-22}"
-          ssh \
-            -i ~/.ssh/ohm_deploy \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=20 \
-            -o TCPKeepAlive=yes \
-            -p "$PORT" \
-            "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
-            "deploy $TARGET_SHA" 2>&1 | tee deploy.log
-          RC=${PIPESTATUS[0]}
 
-          # Structured post-deploy status emitted by ohm-deploy. Core release
-          # state and learning readiness are separate facts: a healthy committed
-          # core whose learning export failed must never be reported as a failed
-          # server deploy with an unknown rollback.
-          # Structured post-deploy status emitted by ohm-deploy. Core release
-          # state and learning readiness are separate facts: a healthy committed
-          # core whose learning export failed must never be reported as a failed
-          # server deploy with an unknown rollback.
-          #
-          # Values are captured with a permissive pattern and marker PRESENCE is
-          # detected separately, because a restrictive pattern cannot tell an
-          # absent marker from a malformed one. Treating a malformed value as
-          # absent would let an incompatible ohm-deploy fall into the legacy path
-          # and still publish SUCCESS from the learning markers alone.
-          CORE_STATUS="$(grep -oE 'OPIP_CORE_DEPLOY_STATUS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
-          LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
-          LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
-          if grep -q 'OPIP_CORE_DEPLOY_STATUS=' deploy.log; then
-            CORE_MARKER="PRESENT"
-          else
-            CORE_MARKER="ABSENT"
-          fi
+          run_deploy() {
+            # One invocation of the owner-gated host deploy for the exact approved
+            # target SHA. Called at most twice, and the second call is gated on the
+            # bounded legacy-transition proof in `classify`.
+            local log="$1"
+            ssh \
+              -i ~/.ssh/ohm_deploy \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=20 \
+              -o TCPKeepAlive=yes \
+              -p "$PORT" \
+              "$OHM_DEPLOY_USER@$OHM_DEPLOY_HOST" \
+              "deploy $TARGET_SHA" 2>&1 | tee "$log"
+            return "${PIPESTATUS[0]}"
+          }
 
-          # Core success requires the structured marker to say SUCCESS explicitly.
-          # An ABSENT marker means the running ohm-deploy predates the contract
-          # (it is reinstalled mid-deploy); that path is treated as legacy
-          # evidence and reported as UNPROVEN rather than as a core failure. Any
-          # other combination is malformed and fails closed.
-          core_verdict="NONE"
-          if [[ "$RC" -eq 0 ]] \
-             && grep -q "O'Pip deployment succeeded" deploy.log \
-             && grep -q '"status":"ok"' deploy.log \
-             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log; then
-            case "${CORE_MARKER}:${CORE_STATUS}" in
-              PRESENT:SUCCESS) core_verdict="PROVEN" ;;
-              ABSENT:) core_verdict="LEGACY" ;;
-              *) core_verdict="NONE" ;;
-            esac
-          fi
-
-          if [[ "$core_verdict" != "NONE" ]]; then
-            HEALTH="OK"
-            ROLLBACK="NO"
-            # Success requires BOTH learning facts: a successful export attempt AND
-            # a proven committed export for this SHA. Contradictory markers (for
-            # example export FAILED while readiness claims READY) are treated as
-            # blocked rather than as success, so partial or inconsistent marker
-            # emission fails closed.
-            if [[ "$LEARNING_EXPORT_STATUS" == "SUCCESS" && "$LEARNING_READINESS" == "READY" ]]; then
-              RESULT="SUCCESS"
-            elif [[ "$core_verdict" == "LEGACY" ]]; then
-              RESULT="CORE DEPLOYED - LEARNING UNPROVEN"
+          classify() {
+            # classify <log> <rc> <legacy_allowed>
+            #
+            # Sets RESULT / HEALTH / ROLLBACK / GATE / core_status / learning_* and
+            # TRANSITION_ELIGIBLE. Core release state and learning readiness are
+            # separate facts: a healthy committed core whose learning export failed
+            # must never be reported as a failed server deploy with an unknown
+            # rollback.
+            #
+            # Values are captured with a permissive pattern and marker PRESENCE is
+            # detected separately, because a restrictive pattern cannot tell an
+            # absent marker from a malformed one. Treating a malformed value as
+            # absent would let an incompatible ohm-deploy fall into the legacy path
+            # and still publish SUCCESS from the learning markers alone.
+            local log="$1" rc="$2" legacy_allowed="$3"
+            CORE_STATUS="$(grep -oE 'OPIP_CORE_DEPLOY_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            POSTCOMMIT_HEALTH="$(grep -oE 'OPIP_CORE_POSTCOMMIT_HEALTH=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            if grep -q 'OPIP_CORE_DEPLOY_STATUS=' "$log"; then
+              CORE_MARKER="PRESENT"
             else
-              RESULT="CORE DEPLOYED - LEARNING BLOCKED"
+              CORE_MARKER="ABSENT"
             fi
-          elif grep -q 'rollback health check passed' deploy.log; then
-            RESULT="ROLLED BACK"
-            HEALTH="PREVIOUS RELEASE OK"
-            ROLLBACK="YES"
-          elif grep -qiE 'Permission denied \(publickey\)|Too many authentication failures' deploy.log; then
-            RESULT="SSH AUTH FAILED"
-            HEALTH="NOT CONFIRMED"
-            ROLLBACK="NOT RUN"
-          elif grep -qiE 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|No .* host key is known' deploy.log; then
-            RESULT="HOST KEY FAILED"
-            HEALTH="NOT CONFIRMED"
-            ROLLBACK="NOT RUN"
-          else
-            RESULT="SERVER DEPLOY FAILED"
-            HEALTH="NOT CONFIRMED"
-            ROLLBACK="UNKNOWN OR FAILED"
+
+            # Core success requires the structured marker to say SUCCESS explicitly.
+            # An ABSENT marker means the running ohm-deploy predates the contract
+            # (it is reinstalled mid-deploy); that is the legacy path, handled as
+            # UNPROVEN or as an eligible transition below - never as a core failure.
+            # Any other combination is malformed and fails closed.
+            #
+            # The legacy path also requires the final health JSON, because that is
+            # the only core-commit evidence the legacy contract emitted. The new
+            # path deliberately does NOT require it: post-commit observation failure
+            # is reported by OPIP_CORE_POSTCOMMIT_HEALTH instead, so a failed final
+            # probe cannot retroactively deny an already-committed core.
+            core_verdict="NONE"
+            if [[ "$rc" -eq 0 ]] \
+               && grep -q "O'Pip deployment succeeded" "$log" \
+               && grep -q '"status":"ok"' "$log" \
+               && grep -q "O'Pip scheduler reconciliation: OK" "$log"; then
+              case "${CORE_MARKER}:${CORE_STATUS}" in
+                PRESENT:SUCCESS) core_verdict="PROVEN" ;;
+                ABSENT:) core_verdict="LEGACY" ;;
+                *) core_verdict="NONE" ;;
+              esac
+            fi
+
+            TRANSITION_ELIGIBLE="NO"
+            if [[ "$legacy_allowed" == "1" && "$CORE_MARKER" == "ABSENT" ]]; then
+              # A one-time transition may retry ONLY when the first invocation ran
+              # under the pre-#247 contract and provably crossed its commit point.
+              # Both such signals appear strictly after last-good-sha is written and
+              # the rollback trap is disarmed:
+              #   * "O'Pip scheduler reconciliation: OK" proves the run reached
+              #     reconcile-scheduler.sh, which is what installs THIS target SHA's
+              #     /usr/local/sbin/ohm-deploy - so the retry executes the new code;
+              #   * the P1 retirement success strings prove the commit point itself
+              #     was crossed (that step runs after last-good-sha + trap - ERR);
+              #     and "O'Pip deployment succeeded" is the legacy end-of-run marker.
+              # A genuine pre-commit failure (core/writer health, paper topology,
+              # resource budget) never produces those, so it is never retried.
+              if grep -q "O'Pip scheduler reconciliation: OK" "$log"; then
+                if [[ "$core_verdict" == "LEGACY" ]]; then
+                  TRANSITION_ELIGIBLE="YES"
+                elif grep -q "O'Pip P1 shadow outbox retirement: OK" "$log" \
+                  || grep -q 'disposition=RETIRED_OWNER_DISCARDED' "$log"; then
+                  TRANSITION_ELIGIBLE="YES"
+                fi
+              fi
+            fi
+
+            if [[ "$core_verdict" != "NONE" ]]; then
+              HEALTH="OK"
+              ROLLBACK="NO"
+              # Success requires BOTH learning facts (a successful export attempt AND
+              # a proven committed export for this SHA) AND a clean post-commit health
+              # observation. Contradictory or degraded markers are reported as a
+              # committed core with the specific problem named, so partial or
+              # inconsistent emission fails closed without ever implying that the
+              # core release failed or rolled back.
+              if [[ "$LEARNING_EXPORT_STATUS" == "SUCCESS" && "$LEARNING_READINESS" == "READY" ]]; then
+                learning_verdict="PROVEN"
+              elif [[ "$core_verdict" == "LEGACY" ]]; then
+                learning_verdict="UNPROVEN"
+              else
+                learning_verdict="BLOCKED"
+              fi
+              suffix=""
+              [[ "$learning_verdict" == "PROVEN" ]] || suffix="LEARNING $learning_verdict"
+              if [[ "$POSTCOMMIT_HEALTH" != "OK" ]]; then
+                suffix="${suffix:+$suffix + }POST-COMMIT HEALTH ${POSTCOMMIT_HEALTH:-UNREPORTED}"
+              fi
+              if [[ -z "$suffix" ]]; then
+                RESULT="SUCCESS"
+              else
+                RESULT="CORE DEPLOYED - $suffix"
+              fi
+            elif grep -q 'rollback health check passed' "$log"; then
+              RESULT="ROLLED BACK"
+              HEALTH="PREVIOUS RELEASE OK"
+              ROLLBACK="YES"
+            elif grep -qiE 'Permission denied \(publickey\)|Too many authentication failures' "$log"; then
+              RESULT="SSH AUTH FAILED"
+              HEALTH="NOT CONFIRMED"
+              ROLLBACK="NOT RUN"
+            elif grep -qiE 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|No .* host key is known' "$log"; then
+              RESULT="HOST KEY FAILED"
+              HEALTH="NOT CONFIRMED"
+              ROLLBACK="NOT RUN"
+            else
+              RESULT="SERVER DEPLOY FAILED"
+              HEALTH="NOT CONFIRMED"
+              ROLLBACK="UNKNOWN OR FAILED"
+            fi
+          }
+
+          run_deploy deploy.log
+          RC=$?
+          classify deploy.log "$RC" 1
+
+          # ---------------------------------------------------------------------
+          # ONE-TIME FIRST-DEPLOY TRANSITION.
+          #
+          # The first deploy after this contract ships executes the PREVIOUSLY
+          # installed /usr/local/sbin/ohm-deploy: reconcile-scheduler.sh installs
+          # the target-SHA script during the run, but the already-running process
+          # keeps its old code, so it never emits the structured markers and (with
+          # the paper registry still missing) aborts rc=70 at the exporter AFTER
+          # committing the core.
+          #
+          # Because that run also installed the target-SHA deploy script, exactly
+          # one further invocation of the SAME approved SHA completes the
+          # transition under the new contract. Bounded to a single retry, only for
+          # a provably-legacy transition (see `classify`), and never for a genuine
+          # core failure. The operator is not asked to re-issue /deploy.
+          # ---------------------------------------------------------------------
+          TRANSITION_RETRY="NO"
+          if [[ "$TRANSITION_ELIGIBLE" == "YES" ]]; then
+            TRANSITION_RETRY="YES"
+            echo "O'Pip deploy transition: legacy deployment detected (no structured markers, commit point crossed); performing exactly one transition retry against the newly installed target-SHA ohm-deploy" >&2
+            run_deploy deploy-transition.log
+            RC=$?
+            # legacy_allowed=0: the retry must satisfy the full structured contract.
+            classify deploy-transition.log "$RC" 0
           fi
 
-          # The gate passes only when the core committed AND learning readiness
-          # was proven. A blocked learning export is surfaced as a failed gate
-          # with an accurate result label, never hidden behind exit 0.
+          # The gate passes only when the core committed AND learning readiness was
+          # proven AND the post-commit observation was clean. A committed core with a
+          # blocked learning export is surfaced as a failed gate with an accurate
+          # result label, never hidden behind exit 0 and never reported as a rollback.
           if [[ "$RESULT" == "SUCCESS" ]]; then
             GATE="PASS"
           else
@@ -245,6 +327,8 @@ jobs:
           echo "core_status=${CORE_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "learning_export_status=${LEARNING_EXPORT_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "learning_readiness=${LEARNING_READINESS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "postcommit_health=${POSTCOMMIT_HEALTH:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "transition_retry=$TRANSITION_RETRY" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Publish deployment receipt to approval issue
@@ -261,6 +345,8 @@ jobs:
           CORE_STATUS: ${{ steps.production_deploy.outputs.core_status }}
           LEARNING_EXPORT_STATUS: ${{ steps.production_deploy.outputs.learning_export_status }}
           LEARNING_READINESS: ${{ steps.production_deploy.outputs.learning_readiness }}
+          POSTCOMMIT_HEALTH: ${{ steps.production_deploy.outputs.postcommit_health }}
+          TRANSITION_RETRY: ${{ steps.production_deploy.outputs.transition_retry }}
         run: |
           set -euo pipefail
           RESULT="${DEPLOY_RESULT:-${SSH_CONFIG_RESULT:-FAILED BEFORE SSH}}"
@@ -285,12 +371,19 @@ jobs:
           - **Core deployment:** ${CORE_STATUS:-UNKNOWN}
           - **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
           - **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
+          - **Post-commit health:** ${POSTCOMMIT_HEALTH:-UNKNOWN}
+          - **Transition retry:** ${TRANSITION_RETRY:-NO}
           - **Deploy exit code:** $RC
           - **Workflow run:** $RUN_URL
 
           \`Learning readiness\` proves a fresh committed canonical replica for this
           exact SHA. \`BLOCKED\` means the production side could not prove it; a
           \`BLOCKED\` learning gate does not indicate a core release failure.
+
+          \`Transition retry\` records the one-time first-deploy bootstrap: when the
+          first invocation ran the previously installed ohm-deploy, exactly one
+          further invocation of the same SHA completed the transition under the new
+          contract. It is never used for a genuine core failure.
           EOF
           )
 

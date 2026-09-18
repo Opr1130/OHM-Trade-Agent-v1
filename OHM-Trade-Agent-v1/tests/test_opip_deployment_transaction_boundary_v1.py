@@ -34,6 +34,7 @@ from app.opip.learning.canonical_replica import (
     EXPORT_PROOF_FRESHNESS_SECONDS,
     MANIFEST_ENV_FILENAME,
     REASON_EXPORT_MANIFEST_MISSING,
+    REASON_EXPORT_OUTER_ADDRESS_INVALID,
     REASON_EXPORT_READY,
     REASON_EXPORT_RELEASE_SHA_MISMATCH,
     REASON_EXPORT_REPLICA_DIR_INVALID,
@@ -41,6 +42,7 @@ from app.opip.learning.canonical_replica import (
     REASON_EXPORT_REPLICA_MISMATCH,
     REASON_EXPORT_STALE,
     export_replica_bundle,
+    replica_tree_digest,
     verify_committed_export,
 )
 
@@ -77,7 +79,12 @@ def _build_committed_export(
     dir_name_override: str | None = None,
     symlink_dir: bool = False,
 ) -> Path:
-    """Produce an export root that looks exactly like the production one."""
+    """Produce an export root that looks exactly like the production one.
+
+    The directory name and the recorded digest/byte count come from the SAME
+    implementation the exporter and verifier use, so this fixture cannot drift
+    from the contract it is modelling.
+    """
     source = tmp_path / "source"
     db = source / "opip" / "canonical" / "opip_canonical_v1.sqlite3"
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -97,9 +104,10 @@ def _build_committed_export(
         now=exported_at,
     )
 
+    tree_sha, tree_bytes = replica_tree_digest(staging)
     export_root = tmp_path / "export"
     export_root.mkdir(parents=True, exist_ok=True)
-    dir_name = dir_name_override or f"canonical_learning_replica.{_tree_sha256(staging)}"
+    dir_name = dir_name_override or f"canonical_learning_replica.{tree_sha}"
     target = export_root / dir_name
     if symlink_dir:
         outside = tmp_path / "outside"
@@ -119,8 +127,8 @@ def _build_committed_export(
         lines += [
             f"canonical_learning_replica_version={marker}",
             f"canonical_learning_replica_dir={dir_name}",
-            "canonical_learning_replica_bytes=1024",
-            f"canonical_learning_replica_sha256={dir_name.rsplit('.', 1)[-1]}",
+            f"canonical_learning_replica_bytes={tree_bytes}",
+            f"canonical_learning_replica_sha256={tree_sha}",
         ]
     (export_root / MANIFEST_ENV_FILENAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return export_root
@@ -344,19 +352,23 @@ def _shell_quote(value: str) -> str:
 
 
 def _classification_block() -> str:
-    """Extract the workflow's real deploy-classification shell block."""
+    """Extract the workflow's real `classify()` function body."""
     text = WORKFLOW.read_text(encoding="utf-8")
-    start = text.index('          CORE_STATUS="$(grep -oE')
-    end = text.index('          exit 0', start)
-    block = text[start:end]
+    start = text.index("          classify() {")
+    # The function ends at the first line that is exactly the closing brace at
+    # the same indentation.
+    end = text.index("\n          }\n", start)
+    block = text[start : end + len("\n          }\n")]
     return "\n".join(
         line[10:] if line.startswith("          ") else line
         for line in block.splitlines()
     )
 
 
-def _classify(tmp_path: Path, deploy_log: str, rc: int) -> dict[str, str]:
-    """Run the workflow's classification logic against a synthetic deploy log.
+def _classify(
+    tmp_path: Path, deploy_log: str, rc: int, *, legacy_allowed: int = 1
+) -> dict[str, str]:
+    """Run the workflow's classification function against a synthetic deploy log.
 
     Two fidelity details matter and are matched deliberately:
 
@@ -372,16 +384,20 @@ def _classify(tmp_path: Path, deploy_log: str, rc: int) -> dict[str, str]:
     harness = tmp_path / "classify.sh"
     harness.write_text(
         "set +e\n"
-        f"RC={rc}\n"
         f"GITHUB_OUTPUT={_shell_quote(str(tmp_path / 'github_output'))}\n"
-        ": > \"$GITHUB_OUTPUT\"\n"
-        "cd " + _shell_quote(str(tmp_path)) + "\n"
+        ': > "$GITHUB_OUTPUT"\n'
         + _classification_block()
-        + '\nprintf "RESULT=%s\\nHEALTH=%s\\nROLLBACK=%s\\nGATE=%s\\n"'
+        + "\n"
+        # Mirror the step's tail so the gate and the transition decision are
+        # exercised exactly as the workflow computes them.
+        f'classify {_shell_quote(str(tmp_path / "deploy.log"))} {rc} {legacy_allowed}\n'
+        'if [[ "$RESULT" == "SUCCESS" ]]; then GATE="PASS"; else GATE="FAIL"; fi\n'
+        'printf "RESULT=%s\\nHEALTH=%s\\nROLLBACK=%s\\nGATE=%s\\n"'
         ' "$RESULT" "$HEALTH" "$ROLLBACK" "$GATE"\n'
-        # Echo the step outputs the workflow would publish.
-        'grep -E "^(gate|core_status|learning_export_status|learning_readiness)=" '
-        '"$GITHUB_OUTPUT" || true\n',
+        'printf "CORE_STATUS=%s\\nLEARNING_EXPORT_STATUS=%s\\nLEARNING_READINESS=%s\\n"'
+        ' "${CORE_STATUS:-}" "${LEARNING_EXPORT_STATUS:-}" "${LEARNING_READINESS:-}"\n'
+        'printf "POSTCOMMIT_HEALTH=%s\\nTRANSITION_ELIGIBLE=%s\\n"'
+        ' "${POSTCOMMIT_HEALTH:-}" "${TRANSITION_ELIGIBLE:-}"\n',
         encoding="utf-8",
     )
     import subprocess
@@ -403,6 +419,40 @@ CORE_OK_LOG = "\n".join(
         '"status":"ok"',
         "O'Pip scheduler reconciliation: OK",
         "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+        "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
+    ]
+)
+
+#: The real first-deploy-after-merge shape. The previously installed ohm-deploy
+#: had no genesis and no structured markers, so it crossed its commit point
+#: (scheduler reconciliation installed this target SHA's deploy script; P1
+#: retirement ran after last-good-sha and after the rollback trap was disarmed)
+#: and then aborted rc=70 at the exporter on the still-missing registry.
+LEGACY_RC70_TRANSITION_LOG = "\n".join(
+    [
+        '"status":"ok"',
+        "O'Pip scheduler reconciliation: OK",
+        "canonical=/etc/cron.d/ohm-unified-cycle",
+        "O'Pip resource budget validation: PASS available_kb=704036",
+        "O'Pip P1 shadow outbox retirement: OK",
+        "bytes_deleted=0",
+        "disposition=RETIRED_OWNER_DISCARDED",
+        "canonical replica refused: CANONICAL_REPLICA_PAPER_STATE_MISSING: paper "
+        "lifecycle state not found at /app/data/paper_trading/state.json",
+        "O'Pip learning export: canonical replica export FAILED (rc=78)",
+        "O'Pip learning evidence export: JSON artifacts OK, canonical replica FAILED",
+    ]
+)
+
+#: Legacy case A: the old contract completed successfully but emitted no markers.
+LEGACY_RC0_TRANSITION_LOG = "\n".join(
+    [
+        '"status":"ok"',
+        "O'Pip scheduler reconciliation: OK",
+        "O'Pip P1 shadow outbox retirement: OK",
+        "disposition=RETIRED_OWNER_DISCARDED",
+        "O'Pip deployment succeeded",
+        "sha=" + RELEASE_SHA,
     ]
 )
 
@@ -461,26 +511,21 @@ def test_case_b_core_and_learning_both_succeed(tmp_path):
 
 
 @requires_bash
-def test_core_ok_without_any_markers_is_reported_unproven(tmp_path):
+def test_core_ok_without_any_markers_is_unproven_and_transition_eligible(tmp_path):
     """A pre-contract ohm-deploy emits legacy strings only.
 
     RC 0 plus the legacy success strings prove the core committed, but nothing
     proves the export, so readiness is UNPROVEN and the gate fails closed. The
-    core must not be reported as failed or rolled back.
+    core must not be reported as failed or rolled back, and this is exactly the
+    shape that makes the first deploy after the contract ships eligible for the
+    single transition retry.
     """
-    log = "\n".join(
-        [
-            '"status":"ok"',
-            "O'Pip scheduler reconciliation: OK",
-            "O'Pip deployment succeeded",
-            "sha=" + RELEASE_SHA,
-        ]
-    )
-    fields = _classify(tmp_path, log, rc=0)
-    assert fields["RESULT"] == "CORE DEPLOYED - LEARNING UNPROVEN"
+    fields = _classify(tmp_path, LEGACY_RC0_TRANSITION_LOG, rc=0, legacy_allowed=1)
+    assert fields["RESULT"].startswith("CORE DEPLOYED - LEARNING UNPROVEN")
     assert fields["HEALTH"] == "OK"
     assert fields["ROLLBACK"] == "NO"
     assert fields["GATE"] == "FAIL"
+    assert fields["TRANSITION_ELIGIBLE"] == "YES"
 
 
 @requires_bash
@@ -627,6 +672,268 @@ def test_ready_readiness_without_export_success_is_blocked(tmp_path):
     assert fields["GATE"] == "FAIL"
 
 
+# ---------------------------------------------------------------------------
+# Blocker 1 - one-time first-deploy transition
+# ---------------------------------------------------------------------------
+
+
+@requires_bash
+def test_legacy_rc70_transition_is_eligible_and_did_not_roll_back(tmp_path):
+    """The real incident shape must be eligible, and must not have rolled back.
+
+    This is the case the transition exists for: the legacy deploy crossed its
+    commit point and then aborted at the exporter, so a single retry against the
+    newly installed target-SHA ohm-deploy completes the deployment without the
+    operator re-issuing /deploy.
+    """
+    fields = _classify(tmp_path, LEGACY_RC70_TRANSITION_LOG, rc=70, legacy_allowed=1)
+    assert fields["TRANSITION_ELIGIBLE"] == "YES"
+    # No rollback: the core was already committed, so nothing was reverted.
+    assert fields["ROLLBACK"] != "YES"
+
+
+@requires_bash
+def test_legacy_rc0_success_without_markers_is_eligible(tmp_path):
+    """Legacy case A: complete legacy success, no structured markers."""
+    fields = _classify(tmp_path, LEGACY_RC0_TRANSITION_LOG, rc=0, legacy_allowed=1)
+    assert fields["TRANSITION_ELIGIBLE"] == "YES"
+    assert fields["ROLLBACK"] == "NO"
+
+
+@requires_bash
+def test_genuine_precommit_core_failure_is_never_retried(tmp_path):
+    """A real pre-commit failure must not trigger a transition retry.
+
+    Enumerated pre-commit failures - core health, writer health, paper topology and
+    resource budget - all roll back before the exporter, so none of the
+    commit-crossed evidence is present.
+    """
+    cases = {
+        "core-health": "\n".join(
+            [
+                "production core health check failed",
+                "deployment failed; rolling back to " + OTHER_SHA,
+                "rollback health check passed",
+            ]
+        ),
+        "writer-health": "\n".join(
+            [
+                "O'Pip scheduler reconciliation: OK",
+                "production writer health check failed",
+                "deployment failed; rolling back to " + OTHER_SHA,
+                "rollback health check passed",
+            ]
+        ),
+        "paper-topology": "\n".join(
+            [
+                '"status":"ok"',
+                "O'Pip scheduler reconciliation: OK",
+                "Freqtrade paper topology failed health/authority validation",
+                "deployment failed; rolling back to " + OTHER_SHA,
+                "rollback health check passed",
+            ]
+        ),
+        "resource-budget": "\n".join(
+            [
+                '"status":"ok"',
+                "O'Pip scheduler reconciliation: OK",
+                "insufficient host memory headroom after paper startup: available_kb=1000",
+                "deployment failed; rolling back to " + OTHER_SHA,
+                "rollback health check passed",
+            ]
+        ),
+    }
+    for name, log in cases.items():
+        case_dir = tmp_path / name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        fields = _classify(case_dir, log, rc=1, legacy_allowed=1)
+        assert fields["TRANSITION_ELIGIBLE"] == "NO", name
+        assert fields["ROLLBACK"] == "YES", name
+        assert fields["GATE"] == "FAIL", name
+
+
+@requires_bash
+def test_retry_cannot_recur_because_it_is_classified_strictly(tmp_path):
+    """Bounded to one: a legacy log reclassified strictly is not eligible.
+
+    The retry is classified with legacy_allowed=0, so even if it somehow produced
+    legacy output the workflow could not loop.
+    """
+    fields = _classify(tmp_path, LEGACY_RC70_TRANSITION_LOG, rc=70, legacy_allowed=0)
+    assert fields["TRANSITION_ELIGIBLE"] == "NO"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
+def test_second_invocation_success_yields_structured_success(tmp_path):
+    """The retry running the new ohm-deploy must produce a normal SUCCESS."""
+    log = "\n".join(
+        [
+            CORE_OK_LOG,
+            "OPIP_PAPER_REGISTRY_GENESIS=INITIALIZED",
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+            "sha=" + RELEASE_SHA,
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "SUCCESS"
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
+    assert fields["GATE"] == "PASS"
+    assert fields["TRANSITION_ELIGIBLE"] == "NO"
+
+
+@requires_bash
+def test_second_invocation_failure_stays_blocked(tmp_path):
+    """If the retry still cannot prove the export, the gate stays red."""
+    log = "\n".join(
+        [
+            CORE_OK_LOG,
+            "OPIP_PAPER_REGISTRY_GENESIS_STATUS=REFUSED",
+            "OPIP_LEARNING_EXPORT_STATUS=FAILED",
+            "OPIP_LEARNING_READINESS=BLOCKED",
+            "O'Pip deployment succeeded",
+            "sha=" + RELEASE_SHA,
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "CORE DEPLOYED - LEARNING BLOCKED"
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
+    assert fields["GATE"] == "FAIL"
+    assert fields["TRANSITION_ELIGIBLE"] == "NO"
+
+
+def test_workflow_retries_at_most_once():
+    """The workflow must contain exactly one transition retry invocation."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("run_deploy deploy-transition.log") == 1
+    # The retry is gated on the eligibility flag, not on a bare failure.
+    assert 'if [[ "$TRANSITION_ELIGIBLE" == "YES" ]]; then' in text
+    # And it is classified strictly, so it cannot recur.
+    assert 'classify deploy-transition.log "$RC" 0' in text
+    # No loop construct may wrap a deploy invocation.
+    for token in ("while ", "until "):
+        assert token not in text, token
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2 - post-commit commands must not abort the committed release
+# ---------------------------------------------------------------------------
+
+_DOCKER_SHIM_OK = "#!/bin/sh\necho 'shim: compose ps'\nexit 0\n"
+_DOCKER_SHIM_FAIL = "#!/bin/sh\necho 'shim: compose ps failed' >&2\nexit 1\n"
+_CURL_SHIM_OK = "#!/bin/sh\necho '{\"status\":\"ok\"}'\nexit 0\n"
+_CURL_SHIM_FAIL = "#!/bin/sh\necho 'shim: connection reset' >&2\nexit 1\n"
+
+
+def _postcommit_section() -> str:
+    """Extract ohm-deploy's post-commit section (from the success echo to EOF)."""
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    start = source.index('echo "O\'Pip deployment succeeded"')
+    return source[start:]
+
+
+def _run_postcommit(tmp_path: Path, *, docker_ok: bool, curl_ok: bool) -> tuple[int, str]:
+    """Run the real post-commit section with failing shims on PATH.
+
+    This is the behavioural replacement for a static "no exit 69/70" assertion: it
+    proves that a nonzero post-commit docker/curl command cannot abort an
+    already-committed release.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir(parents=True, exist_ok=True)
+    for name, body in (
+        ("docker", _DOCKER_SHIM_OK if docker_ok else _DOCKER_SHIM_FAIL),
+        ("curl", _CURL_SHIM_OK if curl_ok else _CURL_SHIM_FAIL),
+    ):
+        exe = shim / name
+        exe.write_text(body, encoding="utf-8")
+        exe.chmod(0o755)
+
+    harness = tmp_path / "postcommit.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        f'PAPER_COMPOSE={_shell_quote(str(tmp_path / "docker-compose.paper.yml"))}\n'
+        f"TARGET_SHA={RELEASE_SHA}\n"
+        + _postcommit_section(),
+        encoding="utf-8",
+    )
+    import subprocess
+
+    proc = subprocess.run(
+        [BASH, str(harness)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"},
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+@requires_bash
+def test_postcommit_nonzero_docker_cannot_abort_the_committed_core(tmp_path):
+    """A failing post-commit docker command must not abort or fail the core."""
+    rc, out = _run_postcommit(tmp_path, docker_ok=False, curl_ok=True)
+    assert rc == 0, out
+    assert "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED" in out
+    assert "O'Pip deployment succeeded" in out
+
+
+@requires_bash
+def test_postcommit_nonzero_curl_cannot_abort_the_committed_core(tmp_path):
+    """A failing final health probe must not abort or fail the core."""
+    rc, out = _run_postcommit(tmp_path, docker_ok=True, curl_ok=False)
+    assert rc == 0, out
+    assert "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED" in out
+
+
+@requires_bash
+def test_postcommit_clean_observations_report_ok(tmp_path):
+    """Control: with working shims the marker is OK, so the test discriminates."""
+    rc, out = _run_postcommit(tmp_path, docker_ok=True, curl_ok=True)
+    assert rc == 0, out
+    assert "OPIP_CORE_POSTCOMMIT_HEALTH=OK" in out
+    assert "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED" not in out
+
+
+@requires_bash
+def test_postcommit_degraded_health_is_reported_but_not_as_a_core_failure(tmp_path):
+    """Degraded post-commit health goes red without implying a core failure."""
+    log = "\n".join(
+        [
+            "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+            "O'Pip scheduler reconciliation: OK",
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "CORE DEPLOYED - POST-COMMIT HEALTH DEGRADED"
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
+    assert fields["GATE"] == "FAIL"
+
+
+def test_postcommit_section_guards_every_command():
+    """Static supplement: no bare post-commit command may run unguarded."""
+    section = _postcommit_section()
+    assert 'compose_ps_out="$(docker compose ps 2>&1)" || postcommit_problems=1' in section
+    assert (
+        'paper_ps_out="$(docker compose -f "$PAPER_COMPOSE" ps 2>&1)"'
+        " || postcommit_problems=1" in section
+    )
+    assert "if curl --fail --silent --show-error http://127.0.0.1:8000/health; then" in section
+    # The section always exits zero once the core is committed.
+    assert section.rstrip().endswith("exit 0")
+    for forbidden in ("exit 69", "exit 70"):
+        assert forbidden not in section
+
+
 def test_workflow_receipt_reports_core_and_learning_separately():
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "**Core health:** $HEALTH" in text
@@ -658,18 +965,256 @@ def test_export_proof_bounds_are_derived_from_the_export_cadence():
 
 
 def test_export_proof_requires_the_immutable_generation_to_verify(tmp_path):
-    """The proof must inspect the generation, not just the manifest text."""
+    """Tampering the generation is caught (by the outer address, first)."""
     root = _build_committed_export(tmp_path)
-    # Tamper with the referenced generation's database: hash validation must fail.
-    dir_name = [
-        line.split("=", 1)[1]
-        for line in (root / MANIFEST_ENV_FILENAME).read_text(encoding="utf-8").splitlines()
-        if line.startswith("canonical_learning_replica_dir=")
-    ][0]
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
     db = root / dir_name / "opip" / "canonical" / "opip_canonical_v1.sqlite3"
     db.write_bytes(db.read_bytes() + b"tampered")
 
     readiness = _verify(root)
 
     assert readiness.ready is False
+    # The outer content address is the first integrity gate, so it reports the
+    # tamper. (The test below proves the inner verification still fires when the
+    # outer address is made consistent with the tampered tree.)
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_outer_consistent_but_inner_invalid_is_blocked(tmp_path):
+    """The outer address cannot be used to bypass the inner provenance check.
+
+    Here the outer content address is made fully self-consistent *after*
+    tampering - directory renamed to the new digest and the manifest rewritten to
+    match - so the outer gate passes and the inner replica manifest must still
+    refuse the generation.
+    """
+    root = _build_committed_export(tmp_path)
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
+    db = root / dir_name / "opip" / "canonical" / "opip_canonical_v1.sqlite3"
+    db.write_bytes(db.read_bytes() + b"tampered")
+
+    # Re-establish a consistent OUTER address over the tampered tree.
+    new_sha, new_bytes = replica_tree_digest(root / dir_name)
+    new_name = f"canonical_learning_replica.{new_sha}"
+    (root / dir_name).rename(root / new_name)
+    _rewrite_manifest(
+        root,
+        canonical_learning_replica_dir=new_name,
+        canonical_learning_replica_sha256=new_sha,
+        canonical_learning_replica_bytes=str(new_bytes),
+    )
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
     assert readiness.reason == REASON_EXPORT_REPLICA_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3 - the OUTER content address must be proven
+# ---------------------------------------------------------------------------
+
+
+def _manifest_line(root: Path, key: str) -> str:
+    for line in (root / MANIFEST_ENV_FILENAME).read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"{key} not in manifest")
+
+
+def _rewrite_manifest(root: Path, **values: str) -> None:
+    lines = (root / MANIFEST_ENV_FILENAME).read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0] if "=" in line else ""
+        if key in values:
+            out.append(f"{key}={values[key]}")
+        else:
+            out.append(line)
+    (root / MANIFEST_ENV_FILENAME).write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def test_control_content_addressed_export_is_ready(tmp_path):
+    """Control for the negative cases below: a genuine content address passes."""
+    root = _build_committed_export(tmp_path)
+    readiness = _verify(root)
+    assert readiness.ready is True
+    assert readiness.facts["actual_replica_tree_sha256"] == _manifest_line(
+        root, "canonical_learning_replica_sha256"
+    )
+    assert readiness.facts["actual_replica_tree_bytes"] == int(
+        _manifest_line(root, "canonical_learning_replica_bytes")
+    )
+
+
+def test_outer_manifest_sha_mismatch_is_blocked(tmp_path):
+    """A recorded digest that is not the tree's real digest must be refused."""
+    root = _build_committed_export(tmp_path)
+    _rewrite_manifest(root, canonical_learning_replica_sha256="a" * 64)
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_outer_manifest_sha_not_a_digest_is_blocked(tmp_path):
+    root = _build_committed_export(tmp_path)
+    _rewrite_manifest(root, canonical_learning_replica_sha256="notahash")
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_directory_suffix_disagreeing_with_manifest_sha_is_blocked(tmp_path):
+    """A correct-looking directory whose name disagrees with the manifest fails.
+
+    This is the case the inner manifest cannot catch: the name claims one content
+    address while the manifest claims another.
+    """
+    root = _build_committed_export(tmp_path)
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
+    real_sha = _manifest_line(root, "canonical_learning_replica_sha256")
+    other_sha = ("b" * 64) if real_sha != "b" * 64 else ("c" * 64)
+    # Rename the real directory to a name ending in a DIFFERENT valid digest and
+    # point the manifest at it.
+    (root / dir_name).rename(root / f"canonical_learning_replica.{other_sha}")
+    _rewrite_manifest(
+        root,
+        canonical_learning_replica_dir=f"canonical_learning_replica.{other_sha}",
+    )
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+    assert "directory name does not match" in readiness.detail
+
+
+def test_outer_manifest_byte_count_mismatch_is_blocked(tmp_path):
+    """A wrong byte count must be refused even when the digest matches."""
+    root = _build_committed_export(tmp_path)
+    actual = _manifest_line(root, "canonical_learning_replica_bytes")
+    _rewrite_manifest(root, canonical_learning_replica_bytes=str(int(actual) + 1))
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_outer_manifest_byte_count_not_an_integer_is_blocked(tmp_path):
+    root = _build_committed_export(tmp_path)
+    _rewrite_manifest(root, canonical_learning_replica_bytes="abc")
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_outer_manifest_negative_byte_count_is_blocked(tmp_path):
+    root = _build_committed_export(tmp_path)
+    _rewrite_manifest(root, canonical_learning_replica_bytes="-5")
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_content_addressed_name_with_wrong_contents_is_blocked(tmp_path):
+    """Correct-looking name, contents that do not hash to it -> BLOCKED.
+
+    The directory name advertises a digest; recomputing the tree must disagree.
+    """
+    root = _build_committed_export(tmp_path)
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
+    # Genuinely change bundled content - writing identical bytes would leave the
+    # tree hash unchanged and prove nothing.
+    target = root / dir_name / "paper_trading" / "state.json"
+    target.write_text(
+        '{"schema_version": 1, "paper_only": true, "lifecycles": {"PAPER:x": {}}}',
+        encoding="utf-8",
+    )
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+    assert "recomputed replica tree digest" in readiness.detail
+
+
+def test_extra_file_changes_the_tree_hash_and_is_blocked(tmp_path):
+    """An extra file must change the tree digest, so it cannot pass."""
+    root = _build_committed_export(tmp_path)
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
+    (root / dir_name / "extra-file.txt").write_text("injected", encoding="utf-8")
+
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_inner_manifest_valid_but_outer_invalid_is_blocked(tmp_path):
+    """Both layers are required: a valid inner manifest cannot excuse a bad outer.
+
+    The inner replica manifest is left completely intact here, so only the outer
+    content address is wrong.
+    """
+    root = _build_committed_export(tmp_path)
+    # Sanity: the inner manifest verifies on its own before we break the outer.
+    inner_only = verify_committed_export(
+        export_root=root,
+        expected_source_release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+    assert inner_only.ready is True
+
+    _rewrite_manifest(root, canonical_learning_replica_sha256="d" * 64)
+    readiness = _verify(root)
+
+    assert readiness.ready is False
+    assert readiness.reason == REASON_EXPORT_OUTER_ADDRESS_INVALID
+
+
+def test_symlinked_file_in_replica_tree_is_not_followed(tmp_path):
+    """A symlinked file is not part of the content address.
+
+    The digest is defined over regular files only, mirroring `find -type f`, so a
+    link cannot pull outside content into the address. Adding one therefore
+    changes nothing - and because the recorded digest does not change, the export
+    still verifies, which proves links are excluded rather than silently hashed.
+    """
+    root = _build_committed_export(tmp_path)
+    dir_name = _manifest_line(root, "canonical_learning_replica_dir")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    link = root / dir_name / "link.txt"
+    link.symlink_to(outside)
+
+    readiness = _verify(root)
+
+    assert readiness.ready is True, readiness.detail
+
+
+def test_exporter_and_verifier_share_one_tree_digest_implementation():
+    """Exporter and verifier must not maintain separate digest algorithms."""
+    import app.opip.learning.canonical_replica as replica_module
+
+    exporter = (
+        DEPLOY_SCRIPT.parent / "export-opip-learning-evidence.sh"
+    ).read_text(encoding="utf-8")
+    # The exporter delegates to the module rather than recomputing...
+    assert "read_replica_tree_digest" in exporter
+    assert "tree-digest --root" in exporter
+    # ...and no longer computes the replica address with its own shell hashing.
+    assert 'tree_sha256 "$REPLICA_STAGING"' not in exporter
+    assert 'tree_bytes "$REPLICA_STAGING"' not in exporter
+    assert 'tree_sha256 "$REPLICA_PUBLISH_DIR"' not in exporter
+    # The single implementation is exported for both sides.
+    assert "replica_tree_digest" in replica_module.__all__
+    assert callable(replica_module.replica_tree_digest)
