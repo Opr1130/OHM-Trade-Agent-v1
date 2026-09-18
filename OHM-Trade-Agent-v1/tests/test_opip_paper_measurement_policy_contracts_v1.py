@@ -24,6 +24,10 @@ def test_registry_ids_are_unique_and_definition_version_is_frozen():
     assert PAPER_METRICS
     assert len(PAPER_METRICS) == len(set(PAPER_METRICS))
     assert all(
+        key == metric.metric_id
+        for key, metric in PAPER_METRICS.items()
+    )
+    assert all(
         metric.definition_version == PAPER_METRIC_REGISTRY_VERSION
         for metric in PAPER_METRICS.values()
     )
