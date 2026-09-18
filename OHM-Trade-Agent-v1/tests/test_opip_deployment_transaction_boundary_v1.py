@@ -642,6 +642,9 @@ def test_contradictory_learning_markers_are_blocked(tmp_path):
         [
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             "O'Pip scheduler reconciliation: OK",
+            # Genesis is proven here so this fixture isolates the LEARNING
+            # contradiction it is about; genesis gating is covered separately.
+            "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
             "OPIP_LEARNING_EXPORT_STATUS=FAILED",
             'OPIP_LEARNING_READINESS=READY',
             "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
