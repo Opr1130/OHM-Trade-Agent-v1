@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
+from app.opip.contracts.paper_execution_runtime import (
+    PaperAdmissionAck,
+    PaperAdmissionRequest,
+)
 from app.opip.canonical.paths import socket_path
 from app.opip.canonical.protocol import recv_json, send_json
 
@@ -16,6 +20,10 @@ if TYPE_CHECKING:
 
 class WriterClient(Protocol):
     def submit(self, intent: WriterIntent) -> WriterAck: ...
+
+    def admit_paper_opportunity(
+        self, request: PaperAdmissionRequest
+    ) -> PaperAdmissionAck: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -67,6 +75,17 @@ class CanonicalWriterClient:
         response = self._roundtrip({"method": "SUBMIT", "intent": intent.to_dict()})
         return WriterAck.from_dict(response)
 
+    def admit_paper_opportunity(
+        self, request: PaperAdmissionRequest
+    ) -> PaperAdmissionAck:
+        response = self._roundtrip(
+            {
+                "method": "ADMIT_PAPER_OPPORTUNITY",
+                "request": request.as_dict(),
+            }
+        )
+        return PaperAdmissionAck.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -104,6 +123,18 @@ class InProcessWriterClient:
 
     def submit(self, intent: WriterIntent) -> WriterAck:
         return self._server.enqueue_for_tests(intent)
+
+    def admit_paper_opportunity(
+        self, request: PaperAdmissionRequest
+    ) -> PaperAdmissionAck:
+        return PaperAdmissionAck.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "ADMIT_PAPER_OPPORTUNITY",
+                    "request": request.as_dict(),
+                }
+            )
+        )
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         return WriterAck.from_dict(
