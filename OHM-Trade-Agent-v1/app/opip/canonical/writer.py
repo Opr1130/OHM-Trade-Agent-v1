@@ -1096,6 +1096,228 @@ class CanonicalWriter:
             raise ValueError("feature bus events must not carry ops_handoff")
         return intent.payload
 
+    def _load_paper_event_by_identity(
+        self,
+        event_type: str,
+        identity: str,
+    ) -> dict:
+        contract = paper_event_contract(event_type)
+        key = paper_evidence_idempotency_key(
+            event_type,
+            {contract.identity_field: identity},
+        )
+        row = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (event_type, key),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"required {event_type} record is missing for ancestry validation"
+            )
+        try:
+            raw = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"persisted {event_type} payload is invalid JSON") from exc
+        return validate_paper_evidence_payload(event_type, raw)
+
+    def _load_quote_evidence_by_id(self, quote_evidence_id: str) -> dict:
+        key = f"{PAPER_QUOTE_EVIDENCE_RECORDED}:{quote_evidence_id}"
+        row = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_QUOTE_EVIDENCE_RECORDED, key),
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "required Level-1 quote evidence is missing for execution validation"
+            )
+        try:
+            raw = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError("persisted quote evidence payload is invalid JSON") from exc
+        return validate_quote_evidence_payload(raw)
+
+    def _admitted_dispositions(self, quote_currency: str | None = None) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (PAPER_OPPORTUNITY_DISPOSITION_RECORDED,),
+        ).fetchall()
+        admitted: list[dict] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError("persisted Paper v2 disposition is invalid JSON") from exc
+            payload = validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                raw,
+            )
+            if payload.get("disposition") != "ADMITTED":
+                continue
+            if quote_currency is not None and payload.get("quote_currency") != quote_currency:
+                continue
+            admitted.append(payload)
+        return admitted
+
+    def _portfolio_state(self, quote_currency: str) -> tuple[int, float, int]:
+        """Return version, reserved capital, active reservation count.
+
+        In B/C-1 a committed ADMITTED disposition is the reservation authority.
+        Reservation release is deliberately deferred to B/C-2, so the version is
+        exactly the number of admissions for the quote-currency portfolio.
+        """
+        admitted = self._admitted_dispositions(quote_currency)
+        reserved = sum(
+            float(item["requested_reservation_amount"])
+            for item in admitted
+        )
+        return len(admitted), reserved, len(admitted)
+
+    def _admission_for_reservation(self, reservation_id: str) -> dict:
+        matches = [
+            item
+            for item in self._admitted_dispositions()
+            if item.get("reservation_id") == reservation_id
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise ValueError("reservation ancestry is missing")
+            raise ValueError("reservation ancestry is ambiguous")
+        return matches[0]
+
+    def _validate_quote_matches_lineage(
+        self,
+        quote: Mapping[str, object],
+        *,
+        context: Mapping[str, object],
+        admission: Mapping[str, object],
+    ) -> None:
+        if quote.get("instrument_version") != context.get("instrument_version"):
+            raise ValueError("quote evidence instrument_version does not match decision context")
+        if quote.get("quote_currency") != admission.get("quote_currency"):
+            raise ValueError("quote evidence quote_currency does not match reservation")
+
+    def _validate_paper_execution_ancestry(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
+            return
+
+        if event_type == PAPER_ORDER_INTENT_RECORDED:
+            context_id = self._require_string_ref(payload, "decision_context_id")
+            context = self._load_context_by_id(context_id)
+            reservation_id = self._require_string_ref(payload, "reservation_id")
+            admission = self._admission_for_reservation(reservation_id)
+            if admission.get("decision_context_id") != context_id:
+                raise ValueError("order intent decision context does not match reservation")
+            if admission.get("paper_trade_id") != payload.get("paper_trade_id"):
+                raise ValueError("order intent paper_trade_id does not match reservation")
+            if context.get("context_id") != context_id:
+                raise ValueError("order intent decision context ancestry is invalid")
+            if payload.get("intent_role") == "ENTRY" and (
+                float(payload["requested_notional"])
+                > float(admission["requested_reservation_amount"]) + 1e-9
+            ):
+                raise ValueError("entry requested_notional exceeds reserved capital")
+            return
+
+        if event_type == PAPER_EXECUTION_ATTEMPT_RECORDED:
+            order_id = self._require_string_ref(payload, "order_intent_id")
+            order = self._load_paper_event_by_identity(
+                PAPER_ORDER_INTENT_RECORDED,
+                order_id,
+            )
+            if order.get("paper_trade_id") != payload.get("paper_trade_id"):
+                raise ValueError("execution attempt paper_trade_id does not match order intent")
+            admission = self._admission_for_reservation(str(order["reservation_id"]))
+            context = self._load_context_by_id(str(order["decision_context_id"]))
+            state = ExecutionState(str(payload["execution_state"]))
+            quote_ref = payload.get("market_evidence_ref")
+            quote_required = state in {
+                ExecutionState.ACCEPTED,
+                ExecutionState.WORKING,
+                ExecutionState.PARTIALLY_FILLED,
+                ExecutionState.FILLED,
+            }
+            if quote_required and not isinstance(quote_ref, str):
+                raise ValueError(
+                    "execution attempt state requires exact Level-1 market_evidence_ref"
+                )
+            if quote_ref is not None:
+                if not isinstance(quote_ref, str) or not quote_ref:
+                    raise ValueError("market_evidence_ref is invalid")
+                quote = self._load_quote_evidence_by_id(quote_ref)
+                self._validate_quote_matches_lineage(
+                    quote,
+                    context=context,
+                    admission=admission,
+                )
+            return
+
+        if event_type != PAPER_FILL_RECORDED:
+            return
+
+        attempt_id = self._require_string_ref(payload, "execution_attempt_id")
+        order_id = self._require_string_ref(payload, "order_intent_id")
+        attempt = self._load_paper_event_by_identity(
+            PAPER_EXECUTION_ATTEMPT_RECORDED,
+            attempt_id,
+        )
+        order = self._load_paper_event_by_identity(
+            PAPER_ORDER_INTENT_RECORDED,
+            order_id,
+        )
+        if attempt.get("order_intent_id") != order_id:
+            raise ValueError("fill execution attempt does not belong to order intent")
+        if attempt.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("fill paper_trade_id does not match execution attempt")
+        if order.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("fill paper_trade_id does not match order intent")
+        if order.get("side") != payload.get("side"):
+            raise ValueError("fill side does not match order intent")
+
+        quote_ref = payload.get("market_evidence_ref")
+        if not isinstance(quote_ref, str) or not quote_ref:
+            raise ValueError("fill requires exact Level-1 market_evidence_ref")
+        admission = self._admission_for_reservation(str(order["reservation_id"]))
+        context = self._load_context_by_id(str(order["decision_context_id"]))
+        quote = self._load_quote_evidence_by_id(quote_ref)
+        self._validate_quote_matches_lineage(
+            quote,
+            context=context,
+            admission=admission,
+        )
+
+        prior_rows = self._conn.execute(
+            """
+            SELECT payload_json
+            FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (PAPER_FILL_RECORDED,),
+        ).fetchall()
+        prior_quantity = 0.0
+        for row in prior_rows:
+            raw = json.loads(str(row["payload_json"]))
+            prior = validate_paper_evidence_payload(PAPER_FILL_RECORDED, raw)
+            if prior.get("order_intent_id") == order_id:
+                prior_quantity += float(prior["quantity"])
+        if prior_quantity + float(payload["quantity"]) > float(order["requested_quantity"]) + 1e-9:
+            raise ValueError("aggregate fill quantity exceeds requested order quantity")
+
     def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
         """Validate B/C-1 producer-submitted Paper v2 evidence.
 
