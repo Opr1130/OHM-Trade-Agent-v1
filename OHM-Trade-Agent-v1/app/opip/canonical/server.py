@@ -15,6 +15,10 @@ from typing import Any
 from app.opip.canonical.models import WriterAck, WriterIntent
 from app.opip.canonical.protocol import recv_json, send_json
 from app.opip.canonical.writer import CanonicalWriter
+from app.opip.contracts.paper_execution_runtime import (
+    PaperAdmissionAck,
+    PaperAdmissionRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,11 +228,26 @@ class CanonicalWriterServer:
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":
+            if method == "ADMIT_PAPER_OPPORTUNITY":
+                return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
             return WriterAck(
                 status="RETRYABLE",
                 error_code="WORKER_UNHEALTHY",
             ).to_dict()
 
+        if method == "ADMIT_PAPER_OPPORTUNITY":
+            try:
+                request_model = PaperAdmissionRequest.from_dict(request["request"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="INVALID_ADMISSION_REQUEST",
+                    detail=str(exc),
+                ).to_dict()
+            return self.writer.admit_paper_opportunity(request_model).to_dict()
         if method == "CONFIRM_OPS_APPLIED":
             return self.writer.confirm_ops_applied(str(request["event_id"])).to_dict()
         if method == "MARK_HANDOFF_SUPERSEDED":
