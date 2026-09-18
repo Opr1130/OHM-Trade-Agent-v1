@@ -159,23 +159,38 @@ jobs:
           # state and learning readiness are separate facts: a healthy committed
           # core whose learning export failed must never be reported as a failed
           # server deploy with an unknown rollback.
-          CORE_STATUS="$(grep -oE 'OPIP_CORE_DEPLOY_STATUS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
-          LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
-          LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
+          # Structured post-deploy status emitted by ohm-deploy. Core release
+          # state and learning readiness are separate facts: a healthy committed
+          # core whose learning export failed must never be reported as a failed
+          # server deploy with an unknown rollback.
+          #
+          # Values are captured with a permissive pattern and marker PRESENCE is
+          # detected separately, because a restrictive pattern cannot tell an
+          # absent marker from a malformed one. Treating a malformed value as
+          # absent would let an incompatible ohm-deploy fall into the legacy path
+          # and still publish SUCCESS from the learning markers alone.
+          CORE_STATUS="$(grep -oE 'OPIP_CORE_DEPLOY_STATUS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
+          LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
+          LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[^[:space:]]*' deploy.log | tail -n 1 | cut -d= -f2)"
+          if grep -q 'OPIP_CORE_DEPLOY_STATUS=' deploy.log; then
+            CORE_MARKER="PRESENT"
+          else
+            CORE_MARKER="ABSENT"
+          fi
 
           # Core success requires the structured marker to say SUCCESS explicitly.
-          # An absent marker means the running ohm-deploy predates the contract
+          # An ABSENT marker means the running ohm-deploy predates the contract
           # (it is reinstalled mid-deploy); that path is treated as legacy
           # evidence and reported as UNPROVEN rather than as a core failure. Any
-          # OTHER value is malformed, so it must not be read as success.
+          # other combination is malformed and fails closed.
           core_verdict="NONE"
           if [[ "$RC" -eq 0 ]] \
              && grep -q "O'Pip deployment succeeded" deploy.log \
              && grep -q '"status":"ok"' deploy.log \
              && grep -q "O'Pip scheduler reconciliation: OK" deploy.log; then
-            case "$CORE_STATUS" in
-              SUCCESS) core_verdict="PROVEN" ;;
-              "") core_verdict="LEGACY" ;;
+            case "${CORE_MARKER}:${CORE_STATUS}" in
+              PRESENT:SUCCESS) core_verdict="PROVEN" ;;
+              ABSENT:) core_verdict="LEGACY" ;;
               *) core_verdict="NONE" ;;
             esac
           fi

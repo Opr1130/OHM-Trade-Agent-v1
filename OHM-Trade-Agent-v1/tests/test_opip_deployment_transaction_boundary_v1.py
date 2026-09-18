@@ -561,6 +561,30 @@ def test_unexpected_core_status_marker_is_not_success(tmp_path):
 
 
 @requires_bash
+def test_present_but_empty_core_status_marker_is_not_success(tmp_path):
+    """A present marker with no value must not fall back to the legacy path.
+
+    This is the distinction a restrictive value pattern could not make: if an
+    unparseable value were treated as "marker absent", an incompatible
+    ohm-deploy would land in the legacy branch and could still publish SUCCESS
+    from the learning markers alone.
+    """
+    log = "\n".join(
+        [
+            "OPIP_CORE_DEPLOY_STATUS=",
+            '"status":"ok"',
+            "O'Pip scheduler reconciliation: OK",
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0)
+    assert fields["RESULT"] != "SUCCESS"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
 def test_contradictory_learning_markers_are_blocked(tmp_path):
     """A failed export with a READY readiness claim must not be SUCCESS.
 
