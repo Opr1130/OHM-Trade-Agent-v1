@@ -291,7 +291,7 @@ class PaperAdmissionAck:
 
 
 def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]:
-    """Validate admission input against the frozen B/C-0 ADMITTED shape."""
+    """Validate admission input against the frozen B/C-0 ADMITTED contract."""
 
     payload = request.as_dict()
     paper_trade_id, reservation_id = admission_result_identities(request.disposition_id)
