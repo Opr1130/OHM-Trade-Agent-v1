@@ -32,6 +32,7 @@ from app.opip.contracts.paper_execution import (
     TemporalPrecision,
     TerminalReconciliationState,
 )
+from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
 
 
 PAPER_EXECUTION_STREAM = "paper_execution.v2"
@@ -431,7 +432,9 @@ def validate_paper_evidence_payload(
             population = EvaluationPopulation(str(normalized["evaluation_population"]))
         except ValueError as exc:
             raise ValueError("unsupported evaluation population") from exc
-        _require_nonempty_string(normalized, "quote_currency")
+        quote_currency = _require_nonempty_string(normalized, "quote_currency")
+        if quote_currency not in QUOTE_CURRENCIES:
+            raise ValueError("unsupported quote_currency")
         _require_nonempty_string(normalized, "reason_code")
         _require_finite_number(normalized, "requested_capital", nonnegative=True)
         if disposition is QualifiedOpportunityDisposition.ADMITTED:
@@ -568,6 +571,15 @@ def validate_paper_evidence_payload(
             if normalized.get("unresolved_reason") is not None:
                 raise ValueError(
                     "FINAL_VERIFIED reconciliation cannot carry unresolved_reason"
+                )
+        if (
+            reconciliation_state
+            is TerminalReconciliationState.FLAT_AWAITING_RECONCILIATION
+        ):
+            if position_state is not PositionState.FLAT or remaining > 0.0:
+                raise ValueError(
+                    "FLAT_AWAITING_RECONCILIATION requires FLAT position "
+                    "and zero remaining quantity"
                 )
         if reconciliation_state is TerminalReconciliationState.UNRESOLVED_EVIDENCE:
             _require_nonempty_string(normalized, "unresolved_reason")
