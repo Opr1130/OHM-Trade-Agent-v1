@@ -441,6 +441,54 @@ def test_ack_loss_then_terminal_resave_preserves_exact_pending_intent(
     assert len(_canonical_rows(canonical_env)) == 1
 
 
+def test_existing_malformed_terminal_envelope_is_not_rebuilt_from_later_state(
+    canonical_env, paper_env
+):
+    """Corrupt recovery evidence must stay visible instead of being rewritten."""
+    client = _FailingClient(OSError("must not submit"))
+    outbox.set_writer_client_for_tests(client)
+    trade = _seed_open(paper_env)
+
+    # Simulate a durable but malformed recovery envelope left by corruption or
+    # an older defect. Reconstructing it from a later terminal lifecycle would
+    # create a new evidence claim and hide the integrity problem.
+    state = json.loads(paper_env["state"].read_text(encoding="utf-8"))
+    malformed = {
+        "schema_version": 1,
+        "delivery": outbox.DELIVERY_PENDING,
+        "intent": None,
+        "outcome_id": None,
+        "idempotency_key": None,
+        "attempts": 2,
+        "gap_id": None,
+        "last_error": outbox.ERROR_UNBUILDABLE_PAYLOAD,
+        "last_detail": "corrupt durable envelope",
+        "last_attempt_at": None,
+    }
+    state["lifecycles"][PAPER_ID]["outcome_outbox"] = malformed
+    paper_env["state"].write_text(json.dumps(state), encoding="utf-8")
+
+    trade.status = "CLOSED"
+    trade.exit_reason = "STOP"
+    trade.exit_price = 98.0
+    trade.closed_at = EXIT.isoformat()
+    trade.gross_pnl = -25.0
+    trade.net_pnl = -29.0
+    trade.net_pnl_pct = -2.9
+    trade.outcome = "LOSS"
+
+    registry.save_lifecycle(
+        trade,
+        event_type="CLOSED_STOP",
+        state_file=paper_env["state"],
+        event_file=paper_env["events"],
+    )
+
+    assert _envelope(paper_env) == malformed
+    assert client.calls == 0
+    assert _canonical_rows(canonical_env) == []
+
+
 def test_reprocessing_a_closed_lifecycle_does_not_duplicate(canonical_env, paper_env, servers):
     outbox.set_writer_client_for_tests(InProcessWriterClient(servers()))
     trade = _seed_terminal(paper_env)
