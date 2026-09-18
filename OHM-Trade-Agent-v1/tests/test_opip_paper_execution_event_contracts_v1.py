@@ -400,6 +400,7 @@ def test_protection_trigger_contains_no_exit_claim():
 
 def test_final_reconciliation_requires_flat_zero_remaining_and_exact_economics():
     payload = _reconciliation()
+    payload["filled_exit_quantity"] = 4.0
     payload["remaining_quantity"] = 1.0
     with pytest.raises(ValueError, match="FINAL_VERIFIED"):
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
@@ -421,11 +422,13 @@ def test_flat_awaiting_reconciliation_requires_flat_zero_remaining():
     payload = _reconciliation()
     payload["terminal_reconciliation_state"] = "FLAT_AWAITING_RECONCILIATION"
     payload["position_state"] = "OPEN"
+    payload["filled_exit_quantity"] = 4.0
     payload["remaining_quantity"] = 1.0
     with pytest.raises(ValueError, match="FLAT_AWAITING_RECONCILIATION"):
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
     payload["position_state"] = "FLAT"
+    payload["filled_exit_quantity"] = 5.0
     payload["remaining_quantity"] = 0.0
     assert validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
@@ -434,6 +437,7 @@ def test_unresolved_reconciliation_requires_explicit_reason():
     payload = _reconciliation()
     payload["position_state"] = "OPEN"
     payload["terminal_reconciliation_state"] = "UNRESOLVED_EVIDENCE"
+    payload["filled_exit_quantity"] = 4.0
     payload["remaining_quantity"] = 1.0
     with pytest.raises(ValueError, match="unresolved_reason"):
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
