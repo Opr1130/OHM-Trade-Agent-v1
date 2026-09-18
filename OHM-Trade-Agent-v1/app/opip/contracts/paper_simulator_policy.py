@@ -148,29 +148,7 @@ OPIP_PAPER_V2_TARGET_POLICY = PaperSimulatorPolicy(
 )
 
 
-#: Compatibility diagnostic policy for old OHLC-derived evidence. It cannot
-#: claim exact intrabar occurrence times or become headline Paper v2 economics.
-LEGACY_OHLC_DIAGNOSTIC_POLICY = PaperSimulatorPolicy(
-    policy_version=PAPER_SIMULATOR_POLICY_VERSION,
-    fidelity=SimulationFidelity.LEVEL_0_OHLC_BOUNDED,
-    execution_model_version=PAPER_EXECUTION_MODEL_VERSION,
-    economic_model_version=PAPER_ECONOMIC_MODEL_VERSION,
-    protection_model_version=PAPER_PROTECTION_MODEL_VERSION,
-    quote_freshness=ModelingDisposition.OPTIONAL_WHEN_EVIDENCE_EXISTS,
-    bid_ask_spread=ModelingDisposition.OPTIONAL_WHEN_EVIDENCE_EXISTS,
-    fees=ModelingDisposition.REQUIRED,
-    slippage=ModelingDisposition.REQUIRED,
-    partial_fills=ModelingDisposition.NOT_MODELED,
-    market_impact=ModelingDisposition.NOT_MODELED,
-    queue_position=ModelingDisposition.NOT_MODELED,
-    latency_model=LatencyModel.NOT_MODELED,
-    fixed_latency_ms=None,
-    passive_limit_fill_model=PassiveLimitFillModel.OHLC_TOUCH_BOUNDED,
-)
-
-
-__all__ = [
-    "LEGACY_OHLC_DIAGNOSTIC_POLICY",
+# Legacy Paper v1/OHLC evidence is intentionally NOT wrapped in this v2 policy.\n# Its historical meaning remains governed by paper_outcome.py and\n# paper_trade_simulation.py exactly as committed.\n\n\n__all__ = [
     "LatencyModel",
     "ModelingDisposition",
     "OPIP_PAPER_V2_TARGET_POLICY",
