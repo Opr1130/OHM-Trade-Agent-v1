@@ -47,7 +47,7 @@ def _admission() -> dict:
         "capital_policy_version": "paper-capital-v1",
         "portfolio_equity_limit": 10000.0,
         "portfolio_position_limit": 3,
-        "reservation_amount": 1004.0,
+        "requested_reservation_amount": 1004.0,
         "disposition_time": _exact(),
         "reason_code": "QUALIFIED",
         "paper_trade_id": "paper-1",
@@ -268,8 +268,8 @@ def test_admitted_disposition_requires_expected_portfolio_version():
 
 def test_admitted_reservation_cannot_underfund_requested_capital():
     payload = _admission()
-    payload["reservation_amount"] = 999.0
-    with pytest.raises(ValueError, match="reservation_amount"):
+    payload["requested_reservation_amount"] = 999.0
+    with pytest.raises(ValueError, match="requested_reservation_amount"):
         validate_paper_evidence_payload(
             PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
             payload,
@@ -279,7 +279,6 @@ def test_admitted_reservation_cannot_underfund_requested_capital():
 def test_capital_rejection_records_policy_context_but_reserves_nothing():
     payload = _admission()
     payload["disposition"] = "CAPITAL_REJECTED"
-    payload["reservation_amount"] = 0.0
     payload.pop("reservation_id")
     payload.pop("paper_trade_id")
     assert validate_paper_evidence_payload(
