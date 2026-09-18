@@ -99,11 +99,23 @@ class PaperSimulatorPolicy:
         if self.protection_model_version != PAPER_PROTECTION_MODEL_VERSION:
             raise ValueError("protection model version must match Paper v2 contract")
 
-        if self.latency_model is LatencyModel.FIXED_DETERMINISTIC:
-            if type(self.fixed_latency_ms) is not int or self.fixed_latency_ms < 0:
-                raise ValueError("FIXED_DETERMINISTIC latency requires non-negative fixed_latency_ms")
-        elif self.fixed_latency_ms is not None:
-            raise ValueError("fixed_latency_ms is legal only for FIXED_DETERMINISTIC latency")
+        # Latency is NOT_MODELED for the currently frozen policy version. A numeric
+        # latency assumption is a model change, and a model change must not be
+        # achievable by a caller while the version string stays the same - that is
+        # exactly the hidden model change the versioning rule forbids. So this fails
+        # closed rather than accepting a caller-supplied number. A future approved
+        # version releases this by introducing its own versioned, tested assumption.
+        if self.latency_model is not LatencyModel.NOT_MODELED:
+            raise ValueError(
+                f"{PAPER_SIMULATOR_POLICY_VERSION} freezes latency_model to "
+                "NOT_MODELED; a numeric latency model requires a new approved "
+                "policy version"
+            )
+        if self.fixed_latency_ms is not None:
+            raise ValueError(
+                "fixed_latency_ms is not legal for the frozen NOT_MODELED latency "
+                "model and requires a new approved policy version"
+            )
 
         if self.trigger_is_exit:
             raise ValueError("a protection trigger cannot be treated as an exit")

@@ -79,6 +79,14 @@ class PaperEvidenceEventContract:
 
 _COMMON = frozenset({"schema_version", "engine"})
 
+#: Reference fields naming another artifact. `reservation_id` and `paper_trade_id`
+#: are already declared parent refs, so they are validated as ancestry instead.
+_REFERENCE_FIELDS = frozenset({"market_evidence_ref"})
+
+#: Tolerance for the aggregate protection-target allocation. Wide enough to absorb
+#: binary float representation error, far too tight to admit a real over-allocation.
+_TARGET_FRACTION_TOLERANCE = 1e-9
+
 _EVENT_CONTRACTS = {
     PAPER_OPPORTUNITY_DISPOSITION_RECORDED: PaperEvidenceEventContract(
         event_type=PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
@@ -133,7 +141,11 @@ _EVENT_CONTRACTS = {
             }
         ),
         optional_fields=frozenset({"limit_price"}),
-        parent_refs=("decision_context_id", "paper_trade_id"),
+        # The admitting reservation is declared ancestry, not a free-floating
+        # attribute: a writer must resolve the reservation created by the ADMITTED
+        # disposition of the same decision context before this intent can be
+        # accepted, so an intent cannot claim an arbitrary reservation.
+        parent_refs=("decision_context_id", "paper_trade_id", "reservation_id"),
         temporal_field="intent_time",
     ),
     PAPER_EXECUTION_ATTEMPT_RECORDED: PaperEvidenceEventContract(
@@ -293,10 +305,11 @@ def event_contract(event_type: str) -> PaperEvidenceEventContract:
 
 def paper_evidence_idempotency_key(event_type: str, payload: Mapping[str, Any]) -> str:
     contract = event_contract(event_type)
-    identity = payload.get(contract.identity_field)
-    if not isinstance(identity, str) or not identity.strip():
-        raise ValueError(f"{contract.identity_field} is required")
-    return f"{event_type}:{identity.strip()}"
+    # Keyed from the same canonical contract validation enforces. Nothing is
+    # stripped here: a normalizer that disagreed with validation would let two
+    # different payload identities collapse into one key.
+    identity = _require_canonical_identity(payload, contract.identity_field)
+    return f"{event_type}:{identity}"
 
 
 def _require_nonempty_string(payload: Mapping[str, Any], field_name: str) -> str:
@@ -304,6 +317,28 @@ def _require_nonempty_string(payload: Mapping[str, Any], field_name: str) -> str
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value.strip()
+
+
+def _require_canonical_identity(payload: Mapping[str, Any], field_name: str) -> str:
+    """Require an identity/reference string in its exact canonical form.
+
+    Identity and reference fields are never normalized. Validation and
+    idempotency keying must agree on the identical value, so a padded identity is
+    rejected rather than trimmed: trimming would let `" fill-1 "` and `"fill-1"`
+    validate as two distinct payload identities while collapsing to a single
+    idempotency key. Returning the value unchanged is what keeps the contract
+    single-sourced between the two.
+    """
+    value = payload.get(field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a non-empty canonical string")
+    if value != value.strip():
+        raise ValueError(
+            f"{field_name} must not have leading or trailing whitespace"
+        )
+    if not value:
+        raise ValueError(f"{field_name} must be a non-empty canonical string")
+    return value
 
 
 def _require_nonnegative_int(payload: Mapping[str, Any], field_name: str) -> int:
@@ -419,9 +454,12 @@ def _validate_common(
     if payload.get("engine") != ENGINE_OPIP_PAPER_V2:
         raise ValueError("Paper v2 event engine must be OPIP_PAPER_V2")
 
-    _require_nonempty_string(payload, contract.identity_field)
+    _require_canonical_identity(payload, contract.identity_field)
     for parent_ref in contract.parent_refs:
-        _require_nonempty_string(payload, parent_ref)
+        _require_canonical_identity(payload, parent_ref)
+    for reference_field in sorted(_REFERENCE_FIELDS):
+        if payload.get(reference_field) is not None:
+            _require_canonical_identity(payload, reference_field)
     _validate_temporal(payload.get(contract.temporal_field), field_name=contract.temporal_field)
 
     normalized = dict(payload)
@@ -528,7 +566,14 @@ def validate_paper_evidence_payload(
         )
         if requested_quantity <= 0:
             raise ValueError("requested_quantity must be positive")
-        _require_finite_number(normalized, "requested_notional", nonnegative=True)
+        # An executable intent must carry positive economic size. A zero (or
+        # negative) notional alongside a positive quantity is not an executable
+        # order and must not be recordable as one.
+        requested_notional = _require_finite_number(
+            normalized, "requested_notional", nonnegative=True
+        )
+        if requested_notional <= 0:
+            raise ValueError("requested_notional must be positive")
         if normalized["order_type"] == "LIMIT":
             limit_price = _require_finite_number(
                 normalized, "limit_price", nonnegative=True
@@ -577,11 +622,18 @@ def validate_paper_evidence_payload(
 
     elif event_type == PAPER_PROTECTION_PLAN_RECORDED:
         _require_nonnegative_int(normalized, "plan_seq")
-        _require_finite_number(normalized, "stop_price", nonnegative=True)
+        # A declared stop is a real protective price level; zero (or negative) is
+        # not a usable stop and would silently disable protection.
+        stop_price = _require_finite_number(
+            normalized, "stop_price", nonnegative=True
+        )
+        if stop_price <= 0:
+            raise ValueError("stop_price must be positive")
         _require_nonnegative_int(normalized, "max_hold_seconds")
         targets = normalized["targets"]
         if not isinstance(targets, list) or not targets:
             raise ValueError("targets must be a non-empty canonical array")
+        total_target_fraction = 0.0
         for target in targets:
             if not isinstance(target, Mapping):
                 raise ValueError("each protection target must be an object")
@@ -591,7 +643,7 @@ def validate_paper_evidence_payload(
                     "each protection target must contain exactly "
                     "target_id, price, and fraction"
                 )
-            _require_nonempty_string(target, "target_id")
+            _require_canonical_identity(target, "target_id")
             target_price = _require_finite_number(
                 target, "price", nonnegative=True
             )
@@ -604,6 +656,14 @@ def validate_paper_evidence_payload(
                 raise ValueError(
                     "protection target fraction must be within (0, 1]"
                 )
+            total_target_fraction += target_fraction
+        # Each fraction is bounded on its own above, but the plan as a whole must
+        # still not allocate more than the position. A residual below 1.0 is legal
+        # because another exit mechanism may intentionally own the remainder.
+        if total_target_fraction > 1.0 + _TARGET_FRACTION_TOLERANCE:
+            raise ValueError(
+                "protection target fractions must not sum to more than 1.0"
+            )
         if normalized["protection_model_version"] != PAPER_PROTECTION_MODEL_VERSION:
             raise ValueError("unsupported protection model version")
 

@@ -131,7 +131,10 @@ _PAPER_METRICS = {
     "paper.execution_cost": _metric(
         "paper.execution_cost",
         description="Recorded fees plus modeled spread/slippage components actually charged by the declared simulator version.",
-        formula="SUM(fee_cost + spread_cost + slippage_cost + other_supported_execution_cost)",
+        # Cost component names must match the canonical fill contract exactly, which
+        # exposes `other_supported_cost`. A near-miss name here would make the
+        # formula reference a field no canonical fill can carry.
+        formula="SUM(fee_cost + spread_cost + slippage_cost + other_supported_cost)",
         eligible_population="ACTUAL_REALIZED executions with complete cost evidence",
         exclusions=("NOT_MODELED cost components", "UNRESOLVED_EVIDENCE"),
         authoritative_source="canonical execution attempts/fills and execution-model version",
@@ -154,6 +157,10 @@ _PAPER_METRICS = {
         exclusions=("UNKNOWN temporal evidence",),
         authoritative_source="decision context + canonical entry fill temporal evidence",
         unit=MetricUnit.SECONDS,
+        # Latency may derive from bounded temporal evidence. Presenting it as a bare
+        # point would invent precision the retained evidence does not support, so
+        # the interval must be shown rather than collapsed to a single number.
+        uncertainty=UncertaintyRequirement.SHOW_INTERVAL,
     ),
     "paper.exit_latency": _metric(
         "paper.exit_latency",
@@ -163,6 +170,8 @@ _PAPER_METRICS = {
         exclusions=("UNKNOWN temporal evidence",),
         authoritative_source="canonical protection/exit intent + canonical exit fill temporal evidence",
         unit=MetricUnit.SECONDS,
+        # Same bounded-evidence rule as entry latency: never fabricate a point.
+        uncertainty=UncertaintyRequirement.SHOW_INTERVAL,
     ),
     "paper.entry_price_drift_bps": _metric(
         "paper.entry_price_drift_bps",
