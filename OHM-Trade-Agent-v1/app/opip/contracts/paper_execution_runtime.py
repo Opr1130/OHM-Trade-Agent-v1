@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import math
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from app.opip.contracts.paper_execution import (
@@ -50,6 +51,61 @@ PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES = frozenset(
         PAPER_FILL_RECORDED,
     }
 )
+
+#: The single authoritative Paper v2 capital/capacity policy version.
+PAPER_CAPITAL_POLICY_VERSION = "paper-capital-v1"
+
+
+@dataclass(frozen=True)
+class PaperCapitalPolicy:
+    """Writer-owned capital/capacity limits for one policy version.
+
+    This is the only authority for the limits an admission decision may use. A
+    producer-supplied limit is evidence to be checked against this policy, never
+    an input that can widen it, so a request cannot relax the portfolio gate.
+    The values are frozen here rather than calibrated from market evidence
+    because they are portfolio policy (paper-only), not an empirical model.
+    """
+
+    policy_version: str
+    portfolio_equity_limit: float
+    portfolio_position_limit: int
+
+    def __post_init__(self) -> None:
+        if not str(self.policy_version or "").strip():
+            raise ValueError("capital policy_version is required")
+        if self.portfolio_equity_limit <= 0:
+            raise ValueError("capital policy portfolio_equity_limit must be positive")
+        if self.portfolio_position_limit <= 0:
+            raise ValueError("capital policy portfolio_position_limit must be positive")
+
+
+#: Frozen policy registry. Adding a version here is the *only* way to change the
+#: limits the writer applies, so limits can never drift under an unchanged
+#: ``capital_policy_version``.
+_PAPER_CAPITAL_POLICIES: Mapping[str, PaperCapitalPolicy] = MappingProxyType(
+    {
+        PAPER_CAPITAL_POLICY_VERSION: PaperCapitalPolicy(
+            policy_version=PAPER_CAPITAL_POLICY_VERSION,
+            portfolio_equity_limit=10_000.0,
+            portfolio_position_limit=3,
+        )
+    }
+)
+
+
+def resolve_capital_policy(policy_version: str) -> PaperCapitalPolicy:
+    """Resolve the authoritative capital policy, failing closed when unknown.
+
+    An unsupported or unknown version must never be treated as "no limits"; it
+    must not be able to reach an ADMITTED decision at all.
+    """
+    key = str(policy_version or "").strip()
+    try:
+        return _PAPER_CAPITAL_POLICIES[key]
+    except KeyError as exc:
+        raise ValueError(f"unsupported capital policy version: {key!r}") from exc
+
 
 _ADMISSION_REQUEST_FIELDS = frozenset(
     {
@@ -291,7 +347,24 @@ class PaperAdmissionAck:
 
 
 def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]:
-    """Validate admission input against the frozen B/C-0 ADMITTED contract."""
+    """Validate admission input against the frozen B/C-0 ADMITTED contract.
+
+    The request must agree with the authoritative capital policy for its declared
+    version. Enforcing this structurally (not only in the writer) means a request
+    carrying relaxed limits cannot be constructed or deserialized at all, so a
+    producer has no path that could widen the portfolio gate.
+    """
+    policy = resolve_capital_policy(request.capital_policy_version)
+    if request.portfolio_equity_limit != policy.portfolio_equity_limit:
+        raise ValueError(
+            "portfolio_equity_limit does not match the authoritative capital policy "
+            f"{policy.policy_version} ({policy.portfolio_equity_limit})"
+        )
+    if request.portfolio_position_limit != policy.portfolio_position_limit:
+        raise ValueError(
+            "portfolio_position_limit does not match the authoritative capital policy "
+            f"{policy.policy_version} ({policy.portfolio_position_limit})"
+        )
 
     payload = request.as_dict()
     paper_trade_id, reservation_id = admission_result_identities(request.disposition_id)
@@ -395,13 +468,16 @@ def quote_evidence_idempotency_key(payload: Mapping[str, Any]) -> str:
 
 __all__ = [
     "PAPER_ADMISSION_REQUEST_RECORDED",
+    "PAPER_CAPITAL_POLICY_VERSION",
     "PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES",
     "PAPER_QUOTE_EVIDENCE_RECORDED",
     "PaperAdmissionAck",
     "PaperAdmissionRequest",
+    "PaperCapitalPolicy",
     "admission_request_idempotency_key",
     "admission_result_identities",
     "quote_evidence_idempotency_key",
+    "resolve_capital_policy",
     "validate_admission_request",
     "validate_admission_request_record_payload",
     "validate_quote_evidence_payload",

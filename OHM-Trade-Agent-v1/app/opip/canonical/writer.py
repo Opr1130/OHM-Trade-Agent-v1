@@ -31,6 +31,7 @@ from app.opip.contracts.events import (
     FEATURE_BUS_STREAM,
     FEATURE_CHECKPOINT_RECORDED,
     FEATURE_SNAPSHOT_RECORDED,
+    MARKET_INSTRUMENT_VERSION_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
 from app.opip.contracts.paper_execution import ExecutionState
@@ -54,6 +55,7 @@ from app.opip.contracts.paper_execution_runtime import (
     admission_request_idempotency_key,
     admission_result_identities,
     quote_evidence_idempotency_key,
+    resolve_capital_policy,
     validate_admission_request,
     validate_admission_request_record_payload,
     validate_quote_evidence_payload,
@@ -87,6 +89,7 @@ from app.opip.decision_intelligence.events import (
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
+from app.opip.market.instrument_version_store import instrument_version_from_payload
 
 MAX_PAYLOAD_BYTES = 16 * 1024
 _UTC_OFFSET = "+00:00"
@@ -666,6 +669,37 @@ class CanonicalWriter:
         """Atomically decide Paper v2 capital/capacity and record the disposition."""
 
         with self._lock:
+            # Resolve the authoritative policy first so an unsupported version is
+            # reported precisely and can never fall through to a decision. The
+            # effective limits below come from this policy, never from the request,
+            # so a producer cannot widen the portfolio gate by supplying values.
+            try:
+                capital_policy = resolve_capital_policy(
+                    request.capital_policy_version
+                )
+            except (TypeError, ValueError) as exc:
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="UNSUPPORTED_CAPITAL_POLICY_VERSION",
+                    detail=str(exc),
+                )
+
+            if (
+                request.portfolio_equity_limit != capital_policy.portfolio_equity_limit
+                or request.portfolio_position_limit
+                != capital_policy.portfolio_position_limit
+            ):
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="CAPITAL_POLICY_MISMATCH",
+                    detail=(
+                        "admission limits do not match the authoritative capital "
+                        f"policy {capital_policy.policy_version}: expected "
+                        f"equity={capital_policy.portfolio_equity_limit} "
+                        f"positions={capital_policy.portfolio_position_limit}"
+                    ),
+                )
+
             try:
                 request_payload = validate_admission_request(request)
             except (TypeError, ValueError) as exc:
@@ -786,12 +820,12 @@ class CanonicalWriter:
                         ),
                     )
 
-                if active_reservations >= request.portfolio_position_limit:
+                if active_reservations >= capital_policy.portfolio_position_limit:
                     disposition = "CAPACITY_REJECTED"
                     reason_code = "PORTFOLIO_POSITION_LIMIT"
                 elif (
                     reserved_capital + request.requested_reservation_amount
-                    > request.portfolio_equity_limit + 1e-9
+                    > capital_policy.portfolio_equity_limit + 1e-9
                 ):
                     disposition = "CAPITAL_REJECTED"
                     reason_code = "PORTFOLIO_CAPITAL_LIMIT"
@@ -1561,6 +1595,138 @@ class CanonicalWriter:
             raise ValueError("persisted quote evidence payload is invalid JSON") from exc
         return validate_quote_evidence_payload(raw)
 
+    def _load_instrument_version_by_id(self, instrument_version_id: str) -> dict:
+        """Resolve a canonical instrument version, failing closed when unprovable.
+
+        The authoritative mapping already exists: instrument versions are
+        committed to this same canonical store as ``MARKET_INSTRUMENT_VERSION_``
+        events. Reusing it avoids inventing a parallel instrument registry, and
+        the payload is rebuilt through the canonical verifier so a committed row
+        whose declared identity disagrees with its own reference data is rejected
+        instead of being trusted.
+        """
+        wanted = str(instrument_version_id or "").strip()
+        if not wanted:
+            raise ValueError("decision context instrument_version is required")
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (MARKET_INSTRUMENT_VERSION_RECORDED,),
+        ).fetchall()
+        resolved: dict | None = None
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "persisted instrument version payload is invalid JSON"
+                ) from exc
+            if str(raw.get("instrument_version_id") or "").strip() != wanted:
+                continue
+            try:
+                version = instrument_version_from_payload(raw)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise ValueError(
+                    "canonical instrument version payload is not verifiable"
+                ) from exc
+            candidate = {
+                "instrument_version_id": version.instrument_version_id,
+                "venue": version.venue,
+                "base_asset": version.base_asset,
+                "quote_currency": version.quote_currency,
+                "venue_instrument_id": version.venue_instrument_id,
+            }
+            if resolved is not None and resolved != candidate:
+                raise ValueError(
+                    "canonical instrument version identity is ambiguous"
+                )
+            resolved = candidate
+        if resolved is None:
+            raise ValueError(
+                "decision context instrument_version is not a registered "
+                "canonical instrument version"
+            )
+        return resolved
+
+    def _committed_sibling_sequences(
+        self,
+        *,
+        event_type: str,
+        parent_field: str,
+        parent_value: str,
+        sequence_field: str,
+        identity_field: str,
+        identity_value: str,
+    ) -> list[int]:
+        """Sequences already committed for one canonical sibling scope.
+
+        The incoming event is excluded by identity so an idempotent retry of an
+        already-committed record is never treated as a duplicate of itself. The
+        caller runs inside the write transaction, so concurrent siblings cannot
+        both observe the same predecessor set.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (event_type,),
+        ).fetchall()
+        sequences: list[int] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"persisted {event_type} payload is invalid JSON"
+                ) from exc
+            if str(raw.get(parent_field) or "") != parent_value:
+                continue
+            if str(raw.get(identity_field) or "") == identity_value:
+                continue
+            sequences.append(int(raw[sequence_field]))
+        return sequences
+
+    def _require_monotonic_sibling_sequence(
+        self,
+        *,
+        event_type: str,
+        payload: Mapping[str, object],
+        parent_field: str,
+        parent_value: str,
+        sequence_field: str,
+        identity_field: str,
+        scope: str,
+    ) -> None:
+        """Enforce one unambiguous ordering for a sibling sequence.
+
+        Sequences must strictly increase within their canonical parent scope, so
+        neither a duplicate nor a regressing value can be committed and the field
+        keeps a single deterministic interpretation for downstream consumers.
+        """
+        candidate = int(payload[sequence_field])  # type: ignore[arg-type]
+        existing = self._committed_sibling_sequences(
+            event_type=event_type,
+            parent_field=parent_field,
+            parent_value=parent_value,
+            sequence_field=sequence_field,
+            identity_field=identity_field,
+            identity_value=str(payload.get(identity_field) or ""),
+        )
+        if candidate in existing:
+            raise ValueError(
+                f"{sequence_field} {candidate} is already committed for this {scope}"
+            )
+        if existing and candidate < max(existing):
+            raise ValueError(
+                f"{sequence_field} {candidate} regresses behind a committed "
+                f"sibling sequence for this {scope}"
+            )
+
     def _admitted_dispositions(self, quote_currency: str | None = None) -> list[dict]:
         rows = self._conn.execute(
             """
@@ -1621,8 +1787,41 @@ class CanonicalWriter:
         context: Mapping[str, object],
         admission: Mapping[str, object],
     ) -> None:
-        if quote.get("instrument_version") != context.get("instrument_version"):
+        """Bind quote evidence to the canonical execution instrument identity.
+
+        Comparing self-declared strings alone is insufficient: a producer could
+        copy a compatible ``instrument_version`` while recording a different venue
+        or native symbol. The authoritative identity is therefore resolved from
+        the canonical instrument-version registry the decision context names, and
+        the quote must match it on every identity dimension. If the instrument
+        cannot be proven canonically, the evidence is rejected rather than trusted.
+        """
+        instrument_version_id = str(context.get("instrument_version") or "")
+        if quote.get("instrument_version") != instrument_version_id:
             raise ValueError("quote evidence instrument_version does not match decision context")
+
+        instrument = self._load_instrument_version_by_id(instrument_version_id)
+        canonical_venue = str(instrument.get("venue") or "").strip().upper()
+        if str(quote.get("venue") or "").strip().upper() != canonical_venue:
+            raise ValueError(
+                "quote evidence venue does not match the canonical instrument version"
+            )
+        canonical_native_symbol = str(
+            instrument.get("venue_instrument_id") or ""
+        ).strip()
+        if str(quote.get("native_symbol") or "").strip() != canonical_native_symbol:
+            raise ValueError(
+                "quote evidence native_symbol does not match the canonical "
+                "instrument version"
+            )
+        canonical_quote_currency = str(
+            instrument.get("quote_currency") or ""
+        ).strip().upper()
+        if str(quote.get("quote_currency") or "").strip().upper() != canonical_quote_currency:
+            raise ValueError(
+                "quote evidence quote_currency does not match the canonical "
+                "instrument version"
+            )
         if quote.get("quote_currency") != admission.get("quote_currency"):
             raise ValueError("quote evidence quote_currency does not match reservation")
 
@@ -1712,6 +1911,17 @@ class CanonicalWriter:
             )
             if order.get("paper_trade_id") != payload.get("paper_trade_id"):
                 raise ValueError("execution attempt paper_trade_id does not match order intent")
+            # Attempts are sequenced within their parent order intent, so the
+            # order is the sibling scope that gives attempt_seq one meaning.
+            self._require_monotonic_sibling_sequence(
+                event_type=PAPER_EXECUTION_ATTEMPT_RECORDED,
+                payload=payload,
+                parent_field="order_intent_id",
+                parent_value=order_id,
+                sequence_field="attempt_seq",
+                identity_field="execution_attempt_id",
+                scope="order intent",
+            )
             admission = self._admission_for_reservation(str(order["reservation_id"]))
             context = self._load_context_by_id(str(order["decision_context_id"]))
             state = ExecutionState(str(payload["execution_state"]))
@@ -1792,6 +2002,17 @@ class CanonicalWriter:
         }
         if attempt_state not in fillable_states:
             raise ValueError("fill cannot reference a non-fillable execution attempt")
+        # Fills are sequenced within their parent execution attempt, which is the
+        # scope the frozen fill contract already defines for fill_seq.
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_FILL_RECORDED,
+            payload=payload,
+            parent_field="execution_attempt_id",
+            parent_value=attempt_id,
+            sequence_field="fill_seq",
+            identity_field="fill_id",
+            scope="execution attempt",
+        )
         accepted_quantity = attempt.get("accepted_quantity")
         if not isinstance(accepted_quantity, (int, float)) or isinstance(
             accepted_quantity, bool
