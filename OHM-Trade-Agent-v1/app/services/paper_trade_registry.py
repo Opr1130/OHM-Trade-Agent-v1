@@ -272,18 +272,21 @@ def save_lifecycle(
         # revision is already final here, which is what makes the persisted
         # intent byte-identical on every later retry.
         #
-        # A lifecycle that already reached a settled delivery keeps its existing
-        # envelope rather than being rebuilt. Rebuilding would embed the new
-        # revision, and since recorded provenance participates in conflict
-        # detection the resubmission would be rejected as a conflict instead of
-        # resolving as a duplicate - turning a harmless re-save into a permanent
-        # evidence failure.
+        # Once a terminal recovery envelope exists, it is immutable evidence.
+        # Preserve it verbatim for every later lifecycle re-save regardless of
+        # delivery state. In particular, a PENDING envelope may represent an
+        # ACK-loss path where the writer already committed the original intent.
+        # Rebuilding it with the new lifecycle revision would create a different
+        # payload under the same semantic terminal transition and turn a safe
+        # DUPLICATE_OK retry into an idempotency conflict.
+        #
+        # A malformed existing envelope is also preserved rather than "repaired"
+        # by reconstruction. Rebuilding from later mutable state would invent a
+        # new claim; completeness/readiness must surface the malformed evidence
+        # instead. Only a lifecycle with no prior envelope may build one.
         if terminal:
             prior = current.get("outcome_outbox")
-            prior_delivery = (
-                str(prior.get("delivery") or "") if isinstance(prior, dict) else ""
-            )
-            if prior_delivery in {DELIVERY_COMMITTED, DELIVERY_PERMANENT_FAILURE}:
+            if isinstance(prior, dict):
                 envelope = None
                 trade.outcome_outbox = prior
             else:
