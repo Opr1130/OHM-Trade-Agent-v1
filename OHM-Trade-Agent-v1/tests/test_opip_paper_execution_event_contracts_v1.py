@@ -43,6 +43,11 @@ def _admission() -> dict:
         "evaluation_population": "QUALIFIED_INTENT",
         "quote_currency": "USD",
         "requested_capital": 1000.0,
+        "expected_portfolio_version": 0,
+        "capital_policy_version": "paper-capital-v1",
+        "portfolio_equity_limit": 10000.0,
+        "portfolio_position_limit": 3,
+        "reservation_amount": 1004.0,
         "disposition_time": _exact(),
         "reason_code": "QUALIFIED",
         "paper_trade_id": "paper-1",
@@ -245,6 +250,48 @@ def test_admitted_opportunity_requires_trade_and_reservation_identity():
     payload = _admission()
     del payload["reservation_id"]
     with pytest.raises(ValueError, match="reservation_id"):
+        validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            payload,
+        )
+
+
+def test_admitted_disposition_requires_expected_portfolio_version():
+    payload = _admission()
+    del payload["expected_portfolio_version"]
+    with pytest.raises(ValueError, match="expected_portfolio_version"):
+        validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            payload,
+        )
+
+
+def test_admitted_reservation_cannot_underfund_requested_capital():
+    payload = _admission()
+    payload["reservation_amount"] = 999.0
+    with pytest.raises(ValueError, match="reservation_amount"):
+        validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            payload,
+        )
+
+
+def test_capital_rejection_records_policy_context_but_reserves_nothing():
+    payload = _admission()
+    payload["disposition"] = "CAPITAL_REJECTED"
+    payload["reservation_amount"] = 0.0
+    payload.pop("reservation_id")
+    payload.pop("paper_trade_id")
+    assert validate_paper_evidence_payload(
+        PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+        payload,
+    )
+
+
+def test_non_capital_disposition_cannot_smuggle_reservation_policy():
+    payload = _admission()
+    payload["disposition"] = "NOT_ACTIONABLE"
+    with pytest.raises(ValueError, match="reservation-policy"):
         validate_paper_evidence_payload(
             PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
             payload,
