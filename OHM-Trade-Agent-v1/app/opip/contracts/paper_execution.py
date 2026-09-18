@@ -68,6 +68,15 @@ class TemporalBasis(str, Enum):
 
 
 class QualifiedOpportunityDisposition(str, Enum):
+    """Why a qualified opportunity did or did not become an admitted intent.
+
+    Every member is a distinct outcome; none aliases another. ``UNRESOLVED`` stays
+    reserved for genuinely uncategorizable dispositions and is deliberately *not*
+    reused for the specific reasons below. Terminal post-execution reconciliation
+    is a separate vocabulary (``TerminalReconciliationState.UNRESOLVED_EVIDENCE``)
+    and must never be expressed here.
+    """
+
     ADMITTED = "ADMITTED"
     CAPACITY_REJECTED = "CAPACITY_REJECTED"
     ALREADY_TRACKED = "ALREADY_TRACKED"
@@ -77,6 +86,14 @@ class QualifiedOpportunityDisposition(str, Enum):
     DO_NOT_CHASE = "DO_NOT_CHASE"
     CANCELLED = "CANCELLED"
     UNSUPPORTED = "UNSUPPORTED"
+    #: Qualified evaluation cannot safely proceed because required
+    #: decision/admission evidence is incomplete. Distinct from UNRESOLVED: the
+    #: reason is known and specific, not uncategorizable.
+    EVIDENCE_INCOMPLETE = "EVIDENCE_INCOMPLETE"
+    #: Qualified evaluation intentionally not admitted because the relevant Paper
+    #: v2 admission/execution capability is disabled. Distinct from UNRESOLVED and
+    #: from a capital/capacity rejection.
+    DISABLED = "DISABLED"
     UNRESOLVED = "UNRESOLVED"
 
 

@@ -520,8 +520,13 @@ def validate_paper_evidence_payload(
                     "requested_reservation_amount cannot be less than requested_capital"
                 )
             if disposition is QualifiedOpportunityDisposition.ADMITTED:
-                _require_nonempty_string(normalized, "paper_trade_id")
-                _require_nonempty_string(normalized, "reservation_id")
+                # The admitting trade and reservation are identity/ancestry, so
+                # they follow the canonical identity contract: padded values are
+                # rejected rather than trimmed. These are the ids an order intent
+                # later declares as parent refs, so a padded id here would not
+                # resolve to the intent's canonical reference.
+                _require_canonical_identity(normalized, "paper_trade_id")
+                _require_canonical_identity(normalized, "reservation_id")
             else:
                 if normalized.get("reservation_id") is not None:
                     raise ValueError(

@@ -7,6 +7,7 @@ from app.opip.contracts.paper_execution import (
     PAPER_ECONOMIC_MODEL_VERSION,
     PAPER_EXECUTION_MODEL_VERSION,
     PAPER_PROTECTION_MODEL_VERSION,
+    QualifiedOpportunityDisposition,
 )
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
@@ -302,6 +303,154 @@ def test_non_capital_disposition_cannot_smuggle_reservation_policy():
             PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
             payload,
         )
+
+
+#: The reservation-policy fields a non-capital disposition must never carry.
+_RESERVATION_POLICY_FIELDS = (
+    "paper_trade_id",
+    "reservation_id",
+    "expected_portfolio_version",
+    "capital_policy_version",
+    "portfolio_equity_limit",
+    "portfolio_position_limit",
+    "requested_reservation_amount",
+)
+
+_NEW_DISPOSITIONS = (
+    QualifiedOpportunityDisposition.EVIDENCE_INCOMPLETE.value,
+    QualifiedOpportunityDisposition.DISABLED.value,
+)
+
+
+def _non_capital_disposition(disposition: str) -> dict:
+    """A valid non-capital disposition payload for the given disposition.
+
+    Non-capital dispositions may not carry reservation-policy fields, so they are
+    removed from the ADMITTED-shaped fixture while keeping every required field.
+    """
+    payload = _admission()
+    payload["disposition"] = disposition
+    for field_name in _RESERVATION_POLICY_FIELDS:
+        payload.pop(field_name, None)
+    return payload
+
+
+@pytest.mark.parametrize("disposition", _NEW_DISPOSITIONS)
+def test_new_dispositions_are_accepted_as_qualified_intent_non_capital(disposition):
+    """EVIDENCE_INCOMPLETE and DISABLED are real dispositions, not UNRESOLVED."""
+    payload = _non_capital_disposition(disposition)
+    assert payload["evaluation_population"] == "QUALIFIED_INTENT"
+
+    normalized = validate_paper_evidence_payload(
+        PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload
+    )
+    assert normalized["disposition"] == disposition
+    # Non-capital: neither may claim a reservation or a trade it never obtained.
+    assert set(_RESERVATION_POLICY_FIELDS) & set(normalized) == set()
+    # And neither collapses onto the catch-all.
+    assert normalized["disposition"] != "UNRESOLVED"
+
+
+@pytest.mark.parametrize("field_name", _RESERVATION_POLICY_FIELDS)
+def test_new_dispositions_cannot_carry_reservation_policy_fields(field_name):
+    """Smuggling any reservation-policy field onto either new reason is rejected."""
+    for disposition in _NEW_DISPOSITIONS:
+        payload = _non_capital_disposition(disposition)
+        payload[field_name] = _admission()[field_name]
+        with pytest.raises(ValueError, match="reservation-policy"):
+            validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload
+            )
+
+
+def test_new_dispositions_are_not_capital_decisions():
+    """A capital decision requires the full reservation-policy context.
+
+    Neither new reason carries it, so omitting those fields must NOT be reported as
+    a missing-capital-context error: they are genuinely non-capital dispositions.
+    """
+    for disposition in _NEW_DISPOSITIONS:
+        payload = _non_capital_disposition(disposition)
+        for field_name in (
+            "expected_portfolio_version",
+            "capital_policy_version",
+            "portfolio_equity_limit",
+            "portfolio_position_limit",
+            "requested_reservation_amount",
+        ):
+            assert field_name not in payload
+        assert validate_paper_evidence_payload(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload
+        )
+
+
+# ---------------------------------------------------------------------------
+# Greptile P1: ADMITTED trade/reservation identity follows the canonical contract
+# ---------------------------------------------------------------------------
+
+
+def test_admitted_disposition_accepts_canonical_trade_and_reservation_ids():
+    payload = _admission()
+    normalized = validate_paper_evidence_payload(
+        PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload
+    )
+    assert normalized["paper_trade_id"] == "paper-1"
+    assert normalized["reservation_id"] == "reserve-1"
+
+
+@pytest.mark.parametrize(
+    "padded",
+    [" paper-1", "paper-1 ", "  paper-1  ", "\tpaper-1", "paper-1\n"],
+)
+def test_admitted_disposition_rejects_padded_paper_trade_id(padded):
+    """A padded admission id would not match the canonical ref an intent declares."""
+    payload = _admission()
+    payload["paper_trade_id"] = padded
+    with pytest.raises(ValueError, match="whitespace"):
+        validate_paper_evidence_payload(PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload)
+
+
+@pytest.mark.parametrize(
+    "padded",
+    [" reserve-1", "reserve-1 ", "  reserve-1  ", "\treserve-1", "reserve-1\n"],
+)
+def test_admitted_disposition_rejects_padded_reservation_id(padded):
+    payload = _admission()
+    payload["reservation_id"] = padded
+    with pytest.raises(ValueError, match="whitespace"):
+        validate_paper_evidence_payload(PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload)
+
+
+def test_admitted_disposition_rejects_whitespace_only_trade_and_reservation_ids():
+    for field_name in ("paper_trade_id", "reservation_id"):
+        payload = _admission()
+        payload[field_name] = "   "
+        with pytest.raises(ValueError, match=field_name):
+            validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED, payload
+            )
+
+
+def test_admitted_ids_and_intent_ancestry_share_one_canonical_rule():
+    """The admission id and the intent parent ref cannot disagree by whitespace.
+
+    The intent declares `reservation_id` as ancestry, so both the admission that
+    creates it and the intent that references it must accept exactly the same
+    canonical form.
+    """
+    admission = _admission()
+    intent = _order_intent()
+    assert admission["reservation_id"] == intent["reservation_id"] == "reserve-1"
+
+    padded = _admission()
+    padded["reservation_id"] = " reserve-1 "
+    with pytest.raises(ValueError, match="whitespace"):
+        validate_paper_evidence_payload(PAPER_OPPORTUNITY_DISPOSITION_RECORDED, padded)
+
+    padded_intent = _order_intent()
+    padded_intent["reservation_id"] = " reserve-1 "
+    with pytest.raises(ValueError, match="whitespace"):
+        validate_paper_evidence_payload(PAPER_ORDER_INTENT_RECORDED, padded_intent)
 
 
 def test_counterfactual_population_cannot_enter_qualified_intent_stream():

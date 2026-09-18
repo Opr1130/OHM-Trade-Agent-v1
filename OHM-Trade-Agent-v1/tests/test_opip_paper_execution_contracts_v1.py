@@ -184,8 +184,43 @@ def test_qualified_opportunity_disposition_is_closed_vocabulary():
         "DO_NOT_CHASE",
         "CANCELLED",
         "UNSUPPORTED",
+        "EVIDENCE_INCOMPLETE",
+        "DISABLED",
         "UNRESOLVED",
     }
+
+
+def test_new_dispositions_are_explicit_and_not_aliases_of_unresolved():
+    """UNRESOLVED stays the catch-all; the new reasons are not folded into it."""
+    assert (
+        QualifiedOpportunityDisposition.EVIDENCE_INCOMPLETE.value
+        == "EVIDENCE_INCOMPLETE"
+    )
+    assert QualifiedOpportunityDisposition.DISABLED.value == "DISABLED"
+
+    distinct = {
+        QualifiedOpportunityDisposition.EVIDENCE_INCOMPLETE,
+        QualifiedOpportunityDisposition.DISABLED,
+        QualifiedOpportunityDisposition.UNRESOLVED,
+    }
+    assert len(distinct) == 3
+    assert len({item.value for item in distinct}) == 3
+
+
+def test_disposition_and_terminal_reconciliation_vocabularies_stay_separate():
+    """Admission-time evidence gaps are not terminal reconciliation states.
+
+    `TerminalReconciliationState.UNRESOLVED_EVIDENCE` remains post-execution
+    reconciliation only, so neither vocabulary may borrow the other's member.
+    """
+    dispositions = {item.value for item in QualifiedOpportunityDisposition}
+    reconciliations = {item.value for item in TerminalReconciliationState}
+
+    assert "EVIDENCE_INCOMPLETE" in dispositions
+    assert "UNRESOLVED_EVIDENCE" not in dispositions
+    assert "UNRESOLVED_EVIDENCE" in reconciliations
+    assert "EVIDENCE_INCOMPLETE" not in reconciliations
+    assert "DISABLED" not in reconciliations
 
 
 def test_evaluation_populations_never_alias():
