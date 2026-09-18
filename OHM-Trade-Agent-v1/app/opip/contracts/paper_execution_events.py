@@ -283,11 +283,12 @@ PAPER_EXECUTION_EVENT_CONTRACTS: Mapping[str, PaperEvidenceEventContract] = (
 
 
 def event_contract(event_type: str) -> PaperEvidenceEventContract:
-    key = str(event_type or "").strip()
+    if not isinstance(event_type, str):
+        raise ValueError("Paper v2 event type must be a canonical string")
     try:
-        return PAPER_EXECUTION_EVENT_CONTRACTS[key]
+        return PAPER_EXECUTION_EVENT_CONTRACTS[event_type]
     except KeyError as exc:
-        raise ValueError(f"unsupported Paper v2 event type: {key}") from exc
+        raise ValueError(f"unsupported Paper v2 event type: {event_type}") from exc
 
 
 def paper_evidence_idempotency_key(event_type: str, payload: Mapping[str, Any]) -> str:
@@ -522,10 +523,18 @@ def validate_paper_evidence_payload(
         if normalized["order_type"] not in {"MARKET", "LIMIT"}:
             raise ValueError("order_type must be MARKET or LIMIT")
         _require_nonempty_string(normalized, "reason_code")
-        _require_finite_number(normalized, "requested_quantity", nonnegative=True)
+        requested_quantity = _require_finite_number(
+            normalized, "requested_quantity", nonnegative=True
+        )
+        if requested_quantity <= 0:
+            raise ValueError("requested_quantity must be positive")
         _require_finite_number(normalized, "requested_notional", nonnegative=True)
         if normalized["order_type"] == "LIMIT":
-            _require_finite_number(normalized, "limit_price", nonnegative=True)
+            limit_price = _require_finite_number(
+                normalized, "limit_price", nonnegative=True
+            )
+            if limit_price <= 0:
+                raise ValueError("limit_price must be positive")
         elif normalized.get("limit_price") is not None:
             raise ValueError("MARKET order intent cannot carry limit_price")
         if normalized["execution_model_version"] != PAPER_EXECUTION_MODEL_VERSION:
@@ -573,6 +582,28 @@ def validate_paper_evidence_payload(
         targets = normalized["targets"]
         if not isinstance(targets, list) or not targets:
             raise ValueError("targets must be a non-empty canonical array")
+        for target in targets:
+            if not isinstance(target, Mapping):
+                raise ValueError("each protection target must be an object")
+            required_target_fields = {"target_id", "price", "fraction"}
+            if set(target) != required_target_fields:
+                raise ValueError(
+                    "each protection target must contain exactly "
+                    "target_id, price, and fraction"
+                )
+            _require_nonempty_string(target, "target_id")
+            target_price = _require_finite_number(
+                target, "price", nonnegative=True
+            )
+            target_fraction = _require_finite_number(
+                target, "fraction", nonnegative=True
+            )
+            if target_price <= 0:
+                raise ValueError("protection target price must be positive")
+            if target_fraction <= 0 or target_fraction > 1:
+                raise ValueError(
+                    "protection target fraction must be within (0, 1]"
+                )
         if normalized["protection_model_version"] != PAPER_PROTECTION_MODEL_VERSION:
             raise ValueError("unsupported protection model version")
 
@@ -630,7 +661,14 @@ def validate_paper_evidence_payload(
         if normalized["economic_model_version"] != PAPER_ECONOMIC_MODEL_VERSION:
             raise ValueError("unsupported economic model version")
 
+        entry = float(normalized["filled_entry_quantity"])
+        exit_quantity = float(normalized["filled_exit_quantity"])
         remaining = float(normalized["remaining_quantity"])
+        if abs(entry - (exit_quantity + remaining)) > 1e-6:
+            raise ValueError(
+                "filled_entry_quantity must equal "
+                "filled_exit_quantity + remaining_quantity"
+            )
         if reconciliation_state is TerminalReconciliationState.FINAL_VERIFIED:
             if position_state is not PositionState.FLAT or remaining > 0.0:
                 raise ValueError(
