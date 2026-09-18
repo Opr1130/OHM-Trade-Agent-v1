@@ -55,6 +55,7 @@ from app.opip.contracts.paper_execution_runtime import (
     admission_result_identities,
     quote_evidence_idempotency_key,
     validate_admission_request,
+    validate_admission_request_record_payload,
     validate_quote_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import (
@@ -546,8 +547,10 @@ class CanonicalWriter:
         if row is None:
             return None
         try:
-            stored = json.loads(str(row["payload_json"]))
-        except json.JSONDecodeError:
+            stored = validate_admission_request_record_payload(
+                json.loads(str(row["payload_json"]))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
             return PaperAdmissionAck(
                 status="REJECTED",
                 request_event_id=str(row["event_id"]),
@@ -710,11 +713,13 @@ class CanonicalWriter:
                     if request.expected_portfolio_version == current_version
                     else "STALE_PORTFOLIO_VERSION"
                 )
-                request_record = {
-                    **request_payload,
-                    "guard_result": guard_result,
-                    "observed_portfolio_version": current_version,
-                }
+                request_record = validate_admission_request_record_payload(
+                    {
+                        **request_payload,
+                        "guard_result": guard_result,
+                        "observed_portfolio_version": current_version,
+                    }
+                )
                 request_event_id = self._insert_event_row_in_transaction(
                     event_type=PAPER_ADMISSION_REQUEST_RECORDED,
                     idempotency_key=admission_request_idempotency_key(
