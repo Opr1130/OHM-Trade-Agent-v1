@@ -148,7 +148,12 @@ OPIP_PAPER_V2_TARGET_POLICY = PaperSimulatorPolicy(
 )
 
 
-# Legacy Paper v1/OHLC evidence is intentionally NOT wrapped in this v2 policy.\n# Its historical meaning remains governed by paper_outcome.py and\n# paper_trade_simulation.py exactly as committed.\n\n\n__all__ = [
+# Legacy Paper v1/OHLC evidence is intentionally NOT wrapped in this v2 policy.
+# Its historical meaning remains governed by paper_outcome.py and
+# paper_trade_simulation.py exactly as committed.
+
+
+__all__ = [
     "LatencyModel",
     "ModelingDisposition",
     "OPIP_PAPER_V2_TARGET_POLICY",
