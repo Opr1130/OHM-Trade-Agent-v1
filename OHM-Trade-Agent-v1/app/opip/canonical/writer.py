@@ -480,6 +480,407 @@ class CanonicalWriter:
                 self._conn.rollback()
                 return WriterAck(status="RETRYABLE", error_code="SQLITE_ERROR", detail=str(exc))
 
+    def _insert_event_row_in_transaction(
+        self,
+        *,
+        event_type: str,
+        idempotency_key: str,
+        payload: Mapping[str, object],
+        history_epoch: int,
+        local_sequence: int,
+        now: str,
+        causation_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> str:
+        event_id = _new_event_id()
+        payload_json = json.dumps(
+            dict(payload),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._conn.execute(
+            """
+            INSERT INTO events (
+                event_id, schema_version, event_type, history_epoch, local_sequence,
+                recorded_at, event_time, causation_id, correlation_id,
+                idempotency_key, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                EVENT_SCHEMA_VERSION,
+                event_type,
+                history_epoch,
+                local_sequence,
+                now,
+                causation_id,
+                correlation_id,
+                idempotency_key,
+                payload_json,
+            ),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO idempotency_keys (idempotency_key, event_id, committed_at)
+            VALUES (?, ?, ?)
+            """,
+            (idempotency_key, event_id, now),
+        )
+        return event_id
+
+    def _existing_admission_result(
+        self,
+        request: PaperAdmissionRequest,
+        *,
+        request_payload: Mapping[str, object],
+    ) -> PaperAdmissionAck | None:
+        request_key = admission_request_idempotency_key(request.disposition_id)
+        row = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_ADMISSION_REQUEST_RECORDED, request_key),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+
+        stored_request = {key: stored.get(key) for key in request_payload}
+        expected_json = json.dumps(
+            dict(request_payload),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        stored_json = json.dumps(
+            stored_request,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if stored_json != expected_json:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                detail=(
+                    "disposition identity already committed with a different "
+                    "admission request payload"
+                ),
+            )
+
+        observed_version = stored.get("observed_portfolio_version")
+        if type(observed_version) is not int or observed_version < 0:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+        guard_result = stored.get("guard_result")
+        if guard_result == "STALE_PORTFOLIO_VERSION":
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                history_epoch=int(row["history_epoch"]),
+                local_sequence=int(row["local_sequence"]),
+                portfolio_version=observed_version,
+                error_code="STALE_PORTFOLIO_VERSION",
+                detail=(
+                    f"expected portfolio version {request.expected_portfolio_version}; "
+                    f"observed {observed_version}"
+                ),
+            )
+        if guard_result != "ELIGIBLE":
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_REQUEST_CORRUPT",
+            )
+
+        disposition_key = paper_evidence_idempotency_key(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+            {"disposition_id": request.disposition_id},
+        )
+        result_row = self._conn.execute(
+            """
+            SELECT event_id, history_epoch, local_sequence, payload_json
+            FROM events
+            WHERE event_type = ? AND idempotency_key = ?
+            """,
+            (PAPER_OPPORTUNITY_DISPOSITION_RECORDED, disposition_key),
+        ).fetchone()
+        if result_row is None:
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                error_code="ADMISSION_TRANSACTION_INCOMPLETE",
+            )
+        try:
+            result = validate_paper_evidence_payload(
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                json.loads(str(result_row["payload_json"])),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PaperAdmissionAck(
+                status="REJECTED",
+                request_event_id=str(row["event_id"]),
+                disposition_event_id=str(result_row["event_id"]),
+                error_code="ADMISSION_RESULT_CORRUPT",
+            )
+        disposition = str(result["disposition"])
+        portfolio_version = observed_version + (1 if disposition == "ADMITTED" else 0)
+        return PaperAdmissionAck(
+            status="DUPLICATE_OK",
+            disposition=disposition,
+            request_event_id=str(row["event_id"]),
+            disposition_event_id=str(result_row["event_id"]),
+            history_epoch=int(result_row["history_epoch"]),
+            local_sequence=int(result_row["local_sequence"]),
+            portfolio_version=portfolio_version,
+            paper_trade_id=(
+                str(result["paper_trade_id"])
+                if result.get("paper_trade_id") is not None
+                else None
+            ),
+            reservation_id=(
+                str(result["reservation_id"])
+                if result.get("reservation_id") is not None
+                else None
+            ),
+        )
+
+    def admit_paper_opportunity(
+        self,
+        request: PaperAdmissionRequest,
+    ) -> PaperAdmissionAck:
+        """Atomically decide Paper v2 capital/capacity and record the disposition."""
+
+        with self._lock:
+            try:
+                request_payload = validate_admission_request(request)
+            except (TypeError, ValueError) as exc:
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="INVALID_ADMISSION_REQUEST",
+                    detail=str(exc),
+                )
+
+            existing = self._existing_admission_result(
+                request,
+                request_payload=request_payload,
+            )
+            if existing is not None:
+                return existing
+
+            now = _utc_now()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                meta = self._conn.execute(
+                    "SELECT history_epoch, next_local_sequence, schema_version "
+                    "FROM meta WHERE id = 1"
+                ).fetchone()
+                if meta is None:
+                    raise ValueError("canonical meta row missing")
+                if int(meta["schema_version"]) != SCHEMA_VERSION:
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DB_SCHEMA_MISMATCH",
+                    )
+
+                # The decision context must already be canonical. Admission never
+                # invents or reconstructs upstream decision ancestry.
+                self._load_context_by_id(request.decision_context_id)
+
+                history_epoch = int(meta["history_epoch"])
+                local_sequence = int(meta["next_local_sequence"])
+                current_version, reserved_capital, active_reservations = (
+                    self._portfolio_state(request.quote_currency)
+                )
+
+                guard_result = (
+                    "ELIGIBLE"
+                    if request.expected_portfolio_version == current_version
+                    else "STALE_PORTFOLIO_VERSION"
+                )
+                request_record = {
+                    **request_payload,
+                    "guard_result": guard_result,
+                    "observed_portfolio_version": current_version,
+                }
+                request_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_ADMISSION_REQUEST_RECORDED,
+                    idempotency_key=admission_request_idempotency_key(
+                        request.disposition_id
+                    ),
+                    payload=request_record,
+                    history_epoch=history_epoch,
+                    local_sequence=local_sequence,
+                    now=now,
+                    correlation_id=request.decision_context_id,
+                )
+
+                if guard_result == "STALE_PORTFOLIO_VERSION":
+                    self._conn.execute(
+                        """
+                        INSERT INTO watermarks (
+                            stream, history_epoch, local_sequence, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(stream) DO UPDATE SET
+                            history_epoch = excluded.history_epoch,
+                            local_sequence = excluded.local_sequence,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            PAPER_EXECUTION_STREAM,
+                            history_epoch,
+                            local_sequence,
+                            now,
+                        ),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE meta
+                        SET next_local_sequence = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (local_sequence + 1, now),
+                    )
+                    self._conn.commit()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        request_event_id=request_event_id,
+                        history_epoch=history_epoch,
+                        local_sequence=local_sequence,
+                        portfolio_version=current_version,
+                        error_code="STALE_PORTFOLIO_VERSION",
+                        detail=(
+                            f"expected portfolio version "
+                            f"{request.expected_portfolio_version}; "
+                            f"observed {current_version}"
+                        ),
+                    )
+
+                if active_reservations >= request.portfolio_position_limit:
+                    disposition = "CAPACITY_REJECTED"
+                    reason_code = "PORTFOLIO_POSITION_LIMIT"
+                elif (
+                    reserved_capital + request.requested_reservation_amount
+                    > request.portfolio_equity_limit + 1e-9
+                ):
+                    disposition = "CAPITAL_REJECTED"
+                    reason_code = "PORTFOLIO_CAPITAL_LIMIT"
+                else:
+                    disposition = "ADMITTED"
+                    reason_code = "CAPITAL_AND_CAPACITY_ADMITTED"
+
+                disposition_payload = {
+                    **request_payload,
+                    "disposition": disposition,
+                    "reason_code": reason_code,
+                }
+                paper_trade_id: str | None = None
+                reservation_id: str | None = None
+                if disposition == "ADMITTED":
+                    paper_trade_id, reservation_id = admission_result_identities(
+                        request.disposition_id
+                    )
+                    disposition_payload["paper_trade_id"] = paper_trade_id
+                    disposition_payload["reservation_id"] = reservation_id
+
+                normalized = validate_paper_evidence_payload(
+                    PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                    disposition_payload,
+                )
+                disposition_sequence = local_sequence + 1
+                disposition_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                        normalized,
+                    ),
+                    payload=normalized,
+                    history_epoch=history_epoch,
+                    local_sequence=disposition_sequence,
+                    now=now,
+                    causation_id=request_event_id,
+                    correlation_id=request.decision_context_id,
+                )
+
+                self._conn.execute(
+                    """
+                    INSERT INTO watermarks (
+                        stream, history_epoch, local_sequence, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stream) DO UPDATE SET
+                        history_epoch = excluded.history_epoch,
+                        local_sequence = excluded.local_sequence,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        PAPER_EXECUTION_STREAM,
+                        history_epoch,
+                        disposition_sequence,
+                        now,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE meta
+                    SET next_local_sequence = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (disposition_sequence + 1, now),
+                )
+                self._conn.commit()
+                resulting_version = current_version + (
+                    1 if disposition == "ADMITTED" else 0
+                )
+                return PaperAdmissionAck(
+                    status="OK",
+                    disposition=disposition,
+                    request_event_id=request_event_id,
+                    disposition_event_id=disposition_event_id,
+                    history_epoch=history_epoch,
+                    local_sequence=disposition_sequence,
+                    portfolio_version=resulting_version,
+                    paper_trade_id=paper_trade_id,
+                    reservation_id=reservation_id,
+                )
+            except (TypeError, ValueError) as exc:
+                self._conn.rollback()
+                return PaperAdmissionAck(
+                    status="REJECTED",
+                    error_code="INVALID_ADMISSION_REQUEST",
+                    detail=str(exc),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                existing = self._existing_admission_result(
+                    request,
+                    request_payload=request_payload,
+                )
+                if existing is not None:
+                    return existing
+                return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="INTEGRITY_CONFLICT",
+                )
+            except sqlite3.Error as exc:
+                self._conn.rollback()
+                return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         now = _utc_now()
         with self._lock:
