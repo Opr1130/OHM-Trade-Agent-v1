@@ -40,7 +40,7 @@ def _admission() -> dict:
         "decision_context_id": "ctx-1",
         "disposition_seq": 0,
         "disposition": "ADMITTED",
-        "evaluation_population": "ACTUAL_REALIZED",
+        "evaluation_population": "QUALIFIED_INTENT",
         "quote_currency": "USD",
         "requested_capital": 1000.0,
         "disposition_time": _exact(),
@@ -251,10 +251,10 @@ def test_admitted_opportunity_requires_trade_and_reservation_identity():
         )
 
 
-def test_counterfactual_population_cannot_enter_actual_admission_stream():
+def test_counterfactual_population_cannot_enter_qualified_intent_stream():
     payload = _admission()
     payload["evaluation_population"] = "COUNTERFACTUAL_POLICY"
-    with pytest.raises(ValueError, match="ACTUAL_REALIZED"):
+    with pytest.raises(ValueError, match="QUALIFIED_INTENT"):
         validate_paper_evidence_payload(
             PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
             payload,
