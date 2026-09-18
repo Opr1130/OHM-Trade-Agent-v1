@@ -97,7 +97,17 @@ _EVENT_CONTRACTS = {
                 "reason_code",
             }
         ),
-        optional_fields=frozenset({"paper_trade_id", "reservation_id"}),
+        optional_fields=frozenset(
+            {
+                "paper_trade_id",
+                "reservation_id",
+                "expected_portfolio_version",
+                "capital_policy_version",
+                "portfolio_equity_limit",
+                "portfolio_position_limit",
+                "reservation_amount",
+            }
+        ),
         parent_refs=("decision_context_id",),
         temporal_field="disposition_time",
     ),
@@ -436,10 +446,74 @@ def validate_paper_evidence_payload(
         if quote_currency not in QUOTE_CURRENCIES:
             raise ValueError("unsupported quote_currency")
         _require_nonempty_string(normalized, "reason_code")
-        _require_finite_number(normalized, "requested_capital", nonnegative=True)
-        if disposition is QualifiedOpportunityDisposition.ADMITTED:
-            _require_nonempty_string(normalized, "paper_trade_id")
-            _require_nonempty_string(normalized, "reservation_id")
+        requested_capital = _require_finite_number(
+            normalized, "requested_capital", nonnegative=True
+        )
+        if requested_capital <= 0:
+            raise ValueError("requested_capital must be positive")
+
+        capital_decision = disposition in {
+            QualifiedOpportunityDisposition.ADMITTED,
+            QualifiedOpportunityDisposition.CAPITAL_REJECTED,
+            QualifiedOpportunityDisposition.CAPACITY_REJECTED,
+        }
+        if capital_decision:
+            expected_version = _require_nonnegative_int(
+                normalized, "expected_portfolio_version"
+            )
+            _require_nonempty_string(normalized, "capital_policy_version")
+            equity_limit = _require_finite_number(
+                normalized, "portfolio_equity_limit", nonnegative=True
+            )
+            position_limit = _require_nonnegative_int(
+                normalized, "portfolio_position_limit"
+            )
+            reservation_amount = _require_finite_number(
+                normalized, "reservation_amount", nonnegative=True
+            )
+            if equity_limit <= 0:
+                raise ValueError("portfolio_equity_limit must be positive")
+            if position_limit <= 0:
+                raise ValueError("portfolio_position_limit must be positive")
+            if expected_version < 0:
+                raise ValueError("expected_portfolio_version must be non-negative")
+
+            if disposition is QualifiedOpportunityDisposition.ADMITTED:
+                _require_nonempty_string(normalized, "paper_trade_id")
+                _require_nonempty_string(normalized, "reservation_id")
+                if reservation_amount < requested_capital:
+                    raise ValueError(
+                        "reservation_amount cannot be less than requested_capital"
+                    )
+            else:
+                if reservation_amount != 0.0:
+                    raise ValueError(
+                        "rejected capital disposition cannot reserve capital"
+                    )
+                if normalized.get("reservation_id") is not None:
+                    raise ValueError(
+                        "rejected capital disposition cannot carry reservation_id"
+                    )
+                if normalized.get("paper_trade_id") is not None:
+                    raise ValueError(
+                        "rejected capital disposition cannot carry paper_trade_id"
+                    )
+        elif any(
+            normalized.get(field_name) is not None
+            for field_name in (
+                "paper_trade_id",
+                "reservation_id",
+                "expected_portfolio_version",
+                "capital_policy_version",
+                "portfolio_equity_limit",
+                "portfolio_position_limit",
+                "reservation_amount",
+            )
+        ):
+            raise ValueError(
+                "non-capital disposition cannot carry reservation-policy fields"
+            )
+
         if population is not EvaluationPopulation.QUALIFIED_INTENT:
             raise ValueError(
                 "opportunity disposition evidence belongs to QUALIFIED_INTENT population"
