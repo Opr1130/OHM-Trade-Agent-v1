@@ -322,6 +322,53 @@ def _prove_virgin(
     )
 
 
+def _adopt_existing_registry_if_valid(
+    *,
+    state_file: Path,
+    marker_path: Path,
+    marker_present: bool,
+    stamp: datetime,
+    release_sha: str | None,
+    facts: dict[str, Any],
+) -> GenesisOutcome | None:
+    """Adopt an existing valid registry, refusing a corrupt one.
+
+    Returns ``None`` when no registry exists, so the caller continues to genesis.
+    A corrupt registry is never rewritten, replaced or quarantined - it is reported
+    and refused.
+
+    Called both before taking the state lock (fast path) and again inside it, so
+    one implementation covers sequential adoption, concurrent adoption and the
+    corrupt case identically.
+    """
+    if not state_file.exists():
+        return None
+    try:
+        _validate_registry_payload(state_file)
+    except PaperRegistryStateCorruptError as exc:
+        logger.critical(
+            "paper registry genesis refused: existing registry is invalid (%s)", exc
+        )
+        return GenesisOutcome(
+            status=GENESIS_REFUSED,
+            reason=REASON_STATE_CORRUPT,
+            detail=str(exc),
+            marker_path=marker_path,
+            facts={**facts, "state_present": True, "state_valid": False},
+        )
+    # A valid registry is never rewritten or reformatted. Adoption only records
+    # durable provenance, so a later disappearance cannot be read as virginity.
+    basis = BASIS_GENESIS if marker_present else BASIS_ADOPTED
+    _write_marker(marker_path, basis=basis, recorded_at=stamp, release_sha=release_sha)
+    return GenesisOutcome(
+        status=GENESIS_ALREADY_INITIALIZED if marker_present else GENESIS_ADOPTED_EXISTING,
+        reason=REASON_STATE_PRESENT_VALID,
+        detail="paper registry already present and valid",
+        marker_path=marker_path,
+        facts={**facts, "state_present": True, "state_valid": True, "basis": basis},
+    )
+
+
 def ensure_paper_registry_initialized(
     *,
     state_file: Path = STATE_FILE,
@@ -353,34 +400,16 @@ def ensure_paper_registry_initialized(
         "marker_exists": marker_present,
     }
 
-    if state_file.exists():
-        try:
-            _validate_registry_payload(state_file)
-        except PaperRegistryStateCorruptError as exc:
-            logger.critical(
-                "paper registry genesis refused: existing registry is invalid (%s)", exc
-            )
-            return GenesisOutcome(
-                status=GENESIS_REFUSED,
-                reason=REASON_STATE_CORRUPT,
-                detail=str(exc),
-                marker_path=marker_path,
-                facts={**facts, "state_present": True, "state_valid": False},
-            )
-        # A valid registry is never rewritten or reformatted. Adoption only
-        # records durable provenance, so a later disappearance cannot be read as
-        # virginity.
-        basis = BASIS_GENESIS if marker_present else BASIS_ADOPTED
-        _write_marker(
-            marker_path, basis=basis, recorded_at=stamp, release_sha=release_sha
-        )
-        return GenesisOutcome(
-            status=GENESIS_ALREADY_INITIALIZED if marker_present else GENESIS_ADOPTED_EXISTING,
-            reason=REASON_STATE_PRESENT_VALID,
-            detail="paper registry already present and valid",
-            marker_path=marker_path,
-            facts={**facts, "state_present": True, "state_valid": True, "basis": basis},
-        )
+    adopted = _adopt_existing_registry_if_valid(
+        state_file=state_file,
+        marker_path=marker_path,
+        marker_present=marker_present,
+        stamp=stamp,
+        release_sha=release_sha,
+        facts=facts,
+    )
+    if adopted is not None:
+        return adopted
 
     # State is absent. A marker proves it was initialized at some point, so its
     # absence now is potential evidence loss - never virginity.
@@ -434,31 +463,17 @@ def ensure_paper_registry_initialized(
     # the pre-check and the write would be silently overwritten by an empty
     # registry that then certifies completeness.
     with registry_lock(registry_state_lock(state_file)):
-        if state_file.exists():
-            try:
-                _validate_registry_payload(state_file)
-            except PaperRegistryStateCorruptError as exc:
-                return GenesisOutcome(
-                    status=GENESIS_REFUSED,
-                    reason=REASON_STATE_CORRUPT,
-                    detail=str(exc),
-                    marker_path=marker_path,
-                    facts={**facts, "state_present": True, "state_valid": False},
-                )
-            # Another attempt won the race. Its own marker write is equivalent.
-            _write_marker(
-                marker_path,
-                basis=BASIS_GENESIS if marker_present else BASIS_ADOPTED,
-                recorded_at=stamp,
-                release_sha=release_sha,
-            )
-            return GenesisOutcome(
-                status=GENESIS_ALREADY_INITIALIZED,
-                reason=REASON_STATE_PRESENT_VALID,
-                detail="paper registry created concurrently; no action taken",
-                marker_path=marker_path,
-                facts={**facts, "state_present": True, "state_valid": True},
-            )
+        adopted = _adopt_existing_registry_if_valid(
+            state_file=state_file,
+            marker_path=marker_path,
+            marker_present=marker_present,
+            stamp=stamp,
+            release_sha=release_sha,
+            facts=facts,
+        )
+        if adopted is not None:
+            # Another attempt won the race; its own marker write is equivalent.
+            return adopted
 
         recheck = _prove_virgin(
             event_file=Path(event_file),
