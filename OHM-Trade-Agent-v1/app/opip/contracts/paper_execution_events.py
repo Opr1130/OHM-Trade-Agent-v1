@@ -105,7 +105,7 @@ _EVENT_CONTRACTS = {
                 "capital_policy_version",
                 "portfolio_equity_limit",
                 "portfolio_position_limit",
-                "reservation_amount",
+                "requested_reservation_amount",
             }
         ),
         parent_refs=("decision_context_id",),
@@ -468,25 +468,21 @@ def validate_paper_evidence_payload(
             position_limit = _require_nonnegative_int(
                 normalized, "portfolio_position_limit"
             )
-            reservation_amount = _require_finite_number(
-                normalized, "reservation_amount", nonnegative=True
+            requested_reservation_amount = _require_finite_number(
+                normalized, "requested_reservation_amount", nonnegative=True
             )
             if equity_limit <= 0:
                 raise ValueError("portfolio_equity_limit must be positive")
             if position_limit <= 0:
                 raise ValueError("portfolio_position_limit must be positive")
+            if requested_reservation_amount < requested_capital:
+                raise ValueError(
+                    "requested_reservation_amount cannot be less than requested_capital"
+                )
             if disposition is QualifiedOpportunityDisposition.ADMITTED:
                 _require_nonempty_string(normalized, "paper_trade_id")
                 _require_nonempty_string(normalized, "reservation_id")
-                if reservation_amount < requested_capital:
-                    raise ValueError(
-                        "reservation_amount cannot be less than requested_capital"
-                    )
             else:
-                if reservation_amount != 0.0:
-                    raise ValueError(
-                        "rejected capital disposition cannot reserve capital"
-                    )
                 if normalized.get("reservation_id") is not None:
                     raise ValueError(
                         "rejected capital disposition cannot carry reservation_id"
@@ -504,7 +500,7 @@ def validate_paper_evidence_payload(
                 "capital_policy_version",
                 "portfolio_equity_limit",
                 "portfolio_position_limit",
-                "reservation_amount",
+                "requested_reservation_amount",
             )
         ):
             raise ValueError(
