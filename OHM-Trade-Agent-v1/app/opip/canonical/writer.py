@@ -1656,6 +1656,11 @@ class CanonicalWriter:
             intent.event_type,
             payload,
         )
+        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            self._validate_paper_execution_ancestry(
+                intent.event_type,
+                payload,
+            )
         if intent.event_type in {
             DECISION_INTELLIGENCE_ROLE_RESULT_RECORDED,
             DECISION_INTELLIGENCE_ASSESSMENT_RECORDED,
