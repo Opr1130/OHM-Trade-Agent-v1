@@ -681,6 +681,56 @@ def test_future_or_temporally_ambiguous_quote_cannot_justify_execution(canonical
     assert future_ack.status == "REJECTED"
     assert "not proven available" in str(future_ack.detail)
 
+    valid_quote = {
+        **future_quote,
+        "quote_evidence_id": "quote-before-attempt",
+        "quote_time": _exact("2026-09-18T16:00:01Z"),
+    }
+    assert (
+        _submit_paper(writer, PAPER_QUOTE_EVIDENCE_RECORDED, valid_quote).status
+        == "OK"
+    )
+    valid_attempt = {
+        **future_attempt,
+        "execution_attempt_id": "attempt-before-fill",
+        "market_evidence_ref": valid_quote["quote_evidence_id"],
+    }
+    assert (
+        _submit_paper(
+            writer,
+            PAPER_EXECUTION_ATTEMPT_RECORDED,
+            valid_attempt,
+        ).status
+        == "OK"
+    )
+    future_fill = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "fill_id": "fill-future-quote",
+        "execution_attempt_id": valid_attempt["execution_attempt_id"],
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "fill_seq": 0,
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 100.0,
+        "fee_cost": 0.2,
+        "spread_cost": 0.1,
+        "slippage_cost": 0.05,
+        "other_supported_cost": 0.0,
+        "fill_time": _exact("2026-09-18T16:00:03Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+        "market_evidence_ref": future_quote["quote_evidence_id"],
+    }
+    future_fill_ack = _submit_paper(
+        writer,
+        PAPER_FILL_RECORDED,
+        future_fill,
+    )
+    assert future_fill_ack.status == "REJECTED"
+    assert "not proven available" in str(future_fill_ack.detail)
+
     ambiguous_quote = {
         **future_quote,
         "quote_evidence_id": "quote-overlap",
