@@ -1235,6 +1235,102 @@ def read_export_manifest(path: Path) -> dict[str, str]:
     return values
 
 
+def _verify_outer_content_address(
+    *,
+    export_root: Path,
+    dir_name: str,
+    manifest: Mapping[str, str],
+    facts: dict[str, Any],
+) -> tuple[bool, str, str, Path | None]:
+    """Prove the OUTER content address of the referenced replica tree.
+
+    This is the layer the inner replica manifest cannot police on its own: the
+    manifest records a tree digest and byte count, and both must be recomputed
+    from the referenced tree with the same implementation the exporter used. The
+    directory's own name must also agree with the claimed digest, and the entry
+    must be a real directory contained beneath the export root.
+
+    Returns ``(ok, reason, detail, replica_dir)``. ``facts`` is updated in place
+    for observability.
+    """
+    replica_dir = export_root / dir_name
+    if replica_dir.is_symlink():
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory is a symlink: {replica_dir}",
+            None,
+        )
+    if not replica_dir.is_dir():
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory is missing: {replica_dir}",
+            None,
+        )
+    resolved_dir = Path(os.path.realpath(replica_dir))
+    resolved_root = Path(os.path.realpath(export_root))
+    if resolved_dir != resolved_root and resolved_root not in resolved_dir.parents:
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory escapes the export root: {resolved_dir}",
+            None,
+        )
+
+    recorded_tree_sha = (manifest.get("canonical_learning_replica_sha256", "") or "").strip()
+    recorded_tree_bytes = (manifest.get("canonical_learning_replica_bytes", "") or "").strip()
+    facts["manifest_replica_tree_sha256"] = recorded_tree_sha
+    facts["manifest_replica_tree_bytes"] = recorded_tree_bytes
+    if not _SHA256_PATTERN.match(recorded_tree_sha):
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            f"manifest canonical_learning_replica_sha256 is not a sha256: {recorded_tree_sha!r}",
+            None,
+        )
+    if not recorded_tree_bytes.isdigit():
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "manifest canonical_learning_replica_bytes is not a non-negative integer: "
+            f"{recorded_tree_bytes!r}",
+            None,
+        )
+    if dir_name.rsplit(".", 1)[-1] != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "referenced directory name does not match the manifest tree digest "
+            f"({dir_name.rsplit('.', 1)[-1]} != {recorded_tree_sha})",
+            None,
+        )
+
+    try:
+        actual_tree_sha, actual_tree_bytes = replica_tree_digest(replica_dir)
+    except ReplicaUnavailableError as exc:
+        return False, exc.reason, str(exc), None
+    facts["actual_replica_tree_sha256"] = actual_tree_sha
+    facts["actual_replica_tree_bytes"] = actual_tree_bytes
+    if actual_tree_sha != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree digest does not match the manifest "
+            f"({actual_tree_sha} != {recorded_tree_sha})",
+            None,
+        )
+    if actual_tree_bytes != int(recorded_tree_bytes):
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree byte count does not match the manifest "
+            f"({actual_tree_bytes} != {recorded_tree_bytes})",
+            None,
+        )
+    return True, REASON_EXPORT_READY, "outer content address proven", replica_dir
+
+
 def _evaluate_committed_export(
     *,
     export_root: Path,
@@ -1302,9 +1398,9 @@ def _evaluate_committed_export(
             facts,
         )
 
-    # 4. The referenced directory must be a real, contained, content-addressed
-    #    directory. A valid-looking *name* is not sufficient: `is_dir()` follows
-    #    symlinks, so the resolved path is re-verified beneath the export root.
+    # 4. The referenced directory name must be content-addressed before anything
+    #    is derived from it. A valid-looking *name* is not sufficient on its own;
+    #    containment and the digest binding are proven by the helper below.
     dir_name = manifest.get("canonical_learning_replica_dir", "")
     if not EXPORT_REPLICA_DIR_PATTERN.match(dir_name or ""):
         return (
@@ -1313,91 +1409,20 @@ def _evaluate_committed_export(
             f"canonical_learning_replica_dir is not content-addressed: {dir_name!r}",
             facts,
         )
-    replica_dir = export_root / dir_name
-    if replica_dir.is_symlink():
-        return (
-            False,
-            REASON_EXPORT_REPLICA_DIR_INVALID,
-            f"referenced replica directory is a symlink: {replica_dir}",
-            facts,
-        )
-    if not replica_dir.is_dir():
-        return (
-            False,
-            REASON_EXPORT_REPLICA_DIR_INVALID,
-            f"referenced replica directory is missing: {replica_dir}",
-            facts,
-        )
-    resolved_dir = Path(os.path.realpath(replica_dir))
-    resolved_root = Path(os.path.realpath(export_root))
-    if resolved_dir != resolved_root and resolved_root not in resolved_dir.parents:
-        return (
-            False,
-            REASON_EXPORT_REPLICA_DIR_INVALID,
-            f"referenced replica directory escapes the export root: {resolved_dir}",
-            facts,
-        )
 
-    # 5. The OUTER content address must be proven, not merely present. The marker
-    #    claims a tree digest and a byte count; both are recomputed from the
-    #    referenced tree with the same implementation the exporter used, and the
-    #    directory's own name must agree with the claimed digest. Without this the
-    #    manifest could name a directory whose contents were not what was
-    #    published - the inner manifest alone cannot detect that, because its
-    #    recorded hashes travel inside the same tree.
-    recorded_tree_sha = (manifest.get("canonical_learning_replica_sha256", "") or "").strip()
-    recorded_tree_bytes = (manifest.get("canonical_learning_replica_bytes", "") or "").strip()
-    facts["manifest_replica_tree_sha256"] = recorded_tree_sha
-    facts["manifest_replica_tree_bytes"] = recorded_tree_bytes
-    if not _SHA256_PATTERN.match(recorded_tree_sha):
-        return (
-            False,
-            REASON_EXPORT_OUTER_ADDRESS_INVALID,
-            f"manifest canonical_learning_replica_sha256 is not a sha256: {recorded_tree_sha!r}",
-            facts,
-        )
-    if not recorded_tree_bytes.isdigit():
-        return (
-            False,
-            REASON_EXPORT_OUTER_ADDRESS_INVALID,
-            "manifest canonical_learning_replica_bytes is not a non-negative integer: "
-            f"{recorded_tree_bytes!r}",
-            facts,
-        )
-    claimed_bytes = int(recorded_tree_bytes)
-    if dir_name.rsplit(".", 1)[-1] != recorded_tree_sha:
-        return (
-            False,
-            REASON_EXPORT_OUTER_ADDRESS_INVALID,
-            "referenced directory name does not match the manifest tree digest "
-            f"({dir_name.rsplit('.', 1)[-1]} != {recorded_tree_sha})",
-            facts,
-        )
-    try:
-        actual_tree_sha, actual_tree_bytes = replica_tree_digest(replica_dir)
-    except ReplicaUnavailableError as exc:
-        return False, exc.reason, str(exc), facts
-    facts["actual_replica_tree_sha256"] = actual_tree_sha
-    facts["actual_replica_tree_bytes"] = actual_tree_bytes
-    if actual_tree_sha != recorded_tree_sha:
-        return (
-            False,
-            REASON_EXPORT_OUTER_ADDRESS_INVALID,
-            "recomputed replica tree digest does not match the manifest "
-            f"({actual_tree_sha} != {recorded_tree_sha})",
-            facts,
-        )
-    if actual_tree_bytes != claimed_bytes:
-        return (
-            False,
-            REASON_EXPORT_OUTER_ADDRESS_INVALID,
-            "recomputed replica tree byte count does not match the manifest "
-            f"({actual_tree_bytes} != {claimed_bytes})",
-            facts,
-        )
+    # 5+6. The OUTER content address and containment are proven as one unit, then
+    #      the INNER replica manifest is verified. Both layers are required: the
+    #      inner manifest records hashes that travel inside the same tree, so it
+    #      cannot detect a tree that is not what the manifest claims was published.
+    ok, reason, detail, replica_dir = _verify_outer_content_address(
+        export_root=export_root,
+        dir_name=dir_name,
+        manifest=manifest,
+        facts=facts,
+    )
+    if not ok or replica_dir is None:
+        return False, reason, detail, facts
 
-    # 6. Finally the inner replica manifest, which proves hashes, release binding
-    #    and snapshot freshness for the immutable generation just content-addressed.
     try:
         inner = read_replica_manifest(replica_dir / MANIFEST_FILENAME)
         verified = verify_replica_manifest(
