@@ -34,7 +34,12 @@ from app.opip.contracts.events import (
     MARKET_INSTRUMENT_VERSION_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
-from app.opip.contracts.paper_execution import ExecutionState
+from app.opip.contracts.paper_execution import (
+    ExecutionState,
+    PositionState,
+    ProtectionState,
+    TerminalReconciliationState,
+)
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_EXECUTION_PRIORITY,
@@ -42,6 +47,10 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_FILL_RECORDED,
     PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
+    PAPER_PROTECTION_PLAN_RECORDED,
+    PAPER_PROTECTION_STATE_RECORDED,
+    PAPER_PROTECTION_TRIGGER_RECORDED,
+    PAPER_RECONCILIATION_RECORDED,
     event_contract as paper_event_contract,
     paper_evidence_idempotency_key,
     validate_paper_evidence_payload,
@@ -49,11 +58,17 @@ from app.opip.contracts.paper_execution_events import (
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
+    PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
+    PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME,
+    PAPER_TRIGGER_TYPES_REQUIRING_QUOTE,
+    PAPER_V2_WRITER_EVENT_TYPES,
     PaperAdmissionAck,
     PaperAdmissionRequest,
     admission_request_idempotency_key,
     admission_result_identities,
+    protection_transition_allowed,
+    protection_transition_requires_trigger,
     quote_evidence_idempotency_key,
     resolve_capital_policy,
     validate_admission_request,
@@ -117,7 +132,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # strategy/execution provenance) is exactly what makes two otherwise
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
-    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+    | PAPER_V2_WRITER_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -190,7 +205,7 @@ ACCEPTED_EVENT_TYPES = (
     | FEATURE_BUS_EVENT_TYPES
     | DECISION_INTELLIGENCE_EVENT_TYPES
     | PAPER_OUTCOME_EVENT_TYPES
-    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+    | PAPER_V2_WRITER_EVENT_TYPES
 )
 
 
@@ -1758,15 +1773,29 @@ class CanonicalWriter:
         """Return version, reserved capital, active reservation count.
 
         In B/C-1 a committed ADMITTED disposition is the reservation authority.
-        Reservation release is deliberately deferred to B/C-2, so the version is
-        exactly the number of admissions for the quote-currency portfolio.
+        Reservation release is deferred to B/C-2 and is now driven by canonical
+        terminal reconciliation: a reservation is released from the active
+        projection only once its trade is FINAL_VERIFIED. Until then it remains
+        active through plan creation, activation, trigger, exit intent, attempts,
+        partial fills and unverified FLAT state.
+
+        The portfolio version stays the cumulative admission count so it remains a
+        monotone concurrency token; only the reservation projection is released.
+        Quote currencies stay separate: only this currency's verified trades can
+        release capacity here.
         """
         admitted = self._admitted_dispositions(quote_currency)
+        released = self._verified_paper_trade_ids(quote_currency)
+        active = [
+            item
+            for item in admitted
+            if str(item.get("paper_trade_id")) not in released
+        ]
         reserved = sum(
             float(item["requested_reservation_amount"])
-            for item in admitted
+            for item in active
         )
-        return len(admitted), reserved, len(admitted)
+        return len(admitted), reserved, len(active)
 
     def _admission_for_reservation(self, reservation_id: str) -> dict:
         matches = [
@@ -2087,8 +2116,8 @@ class CanonicalWriter:
             normalized = validate_quote_evidence_payload(intent.payload)
             expected_key = quote_evidence_idempotency_key(normalized)
         else:
-            if intent.event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
-                raise ValueError("Paper v2 event is not registered in B/C-1")
+            if intent.event_type not in PAPER_V2_WRITER_EVENT_TYPES:
+                raise ValueError("Paper v2 event is not registered for runtime")
             normalized = validate_paper_evidence_payload(
                 intent.event_type,
                 intent.payload,
@@ -2102,6 +2131,357 @@ class CanonicalWriter:
                 "Paper v2 idempotency_key does not match canonical record identity"
             )
         return normalized
+
+    # ------------------------------------------------------------------
+    # B/C-2 canonical protection and terminal reconciliation authority
+    # ------------------------------------------------------------------
+
+    def _committed_paper_rows(self, event_type: str) -> list[dict]:
+        """All committed payloads for one Paper v2 event type, in commit order."""
+        rows = self._conn.execute(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type = ?
+            ORDER BY history_epoch ASC, local_sequence ASC
+            """,
+            (event_type,),
+        ).fetchall()
+        payloads: list[dict] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"persisted {event_type} payload is invalid JSON"
+                ) from exc
+            payloads.append(
+                validate_paper_evidence_payload(event_type, raw)
+            )
+        return payloads
+
+    def _admitted_trade(self, paper_trade_id: str) -> dict:
+        """The ADMITTED disposition that owns this trade, or fail closed.
+
+        Protection and reconciliation evidence must attach to a trade the writer
+        actually admitted; ancestry is never taken on the producer's word.
+        """
+        matches = [
+            item
+            for item in self._admitted_dispositions()
+            if item.get("paper_trade_id") == paper_trade_id
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise ValueError("paper_trade_id is not an admitted Paper v2 trade")
+            raise ValueError("paper_trade_id is ambiguous across admissions")
+        return matches[0]
+
+    def _canonical_fill_totals(self, paper_trade_id: str) -> dict:
+        """Exposure and economics derived strictly from canonical fills.
+
+        Position quantity is never taken from a trigger, a protection state, an
+        exit intent or an attempted execution - only from fills that the canonical
+        writer actually committed.
+        """
+        entry_quantity = 0.0
+        exit_quantity = 0.0
+        gross_pnl = 0.0
+        execution_costs = 0.0
+        for fill in self._committed_paper_rows(PAPER_FILL_RECORDED):
+            if fill.get("paper_trade_id") != paper_trade_id:
+                continue
+            quantity = float(fill["quantity"])
+            notional = quantity * float(fill["price"])
+            execution_costs += (
+                float(fill["fee_cost"])
+                + float(fill["spread_cost"])
+                + float(fill["slippage_cost"])
+                + float(fill["other_supported_cost"])
+            )
+            if fill["side"] == "BUY":
+                entry_quantity += quantity
+                gross_pnl -= notional
+            else:
+                exit_quantity += quantity
+                gross_pnl += notional
+        return {
+            "entry_quantity": entry_quantity,
+            "exit_quantity": exit_quantity,
+            "remaining_quantity": entry_quantity - exit_quantity,
+            "gross_pnl": gross_pnl,
+            "execution_costs": execution_costs,
+        }
+
+    def _protection_plan_record(self, protection_plan_id: str) -> dict:
+        plan = self._load_paper_event_by_identity(
+            PAPER_PROTECTION_PLAN_RECORDED,
+            protection_plan_id,
+        )
+        if plan.get("protection_plan_id") != protection_plan_id:
+            raise ValueError("protection plan ancestry is invalid")
+        return plan
+
+    def _protection_state_records(self, protection_plan_id: str) -> list[dict]:
+        return [
+            record
+            for record in self._committed_paper_rows(PAPER_PROTECTION_STATE_RECORDED)
+            if record.get("protection_plan_id") == protection_plan_id
+        ]
+
+    def _effective_protection_state(self, protection_plan_id: str) -> ProtectionState:
+        """Reconstruct the current state from canonical evidence only.
+
+        The latest committed transition wins, so no in-memory authority is
+        required and a restart reproduces the same answer deterministically.
+        """
+        records = self._protection_state_records(protection_plan_id)
+        if not records:
+            return ProtectionState.PLANNED
+        latest = max(records, key=lambda record: int(record["state_seq"]))
+        return ProtectionState(str(latest["to_state"]))
+
+    def _activated_plan_ids(self, paper_trade_id: str) -> list[tuple[int, str]]:
+        """Plans for this trade that canonical state evidence proves activated.
+
+        Activation is proven by a committed transition into ACTIVE or TRIGGERED,
+        never by the plan payload alone.
+        """
+        activated: list[tuple[int, str]] = []
+        for plan in self._committed_paper_rows(PAPER_PROTECTION_PLAN_RECORDED):
+            if plan.get("paper_trade_id") != paper_trade_id:
+                continue
+            plan_id = str(plan["protection_plan_id"])
+            if any(
+                record["to_state"] in {"ACTIVE", "TRIGGERED"}
+                for record in self._protection_state_records(plan_id)
+            ):
+                activated.append((int(plan["plan_seq"]), plan_id))
+        return sorted(activated)
+
+    def _effective_protection_plan(self, paper_trade_id: str) -> dict | None:
+        """The effective plan is the highest activated plan_seq for the trade."""
+        activated = self._activated_plan_ids(paper_trade_id)
+        if not activated:
+            return None
+        return self._protection_plan_record(activated[-1][1])
+
+    def _verified_paper_trade_ids(self, quote_currency: str) -> set[str]:
+        """Trades whose economics are FINAL_VERIFIED, so capacity may be released."""
+        verified: set[str] = set()
+        for record in self._committed_paper_rows(PAPER_RECONCILIATION_RECORDED):
+            if (
+                record.get("terminal_reconciliation_state") == "FINAL_VERIFIED"
+                and record.get("position_state") == PositionState.FLAT.value
+                and float(record["remaining_quantity"]) == 0.0
+            ):
+                verified.add(str(record["paper_trade_id"]))
+        if not verified:
+            return verified
+        return {
+            trade_id
+            for trade_id in verified
+            if any(
+                item.get("paper_trade_id") == trade_id
+                and item.get("quote_currency") == quote_currency
+                for item in self._admitted_dispositions(quote_currency)
+            )
+        }
+
+    def _validate_protection_plan(self, payload: Mapping[str, object]) -> None:
+        """Immutable plans with strictly monotonic plan_seq within the trade."""
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        self._admitted_trade(paper_trade_id)
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_PLAN_RECORDED,
+            payload=payload,
+            parent_field="paper_trade_id",
+            parent_value=paper_trade_id,
+            sequence_field="plan_seq",
+            identity_field="protection_plan_id",
+            scope="paper trade",
+        )
+
+    def _validate_protection_state(self, payload: Mapping[str, object]) -> None:
+        """Only supported transitions, sequenced within their plan.
+
+        ACTIVE additionally requires canonical fills to prove positive current
+        exposure, and TRIGGERED requires a committed trigger for the same plan, so
+        a producer cannot assert protection it has not earned.
+        """
+        plan_id = self._require_string_ref(payload, "protection_plan_id")
+        plan = self._protection_plan_record(plan_id)
+        if plan.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("protection state paper_trade_id does not match the plan")
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_STATE_RECORDED,
+            payload=payload,
+            parent_field="protection_plan_id",
+            parent_value=plan_id,
+            sequence_field="state_seq",
+            identity_field="protection_event_id",
+            scope="protection plan",
+        )
+        from_state = str(payload["from_state"])
+        to_state = str(payload["to_state"])
+        if not protection_transition_allowed(from_state, to_state):
+            raise ValueError(
+                f"unsupported protection state transition {from_state} -> {to_state}"
+            )
+        # The declared origin must be the state canonical evidence already proves,
+        # so a producer cannot skip an intermediate transition.
+        effective = self._effective_protection_state(plan_id)
+        if effective.value != from_state:
+            raise ValueError(
+                "protection state from_state does not match the effective canonical state"
+            )
+        totals = self._canonical_fill_totals(str(plan["paper_trade_id"]))
+        if to_state == ProtectionState.ACTIVE.value and totals["remaining_quantity"] <= 0:
+            raise ValueError(
+                "protection plan cannot become ACTIVE without positive canonical exposure"
+            )
+        if protection_transition_requires_trigger(from_state, to_state):
+            committed = [
+                trigger
+                for trigger in self._committed_paper_rows(
+                    PAPER_PROTECTION_TRIGGER_RECORDED
+                )
+                if trigger.get("protection_plan_id") == plan_id
+            ]
+            if not committed:
+                raise ValueError(
+                    "protection cannot become TRIGGERED without committed trigger evidence"
+                )
+
+    def _validate_protection_trigger(self, payload: Mapping[str, object]) -> None:
+        """Triggers require a proven, armed plan and defensible evidence.
+
+        A trigger never changes quantity, P/L or terminal state; this method only
+        proves that the claimed market/time condition is canonically supported.
+        """
+        plan_id = self._require_string_ref(payload, "protection_plan_id")
+        plan = self._protection_plan_record(plan_id)
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        if plan.get("paper_trade_id") != paper_trade_id:
+            raise ValueError("protection trigger paper_trade_id does not match the plan")
+        self._admitted_trade(paper_trade_id)
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_TRIGGER_RECORDED,
+            payload=payload,
+            parent_field="protection_plan_id",
+            parent_value=plan_id,
+            sequence_field="trigger_seq",
+            identity_field="protection_trigger_id",
+            scope="protection plan",
+        )
+        effective_state = self._effective_protection_state(plan_id)
+        if effective_state not in {ProtectionState.ACTIVE, ProtectionState.DEGRADED}:
+            raise ValueError(
+                "protection trigger requires an armed (ACTIVE or DEGRADED) plan"
+            )
+
+        trigger_type = str(payload["trigger_type"])
+        quote_ref = payload.get("market_evidence_ref")
+        if trigger_type in PAPER_TRIGGER_TYPES_REQUIRING_QUOTE:
+            # STOP/TARGET make a market claim, so they must cite the exact
+            # canonical Level-1 quote evidence that supports it. Missing or
+            # unprovable evidence degrades rather than firing: fail closed here so
+            # protection cannot be reported TRIGGERED on an invented condition.
+            if not isinstance(quote_ref, str) or not quote_ref:
+                raise ValueError(
+                    f"{trigger_type} trigger requires canonical Level-1 market evidence"
+                )
+            quote = self._load_quote_evidence_by_id(quote_ref)
+            admission = self._admitted_trade(paper_trade_id)
+            context = self._load_context_by_id(str(admission["decision_context_id"]))
+            self._validate_quote_matches_lineage(
+                quote,
+                context=context,
+                admission=admission,
+            )
+            self._validate_quote_causality(
+                quote,
+                execution_time=payload.get("trigger_time"),
+                execution_time_field="trigger_time",
+            )
+        elif trigger_type in PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME:
+            temporal = payload.get("trigger_time")
+            if not isinstance(temporal, Mapping) or str(
+                temporal.get("precision")
+            ) != "EXACT":
+                raise ValueError(
+                    f"{trigger_type} trigger requires exact temporal evidence"
+                )
+            if quote_ref is not None:
+                raise ValueError(
+                    f"{trigger_type} trigger cannot claim a market evidence reference"
+                )
+
+    def _validate_reconciliation(self, payload: Mapping[str, object]) -> None:
+        """Terminal economics must be reproducible from canonical fills.
+
+        Position and economics are never taken from protection evidence. A
+        FINAL_VERIFIED claim that canonical fills do not support is refused, so
+        unverifiable economics can only be recorded as UNRESOLVED_EVIDENCE -
+        which never releases reserved capacity.
+        """
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        self._admitted_trade(paper_trade_id)
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_RECONCILIATION_RECORDED,
+            payload=payload,
+            parent_field="paper_trade_id",
+            parent_value=paper_trade_id,
+            sequence_field="reconciliation_seq",
+            identity_field="reconciliation_id",
+            scope="paper trade",
+        )
+        terminal = str(payload["terminal_reconciliation_state"])
+        if terminal == TerminalReconciliationState.UNRESOLVED_EVIDENCE.value:
+            # The contract already requires an explicit reason. Unverifiable
+            # evidence is recorded rather than promoted, and the quantity claims
+            # are deliberately not forced to match canonical fills: the point of
+            # this state is that the economics could not be proven.
+            return
+
+        totals = self._canonical_fill_totals(paper_trade_id)
+        for field_name, canonical in (
+            ("filled_entry_quantity", totals["entry_quantity"]),
+            ("filled_exit_quantity", totals["exit_quantity"]),
+            ("remaining_quantity", totals["remaining_quantity"]),
+        ):
+            if abs(float(payload[field_name]) - canonical) > 1e-9:
+                raise ValueError(
+                    f"{field_name} is not reproducible from canonical fills"
+                )
+        if terminal != TerminalReconciliationState.FINAL_VERIFIED.value:
+            return
+        for field_name, canonical in (
+            ("realized_gross_pnl", totals["gross_pnl"]),
+            ("recorded_execution_costs", totals["execution_costs"]),
+        ):
+            if abs(float(payload[field_name]) - canonical) > 1e-9:
+                raise ValueError(
+                    f"{field_name} is not reproducible from canonical fills"
+                )
+
+    def _validate_paper_protection_ancestry(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if event_type == PAPER_PROTECTION_PLAN_RECORDED:
+            self._validate_protection_plan(payload)
+            return
+        if event_type == PAPER_PROTECTION_STATE_RECORDED:
+            self._validate_protection_state(payload)
+            return
+        if event_type == PAPER_PROTECTION_TRIGGER_RECORDED:
+            self._validate_protection_trigger(payload)
+            return
+        if event_type == PAPER_RECONCILIATION_RECORDED:
+            self._validate_reconciliation(payload)
+            return
+        raise ValueError("unsupported Paper v2 protection event type")
 
     def _validate_paper_outcome_intent(self, intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
@@ -2238,7 +2618,7 @@ class CanonicalWriter:
             return self._validate_decision_intelligence_intent(intent)
         if intent.event_type in PAPER_OUTCOME_EVENT_TYPES:
             return self._validate_paper_outcome_intent(intent)
-        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+        if intent.event_type in PAPER_V2_WRITER_EVENT_TYPES:
             return self._validate_paper_execution_intent(intent)
 
         self._validate_alert_ops_intent(intent)
@@ -2260,7 +2640,7 @@ class CanonicalWriter:
             return FEATURE_BUS_STREAM
         if event_type in PAPER_OUTCOME_EVENT_TYPES:
             return PAPER_OUTCOME_STREAM
-        if event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+        if event_type in PAPER_V2_WRITER_EVENT_TYPES:
             return PAPER_EXECUTION_STREAM
         return STREAM_EARLY_WATCH
 
@@ -2271,7 +2651,7 @@ class CanonicalWriter:
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
-            and event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+            and event_type not in PAPER_V2_WRITER_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(
@@ -2410,6 +2790,11 @@ class CanonicalWriter:
         )
         if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
             self._validate_paper_execution_ancestry(
+                intent.event_type,
+                payload,
+            )
+        if intent.event_type in PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES:
+            self._validate_paper_protection_ancestry(
                 intent.event_type,
                 payload,
             )

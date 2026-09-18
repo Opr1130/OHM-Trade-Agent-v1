@@ -24,6 +24,7 @@ from app.opip.contracts.paper_execution import (
     PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
     PAPER_EXECUTION_MODEL_VERSION,
     EvaluationPopulation,
+    ProtectionState,
     TemporalBasis,
     TemporalEvidence,
     TemporalPrecision,
@@ -33,6 +34,10 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_FILL_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
     PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+    PAPER_PROTECTION_PLAN_RECORDED,
+    PAPER_PROTECTION_STATE_RECORDED,
+    PAPER_PROTECTION_TRIGGER_RECORDED,
+    PAPER_RECONCILIATION_RECORDED,
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
@@ -54,6 +59,79 @@ PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES = frozenset(
 
 #: The single authoritative Paper v2 capital/capacity policy version.
 PAPER_CAPITAL_POLICY_VERSION = "paper-capital-v1"
+
+#: B/C-2 proof: immutability and monotonicity are enforced at the persistence
+#: boundary, so a producer cannot rewrite history or reuse a sequence value.
+
+#: Protection/reconciliation evidence producers may submit in B/C-2.
+#: Protection state is writer-validated against the transition table below.
+PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES = frozenset(
+    {
+        PAPER_PROTECTION_PLAN_RECORDED,
+        PAPER_PROTECTION_STATE_RECORDED,
+        PAPER_PROTECTION_TRIGGER_RECORDED,
+        PAPER_RECONCILIATION_RECORDED,
+    }
+)
+
+#: Every Paper v2 event family a producer may submit through WriterIntent.
+PAPER_V2_WRITER_EVENT_TYPES = (
+    PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES | PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES
+)
+
+#: Permitted protection-state transitions. Any transition not listed here is
+#: rejected, so the state machine cannot be widened by a producer. DEGRADED ->
+#: TRIGGERED is additionally gated on committed trigger evidence.
+_PAPER_PROTECTION_ALLOWED_TRANSITIONS = frozenset(
+    {
+        (ProtectionState.PLANNED, ProtectionState.ACTIVE),
+        (ProtectionState.ACTIVE, ProtectionState.DEGRADED),
+        (ProtectionState.DEGRADED, ProtectionState.ACTIVE),
+        (ProtectionState.ACTIVE, ProtectionState.TRIGGERED),
+        (ProtectionState.DEGRADED, ProtectionState.TRIGGERED),
+    }
+)
+
+
+def protection_transition_allowed(from_state: object, to_state: object) -> bool:
+    """Whether a protection state transition is a supported runtime transition.
+
+    Returns False rather than raising so callers can fail closed uniformly. An
+    unrecognized state is simply not in the table and is therefore refused.
+    """
+    try:
+        pair = (ProtectionState(str(from_state)), ProtectionState(str(to_state)))
+    except ValueError:
+        return False
+    return pair in _PAPER_PROTECTION_ALLOWED_TRANSITIONS
+
+
+#: Transitions that require committed trigger evidence for the same plan. A plan
+#: may only be reported TRIGGERED when a canonical trigger actually exists, so
+#: reclassifying DEGRADED as TRIGGERED without evidence is refused.
+_PAPER_PROTECTION_TRANSITIONS_REQUIRING_TRIGGER = frozenset(
+    {
+        (ProtectionState.ACTIVE, ProtectionState.TRIGGERED),
+        (ProtectionState.DEGRADED, ProtectionState.TRIGGERED),
+    }
+)
+
+
+def protection_transition_requires_trigger(from_state: object, to_state: object) -> bool:
+    try:
+        pair = (ProtectionState(str(from_state)), ProtectionState(str(to_state)))
+    except ValueError:
+        return False
+    return pair in _PAPER_PROTECTION_TRANSITIONS_REQUIRING_TRIGGER
+
+
+#: Trigger types that make a market claim and therefore require exact canonical
+#: Level-1 quote ancestry in addition to temporal evidence.
+PAPER_TRIGGER_TYPES_REQUIRING_QUOTE = frozenset({"STOP", "TARGET"})
+
+#: Trigger types that assert a time-based exit condition and therefore require
+#: exact temporal evidence rather than a quote.
+PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME = frozenset({"TIME", "EMERGENCY"})
 
 
 @dataclass(frozen=True)
@@ -470,12 +548,18 @@ __all__ = [
     "PAPER_ADMISSION_REQUEST_RECORDED",
     "PAPER_CAPITAL_POLICY_VERSION",
     "PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES",
+    "PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES",
     "PAPER_QUOTE_EVIDENCE_RECORDED",
+    "PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME",
+    "PAPER_TRIGGER_TYPES_REQUIRING_QUOTE",
+    "PAPER_V2_WRITER_EVENT_TYPES",
     "PaperAdmissionAck",
     "PaperAdmissionRequest",
     "PaperCapitalPolicy",
     "admission_request_idempotency_key",
     "admission_result_identities",
+    "protection_transition_allowed",
+    "protection_transition_requires_trigger",
     "quote_evidence_idempotency_key",
     "resolve_capital_policy",
     "validate_admission_request",
