@@ -327,6 +327,13 @@ def test_opportunity_disposition_rejects_unsupported_quote_currency():
         )
 
 
+def test_order_intent_requires_admission_reservation_identity():
+    payload = _order_intent()
+    del payload["reservation_id"]
+    with pytest.raises(ValueError, match="reservation_id"):
+        validate_paper_evidence_payload(PAPER_ORDER_INTENT_RECORDED, payload)
+
+
 def test_market_order_cannot_smuggle_limit_price():
     payload = _order_intent()
     payload["limit_price"] = 199.0
