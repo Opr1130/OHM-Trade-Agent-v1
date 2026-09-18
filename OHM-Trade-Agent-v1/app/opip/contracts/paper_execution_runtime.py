@@ -70,6 +70,10 @@ _ADMISSION_REQUEST_FIELDS = frozenset(
     }
 )
 
+_ADMISSION_RECORD_FIELDS = _ADMISSION_REQUEST_FIELDS | frozenset(
+    {"guard_result", "observed_portfolio_version"}
+)
+
 _QUOTE_EVIDENCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -302,6 +306,36 @@ def validate_admission_request(request: PaperAdmissionRequest) -> dict[str, Any]
     return payload
 
 
+def validate_admission_request_record_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping) or set(payload) != _ADMISSION_RECORD_FIELDS:
+        raise ValueError("invalid canonical admission request record fields")
+
+    request_payload = {
+        field_name: payload[field_name]
+        for field_name in _ADMISSION_REQUEST_FIELDS
+    }
+    request = PaperAdmissionRequest.from_dict(request_payload)
+    guard_result = payload.get("guard_result")
+    if guard_result not in {"ELIGIBLE", "STALE_PORTFOLIO_VERSION"}:
+        raise ValueError("unsupported admission guard_result")
+    observed_version = payload.get("observed_portfolio_version")
+    if type(observed_version) is not int or observed_version < 0:
+        raise ValueError("observed_portfolio_version must be a nonnegative integer")
+    if guard_result == "ELIGIBLE":
+        if request.expected_portfolio_version != observed_version:
+            raise ValueError("eligible admission guard must match expected portfolio version")
+    elif request.expected_portfolio_version == observed_version:
+        raise ValueError("stale admission guard cannot match expected portfolio version")
+
+    return {
+        **request.as_dict(),
+        "guard_result": guard_result,
+        "observed_portfolio_version": observed_version,
+    }
+
+
 def admission_request_idempotency_key(disposition_id: str) -> str:
     return (
         f"{PAPER_ADMISSION_REQUEST_RECORDED}:"
@@ -369,5 +403,6 @@ __all__ = [
     "admission_result_identities",
     "quote_evidence_idempotency_key",
     "validate_admission_request",
+    "validate_admission_request_record_payload",
     "validate_quote_evidence_payload",
 ]
