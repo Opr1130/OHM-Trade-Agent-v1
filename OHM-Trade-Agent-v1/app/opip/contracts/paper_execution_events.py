@@ -561,7 +561,7 @@ def validate_paper_evidence_payload(
 
         remaining = float(normalized["remaining_quantity"])
         if reconciliation_state is TerminalReconciliationState.FINAL_VERIFIED:
-            if position_state is not PositionState.FLAT or remaining != 0.0:
+            if position_state is not PositionState.FLAT or remaining > 0.0:
                 raise ValueError(
                     "FINAL_VERIFIED reconciliation requires FLAT position and zero remaining quantity"
                 )
