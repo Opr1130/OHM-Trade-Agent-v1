@@ -443,7 +443,13 @@ def test_genesis_cli_reports_structured_status(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _run_export_cli(*, source_db: Path, staging: Path) -> subprocess.CompletedProcess:
+def _run_export_cli(*, paths: dict[str, Path], staging: Path) -> subprocess.CompletedProcess:
+    """Invoke the exact CLI command the exporter shell script runs.
+
+    Paths are passed explicitly rather than derived, so the helper cannot drift
+    from the production layout (an earlier version derived them and silently
+    pointed at ``data/opip/paper_trading`` instead of ``data/paper_trading``).
+    """
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     return subprocess.run(
         [
@@ -452,7 +458,7 @@ def _run_export_cli(*, source_db: Path, staging: Path) -> subprocess.CompletedPr
             "app.opip.learning.canonical_replica",
             "export",
             "--source-db",
-            str(source_db),
+            str(paths["canonical_db"]),
             "--staging",
             str(staging),
             "--release-sha",
@@ -460,9 +466,9 @@ def _run_export_cli(*, source_db: Path, staging: Path) -> subprocess.CompletedPr
             # The exporter shell always passes these; `require_paper_state`
             # intentionally stays at its True default.
             "--paper-state",
-            str(source_db.parent.parent / "paper_trading" / "state.json"),
+            str(paths["state_file"]),
             "--paper-gap",
-            str(source_db.parent.parent / "paper_trading" / "evidence_gap_spool.json"),
+            str(paths["gap_spool_file"]),
         ],
         cwd=ROOT,
         env=env,
@@ -547,13 +553,19 @@ def test_real_upgrade_path_through_the_exporter_cli(tmp_path):
     """
     paths = _virgin(tmp_path)
 
-    before = _run_export_cli(source_db=paths["canonical_db"], staging=tmp_path / "s1")
+    before = _run_export_cli(paths=paths, staging=tmp_path / "s1")
     assert before.returncode == 78, before.stderr
     assert "CANONICAL_REPLICA_PAPER_STATE_MISSING" in before.stderr
 
     assert _ensure(paths).status == GENESIS_INITIALIZED
 
-    after = _run_export_cli(source_db=paths["canonical_db"], staging=tmp_path / "s2")
+    # Guard the helper itself. A path-arithmetic bug here previously pointed the
+    # CLI at ``data/opip/paper_trading`` instead of ``data/paper_trading`` and
+    # surfaced as a confusing refusal rather than a clear fixture failure.
+    assert paths["state_file"].is_file(), paths["state_file"]
+    assert paths["state_file"] == tmp_path / "data" / "paper_trading" / "state.json"
+
+    after = _run_export_cli(paths=paths, staging=tmp_path / "s2")
     assert after.returncode == 0, after.stderr
     assert "O'Pip canonical replica export: OK" in after.stdout
     assert json.loads(tmp_path.joinpath("s2", "paper_trading", "state.json").read_text("utf-8")) == EMPTY_REGISTRY
