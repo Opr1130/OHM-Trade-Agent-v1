@@ -181,6 +181,7 @@ def test_qualified_opportunity_disposition_is_closed_vocabulary():
 
 def test_evaluation_populations_never_alias():
     assert {item.value for item in EvaluationPopulation} == {
+        "QUALIFIED_INTENT",
         "ACTUAL_REALIZED",
         "COUNTERFACTUAL_POLICY",
         "HINDSIGHT_DIAGNOSTIC",
