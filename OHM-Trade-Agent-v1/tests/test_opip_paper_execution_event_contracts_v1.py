@@ -212,6 +212,13 @@ def test_event_types_are_closed_and_have_unique_identity_fields():
     assert len(identity_fields) == len(PAPER_EXECUTION_EVENT_TYPES)
 
 
+def test_event_type_must_be_canonical_exact_string():
+    with pytest.raises(ValueError, match="canonical string"):
+        event_contract(None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unsupported"):
+        event_contract(f" {PAPER_FILL_RECORDED}")
+
+
 def test_idempotency_uses_preassigned_immutable_event_identity():
     payload = _fill()
     assert paper_evidence_idempotency_key(PAPER_FILL_RECORDED, payload) == (
@@ -341,6 +348,19 @@ def test_market_order_cannot_smuggle_limit_price():
         validate_paper_evidence_payload(PAPER_ORDER_INTENT_RECORDED, payload)
 
 
+def test_order_intent_requires_positive_requested_quantity_and_limit_price():
+    payload = _order_intent()
+    payload["requested_quantity"] = 0.0
+    with pytest.raises(ValueError, match="requested_quantity"):
+        validate_paper_evidence_payload(PAPER_ORDER_INTENT_RECORDED, payload)
+
+    payload = _order_intent()
+    payload["order_type"] = "LIMIT"
+    payload["limit_price"] = 0.0
+    with pytest.raises(ValueError, match="limit_price"):
+        validate_paper_evidence_payload(PAPER_ORDER_INTENT_RECORDED, payload)
+
+
 def test_rejected_attempt_requires_reason():
     payload = _attempt()
     payload["execution_state"] = "REJECTED"
@@ -359,6 +379,18 @@ def test_fill_requires_positive_quantity_and_price():
         validate_paper_evidence_payload(PAPER_FILL_RECORDED, payload)
 
 
+def test_protection_plan_requires_structured_targets():
+    payload = _plan()
+    payload["targets"] = [220.0]
+    with pytest.raises(ValueError, match="object"):
+        validate_paper_evidence_payload(PAPER_PROTECTION_PLAN_RECORDED, payload)
+
+    payload = _plan()
+    payload["targets"] = [{"target_id": "tp1", "price": 220.0}]
+    with pytest.raises(ValueError, match="target_id, price, and fraction"):
+        validate_paper_evidence_payload(PAPER_PROTECTION_PLAN_RECORDED, payload)
+
+
 def test_protection_trigger_contains_no_exit_claim():
     contract = event_contract(PAPER_PROTECTION_TRIGGER_RECORDED)
     assert "exit_price" not in contract.allowed_fields
@@ -375,6 +407,13 @@ def test_final_reconciliation_requires_flat_zero_remaining_and_exact_economics()
     payload = _reconciliation()
     payload["realized_net_pnl"] = 91.0
     with pytest.raises(ValueError, match="realized_net_pnl"):
+        validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
+
+
+def test_reconciliation_enforces_quantity_conservation():
+    payload = _reconciliation()
+    payload["filled_exit_quantity"] = 4.0
+    with pytest.raises(ValueError, match="filled_entry_quantity"):
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
 
