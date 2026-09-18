@@ -390,6 +390,58 @@ def test_naive_now_is_rejected(tmp_path):
         _ensure(paths, now=datetime(2026, 9, 18, 3, 0))
 
 
+def test_evidence_committed_after_the_precheck_still_blocks_genesis(tmp_path, monkeypatch):
+    """The proof must be re-run UNDER the state lock, not only before it.
+
+    Regression cover: the virginity evidence was checked once before acquiring
+    the lock and never rechecked, so durable evidence committed between the check
+    and the write could be overwritten by an empty registry - which would then
+    falsely certify completeness. The in-lock recheck is what prevents that, so
+    this proves the second call actually gates creation.
+    """
+    from app.services import paper_registry_genesis as genesis
+
+    calls = {"n": 0}
+    real_prove = genesis._prove_virgin
+
+    def prove_with_late_evidence(**kwargs):
+        calls["n"] += 1
+        proof = real_prove(**kwargs)
+        if calls["n"] == 1:
+            # First (pre-lock) pass sees a clean tree.
+            return proof
+        # Second (in-lock) pass must observe evidence that "arrived" meanwhile.
+        if not proof.virgin:
+            return proof
+        return genesis._VirginProof(
+            virgin=False,
+            reason=genesis.REASON_EVIDENCE_EXISTS,
+            detail="paper event committed during genesis",
+            facts={**proof.facts, "paper_event_rows": 1},
+        )
+
+    monkeypatch.setattr(genesis, "_prove_virgin", prove_with_late_evidence)
+
+    paths = _virgin(tmp_path)
+    outcome = _ensure(paths)
+
+    assert calls["n"] >= 2, "the proof must be consulted again inside the lock"
+    assert outcome.status == GENESIS_REFUSED
+    assert outcome.reason == REASON_EVIDENCE_EXISTS
+    assert not paths["state_file"].exists()
+    assert not paths["marker_path"].exists()
+
+
+def test_evidence_present_before_the_lock_is_refused_without_creating(tmp_path):
+    """The fast path refuses before taking the lock, and writes nothing."""
+    paths = _virgin(tmp_path)
+    paths["event_file"].parent.mkdir(parents=True, exist_ok=True)
+    paths["event_file"].write_text('{"event_type":"CREATED"}\n', encoding="utf-8")
+    outcome = _ensure(paths)
+    assert outcome.status == GENESIS_REFUSED
+    assert not paths["marker_path"].exists()
+
+
 def test_genesis_cli_reports_structured_status(tmp_path):
     """The CLI is the deploy's contract, so it must be machine-readable."""
     paths = _virgin(tmp_path)

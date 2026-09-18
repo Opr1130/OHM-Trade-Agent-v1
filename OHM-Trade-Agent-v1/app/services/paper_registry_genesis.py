@@ -252,6 +252,76 @@ def _write_marker(
     save_json_atomic(Path(marker_path), payload)
 
 
+@dataclass(frozen=True)
+class _VirginProof:
+    """Outcome of the virgin-state proof across every durable paper evidence source."""
+
+    virgin: bool
+    reason: str | None
+    detail: str
+    facts: dict[str, Any]
+
+
+def _prove_virgin(
+    *,
+    event_file: Path,
+    gap_spool_file: Path,
+    canonical_db: Path | None,
+) -> _VirginProof:
+    """Prove that no durable O'Pip paper lifecycle evidence exists.
+
+    Checked twice by the caller - once before taking the state lock as a fast
+    path, and again *inside* the lock immediately before creating the registry.
+    The second check is the authoritative one: evidence committed after the
+    pre-check must still block creation, or an empty registry could be written
+    over real activity and then falsely certify completeness.
+    """
+    events, events_error = _count_paper_events(event_file)
+    gaps, gaps_error = _unresolved_gap_count(gap_spool_file)
+    outcomes, stream_present, canonical_error = _canonical_outcome_count(canonical_db)
+    facts: dict[str, Any] = {
+        "paper_event_rows": events,
+        "paper_event_error": events_error,
+        "unresolved_gap_rows": gaps,
+        "gap_spool_error": gaps_error,
+        "canonical_terminal_outcomes": outcomes,
+        "canonical_stream_present": stream_present,
+        "canonical_error": canonical_error,
+    }
+
+    unprovable = [
+        reason
+        for reason in (events_error, gaps_error, canonical_error)
+        if reason is not None
+    ]
+    if unprovable:
+        return _VirginProof(
+            virgin=False,
+            reason=REASON_NOT_PROVABLE,
+            detail="; ".join(unprovable),
+            facts=facts,
+        )
+
+    if events or gaps or outcomes or stream_present:
+        return _VirginProof(
+            virgin=False,
+            reason=REASON_EVIDENCE_EXISTS,
+            detail=(
+                f"durable paper evidence exists (events={events}, "
+                f"unresolved_gaps={gaps}, canonical_outcomes={outcomes}, "
+                f"canonical_stream={stream_present}); refusing to create an empty registry"
+            ),
+            facts=facts,
+        )
+
+    return _VirginProof(
+        virgin=True,
+        reason=None,
+        detail="no durable paper lifecycle evidence exists",
+        facts=facts,
+    )
+
+
 def ensure_paper_registry_initialized(
     *,
     state_file: Path = STATE_FILE,
@@ -332,58 +402,37 @@ def ensure_paper_registry_initialized(
         )
 
     # No state and no marker: virgin state must be *proven*, never assumed.
-    events, events_error = _count_paper_events(Path(event_file))
-    gaps, gaps_error = _unresolved_gap_count(Path(gap_spool_file))
-    outcomes, stream_present, canonical_error = _canonical_outcome_count(canonical_db)
-    facts.update(
-        {
-            "state_present": False,
-            "state_valid": None,
-            "paper_event_rows": events,
-            "paper_event_error": events_error,
-            "unresolved_gap_rows": gaps,
-            "gap_spool_error": gaps_error,
-            "canonical_terminal_outcomes": outcomes,
-            "canonical_stream_present": stream_present,
-            "canonical_error": canonical_error,
-        }
+    # This first pass is a fast path; the authoritative proof runs again inside
+    # the state lock, immediately before anything is created.
+    proof = _prove_virgin(
+        event_file=Path(event_file),
+        gap_spool_file=Path(gap_spool_file),
+        canonical_db=canonical_db,
     )
-
-    unprovable = [
-        reason
-        for reason in (events_error, gaps_error, canonical_error)
-        if reason is not None
-    ]
-    if unprovable:
-        logger.critical(
-            "paper registry genesis refused: virgin state is unprovable (%s)",
-            "; ".join(unprovable),
-        )
+    facts.update(proof.facts)
+    facts["state_present"] = False
+    facts["state_valid"] = None
+    if not proof.virgin:
+        logger.critical("paper registry genesis refused: %s", proof.detail)
         return GenesisOutcome(
             status=GENESIS_REFUSED,
-            reason=REASON_NOT_PROVABLE,
-            detail="; ".join(unprovable),
-            marker_path=marker_path,
-            facts=facts,
-        )
-
-    if events or gaps or outcomes or stream_present:
-        detail = (
-            f"durable paper evidence exists (events={events}, unresolved_gaps={gaps}, "
-            f"canonical_outcomes={outcomes}, canonical_stream={stream_present}); "
-            "refusing to create an empty registry"
-        )
-        logger.critical("paper registry genesis refused: %s", detail)
-        return GenesisOutcome(
-            status=GENESIS_REFUSED,
-            reason=REASON_EVIDENCE_EXISTS,
-            detail=detail,
+            reason=proof.reason or REASON_NOT_PROVABLE,
+            detail=proof.detail,
             marker_path=marker_path,
             facts=facts,
         )
 
     # Provably virgin. Create under the shared state lock and re-check inside it,
     # so two concurrent attempts cannot both decide to create.
+    #
+    # The evidence proof is repeated here deliberately. Every paper lifecycle
+    # writer persists state.json under this same lock *before* emitting its event
+    # or canonical outcome, so holding the lock already excludes the dangerous
+    # interleaving; re-proving inside the lock makes that invariant explicit and
+    # also covers any evidence writer that does not touch state.json (for example
+    # a gap appended by a recovery path). Without it, evidence committed between
+    # the pre-check and the write would be silently overwritten by an empty
+    # registry that then certifies completeness.
     with registry_lock(registry_state_lock(state_file)):
         if state_file.exists():
             try:
@@ -410,6 +459,24 @@ def ensure_paper_registry_initialized(
                 marker_path=marker_path,
                 facts={**facts, "state_present": True, "state_valid": True},
             )
+
+        recheck = _prove_virgin(
+            event_file=Path(event_file),
+            gap_spool_file=Path(gap_spool_file),
+            canonical_db=canonical_db,
+        )
+        if not recheck.virgin:
+            logger.critical(
+                "paper registry genesis refused under lock: %s", recheck.detail
+            )
+            return GenesisOutcome(
+                status=GENESIS_REFUSED,
+                reason=recheck.reason or REASON_NOT_PROVABLE,
+                detail=recheck.detail,
+                marker_path=marker_path,
+                facts={**facts, **recheck.facts, "state_present": False},
+            )
+
         write_empty_registry_locked(state_file)
 
     _write_marker(

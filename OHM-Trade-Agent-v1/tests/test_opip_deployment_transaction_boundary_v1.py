@@ -459,13 +459,25 @@ def test_case_b_core_and_learning_both_succeed(tmp_path):
 
 
 @requires_bash
-def test_core_ok_without_readiness_marker_fails_closed(tmp_path):
-    """A pre-contract ohm-deploy cannot prove the export, so readiness is unproven."""
+def test_core_ok_without_any_markers_is_reported_unproven(tmp_path):
+    """A pre-contract ohm-deploy emits legacy strings only.
+
+    RC 0 plus the legacy success strings prove the core committed, but nothing
+    proves the export, so readiness is UNPROVEN and the gate fails closed. The
+    core must not be reported as failed or rolled back.
+    """
     log = "\n".join(
-        [CORE_OK_LOG, "O'Pip deployment succeeded", "sha=" + RELEASE_SHA]
+        [
+            '"status":"ok"',
+            "O'Pip scheduler reconciliation: OK",
+            "O'Pip deployment succeeded",
+            "sha=" + RELEASE_SHA,
+        ]
     )
     fields = _classify(tmp_path, log, rc=0)
     assert fields["RESULT"] == "CORE DEPLOYED - LEARNING UNPROVEN"
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
     assert fields["GATE"] == "FAIL"
 
 
@@ -518,6 +530,73 @@ def test_rollback_emits_the_core_failure_marker():
     rollback = source[source.index("rollback() {") :]
     rollback = rollback[: rollback.index("\n}\n")]
     assert "OPIP_CORE_DEPLOY_STATUS=FAILED" in rollback
+
+
+@requires_bash
+def test_unexpected_core_status_marker_is_not_success(tmp_path):
+    """An unknown CORE_STATUS value must fail closed, not read as success.
+
+    Regression cover: the success branch accepted every value except the literal
+    FAILED, so a malformed marker plus legacy log strings could publish SUCCESS
+    without proof that the core commit succeeded.
+    """
+    for bad in ("GARBAGE", "success", "UNKNOWN", "PARTIAL"):
+        log = "\n".join(
+            [
+                f"OPIP_CORE_DEPLOY_STATUS={bad}",
+                '"status":"ok"',
+                "O'Pip scheduler reconciliation: OK",
+                "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+                "OPIP_LEARNING_READINESS=READY",
+                "O'Pip deployment succeeded",
+            ]
+        )
+        fields = _classify(tmp_path / bad, log, rc=0)
+        assert fields["RESULT"] != "SUCCESS", bad
+        assert fields["GATE"] == "FAIL", bad
+
+
+@requires_bash
+def test_contradictory_learning_markers_are_blocked(tmp_path):
+    """A failed export with a READY readiness claim must not be SUCCESS.
+
+    Readiness proves the committed export; the export status records this attempt.
+    Contradiction means the markers are partial or inconsistent, so the gate must
+    fail closed rather than publish SUCCESS from one of them.
+    """
+    log = "\n".join(
+        [
+            "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+            '"status":"ok"',
+            "O'Pip scheduler reconciliation: OK",
+            "OPIP_LEARNING_EXPORT_STATUS=FAILED",
+            'OPIP_LEARNING_READINESS=READY',
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0)
+    assert fields["RESULT"] == "CORE DEPLOYED - LEARNING BLOCKED"
+    assert fields["GATE"] == "FAIL"
+    # Core state is still reported accurately and not as a rollback.
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
+
+
+@requires_bash
+def test_ready_readiness_without_export_success_is_blocked(tmp_path):
+    """Both learning facts are required for SUCCESS."""
+    log = "\n".join(
+        [
+            "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+            '"status":"ok"',
+            "O'Pip scheduler reconciliation: OK",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0)
+    assert fields["RESULT"] != "SUCCESS"
+    assert fields["GATE"] == "FAIL"
 
 
 def test_workflow_receipt_reports_core_and_learning_separately():

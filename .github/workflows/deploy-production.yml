@@ -163,23 +163,37 @@ jobs:
           LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
           LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
 
+          # Core success requires the structured marker to say SUCCESS explicitly.
+          # An absent marker means the running ohm-deploy predates the contract
+          # (it is reinstalled mid-deploy); that path is treated as legacy
+          # evidence and reported as UNPROVEN rather than as a core failure. Any
+          # OTHER value is malformed, so it must not be read as success.
+          core_verdict="NONE"
           if [[ "$RC" -eq 0 ]] \
              && grep -q "O'Pip deployment succeeded" deploy.log \
              && grep -q '"status":"ok"' deploy.log \
-             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log \
-             && [[ "$CORE_STATUS" != "FAILED" ]]; then
+             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log; then
+            case "$CORE_STATUS" in
+              SUCCESS) core_verdict="PROVEN" ;;
+              "") core_verdict="LEGACY" ;;
+              *) core_verdict="NONE" ;;
+            esac
+          fi
+
+          if [[ "$core_verdict" != "NONE" ]]; then
             HEALTH="OK"
             ROLLBACK="NO"
-            if [[ "$LEARNING_READINESS" == "READY" ]]; then
+            # Success requires BOTH learning facts: a successful export attempt AND
+            # a proven committed export for this SHA. Contradictory markers (for
+            # example export FAILED while readiness claims READY) are treated as
+            # blocked rather than as success, so partial or inconsistent marker
+            # emission fails closed.
+            if [[ "$LEARNING_EXPORT_STATUS" == "SUCCESS" && "$LEARNING_READINESS" == "READY" ]]; then
               RESULT="SUCCESS"
-            elif [[ -n "$LEARNING_READINESS" ]]; then
-              RESULT="CORE DEPLOYED - LEARNING BLOCKED"
-            else
-              # No readiness marker: the running ohm-deploy predates the
-              # structured contract (it is reinstalled mid-deploy), so the
-              # committed export for this SHA is unproven. Fail closed rather
-              # than assume it.
+            elif [[ "$core_verdict" == "LEGACY" ]]; then
               RESULT="CORE DEPLOYED - LEARNING UNPROVEN"
+            else
+              RESULT="CORE DEPLOYED - LEARNING BLOCKED"
             fi
           elif grep -q 'rollback health check passed' deploy.log; then
             RESULT="ROLLED BACK"
