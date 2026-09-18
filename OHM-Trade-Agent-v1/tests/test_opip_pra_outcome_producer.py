@@ -374,6 +374,73 @@ def test_acknowledgement_loss_retry_yields_one_outcome(canonical_env, paper_env,
     assert _envelope(paper_env)["delivery"] == outbox.DELIVERY_COMMITTED
 
 
+def test_ack_loss_then_terminal_resave_preserves_exact_pending_intent(
+    canonical_env, paper_env, servers
+):
+    """ACK loss + re-save must retry the exact durable intent, never rebuild it."""
+    server = servers()
+    real = InProcessWriterClient(server)
+    calls = {"n": 0}
+
+    class _LoseFirstAck:
+        def submit(self, intent):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                real.submit(intent)  # commit succeeds; producer loses the ACK
+                raise OSError("connection reset after commit")
+            return real.submit(intent)
+
+        def confirm_ops_applied(self, event_id):
+            return real.confirm_ops_applied(event_id)
+
+        def mark_handoff_superseded(self, event_id):
+            return real.mark_handoff_superseded(event_id)
+
+        def list_pending_handoffs(self):
+            return real.list_pending_handoffs()
+
+        def health(self):
+            return real.health()
+
+    outbox.set_writer_client_for_tests(_LoseFirstAck())
+    trade = _seed_terminal(paper_env)
+
+    pending = _envelope(paper_env)
+    assert pending["delivery"] == outbox.DELIVERY_PENDING
+    durable_intent = json.loads(json.dumps(pending["intent"], sort_keys=True))
+    durable_outcome_id = pending["outcome_id"]
+    durable_key = pending["idempotency_key"]
+    durable_attempts = pending["attempts"]
+    assert len(_canonical_rows(canonical_env)) == 1
+
+    # A later terminal save increments lifecycle revision. It must not rebuild
+    # the already-durable PENDING intent from that newer mutable lifecycle.
+    registry.save_lifecycle(
+        trade,
+        event_type="CLOSED_STOP",
+        state_file=paper_env["state"],
+        event_file=paper_env["events"],
+    )
+
+    after_resave = _envelope(paper_env)
+    assert after_resave["delivery"] == outbox.DELIVERY_PENDING
+    assert after_resave["intent"] == durable_intent
+    assert after_resave["outcome_id"] == durable_outcome_id
+    assert after_resave["idempotency_key"] == durable_key
+    assert after_resave["attempts"] == durable_attempts
+    assert len(_canonical_rows(canonical_env)) == 1
+
+    # Reconciliation resubmits the exact original intent. Since the writer
+    # already committed it before the ACK was lost, DUPLICATE_OK resolves the
+    # delivery without creating a second economic outcome.
+    stats = registry.reconcile_pending_outcomes(state_file=paper_env["state"])
+    assert stats["committed"] == 1
+    assert stats["pending"] == 0
+    assert _envelope(paper_env)["delivery"] == outbox.DELIVERY_COMMITTED
+    assert _envelope(paper_env)["intent"] == durable_intent
+    assert len(_canonical_rows(canonical_env)) == 1
+
+
 def test_reprocessing_a_closed_lifecycle_does_not_duplicate(canonical_env, paper_env, servers):
     outbox.set_writer_client_for_tests(InProcessWriterClient(servers()))
     trade = _seed_terminal(paper_env)
