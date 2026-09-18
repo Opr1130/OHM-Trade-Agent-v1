@@ -81,6 +81,7 @@ class QualifiedOpportunityDisposition(str, Enum):
 
 
 class EvaluationPopulation(str, Enum):
+    QUALIFIED_INTENT = "QUALIFIED_INTENT"
     ACTUAL_REALIZED = "ACTUAL_REALIZED"
     COUNTERFACTUAL_POLICY = "COUNTERFACTUAL_POLICY"
     HINDSIGHT_DIAGNOSTIC = "HINDSIGHT_DIAGNOSTIC"
