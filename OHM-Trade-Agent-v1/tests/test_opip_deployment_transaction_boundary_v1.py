@@ -366,6 +366,8 @@ def _classify(tmp_path: Path, deploy_log: str, rc: int) -> dict[str, str]:
     * the block appends its step outputs to ``$GITHUB_OUTPUT``, so the harness
       must define it rather than leave it empty.
     """
+    tmp_path = Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "deploy.log").write_text(deploy_log, encoding="utf-8")
     harness = tmp_path / "classify.sh"
     harness.write_text(
@@ -551,7 +553,9 @@ def test_unexpected_core_status_marker_is_not_success(tmp_path):
                 "O'Pip deployment succeeded",
             ]
         )
-        fields = _classify(tmp_path / bad, log, rc=0)
+        case_dir = tmp_path / bad
+        case_dir.mkdir(parents=True, exist_ok=True)
+        fields = _classify(case_dir, log, rc=0)
         assert fields["RESULT"] != "SUCCESS", bad
         assert fields["GATE"] == "FAIL", bad
 
