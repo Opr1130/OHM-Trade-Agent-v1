@@ -437,9 +437,9 @@ def validate_paper_evidence_payload(
         if disposition is QualifiedOpportunityDisposition.ADMITTED:
             _require_nonempty_string(normalized, "paper_trade_id")
             _require_nonempty_string(normalized, "reservation_id")
-        if population is not EvaluationPopulation.ACTUAL_REALIZED:
+        if population is not EvaluationPopulation.QUALIFIED_INTENT:
             raise ValueError(
-                "opportunity admission/disposition evidence belongs to ACTUAL_REALIZED population"
+                "opportunity disposition evidence belongs to QUALIFIED_INTENT population"
             )
 
     elif event_type == PAPER_ORDER_INTENT_RECORDED:
