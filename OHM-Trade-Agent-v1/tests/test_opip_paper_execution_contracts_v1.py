@@ -112,6 +112,15 @@ def test_exact_temporal_evidence_preserves_only_proven_point_time():
     }
 
 
+def test_exact_temporal_evidence_rejects_model_assigned_basis():
+    with pytest.raises(ValueError, match="MODEL_ASSIGNED"):
+        TemporalEvidence(
+            precision=TemporalPrecision.EXACT,
+            basis=TemporalBasis.MODEL_ASSIGNED,
+            occurred_at=_utc(12, 1),
+        )
+
+
 def test_bounded_temporal_evidence_preserves_intrabar_uncertainty():
     evidence = TemporalEvidence(
         precision=TemporalPrecision.BOUNDED,
