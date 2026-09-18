@@ -36,6 +36,13 @@ EventType = Literal[
     # cannot be computed from that frozenset. Admission is unchanged in form:
     # LOW priority, no ops handoff, validated payload.
     "paper_outcome.terminal.recorded",
+    # B/C-1 Paper v2 execution ground truth. Opportunity disposition is writer-
+    # owned through the atomic admission RPC; protection/reconciliation remain
+    # unregistered until B/C-2.
+    "paper_execution.quote_evidence.recorded",
+    "paper_execution.order_intent.recorded",
+    "paper_execution.attempt.recorded",
+    "paper_execution.fill.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]
