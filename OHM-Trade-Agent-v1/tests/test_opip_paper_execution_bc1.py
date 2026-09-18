@@ -8,7 +8,6 @@ or production trading path in this slice.
 from __future__ import annotations
 
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -49,15 +48,20 @@ def _exact(ts: str = "2026-09-18T16:00:00Z") -> dict:
     }
 
 
-def _context_payload() -> dict:
+def _context_payload(
+    *,
+    suffix: str = "bc1",
+    eligibility: bool = True,
+    environment: str = "paper",
+) -> dict:
     payload = {
         "context_id": "pending",
-        "candidate_id": "candidate-bc1",
-        "episode_id": "episode-bc1",
-        "evaluation_id": "evaluation-bc1",
+        "candidate_id": f"candidate-{suffix}",
+        "episode_id": f"episode-{suffix}",
+        "evaluation_id": f"evaluation-{suffix}",
         "instrument_version": "KRAKEN:SOLUSD:v1",
-        "snapshot_id": "snapshot-bc1",
-        "snapshot_hash": "snapshot-hash-bc1",
+        "snapshot_id": f"snapshot-{suffix}",
+        "snapshot_hash": f"snapshot-hash-{suffix}",
         "evaluation_time": "2026-09-18T15:59:59Z",
         "evidence_cutoff": "2026-09-18T15:59:59Z",
         "consumed_input_watermark": {
@@ -68,20 +72,20 @@ def _context_payload() -> dict:
         "policy_version": "policy-bc1",
         "detector_version": "detector-bc1",
         "forecast_version": "forecast-bc1",
-        "candidate_set_ref": "candidate-set-bc1",
+        "candidate_set_ref": f"candidate-set-{suffix}",
         "portfolio_version_ref": None,
-        "environment": "paper",
-        "eligibility": True,
+        "environment": environment,
+        "eligibility": eligibility,
         "missingness": {},
         "source_availability_times": {},
         "evidence_eligibility_manifest": {},
         "schema_version": 1,
         "provenance": {
             "producing_component": "bc1-test",
-            "artifact_or_build_id": "build-bc1",
-            "process_instance_id": "proc-bc1",
+            "artifact_or_build_id": f"build-{suffix}",
+            "process_instance_id": f"proc-{suffix}",
             "emitted_at": "2026-09-18T15:59:59Z",
-            "source_record_refs": ["source:bc1"],
+            "source_record_refs": [f"source:{suffix}"],
             "schema_version": 1,
         },
     }
@@ -89,10 +93,18 @@ def _context_payload() -> dict:
     return payload
 
 
-@pytest.fixture
-def canonical(tmp_path):
-    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
-    context = _context_payload()
+def _seed_context(
+    writer: CanonicalWriter,
+    *,
+    suffix: str,
+    eligibility: bool = True,
+    environment: str = "paper",
+) -> dict:
+    context = _context_payload(
+        suffix=suffix,
+        eligibility=eligibility,
+        environment=environment,
+    )
     ack = writer.submit(
         WriterIntent(
             schema_version=SCHEMA_VERSION,
@@ -105,6 +117,13 @@ def canonical(tmp_path):
         )
     )
     assert ack.status == "OK"
+    return context
+
+
+@pytest.fixture
+def canonical(tmp_path):
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    context = _seed_context(writer, suffix="bc1")
     try:
         yield writer, context
     finally:
@@ -183,6 +202,42 @@ def _submit_paper(writer: CanonicalWriter, event_type: str, payload: dict):
             payload=payload,
         )
     )
+
+
+def test_admission_rejects_ineligible_or_nonpaper_context_without_reservation(
+    canonical,
+):
+    writer, _ = canonical
+    ineligible = _seed_context(
+        writer,
+        suffix="ineligible",
+        eligibility=False,
+    )
+    nonpaper = _seed_context(
+        writer,
+        suffix="nonpaper",
+        environment="live",
+    )
+
+    rejected_ineligible = writer.admit_paper_opportunity(
+        _admission(
+            ineligible["context_id"],
+            disposition_id="disp-ineligible",
+        )
+    )
+    rejected_nonpaper = writer.admit_paper_opportunity(
+        _admission(
+            nonpaper["context_id"],
+            disposition_id="disp-nonpaper",
+        )
+    )
+
+    assert rejected_ineligible.status == "REJECTED"
+    assert rejected_ineligible.error_code == "DECISION_CONTEXT_INELIGIBLE"
+    assert rejected_nonpaper.status == "REJECTED"
+    assert rejected_nonpaper.error_code == "DECISION_CONTEXT_NOT_PAPER"
+    assert _rows(writer, PAPER_ADMISSION_REQUEST_RECORDED) == []
+    assert _rows(writer, PAPER_OPPORTUNITY_DISPOSITION_RECORDED) == []
 
 
 def test_atomic_admission_allows_only_one_writer_of_expected_version_zero(canonical):
@@ -411,6 +466,251 @@ def test_order_attempt_fill_require_reservation_and_exact_level1_quote(canonical
     conflict = _submit_paper(writer, PAPER_FILL_RECORDED, changed)
     assert conflict.status == "REJECTED"
     assert conflict.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+
+
+def test_execution_attempt_cannot_accept_more_than_parent_order(canonical):
+    writer, context = canonical
+    admission = writer.admit_paper_opportunity(
+        _admission(context["context_id"], disposition_id="disp-attempt-cap")
+    )
+    order = _order_payload(
+        context["context_id"],
+        admission,
+        order_id="order-attempt-cap",
+    )
+    assert _submit_paper(writer, PAPER_ORDER_INTENT_RECORDED, order).status == "OK"
+
+    quote = {
+        "schema_version": 1,
+        "quote_evidence_id": "quote-attempt-cap",
+        "instrument_version": context["instrument_version"],
+        "venue": "KRAKEN",
+        "native_symbol": "SOL/USD",
+        "quote_currency": "USD",
+        "source_kind": "LEVEL_1_BOOK",
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "bid_quantity": 10.0,
+        "ask_quantity": 12.0,
+        "quote_time": _exact("2026-09-18T16:00:01Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+    }
+    assert _submit_paper(writer, PAPER_QUOTE_EVIDENCE_RECORDED, quote).status == "OK"
+
+    attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-oversized",
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "ACCEPTED",
+        "attempt_time": _exact("2026-09-18T16:00:02Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": 6.0,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    ack = _submit_paper(writer, PAPER_EXECUTION_ATTEMPT_RECORDED, attempt)
+    assert ack.status == "REJECTED"
+    assert "accepted_quantity exceeds" in str(ack.detail)
+
+
+def test_fill_requires_fillable_attempt_and_respects_attempt_quantity(canonical):
+    writer, context = canonical
+    admission = writer.admit_paper_opportunity(
+        _admission(context["context_id"], disposition_id="disp-fill-cap")
+    )
+    order = _order_payload(
+        context["context_id"],
+        admission,
+        order_id="order-fill-cap",
+    )
+    assert _submit_paper(writer, PAPER_ORDER_INTENT_RECORDED, order).status == "OK"
+
+    quote = {
+        "schema_version": 1,
+        "quote_evidence_id": "quote-fill-cap",
+        "instrument_version": context["instrument_version"],
+        "venue": "KRAKEN",
+        "native_symbol": "SOL/USD",
+        "quote_currency": "USD",
+        "source_kind": "LEVEL_1_BOOK",
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "bid_quantity": 10.0,
+        "ask_quantity": 12.0,
+        "quote_time": _exact("2026-09-18T16:00:01Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+    }
+    assert _submit_paper(writer, PAPER_QUOTE_EVIDENCE_RECORDED, quote).status == "OK"
+
+    rejected_attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-rejected",
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "REJECTED",
+        "attempt_time": _exact("2026-09-18T16:00:02Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "rejection_reason": "VENUE_REJECTED",
+    }
+    assert (
+        _submit_paper(
+            writer,
+            PAPER_EXECUTION_ATTEMPT_RECORDED,
+            rejected_attempt,
+        ).status
+        == "OK"
+    )
+    invalid_fill = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "fill_id": "fill-rejected-attempt",
+        "execution_attempt_id": rejected_attempt["execution_attempt_id"],
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "fill_seq": 0,
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 100.0,
+        "fee_cost": 0.2,
+        "spread_cost": 0.1,
+        "slippage_cost": 0.05,
+        "other_supported_cost": 0.0,
+        "fill_time": _exact("2026-09-18T16:00:03Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    invalid_ack = _submit_paper(writer, PAPER_FILL_RECORDED, invalid_fill)
+    assert invalid_ack.status == "REJECTED"
+    assert "non-fillable" in str(invalid_ack.detail)
+
+    accepted_attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-small",
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 1,
+        "execution_state": "ACCEPTED",
+        "attempt_time": _exact("2026-09-18T16:00:02Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": 2.0,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    assert (
+        _submit_paper(
+            writer,
+            PAPER_EXECUTION_ATTEMPT_RECORDED,
+            accepted_attempt,
+        ).status
+        == "OK"
+    )
+
+    first_fill = {
+        **invalid_fill,
+        "fill_id": "fill-small-1",
+        "execution_attempt_id": accepted_attempt["execution_attempt_id"],
+        "quantity": 1.5,
+    }
+    assert _submit_paper(writer, PAPER_FILL_RECORDED, first_fill).status == "OK"
+
+    second_fill = {
+        **first_fill,
+        "fill_id": "fill-small-2",
+        "fill_seq": 1,
+        "quantity": 1.0,
+    }
+    oversized = _submit_paper(writer, PAPER_FILL_RECORDED, second_fill)
+    assert oversized.status == "REJECTED"
+    assert "accepted_quantity" in str(oversized.detail)
+
+
+def test_future_or_temporally_ambiguous_quote_cannot_justify_execution(canonical):
+    writer, context = canonical
+    admission = writer.admit_paper_opportunity(
+        _admission(context["context_id"], disposition_id="disp-quote-causality")
+    )
+    order = _order_payload(
+        context["context_id"],
+        admission,
+        order_id="order-quote-causality",
+    )
+    assert _submit_paper(writer, PAPER_ORDER_INTENT_RECORDED, order).status == "OK"
+
+    future_quote = {
+        "schema_version": 1,
+        "quote_evidence_id": "quote-future",
+        "instrument_version": context["instrument_version"],
+        "venue": "KRAKEN",
+        "native_symbol": "SOL/USD",
+        "quote_currency": "USD",
+        "source_kind": "LEVEL_1_BOOK",
+        "best_bid": 99.9,
+        "best_ask": 100.1,
+        "bid_quantity": 10.0,
+        "ask_quantity": 12.0,
+        "quote_time": _exact("2026-09-18T16:00:04Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+    }
+    assert (
+        _submit_paper(writer, PAPER_QUOTE_EVIDENCE_RECORDED, future_quote).status
+        == "OK"
+    )
+    future_attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-future-quote",
+        "order_intent_id": order["order_intent_id"],
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "ACCEPTED",
+        "attempt_time": _exact("2026-09-18T16:00:02Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": 5.0,
+        "market_evidence_ref": future_quote["quote_evidence_id"],
+    }
+    future_ack = _submit_paper(
+        writer,
+        PAPER_EXECUTION_ATTEMPT_RECORDED,
+        future_attempt,
+    )
+    assert future_ack.status == "REJECTED"
+    assert "not proven available" in str(future_ack.detail)
+
+    ambiguous_quote = {
+        **future_quote,
+        "quote_evidence_id": "quote-overlap",
+        "quote_time": {
+            "precision": "BOUNDED",
+            "basis": "LOCALLY_OBSERVED",
+            "window_start": "2026-09-18T16:00:01Z",
+            "window_end": "2026-09-18T16:00:03Z",
+        },
+    }
+    assert (
+        _submit_paper(
+            writer,
+            PAPER_QUOTE_EVIDENCE_RECORDED,
+            ambiguous_quote,
+        ).status
+        == "OK"
+    )
+    ambiguous_attempt = {
+        **future_attempt,
+        "execution_attempt_id": "attempt-overlap-quote",
+        "market_evidence_ref": ambiguous_quote["quote_evidence_id"],
+    }
+    ambiguous_ack = _submit_paper(
+        writer,
+        PAPER_EXECUTION_ATTEMPT_RECORDED,
+        ambiguous_attempt,
+    )
+    assert ambiguous_ack.status == "REJECTED"
+    assert "not proven available" in str(ambiguous_ack.detail)
 
 
 def test_quote_evidence_cannot_be_ohlc_or_unknown_time(canonical):
