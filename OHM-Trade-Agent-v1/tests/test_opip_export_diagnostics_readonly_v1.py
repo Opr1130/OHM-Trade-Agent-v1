@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1505,6 +1506,37 @@ def test_unconfirmed_opener_is_unknown_never_a_stall(tmp_path):
 
 
 @pytestmark_posix
+def _spawn_argv_decoy(command_line: str, *, expect_substring: str) -> subprocess.Popen:
+    """Start a long-lived process whose argv is ``command_line``, and prove it ran.
+
+    ``exec -a`` is a bash extension: on Ubuntu ``/bin/sh`` is dash, which rejects
+    ``-a`` and exits immediately, so the decoy would never start and any assertion
+    about it would pass vacuously. This spawns it under bash and then verifies via
+    /proc that the process is alive and its argv really does carry the expected
+    substring, so the test cannot succeed without actually exercising the case.
+    """
+    proc = subprocess.Popen(["bash", "-c", f'exec -a "{command_line}" sleep 30'])
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"decoy exited early (rc={proc.returncode}); it did not start"
+            )
+        try:
+            argv = Path(f"/proc/{proc.pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            argv = b""
+        if expect_substring.encode() in argv:
+            return proc
+        time.sleep(0.05)
+    proc.kill()
+    proc.wait(timeout=5)
+    raise AssertionError(
+        f"decoy argv never contained {expect_substring!r}; regression not exercised"
+    )
+
+
+@pytestmark_posix
 def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
     """A `tail`/`less` on the log file must not appear as an exporter.
 
@@ -1517,10 +1549,12 @@ def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
     """
     fx = _fixture(tmp_path)
     fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
-    # A subprocess whose command line contains the log filename but not the
-    # exporter script name. sleep is a harmless long-lived stand-in.
-    consumer = subprocess.Popen(
-        ["sh", "-c", f'exec -a "cat /var/log/opip-learning-export.log" sleep 30'],
+    # A long-lived process whose argv carries the log filename but not the
+    # exporter script name. The spawn helper asserts it actually started and that
+    # its argv carries the log path, so this cannot pass vacuously.
+    consumer = _spawn_argv_decoy(
+        "cat /var/log/opip-learning-export.log",
+        expect_substring="/var/log/opip-learning-export.log",
     )
     try:
         fields = _run_block(tmp_path, fx, "2026-09-17T19:00:47Z")
@@ -1529,12 +1563,8 @@ def test_long_lived_log_consumer_is_not_reported_as_the_exporter(tmp_path):
         # And nothing raises a false stall.
         assert fields["export_lock_stall_suspected"] != "YES"
     finally:
-        consumer.terminate()
-        try:
-            consumer.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            consumer.kill()
-            consumer.wait(timeout=5)
+        consumer.kill()
+        consumer.wait(timeout=5)
 
 
 @pytestmark_posix
