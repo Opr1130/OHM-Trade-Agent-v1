@@ -12,7 +12,6 @@ from app.opip.contracts.paper_metrics import (
     metric_definition,
 )
 from app.opip.contracts.paper_simulator_policy import (
-    LEGACY_OHLC_DIAGNOSTIC_POLICY,
     OPIP_PAPER_V2_TARGET_POLICY,
     LatencyModel,
     ModelingDisposition,
@@ -86,12 +85,6 @@ def test_v2_policy_uses_quote_cross_confirmation_for_passive_limits():
         is PassiveLimitFillModel.QUOTE_CROSS_CONFIRMATION
     )
 
-
-def test_legacy_ohlc_policy_is_bounded_diagnostic_only():
-    policy = LEGACY_OHLC_DIAGNOSTIC_POLICY
-    assert policy.fidelity is SimulationFidelity.LEVEL_0_OHLC_BOUNDED
-    assert policy.passive_limit_fill_model is PassiveLimitFillModel.OHLC_TOUCH_BOUNDED
-    assert policy.partial_fills is ModelingDisposition.NOT_MODELED
 
 
 def test_market_impact_cannot_be_enabled_without_new_contract():
