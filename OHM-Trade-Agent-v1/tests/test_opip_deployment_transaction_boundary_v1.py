@@ -640,14 +640,14 @@ def test_contradictory_learning_markers_are_blocked(tmp_path):
     log = "\n".join(
         [
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
-            '"status":"ok"',
             "O'Pip scheduler reconciliation: OK",
             "OPIP_LEARNING_EXPORT_STATUS=FAILED",
             'OPIP_LEARNING_READINESS=READY',
+            "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
             "O'Pip deployment succeeded",
         ]
     )
-    fields = _classify(tmp_path, log, rc=0)
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
     assert fields["RESULT"] == "CORE DEPLOYED - LEARNING BLOCKED"
     assert fields["GATE"] == "FAIL"
     # Core state is still reported accurately and not as a rollback.

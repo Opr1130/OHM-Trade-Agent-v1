@@ -193,19 +193,22 @@ jobs:
             # UNPROVEN or as an eligible transition below - never as a core failure.
             # Any other combination is malformed and fails closed.
             #
-            # The legacy path also requires the final health JSON, because that is
-            # the only core-commit evidence the legacy contract emitted. The new
-            # path deliberately does NOT require it: post-commit observation failure
-            # is reported by OPIP_CORE_POSTCOMMIT_HEALTH instead, so a failed final
-            # probe cannot retroactively deny an already-committed core.
+            # The final health JSON is required ONLY on the legacy path, where it was
+            # the sole core-commit evidence. The new path must not require it: a
+            # failed final probe is reported by OPIP_CORE_POSTCOMMIT_HEALTH, and
+            # requiring it here would let a failed post-commit observation
+            # retroactively reclassify an already-committed core as a server failure.
             core_verdict="NONE"
             if [[ "$rc" -eq 0 ]] \
                && grep -q "O'Pip deployment succeeded" "$log" \
-               && grep -q '"status":"ok"' "$log" \
                && grep -q "O'Pip scheduler reconciliation: OK" "$log"; then
               case "${CORE_MARKER}:${CORE_STATUS}" in
                 PRESENT:SUCCESS) core_verdict="PROVEN" ;;
-                ABSENT:) core_verdict="LEGACY" ;;
+                ABSENT:)
+                  if grep -q '"status":"ok"' "$log"; then
+                    core_verdict="LEGACY"
+                  fi
+                  ;;
                 *) core_verdict="NONE" ;;
               esac
             fi
