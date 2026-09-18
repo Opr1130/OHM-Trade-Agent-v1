@@ -458,7 +458,7 @@ def validate_paper_evidence_payload(
             QualifiedOpportunityDisposition.CAPACITY_REJECTED,
         }
         if capital_decision:
-            expected_version = _require_nonnegative_int(
+            _require_nonnegative_int(
                 normalized, "expected_portfolio_version"
             )
             _require_nonempty_string(normalized, "capital_policy_version")
@@ -475,9 +475,6 @@ def validate_paper_evidence_payload(
                 raise ValueError("portfolio_equity_limit must be positive")
             if position_limit <= 0:
                 raise ValueError("portfolio_position_limit must be positive")
-            if expected_version < 0:
-                raise ValueError("expected_portfolio_version must be non-negative")
-
             if disposition is QualifiedOpportunityDisposition.ADMITTED:
                 _require_nonempty_string(normalized, "paper_trade_id")
                 _require_nonempty_string(normalized, "reservation_id")
