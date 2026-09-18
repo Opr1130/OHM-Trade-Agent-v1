@@ -698,9 +698,22 @@ class CanonicalWriter:
                         error_code="DB_SCHEMA_MISMATCH",
                     )
 
-                # The decision context must already be canonical. Admission never
-                # invents or reconstructs upstream decision ancestry.
-                self._load_context_by_id(request.decision_context_id)
+                # The decision context must already be canonical and must itself
+                # authorize Paper v2 evaluation. Admission never invents or
+                # reconstructs upstream eligibility/environment ancestry.
+                context = self._load_context_by_id(request.decision_context_id)
+                if context.get("eligibility") is not True:
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DECISION_CONTEXT_INELIGIBLE",
+                    )
+                if context.get("environment") != "paper":
+                    self._conn.rollback()
+                    return PaperAdmissionAck(
+                        status="REJECTED",
+                        error_code="DECISION_CONTEXT_NOT_PAPER",
+                    )
 
                 history_epoch = int(meta["history_epoch"])
                 local_sequence = int(meta["next_local_sequence"])
@@ -1613,6 +1626,58 @@ class CanonicalWriter:
         if quote.get("quote_currency") != admission.get("quote_currency"):
             raise ValueError("quote evidence quote_currency does not match reservation")
 
+    @staticmethod
+    def _temporal_bounds(
+        evidence: object,
+        *,
+        field_name: str,
+    ) -> tuple[datetime, datetime]:
+        if not isinstance(evidence, Mapping):
+            raise ValueError(f"{field_name} must be temporal evidence")
+        precision = str(evidence.get("precision") or "")
+        if precision == "EXACT":
+            raw = evidence.get("occurred_at")
+            if not isinstance(raw, str):
+                raise ValueError(f"{field_name}.occurred_at is required")
+            moment = _parse_aware_iso_timestamp(raw, field_name=field_name)
+            return moment, moment
+        if precision == "BOUNDED":
+            raw_start = evidence.get("window_start")
+            raw_end = evidence.get("window_end")
+            if not isinstance(raw_start, str) or not isinstance(raw_end, str):
+                raise ValueError(f"{field_name} bounded window is incomplete")
+            start = _parse_aware_iso_timestamp(raw_start, field_name=field_name)
+            end = _parse_aware_iso_timestamp(raw_end, field_name=field_name)
+            if end < start:
+                raise ValueError(f"{field_name} bounded window is inverted")
+            return start, end
+        raise ValueError(
+            f"{field_name} must be EXACT or BOUNDED for execution evidence"
+        )
+
+    def _validate_quote_causality(
+        self,
+        quote: Mapping[str, object],
+        *,
+        execution_time: object,
+        execution_time_field: str,
+    ) -> None:
+        # For bounded evidence, preserve uncertainty and fail closed unless the
+        # entire quote interval is no later than the earliest possible execution
+        # time. Overlapping intervals cannot prove the quote was already known.
+        _, quote_end = self._temporal_bounds(
+            quote.get("quote_time"),
+            field_name="quote_time",
+        )
+        execution_start, _ = self._temporal_bounds(
+            execution_time,
+            field_name=execution_time_field,
+        )
+        if quote_end > execution_start:
+            raise ValueError(
+                "Level-1 quote evidence is not proven available before execution"
+            )
+
     def _validate_paper_execution_ancestry(
         self,
         event_type: str,
@@ -1650,13 +1715,32 @@ class CanonicalWriter:
             admission = self._admission_for_reservation(str(order["reservation_id"]))
             context = self._load_context_by_id(str(order["decision_context_id"]))
             state = ExecutionState(str(payload["execution_state"]))
-            quote_ref = payload.get("market_evidence_ref")
-            quote_required = state in {
+            fillable_states = {
                 ExecutionState.ACCEPTED,
                 ExecutionState.WORKING,
                 ExecutionState.PARTIALLY_FILLED,
                 ExecutionState.FILLED,
             }
+            accepted_quantity = payload.get("accepted_quantity")
+            if state in fillable_states:
+                if not isinstance(accepted_quantity, (int, float)) or isinstance(
+                    accepted_quantity, bool
+                ):
+                    raise ValueError(
+                        "fillable execution attempt requires accepted_quantity"
+                    )
+                accepted = float(accepted_quantity)
+                if accepted <= 0:
+                    raise ValueError(
+                        "fillable execution attempt requires positive accepted_quantity"
+                    )
+                if accepted > float(order["requested_quantity"]) + 1e-9:
+                    raise ValueError(
+                        "execution attempt accepted_quantity exceeds requested order quantity"
+                    )
+
+            quote_ref = payload.get("market_evidence_ref")
+            quote_required = state in fillable_states
             if quote_required and not isinstance(quote_ref, str):
                 raise ValueError(
                     "execution attempt state requires exact Level-1 market_evidence_ref"
@@ -1669,6 +1753,11 @@ class CanonicalWriter:
                     quote,
                     context=context,
                     admission=admission,
+                )
+                self._validate_quote_causality(
+                    quote,
+                    execution_time=payload.get("attempt_time"),
+                    execution_time_field="attempt_time",
                 )
             return
 
@@ -1694,6 +1783,24 @@ class CanonicalWriter:
         if order.get("side") != payload.get("side"):
             raise ValueError("fill side does not match order intent")
 
+        attempt_state = ExecutionState(str(attempt["execution_state"]))
+        fillable_states = {
+            ExecutionState.ACCEPTED,
+            ExecutionState.WORKING,
+            ExecutionState.PARTIALLY_FILLED,
+            ExecutionState.FILLED,
+        }
+        if attempt_state not in fillable_states:
+            raise ValueError("fill cannot reference a non-fillable execution attempt")
+        accepted_quantity = attempt.get("accepted_quantity")
+        if not isinstance(accepted_quantity, (int, float)) or isinstance(
+            accepted_quantity, bool
+        ):
+            raise ValueError("fill parent attempt is missing accepted_quantity")
+        accepted_quantity = float(accepted_quantity)
+        if accepted_quantity <= 0:
+            raise ValueError("fill parent attempt accepted_quantity must be positive")
+
         quote_ref = payload.get("market_evidence_ref")
         if not isinstance(quote_ref, str) or not quote_ref:
             raise ValueError("fill requires exact Level-1 market_evidence_ref")
@@ -1705,6 +1812,11 @@ class CanonicalWriter:
             context=context,
             admission=admission,
         )
+        self._validate_quote_causality(
+            quote,
+            execution_time=payload.get("fill_time"),
+            execution_time_field="fill_time",
+        )
 
         prior_rows = self._conn.execute(
             """
@@ -1715,13 +1827,26 @@ class CanonicalWriter:
             """,
             (PAPER_FILL_RECORDED,),
         ).fetchall()
-        prior_quantity = 0.0
+        prior_order_quantity = 0.0
+        prior_attempt_quantity = 0.0
         for row in prior_rows:
             raw = json.loads(str(row["payload_json"]))
             prior = validate_paper_evidence_payload(PAPER_FILL_RECORDED, raw)
+            quantity = float(prior["quantity"])
             if prior.get("order_intent_id") == order_id:
-                prior_quantity += float(prior["quantity"])
-        if prior_quantity + float(payload["quantity"]) > float(order["requested_quantity"]) + 1e-9:
+                prior_order_quantity += quantity
+            if prior.get("execution_attempt_id") == attempt_id:
+                prior_attempt_quantity += quantity
+
+        fill_quantity = float(payload["quantity"])
+        if prior_attempt_quantity + fill_quantity > accepted_quantity + 1e-9:
+            raise ValueError(
+                "aggregate fill quantity exceeds execution attempt accepted_quantity"
+            )
+        if (
+            prior_order_quantity + fill_quantity
+            > float(order["requested_quantity"]) + 1e-9
+        ):
             raise ValueError("aggregate fill quantity exceeds requested order quantity")
 
     def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
