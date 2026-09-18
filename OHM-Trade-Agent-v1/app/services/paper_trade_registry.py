@@ -494,3 +494,30 @@ def account_summary(
         unresolved_trades=sum(trade.status == "UNRESOLVED" for trade in rows),
         realized_net_pnl_by_currency=realized_by_currency,
     )
+
+
+# ---------------------------------------------------------------------------
+# Genesis seams
+#
+# ``state.json`` is both the paper lifecycle registry and a canonical
+# learning-replica completeness companion. Registry genesis therefore has to
+# create the *canonical empty registry* and serialize against the same state lock
+# every lifecycle path uses, without re-declaring either one. These two narrow
+# accessors exist so the genesis module cannot drift from that single definition
+# of the empty payload or of the locking discipline.
+# ---------------------------------------------------------------------------
+
+
+def registry_state_lock(state_file: Path = STATE_FILE) -> Path:
+    """The lock path guarding ``state_file``, shared with lifecycle writes."""
+    return _state_lock(state_file)
+
+
+def write_empty_registry_locked(state_file: Path = STATE_FILE) -> None:
+    """Write the canonical empty registry. Caller MUST hold ``registry_state_lock``.
+
+    The payload comes from the same ``_save_rows`` used by every lifecycle write,
+    so an initialized-but-empty registry is byte-identical to a registry that has
+    simply never held a lifecycle. There is no genesis-specific shape.
+    """
+    _save_rows({}, state_file)

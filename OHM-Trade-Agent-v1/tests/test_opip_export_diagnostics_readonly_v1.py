@@ -290,6 +290,36 @@ def test_replica_directory_validation_rejects_symlinks():
     assert "realpath" in _script()
 
 
+def test_export_log_exists_symmetry_is_reported_on_both_branches():
+    """The field must be emitted whether the log exists or not.
+
+    Regression cover: the block only echoed ``export_log_exists=NO``, so the
+    field was silently *absent* whenever the log did exist - exactly the case an
+    operator most needs to read. Read-only invariant unchanged.
+    """
+    block = _block()
+    assert 'echo "export_log_exists=YES"' in block
+    assert 'echo "export_log_exists=NO"' in block
+
+
+@pytestmark_posix
+def test_export_log_exists_is_yes_when_present_and_no_when_absent(tmp_path):
+    """Behavioural proof of the symmetry, executing the real block."""
+    present_root = tmp_path / "present"
+    present_root.mkdir()
+    fx = _fixture(present_root)
+    fx["log"].write_text("O'Pip learning evidence export: OK\n", encoding="utf-8")
+    fields = _run_block(present_root, fx, "2026-09-17T19:00:47Z")
+    assert fields["export_log_exists"] == "YES"
+
+    absent_root = tmp_path / "absent"
+    absent_root.mkdir()
+    fx_absent = _fixture(absent_root)
+    # Deliberately never created.
+    fields_absent = _run_block(absent_root, fx_absent, "2026-09-17T19:00:47Z")
+    assert fields_absent["export_log_exists"] == "NO"
+
+
 def test_block_reports_committed_state_log_classification_and_orphans():
     block = _block()
     for field in (

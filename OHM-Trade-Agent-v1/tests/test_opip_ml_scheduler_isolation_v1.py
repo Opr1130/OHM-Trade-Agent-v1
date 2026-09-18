@@ -102,16 +102,20 @@ def test_production_export_is_copy_only_and_locked():
         source,
     )
     assert "mv -f" in source
-    # The exporter was originally copy-only shell. The canonical learning-replica
-    # snapshot requires the PR-A0 SQLite online-backup path, which is mandated to
-    # stay in Python rather than being reimplemented in Bash, so the script now
-    # invokes exactly one helper. Count actual module invocations, not harmless
-    # references such as the executable preflight check.
+    # Python owns the work that must not be reimplemented in Bash: the PR-A0
+    # SQLite online-backup path, and the replica content address (shared with the
+    # deploy-side verifier so the two cannot drift). Exactly these two helpers are
+    # sanctioned; the forbidden list below is the actual safety contract.
     python_invocations = re.findall(
         r'(?m)^(?!\s*#).*"\$PYTHON_BIN"\s+-m\s+.*$', source
     )
-    assert len(python_invocations) == 1
-    assert "app.opip.learning.canonical_replica export" in python_invocations[0]
+    assert len(python_invocations) == 2
+    joined = "\n".join(python_invocations)
+    assert "app.opip.learning.canonical_replica export" in joined
+    assert "tree-digest" in source
+    # Neither invocation may be a capture/compute job reimplemented here.
+    for invocation in python_invocations:
+        assert "canonical_replica" in invocation
     for forbidden in (
         "app.jobs.run_opip_ml_capture",
         "run_opportunity_intelligence_cycle",

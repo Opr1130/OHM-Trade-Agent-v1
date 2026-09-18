@@ -39,13 +39,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import sys
-from typing import Any, Iterable, Mapping
+import time
+from typing import Any, Callable, Iterable, Mapping
 import uuid
 
 from app.opip.canonical.backup import (
@@ -1147,6 +1150,459 @@ def _prune_generations(
 
 
 # ---------------------------------------------------------------------------
+# Fresh committed-export proof (deploy-side gate)
+#
+# A cron/export lock skip is *valid* exporter behaviour and returns success, but
+# it is **not** evidence that the deployed release is exported. The deploy must
+# therefore prove a committed export for the exact target SHA from durable
+# artifacts, never from an exit code.
+# ---------------------------------------------------------------------------
+
+#: Filename of the production export manifest that acts as the generation commit
+#: marker for the learning export root.
+MANIFEST_ENV_FILENAME = "manifest.env"
+
+#: Content-addressed replica directory name produced by the exporter:
+#: ``canonical_learning_replica.<tree sha256>``.
+EXPORT_REPLICA_DIR_PATTERN = re.compile(r"^canonical_learning_replica\.[0-9a-f]{64}$")
+
+#: A bare lowercase SHA-256, used for recorded digests.
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+#: Deploy-time freshness bound for the committed export. Derived from the export
+#: schedule (2 minutes + 40s offset, so ~160s per cycle) with margin: two full
+#: cycles plus slack, so one missed tick does not flap the gate while a genuinely
+#: stale manifest still fails. Deliberately tighter than the 1800s replica
+#: contract, which governs learning consumption rather than deploy proof.
+EXPORT_PROOF_FRESHNESS_SECONDS = 600
+
+#: Bounded wait for a committed target-SHA export. Also derived from the cadence
+#: (two cycles plus slack) so a skipped-due-to-lock run has a chance to be
+#: superseded by the next scheduled run, and so the wait stays well inside the
+#: deploy's SSH keepalive budget. Never unbounded.
+EXPORT_PROOF_WAIT_SECONDS = 360
+EXPORT_PROOF_POLL_INTERVAL_SECONDS = 10.0
+
+REASON_EXPORT_MANIFEST_MISSING = "LEARNING_EXPORT_MANIFEST_MISSING"
+REASON_EXPORT_MANIFEST_MALFORMED = "LEARNING_EXPORT_MANIFEST_MALFORMED"
+REASON_EXPORT_RELEASE_SHA_MISMATCH = "LEARNING_EXPORT_RELEASE_SHA_MISMATCH"
+REASON_EXPORT_TIMESTAMP_INVALID = "LEARNING_EXPORT_TIMESTAMP_INVALID"
+REASON_EXPORT_STALE = "LEARNING_EXPORT_STALE"
+REASON_EXPORT_REPLICA_MARKER_MISSING = "LEARNING_EXPORT_REPLICA_MARKER_MISSING"
+REASON_EXPORT_REPLICA_DIR_INVALID = "LEARNING_EXPORT_REPLICA_DIR_INVALID"
+REASON_EXPORT_REPLICA_MISMATCH = "LEARNING_EXPORT_REPLICA_PROVENANCE_MISMATCH"
+REASON_EXPORT_OUTER_ADDRESS_INVALID = "LEARNING_EXPORT_OUTER_CONTENT_ADDRESS_INVALID"
+REASON_EXPORT_READY = "LEARNING_EXPORT_READY"
+
+
+@dataclass(frozen=True)
+class ExportReadiness:
+    """Whether a committed export proves the target release is exported."""
+
+    ready: bool
+    reason: str
+    detail: str
+    facts: dict[str, Any]
+    attempts: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "reason": self.reason,
+            "detail": self.detail,
+            "attempts": self.attempts,
+            **self.facts,
+        }
+
+
+def read_export_manifest(path: Path) -> dict[str, str]:
+    """Parse the production export manifest (``KEY=VALUE`` lines)."""
+    target = Path(path)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReplicaUnavailableError(
+            REASON_EXPORT_MANIFEST_MISSING,
+            f"export manifest unavailable at {target}: {exc}",
+        ) from exc
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _verify_outer_content_address(
+    *,
+    export_root: Path,
+    dir_name: str,
+    manifest: Mapping[str, str],
+    facts: dict[str, Any],
+) -> tuple[bool, str, str, Path | None]:
+    """Prove the OUTER content address of the referenced replica tree.
+
+    This is the layer the inner replica manifest cannot police on its own: the
+    manifest records a tree digest and byte count, and both must be recomputed
+    from the referenced tree with the same implementation the exporter used. The
+    directory's own name must also agree with the claimed digest, and the entry
+    must be a real directory contained beneath the export root.
+
+    Returns ``(ok, reason, detail, replica_dir)``. ``facts`` is updated in place
+    for observability.
+    """
+    replica_dir = export_root / dir_name
+    if replica_dir.is_symlink():
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory is a symlink: {replica_dir}",
+            None,
+        )
+    if not replica_dir.is_dir():
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory is missing: {replica_dir}",
+            None,
+        )
+    resolved_dir = Path(os.path.realpath(replica_dir))
+    resolved_root = Path(os.path.realpath(export_root))
+    if resolved_dir != resolved_root and resolved_root not in resolved_dir.parents:
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"referenced replica directory escapes the export root: {resolved_dir}",
+            None,
+        )
+
+    recorded_tree_sha = (manifest.get("canonical_learning_replica_sha256", "") or "").strip()
+    recorded_tree_bytes = (manifest.get("canonical_learning_replica_bytes", "") or "").strip()
+    facts["manifest_replica_tree_sha256"] = recorded_tree_sha
+    facts["manifest_replica_tree_bytes"] = recorded_tree_bytes
+    if not _SHA256_PATTERN.match(recorded_tree_sha):
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            f"manifest canonical_learning_replica_sha256 is not a sha256: {recorded_tree_sha!r}",
+            None,
+        )
+    if not recorded_tree_bytes.isdigit():
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "manifest canonical_learning_replica_bytes is not a non-negative integer: "
+            f"{recorded_tree_bytes!r}",
+            None,
+        )
+    if dir_name.rsplit(".", 1)[-1] != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "referenced directory name does not match the manifest tree digest "
+            f"({dir_name.rsplit('.', 1)[-1]} != {recorded_tree_sha})",
+            None,
+        )
+
+    try:
+        actual_tree_sha, actual_tree_bytes = replica_tree_digest(replica_dir)
+    except ReplicaUnavailableError as exc:
+        return False, exc.reason, str(exc), None
+    facts["actual_replica_tree_sha256"] = actual_tree_sha
+    facts["actual_replica_tree_bytes"] = actual_tree_bytes
+    if actual_tree_sha != recorded_tree_sha:
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree digest does not match the manifest "
+            f"({actual_tree_sha} != {recorded_tree_sha})",
+            None,
+        )
+    if actual_tree_bytes != int(recorded_tree_bytes):
+        return (
+            False,
+            REASON_EXPORT_OUTER_ADDRESS_INVALID,
+            "recomputed replica tree byte count does not match the manifest "
+            f"({actual_tree_bytes} != {recorded_tree_bytes})",
+            None,
+        )
+    return True, REASON_EXPORT_READY, "outer content address proven", replica_dir
+
+
+def _evaluate_committed_export(
+    *,
+    export_root: Path,
+    expected_source_release_sha: str,
+    moment: datetime,
+    max_age_seconds: int,
+) -> tuple[bool, str, str, dict[str, Any]]:
+    """One evaluation of the committed export. Never raises for a bad state."""
+    facts: dict[str, Any] = {"export_root": str(export_root)}
+    manifest_path = export_root / MANIFEST_ENV_FILENAME
+    try:
+        manifest = read_export_manifest(manifest_path)
+    except ReplicaUnavailableError as exc:
+        return False, exc.reason, str(exc), facts
+
+    facts["manifest_path"] = str(manifest_path)
+    facts["manifest_production_deployed_sha"] = manifest.get("production_deployed_sha", "")
+    facts["manifest_exported_at_utc"] = manifest.get("exported_at_utc", "")
+    facts["manifest_replica_marker"] = manifest.get("canonical_learning_replica_version", "")
+    facts["manifest_replica_dir"] = manifest.get("canonical_learning_replica_dir", "")
+
+    # 1. The manifest must name the exact release being deployed. This is the
+    #    check a lock-skip cannot satisfy on its own.
+    recorded_sha = manifest.get("production_deployed_sha", "")
+    if recorded_sha != expected_source_release_sha:
+        return (
+            False,
+            REASON_EXPORT_RELEASE_SHA_MISMATCH,
+            f"committed export is for {recorded_sha or 'no recorded SHA'}, "
+            f"expected {expected_source_release_sha}",
+            facts,
+        )
+
+    # 2. The commit timestamp must be present, timezone-aware and fresh.
+    raw_stamp = manifest.get("exported_at_utc", "")
+    if not raw_stamp:
+        return (
+            False,
+            REASON_EXPORT_MANIFEST_MALFORMED,
+            "committed export has no exported_at_utc",
+            facts,
+        )
+    try:
+        exported_at = _parse_utc(raw_stamp, field_name="exported_at_utc")
+    except ReplicaProvenanceError as exc:
+        return False, REASON_EXPORT_TIMESTAMP_INVALID, str(exc), facts
+    age = (moment - exported_at).total_seconds()
+    facts["export_age_seconds"] = int(age)
+    facts["export_freshness_bound_seconds"] = int(max_age_seconds)
+    if age > max_age_seconds or age < -max_age_seconds:
+        return (
+            False,
+            REASON_EXPORT_STALE,
+            f"committed export age {int(age)}s exceeds bound {max_age_seconds}s",
+            facts,
+        )
+
+    # 3. The additive replica marker must be present and versioned.
+    marker = manifest.get("canonical_learning_replica_version", "")
+    if marker != "1":
+        return (
+            False,
+            REASON_EXPORT_REPLICA_MARKER_MISSING,
+            f"committed export has no canonical_learning_replica_version=1 (got {marker!r})",
+            facts,
+        )
+
+    # 4. The referenced directory name must be content-addressed before anything
+    #    is derived from it. A valid-looking *name* is not sufficient on its own;
+    #    containment and the digest binding are proven by the helper below.
+    dir_name = manifest.get("canonical_learning_replica_dir", "")
+    if not EXPORT_REPLICA_DIR_PATTERN.match(dir_name or ""):
+        return (
+            False,
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"canonical_learning_replica_dir is not content-addressed: {dir_name!r}",
+            facts,
+        )
+
+    # 5+6. The OUTER content address and containment are proven as one unit, then
+    #      the INNER replica manifest is verified. Both layers are required: the
+    #      inner manifest records hashes that travel inside the same tree, so it
+    #      cannot detect a tree that is not what the manifest claims was published.
+    ok, reason, detail, replica_dir = _verify_outer_content_address(
+        export_root=export_root,
+        dir_name=dir_name,
+        manifest=manifest,
+        facts=facts,
+    )
+    if not ok or replica_dir is None:
+        return False, reason, detail, facts
+
+    try:
+        inner = read_replica_manifest(replica_dir / MANIFEST_FILENAME)
+        verified = verify_replica_manifest(
+            inner,
+            root=replica_dir,
+            expected_source_release_sha=expected_source_release_sha,
+            now=moment,
+            max_age_seconds=REPLICA_FRESHNESS_SECONDS,
+        )
+    except ReplicaVerificationError as exc:
+        return (
+            False,
+            REASON_EXPORT_REPLICA_MISMATCH,
+            f"inner replica manifest did not verify: {exc}",
+            facts,
+        )
+    facts["replica_generation_id"] = verified.generation_id
+    facts["replica_source_release_sha"] = verified.source_release_sha
+    facts["replica_snapshot_created_at_utc"] = iso_z(verified.snapshot_created_at_utc)
+    facts["replica_completeness_supported"] = replica_supports_completeness(verified)[0]
+
+    return True, REASON_EXPORT_READY, "committed export proves the target release", facts
+
+
+def verify_committed_export(
+    *,
+    export_root: Path,
+    expected_source_release_sha: str,
+    now: datetime | None = None,
+    max_age_seconds: int = EXPORT_PROOF_FRESHNESS_SECONDS,
+    wait_seconds: float = 0.0,
+    poll_interval_seconds: float = EXPORT_PROOF_POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    clock: Callable[[], datetime] | None = None,
+) -> ExportReadiness:
+    """Prove that ``expected_source_release_sha`` is committed in the export.
+
+    ``wait_seconds`` exists for one specific, legitimate case: the exporter
+    returned success because the cron run already held the lock, so the committed
+    manifest still names the previous release. The next scheduled run may commit
+    the target, so a bounded wait is useful - but it is strictly bounded and
+    never spins indefinitely.
+
+    Time is injectable so the wait and the freshness bound are testable without
+    sleeping in tests.
+    """
+    if wait_seconds < 0:
+        raise ValueError("wait_seconds must not be negative")
+    release_sha = require_release_sha(
+        expected_source_release_sha, field_name="expected_source_release_sha"
+    )
+    root = Path(export_root)
+    resolved_now = _require_utc_datetime(now, field_name="now") if now is not None else None
+
+    started = monotonic()
+    attempts = 0
+    readiness: ExportReadiness | None = None
+    while True:
+        attempts += 1
+        moment = resolved_now if resolved_now is not None else (clock or _utc_now)()
+        ready, reason, detail, facts = _evaluate_committed_export(
+            export_root=root,
+            expected_source_release_sha=release_sha,
+            moment=moment,
+            max_age_seconds=max_age_seconds,
+        )
+        readiness = ExportReadiness(
+            ready=ready, reason=reason, detail=detail, facts=facts, attempts=attempts
+        )
+        if ready:
+            return readiness
+        elapsed = monotonic() - started
+        remaining = wait_seconds - elapsed
+        if remaining <= 0:
+            return readiness
+        sleep(min(poll_interval_seconds, remaining))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _cmd_verify_export(args: argparse.Namespace) -> int:
+    readiness = verify_committed_export(
+        export_root=Path(args.root),
+        expected_source_release_sha=args.release_sha,
+        max_age_seconds=int(args.max_age_seconds),
+        wait_seconds=float(args.wait_seconds),
+    )
+    print(json.dumps(readiness.as_dict(), sort_keys=True))
+    print(f"OPIP_LEARNING_READINESS={'READY' if readiness.ready else 'BLOCKED'}")
+    print(f"OPIP_LEARNING_READINESS_REASON={readiness.reason}")
+    print(f"OPIP_LEARNING_EXPORT_ATTEMPTS={readiness.attempts}")
+    if readiness.ready:
+        print("O'Pip learning export readiness: READY")
+        return 0
+    # Non-zero so the deploy cannot mistake this for a proven export; the caller
+    # reads it in an `if` so the core deployment is never aborted by it.
+    print(
+        f"O'Pip learning export readiness: BLOCKED ({readiness.reason})",
+        file=sys.stderr,
+    )
+    print(f"  {readiness.detail}", file=sys.stderr)
+    return 3
+
+
+# ---------------------------------------------------------------------------
+# Replica content address (single implementation)
+#
+# The published replica directory is content-addressed:
+# ``canonical_learning_replica.<tree sha256>``. The exporter names the directory
+# from this digest and records it in ``manifest.env`` as
+# ``canonical_learning_replica_sha256`` / ``canonical_learning_replica_bytes``;
+# the deploy-side verifier recomputes it and requires agreement.
+#
+# There is exactly ONE implementation, used by both sides, so the two cannot
+# silently drift. The ordering is defined as a byte-sort of each file's
+# ``./relative/path`` record. That is deliberate: the shell version this replaces
+# sorted with the ambient locale, which makes a content address depend on the
+# environment that produced it. A content address must be a pure function of the
+# content.
+# ---------------------------------------------------------------------------
+
+
+def _iter_tree_files(root: Path) -> list[tuple[bytes, Path]]:
+    """Regular files under ``root`` as ``(record, path)``, symlinks excluded.
+
+    Mirrors ``find . -type f``: a symlink is not a regular file, so it is not
+    part of the content address. Symlinked directories are never traversed.
+    """
+    entries: list[tuple[bytes, Path]] = []
+    for current, dirnames, filenames in os.walk(Path(root), followlinks=False):
+        # Prune symlinked directories so a link can never pull an outside tree in.
+        dirnames[:] = [
+            name for name in dirnames if not (Path(current) / name).is_symlink()
+        ]
+        for name in filenames:
+            path = Path(current) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            entries.append((f"./{relative}".encode("utf-8"), path))
+    return entries
+
+
+def replica_tree_digest(root: Path) -> tuple[str, int]:
+    """Return ``(tree_sha256, total_bytes)`` for a replica tree.
+
+    ``total_bytes`` is the sum of regular-file sizes. ``tree_sha256`` is the
+    SHA-256 of the concatenated ``<file sha256>  <record>\\n`` lines, in
+    byte-sorted record order - the same line format ``sha256sum`` emits, so the
+    digest is reproducible and auditable from the tree alone.
+    """
+    base = Path(root)
+    if not base.is_dir():
+        raise ReplicaUnavailableError(
+            REASON_EXPORT_REPLICA_DIR_INVALID,
+            f"replica tree is not a directory: {base}",
+        )
+    total = 0
+    digests: list[tuple[bytes, bytes]] = []
+    for record, path in _iter_tree_files(base):
+        total += path.stat().st_size
+        digests.append((record, hash_file_sha256(path).encode("ascii")))
+
+    outer = hashlib.sha256()
+    for record, file_sha in sorted(digests, key=lambda item: item[0]):
+        outer.update(file_sha + b"  " + record + b"\n")
+    return outer.hexdigest(), total
+
+
+def _cmd_tree_digest(args: argparse.Namespace) -> int:
+    digest, total = replica_tree_digest(Path(args.root))
+    print(f"OPIP_REPLICA_TREE_SHA256={digest}")
+    print(f"OPIP_REPLICA_TREE_BYTES={total}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI seam
 #
 # The shell scripts call these instead of reimplementing SQLite or hash
@@ -1239,6 +1695,32 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument("--host-root", required=True)
     resolve.set_defaults(func=_cmd_resolve)
 
+    verify_export = sub.add_parser(
+        "verify-export",
+        help="prove a committed export names the target release (deploy gate)",
+    )
+    verify_export.add_argument("--root", required=True)
+    verify_export.add_argument("--release-sha", required=True)
+    verify_export.add_argument(
+        "--max-age-seconds", default=str(EXPORT_PROOF_FRESHNESS_SECONDS)
+    )
+    verify_export.add_argument(
+        "--wait-seconds",
+        default="0",
+        help=(
+            "bounded wait for a committed target-SHA export, for the case where "
+            "the exporter returned success because a cron run held the lock"
+        ),
+    )
+    verify_export.set_defaults(func=_cmd_verify_export)
+
+    tree_digest = sub.add_parser(
+        "tree-digest",
+        help="content address a replica tree (single implementation, exporter + verifier)",
+    )
+    tree_digest.add_argument("--root", required=True)
+    tree_digest.set_defaults(func=_cmd_tree_digest)
+
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
@@ -1255,6 +1737,10 @@ __all__ = [
     "CANONICAL_RELATIVE",
     "CanonicalLearningReplicaManifest",
     "DEFAULT_REPLICA_ROOT",
+    "EXPORT_PROOF_FRESHNESS_SECONDS",
+    "EXPORT_PROOF_WAIT_SECONDS",
+    "EXPORT_REPLICA_DIR_PATTERN",
+    "ExportReadiness",
     "HOST_CURRENT_POINTER",
     "HOST_GENERATIONS_DIRNAME",
     "MANIFEST_FILENAME",
@@ -1264,6 +1750,14 @@ __all__ = [
     "REASON_DB_MISSING",
     "REASON_DB_NOT_SELF_CONTAINED",
     "REASON_DB_SIZE_MISMATCH",
+    "REASON_EXPORT_MANIFEST_MISSING",
+    "REASON_EXPORT_OUTER_ADDRESS_INVALID",
+    "REASON_EXPORT_READY",
+    "REASON_EXPORT_RELEASE_SHA_MISMATCH",
+    "REASON_EXPORT_REPLICA_DIR_INVALID",
+    "REASON_EXPORT_REPLICA_MARKER_MISSING",
+    "REASON_EXPORT_REPLICA_MISMATCH",
+    "REASON_EXPORT_STALE",
     "REASON_GENERATION_ID_COLLISION",
     "REASON_GENERATION_ID_INVALID",
     "REASON_MANIFEST_MALFORMED",
@@ -1293,9 +1787,11 @@ __all__ = [
     "host_generations_dir",
     "install_replica_generation",
     "iso_z",
+    "read_export_manifest",
     "read_replica_manifest",
     "read_snapshot_facts",
     "replica_db_path",
+    "replica_tree_digest",
     "replica_manifest_path",
     "replica_paper_gap_path",
     "replica_paper_state_path",
@@ -1304,6 +1800,7 @@ __all__ = [
     "require_generation_id",
     "resolve_current_generation",
     "resolve_verified_replica_bundle",
+    "verify_committed_export",
     "verify_installed_replica",
     "verify_replica_manifest",
     "write_replica_manifest",
