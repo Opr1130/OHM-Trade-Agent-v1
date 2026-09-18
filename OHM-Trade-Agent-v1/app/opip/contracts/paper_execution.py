@@ -161,6 +161,8 @@ class TemporalEvidence:
         object.__setattr__(self, "basis", basis)
 
         if precision is TemporalPrecision.EXACT:
+            if basis is TemporalBasis.MODEL_ASSIGNED:
+                raise ValueError("EXACT temporal evidence cannot be MODEL_ASSIGNED")
             if self.occurred_at is None:
                 raise ValueError("EXACT temporal evidence requires occurred_at")
             occurred_at = require_utc(
