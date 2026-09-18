@@ -4,6 +4,9 @@ set -Eeuo pipefail
 TARGET_SHA="${1:-}"
 REPO_ROOT="/opt/OHM-Trade-Agent-v1"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
+DATA_ROOT="$APP_ROOT/data"
+# Same interpreter convention as the rest of the production scripts.
+PYTHON_BIN="${OPIP_PYTHON_BIN:-/usr/bin/python3}"
 DEPLOY_SCRIPT_DST="/usr/local/sbin/ohm-deploy"
 SSH_GATEWAY_DST="/usr/local/sbin/ohm-deploy-ssh"
 LEARNING_READER_DST="/usr/local/sbin/opip-learning-read-export"
@@ -21,8 +24,17 @@ fi
 LOCK_FILE="/var/lock/ohm-deploy.lock"
 STATE_DIR="/var/lib/ohm-deploy"
 LAST_GOOD_FILE="$STATE_DIR/last-good-sha"
+# Durable paper-registry initialization provenance. Lives in host operational
+# state so it outlives the registry it protects and never becomes evidence a
+# reader could be handed. See app/services/paper_registry_genesis.py.
+PAPER_GENESIS_MARKER="$STATE_DIR/paper-registry-initialized-v1"
 SCHEDULER_RECONCILE="$APP_ROOT/deploy/remote/reconcile-scheduler.sh"
 PAPER_COMPOSE="$APP_ROOT/docker-compose.paper.yml"
+# Export root and proof bounds, mirroring the exporter and the verification
+# helper. Kept explicit here so the deploy gate cannot drift from them.
+EXPORT_ROOT="/var/lib/opip-learning-export"
+EXPORT_PROOF_FRESHNESS_SECONDS=600
+EXPORT_PROOF_WAIT_SECONDS=360
 SCHEDULER_SNAPSHOT=""
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -273,6 +285,9 @@ snapshot_scheduler_state
 rollback() {
   rc=$?
   trap - ERR
+  # Explicit core-failure marker so the workflow never has to infer core state
+  # from an exit code alone.
+  echo "OPIP_CORE_DEPLOY_STATUS=FAILED"
   echo "deployment failed; rolling back to $PREVIOUS_SHA" >&2
 
   # Free paper-worker memory before rebuilding the previous deterministic core.
@@ -379,19 +394,120 @@ printf '%s\n' "$TARGET_SHA" > "$LAST_GOOD_FILE"
 cleanup_snapshot
 trap - ERR
 
-if [[ ! -s "$P1_RETIRE_SCRIPT" ]]; then
-  echo "P1 shadow outbox retirement helper missing" >&2
-  exit 69
-fi
-bash "$P1_RETIRE_SCRIPT"
+# ---------------------------------------------------------------------------
+# CORE RELEASE IS NOW COMMITTED.
+#
+# Everything below this line is post-deploy work whose failure must never be
+# reported as a failed or rolled-back core release. The core release boundary is
+# explicit: /var/lib/ohm-deploy/last-good-sha already names the target, the core
+# and writer are healthy, the paper topology is validated and the rollback trap
+# is disabled.
+#
+# Post-deploy work is reported through machine-readable markers rather than by
+# a single exit code, because two genuinely different things are being measured:
+#
+#   OPIP_CORE_DEPLOY_STATUS       SUCCESS | FAILED
+#   OPIP_PAPER_REGISTRY_GENESIS   INITIALIZED | ALREADY_INITIALIZED | ADOPTED_EXISTING | REFUSED
+#   OPIP_P1_RETIREMENT_STATUS     SUCCESS | FAILED | SKIPPED
+#   OPIP_LEARNING_EXPORT_STATUS   SUCCESS | FAILED | SKIPPED
+#   OPIP_LEARNING_READINESS       READY | BLOCKED
+#
+# The GitHub workflow consumes these to publish an accurate receipt. A blocked
+# learning export on a healthy committed core must never be described as
+# "SERVER DEPLOY FAILED" with "Rollback: UNKNOWN OR FAILED".
+# ---------------------------------------------------------------------------
+echo "OPIP_CORE_DEPLOY_STATUS=SUCCESS"
 
-# Publish schema-4 evidence immediately so the remote worker stops requesting
-# the retired multi-hundred-MB artifact without waiting for the next cron tick.
-if [[ ! -s "$LEARNING_EXPORTER" ]]; then
-  echo "learning exporter missing after P1 retirement" >&2
-  exit 69
+# --- Paper registry genesis -------------------------------------------------
+# `paper_trading/state.json` is both the lifecycle registry and a canonical
+# replica completeness companion. A pre-#245 installation that legitimately has
+# zero paper lifecycle activity has no registry, and the replica contract
+# correctly refuses to certify completeness without it. Genesis supplies the
+# missing migration boundary: it creates the canonical EMPTY registry only when
+# virgin state is provable, records durable initialization provenance, and
+# refuses (identically fail-closed) when evidence exists or state was lost.
+#
+# A refusal is an integrity incident, not a deploy failure, and the exporter
+# below will fail closed on its own if the registry is still absent - so this
+# never aborts a committed core release.
+genesis_args=(
+  --state-file "$DATA_ROOT/paper_trading/state.json"
+  --event-file "$DATA_ROOT/paper_trading/events.jsonl"
+  --gap-spool "$DATA_ROOT/paper_trading/evidence_gap_spool.json"
+  --canonical-db "$DATA_ROOT/opip/canonical/opip_canonical_v1.sqlite3"
+  --marker "$PAPER_GENESIS_MARKER"
+  --release-sha "$TARGET_SHA"
+)
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=SKIPPED" >&2
+  echo "O'Pip Python interpreter missing; paper registry genesis skipped" >&2
+elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.services.paper_registry_genesis ensure "${genesis_args[@]}"; then
+  echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK"
+else
+  genesis_rc=$?
+  # Read-only reporting: the refusal reason is already on stdout as a marker.
+  echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=REFUSED" >&2
+  echo "O'Pip paper registry genesis refused (rc=$genesis_rc); core release unaffected; learning export will fail closed" >&2
 fi
-bash "$LEARNING_EXPORTER"
+
+# --- P1 shadow outbox retirement (owner-authorized, irreversible) ------------
+p1_status="SKIPPED"
+if [[ -s "$P1_RETIRE_SCRIPT" ]]; then
+  if bash "$P1_RETIRE_SCRIPT"; then
+    p1_status="SUCCESS"
+  else
+    p1_status="FAILED"
+    echo "O'Pip P1 shadow outbox retirement FAILED; core release already committed" >&2
+  fi
+else
+  p1_status="FAILED"
+  echo "P1 shadow outbox retirement helper missing" >&2
+fi
+echo "OPIP_P1_RETIREMENT_STATUS=$p1_status"
+
+# --- Learning evidence export (post-deploy gate) -----------------------------
+# Publish schema-4 evidence immediately so the remote worker stops requesting the
+# retired multi-hundred-MB artifact without waiting for the next cron tick.
+#
+# Deliberately NOT fatal: this is non-authoritative for the core release. A
+# success here also does not prove the target SHA is committed - the exporter
+# returns success when a cron run already holds the lock - so the proof below is
+# what actually gates learning readiness.
+learning_export="SKIPPED"
+if [[ -s "$LEARNING_EXPORTER" ]]; then
+  if bash "$LEARNING_EXPORTER"; then
+    learning_export="SUCCESS"
+  else
+    learning_export="FAILED"
+    echo "O'Pip learning evidence export FAILED; core release already committed" >&2
+  fi
+else
+  learning_export="FAILED"
+  echo "learning exporter missing after P1 retirement" >&2
+fi
+echo "OPIP_LEARNING_EXPORT_STATUS=$learning_export"
+
+# --- Fresh committed-export proof (authoritative learning readiness) --------
+# A lock skip is valid exporter behaviour and is NOT proof that the deployed SHA
+# is exported. Readiness is therefore proven from durable artifacts: the
+# committed manifest must name this exact SHA, be fresh, carry replica marker
+# version 1, reference a real content-addressed replica directory, and that
+# generation's inner manifest must verify against this same release.
+#
+# The wait is bounded (derived from the export cadence) and covers exactly one
+# legitimate case: the exporter skipped because the cron run held the lock, so
+# the next scheduled run may still commit the target. It never spins.
+learning_readiness="BLOCKED"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "O'Pip Python interpreter missing; committed-export proof unavailable" >&2
+elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.opip.learning.canonical_replica verify-export \
+  --root "$EXPORT_ROOT" \
+  --release-sha "$TARGET_SHA" \
+  --max-age-seconds "$EXPORT_PROOF_FRESHNESS_SECONDS" \
+  --wait-seconds "$EXPORT_PROOF_WAIT_SECONDS"; then
+  learning_readiness="READY"
+fi
+echo "OPIP_LEARNING_READINESS=$learning_readiness"
 
 # Learning computation is remote-only. Production performs only the lightweight
 # bounded evidence export installed by reconcile-scheduler.sh.

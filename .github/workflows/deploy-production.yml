@@ -155,13 +155,32 @@ jobs:
             "deploy $TARGET_SHA" 2>&1 | tee deploy.log
           RC=${PIPESTATUS[0]}
 
+          # Structured post-deploy status emitted by ohm-deploy. Core release
+          # state and learning readiness are separate facts: a healthy committed
+          # core whose learning export failed must never be reported as a failed
+          # server deploy with an unknown rollback.
+          CORE_STATUS="$(grep -oE 'OPIP_CORE_DEPLOY_STATUS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
+          LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
+          LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[A-Z]+' deploy.log | tail -n 1 | cut -d= -f2)"
+
           if [[ "$RC" -eq 0 ]] \
              && grep -q "O'Pip deployment succeeded" deploy.log \
              && grep -q '"status":"ok"' deploy.log \
-             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log; then
-            RESULT="SUCCESS"
+             && grep -q "O'Pip scheduler reconciliation: OK" deploy.log \
+             && [[ "$CORE_STATUS" != "FAILED" ]]; then
             HEALTH="OK"
             ROLLBACK="NO"
+            if [[ "$LEARNING_READINESS" == "READY" ]]; then
+              RESULT="SUCCESS"
+            elif [[ -n "$LEARNING_READINESS" ]]; then
+              RESULT="CORE DEPLOYED - LEARNING BLOCKED"
+            else
+              # No readiness marker: the running ohm-deploy predates the
+              # structured contract (it is reinstalled mid-deploy), so the
+              # committed export for this SHA is unproven. Fail closed rather
+              # than assume it.
+              RESULT="CORE DEPLOYED - LEARNING UNPROVEN"
+            fi
           elif grep -q 'rollback health check passed' deploy.log; then
             RESULT="ROLLED BACK"
             HEALTH="PREVIOUS RELEASE OK"
@@ -180,10 +199,23 @@ jobs:
             ROLLBACK="UNKNOWN OR FAILED"
           fi
 
+          # The gate passes only when the core committed AND learning readiness
+          # was proven. A blocked learning export is surfaced as a failed gate
+          # with an accurate result label, never hidden behind exit 0.
+          if [[ "$RESULT" == "SUCCESS" ]]; then
+            GATE="PASS"
+          else
+            GATE="FAIL"
+          fi
+
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
           echo "result=$RESULT" >> "$GITHUB_OUTPUT"
           echo "health=$HEALTH" >> "$GITHUB_OUTPUT"
           echo "rollback=$ROLLBACK" >> "$GITHUB_OUTPUT"
+          echo "gate=$GATE" >> "$GITHUB_OUTPUT"
+          echo "core_status=${CORE_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "learning_export_status=${LEARNING_EXPORT_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "learning_readiness=${LEARNING_READINESS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Publish deployment receipt to approval issue
@@ -197,6 +229,9 @@ jobs:
           HEALTH_RESULT: ${{ steps.production_deploy.outputs.health }}
           ROLLBACK_RESULT: ${{ steps.production_deploy.outputs.rollback }}
           DEPLOY_RC: ${{ steps.production_deploy.outputs.rc }}
+          CORE_STATUS: ${{ steps.production_deploy.outputs.core_status }}
+          LEARNING_EXPORT_STATUS: ${{ steps.production_deploy.outputs.learning_export_status }}
+          LEARNING_READINESS: ${{ steps.production_deploy.outputs.learning_readiness }}
         run: |
           set -euo pipefail
           RESULT="${DEPLOY_RESULT:-${SSH_CONFIG_RESULT:-FAILED BEFORE SSH}}"
@@ -209,14 +244,24 @@ jobs:
           RC="${DEPLOY_RC:-${SSH_CONFIG_RC:-N/A}}"
           RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
+          # Core release state and learning readiness are reported separately so a
+          # healthy committed core with a blocked learning export is never
+          # described as a failed or rolled-back deployment.
           BODY=$(cat <<EOF
           ## OHM Production Deployment Receipt
           - **Result:** $RESULT
           - **SHA:** \`$TARGET_SHA\`
-          - **Health:** $HEALTH
+          - **Core health:** $HEALTH
           - **Rollback:** $ROLLBACK
+          - **Core deployment:** ${CORE_STATUS:-UNKNOWN}
+          - **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
+          - **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
           - **Deploy exit code:** $RC
           - **Workflow run:** $RUN_URL
+
+          \`Learning readiness\` proves a fresh committed canonical replica for this
+          exact SHA. \`BLOCKED\` means the production side could not prove it; a
+          \`BLOCKED\` learning gate does not indicate a core release failure.
           EOF
           )
 
@@ -225,14 +270,17 @@ jobs:
             "repos/$GITHUB_REPOSITORY/issues/64/comments" \
             -f body="$BODY" >/dev/null
 
-      - name: Fail workflow if production deploy did not succeed
-        if: always() && steps.production_deploy.outputs.result != 'SUCCESS'
+      - name: Fail workflow unless the deployment gate fully passed
+        if: always() && steps.production_deploy.outputs.gate != 'PASS'
         run: |
           RESULT="${{ steps.production_deploy.outputs.result }}"
           if [[ -z "$RESULT" ]]; then
             RESULT="${{ steps.ssh_config.outputs.result }}"
           fi
-          echo "Production deploy result: ${RESULT:-FAILED BEFORE SSH}" >&2
+          echo "Production deployment gate: ${RESULT:-FAILED BEFORE SSH}" >&2
+          echo "Core deployment: ${{ steps.production_deploy.outputs.core_status || 'UNKNOWN' }}" >&2
+          echo "Learning export: ${{ steps.production_deploy.outputs.learning_export_status || 'UNKNOWN' }}" >&2
+          echo "Learning readiness: ${{ steps.production_deploy.outputs.learning_readiness || 'UNKNOWN' }}" >&2
           exit 1
 
   diagnose-learning:

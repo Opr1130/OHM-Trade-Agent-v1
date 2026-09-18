@@ -755,6 +755,10 @@ export_log_post_manifest_unclassified_line_count="0"
 export_log_post_manifest_evidence="UNKNOWN"
 if [[ -f "$EXPORT_LOG" ]]; then
   export_log_exists="YES"
+  # Symmetry with the missing branch below. Without this the field was silently
+  # absent whenever the log DID exist, which is exactly the case an operator
+  # most needs to read.
+  echo "export_log_exists=YES"
   log_meta="$(stat -c '%U|%G|%a|%s|%Y' "$EXPORT_LOG" 2>/dev/null || true)"
   IFS='|' read -r log_owner log_group log_mode log_size log_mtime <<<"$log_meta"
   echo "export_log_owner=${log_owner:-UNKNOWN}"
