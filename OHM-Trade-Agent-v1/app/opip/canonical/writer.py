@@ -33,6 +33,30 @@ from app.opip.contracts.events import (
     FEATURE_SNAPSHOT_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
+from app.opip.contracts.paper_execution import ExecutionState
+from app.opip.contracts.paper_execution_events import (
+    PAPER_EXECUTION_ATTEMPT_RECORDED,
+    PAPER_EXECUTION_PRIORITY,
+    PAPER_EXECUTION_STREAM,
+    PAPER_FILL_RECORDED,
+    PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+    PAPER_ORDER_INTENT_RECORDED,
+    event_contract as paper_event_contract,
+    paper_evidence_idempotency_key,
+    validate_paper_evidence_payload,
+)
+from app.opip.contracts.paper_execution_runtime import (
+    PAPER_ADMISSION_REQUEST_RECORDED,
+    PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
+    PAPER_QUOTE_EVIDENCE_RECORDED,
+    PaperAdmissionAck,
+    PaperAdmissionRequest,
+    admission_request_idempotency_key,
+    admission_result_identities,
+    quote_evidence_idempotency_key,
+    validate_admission_request,
+    validate_quote_evidence_payload,
+)
 from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_EVENT_TYPES,
     PAPER_OUTCOME_PRIORITY,
@@ -89,6 +113,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # strategy/execution provenance) is exactly what makes two otherwise
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
+    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -161,6 +186,7 @@ ACCEPTED_EVENT_TYPES = (
     | FEATURE_BUS_EVENT_TYPES
     | DECISION_INTELLIGENCE_EVENT_TYPES
     | PAPER_OUTCOME_EVENT_TYPES
+    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
 )
 
 
@@ -1070,6 +1096,39 @@ class CanonicalWriter:
             raise ValueError("feature bus events must not carry ops_handoff")
         return intent.payload
 
+    def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
+        """Validate B/C-1 producer-submitted Paper v2 evidence.
+
+        Opportunity disposition is intentionally absent here: admission must go
+        through admit_paper_opportunity so the portfolio version check,
+        capital/capacity decision, reservation identity and disposition commit
+        share one canonical transaction.
+        """
+        if intent.priority != PAPER_EXECUTION_PRIORITY:
+            raise ValueError("Paper v2 execution events must use LOW priority")
+        if intent.ops_handoff is not None:
+            raise ValueError("Paper v2 execution events must not carry ops_handoff")
+
+        if intent.event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
+            normalized = validate_quote_evidence_payload(intent.payload)
+            expected_key = quote_evidence_idempotency_key(normalized)
+        else:
+            if intent.event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+                raise ValueError("Paper v2 event is not registered in B/C-1")
+            normalized = validate_paper_evidence_payload(
+                intent.event_type,
+                intent.payload,
+            )
+            expected_key = paper_evidence_idempotency_key(
+                intent.event_type,
+                normalized,
+            )
+        if intent.idempotency_key != expected_key:
+            raise ValueError(
+                "Paper v2 idempotency_key does not match canonical record identity"
+            )
+        return normalized
+
     def _validate_paper_outcome_intent(self, intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
 
@@ -1205,6 +1264,8 @@ class CanonicalWriter:
             return self._validate_decision_intelligence_intent(intent)
         if intent.event_type in PAPER_OUTCOME_EVENT_TYPES:
             return self._validate_paper_outcome_intent(intent)
+        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            return self._validate_paper_execution_intent(intent)
 
         self._validate_alert_ops_intent(intent)
         return intent.payload
@@ -1225,6 +1286,8 @@ class CanonicalWriter:
             return FEATURE_BUS_STREAM
         if event_type in PAPER_OUTCOME_EVENT_TYPES:
             return PAPER_OUTCOME_STREAM
+        if event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+            return PAPER_EXECUTION_STREAM
         return STREAM_EARLY_WATCH
 
     @staticmethod
@@ -1234,6 +1297,7 @@ class CanonicalWriter:
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
+            and event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(
