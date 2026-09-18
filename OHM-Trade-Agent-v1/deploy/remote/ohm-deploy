@@ -442,7 +442,17 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=SKIPPED" >&2
   echo "O'Pip Python interpreter missing; paper registry genesis skipped" >&2
 elif PYTHONPATH="$APP_ROOT" "$PYTHON_BIN" -m app.services.paper_registry_genesis ensure "${genesis_args[@]}"; then
-  echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK"
+  # Do not trust the exit code alone. Durable initialization provenance is the
+  # artifact that makes a later missing registry distinguishable from virgin
+  # state, so OK is reported only when that artifact actually exists and is
+  # non-empty. A genesis that created state.json but could not persist the
+  # marker must never be reported as proven.
+  if [[ -s "$PAPER_GENESIS_MARKER" ]]; then
+    echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK"
+  else
+    echo "OPIP_PAPER_REGISTRY_GENESIS_STATUS=REFUSED" >&2
+    echo "O'Pip paper registry genesis reported success but the initialization marker is missing or empty at $PAPER_GENESIS_MARKER; refusing to report durable provenance" >&2
+  fi
 else
   genesis_rc=$?
   # Read-only reporting: the refusal reason is already on stdout as a marker.

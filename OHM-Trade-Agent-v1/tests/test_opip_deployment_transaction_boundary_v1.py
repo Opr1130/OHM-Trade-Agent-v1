@@ -419,6 +419,7 @@ CORE_OK_LOG = "\n".join(
         '"status":"ok"',
         "O'Pip scheduler reconciliation: OK",
         "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+        "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
         "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
     ]
 )
@@ -787,7 +788,12 @@ def test_second_invocation_success_yields_structured_success(tmp_path):
 
 @requires_bash
 def test_second_invocation_failure_stays_blocked(tmp_path):
-    """If the retry still cannot prove the export, the gate stays red."""
+    """If the retry still cannot prove genesis or the export, the gate stays red.
+
+    This fixture has BOTH problems: genesis refused and the export failed. The
+    result names both, which is strictly more informative than the single
+    LEARNING BLOCKED label it reported before genesis became a gate.
+    """
     log = "\n".join(
         [
             CORE_OK_LOG,
@@ -799,7 +805,9 @@ def test_second_invocation_failure_stays_blocked(tmp_path):
         ]
     )
     fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
-    assert fields["RESULT"] == "CORE DEPLOYED - LEARNING BLOCKED"
+    assert fields["RESULT"] == (
+        "CORE DEPLOYED - PAPER REGISTRY GENESIS BLOCKED + LEARNING BLOCKED"
+    )
     assert fields["HEALTH"] == "OK"
     assert fields["ROLLBACK"] == "NO"
     assert fields["GATE"] == "FAIL"
@@ -906,6 +914,7 @@ def test_postcommit_degraded_health_is_reported_but_not_as_a_core_failure(tmp_pa
         [
             "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
             "O'Pip scheduler reconciliation: OK",
+            "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
             "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
             "OPIP_LEARNING_READINESS=READY",
             "OPIP_CORE_POSTCOMMIT_HEALTH=DEGRADED",
@@ -917,6 +926,113 @@ def test_postcommit_degraded_health_is_reported_but_not_as_a_core_failure(tmp_pa
     assert fields["HEALTH"] == "OK"
     assert fields["ROLLBACK"] == "NO"
     assert fields["GATE"] == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Durable genesis provenance is a deployment gate
+# ---------------------------------------------------------------------------
+
+
+@requires_bash
+def test_genesis_blocked_blocks_the_deployment_despite_export_success(tmp_path):
+    """The defect: a committed export with no durable provenance must not pass.
+
+    Every other fact is green here - the core committed, the export succeeded and
+    readiness proved a fresh committed replica - so only provenance is missing. If
+    the gate ignored genesis, this would report SUCCESS while leaving no durable
+    record that the paper registry was ever initialized, and a later missing
+    state.json would again be indistinguishable from virgin state.
+    """
+    log = "\n".join(
+        [
+            CORE_OK_LOG.replace(
+                "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
+                "OPIP_PAPER_REGISTRY_GENESIS_STATUS=REFUSED",
+            ),
+            "OPIP_PAPER_REGISTRY_GENESIS_REASON=PAPER_REGISTRY_GENESIS_MARKER_WRITE_FAILED",
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+            "sha=" + RELEASE_SHA,
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+
+    assert fields["RESULT"] == "CORE DEPLOYED - PAPER REGISTRY GENESIS BLOCKED"
+    assert fields["RESULT"] != "SUCCESS"
+    assert fields["GATE"] == "FAIL"
+    # The committed core is still described accurately and never rolled back.
+    assert fields["HEALTH"] == "OK"
+    assert fields["ROLLBACK"] == "NO"
+    assert fields["GENESIS_STATUS"] if "GENESIS_STATUS" in fields else True
+
+
+@requires_bash
+def test_genesis_skipped_also_blocks_the_deployment(tmp_path):
+    """SKIPPED means provenance was not established, so it cannot pass either."""
+    log = "\n".join(
+        [
+            CORE_OK_LOG.replace(
+                "OPIP_PAPER_REGISTRY_GENESIS_STATUS=OK",
+                "OPIP_PAPER_REGISTRY_GENESIS_STATUS=SKIPPED",
+            ),
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "CORE DEPLOYED - PAPER REGISTRY GENESIS BLOCKED"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
+def test_absent_genesis_marker_blocks_the_deployment(tmp_path):
+    """A contract-era run that never reported genesis provenance fails closed."""
+    log = "\n".join(
+        [
+            "OPIP_CORE_DEPLOY_STATUS=SUCCESS",
+            "O'Pip scheduler reconciliation: OK",
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "OPIP_CORE_POSTCOMMIT_HEALTH=OK",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "CORE DEPLOYED - PAPER REGISTRY GENESIS BLOCKED"
+    assert fields["GATE"] == "FAIL"
+
+
+@requires_bash
+def test_genesis_proven_with_everything_else_green_passes(tmp_path):
+    """Control: genesis OK plus green learning and post-commit health passes."""
+    log = "\n".join(
+        [
+            CORE_OK_LOG,
+            "OPIP_LEARNING_EXPORT_STATUS=SUCCESS",
+            "OPIP_LEARNING_READINESS=READY",
+            "O'Pip deployment succeeded",
+        ]
+    )
+    fields = _classify(tmp_path, log, rc=0, legacy_allowed=0)
+    assert fields["RESULT"] == "SUCCESS"
+    assert fields["GATE"] == "PASS"
+
+
+def test_genesis_gate_is_wired_into_the_workflow_and_deploy():
+    """Static wiring: the gate must exist on both sides of the boundary."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    deploy = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # The workflow parses the structured genesis status and requires OK.
+    assert "OPIP_PAPER_REGISTRY_GENESIS_STATUS=" in text
+    assert 'GENESIS_STATUS" == "OK"' in text
+    assert "PAPER REGISTRY GENESIS" in text
+    # ohm-deploy reports OK only when the durable marker actually exists.
+    assert '[[ -s "$PAPER_GENESIS_MARKER" ]]' in deploy
+    assert "the initialization marker is missing or empty" in deploy
+    for status in ("OK", "REFUSED", "SKIPPED"):
+        assert f"OPIP_PAPER_REGISTRY_GENESIS_STATUS={status}" in deploy
 
 
 def test_postcommit_section_guards_every_command():

@@ -181,6 +181,8 @@ jobs:
             LEARNING_EXPORT_STATUS="$(grep -oE 'OPIP_LEARNING_EXPORT_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             LEARNING_READINESS="$(grep -oE 'OPIP_LEARNING_READINESS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             POSTCOMMIT_HEALTH="$(grep -oE 'OPIP_CORE_POSTCOMMIT_HEALTH=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            GENESIS_STATUS="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_STATUS=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
+            GENESIS_REASON="$(grep -oE 'OPIP_PAPER_REGISTRY_GENESIS_REASON=[^[:space:]]*' "$log" | tail -n 1 | cut -d= -f2)"
             if grep -q 'OPIP_CORE_DEPLOY_STATUS=' "$log"; then
               CORE_MARKER="PRESENT"
             else
@@ -240,12 +242,22 @@ jobs:
             if [[ "$core_verdict" != "NONE" ]]; then
               HEALTH="OK"
               ROLLBACK="NO"
-              # Success requires BOTH learning facts (a successful export attempt AND
-              # a proven committed export for this SHA) AND a clean post-commit health
-              # observation. Contradictory or degraded markers are reported as a
-              # committed core with the specific problem named, so partial or
-              # inconsistent emission fails closed without ever implying that the
-              # core release failed or rolled back.
+              # Success requires EVERY independent fact, because each proves a
+              # different thing and any one of them being unproven leaves the
+              # release in a state that must not be reported as success:
+              #
+              #   OPIP_CORE_DEPLOY_STATUS=SUCCESS   the core release committed
+              #   OPIP_PAPER_REGISTRY_GENESIS=OK    durable initialization
+              #                                     provenance exists
+              #   LEARNING_EXPORT_STATUS=SUCCESS    this export attempt succeeded
+              #   LEARNING_READINESS=READY          a fresh committed replica for
+              #                                     this exact SHA is proven
+              #   POSTCOMMIT_HEALTH=OK              the final observation was clean
+              #
+              # Genesis provenance is a gate in its own right: a committed export
+              # with no durable marker would leave a later missing registry
+              # indistinguishable from virgin state, which is the ambiguity the
+              # marker exists to remove.
               if [[ "$LEARNING_EXPORT_STATUS" == "SUCCESS" && "$LEARNING_READINESS" == "READY" ]]; then
                 learning_verdict="PROVEN"
               elif [[ "$core_verdict" == "LEGACY" ]]; then
@@ -253,15 +265,27 @@ jobs:
               else
                 learning_verdict="BLOCKED"
               fi
-              suffix=""
-              [[ "$learning_verdict" == "PROVEN" ]] || suffix="LEARNING $learning_verdict"
-              if [[ "$POSTCOMMIT_HEALTH" != "OK" ]]; then
-                suffix="${suffix:+$suffix + }POST-COMMIT HEALTH ${POSTCOMMIT_HEALTH:-UNREPORTED}"
+              # Genesis is only meaningful once the contract is running; a legacy
+              # run emits no markers at all and is already caught by UNPROVEN.
+              if [[ "$core_verdict" == "LEGACY" ]]; then
+                genesis_verdict="NOT_APPLICABLE"
+              elif [[ "$GENESIS_STATUS" == "OK" ]]; then
+                genesis_verdict="PROVEN"
+              else
+                genesis_verdict="BLOCKED"
               fi
-              if [[ -z "$suffix" ]]; then
+
+              parts=""
+              [[ "$genesis_verdict" == "PROVEN" || "$genesis_verdict" == "NOT_APPLICABLE" ]] \
+                || parts="PAPER REGISTRY GENESIS ${genesis_verdict}"
+              [[ "$learning_verdict" == "PROVEN" ]] \
+                || parts="${parts:+$parts + }LEARNING $learning_verdict"
+              [[ "$POSTCOMMIT_HEALTH" == "OK" ]] \
+                || parts="${parts:+$parts + }POST-COMMIT HEALTH ${POSTCOMMIT_HEALTH:-UNREPORTED}"
+              if [[ -z "$parts" ]]; then
                 RESULT="SUCCESS"
               else
-                RESULT="CORE DEPLOYED - $suffix"
+                RESULT="CORE DEPLOYED - $parts"
               fi
             elif grep -q 'rollback health check passed' "$log"; then
               RESULT="ROLLED BACK"
@@ -331,6 +355,8 @@ jobs:
           echo "learning_export_status=${LEARNING_EXPORT_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "learning_readiness=${LEARNING_READINESS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "postcommit_health=${POSTCOMMIT_HEALTH:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "genesis_status=${GENESIS_STATUS:-UNKNOWN}" >> "$GITHUB_OUTPUT"
+          echo "genesis_reason=${GENESIS_REASON:-UNKNOWN}" >> "$GITHUB_OUTPUT"
           echo "transition_retry=$TRANSITION_RETRY" >> "$GITHUB_OUTPUT"
           exit 0
 
@@ -349,6 +375,8 @@ jobs:
           LEARNING_EXPORT_STATUS: ${{ steps.production_deploy.outputs.learning_export_status }}
           LEARNING_READINESS: ${{ steps.production_deploy.outputs.learning_readiness }}
           POSTCOMMIT_HEALTH: ${{ steps.production_deploy.outputs.postcommit_health }}
+          GENESIS_STATUS: ${{ steps.production_deploy.outputs.genesis_status }}
+          GENESIS_REASON: ${{ steps.production_deploy.outputs.genesis_reason }}
           TRANSITION_RETRY: ${{ steps.production_deploy.outputs.transition_retry }}
         run: |
           set -euo pipefail
@@ -372,6 +400,7 @@ jobs:
           - **Core health:** $HEALTH
           - **Rollback:** $ROLLBACK
           - **Core deployment:** ${CORE_STATUS:-UNKNOWN}
+          - **Paper registry genesis:** ${GENESIS_STATUS:-UNKNOWN}${GENESIS_REASON:+ (\`$GENESIS_REASON\`)}
           - **Learning export:** ${LEARNING_EXPORT_STATUS:-UNKNOWN}
           - **Learning readiness:** ${LEARNING_READINESS:-UNKNOWN}
           - **Post-commit health:** ${POSTCOMMIT_HEALTH:-UNKNOWN}
@@ -380,8 +409,9 @@ jobs:
           - **Workflow run:** $RUN_URL
 
           \`Learning readiness\` proves a fresh committed canonical replica for this
-          exact SHA. \`BLOCKED\` means the production side could not prove it; a
-          \`BLOCKED\` learning gate does not indicate a core release failure.
+          exact SHA. \`Paper registry genesis\` proves durable initialization
+          provenance exists. \`BLOCKED\` on either means the production side could not
+          prove it; neither indicates a core release failure.
 
           \`Transition retry\` records the one-time first-deploy bootstrap: when the
           first invocation ran the previously installed ohm-deploy, exactly one

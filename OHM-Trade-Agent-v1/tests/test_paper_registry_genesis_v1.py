@@ -52,6 +52,8 @@ from app.services.paper_registry_genesis import (
     GENESIS_MARKER_VERSION,
     GENESIS_REFUSED,
     REASON_EVIDENCE_EXISTS,
+    REASON_MARKER_CORRUPT,
+    REASON_MARKER_WRITE_FAILED,
     REASON_NOT_PROVABLE,
     REASON_STATE_CORRUPT,
     REASON_STATE_LOST,
@@ -388,6 +390,192 @@ def test_naive_now_is_rejected(tmp_path):
     paths = _virgin(tmp_path)
     with pytest.raises(ValueError):
         _ensure(paths, now=datetime(2026, 9, 18, 3, 0))
+
+
+# ---------------------------------------------------------------------------
+# Durable initialization provenance is a gate, not a side effect
+# ---------------------------------------------------------------------------
+
+
+def test_marker_write_failure_refuses_despite_valid_state(tmp_path, monkeypatch):
+    """A registry without durable provenance must never be reported as success.
+
+    The dangerous sequence this closes: state.json is created, the marker write
+    fails, genesis reports failure - but state.json now exists, so the exporter can
+    succeed and the export can verify. Without gating on provenance the deployment
+    could report SUCCESS with no durable record that the registry was ever
+    initialized, and a later disappearance of state.json would again be
+    indistinguishable from virgin state.
+    """
+    from app.services import paper_registry_genesis as genesis
+
+    paths = _virgin(tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("injected marker persistence failure")
+
+    monkeypatch.setattr(genesis, "save_json_atomic", _boom)
+    outcome = _ensure(paths)
+
+    assert outcome.status == GENESIS_REFUSED
+    assert outcome.reason == genesis.REASON_MARKER_WRITE_FAILED
+    assert outcome.refused is True
+    # The registry itself did get created - that is exactly why provenance must be
+    # gated separately rather than inferred from the registry's existence.
+    assert paths["state_file"].exists()
+    assert json.loads(paths["state_file"].read_text(encoding="utf-8")) == EMPTY_REGISTRY
+    # ...and no marker exists, so provenance is genuinely absent.
+    assert not paths["marker_path"].exists()
+
+
+def test_next_attempt_recovers_by_adopting_and_writing_the_marker(tmp_path, monkeypatch):
+    """Recovery: the refused attempt leaves a valid registry, so retry adopts it."""
+    from app.services import paper_registry_genesis as genesis
+
+    paths = _virgin(tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("injected marker persistence failure")
+
+    monkeypatch.setattr(genesis, "save_json_atomic", _boom)
+    assert _ensure(paths).refused is True
+    assert paths["state_file"].exists()
+    assert not paths["marker_path"].exists()
+
+    # Restore persistence: the retry must adopt the existing registry and record
+    # provenance, not fail and not overwrite the registry.
+    monkeypatch.undo()
+    state_before = paths["state_file"].read_bytes()
+    recovered = _ensure(paths)
+
+    assert recovered.status == GENESIS_ADOPTED_EXISTING
+    assert recovered.refused is False
+    assert paths["marker_path"].exists()
+    marker = json.loads(paths["marker_path"].read_text(encoding="utf-8"))
+    assert marker["kind"] == GENESIS_MARKER_KIND
+    assert marker["basis"] == BASIS_ADOPTED
+    # The registry was adopted, not recreated.
+    assert paths["state_file"].read_bytes() == state_before
+
+
+def test_valid_marker_is_never_rewritten(tmp_path):
+    """Repeat genesis preserves the original marker bytes and provenance.
+
+    Rewriting a valid marker would silently restamp initialized_at_utc and release
+    provenance on every deploy, which is provenance drift rather than idempotency.
+    """
+    paths = _virgin(tmp_path)
+    first = _ensure(paths)
+    assert first.status == GENESIS_INITIALIZED
+    marker_bytes = paths["marker_path"].read_bytes()
+    marker_before = json.loads(marker_bytes.decode("utf-8"))
+    mtime_before = paths["marker_path"].stat().st_mtime_ns
+    # A LATER timestamp must not leak into the preserved marker.
+    later = datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+    second = _ensure(paths, now=later)
+    third = _ensure(paths, now=later)
+
+    for outcome in (second, third):
+        assert outcome.status == GENESIS_ALREADY_INITIALIZED
+        assert outcome.refused is False
+        assert outcome.facts["marker_preserved"] is True
+    assert paths["marker_path"].read_bytes() == marker_bytes
+    assert paths["marker_path"].stat().st_mtime_ns == mtime_before
+    assert json.loads(paths["marker_path"].read_text(encoding="utf-8")) == marker_before
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param("{not json", id="not-json"),
+        pytest.param("[]", id="not-an-object"),
+        pytest.param('{"kind": "something_else"}', id="wrong-kind"),
+        pytest.param(
+            '{"kind": "%s", "schema_version": 99}' % GENESIS_MARKER_KIND,
+            id="unsupported-version",
+        ),
+        pytest.param(
+            '{"kind": "%s", "schema_version": 1, "paper_only": true}' % GENESIS_MARKER_KIND,
+            id="missing-recorded-at",
+        ),
+        pytest.param(
+            '{"kind": "%s", "schema_version": 1, "paper_only": false,'
+            ' "recorded_at_utc": "2026-09-18T03:00:00Z"}' % GENESIS_MARKER_KIND,
+            id="not-paper-only",
+        ),
+    ],
+)
+def test_corrupt_marker_with_valid_state_fails_closed(tmp_path, corrupt):
+    """Unreadable provenance is refused, never silently overwritten."""
+    paths = _virgin(tmp_path)
+    assert _ensure(paths).status == GENESIS_INITIALIZED
+    paths["marker_path"].write_text(corrupt, encoding="utf-8")
+    before = paths["marker_path"].read_bytes()
+
+    outcome = _ensure(paths)
+
+    assert outcome.status == GENESIS_REFUSED
+    assert outcome.reason == REASON_MARKER_CORRUPT
+    assert outcome.facts["marker_state"] == "MALFORMED"
+    # Not repaired, not replaced: corrupt provenance stays visible.
+    assert paths["marker_path"].read_bytes() == before
+    # And the registry is untouched.
+    assert json.loads(paths["state_file"].read_text(encoding="utf-8")) == EMPTY_REGISTRY
+
+
+def test_corrupt_marker_with_missing_state_still_fails_closed(tmp_path):
+    """A marker of any kind proves initialization, so a missing registry refuses."""
+    paths = _virgin(tmp_path)
+    assert _ensure(paths).status == GENESIS_INITIALIZED
+    paths["marker_path"].write_text("{not json", encoding="utf-8")
+    paths["state_file"].unlink()
+
+    outcome = _ensure(paths)
+
+    assert outcome.status == GENESIS_REFUSED
+    assert outcome.reason == REASON_STATE_LOST
+    assert not paths["state_file"].exists()
+
+
+def test_marker_state_and_provenance_facts_are_reported(tmp_path):
+    """The deploy gate depends on these facts, so they must be explicit."""
+    paths = _virgin(tmp_path)
+    created = _ensure(paths)
+    assert created.facts["marker_state"] == "VALID"
+    assert created.facts["marker_written"] is True
+    assert created.facts["marker_preserved"] is False
+
+    preserved = _ensure(paths)
+    assert preserved.facts["marker_state"] == "VALID"
+    assert preserved.facts["marker_preserved"] is True
+
+
+def test_genesis_cli_exit_code_is_nonzero_on_marker_failure(tmp_path, monkeypatch):
+    """The CLI contract: a provenance failure must not exit 0.
+
+    ohm-deploy derives its structured genesis status from this exit code, so a
+    zero exit here would defeat the deployment gate.
+    """
+    from app.services import paper_registry_genesis as genesis
+
+    paths = _virgin(tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("injected marker persistence failure")
+
+    monkeypatch.setattr(genesis, "save_json_atomic", _boom)
+    outcome = genesis.ensure_paper_registry_initialized(
+        state_file=paths["state_file"],
+        event_file=paths["event_file"],
+        gap_spool_file=paths["gap_spool_file"],
+        canonical_db=paths["canonical_db"],
+        marker_path=paths["marker_path"],
+        release_sha=RELEASE_SHA,
+        now=NOW,
+    )
+    assert outcome.refused is True
+    assert outcome.reason == genesis.REASON_MARKER_WRITE_FAILED
 
 
 def test_evidence_committed_after_the_precheck_still_blocks_genesis(tmp_path, monkeypatch):

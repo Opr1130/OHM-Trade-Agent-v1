@@ -88,6 +88,18 @@ REASON_EVIDENCE_EXISTS = "PAPER_REGISTRY_GENESIS_REFUSED_EVIDENCE_EXISTS"
 REASON_STATE_LOST = "PAPER_REGISTRY_STATE_LOST_OR_UNPROVABLE"
 REASON_STATE_CORRUPT = "PAPER_REGISTRY_GENESIS_REFUSED_STATE_CORRUPT"
 REASON_NOT_PROVABLE = "PAPER_REGISTRY_GENESIS_REFUSED_NOT_PROVABLE"
+#: The initialization marker could not be written, so durable provenance was not
+#: established even though the registry itself now exists.
+REASON_MARKER_WRITE_FAILED = "PAPER_REGISTRY_GENESIS_MARKER_WRITE_FAILED"
+#: The marker exists but cannot be trusted, so provenance is unprovable. It is
+#: never overwritten: corrupt provenance must not be silently repaired.
+REASON_MARKER_CORRUPT = "PAPER_REGISTRY_GENESIS_REFUSED_MARKER_CORRUPT"
+
+#: Marker states. Valid and Malformed are deliberately distinct: an unreadable
+#: marker must fail closed rather than be treated as absent and rewritten.
+MARKER_ABSENT = "ABSENT"
+MARKER_VALID = "VALID"
+MARKER_MALFORMED = "MALFORMED"
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -252,6 +264,86 @@ def _write_marker(
     save_json_atomic(Path(marker_path), payload)
 
 
+def _read_marker_state(marker_path: Path) -> tuple[str, str]:
+    """Classify the initialization marker. Never raises.
+
+    ``MALFORMED`` is deliberately its own state rather than being folded into
+    ``ABSENT``: treating an unreadable or corrupt marker as "no marker" would let
+    genesis quietly overwrite lost provenance, which is exactly the ambiguity the
+    marker exists to remove.
+    """
+    target = Path(marker_path)
+    if not target.exists():
+        return MARKER_ABSENT, "no initialization marker"
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return MARKER_MALFORMED, f"initialization marker unreadable: {exc}"
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        return MARKER_MALFORMED, f"initialization marker is not valid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return MARKER_MALFORMED, "initialization marker must be a JSON object"
+    if payload.get("kind") != GENESIS_MARKER_KIND:
+        return (
+            MARKER_MALFORMED,
+            f"unexpected initialization marker kind: {payload.get('kind')!r}",
+        )
+    if payload.get("schema_version") != GENESIS_MARKER_VERSION:
+        return (
+            MARKER_MALFORMED,
+            "unsupported initialization marker schema_version: "
+            f"{payload.get('schema_version')!r}",
+        )
+    if payload.get("paper_only") is not True:
+        return MARKER_MALFORMED, "initialization marker is not paper_only"
+    recorded = payload.get("recorded_at_utc")
+    if not isinstance(recorded, str) or not recorded.strip():
+        return MARKER_MALFORMED, "initialization marker has no recorded_at_utc"
+    return MARKER_VALID, "initialization marker is valid"
+
+
+def _persist_marker(
+    marker_path: Path,
+    *,
+    basis: str,
+    recorded_at: datetime,
+    release_sha: str | None,
+    facts: dict[str, Any],
+) -> tuple[bool, GenesisOutcome | None]:
+    """Write the marker, converting a persistence failure into a refusal.
+
+    Returns ``(ok, outcome)``. A failure here is an evidence-integrity failure,
+    not a warning: the registry may now exist while durable provenance does not,
+    so the caller must report refusal rather than success. The next attempt then
+    recovers by adopting the existing registry and retrying the marker.
+    """
+    try:
+        _write_marker(
+            marker_path, basis=basis, recorded_at=recorded_at, release_sha=release_sha
+        )
+    except Exception as exc:  # noqa: BLE001 - any persistence failure is refusal
+        logger.critical(
+            "paper registry genesis refused: initialization marker could not be "
+            "written at %s: %s",
+            marker_path,
+            exc,
+        )
+        return False, GenesisOutcome(
+            status=GENESIS_REFUSED,
+            reason=REASON_MARKER_WRITE_FAILED,
+            detail=f"initialization marker could not be written: {exc}",
+            marker_path=Path(marker_path),
+            facts={**facts, "marker_written": False},
+        )
+    facts["marker_written"] = True
+    # Provenance is now durable, so the reported state becomes VALID. The state
+    # observed at entry is preserved separately as marker_state_at_entry.
+    facts["marker_state"] = MARKER_VALID
+    return True, None
+
+
 @dataclass(frozen=True)
 class _VirginProof:
     """Outcome of the virgin-state proof across every durable paper evidence source."""
@@ -326,20 +418,30 @@ def _adopt_existing_registry_if_valid(
     *,
     state_file: Path,
     marker_path: Path,
-    marker_present: bool,
     stamp: datetime,
     release_sha: str | None,
     facts: dict[str, Any],
 ) -> GenesisOutcome | None:
-    """Adopt an existing valid registry, refusing a corrupt one.
+    """Adopt an existing valid registry, refusing corrupt state or provenance.
 
     Returns ``None`` when no registry exists, so the caller continues to genesis.
     A corrupt registry is never rewritten, replaced or quarantined - it is reported
     and refused.
 
+    Marker handling is fully idempotent and fail-closed:
+
+    * a VALID marker is validated and deliberately **not rewritten**, so the
+      original bytes, initialization timestamp and provenance survive every later
+      genesis run;
+    * a MALFORMED or unreadable marker fails closed rather than being overwritten,
+      because silently repairing corrupt provenance is indistinguishable from
+      losing it;
+    * a genuinely ABSENT marker is created, since that is the documented recovery
+      path when the registry exists but provenance was never persisted.
+
     Called both before taking the state lock (fast path) and again inside it, so
     one implementation covers sequential adoption, concurrent adoption and the
-    corrupt case identically.
+    corrupt cases identically.
     """
     if not state_file.exists():
         return None
@@ -356,16 +458,59 @@ def _adopt_existing_registry_if_valid(
             marker_path=marker_path,
             facts={**facts, "state_present": True, "state_valid": False},
         )
-    # A valid registry is never rewritten or reformatted. Adoption only records
-    # durable provenance, so a later disappearance cannot be read as virginity.
-    basis = BASIS_GENESIS if marker_present else BASIS_ADOPTED
-    _write_marker(marker_path, basis=basis, recorded_at=stamp, release_sha=release_sha)
+
+    marker_state, marker_detail = _read_marker_state(marker_path)
+    facts.update(
+        {
+            "state_present": True,
+            "state_valid": True,
+            "marker_state": marker_state,
+            "marker_detail": marker_detail,
+        }
+    )
+
+    if marker_state == MARKER_MALFORMED:
+        logger.critical(
+            "paper registry genesis refused: %s at %s; not overwriting provenance",
+            marker_detail,
+            marker_path,
+        )
+        return GenesisOutcome(
+            status=GENESIS_REFUSED,
+            reason=REASON_MARKER_CORRUPT,
+            detail=marker_detail,
+            marker_path=marker_path,
+            facts=facts,
+        )
+
+    if marker_state == MARKER_VALID:
+        # Idempotent: validate, report, and leave the marker exactly as found.
+        facts["marker_preserved"] = True
+        return GenesisOutcome(
+            status=GENESIS_ALREADY_INITIALIZED,
+            reason=REASON_STATE_PRESENT_VALID,
+            detail="paper registry and initialization marker already present and valid",
+            marker_path=marker_path,
+            facts=facts,
+        )
+
+    # Marker genuinely absent: adopt the registry and establish provenance.
+    facts["marker_preserved"] = False
+    ok, refusal = _persist_marker(
+        marker_path,
+        basis=BASIS_ADOPTED,
+        recorded_at=stamp,
+        release_sha=release_sha,
+        facts=facts,
+    )
+    if not ok:
+        return refusal
     return GenesisOutcome(
-        status=GENESIS_ALREADY_INITIALIZED if marker_present else GENESIS_ADOPTED_EXISTING,
+        status=GENESIS_ADOPTED_EXISTING,
         reason=REASON_STATE_PRESENT_VALID,
-        detail="paper registry already present and valid",
+        detail="paper registry already present and valid; provenance recorded",
         marker_path=marker_path,
-        facts={**facts, "state_present": True, "state_valid": True, "basis": basis},
+        facts={**facts, "basis": BASIS_ADOPTED},
     )
 
 
@@ -389,21 +534,25 @@ def ensure_paper_registry_initialized(
     stamp = _require_utc(now or datetime.now(timezone.utc), field_name="now")
     state_file = Path(state_file)
     marker_path = Path(marker_path)
-    marker_present = marker_path.exists()
+    marker_state, marker_detail = _read_marker_state(marker_path)
 
     facts: dict[str, Any] = {
         "state_file": str(state_file),
         "marker_path": str(marker_path),
-        "marker_present": marker_present,
-        # The marker is a boolean fact. Whether a *file* exists is not the same
-        # as whether a *name* resolves, so both are recorded.
-        "marker_exists": marker_present,
+        "marker_present": marker_state != MARKER_ABSENT,
+        # The marker is more than a boolean: whether a *file* exists is not the
+        # same as whether it can be trusted, so the state is recorded explicitly.
+        "marker_exists": marker_state != MARKER_ABSENT,
+        # marker_state is the resulting state after this run (VALID once provenance
+        # is durable); marker_state_at_entry is what was observed on entry.
+        "marker_state": marker_state,
+        "marker_state_at_entry": marker_state,
+        "marker_detail": marker_detail,
     }
 
     adopted = _adopt_existing_registry_if_valid(
         state_file=state_file,
         marker_path=marker_path,
-        marker_present=marker_present,
         stamp=stamp,
         release_sha=release_sha,
         facts=facts,
@@ -411,9 +560,10 @@ def ensure_paper_registry_initialized(
     if adopted is not None:
         return adopted
 
-    # State is absent. A marker proves it was initialized at some point, so its
-    # absence now is potential evidence loss - never virginity.
-    if marker_present:
+    # State is absent. Any marker at all - valid or malformed - proves the registry
+    # was initialized at some point, so its absence now is potential evidence loss,
+    # never virginity.
+    if marker_state != MARKER_ABSENT:
         logger.critical(
             "paper registry genesis refused: initialization marker present but "
             "registry is missing (%s); refusing to recreate an empty registry",
@@ -466,7 +616,6 @@ def ensure_paper_registry_initialized(
         adopted = _adopt_existing_registry_if_valid(
             state_file=state_file,
             marker_path=marker_path,
-            marker_present=marker_present,
             stamp=stamp,
             release_sha=release_sha,
             facts=facts,
@@ -494,16 +643,40 @@ def ensure_paper_registry_initialized(
 
         write_empty_registry_locked(state_file)
 
-    _write_marker(
-        marker_path, basis=BASIS_GENESIS, recorded_at=stamp, release_sha=release_sha
+    # The registry now exists, so durable provenance MUST be established before
+    # this can be reported as success. If the marker cannot be written, genesis
+    # refuses even though state.json is now present: otherwise a valid learning
+    # replica could be published with no durable record that the registry was ever
+    # initialized, and a later disappearance of state.json would again be
+    # indistinguishable from virgin state.
+    #
+    # This is exactly why the two writes are ordered registry-then-marker: the
+    # refusal leaves a valid registry with no marker, which the next attempt
+    # recovers by adopting the registry and retrying the marker. Nothing is lost.
+    ok, refusal = _persist_marker(
+        marker_path,
+        basis=BASIS_GENESIS,
+        recorded_at=stamp,
+        release_sha=release_sha,
+        facts=facts,
     )
+    if not ok:
+        return refusal
     logger.info("paper registry genesis: created empty registry at %s", state_file)
     return GenesisOutcome(
         status=GENESIS_INITIALIZED,
         reason=REASON_INITIALIZED_NOW,
         detail="empty paper registry created from provable virgin state",
         marker_path=marker_path,
-        facts={**facts, "state_present": True, "state_valid": True, "basis": BASIS_GENESIS},
+        facts={
+            **facts,
+            "state_present": True,
+            "state_valid": True,
+            "basis": BASIS_GENESIS,
+            # Nothing existing was preserved: both the registry and its provenance
+            # were created by this run.
+            "marker_preserved": False,
+        },
     )
 
 
@@ -565,9 +738,14 @@ __all__ = [
     "GENESIS_MARKER_VERSION",
     "GENESIS_REFUSED",
     "GenesisOutcome",
+    "MARKER_ABSENT",
+    "MARKER_MALFORMED",
+    "MARKER_VALID",
     "PaperRegistryStateCorruptError",
     "REASON_EVIDENCE_EXISTS",
     "REASON_INITIALIZED_NOW",
+    "REASON_MARKER_CORRUPT",
+    "REASON_MARKER_WRITE_FAILED",
     "REASON_NOT_PROVABLE",
     "REASON_STATE_CORRUPT",
     "REASON_STATE_LOST",
