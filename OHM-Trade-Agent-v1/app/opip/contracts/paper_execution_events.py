@@ -129,9 +129,10 @@ _EVENT_CONTRACTS = {
                 "reason_code",
                 "intent_time",
                 "execution_model_version",
+                "reservation_id",
             }
         ),
-        optional_fields=frozenset({"limit_price", "reservation_id"}),
+        optional_fields=frozenset({"limit_price"}),
         parent_refs=("decision_context_id", "paper_trade_id"),
         temporal_field="intent_time",
     ),
