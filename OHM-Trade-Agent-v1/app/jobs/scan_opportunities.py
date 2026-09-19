@@ -1977,10 +1977,14 @@ def main():
         print("Shadow simulator failures:", shadow_failures)
     paper_admission_eligible = opip.record_paper_admission_eligibility(
         ranked_opportunities,
-        paper_enabled=_paper_trade_enabled_safe(),
+        # In active mode the authority is Paper v2, so eligibility must be
+        # reported from the Paper-v2 mode rather than from the legacy paper
+        # control switch.
+        paper_enabled=(True if paper_v2 else _paper_trade_enabled_safe()),
         engine_label=(
             PAPER_ENGINE_PAPER_V2_LABEL if paper_v2 else PAPER_ENGINE_LEGACY_LABEL
         ),
+        paper_v2=paper_v2,
     )
     opip.finalize(
         scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context),

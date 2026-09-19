@@ -832,7 +832,7 @@ def validate_decision_snapshot_payload(payload: Mapping[str, Any]) -> dict[str, 
     # the shared contract: exact field set, production flags, canonical
     # serializability and the deterministic EP:/SNAP: identity relationship. A
     # mapping that merely claims the record type and carries matching ids is not
-    # enough, so an under-shaped payload cannot become execution lineage.
+    # enough, so an incomplete payload cannot become execution lineage.
     inner_payload = validate_canonical_episode_snapshot(inner)
 
     # The wrapper and the snapshot it carries must name the same decision subject.

@@ -186,7 +186,7 @@ class DecisionContextFacts:
     DI plane. Every field is required; there are no defaults, so a caller cannot
     omit a fact and silently get a placeholder.
 
-    The shape is the **schema v2** production contract. Schema v1's
+    The contract form is the **schema v2** production contract. Schema v1's
     committee-oriented facts - ``evaluation_id``, ``consumed_input_watermark``,
     ``feature_version``, ``detector_version``, ``forecast_version``,
     ``candidate_set_ref`` and the evidence-eligibility manifest - are deliberately

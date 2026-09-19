@@ -28,7 +28,8 @@ usable source timestamp fails closed rather than being timestamped locally.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+import math
+from typing import Any, Callable
 
 from app.exchanges.kraken import BookLevel, KrakenAPIError, KrakenClient, PreTradeBook
 from app.opip.contracts.temporal import require_utc
@@ -59,7 +60,8 @@ def parse_source_timestamp(value: object, *, side: str) -> datetime:
         )
     if isinstance(value, (int, float)):
         number = float(value)
-        if number <= 0 or number != number or number in (float("inf"), float("-inf")):
+        # ``isfinite`` rejects NaN and both infinities in one check.
+        if not math.isfinite(number) or number <= 0:
             raise QuoteEvidenceUnavailableError(
                 f"{side} publication timestamp is not a usable epoch"
             )
@@ -215,9 +217,71 @@ def fetch_level1_observation(
     )
 
 
+def system_utc_clock() -> datetime:
+    """The real execution clock.
+
+    This is the default seam for every execution-time reading. It exists so the
+    producer can be handed a deterministic clock in tests while the runtime reads
+    actual wall-clock time.
+    """
+    return datetime.now(timezone.utc)
+
+
+def fetch_fresh_level1_observation(
+    client: Any,
+    *,
+    symbol: str,
+    instrument_version_id: str,
+    native_symbol: str,
+    quote_currency: str,
+    max_age_seconds: int,
+    clock: Callable[[], datetime] | None = None,
+) -> tuple[Level1BookObservation, datetime]:
+    """Read a public pre-trade book and validate it against a post-response clock.
+
+    The freshness clock is read *after* the response returns, and that reading is
+    returned with the observation. Reading the clock before issuing the request
+    was a real defect: a book published during the request is legitimately later
+    than a pre-request reading, so a valid quote was refused as "future-dated".
+    Source publication time and local receipt time are different facts and must be
+    measured separately.
+
+    Returns ``(observation, received_at)`` so the caller can use one execution
+    instant for freshness, attempt and fill occurrence times without re-reading a
+    clock that may have moved.
+    """
+    moment_clock = clock or system_utc_clock
+    if not isinstance(client, KrakenClient):
+        raise QuoteEvidenceUnavailableError("client is not a public Kraken client")
+    try:
+        book = client.get_pre_trade(symbol)
+    except KrakenAPIError as exc:
+        raise QuoteEvidenceUnavailableError(
+            f"public pre-trade book is unavailable: {type(exc).__name__}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - any read failure is fail-closed
+        raise QuoteEvidenceUnavailableError(
+            f"public pre-trade book read failed: {type(exc).__name__}"
+        ) from exc
+
+    # Immediately after receipt: this is the instant the book was observed.
+    received_at = require_utc(moment_clock(), field_name="received_at")
+    observation = observation_from_pre_trade_book(
+        book,
+        instrument_version_id=instrument_version_id,
+        native_symbol=native_symbol,
+        quote_currency=quote_currency,
+        now=received_at,
+        max_age_seconds=max_age_seconds,
+    )
+    return observation, received_at
+
+
 __all__ = [
     "CANONICAL_VENUE",
+    "fetch_fresh_level1_observation",
     "fetch_level1_observation",
     "observation_from_pre_trade_book",
     "parse_source_timestamp",
+    "system_utc_clock",
 ]

@@ -70,7 +70,7 @@ class _Transport:
         return {
             "symbol": "SOL/USD",
             "bids": [{"price": 99.9, "qty": 10.0, "publication_ts": ts}],
-            "asks": [{"price": 100.1, "qty": 12.0, "publication_ts": ts}],
+            "asks": [{"price": 100.0, "qty": 12.0, "publication_ts": ts}],
         }
 
     def telemetry_snapshot(self):
@@ -176,6 +176,10 @@ def _opportunity(**overrides) -> PaperV2Opportunity:
         "native_symbol": "SOL/USD",
         "requested_quantity": 5.0,
         "requested_notional": 500.0,
+        # Qualified entry geometry, copied from the plan.
+        "entry_low": 99.0,
+        "entry_high": 101.0,
+        "chase_limit": 102.0,
         "stop_price": 90.0,
         "target_prices": (110.0, 120.0),
     }
@@ -217,6 +221,18 @@ def _run(env, opportunity=None, *, kraken=None, settings=None, now=NOW):
 # ---------------------------------------------------------------------------
 # Happy path and lineage
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _frozen_execution_clock(monkeypatch):
+    """Freeze the producer's execution clock to this module's NOW.
+
+    Freshness is read from the execution clock, which is real wall-clock time in
+    production; the fixtures' books carry fixed source timestamps.
+    """
+    monkeypatch.setattr(
+        "app.services.paper_v2_execution.system_utc_clock", lambda: NOW
+    )
 
 
 def test_full_path_executes_and_commits_every_stage(env):
@@ -311,8 +327,11 @@ def test_fill_uses_the_ask_side_not_the_midpoint(env):
     server, _ = env
     _run(env)
     fill = _rows(server.writer, PAPER_FILL_RECORDED)[0]
-    # Best ask is 100.1; a midpoint or ticker-last price would differ.
-    assert fill["price"] == pytest.approx(100.1)
+    # Best ask is 100.0 against a 99.9 bid, so the midpoint (99.95) and the bid
+    # are both distinguishable from the ask this fill must use.
+    assert fill["price"] == pytest.approx(100.0)
+    assert fill["price"] != pytest.approx((99.9 + 100.0) / 2)
+    assert fill["price"] != pytest.approx(99.9)
 
 
 def test_exposure_is_fill_derived(env):

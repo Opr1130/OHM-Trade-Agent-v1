@@ -744,6 +744,7 @@ class OPipScanObserver:
         *,
         paper_enabled: bool,
         engine_label: str = "v1 authoritative paper engine",
+        paper_v2: bool = False,
     ) -> int:
         """Record paper admission *eligibility* only.
 
@@ -751,6 +752,11 @@ class OPipScanObserver:
         is spot LONG only, so a qualified SHORT is recorded as ineligible rather
         than being silently absent. ``engine_label`` names the engine that
         actually holds authority; telemetry must not report a different one.
+
+        ``paper_v2`` selects the Paper-v2 executability rule, which must match what
+        the router would actually do. In that mode ``paper_enabled`` is *not*
+        consulted: Paper v2 authority is its own switch, so reporting the legacy
+        paper-control value as "is Paper v2 enabled" would be false attribution.
         """
         eligible = 0
         try:
@@ -762,7 +768,18 @@ class OPipScanObserver:
                 if direction != "LONG":
                     code = ReasonCode.PAPER_ENGINE_DIRECTION_UNSUPPORTED
                     reason = f"{engine_label} is spot LONG only"
-                elif not paper_enabled:
+                elif paper_v2 and not bool(
+                    getattr(ranked.opportunity.plan, "valid_now", False)
+                ):
+                    # Paper v2 has no pending-entry engine, so a LONG whose
+                    # qualified entry is not immediately actionable cannot be
+                    # admitted. Reported distinctly rather than as "disabled".
+                    code = ReasonCode.PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE
+                    reason = (
+                        f"{engine_label} has no pending-entry engine, so a "
+                        "non-immediate LONG is not admission-eligible"
+                    )
+                elif not paper_v2 and not paper_enabled:
                     code = ReasonCode.PAPER_ENGINE_DISABLED
                     reason = "paper trading is switched off"
                 else:
@@ -779,7 +796,10 @@ class OPipScanObserver:
                         code,
                         reason=reason,
                         evaluated_at=self._evaluated_at(),
-                        metadata={"paper_enabled": bool(paper_enabled)},
+                        metadata={
+                            "paper_enabled": bool(paper_enabled),
+                            "paper_v2": bool(paper_v2),
+                        },
                     ),
                 )
         except Exception as exc:
@@ -969,7 +989,10 @@ class NullScanObserver:
         *,
         paper_enabled: bool,
         engine_label: str = "v1 authoritative paper engine",
+        paper_v2: bool = False,
     ) -> int:
+        """No-op. The signature mirrors ``OPipScanObserver`` deliberately."""
+        del ranked_opportunities, paper_enabled, engine_label, paper_v2
         return 0
 
     def finalize(

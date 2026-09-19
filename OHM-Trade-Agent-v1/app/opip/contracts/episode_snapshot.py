@@ -1,9 +1,9 @@
-"""Canonical episode snapshot v1 shape and identity contract.
+"""Canonical episode snapshot v1 form and identity contract.
 
 The canonical episode snapshot is the production record of what O'Pip observed
 for one pair at one scan decision boundary. It is built by the episode-capture
 producer and consumed as lineage by Paper v2, so two layers must agree on its
-shape: the producer that emits it and the canonical validator that accepts it as
+form: the producer that emits it and the canonical validator that accepts it as
 execution evidence.
 
 This module is that single, neutral definition. It lives at the contracts layer
@@ -12,7 +12,7 @@ a producer service. It owns exactly three things and no behavior beyond them:
 
 * the exact v1 field set;
 * the deterministic ``EP:``/``SNAP:`` identity derivation;
-* a strict validator, so an under-shaped mapping that merely *claims* to be an
+* a strict validator, so an incomplete mapping that merely *claims* to be an
   episode snapshot cannot be accepted as one.
 
 Preserving existing identities
@@ -44,7 +44,7 @@ _EPISODE_DIGEST_LENGTH = 24
 _SNAPSHOT_DIGEST_LENGTH = 32
 
 #: The exact v1 field set the episode-capture producer emits. A payload with a
-#: missing or extra field is not a canonical episode snapshot, so an under-shaped
+#: missing or extra field is not a canonical episode snapshot, so an incomplete
 #: mapping cannot pass itself off as one.
 CANONICAL_EPISODE_SNAPSHOT_FIELDS = frozenset(
     {
@@ -171,7 +171,7 @@ def parse_decision_at_utc(value: object) -> datetime:
     """Parse ``decision_at_utc`` as an aware timestamp, normalized to UTC.
 
     The producer serializes the decision instant with ``isoformat()``, so an
-    offset form such as ``+00:00`` is the production shape. A ``Z`` suffix and any
+    offset form such as ``+00:00`` is the production form. A ``Z`` suffix and any
     other aware offset are accepted because they denote the same instant, but a
     naive timestamp is refused: an unqualified local time cannot locate the
     evidence boundary.

@@ -46,7 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.temporal import require_utc
@@ -55,6 +55,7 @@ from app.opip.market.instrument_version_store import (
 )
 from app.opip.market.instruments import InstrumentVersionRegistry, kraken_descriptor
 from app.services.canonical_episode_capture import build_canonical_episode_snapshots
+from app.services.paper_v2_pretrade_adapter import system_utc_clock
 from app.services.paper_v2_execution import (
     OPPORTUNITY_DIRECTION_LONG,
     PaperV2ExecutionError,
@@ -256,6 +257,7 @@ def _route_one(
     kraken_client: Any,
     settings: Any,
     opip: Any,
+    execution_clock: Callable[[], datetime],
 ) -> None:
     opportunity = ranked.opportunity
     snapshot = opportunity.snapshot
@@ -352,16 +354,25 @@ def _route_one(
         native_symbol=native_symbol,
         requested_quantity=requested_quantity,
         requested_notional=requested_notional,
+        # Copied verbatim from the already-approved plan: never recalculated.
+        entry_low=float(plan.entry_low),
+        entry_high=float(plan.entry_high),
+        chase_limit=float(plan.chase_limit),
         stop_price=float(plan.stop_price),
         target_prices=(float(plan.target_1), float(plan.target_2)),
     )
 
+    # Execution runs on the execution clock, not the qualification stamp: quote
+    # freshness and occurrence times are execution facts. ``now`` opens the
+    # execution and ``clock`` is re-read after the venue response.
+    execution_now = require_utc(execution_clock(), field_name="execution_now")
     result = run_paper_v2_opportunity(
         paper_opportunity,
         client=client,
         kraken_client=kraken_client,
         settings=settings,
-        now=stamp.qualification_time,
+        now=execution_now,
+        clock=execution_clock,
     )
     status = str(getattr(result, "status", "") or "UNKNOWN")
     if status == "EXECUTED":
@@ -385,6 +396,7 @@ def route_qualified_opportunities(
     client: Any = None,
     kraken_client: Any = None,
     registry: InstrumentVersionRegistry | None = None,
+    execution_clock: Callable[[], datetime] | None = None,
 ) -> PaperV2RouterSummary:
     """Route every eligible opportunity to Paper v2, independently.
 
@@ -399,6 +411,7 @@ def route_qualified_opportunities(
 
     writer = client if client is not None else _writer_client()
     kraken = kraken_client if kraken_client is not None else _kraken_client()
+    clock = execution_clock or system_utc_clock
 
     try:
         snapshots_by_symbol = _build_cohort_snapshots(scan_facts)
@@ -435,6 +448,7 @@ def route_qualified_opportunities(
                 kraken_client=kraken,
                 settings=settings,
                 opip=opip,
+                execution_clock=clock,
             )
         except PaperV2HandoffError as exc:
             summary.handoff_failures += 1

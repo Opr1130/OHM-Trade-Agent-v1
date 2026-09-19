@@ -160,7 +160,7 @@ class _CountingTransport:
         return {
             "symbol": "SOL/USD",
             "bids": [{"price": 99.9, "qty": 10.0, "publication_ts": "2026-09-19T11:59:59Z"}],
-            "asks": [{"price": 100.1, "qty": 12.0, "publication_ts": "2026-09-19T11:59:59Z"}],
+            "asks": [{"price": 100.0, "qty": 12.0, "publication_ts": "2026-09-19T11:59:59Z"}],
         }
 
     def telemetry_snapshot(self):
@@ -210,6 +210,10 @@ def _opportunity(**overrides) -> PaperV2Opportunity:
         "native_symbol": "SOL/USD",
         "requested_quantity": 5.0,
         "requested_notional": 500.0,
+        # Qualified entry geometry, copied from the plan.
+        "entry_low": 99.0,
+        "entry_high": 101.0,
+        "chase_limit": 102.0,
         "stop_price": 90.0,
         "target_prices": (110.0, 120.0),
     }
@@ -256,6 +260,19 @@ def _total_event_count(writer) -> int:
 # ---------------------------------------------------------------------------
 # 1. The canonical decision-snapshot contract
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _frozen_execution_clock(monkeypatch):
+    """Freeze the producer's execution clock.
+
+    The producer reads market-data freshness from the execution clock, which in
+    production is real wall-clock time. These fixtures' books carry fixed source
+    timestamps, so the clock must be frozen for them to be deterministic.
+    """
+    monkeypatch.setattr(
+        "app.services.paper_v2_execution.system_utc_clock", lambda: NOW
+    )
 
 
 def test_snapshot_contract_pins_the_production_record_type():
@@ -613,6 +630,59 @@ def test_build_identity_is_producer_owned_not_caller_supplied():
     names = {field.name for field in dataclasses.fields(PaperV2Opportunity)}
     assert "artifact_or_build_id" not in names
     assert "process_instance_id" not in names
+
+
+def test_concurrent_first_use_yields_one_identifier_per_process(monkeypatch):
+    """Many threads through first initialization must agree on one identity.
+
+    Initialization is synchronized on a process-scoped lock, so a race cannot
+    publish two registries and hand the same process two identities.
+    """
+    import os
+    import threading
+
+    import app.opip.contracts.process_identity as module
+
+    # A PID with no existing entry forces a genuine first-use race.
+    fake_pid = 987_654_321
+    monkeypatch.setattr(os, "getpid", lambda: fake_pid)
+    module._identity_registry().pop(fake_pid, None)  # noqa: SLF001 - test-only reset
+
+    thread_count = 32
+    barrier = threading.Barrier(thread_count)
+    seen: list[str] = []
+    guard = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        value = module.process_instance_id()
+        with guard:
+            seen.append(value)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(seen) == thread_count
+    assert len(set(seen)) == 1
+    assert seen[0].startswith(f"{PROCESS_INSTANCE_PREFIX}:")
+
+
+def test_process_instance_id_still_stable_and_reload_safe_after_synchronizing():
+    """The synchronization must not weaken the existing per-process guarantees."""
+    import app.opip.contracts.process_identity as identity_module
+
+    first = process_instance_id()
+    assert process_instance_id() == first
+    reloaded_module = importlib.reload(identity_module)
+    try:
+        # The lock lives on ``sys`` alongside the registry, so it survives reload
+        # exactly as the identity does.
+        assert reloaded_module.process_instance_id() == first
+    finally:
+        importlib.reload(identity_module)
 
 
 def test_process_instance_id_is_stable_within_a_process():

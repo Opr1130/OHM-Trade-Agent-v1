@@ -62,19 +62,39 @@ class _Settings:
 
 
 class _EchoTransport:
-    """Counts every request and echoes the requested symbol, like the venue does."""
+    """Counts every request and echoes the requested symbol, like the venue does.
 
-    def __init__(self, *, requests: list, stale: bool = False) -> None:
+    ``ask``/``bid``/quantities and the publication instant are parameters so a test
+    can place the committed book inside or outside the qualified geometry, above
+    the reservation, or too thin to fill.
+    """
+
+    def __init__(
+        self,
+        *,
+        requests: list,
+        stale: bool = False,
+        ask: float = 100.0,
+        bid: float = 99.9,
+        ask_qty: float = 12.0,
+        bid_qty: float = 10.0,
+        published_at: str = "2026-09-19T11:59:59Z",
+    ) -> None:
         self._requests = requests
         self._stale = stale
+        self._ask = float(ask)
+        self._bid = float(bid)
+        self._ask_qty = float(ask_qty)
+        self._bid_qty = float(bid_qty)
+        self._published_at = published_at
 
     def request(self, endpoint, params, timeout_seconds):
         self._requests.append((endpoint, params.get("symbol")))
-        ts = "2026-09-19T11:00:00Z" if self._stale else "2026-09-19T11:59:59Z"
+        ts = "2026-09-19T11:00:00Z" if self._stale else self._published_at
         return {
             "symbol": params.get("symbol"),
-            "bids": [{"price": 99.9, "qty": 10.0, "publication_ts": ts}],
-            "asks": [{"price": 100.1, "qty": 12.0, "publication_ts": ts}],
+            "bids": [{"price": self._bid, "qty": self._bid_qty, "publication_ts": ts}],
+            "asks": [{"price": self._ask, "qty": self._ask_qty, "publication_ts": ts}],
         }
 
     def telemetry_snapshot(self):
@@ -285,6 +305,19 @@ def _registry() -> InstrumentVersionRegistry:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _frozen_execution_clock(monkeypatch):
+    """Freeze the router's execution clock.
+
+    The producer validates market-data freshness against this clock, which is real
+    wall-clock time in production. The fixtures' books carry fixed source
+    timestamps, so it must be frozen for them to be deterministic.
+    """
+    monkeypatch.setattr(
+        "app.services.paper_v2_scan_router.system_utc_clock", lambda: NOW
+    )
+
+
 def test_long_enter_now_routes_exactly_once_to_paper_v2(writer_env):
     server, client = writer_env
     observations = [_observation()]
@@ -439,9 +472,11 @@ def test_post_action_gate_reduced_capital_is_used(writer_env):
 
 def test_requested_quantity_derives_from_the_snapshot_reference_price(writer_env):
     server, client = writer_env
-    observations = [_observation(price=50.0)]
+    observations = [_observation()]
+    # 250 notional at the snapshot's own 100 reference price is 2.5 units. The
+    # figure comes from the decision snapshot, not from a later quote.
     ranked, state = _ranked(
-        observations=observations, decision_at=NOW, notional=500.0, capital=500.0
+        observations=observations, decision_at=NOW, notional=250.0, capital=250.0
     )
     opip = SimpleNamespace(funnel=_Funnel({("SOLUSD", "LONG"): state}))
 
@@ -455,8 +490,7 @@ def test_requested_quantity_derives_from_the_snapshot_reference_price(writer_env
     )
 
     order = _rows(server.writer, "paper_execution.order_intent.recorded")[0]
-    # 500 / 50 = 10 units, derived from the decision snapshot, not a later quote.
-    assert order["requested_quantity"] == pytest.approx(10.0)
+    assert order["requested_quantity"] == pytest.approx(2.5)
 
 
 def test_leverage_inconsistency_fails_closed(writer_env):
@@ -1000,6 +1034,171 @@ def test_handoff_error_is_not_a_strategy_rejection():
 
     assert not issubclass(PaperV2HandoffError, PaperV2ExecutionError)
     assert not issubclass(PaperV2ExecutionError, PaperV2HandoffError)
+
+
+# ---------------------------------------------------------------------------
+# Execution clock: freshness is measured at receipt, not at qualification
+# ---------------------------------------------------------------------------
+
+
+def _run_with_clock(
+    writer_env,
+    *,
+    ask: float = 100.0,
+    bid: float = 99.9,
+    ask_qty: float = 12.0,
+    published_at: str = "2026-09-19T11:59:59Z",
+    capital: float = 500.0,
+    notional: float = 500.0,
+    clock=None,
+):
+    """Route one LONG through a transport whose committed book is parameterised."""
+    server, client = writer_env
+    observations = [_observation()]
+    ranked, state = _ranked(
+        observations=observations,
+        decision_at=NOW,
+        capital=capital,
+        notional=notional,
+        valid_now=True,
+    )
+    opip = SimpleNamespace(funnel=_Funnel({("SOLUSD", "LONG"): state}))
+    requests: list = []
+    summary = route_qualified_opportunities(
+        [ranked],
+        scan_facts=PaperV2ScanFacts(
+            snapshots=tuple(observations),
+            decision_at=NOW,
+            universe_assets=(_universe_asset(),),
+        ),
+        stamp=_stamp(),
+        settings=_Settings(),
+        opip=opip,
+        client=client,
+        kraken_client=KrakenClient(
+            transport=_EchoTransport(
+                requests=requests,
+                ask=ask,
+                bid=bid,
+                ask_qty=ask_qty,
+                published_at=published_at,
+            )
+        ),
+        registry=_registry(),
+        execution_clock=clock,
+    )
+    return server, summary, requests
+
+
+def test_quote_published_between_qualification_and_receipt_is_not_future_dated(
+    writer_env,
+):
+    """T1 < T2 <= T3: a book published after qualification must still fill.
+
+    Qualification is at T1, the venue publishes at T2 (after T1), and the producer
+    receives and validates at T3. Measuring freshness against the qualification
+    instant would refuse this valid book as future-dated, which is exactly the
+    defect the separate execution clock fixes.
+    """
+    t1 = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)  # qualification
+    t2 = t1 + timedelta(seconds=2)  # source publication
+    t3 = t1 + timedelta(seconds=3)  # receipt
+    assert t1 < t2 <= t3
+
+    server, summary, requests = _run_with_clock(
+        writer_env, published_at=t2.isoformat(), clock=lambda: t3
+    )
+    assert summary.executed == 1
+    assert summary.operational_failures == 0
+    assert requests, "the book was actually read"
+    assert len(_rows(server.writer, "paper_execution.fill.recorded")) == 1
+
+
+def test_quote_published_after_the_receipt_clock_is_still_refused(writer_env):
+    """Control: a genuinely future-dated book is still refused."""
+    server, summary, _requests = _run_with_clock(
+        writer_env,
+        published_at="2026-09-19T12:00:30Z",  # later than the frozen clock
+        clock=lambda: NOW,
+    )
+    assert summary.executed == 0
+    assert summary.operational_failures == 1
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_fill_occurrence_time_comes_from_the_execution_clock(writer_env):
+    """Execution facts are stamped at execution time, decisions at decision time."""
+    execution = datetime(2026, 9, 19, 12, 0, 30, tzinfo=timezone.utc)
+    server, summary, _requests = _run_with_clock(
+        writer_env,
+        clock=lambda: execution,
+        # Published one second before the execution clock, so it is fresh.
+        published_at="2026-09-19T12:00:29Z",
+    )
+    assert summary.executed == 1
+    fill = _rows(server.writer, "paper_execution.fill.recorded")[0]
+    assert fill["fill_time"]["occurred_at"] == "2026-09-19T12:00:30Z"
+    # The context still carries the qualification-derived decision instants.
+    context = _rows(server.writer, CTX_EVENT)[0]
+    assert context["evaluation_time"] == "2026-09-19T12:00:05Z"
+    assert context["evidence_cutoff"] == "2026-09-19T12:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Qualified entry geometry, reservation and displayed depth
+# ---------------------------------------------------------------------------
+
+
+def test_ask_above_the_qualified_chase_limit_is_not_filled(writer_env):
+    server, summary, _requests = _run_with_clock(writer_env, ask=105.0, bid=104.0)
+    assert summary.executed == 0
+    assert summary.operational_failures == 1
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_ask_below_the_qualified_entry_band_is_not_filled(writer_env):
+    server, summary, _requests = _run_with_clock(writer_env, ask=95.0, bid=94.0)
+    assert summary.executed == 0
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_ask_at_or_below_the_qualified_stop_is_not_filled(writer_env):
+    server, summary, _requests = _run_with_clock(writer_env, ask=89.0, bid=88.0)
+    assert summary.executed == 0
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_ask_at_or_above_the_first_target_is_not_filled(writer_env):
+    server, summary, _requests = _run_with_clock(writer_env, ask=110.0, bid=109.0)
+    assert summary.executed == 0
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_actual_notional_above_the_reservation_is_not_filled(writer_env):
+    """A rising ask must not silently exceed the approved reservation."""
+    server, summary, _requests = _run_with_clock(
+        writer_env, ask=101.0, bid=100.5, capital=500.0, notional=500.0
+    )
+    # 5 units at 101.0 is 505, above the 500 reserved.
+    assert summary.executed == 0
+    assert summary.operational_failures == 1
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_requested_quantity_above_displayed_ask_quantity_is_not_filled(writer_env):
+    """No depth model exists, so a thin top-of-book cannot produce a full fill."""
+    # The fixture requests 5 units (500 / 100), and the ask shows only 3.
+    server, summary, _requests = _run_with_clock(writer_env, ask_qty=3.0)
+    assert summary.executed == 0
+    assert summary.operational_failures == 1
+    assert _rows(server.writer, "paper_execution.fill.recorded") == []
+
+
+def test_sufficient_displayed_depth_still_fills(writer_env):
+    """Control: a book that supports the requested quantity still executes."""
+    server, summary, _requests = _run_with_clock(writer_env, ask_qty=12.0)
+    assert summary.executed == 1
+    assert len(_rows(server.writer, "paper_execution.fill.recorded")) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -36,9 +36,13 @@ def resolve_paper_v2_mode(settings: Any | None = None) -> str:
 
     Mirrors the existing writer/feature-bus mode resolvers: accepts a Settings
     object, any object exposing the field, or no argument at all (in which case
-    the process settings are consulted). Any value that is not exactly a
-    supported mode resolves to ``off``, so an unexpected host value can never
-    activate a new execution path.
+    the process settings are consulted).
+
+    Only the exact canonical value activates. The comparison is deliberately not
+    normalized: stripping or lower-casing would let a malformed host value such as
+    ``"Active"``, ``"ACTIVE"`` or ``" active "`` enable a live execution path, which
+    contradicts the documented contract. Any other value, any missing field and
+    any non-string resolves to ``off``.
     """
     if settings is not None:
         raw = getattr(settings, "opip_paper_v2_mode", PAPER_V2_MODE_OFF)
@@ -50,8 +54,9 @@ def resolve_paper_v2_mode(settings: Any | None = None) -> str:
         except Exception:
             # An unreadable configuration is not a reason to activate execution.
             raw = PAPER_V2_MODE_OFF
-    mode = str(raw or "").strip().lower()
-    return mode if mode in PAPER_V2_MODES else PAPER_V2_MODE_OFF
+    if isinstance(raw, str) and raw in PAPER_V2_MODES:
+        return raw
+    return PAPER_V2_MODE_OFF
 
 
 def paper_v2_active(settings: Any | None = None) -> bool:

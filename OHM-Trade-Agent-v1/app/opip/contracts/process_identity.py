@@ -22,7 +22,8 @@ Why the sentinel lives on ``sys``
 module: a reload re-executes the module body and rebinds its globals, so a module
 global is not process-scoped at all - it is module-object scoped, and a reload
 would hand the same process a second identity. The state is therefore kept on the
-``sys`` module, which is not reloaded, as a single ``(pid, identifier)`` sentinel.
+``sys`` module, which is not reloaded, as a single ``(pid -> identifier)``
+registry guarded by a lock that lives there too.
 
 Keying on the PID is what makes the value honestly per-process:
 
@@ -40,13 +41,44 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import uuid
 
 #: Domain prefix distinguishing a process-instance identifier from snapshot,
 #: episode, instrument or trade identities.
 PROCESS_INSTANCE_PREFIX = "PROC"
 
-_SENTINEL_ATTRIBUTE = "_opip_process_instance_identity"
+_REGISTRY_ATTRIBUTE = "_opip_process_instance_registry"
+_LOCK_ATTRIBUTE = "_opip_process_instance_lock"
+
+
+def _registry_lock() -> threading.Lock:
+    """Return the process-scoped initialization lock, creating it atomically.
+
+    ``dict.setdefault`` is atomic under the GIL, so two threads racing here still
+    receive one lock object: whichever loses gets the winner's. The lock therefore
+    survives a module reload exactly like the registry it guards, which is what
+    makes "one identity per process" hold across reloads *and* across threads.
+    """
+    holder = getattr(sys, _REGISTRY_ATTRIBUTE, None)
+    if not isinstance(holder, dict):
+        holder = {}
+        setattr(sys, _REGISTRY_ATTRIBUTE, holder)
+    lock = holder.get(_LOCK_ATTRIBUTE)
+    if lock is None:
+        lock = holder.setdefault(_LOCK_ATTRIBUTE, threading.Lock())
+    return lock
+
+
+def _identity_registry() -> dict[int, str]:
+    holder = getattr(sys, _REGISTRY_ATTRIBUTE, None)
+    if not isinstance(holder, dict):
+        holder = {}
+        setattr(sys, _REGISTRY_ATTRIBUTE, holder)
+    registry = holder.get("identities")
+    if not isinstance(registry, dict):
+        registry = holder.setdefault("identities", {})
+    return registry
 
 
 def process_instance_id() -> str:
@@ -55,20 +87,24 @@ def process_instance_id() -> str:
     The value is computed once per (process, PID) and reused for that process
     lifetime, so every record a process emits shares one instance identity. A
     separate process - or the same code after a restart - mints its own.
+
+    Initialization is synchronized, so concurrent first callers in one process
+    cannot publish two registries and observe two different identifiers.
     """
     pid = os.getpid()
-    sentinel = getattr(sys, _SENTINEL_ATTRIBUTE, None)
-    if isinstance(sentinel, tuple) and len(sentinel) == 2 and sentinel[0] == pid:
-        return sentinel[1]
-
-    # ``dict.setdefault`` is atomic under the GIL, so two threads racing on first
-    # use still receive one identifier: the loser gets the winner's value rather
-    # than a second one. A plain check-then-set would not guarantee that.
-    registry = getattr(sys, _SENTINEL_ATTRIBUTE, None)
-    if not isinstance(registry, dict):
-        registry = {}
-        setattr(sys, _SENTINEL_ATTRIBUTE, registry)
-    return registry.setdefault(pid, f"{PROCESS_INSTANCE_PREFIX}:{uuid.uuid4()}")
+    registry = _identity_registry()
+    existing = registry.get(pid)
+    if existing is not None:
+        return existing
+    with _registry_lock():
+        # Re-check under the lock: another thread may have minted while we waited.
+        registry = _identity_registry()
+        existing = registry.get(pid)
+        if existing is not None:
+            return existing
+        minted = f"{PROCESS_INSTANCE_PREFIX}:{uuid.uuid4()}"
+        registry[pid] = minted
+        return minted
 
 
 __all__ = ["PROCESS_INSTANCE_PREFIX", "process_instance_id"]

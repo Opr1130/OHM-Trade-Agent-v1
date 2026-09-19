@@ -174,6 +174,13 @@ class ReasonCode(str, Enum):
     PAPER_ENGINE_DIRECTION_UNSUPPORTED = "PAPER_ENGINE_DIRECTION_UNSUPPORTED"
     PAPER_ENGINE_DISABLED = "PAPER_ENGINE_DISABLED"
     PAPER_ADMISSION_ELIGIBLE = "PAPER_ADMISSION_ELIGIBLE"
+    #: Paper v2 is the authority but the opportunity is a WAIT: its qualified entry
+    #: is not immediately actionable and no pending-entry engine exists, so it is
+    #: not admission-eligible. Deliberately distinct from PAPER_ENGINE_DISABLED,
+    #: which would wrongly report the engine as switched off.
+    PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE = (
+        "PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE"
+    )
     TRADE_QUALITY_NOT_APPLICABLE_TO_SHADOW_ENGINE = (
         "TRADE_QUALITY_NOT_APPLICABLE_TO_SHADOW_ENGINE"
     )
@@ -219,6 +226,7 @@ REASON_CLASSES: dict[ReasonCode, ReasonClass] = {
     ReasonCode.PAPER_ENGINE_DIRECTION_UNSUPPORTED: ReasonClass.INFORMATIONAL,
     ReasonCode.PAPER_ENGINE_DISABLED: ReasonClass.INFORMATIONAL,
     ReasonCode.PAPER_ADMISSION_ELIGIBLE: ReasonClass.INFORMATIONAL,
+    ReasonCode.PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE: ReasonClass.INFORMATIONAL,
     ReasonCode.TRADE_QUALITY_NOT_APPLICABLE_TO_SHADOW_ENGINE: ReasonClass.INFORMATIONAL,
     ReasonCode.CAPITAL_GATE_NOT_APPLICABLE_TO_SHADOW_ENGINE: ReasonClass.INFORMATIONAL,
     ReasonCode.FUNNEL_INCOMPLETE: ReasonClass.OPERATIONAL,

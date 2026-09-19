@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -134,6 +135,35 @@ def test_settings_still_parse_with_the_activation_field(monkeypatch):
     monkeypatch.setenv("WEBHOOK_SECRET", "test-webhook-secret")
     assert _settings().opip_paper_v2_mode == PAPER_V2_MODE_OFF
     assert get_settings().opip_paper_v2_mode == PAPER_V2_MODE_OFF
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("active", PAPER_V2_MODE_ACTIVE),
+        ("off", PAPER_V2_MODE_OFF),
+        # Only the exact canonical value activates. Anything else - including a
+        # near-miss that a normalizing parser would have accepted - is off.
+        ("Active", PAPER_V2_MODE_OFF),
+        ("ACTIVE", PAPER_V2_MODE_OFF),
+        (" active ", PAPER_V2_MODE_OFF),
+        ("Active ", PAPER_V2_MODE_OFF),
+        ("", PAPER_V2_MODE_OFF),
+        (None, PAPER_V2_MODE_OFF),
+        ("unexpected", PAPER_V2_MODE_OFF),
+        (1, PAPER_V2_MODE_OFF),
+        (True, PAPER_V2_MODE_OFF),
+    ],
+)
+def test_only_the_exact_canonical_value_activates(raw, expected):
+    """Activation parsing is exact and fail-closed, never normalized."""
+    holder = SimpleNamespace(opip_paper_v2_mode=raw)
+    assert resolve_paper_v2_mode(holder) == expected
+    assert paper_v2_active(holder) is (expected == PAPER_V2_MODE_ACTIVE)
+
+
+def test_a_missing_activation_field_is_off():
+    assert resolve_paper_v2_mode(SimpleNamespace()) == PAPER_V2_MODE_OFF
 
 
 def _imported_roots(path: Path) -> set[str]:

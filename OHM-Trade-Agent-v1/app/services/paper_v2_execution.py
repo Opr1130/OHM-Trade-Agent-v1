@@ -47,7 +47,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from app.opip.canonical.decision_context_bridge import (
     DecisionContextFacts,
@@ -55,6 +55,12 @@ from app.opip.canonical.decision_context_bridge import (
     require_canonical_commit,
 )
 from app.opip.contracts.identity import InstrumentVersion
+from app.opip.contracts.paper_v2_identity import (
+    paper_v2_entry_attempt_id,
+    paper_v2_entry_fill_id,
+    paper_v2_entry_order_intent_id,
+    paper_v2_quote_evidence_id,
+)
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_ECONOMIC_MODEL_VERSION,
@@ -85,7 +91,10 @@ from app.services.paper_v2_instrument_registration import (
     InstrumentRegistrationError,
     ensure_instrument_version_registered,
 )
-from app.services.paper_v2_pretrade_adapter import fetch_level1_observation
+from app.services.paper_v2_pretrade_adapter import (
+    fetch_fresh_level1_observation,
+    system_utc_clock,
+)
 from app.services.paper_v2_protection_plan import (
     ProtectionPlanSource,
     build_protection_plan_payload,
@@ -96,9 +105,9 @@ from app.services.paper_v2_quote_evidence import (
     require_fresh_quote_evidence,
 )
 
-ENTRY_PREFIX = "ENTRY"
-ATTEMPT_PREFIX = "ATTEMPT"
-FILL_PREFIX = "FILL"
+#: Stage identities now live in the shared contracts layer
+#: (``app.opip.contracts.paper_v2_identity``) so the producer and the canonical
+#: writer derive a given stage's identity from one definition.
 
 #: The component name this producer stamps into its own evidence provenance. It
 #: names the module that actually emits the record, so it is a fact rather than a
@@ -162,6 +171,12 @@ class PaperV2Opportunity:
     native_symbol: str
     requested_quantity: float
     requested_notional: float
+    #: The qualified entry geometry, copied from the already-approved EntryExitPlan.
+    #: Never recalculated: the fresh ask must still sit inside this band, or the
+    #: opportunity that would be filled is not the one that was qualified.
+    entry_low: float
+    entry_high: float
+    chase_limit: float
     stop_price: float
     target_prices: tuple[float, ...]
 
@@ -237,10 +252,20 @@ def run_paper_v2_opportunity(
     kraken_client: Any,
     settings: Any,
     now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> PaperV2ExecutionResult:
-    """Execute one qualified opportunity through the frozen canonical path."""
+    """Execute one qualified opportunity through the frozen canonical path.
+
+    ``now`` is the *execution* opening reading and ``clock`` is the injectable
+    execution clock used for subsequent readings (market-data freshness, attempt
+    and fill occurrence). Neither is the qualification instant: qualification is a
+    decision fact carried on the opportunity, while these are execution facts. The
+    router supplies a real execution reading; tests supply a frozen one.
+    """
     if not isinstance(opportunity, PaperV2Opportunity):
         raise ValueError("opportunity must be a PaperV2Opportunity")
+
+    execution_clock = clock or system_utc_clock
 
     # --- 0. producer-level activation and direction gates ------------------
     # Enforced here, before any canonical write or market-data read, so a direct
@@ -370,9 +395,7 @@ def run_paper_v2_opportunity(
     _require(bool(reservation_id), "admitted trade has no canonical reservation")
 
     # --- 4. ENTRY order intent --------------------------------------------
-    entry_order_id = stable_hash(
-        ENTRY_PREFIX, {"paper_trade_id": paper_trade_id, "seq": 0}
-    )
+    entry_order_id = paper_v2_entry_order_intent_id(paper_trade_id)
     entry_payload = {
         "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
         "engine": ENGINE_OPIP_PAPER_V2,
@@ -403,18 +426,25 @@ def run_paper_v2_opportunity(
     )
 
     # --- 5/6. fresh public pre-trade book -> canonical quote evidence ------
-    quote = _commit_quote(
+    # The freshness clock is read inside this call, after the venue response.
+    quote, received_at = _commit_quote(
         opportunity,
         client=client,
         kraken_client=kraken_client,
         settings=settings,
-        moment=moment,
+        clock=execution_clock,
     )
 
+    # --- 6b. the committed ask must still be an executable qualified entry -
+    # Pure validation against already-committed evidence: geometry, reserved
+    # capital and displayed depth. Nothing is resized, extrapolated or filled
+    # partially, so a quote that cannot support the approved trade produces no
+    # exposure at all.
+    _require_executable_entry(opportunity, quote=quote)
+
     # --- 7. execution attempt ---------------------------------------------
-    attempt_id = stable_hash(
-        ATTEMPT_PREFIX, {"order_intent_id": entry_order_id, "seq": 0}
-    )
+    attempt_moment = require_utc(execution_clock(), field_name="attempt_time")
+    attempt_id = paper_v2_entry_attempt_id(entry_order_id)
     attempt_payload = {
         "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
         "engine": ENGINE_OPIP_PAPER_V2,
@@ -426,7 +456,7 @@ def run_paper_v2_opportunity(
         "attempt_time": {
             "precision": "EXACT",
             "basis": "SOURCE_REPORTED",
-            "occurred_at": iso_z(moment, field_name="attempt_time"),
+            "occurred_at": iso_z(attempt_moment, field_name="attempt_time"),
         },
         "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
         "accepted_quantity": float(opportunity.requested_quantity),
@@ -446,7 +476,8 @@ def run_paper_v2_opportunity(
     fill_quantity = float(opportunity.requested_quantity)
     # A long ENTRY executes against the ask side of the committed book.
     executable_price = float(quote["best_ask"])
-    fill_id = stable_hash(FILL_PREFIX, {"order_intent_id": entry_order_id, "seq": 0})
+    fill_moment = require_utc(execution_clock(), field_name="fill_time")
+    fill_id = paper_v2_entry_fill_id(entry_order_id)
     cost = _cost_components(fill_quantity, executable_price, settings=settings)
     fill_payload = {
         "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -466,7 +497,7 @@ def run_paper_v2_opportunity(
         "fill_time": {
             "precision": "EXACT",
             "basis": "SOURCE_REPORTED",
-            "occurred_at": iso_z(moment, field_name="fill_time"),
+            "occurred_at": iso_z(fill_moment, field_name="fill_time"),
         },
         "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
         "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
@@ -507,6 +538,69 @@ def run_paper_v2_opportunity(
         protection_plan_id=plan_id,
         filled_quantity=fill_quantity,
     )
+
+
+#: Tolerance for the long-spot leverage-consistency check. The action gate rounds
+#: the notional to cents, so a matched position may differ by under a cent.
+_NOTIONAL_TOLERANCE_USD = 0.01
+
+#: Quantity tolerance for the displayed Level-1 depth check.
+_QUANTITY_TOLERANCE = 1e-9
+
+
+def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping[str, Any]) -> None:
+    """Validate the fresh committed ask before it may become exposure.
+
+    Three independent refusals, all fail-closed:
+
+    * **Qualified geometry.** The ask must still sit inside the entry band the plan
+      qualified, above the qualified stop and below the first qualified target. A
+      quote outside that geometry is a different trade from the one that was
+      qualified, so it must not fill.
+    * **Reserved capital.** The actual notional at the committed ask must not exceed
+      the approved reservation. Silently resizing the trade would change approved
+      economics, so this refuses rather than rescaling.
+    * **Displayed depth.** There is no approved depth model and no approved
+      partial-fill model, so a top-of-book ask that cannot support the full
+      requested quantity cannot be filled. Extrapolating deeper liquidity or
+      fabricating a full fill is not permitted.
+    """
+    ask = float(quote["best_ask"])
+    quantity = float(opportunity.requested_quantity)
+
+    if ask > float(opportunity.chase_limit):
+        raise PaperV2ExecutionError(
+            "best ask is above the qualified chase limit for this opportunity"
+        )
+    if ask < float(opportunity.entry_low):
+        raise PaperV2ExecutionError(
+            "best ask is below the qualified entry band for this opportunity"
+        )
+    if ask <= float(opportunity.stop_price):
+        raise PaperV2ExecutionError(
+            "best ask is at or below the qualified stop for this opportunity"
+        )
+    if opportunity.target_prices:
+        first_target = float(opportunity.target_prices[0])
+        if ask >= first_target:
+            raise PaperV2ExecutionError(
+                "best ask is at or above the first qualified target for this opportunity"
+            )
+
+    actual_notional = quantity * ask
+    reserved = float(opportunity.requested_reservation_amount)
+    if actual_notional > reserved + _NOTIONAL_TOLERANCE_USD:
+        raise PaperV2ExecutionError(
+            "actual execution notional at the committed ask exceeds the approved "
+            "reservation; refusing rather than resizing the trade"
+        )
+
+    ask_quantity = float(quote["ask_quantity"])
+    if quantity > ask_quantity + _QUANTITY_TOLERANCE:
+        raise PaperV2ExecutionError(
+            "requested quantity exceeds the displayed Level-1 ask quantity; "
+            "no approved depth or partial-fill model exists"
+        )
 
 
 def _admit(
@@ -582,33 +676,33 @@ def _commit_quote(
     client: Any,
     kraken_client: Any,
     settings: Any,
-    moment: datetime,
-) -> dict:
-    """Fetch a fresh public pre-trade book and commit canonical quote evidence."""
+    clock: Callable[[], datetime],
+) -> tuple[dict, datetime]:
+    """Fetch a fresh public pre-trade book and commit canonical quote evidence.
+
+    Returns the committed payload and the receipt instant the book was validated
+    against, so the caller reuses one execution reading instead of consulting a
+    clock that may have moved.
+    """
     max_age = int(getattr(settings, "paper_v2_quote_max_age_seconds", 15))
     try:
-        observation = fetch_level1_observation(
+        observation, received_at = fetch_fresh_level1_observation(
             kraken_client,
             symbol=opportunity.native_symbol,
             instrument_version_id=opportunity.instrument_version_id,
             native_symbol=opportunity.native_symbol,
             quote_currency=opportunity.quote_currency,
-            now=moment,
             max_age_seconds=max_age,
+            clock=clock,
         )
         payload = require_fresh_quote_evidence(
             observation,
-            quote_evidence_id=stable_hash(
-                "PQUOTE",
-                {
-                    "instrument_version_id": opportunity.instrument_version_id,
-                    "native_symbol": opportunity.native_symbol,
-                    "observed_at": iso_z(
-                        observation.observed_at, field_name="observed_at"
-                    ),
-                },
+            quote_evidence_id=paper_v2_quote_evidence_id(
+                instrument_version_id=opportunity.instrument_version_id,
+                native_symbol=opportunity.native_symbol,
+                observed_at=observation.observed_at,
             ),
-            now=moment,
+            now=received_at,
             max_age_seconds=max_age,
         )
     except QuoteEvidenceUnavailableError as exc:
@@ -621,7 +715,7 @@ def _commit_quote(
         payload=payload,
         what="quote evidence",
     )
-    return payload
+    return payload, received_at
 
 
 def _cost_components(

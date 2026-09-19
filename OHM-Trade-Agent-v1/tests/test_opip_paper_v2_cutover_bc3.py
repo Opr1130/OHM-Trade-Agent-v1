@@ -34,6 +34,12 @@ from app.services.paper_v2_scan_router import (
 from app.jobs import scan_opportunities
 
 NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
+#: The execution instant the router's clock is frozen to. Later than qualification
+#: and later than the book's source timestamp, which is the real ordering.
+EXECUTION_NOW = NOW + timedelta(seconds=10)
+#: Source publication instant of the fixture book. Fresh relative to the frozen
+#: execution clock above.
+QUOTE_PUBLISHED_AT = NOW - timedelta(seconds=1)
 
 
 class _Settings:
@@ -68,15 +74,11 @@ class _EchoTransport:
 
     def request(self, endpoint, params, timeout_seconds):
         self._requests.append((endpoint, params.get("symbol")))
-        # A live book reports its publication time as now; the producer's quote
-        # freshness bound is measured against the qualification instant.
-        ts = (
-            datetime.now(timezone.utc) - timedelta(seconds=1)
-        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ts = QUOTE_PUBLISHED_AT.isoformat()
         return {
             "symbol": params.get("symbol"),
             "bids": [{"price": 99.9, "qty": 10.0, "publication_ts": ts}],
-            "asks": [{"price": 100.1, "qty": 12.0, "publication_ts": ts}],
+            "asks": [{"price": 100.0, "qty": 12.0, "publication_ts": ts}],
         }
 
     def telemetry_snapshot(self):
@@ -232,9 +234,15 @@ class _ObserverStub:
     def record_action_gate(self, ranked, *, allowed, reason) -> None:
         return None
 
-    def record_paper_admission_eligibility(self, ranked, *, paper_enabled, engine_label=None) -> int:
+    def record_paper_admission_eligibility(
+        self, ranked, *, paper_enabled, engine_label=None, paper_v2=False
+    ) -> int:
         self.eligibility_calls.append(
-            {"paper_enabled": paper_enabled, "engine_label": engine_label}
+            {
+                "paper_enabled": paper_enabled,
+                "engine_label": engine_label,
+                "paper_v2": paper_v2,
+            }
         )
         return 0
 
@@ -249,6 +257,76 @@ class _Calls:
         self.router = 0
         self.lineage: list = []
         self.routed: list = []
+
+
+#: Module-level persistence seams the real scan touches that are unrelated to the
+#: paper-authority routing under test (registries, caches, notification state).
+#: Each defaults to ``/app/data``, which is not writable in CI, so they are
+#: redirected into the test's tmp directory. This isolates the *test*, not the
+#: production paths: no production constant changes.
+_SCAN_PERSISTENCE_SEAMS = (
+    "app.services.asset_display_identity.REGISTRY_FILE",
+    "app.services.shadow_learning.SHADOW_FILE",
+    "app.services.telegram_delivery.STATE_FILE",
+    "app.services.telegram_delivery.EVENT_FILE",
+    "app.services.chief_alert_notifier.STATE_FILE",
+    "app.services.notification_policy.STATE_FILE",
+    "app.services.price_movement_learning.MOVEMENT_FILE",
+    "app.services.alert_governor.STATE_FILE",
+    "app.services.journal.JOURNAL_PATH",
+)
+
+
+def _isolate_scan_persistence(monkeypatch, tmp_path) -> None:
+    """Redirect the scan's unrelated runtime persistence into ``tmp_path``.
+
+    The scan orchestrator is real in these tests, so it reaches registries and
+    caches that have nothing to do with paper-authority routing. Left alone they
+    resolve to ``/app/data`` and raise ``PermissionError`` on Linux CI. Redirecting
+    them keeps the tests deterministic and platform-independent while still
+    exercising the real mode-selection and routing logic.
+    """
+    for target in _SCAN_PERSISTENCE_SEAMS:
+        module_path, _, attribute = target.rpartition(".")
+        monkeypatch.setattr(
+            target, tmp_path / f"{module_path.rsplit('.', 1)[-1]}_{attribute}"
+        )
+
+    # The canonical directory resolves from this environment variable in
+    # production, so pointing it at tmp is a supported configuration rather than
+    # a path override.
+    monkeypatch.setenv("OPIP_CANONICAL_DIR", str(tmp_path / "canonical"))
+
+    # ``validate_scheduled_catalysts`` takes its cache as a default argument, so
+    # the module constant is already bound. Inject a tmp cache explicitly.
+    import functools
+
+    real_catalysts = scan_opportunities.validate_scheduled_catalysts
+
+    monkeypatch.setattr(
+        scan_opportunities,
+        "validate_scheduled_catalysts",
+        functools.partial(
+            real_catalysts, cache_path=tmp_path / "coinmarketcal_coin_map.json"
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_scan_persistence(monkeypatch, tmp_path):
+    """Keep every test in this module hermetic.
+
+    Autouse because the scan orchestrator is real here: whichever test drives it
+    would otherwise reach ``/app/data`` and fail on Linux CI for reasons unrelated
+    to paper-authority routing.
+    """
+    _isolate_scan_persistence(monkeypatch, tmp_path)
+    # The producer validates market-data freshness against this clock, which is
+    # real wall-clock time in production. Freeze it so the fixture book's fixed
+    # source timestamp is deterministic.
+    monkeypatch.setattr(
+        "app.services.paper_v2_scan_router.system_utc_clock", lambda: EXECUTION_NOW
+    )
 
 
 def _install_scan(
@@ -657,6 +735,85 @@ def test_route_helper_reports_missing_universe_without_attempting(monkeypatch, c
 
 def test_router_summary_reports_zero_legacy_calls():
     assert PaperV2RouterSummary().legacy_calls == 0
+
+
+def test_paper_v2_eligibility_uses_paper_v2_authority_not_legacy_control():
+    """Paper v2 active must be reported from Paper v2 authority.
+
+    The legacy paper control switch is a different fact, so passing it as "is
+    Paper v2 enabled" would be false attribution.
+    """
+    from app.opip.decision.observer import build_scan_observer
+
+    for direction, valid_now, expected in (
+        ("LONG", True, 1),
+        ("LONG", False, 0),   # WAIT: no pending-entry engine
+        ("SHORT", True, 0),   # no short engine
+    ):
+        entry = _snapshot(direction=direction)
+        observer = build_scan_observer(
+            snapshots=[entry], decision_at=NOW, account_equity=10_000.0
+        )
+        ranked = [
+            SimpleNamespace(
+                rank=1,
+                opportunity=SimpleNamespace(
+                    alert={}, snapshot=entry, plan=_plan(valid_now=valid_now)
+                ),
+                profit_ranking=SimpleNamespace(total_score=1.0),
+            )
+        ]
+        eligible = observer.record_paper_admission_eligibility(
+            ranked,
+            # Legacy paper control is OFF; Paper v2 is the authority.
+            paper_enabled=False,
+            engine_label="O'Pip Paper v2",
+            paper_v2=True,
+        )
+        assert eligible == expected, (direction, valid_now)
+
+
+def test_legacy_eligibility_reason_is_unchanged_when_paper_v2_is_off():
+    """OFF mode keeps the legacy reason and the legacy control semantics."""
+    from app.opip.decision.observer import build_scan_observer
+    from app.opip.decision.models import ReasonCode
+
+    entry = _snapshot(direction="LONG")
+    observer = build_scan_observer(
+        snapshots=[entry], decision_at=NOW, account_equity=10_000.0
+    )
+    ranked = [
+        SimpleNamespace(
+            rank=1,
+            opportunity=SimpleNamespace(
+                alert={}, snapshot=entry, plan=_plan(valid_now=True)
+            ),
+            profit_ranking=SimpleNamespace(total_score=1.0),
+        )
+    ]
+    enabled = observer.record_paper_admission_eligibility(
+        ranked, paper_enabled=True, engine_label="v1 authoritative paper engine"
+    )
+    assert enabled == 1
+
+    disabled = observer.record_paper_admission_eligibility(
+        ranked, paper_enabled=False, engine_label="v1 authoritative paper engine"
+    )
+    assert disabled == 0
+    assert ReasonCode.PAPER_ENGINE_DISABLED is not None
+
+
+def test_paper_v2_wait_has_its_own_reason_code():
+    """A WAIT must not be reported as the engine being disabled."""
+    from app.opip.decision.models import ReasonCode
+
+    assert ReasonCode.PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE.value == (
+        "PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE"
+    )
+    assert (
+        ReasonCode.PAPER_V2_WAIT_NOT_IMMEDIATELY_EXECUTABLE
+        is not ReasonCode.PAPER_ENGINE_DISABLED
+    )
 
 
 def test_scan_module_does_not_import_decision_intelligence():

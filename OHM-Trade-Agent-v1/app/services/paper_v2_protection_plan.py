@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
@@ -76,7 +77,8 @@ def _require_positive(value: object, *, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field_name} must be a finite positive number")
     number = float(value)
-    if number != number or number in (float("inf"), float("-inf")) or number <= 0:
+    # ``isfinite`` rejects NaN and both infinities in one check.
+    if not math.isfinite(number) or number <= 0:
         raise ValueError(f"{field_name} must be a finite positive number")
     return number
 
