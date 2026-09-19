@@ -11,7 +11,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PendingHandoff,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.canonical.paths import (
     EVENT_SCHEMA_VERSION,
     SCHEMA_VERSION,
@@ -86,6 +91,7 @@ from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_EVENT_TYPES,
     PAPER_OUTCOME_PRIORITY,
     PAPER_OUTCOME_STREAM,
+    QUOTE_CURRENCIES,
     PAPER_OUTCOME_TERMINAL_RECORDED,
     assert_supersession_consistent,
     terminal_outcome_idempotency_key,
@@ -714,6 +720,65 @@ class CanonicalWriter:
                 if result.get("reservation_id") is not None
                 else None
             ),
+        )
+
+    def paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        """Read-only projection of one paper portfolio's concurrency token.
+
+        Exists so a Paper-v2 producer can obtain the authoritative
+        ``expected_portfolio_version`` before constructing the already-frozen
+        admission request. Nothing else is exposed: not the underlying event rows,
+        not another portfolio's figures.
+
+        This is a pure read. It holds the existing writer lock, validates the quote
+        currency against the existing canonical rule, and delegates to the existing
+         ``_portfolio_state`` projection - it does not reimplement it. It performs
+        no write of any kind, so it cannot insert an event, consume a local
+        sequence, change the history epoch, advance a watermark, create an
+        idempotency row or reservation, or mutate canonical evidence.
+        """
+        # Canonical identity discipline: a padded or malformed currency is
+        # rejected rather than silently normalized, so the caller cannot ask for
+        # one portfolio and read another.
+        if (
+            not isinstance(quote_currency, str)
+            or not quote_currency
+            or quote_currency != quote_currency.strip()
+        ):
+            return PaperPortfolioState(
+                status="REJECTED",
+                error_code="MALFORMED_QUOTE_CURRENCY",
+                detail="quote_currency must be a non-empty canonical string",
+            )
+        if quote_currency not in QUOTE_CURRENCIES:
+            return PaperPortfolioState(
+                status="REJECTED",
+                error_code="UNSUPPORTED_QUOTE_CURRENCY",
+                detail=f"unsupported quote_currency: {quote_currency!r}",
+            )
+        with self._lock:
+            try:
+                version, reserved_capital, active_reservations = (
+                    self._portfolio_state(quote_currency)
+                )
+            except (TypeError, ValueError) as exc:
+                return PaperPortfolioState(
+                    status="REJECTED",
+                    error_code="PORTFOLIO_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperPortfolioState(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+        return PaperPortfolioState(
+            status="OK",
+            quote_currency=quote_currency,
+            portfolio_version=int(version),
+            reserved_capital=float(reserved_capital),
+            active_reservations=int(active_reservations),
         )
 
     def admit_paper_opportunity(

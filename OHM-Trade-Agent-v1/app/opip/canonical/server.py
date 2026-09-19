@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.opip.canonical.models import WriterAck, WriterIntent
+from app.opip.canonical.models import PaperPortfolioState, WriterAck, WriterIntent
 from app.opip.canonical.protocol import recv_json, send_json
 from app.opip.canonical.writer import CanonicalWriter
 from app.opip.contracts.paper_execution_runtime import (
@@ -227,6 +227,18 @@ class CanonicalWriterServer:
             # Read-only diagnostics remain available while fail-closed.
             rows = [h.__dict__ for h in self.writer.list_pending_handoffs()]
             return {"status": "OK", "handoffs": rows}
+        if method == "GET_PAPER_PORTFOLIO_STATE":
+            # A read-only projection. It is deliberately still gated on canonical
+            # health: an unsafe or unavailable writer must not hand a producer an
+            # apparently valid concurrency token to build an admission on.
+            if self._health_status() != "OK":
+                return PaperPortfolioState(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_portfolio_state(
+                str(request.get("quote_currency") or "")
+            ).to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

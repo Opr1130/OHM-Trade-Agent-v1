@@ -118,6 +118,53 @@ class WriterAck:
         )
 
 
+@dataclass(frozen=True)
+class PaperPortfolioState:
+    """Read-only projection of one paper portfolio's concurrency token and capacity.
+
+    Carries exactly what a Paper-v2 producer needs to construct the frozen
+    admission request, and nothing speculative: the quote currency, the monotone
+    portfolio version, the reserved capital and the active reservation count.
+    """
+
+    status: str
+    quote_currency: str | None = None
+    portfolio_version: int | None = None
+    reserved_capital: float | None = None
+    active_reservations: int | None = None
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperPortfolioState":
+        return cls(
+            status=str(raw["status"]),  # type: ignore[arg-type]
+            quote_currency=(
+                str(raw["quote_currency"]) if raw.get("quote_currency") else None
+            ),
+            portfolio_version=(
+                int(raw["portfolio_version"])
+                if raw.get("portfolio_version") is not None
+                else None
+            ),
+            reserved_capital=(
+                float(raw["reserved_capital"])
+                if raw.get("reserved_capital") is not None
+                else None
+            ),
+            active_reservations=(
+                int(raw["active_reservations"])
+                if raw.get("active_reservations") is not None
+                else None
+            ),
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
 @dataclass
 class PendingHandoff:
     event_id: str

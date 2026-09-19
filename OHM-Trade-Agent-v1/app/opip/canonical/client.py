@@ -6,7 +6,12 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PendingHandoff,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionAck,
     PaperAdmissionRequest,
@@ -30,6 +35,8 @@ class WriterClient(Protocol):
     def trigger_paper_protection_action(
         self, request: PaperProtectionActionRequest
     ) -> PaperProtectionActionAck: ...
+
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -103,6 +110,15 @@ class CanonicalWriterClient:
         )
         return PaperProtectionActionAck.from_dict(response)
 
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        response = self._roundtrip(
+            {
+                "method": "GET_PAPER_PORTFOLIO_STATE",
+                "quote_currency": quote_currency,
+            }
+        )
+        return PaperPortfolioState.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -169,6 +185,16 @@ class InProcessWriterClient:
         return WriterAck.from_dict(
             self._server.dispatch_for_tests(
                 {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
+            )
+        )
+
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        return PaperPortfolioState.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "GET_PAPER_PORTFOLIO_STATE",
+                    "quote_currency": quote_currency,
+                }
             )
         )
 
