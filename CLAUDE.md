@@ -1,5 +1,7 @@
 # O'Pip Claude Code Contract
 
+Read [AGENTS.md](AGENTS.md) first as the canonical shared engineering policy. The specialized guidance below supplements it and cannot grant trading authority or weaken its boundaries.
+
 ## Repository layout
 
 - The GitHub repository root is a wrapper. Application code lives under `OHM-Trade-Agent-v1/`.
