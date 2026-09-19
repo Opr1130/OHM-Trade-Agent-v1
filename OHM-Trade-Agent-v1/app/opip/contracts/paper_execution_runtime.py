@@ -58,6 +58,11 @@ PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES = frozenset(
     }
 )
 
+#: Field-diagnostic prefixes shared by every canonical payload error message,
+#: so the same wording cannot drift between contract validators.
+_FIELD_MISSING_PREFIX = "missing="
+_FIELD_EXTRA_PREFIX = "extra="
+
 #: The single authoritative Paper v2 capital/capacity policy version.
 PAPER_CAPITAL_POLICY_VERSION = "paper-capital-v1"
 
@@ -193,9 +198,9 @@ class PaperProtectionActionRequest:
             extra = sorted(set(raw or {}) - _ACTION_REQUEST_FIELDS)
             details = []
             if missing:
-                details.append("missing=" + ",".join(missing))
+                details.append(_FIELD_MISSING_PREFIX + ",".join(missing))
             if extra:
-                details.append("extra=" + ",".join(extra))
+                details.append(_FIELD_EXTRA_PREFIX + ",".join(extra))
             raise ValueError(
                 "invalid PaperProtectionActionRequest fields: " + "; ".join(details)
             )
@@ -522,9 +527,9 @@ class PaperAdmissionRequest:
             extra = sorted(set(raw) - _ADMISSION_REQUEST_FIELDS)
             details = []
             if missing:
-                details.append("missing=" + ",".join(missing))
+                details.append(_FIELD_MISSING_PREFIX + ",".join(missing))
             if extra:
-                details.append("extra=" + ",".join(extra))
+                details.append(_FIELD_EXTRA_PREFIX + ",".join(extra))
             raise ValueError("invalid PaperAdmissionRequest fields: " + "; ".join(details))
         request = cls(
             schema_version=raw["schema_version"],
@@ -688,9 +693,9 @@ def validate_quote_evidence_payload(payload: Mapping[str, Any]) -> dict[str, Any
         extra = sorted(set(payload) - _QUOTE_EVIDENCE_FIELDS)
         details = []
         if missing:
-            details.append("missing=" + ",".join(missing))
+            details.append(_FIELD_MISSING_PREFIX + ",".join(missing))
         if extra:
-            details.append("extra=" + ",".join(extra))
+            details.append(_FIELD_EXTRA_PREFIX + ",".join(extra))
         raise ValueError("invalid quote evidence fields: " + "; ".join(details))
 
     if (

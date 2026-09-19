@@ -230,21 +230,42 @@ class CanonicalWriterServer:
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":
-            if method == "ADMIT_PAPER_OPPORTUNITY":
-                return PaperAdmissionAck(
-                    status="RETRYABLE",
-                    error_code="WORKER_UNHEALTHY",
-                ).to_dict()
-            if method == "TRIGGER_PAPER_PROTECTION_ACTION":
-                return PaperProtectionActionAck(
-                    status="RETRYABLE",
-                    error_code="WORKER_UNHEALTHY",
-                ).to_dict()
-            return WriterAck(
+            return self._unhealthy_response(method)
+
+        paper_response = self._dispatch_paper_rpc(method, request)
+        if paper_response is not None:
+            return paper_response
+        if method == "CONFIRM_OPS_APPLIED":
+            return self.writer.confirm_ops_applied(str(request["event_id"])).to_dict()
+        if method == "MARK_HANDOFF_SUPERSEDED":
+            return self.writer.mark_handoff_superseded(str(request["event_id"])).to_dict()
+        if method == "ADVANCE_EPOCH":
+            epoch = self.writer.advance_history_epoch_for_restore()
+            return {"status": "OK", "history_epoch": epoch}
+        return WriterAck(status="REJECTED", error_code="UNKNOWN_METHOD").to_dict()
+
+    @staticmethod
+    def _unhealthy_response(method: str) -> dict[str, Any]:
+        """Fail-closed reply, typed for whichever RPC the caller attempted."""
+        if method == "ADMIT_PAPER_OPPORTUNITY":
+            return PaperAdmissionAck(
                 status="RETRYABLE",
                 error_code="WORKER_UNHEALTHY",
             ).to_dict()
+        if method == "TRIGGER_PAPER_PROTECTION_ACTION":
+            return PaperProtectionActionAck(
+                status="RETRYABLE",
+                error_code="WORKER_UNHEALTHY",
+            ).to_dict()
+        return WriterAck(
+            status="RETRYABLE",
+            error_code="WORKER_UNHEALTHY",
+        ).to_dict()
 
+    def _dispatch_paper_rpc(
+        self, method: str, request: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Paper v2 atomic RPCs, or ``None`` when the method is not one of them."""
         if method == "ADMIT_PAPER_OPPORTUNITY":
             try:
                 request_model = PaperAdmissionRequest.from_dict(request["request"])
@@ -269,14 +290,7 @@ class CanonicalWriterServer:
             return self.writer.trigger_paper_protection_action(
                 action_request
             ).to_dict()
-        if method == "CONFIRM_OPS_APPLIED":
-            return self.writer.confirm_ops_applied(str(request["event_id"])).to_dict()
-        if method == "MARK_HANDOFF_SUPERSEDED":
-            return self.writer.mark_handoff_superseded(str(request["event_id"])).to_dict()
-        if method == "ADVANCE_EPOCH":
-            epoch = self.writer.advance_history_epoch_for_restore()
-            return {"status": "OK", "history_epoch": epoch}
-        return WriterAck(status="REJECTED", error_code="UNKNOWN_METHOD").to_dict()
+        return None
 
     def _enqueue(self, intent: WriterIntent) -> WriterAck:
         if self._health_status() != "OK":
