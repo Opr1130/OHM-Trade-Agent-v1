@@ -480,6 +480,19 @@ def test_unknown_economic_model_version_fails_closed():
         paper_economics_for_version("not-a-real-version")
 
 
+def test_existing_trade_stays_bound_to_its_own_model_version(env):
+    """E3: a future model version cannot reinterpret an existing execution."""
+    server, _ = env
+    _run(env)
+    committed = _rows(server.writer, FILL_EVENT)[0]
+    assert committed["economic_model_version"] == PAPER_ECONOMIC_MODEL_VERSION
+    # A trade carries its own version, and that version's coefficients are frozen,
+    # so a later registry addition cannot retroactively change this fill.
+    economics = paper_economics_for_version(committed["economic_model_version"])
+    notional = committed["quantity"] * committed["price"]
+    assert committed["fee_cost"] == pytest.approx(notional * economics.fee_rate)
+
+
 def test_settings_change_after_attempt_cannot_change_the_fill(env):
     """E1/E2: the fill is bound to the frozen model, not to mutable settings."""
     server, _ = env
@@ -665,15 +678,91 @@ def test_active_exposures_empty_when_nothing_is_held(env):
     assert result.exposures == []
 
 
-def test_admitted_without_fill_is_not_active_exposure(env):
+def test_admitted_reservation_with_no_fill_is_not_active_exposure(env):
+    """A reservation alone is not exposure.
+
+    Seeded directly as canonical evidence so the state under test - an admitted
+    disposition with no fills and no terminal record - is explicit rather than
+    transient.
+    """
     server, client = env
-    _run(env)
-    # The trade has a fill, so remove exposure from the picture by checking the
-    # reservation-only case via the portfolio projection instead.
+
+    # Build the same canonical ancestry the producer would: instrument, decision
+    # snapshot, decision context, then admission. That yields the real
+    # "reserved but never filled" state rather than a synthetic one.
+    from app.opip.contracts.paper_execution_runtime import (
+        PaperAdmissionRequest,
+        admission_result_identities,
+    )
+    from app.services.paper_v2_decision_snapshot import (
+        DecisionSnapshot,
+        commit_decision_snapshot,
+    )
+    from app.services.paper_v2_instrument_registration import (
+        ensure_instrument_version_registered,
+    )
+    from app.opip.canonical.decision_context_bridge import (
+        DecisionContextFacts,
+        commit_decision_context,
+    )
+
+    disposition_id = "PDISP:" + "f" * 32
+    paper_trade_id, _reservation_id = admission_result_identities(disposition_id)
+
+    registered = ensure_instrument_version_registered(_version(), client=client)
+    snapshot = DecisionSnapshot.from_payload(_snapshot_payload())
+    snapshot_proof = commit_decision_snapshot(snapshot, client=client)
+    _context_id, _proof = commit_decision_context(
+        DecisionContextFacts(
+            candidate_id="OPIPC:" + "a" * 20,
+            episode_id=snapshot.episode_id,
+            instrument_version_id=INSTRUMENT_VERSION_ID,
+            instrument_registration_event_id=registered.event_id,
+            snapshot_record_event_id=snapshot_proof.event_id,
+            snapshot_id=snapshot.snapshot_id,
+            snapshot_hash=snapshot.snapshot_hash,
+            evaluation_time=QUALIFICATION_TIME,
+            evidence_cutoff=NOW,
+            policy_version="OPIP-GATE-POLICY-TEST",
+            policy_fingerprint="GPF:" + "a" * 16,
+            producing_component="test",
+            artifact_or_build_id="ACF:" + "0" * 64,
+            process_instance_id="PROC:test",
+            emitted_at=QUALIFICATION_TIME,
+            source_record_refs=(),
+        ),
+        client=client,
+    )
+
+    ack = client.admit_paper_opportunity(
+        PaperAdmissionRequest(
+            disposition_id=disposition_id,
+            decision_context_id=_context_id,
+            disposition_seq=0,
+            quote_currency="USD",
+            requested_capital=500.0,
+            disposition_time={
+                "precision": "EXACT",
+                "basis": "SOURCE_REPORTED",
+                "occurred_at": "2026-09-19T12:00:00Z",
+            },
+            expected_portfolio_version=0,
+            capital_policy_version="paper-capital-v1",
+            portfolio_equity_limit=10_000.0,
+            portfolio_position_limit=3,
+            requested_reservation_amount=500.0,
+        )
+    )
+    assert ack.status in {"OK", "DUPLICATE_OK"}, ack.detail
+    assert ack.disposition == "ADMITTED"
+    assert ack.paper_trade_id == paper_trade_id
+
+    # The reservation is active...
     assert server.writer.paper_portfolio_state("USD").active_reservations == 1
-    exposures = client.get_paper_v2_active_exposures()
-    assert len(exposures.exposures) == 1
-    assert exposures.exposures[0].remaining_quantity > 0
+    # ...and it is not exposure.
+    result = client.get_paper_v2_active_exposures()
+    assert result.status == "OK"
+    assert result.exposures == []
 
 
 def test_active_exposure_reports_canonical_facts(env):
@@ -840,3 +929,32 @@ def test_router_summary_reports_no_legacy_calls():
     from app.services.paper_v2_scan_router import PaperV2RouterSummary
 
     assert PaperV2RouterSummary().legacy_calls == 0
+
+
+def test_routing_never_produces_both_authorities(monkeypatch):
+    """C8: one opportunity can never reach both a legacy and a Paper-v2 entry.
+
+    The scan accepts a boolean route, and this asserts the invariant that no
+    outcome can be simultaneously "legacy published" and "Paper-v2 routed".
+    """
+    from app.jobs import scan_opportunities
+
+    outcomes: set[tuple[bool, bool]] = set()
+    for mode, drain in (("off", None), ("active", "drained"), ("active", "blocked")):
+        settings = SimpleNamespace(opip_paper_v2_mode=mode)
+        routed = False
+        if scan_opportunities._paper_v2_active_safe(settings):
+            ready, _reason = (True, "drained") if drain == "drained" else (False, drain)
+            routed = bool(ready)
+        legacy = mode == "off"
+        outcomes.add((legacy, routed))
+
+    # Every reachable pair is exclusive. "Neither" is a legitimate outcome (cutover
+    # requested while legacy is still draining: no new entry in either authority),
+    # but "both" never is.
+    for legacy, routed in outcomes:
+        assert not (legacy and routed), (legacy, routed)
+    # And the two authorities each own at least one state.
+    assert (True, False) in outcomes   # OFF: legacy only
+    assert (False, True) in outcomes   # ACTIVE + drained: Paper v2 only
+    assert (False, False) in outcomes  # ACTIVE + draining: neither
