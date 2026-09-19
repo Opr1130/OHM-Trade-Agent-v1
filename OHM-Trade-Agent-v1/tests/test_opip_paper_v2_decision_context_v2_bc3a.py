@@ -69,6 +69,39 @@ _V1_FIXTURE = {
 }
 
 
+def _provenance_contract() -> Provenance:
+    """The real Provenance contract used by envelope and direct-construction tests."""
+    return Provenance(
+        producing_component="paper_v2_execution",
+        artifact_or_build_id="ACF:" + "0" * 64,
+        process_instance_id="proc-1",
+        emitted_at=NOW,
+        source_record_refs=("source:1",),
+    )
+
+
+def _v2_contract(payload: dict) -> DecisionContextV2:
+    """Build the v2 contract directly, so field type handling is exercised."""
+    return DecisionContextV2(
+        context_id=payload["context_id"],
+        candidate_id=payload["candidate_id"],
+        episode_id=payload["episode_id"],
+        instrument_version=payload["instrument_version"],
+        snapshot_id=payload["snapshot_id"],
+        snapshot_hash=payload["snapshot_hash"],
+        evaluation_time=NOW,
+        evidence_cutoff=NOW,
+        policy_version=payload["policy_version"],
+        policy_fingerprint=payload["policy_fingerprint"],
+        environment=payload["environment"],
+        eligibility=payload["eligibility"],
+        provenance=_provenance_contract(),
+        schema_version=payload["schema_version"],
+        supersedes_id=payload.get("supersedes_id"),
+        supersession_reason=payload.get("supersession_reason"),
+    )
+
+
 def _v1_payload() -> dict:
     """A complete, valid schema-v1 context payload."""
     payload = {
@@ -365,8 +398,11 @@ def test_decision_boundary_is_a_valid_evidence_cutoff():
 
 
 def test_naive_timestamps_are_rejected():
-    payload = _v2_payload(evaluation_time="2026-09-19T12:00:00")
     with pytest.raises(ValueError):
+        # Construction is inside the block because the identity helper now
+        # rejects an unusable timestamp before validation ever runs. The
+        # invariant is unchanged: a naive timestamp cannot produce a v2 context.
+        payload = _v2_payload(evaluation_time="2026-09-19T12:00:00")
         validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
 
 
@@ -975,6 +1011,405 @@ def test_v1_context_supersession_semantics_are_unchanged():
     assert validate_di_payload(
         DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload
     )["supersedes_id"] == "DI-CONTEXT:some-earlier-context"
+
+
+# ---------------------------------------------------------------------------
+# Cross-version supersession is forbidden (Finding 1)
+# ---------------------------------------------------------------------------
+
+
+def _commit_v1_context(writer: CanonicalWriter, payload: dict) -> str:
+    from app.opip.canonical.models import WriterIntent
+
+    ack = writer.submit(
+        WriterIntent(
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=context_idempotency_key(context_id=payload["context_id"]),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+        )
+    )
+    assert ack.status == "OK", ack.detail
+    return payload["context_id"]
+
+
+def _superseding_v2_payload(target_context_id: str) -> dict:
+    return _v2_payload(
+        supersedes_id=target_context_id,
+        supersession_reason="corrected after a revision",
+    )
+
+
+def _superseding_v1_payload(target_context_id: str) -> dict:
+    payload = _v1_payload()
+    payload["supersedes_id"] = target_context_id
+    payload["supersession_reason"] = "corrected after a revision"
+    payload["context_id"] = context_identity(payload)
+    return payload
+
+
+def _submit_context(writer: CanonicalWriter, payload: dict):
+    from app.opip.canonical.models import WriterIntent
+
+    return writer.submit(
+        WriterIntent(
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=context_idempotency_key(context_id=payload["context_id"]),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+        )
+    )
+
+
+def _context_row_count(writer: CanonicalWriter) -> int:
+    return int(
+        writer._conn.execute(  # noqa: SLF001 - test-only inspection
+            "SELECT COUNT(*) FROM events WHERE event_type = ?",
+            (DECISION_INTELLIGENCE_CONTEXT_RECORDED,),
+        ).fetchone()[0]
+    )
+
+
+def test_v1_to_v1_supersession_still_commits_and_reconstructs(writer):
+    from app.opip.decision_intelligence.evidence_reader import (
+        read_di_evidence_snapshot,
+    )
+
+    original = _v1_payload()
+    _commit_v1_context(writer, original)
+    superseding = _superseding_v1_payload(original["context_id"])
+    assert _commit_v1_context(writer, superseding) == superseding["context_id"]
+
+    snapshot = read_di_evidence_snapshot(db_path=writer.db_path)
+    assert set(snapshot.contexts) == {original["context_id"], superseding["context_id"]}
+    assert snapshot.contexts_v2 == {}
+    assert len(snapshot.supersession_edges) == 1
+    assert snapshot.supersession_edges[0].supersedes_id == original["context_id"]
+
+
+def test_v2_to_v2_supersession_still_commits_and_reconstructs(writer):
+    from app.opip.decision_intelligence.evidence_reader import (
+        read_di_evidence_snapshot,
+    )
+
+    original_id, superseding_id = _commit_v2_supersession_pair(writer)
+    snapshot = read_di_evidence_snapshot(db_path=writer.db_path)
+    assert set(snapshot.contexts_v2) == {original_id, superseding_id}
+    assert snapshot.contexts == {}
+    assert len(snapshot.supersession_edges) == 1
+    assert snapshot.supersession_edges[0].supersedes_id == original_id
+
+
+def test_v2_superseding_a_v1_context_is_rejected_before_commit(writer):
+    original = _v1_payload()
+    _commit_v1_context(writer, original)
+    ack = _submit_context(writer, _superseding_v2_payload(original["context_id"]))
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+    assert "cross-version decision context supersession" in str(ack.detail)
+    # Exactly the original remains: no partial durable evidence.
+    assert _context_row_count(writer) == 1
+
+
+def test_v1_superseding_a_v2_context_is_rejected_before_commit(writer):
+    original_id, _ = _commit_v2_supersession_pair(writer)
+    before = _context_row_count(writer)
+    superseding_v1 = _superseding_v1_payload(original_id)
+    ack = _submit_context(writer, superseding_v1)
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+    assert "cross-version decision context supersession" in str(ack.detail)
+    assert _context_row_count(writer) == before
+
+
+def test_rejected_cross_version_attempt_leaves_no_evidence_and_is_retryable(writer):
+    """A refused cross-version correction is not partially durable."""
+    original = _v1_payload()
+    _commit_v1_context(writer, original)
+    before = _context_row_count(writer)
+    payload = _superseding_v2_payload(original["context_id"])
+
+    first = _submit_context(writer, payload)
+    second = _submit_context(writer, payload)
+    assert first.status == "REJECTED"
+    assert second.status == "REJECTED"
+    assert _context_row_count(writer) == before
+
+    # Control: the same supersession against a v2 target is deterministic.
+    v2_original = _v2_payload()
+    _commit_v2_context(writer, v2_original)
+    v2_superseding = _superseding_v2_payload(v2_original["context_id"])
+    assert _submit_context(writer, v2_superseding).status == "OK"
+    assert _submit_context(writer, v2_superseding).status == "DUPLICATE_OK"
+
+
+# ---------------------------------------------------------------------------
+# Envelope accepts both context versions (Finding 2)
+# ---------------------------------------------------------------------------
+
+
+def test_v1_context_envelope_is_valid():
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v1_payload()
+    envelope = DIEventEnvelope(
+        event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+        payload=payload,
+        provenance=_provenance_contract(),
+        payload_schema_version=1,
+    )
+    assert envelope.payload_schema_version == 1
+
+
+def test_v2_context_envelope_is_valid():
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v2_payload()
+    envelope = DIEventEnvelope(
+        event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+        payload=payload,
+        provenance=_provenance_contract(),
+        payload_schema_version=2,
+    )
+    assert envelope.payload_schema_version == 2
+
+
+@pytest.mark.parametrize(
+    ("envelope_version", "payload_version"),
+    [(2, 1), (1, 2)],
+)
+def test_envelope_and_payload_version_mismatch_fails(envelope_version, payload_version):
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v2_payload()
+    payload["schema_version"] = payload_version
+    with pytest.raises(ValueError, match="must match the envelope"):
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+            provenance=_provenance_contract(),
+            payload_schema_version=envelope_version,
+        )
+
+
+@pytest.mark.parametrize("version", [0, 3, 99])
+def test_context_envelope_rejects_unregistered_schema_versions(version):
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v2_payload()
+    payload["schema_version"] = version
+    with pytest.raises(ValueError, match="unsupported DI event payload_schema_version"):
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+            provenance=_provenance_contract(),
+            payload_schema_version=version,
+        )
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_non_context_envelope_still_requires_schema_version_one(version):
+    """No non-context DI contract is weakened by the context-aware rule."""
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    with pytest.raises(ValueError, match="unsupported DI event payload_schema_version"):
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_REQUEST_RECORDED,
+            payload={"schema_version": version},
+            provenance=_provenance_contract(),
+            payload_schema_version=version,
+        )
+
+
+def test_envelope_rejects_non_integer_schema_versions():
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v2_payload()
+    with pytest.raises(ValueError, match="must be an integer"):
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+            provenance=_provenance_contract(),
+            payload_schema_version="2",
+        )
+    with pytest.raises(ValueError, match="must be an integer"):
+        DIEventEnvelope(
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload={**payload, "schema_version": True},
+            provenance=_provenance_contract(),
+            payload_schema_version=2,
+        )
+
+
+def test_v2_envelope_to_writer_intent_is_canonical_and_unchanged():
+    from app.opip.decision_intelligence.events import DIEventEnvelope
+
+    payload = _v2_payload()
+    envelope = DIEventEnvelope(
+        event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+        payload=payload,
+        provenance=_provenance_contract(),
+        payload_schema_version=2,
+    )
+    intent = envelope.to_writer_intent(idempotency_key="k")
+    assert intent.event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED
+    assert intent.priority == "LOW"
+    assert intent.ops_handoff is None
+    assert intent.schema_version == SCHEMA_VERSION
+    assert intent.payload["schema_version"] == 2
+    assert intent.payload["context_id"] == payload["context_id"]
+    # to_writer_intent renders the envelope's own provenance contract, unchanged.
+    assert intent.payload["provenance"]["source_record_refs"] == ["source:1"]
+    assert intent.payload["provenance"]["process_instance_id"] == "proc-1"
+
+
+# ---------------------------------------------------------------------------
+# V2 required string facts reject malformed types (Finding 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [123, 0, True, False, 1.5, None, ["a"], {"a": 1}, ("a",), b"bytes"],
+)
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "context_id",
+        "candidate_id",
+        "episode_id",
+        "instrument_version",
+        "snapshot_id",
+        "snapshot_hash",
+        "policy_version",
+        "policy_fingerprint",
+        "environment",
+    ],
+)
+def test_v2_required_string_facts_reject_malformed_types(field_name, malformed):
+    """A non-string must never coerce into an apparently valid canonical fact."""
+    payload = _v2_payload()
+    payload[field_name] = malformed
+    with pytest.raises(ValueError, match=f"{field_name} must be a canonical string"):
+        _v2_contract(payload)
+
+
+def test_v2_legitimate_string_facts_still_normalize():
+    """Genuine strings keep their existing trimming behaviour."""
+    payload = _v2_payload(
+        candidate_id="  candidate-padded  ",
+        environment="  paper  ",
+    )
+    context = _v2_contract(payload)
+    assert context.candidate_id == "candidate-padded"
+    assert context.environment == "paper"
+
+
+def test_v1_required_string_behaviour_is_unchanged():
+    """v1 keeps its existing coercion semantics; the new rule is v2-only."""
+    # v1 accepts a non-string where it trims to something non-empty, exactly as
+    # before this change.
+    legacy = DecisionContext(
+        context_id="ctx-1",
+        candidate_id=123,  # type: ignore[arg-type]
+        episode_id="episode-1",
+        evaluation_id="evaluation-1",
+        instrument_version="KRAKEN:SOLUSD:v1",
+        snapshot_id="snapshot-1",
+        snapshot_hash="snapshot-hash-1",
+        evaluation_time=NOW,
+        evidence_cutoff=NOW,
+        consumed_input_watermark={"history_epoch": 0, "local_sequence": 0},
+        feature_version="features-v1",
+        policy_version="policy-v1",
+        detector_version="detector-v1",
+        forecast_version="forecast-v1",
+        candidate_set_ref="candidate-set-1",
+        portfolio_version_ref=None,
+        environment="paper",
+        eligibility=True,
+        missingness={},
+        source_availability_times={},
+        evidence_eligibility_manifest={},
+        provenance=_provenance_contract(),
+    )
+    assert legacy.candidate_id == "123"
+
+
+# ---------------------------------------------------------------------------
+# V2 identity canonicalizes timestamps (Finding 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "equivalent",
+    [
+        "2026-09-19T12:00:00Z",
+        "2026-09-19T12:00:00+00:00",
+        "2026-09-19T14:00:00+02:00",
+        "2026-09-19T07:00:00-05:00",
+    ],
+)
+def test_equivalent_timestamp_representations_derive_one_identity(equivalent):
+    first = _v2_payload(
+        evaluation_time=equivalent,
+        evidence_cutoff=equivalent,
+    )
+    second = _v2_payload(
+        evaluation_time="2026-09-19T12:00:00Z",
+        evidence_cutoff="2026-09-19T12:00:00Z",
+    )
+    assert context_identity_v2(first) == context_identity_v2(second)
+
+
+def test_datetime_objects_and_serialized_forms_derive_one_identity():
+    as_datetime = _v2_payload(evaluation_time=NOW, evidence_cutoff=NOW)
+    as_string = _v2_payload(
+        evaluation_time="2026-09-19T12:00:00Z",
+        evidence_cutoff="2026-09-19T12:00:00Z",
+    )
+    assert context_identity_v2(as_datetime) == context_identity_v2(as_string)
+
+
+def test_equivalent_timestamps_produce_a_payload_that_validates():
+    """The derived id must survive normalization, whichever form was supplied."""
+    payload = _v2_payload(
+        evaluation_time="2026-09-19T14:00:00+02:00",
+        evidence_cutoff="2026-09-19T14:00:00+02:00",
+    )
+    normalized = validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+    assert normalized["context_id"] == payload["context_id"]
+    assert normalized["evaluation_time"] == "2026-09-19T12:00:00Z"
+    assert normalized["evidence_cutoff"] == "2026-09-19T12:00:00Z"
+
+
+def test_materially_different_instants_still_change_identity():
+    base = _v2_payload(evaluation_time=NOW, evidence_cutoff=NOW)
+    later = _v2_payload(
+        evaluation_time="2026-09-19T12:00:01Z",
+        evidence_cutoff="2026-09-19T12:00:01Z",
+    )
+    assert context_identity_v2(base) != context_identity_v2(later)
+
+
+def test_identity_timestamps_still_reject_unusable_values():
+    with pytest.raises(ValueError, match="evaluation_time"):
+        context_identity_v2(_v2_payload(evaluation_time="not-a-timestamp"))
+    with pytest.raises(ValueError, match="evaluation_time"):
+        context_identity_v2(_v2_payload(evaluation_time=123))
+
+
+def test_evidence_cutoff_after_evaluation_time_is_still_enforced_after_normalization():
+    """The ordering rule uses the normalized instants, not the supplied strings."""
+    payload = _v2_payload(
+        evaluation_time="2026-09-19T07:00:00-05:00",
+        evidence_cutoff="2026-09-19T13:00:00+00:00",
+    )
+    # 07:00-05:00 == 12:00Z, and 13:00Z is later.
+    with pytest.raises(ValueError, match="evidence_cutoff cannot be after"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
 
 
 # ---------------------------------------------------------------------------

@@ -418,6 +418,11 @@ class DecisionContextV2:
     supersession_reason: str | None = None
 
     def __post_init__(self) -> None:
+        # Required string facts must be actual ``str`` values before any
+        # normalization. Coercing would let a malformed type (an integer, a float
+        # or a boolean) become an apparently valid canonical identity, which is
+        # unacceptable for newly frozen evidence. Trimming behaviour for genuine
+        # strings is unchanged.
         for field_name in (
             "context_id",
             "candidate_id",
@@ -425,14 +430,17 @@ class DecisionContextV2:
             "instrument_version",
             "snapshot_id",
             "snapshot_hash",
+            "policy_version",
+            "policy_fingerprint",
+            "environment",
         ):
-            value = str(getattr(self, field_name) or "").strip()
-            if not value:
-                raise ValueError(f"{field_name} is required")
-            object.__setattr__(self, field_name, value)
-
-        for field_name in ("policy_version", "policy_fingerprint", "environment"):
-            value = str(getattr(self, field_name) or "").strip()
+            raw = getattr(self, field_name)
+            if not isinstance(raw, str):
+                raise ValueError(
+                    f"{field_name} must be a canonical string, "
+                    f"not {type(raw).__name__}"
+                )
+            value = raw.strip()
             if not value:
                 raise ValueError(f"{field_name} is required")
             object.__setattr__(self, field_name, value)
