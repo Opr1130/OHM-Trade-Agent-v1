@@ -65,26 +65,22 @@ def _seed_context(writer: CanonicalWriter) -> dict:
         build_decision_context_payload,
         submit_decision_context,
     )
-    from app.opip.contracts.identity import ConsumedInputWatermark
+    from app.opip.decision.versioning import (
+        GATE_POLICY_VERSION,
+        gate_policy_fingerprint,
+    )
 
     facts = DecisionContextFacts(
         candidate_id="candidate-read",
         episode_id="episode-read",
-        evaluation_id="evaluation-read",
         instrument_version_id="INSTR:kraken:SOL:USD:1",
         instrument_registration_event_id="EVT:seed-proof",
         snapshot_id="snapshot-read",
         snapshot_hash="snapshot-hash-read",
         evaluation_time=NOW,
         evidence_cutoff=NOW,
-        consumed_input_watermark=ConsumedInputWatermark(
-            history_epoch=0, local_sequence=0
-        ),
-        feature_version="features-read",
-        policy_version="policy-read",
-        detector_version="detector-read",
-        forecast_version="forecast-read",
-        candidate_set_ref="candidate-set-read",
+        policy_version=GATE_POLICY_VERSION,
+        policy_fingerprint=gate_policy_fingerprint(),
         producing_component="read-test",
         artifact_or_build_id="build-read",
         process_instance_id="proc-read",

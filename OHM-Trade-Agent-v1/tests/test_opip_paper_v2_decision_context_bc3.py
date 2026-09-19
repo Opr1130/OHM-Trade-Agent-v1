@@ -26,7 +26,8 @@ from app.opip.canonical.decision_context_bridge import (
 )
 from app.opip.canonical.models import WriterAck
 from app.opip.canonical.writer import CanonicalWriter
-from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
+from app.opip.contracts.identity import InstrumentVersion
+from app.opip.decision.versioning import GATE_POLICY_VERSION, gate_policy_fingerprint
 from app.services.paper_v2_instrument_registration import (
     ensure_instrument_version_registered,
 )
@@ -75,21 +76,14 @@ def _facts(**overrides) -> DecisionContextFacts:
     fields = {
         "candidate_id": "candidate-1",
         "episode_id": "episode-1",
-        "evaluation_id": "evaluation-1",
         "instrument_version_id": INSTRUMENT_VERSION_ID,
         "instrument_registration_event_id": "EVT:instrument-proof-1",
         "snapshot_id": "snapshot-1",
         "snapshot_hash": "snapshot-hash-1",
         "evaluation_time": NOW - timedelta(seconds=30),
         "evidence_cutoff": NOW - timedelta(seconds=60),
-        "consumed_input_watermark": ConsumedInputWatermark(
-            history_epoch=1, local_sequence=1
-        ),
-        "feature_version": "features-bc3",
-        "policy_version": "policy-bc3",
-        "detector_version": "detector-bc3",
-        "forecast_version": "forecast-bc3",
-        "candidate_set_ref": "candidate-set-1",
+        "policy_version": GATE_POLICY_VERSION,
+        "policy_fingerprint": gate_policy_fingerprint(),
         "producing_component": "bc3-test",
         "artifact_or_build_id": "build-bc3",
         "process_instance_id": "proc-bc3",
@@ -180,14 +174,17 @@ def test_instrument_registration_uses_the_adapter_for_commit_proof(writer):
 
 
 def test_context_payload_is_built_by_the_frozen_contract():
-    from app.opip.decision_intelligence.events import context_identity
+    from app.opip.decision_intelligence.events import context_identity_v2
 
     payload = build_decision_context_payload(_facts())
     # The identity is the DI helper's output, not a reimplementation.
-    assert payload["context_id"] == context_identity(payload)
+    assert payload["context_id"] == context_identity_v2(payload)
     assert payload["context_id"] != "pending"
     assert payload["environment"] == "paper"
     assert payload["eligibility"] is True
+    # The contract version is explicit, so a v1 and a v2 context are never
+    # confused for one another.
+    assert payload["schema_version"] == 2
 
 
 def test_context_commits_canonically_and_returns_the_stored_id(writer):
@@ -217,15 +214,52 @@ def test_context_references_the_registered_instrument_lineage(writer):
     assert resolved["instrument_version_id"] == INSTRUMENT_VERSION_ID
 
 
-def test_context_watermark_is_the_supplied_source_watermark():
-    watermark = ConsumedInputWatermark(history_epoch=3, local_sequence=7)
-    payload = build_decision_context_payload(
-        _facts(consumed_input_watermark=watermark)
+def test_context_carries_no_fabricated_v1_committee_facts():
+    """B/C-3A removed the v1 committee facts; the adapter must not reintroduce them.
+
+    Each of these either has no truthful production source or was conceptually
+    something else (the registration coordinate is not an input watermark), so a
+    schema-v2 context must omit them rather than carry a placeholder.
+    """
+    payload = build_decision_context_payload(_facts())
+    for absent in (
+        "evaluation_id",
+        "consumed_input_watermark",
+        "feature_version",
+        "detector_version",
+        "forecast_version",
+        "candidate_set_ref",
+        "portfolio_version_ref",
+        "missingness",
+        "source_availability_times",
+        "evidence_eligibility_manifest",
+    ):
+        assert absent not in payload, absent
+
+
+def test_context_policy_identity_is_the_real_qualification_policy():
+    """The committed policy identity is the live gate policy, not a caller string."""
+    payload = build_decision_context_payload(_facts())
+    assert payload["policy_version"] == GATE_POLICY_VERSION
+    assert payload["policy_fingerprint"] == gate_policy_fingerprint()
+    assert payload["policy_fingerprint"].startswith("GPF:")
+
+
+def test_committed_context_is_reconstructed_as_a_schema_v2_context(writer):
+    """The reader reconstructs the adapter's context as v2, never as v1.
+
+    This is the integration the schema version exists for: the adapter emits the
+    context event under ``schema_version`` 2, so the reader hydrates it into the
+    v2 store and never into the v1 store.
+    """
+    from app.opip.decision_intelligence.evidence_reader import (
+        read_di_evidence_snapshot,
     )
-    assert payload["consumed_input_watermark"] == {
-        "history_epoch": 3,
-        "local_sequence": 7,
-    }
+
+    context_id, _proof = commit_decision_context(_facts(), client=writer)
+    snapshot = read_di_evidence_snapshot(db_path=writer.db_path)
+    assert set(snapshot.contexts_v2) == {context_id}
+    assert snapshot.contexts == {}
 
 
 def test_intent_uses_the_canonical_context_idempotency_key():
@@ -339,14 +373,10 @@ def test_unregistered_instrument_still_fails_closed_in_the_writer(writer):
     [
         "candidate_id",
         "episode_id",
-        "evaluation_id",
         "snapshot_id",
         "snapshot_hash",
-        "feature_version",
         "policy_version",
-        "detector_version",
-        "forecast_version",
-        "candidate_set_ref",
+        "policy_fingerprint",
         "producing_component",
         "artifact_or_build_id",
         "process_instance_id",
@@ -508,7 +538,7 @@ def test_adapter_imports_only_context_evidence_from_the_di_plane():
     assert di_imports == {
         "DECISION_INTELLIGENCE_CONTEXT_RECORDED",
         "context_idempotency_key",
-        "context_identity",
-        "DecisionContext",
+        "context_identity_v2",
+        "DecisionContextV2",
         "Provenance",
     }

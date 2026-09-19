@@ -5,6 +5,19 @@ This module is the narrow adapter that constructs and commits exactly that piece
 of evidence, so the Paper v2 runtime can obtain a context id **without** importing
 the decision-intelligence plane.
 
+Contract version
+----------------
+
+It produces the **schema-v2** DecisionContext, which is the contract that
+describes what the real production qualification path can truthfully produce.
+Schema v1 remains the backward-compatibility authority for previously recorded
+committee evidence and is untouched; this adapter does not emit it and the two
+are never reinterpreted as one another.
+
+Schema v1's committee-oriented facts are intentionally not carried here. A
+required v2 fact this adapter cannot obtain truthfully must fail closed rather
+than be defaulted or invented.
+
 Dependency inversion boundary
 -----------------------------
 
@@ -51,9 +64,9 @@ from app.opip.contracts.identity import ConsumedInputWatermark
 from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_CONTEXT_RECORDED,
     context_idempotency_key,
-    context_identity,
+    context_identity_v2,
 )
-from app.opip.decision_intelligence.identity import DecisionContext, Provenance
+from app.opip.decision_intelligence.identity import DecisionContextV2, Provenance
 
 #: Canonical ACK statuses that prove a record is durably committed. Anything else
 #: - REJECTED, RETRYABLE, SPOOLED, DISABLED - is not proof.
@@ -172,11 +185,24 @@ class DecisionContextFacts:
     appears here, which is what lets runtime code supply it without importing the
     DI plane. Every field is required; there are no defaults, so a caller cannot
     omit a fact and silently get a placeholder.
+
+    The shape is the **schema v2** production contract. Schema v1's
+    committee-oriented facts - ``evaluation_id``, ``consumed_input_watermark``,
+    ``feature_version``, ``detector_version``, ``forecast_version``,
+    ``candidate_set_ref`` and the evidence-eligibility manifest - are deliberately
+    absent rather than carried as placeholders: the production qualification path
+    has no truthful value for them, and B/C-3A forbids fabricating them. A committee
+    path that needs them must fail closed on a schema-v2 context instead of having
+    them invented here.
+
+    In particular the instrument-version registration coordinate is **not** a
+    consumed-input watermark: registration proves the instrument exists, it does not
+    describe the canonical input position the decision consumed, and B/C-3A forbids
+    that mapping.
     """
 
     candidate_id: str
     episode_id: str
-    evaluation_id: str
     instrument_version_id: str
     #: Proof that the referenced instrument version is already committed
     #: canonically (the event id returned by registration). Required, so a context
@@ -186,12 +212,8 @@ class DecisionContextFacts:
     snapshot_hash: str
     evaluation_time: datetime
     evidence_cutoff: datetime
-    consumed_input_watermark: ConsumedInputWatermark
-    feature_version: str
     policy_version: str
-    detector_version: str
-    forecast_version: str
-    candidate_set_ref: str
+    policy_fingerprint: str
     producing_component: str
     artifact_or_build_id: str
     process_instance_id: str
@@ -219,11 +241,13 @@ def _build_provenance(facts: DecisionContextFacts) -> Provenance:
 
 
 def build_decision_context_payload(facts: DecisionContextFacts) -> dict:
-    """Build the canonical context payload with its DI-derived ``context_id``.
+    """Build the canonical schema-v2 context payload with its derived ``context_id``.
 
-    Construction goes through the frozen ``DecisionContext`` contract, so every DI
-    invariant is enforced by the contract itself. Identity comes from the existing
-    ``context_identity`` helper - no hash is reconstructed here.
+    Construction goes through the frozen ``DecisionContextV2`` contract, so every
+    v2 invariant is enforced by the contract itself: the required-string type rules,
+    the ``evidence_cutoff <= evaluation_time`` ordering, and the paired
+    supersession rule. Identity comes from the existing ``context_identity_v2``
+    helper - no hash is reconstructed here.
     """
     if not isinstance(facts, DecisionContextFacts):
         raise ValueError("facts must be DecisionContextFacts")
@@ -235,11 +259,10 @@ def build_decision_context_payload(facts: DecisionContextFacts) -> dict:
         field_name="instrument_registration_event_id",
     )
 
-    context = DecisionContext(
+    context = DecisionContextV2(
         context_id=_CONTEXT_ID_PLACEHOLDER,
         candidate_id=_require_text(facts.candidate_id, field_name="candidate_id"),
         episode_id=_require_text(facts.episode_id, field_name="episode_id"),
-        evaluation_id=_require_text(facts.evaluation_id, field_name="evaluation_id"),
         instrument_version=_require_canonical_text(
             facts.instrument_version_id, field_name="instrument_version_id"
         ),
@@ -247,32 +270,18 @@ def build_decision_context_payload(facts: DecisionContextFacts) -> dict:
         snapshot_hash=_require_text(facts.snapshot_hash, field_name="snapshot_hash"),
         evaluation_time=facts.evaluation_time,
         evidence_cutoff=facts.evidence_cutoff,
-        consumed_input_watermark=facts.consumed_input_watermark,
-        feature_version=_require_text(
-            facts.feature_version, field_name="feature_version"
-        ),
         policy_version=_require_text(facts.policy_version, field_name="policy_version"),
-        detector_version=_require_text(
-            facts.detector_version, field_name="detector_version"
+        policy_fingerprint=_require_text(
+            facts.policy_fingerprint, field_name="policy_fingerprint"
         ),
-        forecast_version=_require_text(
-            facts.forecast_version, field_name="forecast_version"
-        ),
-        candidate_set_ref=_require_text(
-            facts.candidate_set_ref, field_name="candidate_set_ref"
-        ),
-        portfolio_version_ref=None,
         environment=PAPER_ENVIRONMENT,
         eligibility=True,
-        missingness={},
-        source_availability_times={},
-        evidence_eligibility_manifest={},
         provenance=_build_provenance(facts),
     )
     payload = context.as_dict()
     # ``context_id`` is a derived identity over the assembled payload: the
     # contract's own helper computes it, exactly as the canonical writer expects.
-    payload["context_id"] = context_identity(payload)
+    payload["context_id"] = context_identity_v2(payload)
     return payload
 
 

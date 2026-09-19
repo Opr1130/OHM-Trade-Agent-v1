@@ -48,7 +48,7 @@ from app.opip.canonical.decision_context_bridge import (
     commit_decision_context,
     require_canonical_commit,
 )
-from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
+from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_ECONOMIC_MODEL_VERSION,
@@ -68,6 +68,7 @@ from app.opip.contracts.paper_execution_runtime import (
 )
 from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import require_utc
+from app.opip.decision.versioning import GATE_POLICY_VERSION, gate_policy_fingerprint
 from app.services.paper_v2_instrument_registration import (
     InstrumentRegistrationError,
     ensure_instrument_version_registered,
@@ -86,6 +87,11 @@ from app.services.paper_v2_quote_evidence import (
 ENTRY_PREFIX = "ENTRY"
 ATTEMPT_PREFIX = "ATTEMPT"
 FILL_PREFIX = "FILL"
+
+#: The component name this producer stamps into its own evidence provenance. It
+#: names the module that actually emits the record, so it is a fact rather than a
+#: placeholder; the build and process identity are supplied by the caller.
+PRODUCING_COMPONENT = "paper_v2_execution"
 
 #: Terminal, non-continuing admission outcomes. Each stops this opportunity.
 STOP_DISPOSITIONS = frozenset({"CAPACITY_REJECTED", "CAPITAL_REJECTED"})
@@ -106,19 +112,20 @@ class PaperV2Opportunity:
     # Canonical lineage
     candidate_id: str
     episode_id: str
-    evaluation_id: str
     cohort_id: str
     instrument_version_id: str
     snapshot_id: str
     snapshot_hash: str
     evaluation_time: datetime
     evidence_cutoff: datetime
-    feature_version: str
-    policy_version: str
-    detector_version: str
-    forecast_version: str
-    candidate_set_ref: str
     source_record_refs: tuple[str, ...]
+    #: Producer provenance. Required, with no defaults, so the producer can never
+    #: fall back to a placeholder build or process identity: the caller must supply
+    #: the identity it actually runs under. The policy identity is deliberately not
+    #: a caller fact - it is read from the live gate policy, which is the only
+    #: authority on which policy qualified the opportunity.
+    artifact_or_build_id: str
+    process_instance_id: str
     # Instrument (registration input)
     instrument_version: InstrumentVersion
     # Portfolio / admission
@@ -224,28 +231,25 @@ def run_paper_v2_opportunity(
         raise PaperV2ExecutionError(f"instrument registration failed: {exc}") from exc
 
     # --- 2. canonical decision context -------------------------------------
+    # The schema-v2 context carries only facts this path can state truthfully. The
+    # policy identity comes from the live gate policy rather than from a caller, so
+    # a context cannot commit to a policy identity that did not actually qualify
+    # the opportunity. The instrument registration proves the instrument exists; its
+    # coordinate is deliberately NOT reused as a consumed-input watermark.
     facts = DecisionContextFacts(
         candidate_id=opportunity.candidate_id,
         episode_id=opportunity.episode_id,
-        evaluation_id=opportunity.evaluation_id,
         instrument_version_id=opportunity.instrument_version_id,
         instrument_registration_event_id=registered.event_id,
         snapshot_id=opportunity.snapshot_id,
         snapshot_hash=opportunity.snapshot_hash,
         evaluation_time=opportunity.evaluation_time,
         evidence_cutoff=opportunity.evidence_cutoff,
-        consumed_input_watermark=ConsumedInputWatermark(
-            history_epoch=registered.history_epoch,
-            local_sequence=registered.local_sequence,
-        ),
-        feature_version=opportunity.feature_version,
-        policy_version=opportunity.policy_version,
-        detector_version=opportunity.detector_version,
-        forecast_version=opportunity.forecast_version,
-        candidate_set_ref=opportunity.candidate_set_ref,
-        producing_component="paper_v2_execution",
-        artifact_or_build_id="paper_v2_execution",
-        process_instance_id="paper_v2_execution",
+        policy_version=GATE_POLICY_VERSION,
+        policy_fingerprint=gate_policy_fingerprint(),
+        producing_component=PRODUCING_COMPONENT,
+        artifact_or_build_id=opportunity.artifact_or_build_id,
+        process_instance_id=opportunity.process_instance_id,
         emitted_at=moment,
         source_record_refs=opportunity.source_record_refs,
     )

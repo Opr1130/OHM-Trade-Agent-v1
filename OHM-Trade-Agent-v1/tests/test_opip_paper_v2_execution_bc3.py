@@ -95,19 +95,15 @@ def _opportunity(**overrides) -> PaperV2Opportunity:
     fields = {
         "candidate_id": "candidate-1",
         "episode_id": "episode-1",
-        "evaluation_id": "evaluation-1",
         "cohort_id": "cohort-1",
         "instrument_version_id": INSTRUMENT_VERSION_ID,
         "snapshot_id": "snapshot-1",
         "snapshot_hash": "snapshot-hash-1",
         "evaluation_time": NOW,
         "evidence_cutoff": NOW,
-        "feature_version": "features-1",
-        "policy_version": "policy-1",
-        "detector_version": "detector-1",
-        "forecast_version": "forecast-1",
-        "candidate_set_ref": "candidate-set-1",
         "source_record_refs": ("source:1",),
+        "artifact_or_build_id": "build-test",
+        "process_instance_id": "proc-test",
         "instrument_version": _version(),
         "quote_currency": "USD",
         "requested_capital": 500.0,
@@ -174,6 +170,46 @@ def test_full_path_executes_and_commits_every_stage(env):
     assert len(_rows(writer, PAPER_EXECUTION_ATTEMPT_RECORDED)) == 1
     assert len(_rows(writer, PAPER_FILL_RECORDED)) == 1
     assert len(_rows(writer, PAPER_PROTECTION_PLAN_RECORDED)) == 1
+
+
+def test_producer_commits_a_schema_v2_decision_context(env):
+    """The producer's lineage context is schema v2 and reconstructs as v2.
+
+    Increment 5's context must be the production schema-v2 contract: the reader
+    must hydrate it into the v2 store, and the payload must carry the live gate
+    policy identity rather than the v1 committee facts B/C-3A removed.
+    """
+    from app.opip.decision.versioning import (
+        GATE_POLICY_VERSION,
+        gate_policy_fingerprint,
+    )
+    from app.opip.decision_intelligence.evidence_reader import (
+        read_di_evidence_snapshot,
+    )
+
+    server, _ = env
+    _run(env)
+    rows = _rows(server.writer, "decision_intelligence.context.recorded")
+    assert len(rows) == 1
+    payload = rows[0]
+    assert payload["schema_version"] == 2
+    assert payload["policy_version"] == GATE_POLICY_VERSION
+    assert payload["policy_fingerprint"] == gate_policy_fingerprint()
+
+    # The v1 committee facts must not reappear as fabricated lineage.
+    for absent in (
+        "evaluation_id",
+        "consumed_input_watermark",
+        "feature_version",
+        "detector_version",
+        "forecast_version",
+        "candidate_set_ref",
+    ):
+        assert absent not in payload, absent
+
+    snapshot = read_di_evidence_snapshot(db_path=server.writer.db_path)
+    assert set(snapshot.contexts_v2) == {payload["context_id"]}
+    assert snapshot.contexts == {}
 
 
 def test_entry_intent_is_long_only_and_references_the_reservation(env):
