@@ -7,9 +7,9 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
 from app.opip.canonical.paths import (
@@ -34,7 +34,12 @@ from app.opip.contracts.events import (
     MARKET_INSTRUMENT_VERSION_RECORDED,
     MARKET_OBSERVATION_RECORDED,
 )
-from app.opip.contracts.paper_execution import ExecutionState
+from app.opip.contracts.paper_execution import (
+    ExecutionState,
+    PositionState,
+    ProtectionState,
+    TerminalReconciliationState,
+)
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_EXECUTION_PRIORITY,
@@ -42,22 +47,39 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_FILL_RECORDED,
     PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
+    PAPER_PROTECTION_PLAN_RECORDED,
+    PAPER_PROTECTION_STATE_RECORDED,
+    PAPER_PROTECTION_TRIGGER_RECORDED,
+    PAPER_RECONCILIATION_RECORDED,
     event_contract as paper_event_contract,
     paper_evidence_idempotency_key,
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_execution_runtime import (
+    PAPER_ACTION_ARMED_STATES,
+    PAPER_ACTION_EXIT_SIDE,
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
+    PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
+    PAPER_TRIGGER_TYPES_REQUIRING_QUOTE,
+    PAPER_V2_ALL_EVENT_TYPES,
+    PAPER_V2_ATOMIC_ONLY_EVENT_TYPES,
+    PAPER_V2_WRITER_EVENT_TYPES,
     PaperAdmissionAck,
     PaperAdmissionRequest,
+    PaperProtectionActionAck,
+    PaperProtectionActionRequest,
     admission_request_idempotency_key,
     admission_result_identities,
+    protection_action_idempotency_key,
+    protection_transition_allowed,
+    protection_transition_requires_trigger,
     quote_evidence_idempotency_key,
     resolve_capital_policy,
     validate_admission_request,
     validate_admission_request_record_payload,
+    validate_protection_action_request,
     validate_quote_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import (
@@ -98,6 +120,38 @@ _ALERT_CAPTURE_GAP_RECORDED = "alert_governor.capture_gap.recorded"
 _ALERT_RESERVATION_RELEASED = "alert_governor.reservation.released"
 _ALERT_TRANSITION_RECORDED = "alert_governor.transition.recorded"
 
+#: Shared canonical-writer SQL and messages, defined once because several
+#: transactional paths must read the same meta row for the same reason.
+_META_SEQUENCE_SQL = (
+    "SELECT history_epoch, next_local_sequence, schema_version FROM meta WHERE id = 1"
+)
+_META_ROW_MISSING = "canonical meta row missing"
+_EVENT_PAYLOADS_BY_TYPE_SQL = (
+    "SELECT payload_json FROM events WHERE event_type = ? "
+    "ORDER BY history_epoch ASC, local_sequence ASC"
+)
+
+#: Execution states from which an attempt can still receive fills. This is the
+#: single definition of "fill-capable": fill validation and the exit-capacity
+#: projection both use it, so a live attempt cannot be forgotten by one while the
+#: other still honours it.
+_FILLABLE_EXECUTION_STATES = frozenset(
+    {
+        ExecutionState.ACCEPTED,
+        ExecutionState.WORKING,
+        ExecutionState.PARTIALLY_FILLED,
+        ExecutionState.FILLED,
+    }
+)
+
+#: Numeric tolerance for canonical Paper v2 quantity/price comparisons.
+_QUANTITY_TOLERANCE = 1e-9
+
+#: String values of the fill-capable execution states. The single definition of
+#: "this attempt can still receive fills", used both by fill validation and by the
+#: exit-capacity projection, so the two cannot drift apart.
+_FILLABLE_STATE_VALUES = frozenset(state.value for state in _FILLABLE_EXECUTION_STATES)
+
 #: Same idempotency key + different semantic payload is integrity corruption.
 #: Feature snapshots and rolling-state checkpoints are included after redacting
 #: volatile clocks so a re-poll that only advances ``evaluated_at_utc`` /
@@ -117,7 +171,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # strategy/execution provenance) is exactly what makes two otherwise
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
-    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+    | PAPER_V2_ALL_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -190,7 +244,7 @@ ACCEPTED_EVENT_TYPES = (
     | FEATURE_BUS_EVENT_TYPES
     | DECISION_INTELLIGENCE_EVENT_TYPES
     | PAPER_OUTCOME_EVENT_TYPES
-    | PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+    | PAPER_V2_WRITER_EVENT_TYPES
 )
 
 
@@ -720,11 +774,10 @@ class CanonicalWriter:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 meta = self._conn.execute(
-                    "SELECT history_epoch, next_local_sequence, schema_version "
-                    "FROM meta WHERE id = 1"
+                    _META_SEQUENCE_SQL
                 ).fetchone()
                 if meta is None:
-                    raise ValueError("canonical meta row missing")
+                    raise ValueError(_META_ROW_MISSING)
                 if int(meta["schema_version"]) != SCHEMA_VERSION:
                     self._conn.rollback()
                     return PaperAdmissionAck(
@@ -933,6 +986,267 @@ class CanonicalWriter:
                     detail=str(exc),
                 )
 
+    # ------------------------------------------------------------------
+    # B/C-2 writer-owned atomic protection action
+    # ------------------------------------------------------------------
+
+    def _protection_action_bundle(
+        self,
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> list[tuple[str, str, str, Mapping[str, Any]]]:
+        """Role-ordered ``(role, event_type, idempotency_key, payload)`` for the bundle."""
+        trigger = payloads["trigger"]
+        exit_order_intent = payloads["exit_order_intent"]
+        protection_state = payloads["protection_state"]
+        return [
+            (
+                "trigger",
+                PAPER_PROTECTION_TRIGGER_RECORDED,
+                protection_action_idempotency_key(trigger),
+                trigger,
+            ),
+            (
+                "exit_order_intent",
+                PAPER_ORDER_INTENT_RECORDED,
+                paper_evidence_idempotency_key(
+                    PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+                ),
+                exit_order_intent,
+            ),
+            (
+                "protection_state",
+                PAPER_PROTECTION_STATE_RECORDED,
+                paper_evidence_idempotency_key(
+                    PAPER_PROTECTION_STATE_RECORDED, protection_state
+                ),
+                protection_state,
+            ),
+        ]
+
+    @staticmethod
+    def _canonical_payload_json(payload: Mapping[str, object]) -> str:
+        return json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
+
+    def _existing_protection_action_result(
+        self,
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> PaperProtectionActionAck | None:
+        """Deterministic retry resolution for the atomic protection bundle.
+
+        A retry is ``DUPLICATE_OK`` only when all three facts already exist with
+        byte-identical payloads. A partially committed bundle is an integrity
+        contradiction and fails closed: missing artifacts are never manufactured
+        from current mutable state.
+        """
+        roles = ("trigger", "exit_order_intent", "protection_state")
+        found: dict[str, tuple[Any, Mapping[str, Any]]] = {}
+        for role, event_type, key, payload in self._protection_action_bundle(payloads):
+            row = self._conn.execute(
+                """
+                SELECT event_id, history_epoch, local_sequence, payload_json
+                FROM events
+                WHERE event_type = ? AND idempotency_key = ?
+                """,
+                (event_type, key),
+            ).fetchone()
+            if row is not None:
+                found[role] = (row, payload)
+        if not found:
+            return None
+        if len(found) != 3:
+            present = ",".join(sorted(found))
+            missing = ",".join(sorted(set(roles) - set(found)))
+            return PaperProtectionActionAck(
+                status="REJECTED",
+                error_code="PROTECTION_ACTION_BUNDLE_INCOMPLETE",
+                detail=(
+                    "protection action bundle is only partially committed "
+                    f"(present={present}; missing={missing}); refusing to "
+                    "reconstruct missing evidence"
+                ),
+            )
+        for role in roles:
+            row, payload = found[role]
+            try:
+                stored = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="PROTECTION_ACTION_BUNDLE_CORRUPT",
+                    detail=f"persisted {role} payload is invalid JSON",
+                )
+            if self._canonical_payload_json(stored) != self._canonical_payload_json(
+                payload
+            ):
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    trigger_event_id=str(found["trigger"][0]["event_id"]),
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    detail=(
+                        f"{role} identity already committed with a different payload"
+                    ),
+                )
+        state_row = found["protection_state"][0]
+        return PaperProtectionActionAck(
+            status="DUPLICATE_OK",
+            trigger_event_id=str(found["trigger"][0]["event_id"]),
+            exit_order_intent_event_id=str(found["exit_order_intent"][0]["event_id"]),
+            protection_state_event_id=str(state_row["event_id"]),
+            history_epoch=int(state_row["history_epoch"]),
+            local_sequence=int(state_row["local_sequence"]),
+        )
+
+    def trigger_paper_protection_action(
+        self,
+        request: PaperProtectionActionRequest,
+    ) -> PaperProtectionActionAck:
+        """Atomically record a protection trigger, its EXIT intent and TRIGGERED state.
+
+        The three facts either all commit or none do, so a trigger is never
+        stranded without the EXIT order intent it caused and a producer cannot
+        assert TRIGGERED independently. Nothing here changes exposure: position
+        quantity and economics move only when canonical B/C-1 fills later commit.
+        """
+        with self._lock:
+            try:
+                payloads = validate_protection_action_request(request)
+            except (TypeError, ValueError) as exc:
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="INVALID_PROTECTION_ACTION_REQUEST",
+                    detail=str(exc),
+                )
+
+            existing = self._existing_protection_action_result(payloads)
+            if existing is not None:
+                return existing
+
+            trigger = payloads["trigger"]
+            exit_order_intent = payloads["exit_order_intent"]
+            protection_state = payloads["protection_state"]
+            paper_trade_id = str(trigger["paper_trade_id"])
+            plan_id = str(trigger["protection_plan_id"])
+            now = _utc_now()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                meta = self._conn.execute(
+                    _META_SEQUENCE_SQL
+                ).fetchone()
+                if meta is None:
+                    raise ValueError(_META_ROW_MISSING)
+                if int(meta["schema_version"]) != SCHEMA_VERSION:
+                    self._conn.rollback()
+                    return PaperProtectionActionAck(
+                        status="REJECTED",
+                        error_code="DB_SCHEMA_MISMATCH",
+                    )
+                history_epoch = int(meta["history_epoch"])
+                next_sequence = int(meta["next_local_sequence"])
+
+                # All action validation happens before any row is written, so a
+                # rejected action commits nothing.
+                context_id = self._validate_protection_action(
+                    trigger=trigger,
+                    exit_order_intent=exit_order_intent,
+                    protection_state=protection_state,
+                    paper_trade_id=paper_trade_id,
+                    plan_id=plan_id,
+                )
+
+                # Deterministic insertion order: trigger, EXIT intent, TRIGGERED
+                # state. The EXIT intent and the state both name the trigger they
+                # were caused by; the trigger payload itself is never mutated to
+                # carry the exit identity.
+                trigger_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_PROTECTION_TRIGGER_RECORDED,
+                    idempotency_key=protection_action_idempotency_key(trigger),
+                    payload=trigger,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence,
+                    now=now,
+                    correlation_id=context_id,
+                )
+                exit_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_ORDER_INTENT_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+                    ),
+                    payload=exit_order_intent,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence + 1,
+                    now=now,
+                    causation_id=trigger_event_id,
+                    correlation_id=context_id,
+                )
+                # Validated after the trigger row exists in this transaction, so
+                # the TRIGGERED rule is satisfied by the fact committed with it.
+                self._validate_protection_state(protection_state)
+                state_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_PROTECTION_STATE_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_PROTECTION_STATE_RECORDED, protection_state
+                    ),
+                    payload=protection_state,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence + 2,
+                    now=now,
+                    causation_id=trigger_event_id,
+                    correlation_id=context_id,
+                )
+                state_sequence = next_sequence + 2
+                self._conn.execute(
+                    """
+                    INSERT INTO watermarks (
+                        stream, history_epoch, local_sequence, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stream) DO UPDATE SET
+                        history_epoch = excluded.history_epoch,
+                        local_sequence = excluded.local_sequence,
+                        updated_at = excluded.updated_at
+                    """,
+                    (PAPER_EXECUTION_STREAM, history_epoch, state_sequence, now),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE meta
+                    SET next_local_sequence = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (state_sequence + 1, now),
+                )
+                self._conn.commit()
+                return PaperProtectionActionAck(
+                    status="OK",
+                    trigger_event_id=trigger_event_id,
+                    exit_order_intent_event_id=exit_event_id,
+                    protection_state_event_id=state_event_id,
+                    history_epoch=history_epoch,
+                    local_sequence=state_sequence,
+                )
+            except (TypeError, ValueError) as exc:
+                self._conn.rollback()
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="INVALID_PROTECTION_ACTION",
+                    detail=str(exc),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                existing = self._existing_protection_action_result(payloads)
+                if existing is not None:
+                    return existing
+                return PaperProtectionActionAck(
+                    status="RETRYABLE",
+                    error_code="INTEGRITY_CONFLICT",
+                )
+            except sqlite3.Error as exc:
+                self._conn.rollback()
+                return PaperProtectionActionAck(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         now = _utc_now()
         with self._lock:
@@ -1054,7 +1368,7 @@ class CanonicalWriter:
                 ).fetchone()
                 if meta is None:
                     self._conn.rollback()
-                    raise RuntimeError("canonical meta row missing")
+                    raise RuntimeError(_META_ROW_MISSING)
                 current_epoch = int(meta["history_epoch"])
                 floor = (
                     current_epoch
@@ -1609,11 +1923,7 @@ class CanonicalWriter:
         if not wanted:
             raise ValueError("decision context instrument_version is required")
         rows = self._conn.execute(
-            """
-            SELECT payload_json FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
+            _EVENT_PAYLOADS_BY_TYPE_SQL,
             (MARKET_INSTRUMENT_VERSION_RECORDED,),
         ).fetchall()
         resolved: dict | None = None
@@ -1669,11 +1979,7 @@ class CanonicalWriter:
         both observe the same predecessor set.
         """
         rows = self._conn.execute(
-            """
-            SELECT payload_json FROM events
-            WHERE event_type = ?
-            ORDER BY history_epoch ASC, local_sequence ASC
-            """,
+            _EVENT_PAYLOADS_BY_TYPE_SQL,
             (event_type,),
         ).fetchall()
         sequences: list[int] = []
@@ -1758,15 +2064,29 @@ class CanonicalWriter:
         """Return version, reserved capital, active reservation count.
 
         In B/C-1 a committed ADMITTED disposition is the reservation authority.
-        Reservation release is deliberately deferred to B/C-2, so the version is
-        exactly the number of admissions for the quote-currency portfolio.
+        Reservation release is deferred to B/C-2 and is now driven by canonical
+        terminal reconciliation: a reservation is released from the active
+        projection only once its trade is FINAL_VERIFIED. Until then it remains
+        active through plan creation, activation, trigger, exit intent, attempts,
+        partial fills and unverified FLAT state.
+
+        The portfolio version stays the cumulative admission count so it remains a
+        monotone concurrency token; only the reservation projection is released.
+        Quote currencies stay separate: only this currency's verified trades can
+        release capacity here.
         """
         admitted = self._admitted_dispositions(quote_currency)
+        released = self._verified_paper_trade_ids(quote_currency)
+        active = [
+            item
+            for item in admitted
+            if str(item.get("paper_trade_id")) not in released
+        ]
         reserved = sum(
             float(item["requested_reservation_amount"])
-            for item in admitted
+            for item in active
         )
-        return len(admitted), reserved, len(admitted)
+        return len(admitted), reserved, len(active)
 
     def _admission_for_reservation(self, reservation_id: str) -> dict:
         matches = [
@@ -1896,15 +2216,43 @@ class CanonicalWriter:
                 raise ValueError("order intent paper_trade_id does not match reservation")
             if context.get("context_id") != context_id:
                 raise ValueError("order intent decision context ancestry is invalid")
-            if payload.get("intent_role") == "ENTRY" and (
+            # Long-only Paper v2 role/side semantics are frozen here so an
+            # unsupported pair cannot reach conservation, protection eligibility
+            # or the reservation controls with the wrong economic meaning.
+            role = str(payload.get("intent_role"))
+            side = str(payload.get("side"))
+            if role == "ENTRY" and side != "BUY":
+                raise ValueError("ENTRY order intent must use side BUY")
+            if role == "EXIT" and side != "SELL":
+                raise ValueError("EXIT order intent must use side SELL")
+            trade_id = self._require_string_ref(payload, "paper_trade_id")
+            # Terminal FINAL_VERIFIED trade: no new economic mutation. Exact
+            # replay never reaches here because idempotency resolves first.
+            self._require_trade_not_final_verified(trade_id, "an order intent")
+            if role == "ENTRY" and (
                 float(payload["requested_notional"])
                 > float(admission["requested_reservation_amount"]) + 1e-9
             ):
                 raise ValueError("entry requested_notional exceeds reserved capital")
+            if role == "EXIT":
+                # Exit capacity is admitted against fills *and* already claimed,
+                # still-unfilled exit intents, so competing exits cannot together
+                # promise more than the trade actually holds.
+                capacity = self._exit_capacity(trade_id)
+                if (
+                    float(payload["requested_quantity"])
+                    > float(capacity["available_exit_quantity"]) + 1e-9
+                ):
+                    raise ValueError(
+                        "exit order intent exceeds available canonical exit capacity"
+                    )
             return
 
         if event_type == PAPER_EXECUTION_ATTEMPT_RECORDED:
             order_id = self._require_string_ref(payload, "order_intent_id")
+            self._require_trade_not_final_verified(
+                str(payload["paper_trade_id"]), "an execution attempt"
+            )
             order = self._load_paper_event_by_identity(
                 PAPER_ORDER_INTENT_RECORDED,
                 order_id,
@@ -1925,12 +2273,7 @@ class CanonicalWriter:
             admission = self._admission_for_reservation(str(order["reservation_id"]))
             context = self._load_context_by_id(str(order["decision_context_id"]))
             state = ExecutionState(str(payload["execution_state"]))
-            fillable_states = {
-                ExecutionState.ACCEPTED,
-                ExecutionState.WORKING,
-                ExecutionState.PARTIALLY_FILLED,
-                ExecutionState.FILLED,
-            }
+            fillable_states = _FILLABLE_EXECUTION_STATES
             accepted_quantity = payload.get("accepted_quantity")
             if state in fillable_states:
                 if not isinstance(accepted_quantity, (int, float)) or isinstance(
@@ -1976,6 +2319,9 @@ class CanonicalWriter:
 
         attempt_id = self._require_string_ref(payload, "execution_attempt_id")
         order_id = self._require_string_ref(payload, "order_intent_id")
+        self._require_trade_not_final_verified(
+            str(payload["paper_trade_id"]), "a fill"
+        )
         attempt = self._load_paper_event_by_identity(
             PAPER_EXECUTION_ATTEMPT_RECORDED,
             attempt_id,
@@ -1994,12 +2340,7 @@ class CanonicalWriter:
             raise ValueError("fill side does not match order intent")
 
         attempt_state = ExecutionState(str(attempt["execution_state"]))
-        fillable_states = {
-            ExecutionState.ACCEPTED,
-            ExecutionState.WORKING,
-            ExecutionState.PARTIALLY_FILLED,
-            ExecutionState.FILLED,
-        }
+        fillable_states = _FILLABLE_EXECUTION_STATES
         if attempt_state not in fillable_states:
             raise ValueError("fill cannot reference a non-fillable execution attempt")
         # Fills are sequenced within their parent execution attempt, which is the
@@ -2070,6 +2411,20 @@ class CanonicalWriter:
         ):
             raise ValueError("aggregate fill quantity exceeds requested order quantity")
 
+        # Aggregate exit conservation at commit: however the exits are split
+        # across orders and attempts, canonical exit quantity may never exceed the
+        # trade's canonical entry exposure. Without this, two pending exits could
+        # each honour their own order cap and still together over-close the trade.
+        if str(order["intent_role"]) == "EXIT":
+            committed = self._canonical_fill_totals(str(payload["paper_trade_id"]))
+            if (
+                float(committed["exit_quantity"]) + fill_quantity
+                > float(committed["entry_quantity"]) + 1e-9
+            ):
+                raise ValueError(
+                    "aggregate exit quantity exceeds canonical entry exposure"
+                )
+
     def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
         """Validate B/C-1 producer-submitted Paper v2 evidence.
 
@@ -2087,8 +2442,8 @@ class CanonicalWriter:
             normalized = validate_quote_evidence_payload(intent.payload)
             expected_key = quote_evidence_idempotency_key(normalized)
         else:
-            if intent.event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
-                raise ValueError("Paper v2 event is not registered in B/C-1")
+            if intent.event_type not in PAPER_V2_WRITER_EVENT_TYPES:
+                raise ValueError("Paper v2 event is not registered for runtime")
             normalized = validate_paper_evidence_payload(
                 intent.event_type,
                 intent.payload,
@@ -2102,6 +2457,773 @@ class CanonicalWriter:
                 "Paper v2 idempotency_key does not match canonical record identity"
             )
         return normalized
+
+    # ------------------------------------------------------------------
+    # B/C-2 canonical protection and terminal reconciliation authority
+    # ------------------------------------------------------------------
+
+    def _committed_paper_rows(self, event_type: str) -> list[dict]:
+        """All committed payloads for one Paper v2 event type, in commit order."""
+        rows = self._conn.execute(
+            _EVENT_PAYLOADS_BY_TYPE_SQL,
+            (event_type,),
+        ).fetchall()
+        payloads: list[dict] = []
+        for row in rows:
+            try:
+                raw = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"persisted {event_type} payload is invalid JSON"
+                ) from exc
+            payloads.append(
+                validate_paper_evidence_payload(event_type, raw)
+            )
+        return payloads
+
+    def _admitted_trade(self, paper_trade_id: str) -> dict:
+        """The ADMITTED disposition that owns this trade, or fail closed.
+
+        Protection and reconciliation evidence must attach to a trade the writer
+        actually admitted; ancestry is never taken on the producer's word.
+        """
+        matches = [
+            item
+            for item in self._admitted_dispositions()
+            if item.get("paper_trade_id") == paper_trade_id
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise ValueError("paper_trade_id is not an admitted Paper v2 trade")
+            raise ValueError("paper_trade_id is ambiguous across admissions")
+        return matches[0]
+
+    def _order_role_by_id(self) -> dict[str, str]:
+        """Map each committed order intent to its canonical ``intent_role``.
+
+        Exposure and economics are classified by the parent order's role, never by
+        a fill's own side: the role is what the trade actually intends, so a
+        mislabelled fill cannot smuggle itself into the wrong side of the
+        conservation identity.
+        """
+        roles: dict[str, str] = {}
+        for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED):
+            roles[str(order["order_intent_id"])] = str(order["intent_role"])
+        return roles
+
+    def _canonical_fill_totals(self, paper_trade_id: str) -> dict:
+        """Exposure and economics derived strictly from canonical fills.
+
+        Position quantity is never taken from a trigger, a protection state, an
+        exit intent or an attempted execution - only from fills that the canonical
+        writer actually committed, classified by their parent order's canonical
+        role.
+        """
+        roles = self._order_role_by_id()
+        entry_quantity = 0.0
+        exit_quantity = 0.0
+        gross_pnl = 0.0
+        execution_costs = 0.0
+        for fill in self._committed_paper_rows(PAPER_FILL_RECORDED):
+            if fill.get("paper_trade_id") != paper_trade_id:
+                continue
+            order_id = str(fill["order_intent_id"])
+            role = roles.get(order_id)
+            if role is None:
+                raise ValueError(
+                    "canonical fill has no committed parent order intent role"
+                )
+            if role not in {"ENTRY", "EXIT"}:
+                raise ValueError(
+                    "canonical fill parent order has an unsupported intent_role"
+                )
+            quantity = float(fill["quantity"])
+            notional = quantity * float(fill["price"])
+            execution_costs += (
+                float(fill["fee_cost"])
+                + float(fill["spread_cost"])
+                + float(fill["slippage_cost"])
+                + float(fill["other_supported_cost"])
+            )
+            if role == "ENTRY":
+                entry_quantity += quantity
+                gross_pnl -= notional
+            else:
+                exit_quantity += quantity
+                gross_pnl += notional
+        return {
+            "entry_quantity": entry_quantity,
+            "exit_quantity": exit_quantity,
+            "remaining_quantity": entry_quantity - exit_quantity,
+            "gross_pnl": gross_pnl,
+            "execution_costs": execution_costs,
+        }
+
+    def _outstanding_exit_quantity(self, paper_trade_id: str) -> float:
+        """Exit quantity already claimed by live, still-fillable EXIT intents.
+
+        Partially filled orders count only for their unfilled remainder. These
+        units are not yet economic exits, but they are already spoken for, so a new
+        protection EXIT must not claim them again or two pending exits could later
+        both fill and over-close the trade.
+
+        An order is treated as dead only when it has at least one committed attempt
+        and *none* of them can still receive a fill. A higher ``attempt_seq`` does
+        not supersede an older attempt - B/C-1 freezes no supersession semantics,
+        and fill validation accepts a fill against any fill-capable attempt - so an
+        earlier WORKING or PARTIALLY_FILLED attempt keeps the unfilled remainder
+        reserved even when a later attempt was rejected, cancelled or expired.
+        Without that rule a live attempt could still fill while a replacement EXIT
+        claimed the same exposure.
+
+        Once every attempt for the order is non-fillable, the unfilled remainder is
+        provably dead and stops counting, so a failed exit no longer permanently
+        shrinks ``available_exit_quantity``. An order with no attempt yet is still a
+        live claim: it was committed precisely to consume that capacity.
+        Already-filled quantity is untouched either way: it is canonical history
+        and still reduces exposure through the fill-derived totals.
+        """
+        roles = self._order_role_by_id()
+        filled_by_order: dict[str, float] = {}
+        for fill in self._committed_paper_rows(PAPER_FILL_RECORDED):
+            if fill.get("paper_trade_id") != paper_trade_id:
+                continue
+            order_id = str(fill["order_intent_id"])
+            if roles.get(order_id) != "EXIT":
+                continue
+            filled_by_order[order_id] = filled_by_order.get(order_id, 0.0) + float(
+                fill["quantity"]
+            )
+
+        # Committed attempts per order. An order is dead only when it has at least
+        # one attempt and *none* of them can still receive a fill. A higher
+        # attempt_seq does not supersede an older one: B/C-1 freezes no such
+        # semantics, and fill validation accepts fills against any fill-capable
+        # attempt, so an earlier WORKING attempt is still live evidence even if a
+        # later attempt was rejected.
+        attempts_by_order: dict[str, list[str]] = {}
+        for attempt in self._committed_paper_rows(PAPER_EXECUTION_ATTEMPT_RECORDED):
+            if attempt.get("paper_trade_id") != paper_trade_id:
+                continue
+            attempts_by_order.setdefault(str(attempt["order_intent_id"]), []).append(
+                str(attempt["execution_state"])
+            )
+
+        outstanding = 0.0
+        for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED):
+            if order.get("paper_trade_id") != paper_trade_id:
+                continue
+            if str(order["intent_role"]) != "EXIT":
+                continue
+            order_id = str(order["order_intent_id"])
+            states = attempts_by_order.get(order_id)
+            # An order with no attempt yet is still a live claim against exit
+            # capacity: it was committed precisely to consume that capacity.
+            if states and not any(
+                state in _FILLABLE_STATE_VALUES for state in states
+            ):
+                continue
+            unfilled = float(order["requested_quantity"]) - filled_by_order.get(
+                order_id, 0.0
+            )
+            if unfilled > 0:
+                outstanding += unfilled
+        return outstanding
+
+    def _exit_capacity(self, paper_trade_id: str) -> dict:
+        """Canonical exit capacity: fill-derived exposure minus claimed exits."""
+        totals = self._canonical_fill_totals(paper_trade_id)
+        outstanding = self._outstanding_exit_quantity(paper_trade_id)
+        return {
+            **totals,
+            "outstanding_exit_quantity": outstanding,
+            "available_exit_quantity": float(totals["remaining_quantity"]) - outstanding,
+        }
+
+    @staticmethod
+    def _expected_position_state(totals: Mapping[str, object]) -> str:
+        """Position state implied by canonical fill-derived exposure.
+
+        Derived from fills alone so a reconciliation record cannot claim a
+        position the trade's own canonical evidence contradicts.
+        """
+        entry = float(totals["entry_quantity"])
+        exit_quantity = float(totals["exit_quantity"])
+        remaining = float(totals["remaining_quantity"])
+        if remaining <= 0:
+            return (
+                PositionState.NO_POSITION.value
+                if entry <= 0
+                else PositionState.FLAT.value
+            )
+        if exit_quantity <= 0:
+            return PositionState.OPEN.value
+        return PositionState.REDUCING.value
+
+    def _protection_plan_record(self, protection_plan_id: str) -> dict:
+        plan = self._load_paper_event_by_identity(
+            PAPER_PROTECTION_PLAN_RECORDED,
+            protection_plan_id,
+        )
+        if plan.get("protection_plan_id") != protection_plan_id:
+            raise ValueError("protection plan ancestry is invalid")
+        return plan
+
+    def _protection_state_records(self, protection_plan_id: str) -> list[dict]:
+        return [
+            record
+            for record in self._committed_paper_rows(PAPER_PROTECTION_STATE_RECORDED)
+            if record.get("protection_plan_id") == protection_plan_id
+        ]
+
+    def _effective_protection_state(self, protection_plan_id: str) -> ProtectionState:
+        """Reconstruct the current state from canonical evidence only.
+
+        The latest committed transition wins, so no in-memory authority is
+        required and a restart reproduces the same answer deterministically.
+        """
+        records = self._protection_state_records(protection_plan_id)
+        if not records:
+            return ProtectionState.PLANNED
+        latest = max(records, key=lambda record: int(record["state_seq"]))
+        return ProtectionState(str(latest["to_state"]))
+
+    def _activated_plan_ids(self, paper_trade_id: str) -> list[tuple[int, str]]:
+        """Plans for this trade that canonical state evidence proves activated.
+
+        Activation is proven by a committed transition into ACTIVE or TRIGGERED,
+        never by the plan payload alone.
+        """
+        activated: list[tuple[int, str]] = []
+        for plan in self._committed_paper_rows(PAPER_PROTECTION_PLAN_RECORDED):
+            if plan.get("paper_trade_id") != paper_trade_id:
+                continue
+            plan_id = str(plan["protection_plan_id"])
+            if any(
+                record["to_state"] in {"ACTIVE", "TRIGGERED"}
+                for record in self._protection_state_records(plan_id)
+            ):
+                activated.append((int(plan["plan_seq"]), plan_id))
+        return sorted(activated)
+
+    def _effective_protection_plan(self, paper_trade_id: str) -> dict | None:
+        """The effective plan is the highest activated plan_seq for the trade."""
+        activated = self._activated_plan_ids(paper_trade_id)
+        if not activated:
+            return None
+        return self._protection_plan_record(activated[-1][1])
+
+    def _final_verified_trade_ids(self) -> set[str]:
+        """Trades that have reached terminal FINAL_VERIFIED reconciliation.
+
+        FINAL_VERIFIED is terminal for a Paper v2 trade's economic/execution
+        lifecycle, so this set is the writer's authority for refusing later
+        mutations. It is derived from canonical evidence only.
+        """
+        return {
+            str(record["paper_trade_id"])
+            for record in self._committed_paper_rows(PAPER_RECONCILIATION_RECORDED)
+            if str(record.get("terminal_reconciliation_state"))
+            == TerminalReconciliationState.FINAL_VERIFIED.value
+        }
+
+    def _require_trade_not_final_verified(
+        self, paper_trade_id: str, what: str
+    ) -> None:
+        """Refuse a new mutation for a trade whose economics are final.
+
+        Exact replay is unaffected: ``submit`` resolves idempotency before the
+        transactional ancestry validation that calls this, so retrying
+        already-committed evidence returns ``DUPLICATE_OK`` and never reaches
+        here, while a genuinely new mutation fails closed.
+        """
+        if paper_trade_id in self._final_verified_trade_ids():
+            raise ValueError(
+                f"paper trade is already FINAL_VERIFIED; {what} cannot be added "
+                "after terminal reconciliation"
+            )
+
+    def _verified_paper_trade_ids(self, quote_currency: str) -> set[str]:
+        """Trades whose economics are FINAL_VERIFIED, so capacity may be released."""
+        verified: set[str] = set()
+        for record in self._committed_paper_rows(PAPER_RECONCILIATION_RECORDED):
+            if (
+                record.get("terminal_reconciliation_state") == "FINAL_VERIFIED"
+                and record.get("position_state") == PositionState.FLAT.value
+                # Tolerance rather than float equality: the frozen contract
+                # already requires exactly zero remaining for this state, and an
+                # equality check on floats is unreliable by construction.
+                and abs(float(record["remaining_quantity"])) <= _QUANTITY_TOLERANCE
+            ):
+                verified.add(str(record["paper_trade_id"]))
+        if not verified:
+            return verified
+        return {
+            trade_id
+            for trade_id in verified
+            if any(
+                item.get("paper_trade_id") == trade_id
+                and item.get("quote_currency") == quote_currency
+                for item in self._admitted_dispositions(quote_currency)
+            )
+        }
+
+    def _validate_protection_plan(self, payload: Mapping[str, object]) -> None:
+        """Immutable plans with strictly monotonic plan_seq within the trade."""
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        self._admitted_trade(paper_trade_id)
+        self._require_trade_not_final_verified(paper_trade_id, "a protection plan")
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_PLAN_RECORDED,
+            payload=payload,
+            parent_field="paper_trade_id",
+            parent_value=paper_trade_id,
+            sequence_field="plan_seq",
+            identity_field="protection_plan_id",
+            scope="paper trade",
+        )
+
+    def _validate_protection_state(self, payload: Mapping[str, object]) -> None:
+        """Only supported transitions, sequenced within their plan.
+
+        ACTIVE additionally requires canonical fills to prove positive current
+        exposure, and TRIGGERED requires a committed trigger for the same plan, so
+        a producer cannot assert protection it has not earned.
+        """
+        plan_id = self._require_string_ref(payload, "protection_plan_id")
+        plan = self._protection_plan_record(plan_id)
+        if plan.get("paper_trade_id") != payload.get("paper_trade_id"):
+            raise ValueError("protection state paper_trade_id does not match the plan")
+        self._require_trade_not_final_verified(
+            str(plan["paper_trade_id"]), "a protection state transition"
+        )
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_STATE_RECORDED,
+            payload=payload,
+            parent_field="protection_plan_id",
+            parent_value=plan_id,
+            sequence_field="state_seq",
+            identity_field="protection_event_id",
+            scope="protection plan",
+        )
+        from_state = str(payload["from_state"])
+        to_state = str(payload["to_state"])
+        if not protection_transition_allowed(from_state, to_state):
+            raise ValueError(
+                f"unsupported protection state transition {from_state} -> {to_state}"
+            )
+        # The declared origin must be the state canonical evidence already proves,
+        # so a producer cannot skip an intermediate transition.
+        effective = self._effective_protection_state(plan_id)
+        if effective.value != from_state:
+            raise ValueError(
+                "protection state from_state does not match the effective canonical state"
+            )
+        totals = self._canonical_fill_totals(str(plan["paper_trade_id"]))
+        if to_state == ProtectionState.ACTIVE.value and totals["remaining_quantity"] <= 0:
+            raise ValueError(
+                "protection plan cannot become ACTIVE without positive canonical exposure"
+            )
+        if protection_transition_requires_trigger(from_state, to_state):
+            committed = [
+                trigger
+                for trigger in self._committed_paper_rows(
+                    PAPER_PROTECTION_TRIGGER_RECORDED
+                )
+                if trigger.get("protection_plan_id") == plan_id
+            ]
+            if not committed:
+                raise ValueError(
+                    "protection cannot become TRIGGERED without committed trigger evidence"
+                )
+
+    def _eligible_target(
+        self,
+        plan: Mapping[str, object],
+        *,
+        plan_id: str,
+    ) -> dict:
+        """Deterministically derive the uniquely eligible next target.
+
+        The frozen trigger contract deliberately carries no target identity, so
+        eligibility is derived from canonical evidence rather than invented: every
+        committed TARGET trigger for this plan consumes one target in ascending
+        price order, and the next target in that order is the only eligible one.
+        Taking the lowest *untriggered* target is what stops one target's crossing
+        from authorising an arbitrary or full-position exit.
+        """
+        targets = sorted(
+            (dict(target) for target in plan["targets"]),
+            key=lambda target: (float(target["price"]), str(target["target_id"])),
+        )
+        consumed = sum(
+            1
+            for trigger in self._committed_paper_rows(
+                PAPER_PROTECTION_TRIGGER_RECORDED
+            )
+            if trigger.get("protection_plan_id") == plan_id
+            and trigger.get("trigger_type") == "TARGET"
+        )
+        if consumed >= len(targets):
+            raise ValueError(
+                "TARGET action has no eligible configured target remaining for "
+                "this protection plan"
+            )
+        return targets[consumed]
+
+    def _validate_quote_backed_trigger(
+        self,
+        payload: Mapping[str, object],
+        plan: Mapping[str, object],
+        *,
+        paper_trade_id: str,
+    ) -> dict | None:
+        """Prove a STOP/TARGET market claim against canonical Level-1 evidence.
+
+        Returns the eligible target for TARGET actions so the caller can bound the
+        exit quantity to that target's configured fraction, and ``None`` for STOP.
+        """
+        trigger_type = str(payload["trigger_type"])
+        quote_ref = payload.get("market_evidence_ref")
+        if not isinstance(quote_ref, str) or not quote_ref:
+            raise ValueError(
+                f"{trigger_type} trigger requires canonical Level-1 market evidence"
+            )
+        quote = self._load_quote_evidence_by_id(quote_ref)
+        admission = self._admitted_trade(paper_trade_id)
+        context = self._load_context_by_id(str(admission["decision_context_id"]))
+        self._validate_quote_matches_lineage(
+            quote,
+            context=context,
+            admission=admission,
+        )
+        self._validate_quote_causality(
+            quote,
+            execution_time=payload.get("trigger_time"),
+            execution_time_field="trigger_time",
+        )
+        # A valid lineage quote is necessary but not sufficient: the quote must
+        # itself prove the configured threshold was crossed. This trade is
+        # long-only and exits by selling, so the authoritative executable price is
+        # the quote's best bid, and reference_price must be exactly that price
+        # rather than a caller-chosen level the market never traded.
+        executable_price = float(quote["best_bid"])
+        reference_price = float(payload["reference_price"])
+        if abs(reference_price - executable_price) > _QUANTITY_TOLERANCE:
+            raise ValueError(
+                "protection trigger reference_price must equal the executable "
+                "quote price for the cited evidence"
+            )
+        if trigger_type == "STOP":
+            if executable_price > float(plan["stop_price"]) + _QUANTITY_TOLERANCE:
+                raise ValueError(
+                    "STOP trigger requires a quote at or below the configured "
+                    "stop_price"
+                )
+            return None
+        eligible = self._eligible_target(
+            plan, plan_id=str(payload["protection_plan_id"])
+        )
+        if executable_price < float(eligible["price"]) - _QUANTITY_TOLERANCE:
+            raise ValueError(
+                "TARGET trigger requires a quote at or above the eligible "
+                "target price"
+            )
+        return eligible
+
+    def _validate_time_trigger(
+        self,
+        payload: Mapping[str, object],
+        plan: Mapping[str, object],
+    ) -> None:
+        """Prove a TIME/EMERGENCY claim from exact temporal evidence."""
+        trigger_type = str(payload["trigger_type"])
+        temporal = payload.get("trigger_time")
+        if not isinstance(temporal, Mapping) or str(temporal.get("precision")) != "EXACT":
+            raise ValueError(
+                f"{trigger_type} trigger requires exact temporal evidence"
+            )
+        if payload.get("market_evidence_ref") is not None:
+            raise ValueError(
+                f"{trigger_type} trigger cannot claim a market evidence reference"
+            )
+        if trigger_type != "TIME":
+            return
+        # The plan's holding period must actually have elapsed. Exact timestamps
+        # are preserved: firing exactly at expiry is allowed, one second earlier
+        # is not.
+        plan_start, _plan_end = self._temporal_bounds(
+            plan.get("plan_time"), field_name="plan_time"
+        )
+        trigger_start, _trigger_end = self._temporal_bounds(
+            temporal, field_name="trigger_time"
+        )
+        expiry = plan_start + timedelta(seconds=int(plan["max_hold_seconds"]))
+        if trigger_start < expiry:
+            raise ValueError(
+                "TIME trigger is before the plan's max_hold_seconds expiry"
+            )
+
+    def _validate_protection_trigger(
+        self, payload: Mapping[str, object]
+    ) -> dict | None:
+        """Triggers require a proven armed plan and defensible evidence.
+
+        A trigger never changes quantity, P/L or terminal state; this method only
+        proves that the claimed market/time condition is canonically supported.
+        Returns the eligible target for TARGET actions, else ``None``.
+        """
+        plan_id = self._require_string_ref(payload, "protection_plan_id")
+        plan = self._protection_plan_record(plan_id)
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        if plan.get("paper_trade_id") != paper_trade_id:
+            raise ValueError("protection trigger paper_trade_id does not match the plan")
+        self._admitted_trade(paper_trade_id)
+        self._require_trade_not_final_verified(paper_trade_id, "a protection trigger")
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_PROTECTION_TRIGGER_RECORDED,
+            payload=payload,
+            parent_field="protection_plan_id",
+            parent_value=plan_id,
+            sequence_field="trigger_seq",
+            identity_field="protection_trigger_id",
+            scope="protection plan",
+        )
+        effective_state = self._effective_protection_state(plan_id)
+        if effective_state not in PAPER_ACTION_ARMED_STATES:
+            raise ValueError(
+                "protection trigger requires an armed (ACTIVE or DEGRADED) plan"
+            )
+        if str(payload["trigger_type"]) in PAPER_TRIGGER_TYPES_REQUIRING_QUOTE:
+            return self._validate_quote_backed_trigger(
+                payload, plan, paper_trade_id=paper_trade_id
+            )
+        self._validate_time_trigger(payload, plan)
+        return None
+
+    def _validate_protection_action(
+        self,
+        *,
+        trigger: Mapping[str, object],
+        exit_order_intent: Mapping[str, object],
+        protection_state: Mapping[str, object],
+        paper_trade_id: str,
+        plan_id: str,
+    ) -> str:
+        """Validate one atomic protection action and return its context id.
+
+        Every step below is proven before any row is written, so a rejected action
+        commits nothing. Steps are labelled as in the design: ancestry, effective
+        plan, armed state, fill-derived exposure, exit sizing, trigger evidence.
+        """
+        # A. canonical trade, reservation and decision-context ancestry.
+        admission = self._admitted_trade(paper_trade_id)
+        context_id = str(admission["decision_context_id"])
+        self._load_context_by_id(context_id)
+        if str(admission.get("reservation_id")) != str(
+            exit_order_intent.get("reservation_id")
+        ):
+            raise ValueError(
+                "protection action EXIT intent reservation does not match "
+                "the admission reservation"
+            )
+        if str(exit_order_intent.get("decision_context_id")) != context_id:
+            raise ValueError(
+                "protection action EXIT intent decision context does not "
+                "match the admitted trade"
+            )
+
+        # B. only the effective (highest activated) plan may act.
+        effective_plan = self._effective_protection_plan(paper_trade_id)
+        if effective_plan is None:
+            raise ValueError("protection action requires an activated protection plan")
+        if str(effective_plan["protection_plan_id"]) != plan_id:
+            raise ValueError(
+                "protection action plan is not the effective activated plan"
+            )
+
+        # C. the plan must be armed, and the transition must start there.
+        current_state = self._effective_protection_state(plan_id)
+        if current_state not in PAPER_ACTION_ARMED_STATES:
+            raise ValueError(
+                "protection action requires an armed (ACTIVE or DEGRADED) plan"
+            )
+        if str(protection_state["from_state"]) != current_state.value:
+            raise ValueError(
+                "protection action state does not start from the effective "
+                "canonical state"
+            )
+
+        # D. exposure is proven by canonical fills alone, and is reduced by exits
+        # already claimed by live EXIT intents.
+        capacity = self._exit_capacity(paper_trade_id)
+        if float(capacity["remaining_quantity"]) <= 0:
+            raise ValueError("protection action requires positive canonical exposure")
+
+        # F. the EXIT intent must reduce exposure without over-closing it.
+        self._validate_action_exit_intent(exit_order_intent, capacity)
+
+        # E and G. frozen trigger evidence, B/C-1 order-intent ancestry, and
+        # trigger sequence monotonicity. The trigger validation returns the
+        # eligible TARGET when this is a target action, so the exit can be capped
+        # to that target's configured fraction rather than the whole position.
+        eligible_target = self._validate_protection_trigger(trigger)
+        if eligible_target is not None:
+            self._require_target_exit_within_fraction(
+                eligible_target,
+                requested_quantity=float(exit_order_intent["requested_quantity"]),
+                entry_quantity=float(capacity["entry_quantity"]),
+                available_exit_quantity=float(capacity["available_exit_quantity"]),
+            )
+        self._validate_paper_execution_ancestry(
+            PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+        )
+        return context_id
+
+    def _validate_action_exit_intent(
+        self,
+        exit_order_intent: Mapping[str, object],
+        capacity: Mapping[str, object],
+    ) -> None:
+        """An action exit must sell, be positive, and fit the available capacity."""
+        if str(exit_order_intent["intent_role"]) != "EXIT":
+            raise ValueError("protection action requires an EXIT order intent")
+        if str(exit_order_intent["side"]) != PAPER_ACTION_EXIT_SIDE:
+            raise ValueError(
+                "protection action EXIT intent must use side "
+                f"{PAPER_ACTION_EXIT_SIDE}"
+            )
+        requested_quantity = float(exit_order_intent["requested_quantity"])
+        if requested_quantity <= 0:
+            raise ValueError("protection action EXIT quantity must be positive")
+        if (
+            requested_quantity
+            > float(capacity["available_exit_quantity"]) + _QUANTITY_TOLERANCE
+        ):
+            raise ValueError(
+                "protection action EXIT quantity exceeds available canonical "
+                "exit capacity"
+            )
+
+    @staticmethod
+    def _require_target_exit_within_fraction(
+        eligible_target: Mapping[str, object],
+        *,
+        requested_quantity: float,
+        entry_quantity: float,
+        available_exit_quantity: float,
+    ) -> None:
+        """A staged target may exit only its own configured fraction.
+
+        Crossing a target authorises that target's fraction of the protected
+        position, never the whole position, which is what keeps a staged plan
+        staged when only its first target has been reached.
+        """
+        fraction_cap = float(eligible_target["fraction"]) * entry_quantity
+        cap = min(fraction_cap, available_exit_quantity)
+        if requested_quantity > cap + _QUANTITY_TOLERANCE:
+            raise ValueError(
+                "TARGET action EXIT quantity exceeds the eligible target's "
+                f"configured fraction (cap {cap})"
+            )
+
+    def _validate_reconciliation(self, payload: Mapping[str, object]) -> None:
+        """Terminal economics must be reproducible from canonical fills.
+
+        Position and economics are never taken from protection evidence. A
+        FINAL_VERIFIED claim that canonical fills do not support is refused, so
+        unverifiable economics can only be recorded as UNRESOLVED_EVIDENCE -
+        which never releases reserved capacity.
+        """
+        paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
+        admission = self._admitted_trade(paper_trade_id)
+        # FINAL_VERIFIED is terminal: a later reconciliation (including a
+        # higher-sequence non-final one, or UNRESOLVED_EVIDENCE) is refused. The
+        # terminal record itself is unaffected because it is committed while the
+        # trade is not yet final, and an exact replay resolves via idempotency.
+        self._require_trade_not_final_verified(
+            paper_trade_id, "a reconciliation record"
+        )
+        self._require_monotonic_sibling_sequence(
+            event_type=PAPER_RECONCILIATION_RECORDED,
+            payload=payload,
+            parent_field="paper_trade_id",
+            parent_value=paper_trade_id,
+            sequence_field="reconciliation_seq",
+            identity_field="reconciliation_id",
+            scope="paper trade",
+        )
+        # The reserve is the admission's own reservation, which stays knowable
+        # regardless of whether the economics could be proven, so it is bound for
+        # every reconciliation record rather than only the final one.
+        canonical_reserved = float(admission["requested_reservation_amount"])
+        if abs(float(payload["reserved_capital"]) - canonical_reserved) > 1e-9:
+            raise ValueError(
+                "reserved_capital does not match the canonical admission reservation"
+            )
+        terminal = str(payload["terminal_reconciliation_state"])
+        if terminal == TerminalReconciliationState.UNRESOLVED_EVIDENCE.value:
+            # The contract already requires an explicit reason. Unverifiable
+            # evidence is recorded rather than promoted, and the quantity claims
+            # are deliberately not forced to match canonical fills: the point of
+            # this state is that the economics could not be proven.
+            return
+
+        totals = self._canonical_fill_totals(paper_trade_id)
+        for field_name, canonical in (
+            ("filled_entry_quantity", totals["entry_quantity"]),
+            ("filled_exit_quantity", totals["exit_quantity"]),
+            ("remaining_quantity", totals["remaining_quantity"]),
+        ):
+            if abs(float(payload[field_name]) - canonical) > 1e-9:
+                raise ValueError(
+                    f"{field_name} is not reproducible from canonical fills"
+                )
+        expected_position_state = self._expected_position_state(totals)
+        if str(payload["position_state"]) != expected_position_state:
+            raise ValueError(
+                "position_state does not agree with canonical fill-derived exposure"
+            )
+        if terminal != TerminalReconciliationState.FINAL_VERIFIED.value:
+            return
+        for field_name, canonical in (
+            ("realized_gross_pnl", totals["gross_pnl"]),
+            ("recorded_execution_costs", totals["execution_costs"]),
+        ):
+            if abs(float(payload[field_name]) - canonical) > 1e-9:
+                raise ValueError(
+                    f"{field_name} is not reproducible from canonical fills"
+                )
+
+    def _validate_paper_protection_ancestry(
+        self,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        if event_type == PAPER_PROTECTION_PLAN_RECORDED:
+            self._validate_protection_plan(payload)
+            return
+        if event_type == PAPER_PROTECTION_STATE_RECORDED:
+            # TRIGGERED is writer-owned: it is the third fact of the atomic
+            # protection action, so a generic state submission must not assert it
+            # even when trigger evidence happens to exist. The safe non-trigger
+            # transitions below stay available on the generic path.
+            if str(payload.get("to_state")) == ProtectionState.TRIGGERED.value:
+                raise ValueError(
+                    "ATOMIC_TRIGGER_ACTION_REQUIRED: a TRIGGERED protection state "
+                    "commits only through the atomic protection action RPC"
+                )
+            self._validate_protection_state(payload)
+            return
+        if event_type == PAPER_PROTECTION_TRIGGER_RECORDED:
+            raise ValueError(
+                "ATOMIC_TRIGGER_ACTION_REQUIRED: a protection trigger commits only "
+                "through the atomic protection action RPC"
+            )
+        if event_type == PAPER_RECONCILIATION_RECORDED:
+            self._validate_reconciliation(payload)
+            return
+        raise ValueError("unsupported Paper v2 protection event type")
 
     def _validate_paper_outcome_intent(self, intent: WriterIntent) -> dict:
         """Validate terminal paper economic evidence.
@@ -2225,6 +3347,15 @@ class CanonicalWriter:
             raise ValueError("invalid priority")
         if not intent.idempotency_key.strip():
             raise ValueError("idempotency_key required")
+        # Checked before the registration gate so the refusal names the real
+        # problem: an action trigger is not merely unregistered, it is only
+        # meaningful inside the atomic protection action bundle.
+        if intent.event_type in PAPER_V2_ATOMIC_ONLY_EVENT_TYPES:
+            raise ValueError(
+                "ATOMIC_TRIGGER_ACTION_REQUIRED: a protection trigger commits only "
+                "through the atomic protection action RPC, never as a standalone "
+                "WriterIntent"
+            )
         if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
 
@@ -2238,7 +3369,7 @@ class CanonicalWriter:
             return self._validate_decision_intelligence_intent(intent)
         if intent.event_type in PAPER_OUTCOME_EVENT_TYPES:
             return self._validate_paper_outcome_intent(intent)
-        if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+        if intent.event_type in PAPER_V2_WRITER_EVENT_TYPES:
             return self._validate_paper_execution_intent(intent)
 
         self._validate_alert_ops_intent(intent)
@@ -2260,7 +3391,7 @@ class CanonicalWriter:
             return FEATURE_BUS_STREAM
         if event_type in PAPER_OUTCOME_EVENT_TYPES:
             return PAPER_OUTCOME_STREAM
-        if event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
+        if event_type in PAPER_V2_ALL_EVENT_TYPES:
             return PAPER_EXECUTION_STREAM
         return STREAM_EARLY_WATCH
 
@@ -2271,7 +3402,7 @@ class CanonicalWriter:
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
-            and event_type not in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+            and event_type not in PAPER_V2_ALL_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(
@@ -2389,10 +3520,7 @@ class CanonicalWriter:
         stream = self._stream_for_event(intent.event_type)
 
         self._conn.execute("BEGIN IMMEDIATE")
-        meta = self._conn.execute(
-            "SELECT history_epoch, next_local_sequence, schema_version "
-            "FROM meta WHERE id = 1"
-        ).fetchone()
+        meta = self._conn.execute(_META_SEQUENCE_SQL).fetchone()
         assert meta is not None
         if int(meta["schema_version"]) != SCHEMA_VERSION:
             self._conn.rollback()
@@ -2410,6 +3538,11 @@ class CanonicalWriter:
         )
         if intent.event_type in PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES:
             self._validate_paper_execution_ancestry(
+                intent.event_type,
+                payload,
+            )
+        if intent.event_type in PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES:
+            self._validate_paper_protection_ancestry(
                 intent.event_type,
                 payload,
             )

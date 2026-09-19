@@ -10,6 +10,7 @@ from app.opip.contracts.paper_execution import (
     QualifiedOpportunityDisposition,
 )
 from app.opip.contracts.paper_execution_runtime import (
+    PAPER_V2_ATOMIC_ONLY_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
 )
 
@@ -596,10 +597,10 @@ def test_unresolved_reconciliation_requires_explicit_reason():
         validate_paper_evidence_payload(PAPER_RECONCILIATION_RECORDED, payload)
 
 
-def test_paper_v2_writer_registration_stays_within_bc1_boundary():
+def test_paper_v2_writer_registration_boundary_after_bc2():
     from app.opip.canonical.writer import ACCEPTED_EVENT_TYPES
 
-    # B/C-1 may persist only the evidence families needed for execution lineage.
+    # B/C-1 evidence families remain registered.
     assert {
         PAPER_QUOTE_EVIDENCE_RECORDED,
         PAPER_ORDER_INTENT_RECORDED,
@@ -609,21 +610,31 @@ def test_paper_v2_writer_registration_stays_within_bc1_boundary():
 
     # Qualified disposition remains writer-owned through the atomic admission
     # RPC, so a generic WriterIntent cannot bypass version/capital reservation.
+    # This is unchanged by B/C-2.
     assert PAPER_OPPORTUNITY_DISPOSITION_RECORDED not in ACCEPTED_EVENT_TYPES
 
-    # Protection/runtime reconciliation stays frozen out until B/C-2.
+    # B/C-2 arrived: plan and state and terminal reconciliation are registered, so
+    # their runtime authority is the canonical writer. The protection TRIGGER is
+    # deliberately NOT registered: it is writer-owned through the atomic
+    # protection action RPC, so a standalone trigger can never be submitted. This
+    # phase-boundary assertion is updated rather than dropped so the registration
+    # set stays explicitly pinned.
     assert {
         PAPER_PROTECTION_PLAN_RECORDED,
         PAPER_PROTECTION_STATE_RECORDED,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
         PAPER_RECONCILIATION_RECORDED,
-    }.isdisjoint(ACCEPTED_EVENT_TYPES)
+    } <= ACCEPTED_EVENT_TYPES
+    assert PAPER_PROTECTION_TRIGGER_RECORDED not in ACCEPTED_EVENT_TYPES
+    assert PAPER_PROTECTION_TRIGGER_RECORDED in PAPER_V2_ATOMIC_ONLY_EVENT_TYPES
 
     registered_frozen_events = PAPER_EXECUTION_EVENT_TYPES & ACCEPTED_EVENT_TYPES
     assert registered_frozen_events == {
         PAPER_ORDER_INTENT_RECORDED,
         PAPER_EXECUTION_ATTEMPT_RECORDED,
         PAPER_FILL_RECORDED,
+        PAPER_PROTECTION_PLAN_RECORDED,
+        PAPER_PROTECTION_STATE_RECORDED,
+        PAPER_RECONCILIATION_RECORDED,
     }
 
 

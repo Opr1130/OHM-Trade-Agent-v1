@@ -10,6 +10,8 @@ from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
 from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionAck,
     PaperAdmissionRequest,
+    PaperProtectionActionAck,
+    PaperProtectionActionRequest,
 )
 from app.opip.canonical.paths import socket_path
 from app.opip.canonical.protocol import recv_json, send_json
@@ -24,6 +26,10 @@ class WriterClient(Protocol):
     def admit_paper_opportunity(
         self, request: PaperAdmissionRequest
     ) -> PaperAdmissionAck: ...
+
+    def trigger_paper_protection_action(
+        self, request: PaperProtectionActionRequest
+    ) -> PaperProtectionActionAck: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -86,6 +92,17 @@ class CanonicalWriterClient:
         )
         return PaperAdmissionAck.from_dict(response)
 
+    def trigger_paper_protection_action(
+        self, request: PaperProtectionActionRequest
+    ) -> PaperProtectionActionAck:
+        response = self._roundtrip(
+            {
+                "method": "TRIGGER_PAPER_PROTECTION_ACTION",
+                "request": request.as_dict(),
+            }
+        )
+        return PaperProtectionActionAck.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -131,6 +148,18 @@ class InProcessWriterClient:
             self._server.dispatch_for_tests(
                 {
                     "method": "ADMIT_PAPER_OPPORTUNITY",
+                    "request": request.as_dict(),
+                }
+            )
+        )
+
+    def trigger_paper_protection_action(
+        self, request: PaperProtectionActionRequest
+    ) -> PaperProtectionActionAck:
+        return PaperProtectionActionAck.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "TRIGGER_PAPER_PROTECTION_ACTION",
                     "request": request.as_dict(),
                 }
             )
