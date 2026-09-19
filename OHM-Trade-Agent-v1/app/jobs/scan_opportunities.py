@@ -395,6 +395,116 @@ def _paper_trade_enabled_safe() -> bool:
         return False
 
 
+# --- B/C-3 Increment 6B: Paper-v2 mode split ---------------------------------
+# The paper authority is selected by mode, never by availability. These labels are
+# metadata only: they never influence execution, ranking or admission.
+PAPER_ENGINE_FREQTRADE_DRY_RUN = "FREQTRADE_DRY_RUN"
+PAPER_ENGINE_OPIP_PAPER_V2 = "OPIP_PAPER_V2"
+#: A LONG that is not immediately actionable. Recorded distinctly so a wait is
+#: never relabelled as a Paper-v2 executed request.
+PAPER_ENGINE_PAPER_V2_WAIT = "OPIP_PAPER_V2_WAIT_NOT_EXECUTABLE"
+PAPER_ENGINE_NO_AUTHORITATIVE_SHORT = "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
+#: Engine-neutral description of the legacy authority, used only when it applies.
+PAPER_ENGINE_LEGACY_LABEL = "v1 authoritative paper engine"
+PAPER_ENGINE_PAPER_V2_LABEL = "O'Pip Paper v2"
+
+
+def _paper_v2_active_safe(settings) -> bool:
+    """Resolve Paper-v2 activation fail-closed, for routing and metadata alike."""
+    try:
+        from app.services.paper_v2_activation import paper_v2_active
+
+        return bool(paper_v2_active(settings))
+    except Exception:
+        return False
+
+
+def _paper_lineage_attribution(
+    *, paper_enabled: bool, direction: str, valid_now: bool, paper_v2: bool
+) -> tuple[bool, str]:
+    """The (paper_requested, paper_engine) lineage pair for one opportunity.
+
+    Mode-aware without changing the inactive path: when Paper v2 is off this
+    returns exactly the historical values. When it is on, only a LONG that is
+    immediately actionable is a Paper-v2 request - a WAIT or a SHORT is recorded
+    as not requested rather than being relabelled as one.
+    """
+    if direction != "LONG":
+        return False, PAPER_ENGINE_NO_AUTHORITATIVE_SHORT
+    if paper_v2:
+        if valid_now:
+            return True, PAPER_ENGINE_OPIP_PAPER_V2
+        return False, PAPER_ENGINE_PAPER_V2_WAIT
+    return bool(paper_enabled and direction == "LONG"), PAPER_ENGINE_FREQTRADE_DRY_RUN
+
+
+def _paper_v2_qualification_time() -> datetime:
+    """The one qualification instant for a scan's Paper-v2 stamp."""
+    return datetime.now(timezone.utc)
+
+
+def _route_paper_v2_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    stamp,
+    settings,
+    opip,
+):
+    """Route every eligible opportunity to O'Pip Paper v2, and only to it.
+
+    Thin by design: the scan owns ordering and telemetry, the router owns the
+    handoff. A router failure is reported and never falls back to a legacy paper
+    authority.
+    """
+    from app.services.paper_v2_scan_router import (
+        PaperV2ScanFacts,
+        route_qualified_opportunities,
+    )
+
+    universe_assets = ()
+    universe = getattr(scan, "universe", None)
+    if universe is not None:
+        universe_assets = tuple(getattr(universe, "assets", ()) or ())
+    if not universe_assets:
+        # Without the exact metadata this scan already observed, no execution
+        # instrument can be proven. Fail closed rather than re-request AssetPairs.
+        print(
+            "PAPER V2: universe metadata unavailable; no Paper-v2 execution attempted"
+        )
+        return None
+    return route_qualified_opportunities(
+        ranked_opportunities,
+        scan_facts=PaperV2ScanFacts(
+            snapshots=tuple(getattr(scan, "snapshots", ()) or ()),
+            decision_at=decision_at,
+            universe_assets=universe_assets,
+        ),
+        stamp=stamp,
+        settings=settings,
+        opip=opip,
+    )
+
+
+def _print_paper_v2_summary(summary) -> None:
+    """Operator-observable accounting for the active Paper-v2 route."""
+    if summary is None:
+        print("Paper v2 routing: not attempted (no universe metadata)")
+        return
+    print("===== PAPER V2 ROUTING (active authority) =====")
+    print("Paper v2 executed:", summary.executed)
+    print("Paper v2 capital rejected:", summary.capital_rejected)
+    print("Paper v2 capacity rejected:", summary.capacity_rejected)
+    print("Paper v2 SHORT unsupported:", summary.short_unsupported)
+    print("Paper v2 WAIT not executable:", summary.wait_not_executable)
+    print("Paper v2 handoff failures:", summary.handoff_failures)
+    print("Paper v2 operational failures:", summary.operational_failures)
+    print("Legacy paper authorities invoked:", summary.legacy_calls)
+    for detail in summary.details:
+        print("  PAPER V2:", detail)
+
+
 def _direction_counts(candidates):
     return (
         sum(c.trade_direction == "LONG" for c in candidates),
@@ -540,6 +650,10 @@ def _prepare_qualified_lineage(
         )
         return 0, len(ranked_opportunities)
 
+    # Resolved once per scan: the lineage metadata must describe the authority
+    # that actually owns this opportunity.
+    paper_v2 = _paper_v2_active_safe(settings)
+
     prepared = 0
     failures = 0
     for ranked in ranked_opportunities:
@@ -548,6 +662,12 @@ def _prepare_qualified_lineage(
         alert = opportunity.alert
         plan = opportunity.plan
         direction = str(snapshot.trade_direction or "LONG").upper()
+        paper_requested, paper_engine = _paper_lineage_attribution(
+            paper_enabled=paper_enabled,
+            direction=direction,
+            valid_now=bool(plan.valid_now),
+            paper_v2=paper_v2,
+        )
         try:
             episode_id = canonical_episode_id(
                 scan.snapshots,
@@ -592,12 +712,8 @@ def _prepare_qualified_lineage(
                     "market_regime": alert.get("market_regime"),
                     "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
                     "target_attainability_score": alert.get("target_attainability_score"),
-                    "paper_requested": bool(paper_enabled and direction == "LONG"),
-                    "paper_engine": (
-                        "FREQTRADE_DRY_RUN"
-                        if direction == "LONG"
-                        else "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
-                    ),
+                    "paper_requested": paper_requested,
+                    "paper_engine": paper_engine,
                 },
             )
             alert["signal_id"] = signal_id
@@ -1779,6 +1895,17 @@ def main():
     print("Qualified signal lineage failures:", lineage_failures)
     opip.record_qualified(ranked_opportunities)
 
+    # Capture the Paper-v2 qualification stamp once, immediately after final
+    # qualification is recorded, and only when the Paper-v2 route could be used.
+    paper_v2 = _paper_v2_active_safe(settings)
+    paper_v2_stamp = None
+    if paper_v2:
+        from app.services.paper_v2_scan_router import capture_qualification_stamp
+
+        paper_v2_stamp = capture_qualification_stamp(
+            qualification_time=_paper_v2_qualification_time()
+        )
+
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
         alert = opportunity.alert
@@ -1819,25 +1946,41 @@ def main():
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
     print("Price movement notification failures:", movement_notification_failures)
-    freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
-        ranked_opportunities,
-        scan=scan,
-        decision_at=decision_at,
-        settings=settings,
-    )
-    shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
-        ranked_opportunities,
-        scan=scan,
-        decision_at=decision_at,
-        settings=settings,
-    )
-    print("Authoritative Freqtrade paper signals published:", freqtrade_published)
-    print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
-    print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
-    print("Shadow simulator failures:", shadow_failures)
+    if paper_v2:
+        # Exclusive authority: O'Pip Paper v2 only. Neither legacy paper authority
+        # is invoked, and no failure path below can reach one.
+        paper_v2_summary = _route_paper_v2_opportunities(
+            ranked_opportunities,
+            scan=scan,
+            decision_at=decision_at,
+            stamp=paper_v2_stamp,
+            settings=settings,
+            opip=opip,
+        )
+        _print_paper_v2_summary(paper_v2_summary)
+    else:
+        freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
+            ranked_opportunities,
+            scan=scan,
+            decision_at=decision_at,
+            settings=settings,
+        )
+        shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
+            ranked_opportunities,
+            scan=scan,
+            decision_at=decision_at,
+            settings=settings,
+        )
+        print("Authoritative Freqtrade paper signals published:", freqtrade_published)
+        print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
+        print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
+        print("Shadow simulator failures:", shadow_failures)
     paper_admission_eligible = opip.record_paper_admission_eligibility(
         ranked_opportunities,
         paper_enabled=_paper_trade_enabled_safe(),
+        engine_label=(
+            PAPER_ENGINE_PAPER_V2_LABEL if paper_v2 else PAPER_ENGINE_LEGACY_LABEL
+        ),
     )
     opip.finalize(
         scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context),

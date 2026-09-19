@@ -391,8 +391,24 @@ def test_missing_required_source_fact_fails_closed(writer, field_name):
 
 
 def test_missing_source_record_refs_fails_closed():
+    """Additional upstream refs may be empty; a bare string is still invalid.
+
+    The mandatory ancestry proofs are composed in by the bridge, so a caller with
+    nothing extra to cite is a valid caller - it must not have to invent a ref.
+    """
+    facts = _facts(source_record_refs=())
+    payload = build_decision_context_payload(facts)
+    refs = payload["provenance"]["source_record_refs"]
+    assert refs, "the mandatory proofs must always be present"
+    # The supplied item count is now zero, so only the two proofs remain.
+    assert len(refs) == 2
+
+    for malformed in ("source:1", None, 42):
+        with pytest.raises(ValueError, match="source_record_refs"):
+            build_decision_context_payload(_facts(source_record_refs=malformed))
+
     with pytest.raises(ValueError, match="source_record_refs"):
-        build_decision_context_payload(_facts(source_record_refs=()))
+        build_decision_context_payload(_facts(source_record_refs=("",)))
 
 
 def test_non_canonical_instrument_version_is_rejected():

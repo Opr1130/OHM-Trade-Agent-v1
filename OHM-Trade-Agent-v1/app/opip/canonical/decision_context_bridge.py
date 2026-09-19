@@ -223,6 +223,11 @@ class DecisionContextFacts:
     artifact_or_build_id: str
     process_instance_id: str
     emitted_at: datetime
+    #: Additional upstream refs. May be empty: the two durable ancestry proofs
+    #: above are always composed in first, so the resulting provenance is never
+    #: empty and a caller never has to invent a ref merely to satisfy a
+    #: precondition. A bare string is still rejected, and every supplied item must
+    #: be a real non-empty reference.
     source_record_refs: tuple[str, ...]
 
 
@@ -247,8 +252,8 @@ def _build_provenance(facts: DecisionContextFacts) -> Provenance:
         facts.snapshot_record_event_id, field_name="snapshot_record_event_id"
     )
     refs = facts.source_record_refs
-    if isinstance(refs, str) or not isinstance(refs, (tuple, list)) or not refs:
-        raise ValueError("source_record_refs is required")
+    if isinstance(refs, str) or not isinstance(refs, (tuple, list)):
+        raise ValueError("source_record_refs must be a sequence of references")
     composed: list[str] = []
     for reference in (instrument_proof, snapshot_proof, *refs):
         canonical = _require_text(reference, field_name="source_record_refs")

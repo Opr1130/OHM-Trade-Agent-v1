@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any, Mapping
 
 from app.exchanges.kraken import KrakenClient
 
@@ -36,6 +37,16 @@ class UniverseAsset:
     liquidity_rank: int = 0
     primary_kraken_symbol: str = ""
     secondary_kraken_symbol: str | None = None
+    #: Exact Kraken reference data for the selected primary pair, carried forward
+    #: so a downstream consumer (Paper v2) can recreate the canonical
+    #: ``InstrumentVersion`` from the metadata this scan actually observed instead
+    #: of issuing a second ``AssetPairs`` request or inferring pair decimals,
+    #: altnames or order minimums from a display symbol.
+    #:
+    #: ``primary_pair_id`` is the Kraken pair id; ``primary_pair_details`` is the
+    #: raw ``AssetPairs`` entry for it (see ``kraken_descriptor``).
+    primary_pair_id: str = ""
+    primary_pair_details: Mapping[str, Any] | None = None
     primary_ticker_last: float = 0.0
     primary_ticker_bid: float = 0.0
     primary_ticker_ask: float = 0.0
@@ -199,6 +210,11 @@ def build_kraken_asset_universe(
             item["usd_pair"] = market.display_pair
             item["usd_notional"] = quote_notional
             item["usd_kraken_symbol"] = market.kraken_public_symbol
+            item["usd_pair_id"] = market.pair_id
+            # The exact AssetPairs entry this scan already fetched. Carried, not
+            # re-requested, so the execution instrument derives from the metadata
+            # actually observed here.
+            item["usd_pair_details"] = pair_details.get(market.pair_id)
             item["usd_ticker"] = ticker
         else:
             item["usdt_pair"] = market.display_pair
@@ -209,6 +225,8 @@ def build_kraken_asset_universe(
                 else 0.0
             )
             item["usdt_kraken_symbol"] = market.kraken_public_symbol
+            item["usdt_pair_id"] = market.pair_id
+            item["usdt_pair_details"] = pair_details.get(market.pair_id)
             item["usdt_ticker"] = ticker
 
     assets: list[UniverseAsset] = []
@@ -240,6 +258,8 @@ def build_kraken_asset_universe(
             )
             primary_ticker = dict(item["usd_ticker"])
             secondary_ticker = dict(item["usdt_ticker"]) if usdt_pair else None
+            primary_pair_id = str(item.get("usd_pair_id") or "")
+            primary_pair_details = item.get("usd_pair_details")
         else:
             primary_pair = str(usdt_pair)
             secondary_pair = None
@@ -248,6 +268,8 @@ def build_kraken_asset_universe(
             secondary_kraken_symbol = None
             primary_ticker = dict(item["usdt_ticker"])
             secondary_ticker = None
+            primary_pair_id = str(item.get("usdt_pair_id") or "")
+            primary_pair_details = item.get("usdt_pair_details")
 
         assets.append(UniverseAsset(
             base_asset=base_asset,
@@ -262,6 +284,12 @@ def build_kraken_asset_universe(
             combined_24h_notional_usd=combined,
             primary_kraken_symbol=primary_kraken_symbol,
             secondary_kraken_symbol=secondary_kraken_symbol,
+            primary_pair_id=primary_pair_id,
+            primary_pair_details=(
+                dict(primary_pair_details)
+                if isinstance(primary_pair_details, dict)
+                else None
+            ),
             primary_ticker_last=float(primary_ticker["last"]),
             primary_ticker_bid=float(primary_ticker.get("bid", primary_ticker["last"])),
             primary_ticker_ask=float(primary_ticker.get("ask", primary_ticker["last"])),

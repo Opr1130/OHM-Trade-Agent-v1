@@ -743,12 +743,14 @@ class OPipScanObserver:
         ranked_opportunities: Iterable[Any],
         *,
         paper_enabled: bool,
+        engine_label: str = "v1 authoritative paper engine",
     ) -> int:
         """Record paper admission *eligibility* only.
 
-        Build 1 does not admit anything. The authoritative paper engine is spot
-        LONG only, so a qualified SHORT is recorded as ineligible rather than
-        being silently absent.
+        Build 1 does not admit anything. The selected authoritative paper engine
+        is spot LONG only, so a qualified SHORT is recorded as ineligible rather
+        than being silently absent. ``engine_label`` names the engine that
+        actually holds authority; telemetry must not report a different one.
         """
         eligible = 0
         try:
@@ -759,7 +761,7 @@ class OPipScanObserver:
                 )
                 if direction != "LONG":
                     code = ReasonCode.PAPER_ENGINE_DIRECTION_UNSUPPORTED
-                    reason = "v1 authoritative paper engine is spot LONG only"
+                    reason = f"{engine_label} is spot LONG only"
                 elif not paper_enabled:
                     code = ReasonCode.PAPER_ENGINE_DISABLED
                     reason = "paper trading is switched off"
@@ -966,6 +968,7 @@ class NullScanObserver:
         ranked_opportunities: Iterable[Any],
         *,
         paper_enabled: bool,
+        engine_label: str = "v1 authoritative paper engine",
     ) -> int:
         return 0
 

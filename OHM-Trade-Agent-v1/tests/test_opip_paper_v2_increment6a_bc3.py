@@ -1206,6 +1206,13 @@ def test_decision_snapshot_event_is_registered_in_the_runtime_accepted_set():
 
 
 def test_scan_opportunities_has_no_paper_v2_execution_caller():
+    """The scan orchestrator delegates; it never calls the producer directly.
+
+    Increment 6B wires the router seam, so the scan does reference the Paper-v2
+    route. What must remain true is that it stays thin: it does not call the
+    execution producer itself, and it does not import the decision-intelligence
+    plane. Those are the invariants this test now guards.
+    """
     source = (APP_ROOT / "jobs" / "scan_opportunities.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     referenced: set[str] = set()
@@ -1219,13 +1226,12 @@ def test_scan_opportunities_has_no_paper_v2_execution_caller():
             referenced.update(alias.name for alias in node.names)
         elif isinstance(node, ast.Import):
             referenced.update(alias.name for alias in node.names)
-    for token in (
-        "run_paper_v2_opportunity",
-        "paper_v2_execution",
-        "paper_v2_decision_snapshot",
-    ):
-        assert token not in referenced, token
-    assert "paper_v2" not in source.lower()
+    # The producer is reached only through the router.
+    assert "run_paper_v2_opportunity" not in referenced
+    assert "paper_v2_execution" not in referenced
+    assert "paper_v2_decision_snapshot" not in referenced
+    # And the runtime import boundary is unchanged.
+    assert "app.opip.decision_intelligence" not in referenced
 
 
 def test_paper_v2_mode_defaults_off():
