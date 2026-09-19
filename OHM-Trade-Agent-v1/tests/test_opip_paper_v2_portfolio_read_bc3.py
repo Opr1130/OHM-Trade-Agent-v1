@@ -75,6 +75,7 @@ def _seed_context(writer: CanonicalWriter) -> dict:
         episode_id="episode-read",
         instrument_version_id="INSTR:kraken:SOL:USD:1",
         instrument_registration_event_id="EVT:seed-proof",
+        snapshot_record_event_id="EVT:seed-snapshot-proof",
         snapshot_id="snapshot-read",
         snapshot_hash="snapshot-hash-read",
         evaluation_time=NOW,

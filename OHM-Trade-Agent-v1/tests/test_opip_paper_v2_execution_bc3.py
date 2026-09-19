@@ -12,6 +12,7 @@ import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,8 @@ from app.opip.contracts.paper_execution_events import (
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_QUOTE_EVIDENCE_RECORDED,
 )
+from app.services.canonical_episode_capture import build_canonical_episode_snapshots
+from app.opip.decision.versioning import GATE_POLICY_VERSION, gate_policy_fingerprint
 from app.services.paper_v2_execution import (
     PaperV2ExecutionError,
     PaperV2Opportunity,
@@ -41,6 +44,7 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
 
 class _Settings:
+    opip_paper_v2_mode = "active"
     paper_v2_quote_max_age_seconds = 15
     paper_trade_fee_rate = 0.004
     paper_trade_slippage_bps = 10.0
@@ -91,24 +95,84 @@ def _version(**overrides) -> InstrumentVersion:
     return InstrumentVersion(**fields)
 
 
+def _snapshot_payload(
+    *,
+    decision: datetime = NOW,
+    symbol: str = "SOLUSD",
+    price: float = 100.0,
+) -> dict:
+    """A real production-shaped canonical episode snapshot.
+
+    Built by the real builder, so the cohort/episode/snapshot identities are the
+    builder's own. Because the cohort identity includes the decision instant, a
+    test obtains a genuinely distinct episode by capturing at a different moment -
+    which is also what distinguishes two episodes in production.
+    """
+    observation = SimpleNamespace(
+        symbol=symbol,
+        base_asset=symbol.removesuffix("USD"),
+        kraken_public_symbol=f"{symbol.removesuffix('USD')}/USD",
+        last_price=float(price),
+        ticker_last=float(price),
+        volume_24h=100_000.0,
+        notional_24h_usd_approx=1_000_000.0,
+        high_24h=float(price) * 1.05,
+        low_24h=float(price) * 0.95,
+        lift_from_24h_low_pct=5.0,
+        distance_from_24h_high_pct=4.0,
+    )
+    candidate = SimpleNamespace(
+        symbol=symbol,
+        universe_size=3,
+        stage="BREAKOUT_CANDIDATE",
+        pattern="REACCELERATION",
+        opportunity_score=78.0,
+        explosion_potential_score=74.0,
+        tradeability_score=72.0,
+        pattern_strength_score=80.0,
+        volume_acceleration_score=70.0,
+        relative_strength_score=88.0,
+        persistence_scans=3,
+        exhaustion_penalty=10.0,
+        exhaustion_band="LOW",
+        relative_strength_percentile=95.0,
+        suppressed=False,
+        reasons=(),
+        components={"near_high": 75.0},
+    )
+    return build_canonical_episode_snapshots(
+        [observation],
+        candidates=[candidate],
+        decision_at=decision,
+        signal_quality_enabled=True,
+        scan_source="LIVE_FULL_MARKET",
+    )[0]
+
+
 def _opportunity(**overrides) -> PaperV2Opportunity:
+    snapshot = overrides.pop("snapshot_payload", None)
+    snapshot_at = overrides.pop("snapshot_at", NOW)
+    if snapshot is None:
+        snapshot = _snapshot_payload(decision=snapshot_at)
     fields = {
         "candidate_id": "candidate-1",
-        "episode_id": "episode-1",
-        "cohort_id": "cohort-1",
+        "episode_id": snapshot["episode_id"],
+        "cohort_id": snapshot["cohort_id"],
+        "direction": "LONG",
         "instrument_version_id": INSTRUMENT_VERSION_ID,
-        "snapshot_id": "snapshot-1",
-        "snapshot_hash": "snapshot-hash-1",
-        "evaluation_time": NOW,
-        "evidence_cutoff": NOW,
+        "snapshot_payload": snapshot,
+        "evaluation_time": snapshot_at,
+        "evidence_cutoff": snapshot_at,
         "source_record_refs": ("source:1",),
-        "artifact_or_build_id": "build-test",
-        "process_instance_id": "proc-test",
+        # Captured where the opportunity was qualified; the producer must carry
+        # this forward rather than re-read the live policy.
+        "qualification_policy_version": GATE_POLICY_VERSION,
+        "qualification_policy_fingerprint": gate_policy_fingerprint(),
         "instrument_version": _version(),
         "quote_currency": "USD",
         "requested_capital": 500.0,
         "requested_reservation_amount": 500.0,
-        "decision_time": NOW,
+        "decision_time": snapshot_at,
         "native_symbol": "SOL/USD",
         "requested_quantity": 5.0,
         "requested_notional": 500.0,
@@ -453,10 +517,8 @@ def _fill_portfolio(env, *, count: int):
         _run(
             env,
             _opportunity(
-                episode_id=f"filler-{index}",
+                snapshot_at=NOW + timedelta(seconds=index),
                 candidate_id=f"filler-c-{index}",
-                snapshot_id=f"filler-s-{index}",
-                snapshot_hash=f"filler-h-{index}",
             ),
         )
 
@@ -470,7 +532,12 @@ def test_capacity_rejection_stops_the_opportunity_without_fallback(env):
     """
     server, _ = env
     _fill_portfolio(env, count=3)
-    result = _run(env, _opportunity(episode_id="episode-over", candidate_id="c-over"))
+    result = _run(
+        env,
+        _opportunity(
+            snapshot_at=NOW + timedelta(seconds=100), candidate_id="c-over"
+        ),
+    )
     assert result.status == "CAPACITY_REJECTED"
     assert result.fill_id is None
     assert len(_rows(server.writer, PAPER_FILL_RECORDED)) == 3  # only the fillers
@@ -482,7 +549,7 @@ def test_capital_rejection_stops_the_opportunity(env):
     result = _run(
         env,
         _opportunity(
-            episode_id="episode-big",
+            snapshot_at=NOW + timedelta(seconds=200),
             candidate_id="c-big",
             requested_capital=10_001.0,
             requested_reservation_amount=10_001.0,
@@ -581,7 +648,9 @@ def test_context_failure_fails_closed(env):
     server, client = env
     with pytest.raises(PaperV2ExecutionError, match="decision context failed"):
         run_paper_v2_opportunity(
-            _opportunity(snapshot_hash=""),
+            # The snapshot commits, but a context with no policy fingerprint
+            # cannot: the context stage must fail closed on its own facts.
+            _opportunity(qualification_policy_fingerprint=""),
             client=client,
             kraken_client=_kraken(),
             settings=_Settings(),
@@ -653,8 +722,13 @@ def test_portfolio_state_is_reread_for_each_opportunity(env):
         return state
 
     client.get_paper_portfolio_state = _counting_read  # type: ignore[assignment]
-    _run(env, _opportunity(episode_id="e-a", candidate_id="c-a", snapshot_id="s-a", snapshot_hash="h-a"))
-    _run(env, _opportunity(episode_id="e-b", candidate_id="c-b", snapshot_id="s-b", snapshot_hash="h-b"))
+    _run(env, _opportunity(candidate_id="c-a"))
+    _run(
+        env,
+        _opportunity(
+            snapshot_at=NOW + timedelta(seconds=1), candidate_id="c-b"
+        ),
+    )
 
     # Version observed for the second opportunity reflects the first admission.
     assert reads == [0, 1]
@@ -667,10 +741,8 @@ def test_usd_and_usdt_remain_independent(env):
     _run(
         env,
         _opportunity(
-            episode_id="episode-usdt",
+            snapshot_at=NOW + timedelta(seconds=1),
             candidate_id="c-usdt",
-            snapshot_id="s-usdt",
-            snapshot_hash="h-usdt",
             quote_currency="USDT",
             # The instrument identity must stay coherent with the registered
             # version, or the canonical instrument binding fails closed.

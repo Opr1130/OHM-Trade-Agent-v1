@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from app.opip.contracts.serialization import episode_snapshot_hash
 from app.services.p1_intelligence_contracts import build_live_scan_snapshot
 from app.services.p1_shadow_outbox import (
     DEFAULT_DEAD_LETTER_FILE,
@@ -462,19 +463,13 @@ def canonical_episode_snapshot_hash(snapshot_payload: Mapping[str, Any]) -> str:
     current time, randomness, process identity, or Feature Bus state takes part.
     The ``PSNAP:`` domain keeps it distinct from the ``SNAP:`` identity, so the two
     can never be confused.
+
+    The digest itself is implemented once at the contracts layer, because the
+    canonical event validator must bind a snapshot's exact contents too and the
+    two layers must not each own a hashing convention. This name is preserved as
+    the producer-facing entry point and returns that same value unchanged.
     """
-    if not isinstance(snapshot_payload, Mapping):
-        raise ValueError("snapshot payload must be a mapping")
-    try:
-        encoded = json.dumps(
-            dict(snapshot_payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("snapshot payload is not canonically serializable") from exc
-    return _hash("PSNAP", encoded, length=32)
+    return episode_snapshot_hash(snapshot_payload)
 
 
 def build_canonical_episode_snapshots(

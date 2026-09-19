@@ -78,6 +78,7 @@ def _facts(**overrides) -> DecisionContextFacts:
         "episode_id": "episode-1",
         "instrument_version_id": INSTRUMENT_VERSION_ID,
         "instrument_registration_event_id": "EVT:instrument-proof-1",
+        "snapshot_record_event_id": "EVT:snapshot-proof-1",
         "snapshot_id": "snapshot-1",
         "snapshot_hash": "snapshot-hash-1",
         "evaluation_time": NOW - timedelta(seconds=30),

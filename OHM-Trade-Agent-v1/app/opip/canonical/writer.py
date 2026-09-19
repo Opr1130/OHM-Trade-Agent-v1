@@ -65,6 +65,7 @@ from app.opip.contracts.paper_execution_runtime import (
     PAPER_ACTION_ARMED_STATES,
     PAPER_ACTION_EXIT_SIDE,
     PAPER_ADMISSION_REQUEST_RECORDED,
+    PAPER_DECISION_SNAPSHOT_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
     PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
@@ -78,6 +79,7 @@ from app.opip.contracts.paper_execution_runtime import (
     PaperProtectionActionRequest,
     admission_request_idempotency_key,
     admission_result_identities,
+    decision_snapshot_idempotency_key,
     protection_action_idempotency_key,
     protection_transition_allowed,
     protection_transition_requires_trigger,
@@ -85,6 +87,7 @@ from app.opip.contracts.paper_execution_runtime import (
     resolve_capital_policy,
     validate_admission_request,
     validate_admission_request_record_payload,
+    validate_decision_snapshot_payload,
     validate_protection_action_request,
     validate_quote_evidence_payload,
 )
@@ -2665,6 +2668,14 @@ class CanonicalWriter:
         if intent.event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
             normalized = validate_quote_evidence_payload(intent.payload)
             expected_key = quote_evidence_idempotency_key(normalized)
+        elif intent.event_type == PAPER_DECISION_SNAPSHOT_RECORDED:
+            # The decision snapshot verifies its own content binding, so a
+            # fabricated or mismatched hash cannot reach the store. Its key is
+            # anchored on snapshot identity, so an identical retry is
+            # DUPLICATE_OK while different content under the same identity hits
+            # the same-key conflict check below.
+            normalized = validate_decision_snapshot_payload(intent.payload)
+            expected_key = decision_snapshot_idempotency_key(normalized)
         else:
             if intent.event_type not in PAPER_V2_WRITER_EVENT_TYPES:
                 raise ValueError("Paper v2 event is not registered for runtime")

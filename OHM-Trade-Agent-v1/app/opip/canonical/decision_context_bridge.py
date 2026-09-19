@@ -208,6 +208,11 @@ class DecisionContextFacts:
     #: canonically (the event id returned by registration). Required, so a context
     #: can never be built for an instrument whose registration was not proven.
     instrument_registration_event_id: str
+    #: Proof that the market snapshot this decision was taken against is committed
+    #: canonically (the event id returned by the decision-snapshot commit). Required
+    #: for the same reason: a context must be able to cite its snapshot as durable
+    #: evidence rather than as a claim.
+    snapshot_record_event_id: str
     snapshot_id: str
     snapshot_hash: str
     evaluation_time: datetime
@@ -222,9 +227,33 @@ class DecisionContextFacts:
 
 
 def _build_provenance(facts: DecisionContextFacts) -> Provenance:
+    """Compose provenance, forcing the durable ancestry proofs into the refs.
+
+    The instrument-registration and decision-snapshot event ids are *proofs*, not
+    optional citations: a context that names an instrument or a snapshot must also
+    name the durable record that establishes it. They are therefore composed here
+    unconditionally rather than trusted to the caller's ref list, so an empty or
+    unrelated proof can never leave a context claiming ancestry it does not have.
+
+    Ordering is deterministic - the proofs first in a fixed order, then the
+    caller's refs in their supplied order - and duplicates are dropped on first
+    occurrence, so the same facts always produce the same ref list.
+    """
+    instrument_proof = _require_text(
+        facts.instrument_registration_event_id,
+        field_name="instrument_registration_event_id",
+    )
+    snapshot_proof = _require_text(
+        facts.snapshot_record_event_id, field_name="snapshot_record_event_id"
+    )
     refs = facts.source_record_refs
     if isinstance(refs, str) or not isinstance(refs, (tuple, list)) or not refs:
         raise ValueError("source_record_refs is required")
+    composed: list[str] = []
+    for reference in (instrument_proof, snapshot_proof, *refs):
+        canonical = _require_text(reference, field_name="source_record_refs")
+        if canonical not in composed:
+            composed.append(canonical)
     return Provenance(
         producing_component=_require_text(
             facts.producing_component, field_name="producing_component"
@@ -236,7 +265,7 @@ def _build_provenance(facts: DecisionContextFacts) -> Provenance:
             facts.process_instance_id, field_name="process_instance_id"
         ),
         emitted_at=facts.emitted_at,
-        source_record_refs=tuple(refs),
+        source_record_refs=tuple(composed),
     )
 
 
@@ -252,11 +281,16 @@ def build_decision_context_payload(facts: DecisionContextFacts) -> dict:
     if not isinstance(facts, DecisionContextFacts):
         raise ValueError("facts must be DecisionContextFacts")
 
-    # Registration must be proven before a context may reference the instrument,
-    # so an unregistered instrument cannot produce context evidence.
+    # Registration and snapshot commit must be proven before a context may exist,
+    # so neither an unregistered instrument nor an unrecorded snapshot can produce
+    # context evidence.
     _require_text(
         facts.instrument_registration_event_id,
         field_name="instrument_registration_event_id",
+    )
+    _require_text(
+        facts.snapshot_record_event_id,
+        field_name="snapshot_record_event_id",
     )
 
     context = DecisionContextV2(

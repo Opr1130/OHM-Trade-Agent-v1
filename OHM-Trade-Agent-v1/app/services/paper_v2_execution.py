@@ -10,7 +10,8 @@ Lifecycle::
 
     qualified opportunity
     -> ensure canonical InstrumentVersion
-    -> ensure canonical DecisionContext
+    -> commit canonical decision snapshot (durable snapshot proof)
+    -> ensure canonical DecisionContext (cites that proof)
     -> read PaperPortfolioState
     -> ADMIT_PAPER_OPPORTUNITY
     -> ENTRY order intent
@@ -19,6 +20,11 @@ Lifecycle::
     -> quote-backed fill
     -> fill-derived exposure
     -> immutable protection plan
+
+The decision snapshot is committed *before* the context on purpose. A context
+must cite durable snapshot evidence, so the record it points at has to exist
+first; a context that hoped a snapshot would appear later would be ancestry that
+cannot be resolved.
 
 Restart safety
 --------------
@@ -68,7 +74,13 @@ from app.opip.contracts.paper_execution_runtime import (
 )
 from app.opip.contracts.serialization import iso_z, stable_hash
 from app.opip.contracts.temporal import require_utc
-from app.opip.decision.versioning import GATE_POLICY_VERSION, gate_policy_fingerprint
+from app.opip.contracts.process_identity import process_instance_id
+from app.opip.decision.versioning import app_code_fingerprint
+from app.services.paper_v2_activation import paper_v2_active
+from app.services.paper_v2_decision_snapshot import (
+    DecisionSnapshot,
+    commit_decision_snapshot,
+)
 from app.services.paper_v2_instrument_registration import (
     InstrumentRegistrationError,
     ensure_instrument_version_registered,
@@ -90,8 +102,14 @@ FILL_PREFIX = "FILL"
 
 #: The component name this producer stamps into its own evidence provenance. It
 #: names the module that actually emits the record, so it is a fact rather than a
-#: placeholder; the build and process identity are supplied by the caller.
+#: placeholder; the build and process identity are obtained by the producer itself.
 PRODUCING_COMPONENT = "paper_v2_execution"
+
+#: The only opportunity direction this slice can execute. Paper v2 models long-only
+#: exposure, so an ENTRY is a BUY. A short needs a separately frozen contract, so
+#: any other direction is refused rather than silently mapped onto a BUY.
+OPPORTUNITY_DIRECTION_LONG = "LONG"
+SUPPORTED_OPPORTUNITY_DIRECTIONS = frozenset({OPPORTUNITY_DIRECTION_LONG})
 
 #: Terminal, non-continuing admission outcomes. Each stops this opportunity.
 STOP_DISPOSITIONS = frozenset({"CAPACITY_REJECTED", "CAPITAL_REJECTED"})
@@ -110,22 +128,29 @@ class PaperV2Opportunity:
     """
 
     # Canonical lineage
+    #: The canonical qualification candidate identity. Increment 6B must supply
+    #: this in the ``OPIPC:`` domain, derived from episode + pair + direction +
+    #: market type. It must not substitute the separate signal/alert id: those are
+    #: different facts, and a context that named an alert as its candidate would
+    #: claim ancestry that does not describe the qualified opportunity.
     candidate_id: str
     episode_id: str
     cohort_id: str
+    direction: str
     instrument_version_id: str
-    snapshot_id: str
-    snapshot_hash: str
+    #: The exact production-shaped canonical episode snapshot this decision is
+    #: taken against. The producer validates it, derives its identity and content
+    #: hash from it, and never accepts a free-standing id/hash pair as proof.
+    snapshot_payload: Mapping[str, Any]
     evaluation_time: datetime
     evidence_cutoff: datetime
     source_record_refs: tuple[str, ...]
-    #: Producer provenance. Required, with no defaults, so the producer can never
-    #: fall back to a placeholder build or process identity: the caller must supply
-    #: the identity it actually runs under. The policy identity is deliberately not
-    #: a caller fact - it is read from the live gate policy, which is the only
-    #: authority on which policy qualified the opportunity.
-    artifact_or_build_id: str
-    process_instance_id: str
+    #: Qualification-time policy identity, captured where the opportunity was
+    #: qualified. Carried explicitly so the committed context describes the policy
+    #: that actually qualified it, even if the live policy changes before this
+    #: producer runs. The producer never reads the live policy.
+    qualification_policy_version: str
+    qualification_policy_fingerprint: str
     # Instrument (registration input)
     instrument_version: InstrumentVersion
     # Portfolio / admission
@@ -216,11 +241,41 @@ def run_paper_v2_opportunity(
     """Execute one qualified opportunity through the frozen canonical path."""
     if not isinstance(opportunity, PaperV2Opportunity):
         raise ValueError("opportunity must be a PaperV2Opportunity")
+
+    # --- 0. producer-level activation and direction gates ------------------
+    # Enforced here, before any canonical write or market-data read, so a direct
+    # call cannot execute while Paper v2 is inactive even if a future runtime
+    # caller forgot to gate. This is defense in depth for the router that
+    # Increment 6B will add; it deliberately does not replace that gate.
+    if not paper_v2_active(settings):
+        raise PaperV2ExecutionError(
+            "Paper v2 is not active, so no paper execution may run"
+        )
+    # Long-only: an ENTRY is a BUY. A short requires a separately frozen contract,
+    # so an unknown or unsupported direction is refused rather than reinterpreted.
+    if opportunity.direction not in SUPPORTED_OPPORTUNITY_DIRECTIONS:
+        raise PaperV2ExecutionError(
+            f"unsupported opportunity direction: {opportunity.direction!r}"
+        )
+
     moment = require_utc(now, field_name="now")
 
     disposition_id = build_disposition_id(
         episode_id=opportunity.episode_id, native_symbol=opportunity.native_symbol
     )
+
+    # --- 0b. validate the snapshot before any canonical write --------------
+    # Pure validation: the snapshot's identity, content hash and decision subject
+    # are derived from the payload itself, so an opportunity cannot assert a
+    # snapshot that does not prove its own contents or belongs to another episode.
+    try:
+        decision_snapshot = DecisionSnapshot.from_payload(
+            opportunity.snapshot_payload,
+            expected_episode_id=opportunity.episode_id,
+            expected_cohort_id=opportunity.cohort_id,
+        )
+    except ValueError as exc:
+        raise PaperV2ExecutionError(f"decision snapshot rejected: {exc}") from exc
 
     # --- 1. canonical instrument version -----------------------------------
     try:
@@ -230,26 +285,40 @@ def run_paper_v2_opportunity(
     except (InstrumentRegistrationError, ValueError) as exc:
         raise PaperV2ExecutionError(f"instrument registration failed: {exc}") from exc
 
+    # --- 1b. durable decision snapshot -------------------------------------
+    # Committed before the context: the context cites this record as snapshot
+    # provenance, so the record must exist first. Only proof of a durable commit
+    # lets execution continue.
+    try:
+        snapshot_proof = commit_decision_snapshot(decision_snapshot, client=client)
+    except ValueError as exc:
+        raise PaperV2ExecutionError(f"decision snapshot failed: {exc}") from exc
+    except RuntimeError as exc:
+        raise PaperV2ExecutionError(f"decision snapshot failed: {exc}") from exc
+
     # --- 2. canonical decision context -------------------------------------
     # The schema-v2 context carries only facts this path can state truthfully. The
-    # policy identity comes from the live gate policy rather than from a caller, so
-    # a context cannot commit to a policy identity that did not actually qualify
-    # the opportunity. The instrument registration proves the instrument exists; its
-    # coordinate is deliberately NOT reused as a consumed-input watermark.
+    # policy identity is the one captured when the opportunity was qualified, never
+    # the live policy, so the context describes the policy that actually qualified
+    # it even if thresholds changed since. The snapshot's id and content hash come
+    # from the snapshot record committed above, not from the caller. The instrument
+    # registration proves the instrument exists; its coordinate is deliberately NOT
+    # reused as a consumed-input watermark.
     facts = DecisionContextFacts(
         candidate_id=opportunity.candidate_id,
         episode_id=opportunity.episode_id,
         instrument_version_id=opportunity.instrument_version_id,
         instrument_registration_event_id=registered.event_id,
-        snapshot_id=opportunity.snapshot_id,
-        snapshot_hash=opportunity.snapshot_hash,
+        snapshot_record_event_id=snapshot_proof.event_id,
+        snapshot_id=decision_snapshot.snapshot_id,
+        snapshot_hash=decision_snapshot.snapshot_hash,
         evaluation_time=opportunity.evaluation_time,
         evidence_cutoff=opportunity.evidence_cutoff,
-        policy_version=GATE_POLICY_VERSION,
-        policy_fingerprint=gate_policy_fingerprint(),
+        policy_version=opportunity.qualification_policy_version,
+        policy_fingerprint=opportunity.qualification_policy_fingerprint,
         producing_component=PRODUCING_COMPONENT,
-        artifact_or_build_id=opportunity.artifact_or_build_id,
-        process_instance_id=opportunity.process_instance_id,
+        artifact_or_build_id=app_code_fingerprint(),
+        process_instance_id=process_instance_id(),
         emitted_at=moment,
         source_record_refs=opportunity.source_record_refs,
     )
