@@ -141,6 +141,12 @@ class Settings(BaseSettings):
     # observed no longer ago than this, so a stale book can never justify a
     # simulated fill. Simulation assumption only: no live effect.
     paper_v2_quote_max_age_seconds: int = Field(default=15, ge=1, le=300)
+    # B/C-3 Paper v2 protection policy. These are the only protection assumptions
+    # that are not already carried by the qualified opportunity: the stop and
+    # target prices come from the opportunity's own plan, while the first target's
+    # share and the maximum hold are policy. Bounded, paper-only, no live effect.
+    paper_v2_tp1_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    paper_v2_max_hold_seconds: int = Field(default=86_400, ge=1, le=604_800)
 
     # Margin Intelligence v1 is advisory/manual only. The configured ceiling
     # mirrors what the account is permitted to use, while validation remains
