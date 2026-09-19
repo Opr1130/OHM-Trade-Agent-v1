@@ -77,6 +77,15 @@ class Settings(BaseSettings):
         default="off",
         pattern=r"^(off|shadow)$",
     )
+    # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
+    # enables it: activation is an explicit operator decision, so an unknown or
+    # malformed value must fail Settings parsing rather than silently enabling a
+    # new execution path. Activation is paper-only. It grants no funded, live or
+    # exchange authority, and it cannot create order-placement capability.
+    opip_paper_v2_mode: str = Field(
+        default="off",
+        pattern=r"^(off|active)$",
+    )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).
