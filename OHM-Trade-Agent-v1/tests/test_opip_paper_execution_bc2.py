@@ -179,7 +179,14 @@ def _admit(writer, context, *, disposition_id, quote_currency="USD"):
 
 
 def _quote(context, *, quote_id, venue=CANONICAL_VENUE, symbol=NATIVE_SYMBOL,
-           quote_currency="USD", ts="2026-09-18T16:00:00Z"):
+           quote_currency="USD", ts="2026-09-18T16:00:00Z", price=None):
+    """Level-1 quote evidence. ``price`` sets the executable best bid.
+
+    A long-only trade exits by selling, so the best bid is the price that matters
+    for proving a protection threshold was crossed. Tests that need a crossed
+    level pass an explicit ``price``.
+    """
+    bid = 99.9 if price is None else float(price)
     return {
         "schema_version": 1,
         "quote_evidence_id": quote_id,
@@ -188,8 +195,8 @@ def _quote(context, *, quote_id, venue=CANONICAL_VENUE, symbol=NATIVE_SYMBOL,
         "native_symbol": symbol,
         "quote_currency": quote_currency,
         "source_kind": "LEVEL_1_BOOK",
-        "best_bid": 99.9,
-        "best_ask": 100.1,
+        "best_bid": bid,
+        "best_ask": bid + 0.2,
         "bid_quantity": 10.0,
         "ask_quantity": 12.0,
         "quote_time": _exact(ts),
@@ -293,7 +300,8 @@ def _entry_trade(writer, context, *, tag="entry", quantity=5.0, price=100.0):
     return admission, quote
 
 
-def _plan(admission, *, plan_id="plan-a", plan_seq=0, stop_price=90.0, ts="2026-09-18T16:00:02Z"):
+def _plan(admission, *, plan_id="plan-a", plan_seq=0, stop_price=90.0,
+          target_price=120.0, max_hold_seconds=3600, ts="2026-09-18T16:00:02Z"):
     return {
         "schema_version": 1,
         "engine": ENGINE_OPIP_PAPER_V2,
@@ -301,8 +309,10 @@ def _plan(admission, *, plan_id="plan-a", plan_seq=0, stop_price=90.0, ts="2026-
         "paper_trade_id": admission.paper_trade_id,
         "plan_seq": plan_seq,
         "stop_price": stop_price,
-        "targets": [{"target_id": "tp1", "price": 120.0, "fraction": 0.5}],
-        "max_hold_seconds": 3600,
+        "targets": [
+            {"target_id": "tp1", "price": target_price, "fraction": 0.5}
+        ],
+        "max_hold_seconds": max_hold_seconds,
         "plan_time": _exact(ts),
         "protection_model_version": PAPER_PROTECTION_MODEL_VERSION,
     }
@@ -326,7 +336,8 @@ def _state(admission, *, plan_id="plan-a", event_id="pstate-1", seq=0,
 
 
 def _trigger(admission, *, plan_id="plan-a", trigger_id="trig-1", seq=0,
-             trigger_type="STOP", quote_id=None, ts="2026-09-18T16:00:04Z"):
+             trigger_type="STOP", quote_id=None, ts="2026-09-18T16:00:04Z",
+             reference_price=90.0):
     payload = {
         "schema_version": 1,
         "engine": ENGINE_OPIP_PAPER_V2,
@@ -335,7 +346,7 @@ def _trigger(admission, *, plan_id="plan-a", trigger_id="trig-1", seq=0,
         "paper_trade_id": admission.paper_trade_id,
         "trigger_seq": seq,
         "trigger_type": trigger_type,
-        "reference_price": 90.0,
+        "reference_price": reference_price,
         "trigger_time": _exact(ts),
         "protection_model_version": PAPER_PROTECTION_MODEL_VERSION,
     }
@@ -600,14 +611,104 @@ def test_effective_plan_is_the_highest_activated_plan(writer_env):
 # ---------------------------------------------------------------------------
 
 
+def _fill_existing_order(
+    writer,
+    context,
+    admission,
+    *,
+    order_id,
+    tag,
+    quantity,
+    price,
+    quote_id,
+    ts="2026-09-18T16:30:00Z",
+    attempt_seq=0,
+    fill_seq=0,
+):
+    """Commit an attempt and fill against an already committed order intent.
+
+    Used where the EXIT order was created by the atomic protection action, so the
+    fill consumes that order's already-committed capacity instead of competing
+    with it as a second, separate exit order.
+    """
+    attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": f"attempt-{tag}",
+        "order_intent_id": order_id,
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": attempt_seq,
+        "execution_state": "ACCEPTED",
+        "attempt_time": _exact(ts),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": quantity,
+        "market_evidence_ref": quote_id,
+    }
+    assert _submit(writer, PAPER_EXECUTION_ATTEMPT_RECORDED, attempt).status == "OK", (
+        "attempt against existing order intent should commit"
+    )
+    fill = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "fill_id": f"fill-{tag}",
+        "execution_attempt_id": attempt["execution_attempt_id"],
+        "order_intent_id": order_id,
+        "paper_trade_id": admission.paper_trade_id,
+        "fill_seq": fill_seq,
+        "side": "SELL",
+        "quantity": quantity,
+        "price": price,
+        "fee_cost": 0.25,
+        "spread_cost": 0.25,
+        "slippage_cost": 0.25,
+        "other_supported_cost": 0.25,
+        "fill_time": _exact(ts),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+        "market_evidence_ref": quote_id,
+    }
+    ack = _submit(writer, PAPER_FILL_RECORDED, fill)
+    assert ack.status == "OK", ack.detail
+    return fill
+
+
 def _armed_trade(writer, context, *, tag):
-    """An admitted trade with positive canonical exposure and an ACTIVE plan."""
-    admission, quote = _entry_trade(writer, context, tag=tag)
+    """An admitted trade with positive exposure, an ACTIVE plan, and a crossed quote.
+
+    The returned quote is evidence that has actually crossed the configured stop,
+    so a default STOP action in these tests is a genuine crossing rather than the
+    pre-fix fixture assumption that any valid-lineage quote sufficed.
+    """
+    admission, _entry_quote = _entry_trade(writer, context, tag=tag)
     assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
     assert _submit(
         writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
     ).status == "OK"
-    return admission, quote
+    return admission, _stop_crossed_quote(writer, context, tag=tag)
+
+
+def _stop_crossed_quote(writer, context, *, tag, quote_id=None):
+    """A quote whose executable bid is at or below the plan's configured stop."""
+    quote = _quote(
+        context,
+        quote_id=quote_id or f"quote-stop-{tag}",
+        price=89.9,
+        ts="2026-09-18T16:00:03Z",
+    )
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, quote).status == "OK"
+    return quote
+
+
+def _target_crossed_quote(writer, context, *, tag, quote_id=None):
+    """A quote whose executable bid is at or above the plan's configured target."""
+    quote = _quote(
+        context,
+        quote_id=quote_id or f"quote-target-{tag}",
+        price=120.5,
+        ts="2026-09-18T16:00:03Z",
+    )
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, quote).status == "OK"
+    return quote
 
 
 def _action_request(
@@ -628,6 +729,8 @@ def _action_request(
     from_state="ACTIVE",
     to_state="TRIGGERED",
     quote_id=None,
+    trigger_quote=None,
+    reference_price=None,
     trigger_overrides=None,
     exit_overrides=None,
     state_overrides=None,
@@ -636,7 +739,9 @@ def _action_request(
     """Build one complete atomic protection action request.
 
     Defaults describe a valid STOP action against an armed plan with positive
-    canonical exposure, so each test overrides exactly the fact it is about.
+    canonical exposure, so each test overrides exactly the fact it is about. The
+    trigger's ``reference_price`` is bound to the cited quote's executable price,
+    matching the writer's binding rule.
     """
     if quote_id is not None:
         evidence_ref = quote_id
@@ -644,6 +749,11 @@ def _action_request(
         evidence_ref = quote["quote_evidence_id"]
     else:
         evidence_ref = None
+    if reference_price is None:
+        if trigger_type in {"STOP", "TARGET"} and quote_id is None:
+            reference_price = float(quote["best_bid"])
+        else:
+            reference_price = 90.0
     trigger = _trigger(
         admission,
         plan_id=plan_id,
@@ -652,6 +762,7 @@ def _action_request(
         trigger_type=trigger_type,
         quote_id=evidence_ref,
         ts=ts,
+        reference_price=reference_price,
     )
     exit_order_intent = {
         "schema_version": 1,
@@ -837,20 +948,101 @@ def test_valid_atomic_stop_commits_trigger_exit_intent_and_state(writer_env):
 def test_valid_atomic_time_action_uses_exact_temporal_evidence(writer_env):
     """TIME uses the same single RPC; only the trigger evidence differs."""
     writer, context = writer_env
-    admission, quote = _armed_trade(writer, context, tag="act-time")
-    ack = _run_action(
+    admission, quote = _entry_trade(writer, context, tag="act-time")
+    # A short holding period so expiry is exercised precisely: the plan is written
+    # at 16:00:02 and expires two seconds later.
+    assert _submit(
         writer,
-        context,
-        admission,
-        quote,
-        trigger_id="trig-time-act",
-        trigger_type="TIME",
+        PAPER_PROTECTION_PLAN_RECORDED,
+        _plan(admission, plan_id="plan-a", max_hold_seconds=2),
+    ).status == "OK"
+    assert _submit(
+        writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
+    ).status == "OK"
+
+    # Exactly at expiry is accepted.
+    at_expiry = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            quote,
+            trigger_id="trig-time-act",
+            trigger_type="TIME",
+            ts="2026-09-18T16:00:04Z",
+        )
     )
-    assert ack.status == "OK", ack.detail
+    assert at_expiry.status == "OK", at_expiry.detail
     triggers, _intents, states = _bundle_rows(writer)
     assert len(triggers) == 1
     assert "market_evidence_ref" not in triggers[0]
     assert len(states) == 2
+
+
+def test_time_action_before_expiry_is_rejected(writer_env):
+    """A TIME trigger may not fire before the configured holding period elapsed."""
+    writer, context = writer_env
+    admission, quote = _entry_trade(writer, context, tag="act-time-early")
+    assert _submit(
+        writer,
+        PAPER_PROTECTION_PLAN_RECORDED,
+        _plan(admission, plan_id="plan-a", max_hold_seconds=3600),
+    ).status == "OK"
+    assert _submit(
+        writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
+    ).status == "OK"
+
+    # One second before the 16:00:02 + 3600s expiry.
+    early = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            quote,
+            trigger_id="trig-time-early",
+            trigger_type="TIME",
+            ts="2026-09-18T17:00:01Z",
+        )
+    )
+    assert early.status == "REJECTED"
+    assert "max_hold_seconds expiry" in str(early.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+@pytest.mark.parametrize("offset_seconds", [0, 1, 60])
+def test_time_action_at_or_after_expiry_is_accepted(writer_env, offset_seconds):
+    """Exactly at expiry and any later time are both accepted.
+
+    Each case gets its own writer fixture, so a trade is only ever triggered once
+    and the plan's armed state is not consumed by a sibling case.
+    """
+    writer, context = writer_env
+    admission, quote = _entry_trade(writer, context, tag="act-time-ok")
+    assert _submit(
+        writer,
+        PAPER_PROTECTION_PLAN_RECORDED,
+        _plan(admission, plan_id="plan-a", max_hold_seconds=3600),
+    ).status == "OK"
+    assert _submit(
+        writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
+    ).status == "OK"
+
+    # plan_time 16:00:02, so expiry is 17:00:02.
+    second = (17 * 3600) + 2 + offset_seconds
+    ts = (
+        f"2026-09-18T{second // 3600:02d}:"
+        f"{(second % 3600) // 60:02d}:{second % 60:02d}Z"
+    )
+    ack = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            quote,
+            trigger_id="trig-time-ok",
+            trigger_type="TIME",
+            ts=ts,
+        )
+    )
+    assert ack.status == "OK", ack.detail
+    assert len(_rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +1055,7 @@ def test_exit_quantity_beyond_exposure_rolls_back_the_whole_bundle(writer_env):
     admission, quote = _armed_trade(writer, context, tag="act-overclose")
     ack = _run_action(writer, context, admission, quote, exit_quantity=6.0)
     assert ack.status == "REJECTED"
-    assert "exceeds canonical remaining exposure" in str(ack.detail)
+    assert "available canonical exit capacity" in str(ack.detail)
     triggers, intents, states = _bundle_rows(writer)
     assert triggers == []
     assert len(intents) == 1  # only the entry intent
@@ -1203,15 +1395,17 @@ def test_trigger_bundle_is_economically_inert(writer_env):
 def test_target_partial_exit_leaves_residual_exposure_protected(writer_env):
     """A partial TARGET action leaves the residual position and its protection."""
     writer, context = writer_env
-    admission, quote = _armed_trade(writer, context, tag="act-target")
-    ack = _run_action(
-        writer,
-        context,
-        admission,
-        quote,
-        trigger_id="trig-target",
-        trigger_type="TARGET",
-        exit_quantity=2.0,
+    admission, _stop_quote = _armed_trade(writer, context, tag="act-target")
+    target_quote = _target_crossed_quote(writer, context, tag="act-target")
+    ack = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            target_quote,
+            trigger_id="trig-target",
+            trigger_type="TARGET",
+            exit_quantity=2.0,
+        )
     )
     assert ack.status == "OK", ack.detail
     # The bundle itself changed no quantity.
@@ -1219,7 +1413,7 @@ def test_target_partial_exit_leaves_residual_exposure_protected(writer_env):
 
     # Only a canonical SELL fill reduces exposure.
     _leg(writer, context, admission, tag="act-target-exit", role="EXIT", side="SELL",
-         quantity=2.0, price=110.0, quote_id=quote["quote_evidence_id"],
+         quantity=2.0, price=110.0, quote_id=target_quote["quote_evidence_id"],
          ts="2026-09-18T16:30:00Z")
     totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
     assert totals["remaining_quantity"] == 3.0
@@ -1236,9 +1430,18 @@ def test_stop_full_exit_does_not_auto_verify_reconciliation(writer_env):
     ack = _run_action(writer, context, admission, quote, trigger_id="trig-stop-full")
     assert ack.status == "OK", ack.detail
 
-    _leg(writer, context, admission, tag="act-stop-full-exit", role="EXIT", side="SELL",
-         quantity=5.0, price=90.0, quote_id=quote["quote_evidence_id"],
-         ts="2026-09-18T16:30:00Z")
+    # Fill the EXIT order the action itself created, rather than opening a second
+    # competing exit: the action already claimed the whole remaining exposure.
+    _fill_existing_order(
+        writer,
+        context,
+        admission,
+        order_id="exit-trig-stop-full",
+        tag="act-stop-full-exit",
+        quantity=5.0,
+        price=90.0,
+        quote_id=quote["quote_evidence_id"],
+    )
     totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
     assert totals["remaining_quantity"] == 0.0
     # Nothing terminalized on its own.
@@ -1254,9 +1457,17 @@ def test_reservation_releases_only_after_final_verified_following_an_action(writ
     # Active through trigger and TRIGGERED.
     assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
 
-    _leg(writer, context, admission, tag="act-release-exit", role="EXIT", side="SELL",
-         quantity=5.0, price=110.0, quote_id=quote["quote_evidence_id"],
-         ts="2026-09-18T16:30:00Z")
+    # Fill the action's own EXIT order: it already claimed the full exposure.
+    _fill_existing_order(
+        writer,
+        context,
+        admission,
+        order_id="exit-trig-act",
+        tag="act-release-exit",
+        quantity=5.0,
+        price=110.0,
+        quote_id=quote["quote_evidence_id"],
+    )
     assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
 
     totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
@@ -1438,13 +1649,15 @@ def test_reservation_stays_active_through_protection_and_partial_exit(writer_env
     ).status == "OK"
     # Remaining canonical exposure is 3.0 after the partial exit fill, so the
     # action's exit request must stay inside it.
-    action = _run_action(
-        writer,
-        context,
-        admission,
-        quote,
-        trigger_id="trig-partial",
-        exit_quantity=3.0,
+    stop_quote = _stop_crossed_quote(writer, context, tag="release-partial")
+    action = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            stop_quote,
+            trigger_id="trig-partial",
+            exit_quantity=3.0,
+        )
     )
     assert action.status == "OK", action.detail
     # Still reserved through plan, activation, atomic action and a partial exit.
@@ -1550,3 +1763,461 @@ def test_restart_reconstructs_protection_authority_from_canonical_evidence(write
         ) == expected_plan
     finally:
         reopened.close()
+
+
+# ---------------------------------------------------------------------------
+# Remediation: STOP/TARGET threshold enforcement
+# ---------------------------------------------------------------------------
+
+
+def _uncrossed_quote(writer, context, *, tag):
+    """A valid-lineage quote whose executable bid has crossed nothing."""
+    quote = _quote(
+        context,
+        quote_id=f"quote-uncrossed-{tag}",
+        price=99.9,
+        ts="2026-09-18T16:00:03Z",
+    )
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, quote).status == "OK"
+    return quote
+
+
+def test_stop_action_rejects_quote_that_has_not_crossed_the_stop(writer_env):
+    """A valid-lineage quote is not sufficient: the stop must actually be crossed."""
+    writer, context = writer_env
+    admission, _ = _armed_trade(writer, context, tag="thr-stop")
+    uncrossed = _uncrossed_quote(writer, context, tag="thr-stop")
+    assert float(uncrossed["best_bid"]) > 90.0
+
+    ack = _run_action(writer, context, admission, uncrossed, trigger_id="trig-thr-stop")
+    assert ack.status == "REJECTED"
+    assert "at or below the configured stop_price" in str(ack.detail)
+    triggers, intents, states = _bundle_rows(writer)
+    assert triggers == []
+    assert len(intents) == 1
+    assert len(states) == 1
+
+
+def test_stop_action_is_accepted_at_exactly_the_stop_level(writer_env):
+    """The boundary is inclusive: executable price == stop_price crosses."""
+    writer, context = writer_env
+    admission, _ = _armed_trade(writer, context, tag="thr-stop-eq")
+    at_stop = _quote(
+        context, quote_id="quote-at-stop", price=90.0, ts="2026-09-18T16:00:03Z"
+    )
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, at_stop).status == "OK"
+    ack = _run_action(writer, context, admission, at_stop, trigger_id="trig-at-stop")
+    assert ack.status == "OK", ack.detail
+
+
+def test_target_action_rejects_quote_that_has_not_crossed_the_target(writer_env):
+    writer, context = writer_env
+    admission, _ = _armed_trade(writer, context, tag="thr-target")
+    uncrossed = _uncrossed_quote(writer, context, tag="thr-target")
+    assert float(uncrossed["best_bid"]) < 120.0
+
+    ack = _run_action(
+        writer,
+        context,
+        admission,
+        uncrossed,
+        trigger_id="trig-thr-target",
+        trigger_type="TARGET",
+    )
+    assert ack.status == "REJECTED"
+    assert "at or above a configured target price" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+def test_target_action_is_accepted_at_exactly_the_target_level(writer_env):
+    writer, context = writer_env
+    admission, _ = _armed_trade(writer, context, tag="thr-target-eq")
+    at_target = _quote(
+        context, quote_id="quote-at-target", price=120.0, ts="2026-09-18T16:00:03Z"
+    )
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, at_target).status == "OK"
+    ack = _run_action(
+        writer,
+        context,
+        admission,
+        at_target,
+        trigger_id="trig-at-target",
+        trigger_type="TARGET",
+    )
+    assert ack.status == "OK", ack.detail
+
+
+def test_stop_action_rejects_reference_price_disagreeing_with_the_quote(writer_env):
+    """reference_price is bound to the cited evidence, not caller-chosen."""
+    writer, context = writer_env
+    admission, stop_quote = _armed_trade(writer, context, tag="thr-ref")
+    ack = _run_action(
+        writer,
+        context,
+        admission,
+        stop_quote,
+        trigger_id="trig-thr-ref",
+        reference_price=80.0,
+    )
+    assert ack.status == "REJECTED"
+    assert "must equal the executable quote price" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+# ---------------------------------------------------------------------------
+# Remediation: aggregate exit conservation at commit
+# ---------------------------------------------------------------------------
+
+
+def _exit_order_payload(admission, context, *, order_id, quantity, ts):
+    return {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "order_intent_id": order_id,
+        "paper_trade_id": admission.paper_trade_id,
+        "decision_context_id": context["context_id"],
+        "intent_seq": 0,
+        "intent_role": "EXIT",
+        "side": "SELL",
+        "order_type": "MARKET",
+        "requested_quantity": quantity,
+        "requested_notional": quantity * 100.0,
+        "reason_code": "EXIT_PROBE",
+        "intent_time": _exact(ts),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "reservation_id": admission.reservation_id,
+    }
+
+
+def test_competing_exit_intents_cannot_together_exceed_exposure(writer_env):
+    """An unfilled EXIT intent's claim is not available to a second exit."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="cons-compete")
+    first = _run_action(
+        writer, context, admission, quote, trigger_id="trig-cons-1", exit_quantity=3.0
+    )
+    assert first.status == "OK", first.detail
+
+    # 3.0 is already claimed and unfilled, so only 2.0 of the 5.0 remains free.
+    competing = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-cons-competing",
+            quantity=3.0,
+            ts="2026-09-18T16:00:05Z",
+        ),
+    )
+    assert competing.status == "REJECTED"
+    assert "available canonical exit capacity" in str(competing.detail)
+
+
+def test_exit_intent_within_remaining_capacity_is_accepted(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="cons-fit")
+    assert _run_action(
+        writer, context, admission, quote, trigger_id="trig-cons-fit", exit_quantity=3.0
+    ).status == "OK"
+
+    fitting = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-cons-fit",
+            quantity=2.0,
+            ts="2026-09-18T16:00:05Z",
+        ),
+    )
+    assert fitting.status == "OK", fitting.detail
+
+
+def _plant_order_intent(writer, order_payload):
+    """Artificially commit an order intent row, bypassing writer capacity rules.
+
+    Used only to reach an over-committed canonical state a correct writer cannot
+    produce, so the aggregate fill backstop can be proven to fire.
+    """
+    meta = writer._conn.execute(  # noqa: SLF001
+        "SELECT history_epoch, next_local_sequence FROM meta WHERE id = 1"
+    ).fetchone()
+    sequence = int(meta["next_local_sequence"])
+    event_id = writer._insert_event_row_in_transaction(  # noqa: SLF001
+        event_type=PAPER_ORDER_INTENT_RECORDED,
+        idempotency_key=paper_evidence_idempotency_key(
+            PAPER_ORDER_INTENT_RECORDED, order_payload
+        ),
+        payload=order_payload,
+        history_epoch=int(meta["history_epoch"]),
+        local_sequence=sequence,
+        now="2026-09-18T16:00:06Z",
+    )
+    # Advance the canonical sequence so a second plant cannot reuse the slot.
+    writer._conn.execute(  # noqa: SLF001
+        "UPDATE meta SET next_local_sequence = ? WHERE id = 1",
+        (sequence + 1,),
+    )
+    writer._conn.commit()  # noqa: SLF001
+    return event_id
+
+
+def test_aggregate_exit_fills_cannot_exceed_entry_exposure(writer_env):
+    """Backstop: even an over-committed canonical state cannot over-close.
+
+    Two exit orders that together promise more than the trade holds cannot both
+    fill; the second fill is refused by aggregate conservation rather than by the
+    per-order cap.
+    """
+    writer, context = writer_env
+    admission, quote = _entry_trade(writer, context, tag="cons-backstop")
+    for index in range(2):
+        _plant_order_intent(
+            writer,
+            _exit_order_payload(
+                admission,
+                context,
+                order_id=f"order-planted-{index}",
+                quantity=5.0,
+                ts="2026-09-18T16:00:06Z",
+            ),
+        )
+    # The first full-size exit consumes the whole entry exposure.
+    _fill_existing_order(
+        writer,
+        context,
+        admission,
+        order_id="order-planted-0",
+        tag="cons-backstop-0",
+        quantity=5.0,
+        price=100.0,
+        quote_id=quote["quote_evidence_id"],
+    )
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["exit_quantity"] == totals["entry_quantity"] == 5.0
+
+    # The second would take exit quantity past entry exposure.
+    second_attempt = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-cons-backstop-1",
+        "order_intent_id": "order-planted-1",
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "ACCEPTED",
+        "attempt_time": _exact("2026-09-18T16:30:00Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": 5.0,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    assert _submit(
+        writer, PAPER_EXECUTION_ATTEMPT_RECORDED, second_attempt
+    ).status == "OK"
+    over = _submit(
+        writer,
+        PAPER_FILL_RECORDED,
+        {
+            "schema_version": 1,
+            "engine": ENGINE_OPIP_PAPER_V2,
+            "fill_id": "fill-cons-backstop-1",
+            "execution_attempt_id": "attempt-cons-backstop-1",
+            "order_intent_id": "order-planted-1",
+            "paper_trade_id": admission.paper_trade_id,
+            "fill_seq": 0,
+            "side": "SELL",
+            "quantity": 5.0,
+            "price": 100.0,
+            "fee_cost": 0.25,
+            "spread_cost": 0.25,
+            "slippage_cost": 0.25,
+            "other_supported_cost": 0.25,
+            "fill_time": _exact("2026-09-18T16:30:00Z"),
+            "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+            "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+            "market_evidence_ref": quote["quote_evidence_id"],
+        },
+    )
+    assert over.status == "REJECTED"
+    assert "aggregate exit quantity exceeds canonical entry exposure" in str(over.detail)
+    assert len(_rows(writer, PAPER_FILL_RECORDED)) == 2  # entry plus the first exit
+
+
+# ---------------------------------------------------------------------------
+# Remediation: canonical long-only role/side semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("role", "side"),
+    [("EXIT", "BUY"), ("ENTRY", "SELL")],
+)
+def test_unsupported_role_side_pairs_are_rejected(writer_env, role, side):
+    """EXIT/BUY and ENTRY/SELL are not Paper v2 semantics and must not commit."""
+    writer, context = writer_env
+    admission, _ = _entry_trade(writer, context, tag=f"role-{role}-{side}")
+    ack = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        {
+            "schema_version": 1,
+            "engine": ENGINE_OPIP_PAPER_V2,
+            "order_intent_id": f"probe-role-{role}-{side}",
+            "paper_trade_id": admission.paper_trade_id,
+            "decision_context_id": context["context_id"],
+            "intent_seq": 0,
+            "intent_role": role,
+            "side": side,
+            "order_type": "MARKET",
+            "requested_quantity": 1.0,
+            "requested_notional": 100.0,
+            "reason_code": "ROLE_SIDE_PROBE",
+            "intent_time": _exact("2026-09-18T16:00:05Z"),
+            "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+            "reservation_id": admission.reservation_id,
+        },
+    )
+    assert ack.status == "REJECTED"
+    assert f"{role} order intent must use side" in str(ack.detail)
+    # The refused pair created no exposure or protection eligibility.
+    assert len(_rows(writer, PAPER_ORDER_INTENT_RECORDED)) == 1
+    assert writer._canonical_fill_totals(admission.paper_trade_id)["entry_quantity"] == 5.0  # noqa: SLF001
+
+
+def test_exposure_is_derived_from_parent_order_role_not_fill_side(writer_env):
+    """Economics follow the parent order's canonical role.
+
+    An exit-role fill reduces remaining exposure even though it is also a SELL, so
+    role and side agree by construction now that the pairing is enforced.
+    """
+    writer, context = writer_env
+    admission, quote = _entry_trade(writer, context, tag="role-role")
+    _leg(
+        writer,
+        context,
+        admission,
+        tag="role-role-exit",
+        role="EXIT",
+        side="SELL",
+        quantity=2.0,
+        price=110.0,
+        quote_id=quote["quote_evidence_id"],
+        ts="2026-09-18T16:30:00Z",
+    )
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["entry_quantity"] == 5.0
+    assert totals["exit_quantity"] == 2.0
+    assert totals["remaining_quantity"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Remediation: reconciliation binding
+# ---------------------------------------------------------------------------
+
+
+def test_reconciliation_rejects_reserved_capital_not_matching_admission(writer_env):
+    writer, context = writer_env
+    admission, _ = _round_trip(writer, context, tag="rec-reserve")
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    payload = _reconciliation(
+        admission,
+        terminal="FINAL_VERIFIED",
+        position_state="FLAT",
+        entry=totals["entry_quantity"],
+        exit_qty=totals["exit_quantity"],
+        remaining=totals["remaining_quantity"],
+        gross=totals["gross_pnl"],
+        costs=totals["execution_costs"],
+    )
+    payload["reserved_capital"] = 0.0
+    ack = _submit(writer, PAPER_RECONCILIATION_RECORDED, payload)
+    assert ack.status == "REJECTED"
+    assert "reserved_capital does not match" in str(ack.detail)
+    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []
+
+
+def test_reconciliation_rejects_position_state_contradicting_fills(writer_env):
+    """A partially exited trade is REDUCING; claiming OPEN is refused."""
+    writer, context = writer_env
+    admission, _ = _round_trip(
+        writer, context, tag="rec-position", exit_quantity=2.0
+    )
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert writer._expected_position_state(totals) == "REDUCING"  # noqa: SLF001
+
+    ack = _submit(
+        writer,
+        PAPER_RECONCILIATION_RECORDED,
+        _reconciliation(
+            admission,
+            terminal="OPEN",
+            position_state="OPEN",
+            entry=totals["entry_quantity"],
+            exit_qty=totals["exit_quantity"],
+            remaining=totals["remaining_quantity"],
+            gross=totals["gross_pnl"],
+            costs=totals["execution_costs"],
+        ),
+    )
+    assert ack.status == "REJECTED"
+    assert "position_state does not agree" in str(ack.detail)
+
+
+def test_reconciliation_accepts_position_state_matching_fills(writer_env):
+    """Control: the fill-derived position state is accepted."""
+    writer, context = writer_env
+    admission, _ = _round_trip(
+        writer, context, tag="rec-position-ok", exit_quantity=2.0
+    )
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    ack = _submit(
+        writer,
+        PAPER_RECONCILIATION_RECORDED,
+        _reconciliation(
+            admission,
+            terminal="OPEN",
+            position_state="REDUCING",
+            entry=totals["entry_quantity"],
+            exit_qty=totals["exit_quantity"],
+            remaining=totals["remaining_quantity"],
+            gross=totals["gross_pnl"],
+            costs=totals["execution_costs"],
+        ),
+    )
+    assert ack.status == "OK", ack.detail
+
+
+def test_reconciliation_rejects_remaining_quantity_not_matching_fills(writer_env):
+    """Canonical quantity claims must match fills, not merely be self-consistent.
+
+    The frozen contract already enforces ``entry == exit + remaining``, so a
+    payload cannot disagree on ``remaining`` alone while the other two agree. This
+    therefore proves the binding with a self-consistent payload whose quantities
+    still contradict canonical fills.
+    """
+    writer, context = writer_env
+    admission, _ = _round_trip(writer, context, tag="rec-qty", exit_quantity=2.0)
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["entry_quantity"] == 5.0
+    assert totals["exit_quantity"] == 2.0
+    assert totals["remaining_quantity"] == 3.0
+
+    # Internally consistent (4 == 2 + 2) but not reproducible from canonical fills.
+    ack = _submit(
+        writer,
+        PAPER_RECONCILIATION_RECORDED,
+        _reconciliation(
+            admission,
+            terminal="OPEN",
+            position_state="REDUCING",
+            entry=4.0,
+            exit_qty=2.0,
+            remaining=2.0,
+            gross=totals["gross_pnl"],
+            costs=totals["execution_costs"],
+        ),
+    )
+    assert ack.status == "REJECTED"
+    assert "is not reproducible from canonical fills" in str(ack.detail)
+    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []

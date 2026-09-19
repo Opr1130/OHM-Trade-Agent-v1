@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -1154,9 +1154,10 @@ class CanonicalWriter:
                         "canonical state"
                     )
 
-                # D. exposure is proven by canonical fills alone.
-                totals = self._canonical_fill_totals(paper_trade_id)
-                remaining = float(totals["remaining_quantity"])
+                # D. exposure is proven by canonical fills alone, and is reduced by
+                # exits already claimed by unfilled EXIT intents.
+                capacity = self._exit_capacity(paper_trade_id)
+                remaining = float(capacity["remaining_quantity"])
                 if remaining <= 0:
                     raise ValueError(
                         "protection action requires positive canonical exposure"
@@ -1177,10 +1178,13 @@ class CanonicalWriter:
                     raise ValueError(
                         "protection action EXIT quantity must be positive"
                     )
-                if requested_quantity > remaining + 1e-9:
+                if (
+                    requested_quantity
+                    > float(capacity["available_exit_quantity"]) + 1e-9
+                ):
                     raise ValueError(
-                        "protection action EXIT quantity exceeds canonical "
-                        "remaining exposure"
+                        "protection action EXIT quantity exceeds available canonical "
+                        "exit capacity"
                     )
 
                 # E and G. frozen trigger evidence, B/C-1 order-intent ancestry,
@@ -2261,11 +2265,33 @@ class CanonicalWriter:
                 raise ValueError("order intent paper_trade_id does not match reservation")
             if context.get("context_id") != context_id:
                 raise ValueError("order intent decision context ancestry is invalid")
-            if payload.get("intent_role") == "ENTRY" and (
+            # Long-only Paper v2 role/side semantics are frozen here so an
+            # unsupported pair cannot reach conservation, protection eligibility
+            # or the reservation controls with the wrong economic meaning.
+            role = str(payload.get("intent_role"))
+            side = str(payload.get("side"))
+            if role == "ENTRY" and side != "BUY":
+                raise ValueError("ENTRY order intent must use side BUY")
+            if role == "EXIT" and side != "SELL":
+                raise ValueError("EXIT order intent must use side SELL")
+            trade_id = self._require_string_ref(payload, "paper_trade_id")
+            if role == "ENTRY" and (
                 float(payload["requested_notional"])
                 > float(admission["requested_reservation_amount"]) + 1e-9
             ):
                 raise ValueError("entry requested_notional exceeds reserved capital")
+            if role == "EXIT":
+                # Exit capacity is admitted against fills *and* already claimed,
+                # still-unfilled exit intents, so competing exits cannot together
+                # promise more than the trade actually holds.
+                capacity = self._exit_capacity(trade_id)
+                if (
+                    float(payload["requested_quantity"])
+                    > float(capacity["available_exit_quantity"]) + 1e-9
+                ):
+                    raise ValueError(
+                        "exit order intent exceeds available canonical exit capacity"
+                    )
             return
 
         if event_type == PAPER_EXECUTION_ATTEMPT_RECORDED:
@@ -2435,6 +2461,20 @@ class CanonicalWriter:
         ):
             raise ValueError("aggregate fill quantity exceeds requested order quantity")
 
+        # Aggregate exit conservation at commit: however the exits are split
+        # across orders and attempts, canonical exit quantity may never exceed the
+        # trade's canonical entry exposure. Without this, two pending exits could
+        # each honour their own order cap and still together over-close the trade.
+        if str(order["intent_role"]) == "EXIT":
+            committed = self._canonical_fill_totals(str(payload["paper_trade_id"]))
+            if (
+                float(committed["exit_quantity"]) + fill_quantity
+                > float(committed["entry_quantity"]) + 1e-9
+            ):
+                raise ValueError(
+                    "aggregate exit quantity exceeds canonical entry exposure"
+                )
+
     def _validate_paper_execution_intent(self, intent: WriterIntent) -> dict:
         """Validate B/C-1 producer-submitted Paper v2 evidence.
 
@@ -2512,13 +2552,28 @@ class CanonicalWriter:
             raise ValueError("paper_trade_id is ambiguous across admissions")
         return matches[0]
 
+    def _order_role_by_id(self) -> dict[str, str]:
+        """Map each committed order intent to its canonical ``intent_role``.
+
+        Exposure and economics are classified by the parent order's role, never by
+        a fill's own side: the role is what the trade actually intends, so a
+        mislabelled fill cannot smuggle itself into the wrong side of the
+        conservation identity.
+        """
+        roles: dict[str, str] = {}
+        for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED):
+            roles[str(order["order_intent_id"])] = str(order["intent_role"])
+        return roles
+
     def _canonical_fill_totals(self, paper_trade_id: str) -> dict:
         """Exposure and economics derived strictly from canonical fills.
 
         Position quantity is never taken from a trigger, a protection state, an
         exit intent or an attempted execution - only from fills that the canonical
-        writer actually committed.
+        writer actually committed, classified by their parent order's canonical
+        role.
         """
+        roles = self._order_role_by_id()
         entry_quantity = 0.0
         exit_quantity = 0.0
         gross_pnl = 0.0
@@ -2526,6 +2581,16 @@ class CanonicalWriter:
         for fill in self._committed_paper_rows(PAPER_FILL_RECORDED):
             if fill.get("paper_trade_id") != paper_trade_id:
                 continue
+            order_id = str(fill["order_intent_id"])
+            role = roles.get(order_id)
+            if role is None:
+                raise ValueError(
+                    "canonical fill has no committed parent order intent role"
+                )
+            if role not in {"ENTRY", "EXIT"}:
+                raise ValueError(
+                    "canonical fill parent order has an unsupported intent_role"
+                )
             quantity = float(fill["quantity"])
             notional = quantity * float(fill["price"])
             execution_costs += (
@@ -2534,7 +2599,7 @@ class CanonicalWriter:
                 + float(fill["slippage_cost"])
                 + float(fill["other_supported_cost"])
             )
-            if fill["side"] == "BUY":
+            if role == "ENTRY":
                 entry_quantity += quantity
                 gross_pnl -= notional
             else:
@@ -2547,6 +2612,69 @@ class CanonicalWriter:
             "gross_pnl": gross_pnl,
             "execution_costs": execution_costs,
         }
+
+    def _outstanding_exit_quantity(self, paper_trade_id: str) -> float:
+        """Exit quantity already claimed by committed but unfilled EXIT intents.
+
+        Partially filled orders count only for their unfilled remainder. These
+        units are not yet economic exits, but they are already spoken for, so a new
+        protection EXIT must not claim them again or two pending exits could later
+        both fill and over-close the trade.
+        """
+        roles = self._order_role_by_id()
+        filled_by_order: dict[str, float] = {}
+        for fill in self._committed_paper_rows(PAPER_FILL_RECORDED):
+            if fill.get("paper_trade_id") != paper_trade_id:
+                continue
+            order_id = str(fill["order_intent_id"])
+            if roles.get(order_id) != "EXIT":
+                continue
+            filled_by_order[order_id] = filled_by_order.get(order_id, 0.0) + float(
+                fill["quantity"]
+            )
+        outstanding = 0.0
+        for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED):
+            if order.get("paper_trade_id") != paper_trade_id:
+                continue
+            if str(order["intent_role"]) != "EXIT":
+                continue
+            order_id = str(order["order_intent_id"])
+            unfilled = float(order["requested_quantity"]) - filled_by_order.get(
+                order_id, 0.0
+            )
+            if unfilled > 0:
+                outstanding += unfilled
+        return outstanding
+
+    def _exit_capacity(self, paper_trade_id: str) -> dict:
+        """Canonical exit capacity: fill-derived exposure minus claimed exits."""
+        totals = self._canonical_fill_totals(paper_trade_id)
+        outstanding = self._outstanding_exit_quantity(paper_trade_id)
+        return {
+            **totals,
+            "outstanding_exit_quantity": outstanding,
+            "available_exit_quantity": float(totals["remaining_quantity"]) - outstanding,
+        }
+
+    @staticmethod
+    def _expected_position_state(totals: Mapping[str, object]) -> str:
+        """Position state implied by canonical fill-derived exposure.
+
+        Derived from fills alone so a reconciliation record cannot claim a
+        position the trade's own canonical evidence contradicts.
+        """
+        entry = float(totals["entry_quantity"])
+        exit_quantity = float(totals["exit_quantity"])
+        remaining = float(totals["remaining_quantity"])
+        if remaining <= 0:
+            return (
+                PositionState.NO_POSITION.value
+                if entry <= 0
+                else PositionState.FLAT.value
+            )
+        if exit_quantity <= 0:
+            return PositionState.OPEN.value
+        return PositionState.REDUCING.value
 
     def _protection_plan_record(self, protection_plan_id: str) -> dict:
         plan = self._load_paper_event_by_identity(
@@ -2739,6 +2867,38 @@ class CanonicalWriter:
                 execution_time=payload.get("trigger_time"),
                 execution_time_field="trigger_time",
             )
+            # A valid lineage quote is necessary but not sufficient: the quote must
+            # itself prove the configured threshold was crossed. This trade is
+            # long-only and exits by selling, so the authoritative executable price
+            # is the quote's best bid, and reference_price must be exactly that
+            # price rather than a caller-chosen level the market never traded.
+            executable_price = float(quote["best_bid"])
+            reference_price = float(payload["reference_price"])
+            if abs(reference_price - executable_price) > 1e-9:
+                raise ValueError(
+                    "protection trigger reference_price must equal the executable "
+                    "quote price for the cited evidence"
+                )
+            if trigger_type == "STOP":
+                stop_price = float(plan["stop_price"])
+                if executable_price > stop_price + 1e-9:
+                    raise ValueError(
+                        "STOP trigger requires a quote at or below the configured "
+                        "stop_price"
+                    )
+            else:
+                # The frozen trigger contract carries no target identity, so the
+                # earliest provable crossing is the least aggressive configured
+                # target. Requiring it is sufficient to reject a quote that has not
+                # crossed any configured target at all.
+                target_prices = [
+                    float(target["price"]) for target in plan["targets"]
+                ]
+                if executable_price < min(target_prices) - 1e-9:
+                    raise ValueError(
+                        "TARGET trigger requires a quote at or above a configured "
+                        "target price"
+                    )
         elif trigger_type in PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME:
             temporal = payload.get("trigger_time")
             if not isinstance(temporal, Mapping) or str(
@@ -2751,6 +2911,23 @@ class CanonicalWriter:
                 raise ValueError(
                     f"{trigger_type} trigger cannot claim a market evidence reference"
                 )
+            if trigger_type == "TIME":
+                # The plan's holding period must actually have elapsed. Exact
+                # timestamps are preserved: firing exactly at expiry is allowed,
+                # firing one second earlier is not.
+                plan_start, _plan_end = self._temporal_bounds(
+                    plan.get("plan_time"), field_name="plan_time"
+                )
+                trigger_start, _trigger_end = self._temporal_bounds(
+                    temporal, field_name="trigger_time"
+                )
+                expiry = plan_start + timedelta(
+                    seconds=int(plan["max_hold_seconds"])
+                )
+                if trigger_start < expiry:
+                    raise ValueError(
+                        "TIME trigger is before the plan's max_hold_seconds expiry"
+                    )
 
     def _validate_reconciliation(self, payload: Mapping[str, object]) -> None:
         """Terminal economics must be reproducible from canonical fills.
@@ -2761,7 +2938,7 @@ class CanonicalWriter:
         which never releases reserved capacity.
         """
         paper_trade_id = self._require_string_ref(payload, "paper_trade_id")
-        self._admitted_trade(paper_trade_id)
+        admission = self._admitted_trade(paper_trade_id)
         self._require_monotonic_sibling_sequence(
             event_type=PAPER_RECONCILIATION_RECORDED,
             payload=payload,
@@ -2771,6 +2948,14 @@ class CanonicalWriter:
             identity_field="reconciliation_id",
             scope="paper trade",
         )
+        # The reserve is the admission's own reservation, which stays knowable
+        # regardless of whether the economics could be proven, so it is bound for
+        # every reconciliation record rather than only the final one.
+        canonical_reserved = float(admission["requested_reservation_amount"])
+        if abs(float(payload["reserved_capital"]) - canonical_reserved) > 1e-9:
+            raise ValueError(
+                "reserved_capital does not match the canonical admission reservation"
+            )
         terminal = str(payload["terminal_reconciliation_state"])
         if terminal == TerminalReconciliationState.UNRESOLVED_EVIDENCE.value:
             # The contract already requires an explicit reason. Unverifiable
@@ -2789,6 +2974,11 @@ class CanonicalWriter:
                 raise ValueError(
                     f"{field_name} is not reproducible from canonical fills"
                 )
+        expected_position_state = self._expected_position_state(totals)
+        if str(payload["position_state"]) != expected_position_state:
+            raise ValueError(
+                "position_state does not agree with canonical fill-derived exposure"
+            )
         if terminal != TerminalReconciliationState.FINAL_VERIFIED.value:
             return
         for field_name, canonical in (
