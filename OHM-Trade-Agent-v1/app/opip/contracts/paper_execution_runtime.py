@@ -38,6 +38,7 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_PROTECTION_STATE_RECORDED,
     PAPER_PROTECTION_TRIGGER_RECORDED,
     PAPER_RECONCILIATION_RECORDED,
+    paper_evidence_idempotency_key,
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
@@ -64,12 +65,14 @@ PAPER_CAPITAL_POLICY_VERSION = "paper-capital-v1"
 #: boundary, so a producer cannot rewrite history or reuse a sequence value.
 
 #: Protection/reconciliation evidence producers may submit in B/C-2.
-#: Protection state is writer-validated against the transition table below.
+#: Protection state is writer-validated against the transition table below, and
+#: a TRIGGERED transition is refused here because it is writer-owned. The
+#: protection trigger is deliberately absent: it commits only as part of an
+#: atomic protection action, never as a standalone producer submission.
 PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES = frozenset(
     {
         PAPER_PROTECTION_PLAN_RECORDED,
         PAPER_PROTECTION_STATE_RECORDED,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
         PAPER_RECONCILIATION_RECORDED,
     }
 )
@@ -78,6 +81,28 @@ PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES = frozenset(
 PAPER_V2_WRITER_EVENT_TYPES = (
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES | PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES
 )
+
+#: Command name for the writer-owned atomic protection action RPC.
+PAPER_PROTECTION_ACTION_COMMAND = "TRIGGER_PAPER_PROTECTION_ACTION"
+
+#: Paper v2 events that are writer-owned and may not be submitted through the
+#: generic WriterIntent path. A protection trigger is only meaningful together
+#: with the EXIT order intent and TRIGGERED transition it causes, so it commits
+#: exclusively inside that atomic bundle. This is what makes "a trigger is never
+#: stranded without its exit intent" structural rather than merely conventional.
+PAPER_V2_ATOMIC_ONLY_EVENT_TYPES = frozenset({PAPER_PROTECTION_TRIGGER_RECORDED})
+
+#: Every Paper v2 event the canonical writer may persist, whichever path owns it.
+PAPER_V2_ALL_EVENT_TYPES = PAPER_V2_WRITER_EVENT_TYPES | PAPER_V2_ATOMIC_ONLY_EVENT_TYPES
+
+#: Protection states from which an action trigger may fire. A plan that is still
+#: PLANNED has no proven exposure, and one already TRIGGERED must not fire twice.
+PAPER_ACTION_ARMED_STATES = frozenset(
+    {ProtectionState.ACTIVE, ProtectionState.DEGRADED}
+)
+
+#: The only side that reduces the long-only exposure modelled by this slice.
+PAPER_ACTION_EXIT_SIDE = "SELL"
 
 #: Permitted protection-state transitions. Any transition not listed here is
 #: rejected, so the state machine cannot be widened by a producer. DEGRADED ->
@@ -132,6 +157,167 @@ PAPER_TRIGGER_TYPES_REQUIRING_QUOTE = frozenset({"STOP", "TARGET"})
 #: Trigger types that assert a time-based exit condition and therefore require
 #: exact temporal evidence rather than a quote.
 PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME = frozenset({"TIME", "EMERGENCY"})
+
+#: The three canonical payloads one atomic protection action carries.
+_ACTION_REQUEST_FIELDS = frozenset(
+    {"trigger", "exit_order_intent", "protection_state"}
+)
+
+
+@dataclass(frozen=True)
+class PaperProtectionActionRequest:
+    """One indivisible canonical protection action.
+
+    Carries the COMPLETE canonical payload for each of the three facts the
+    transaction commits, so economic intent is never reconstructed later from
+    mutable lifecycle state. The relationship between the facts is established by
+    the atomic transaction, their shared ancestry and causation - the frozen
+    trigger contract is deliberately not widened with exit fields.
+    """
+
+    trigger: Mapping[str, Any]
+    exit_order_intent: Mapping[str, Any]
+    protection_state: Mapping[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "trigger": dict(self.trigger),
+            "exit_order_intent": dict(self.exit_order_intent),
+            "protection_state": dict(self.protection_state),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PaperProtectionActionRequest":
+        if not isinstance(raw, Mapping) or set(raw) != _ACTION_REQUEST_FIELDS:
+            missing = sorted(_ACTION_REQUEST_FIELDS - set(raw or {}))
+            extra = sorted(set(raw or {}) - _ACTION_REQUEST_FIELDS)
+            details = []
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            if extra:
+                details.append("extra=" + ",".join(extra))
+            raise ValueError(
+                "invalid PaperProtectionActionRequest fields: " + "; ".join(details)
+            )
+        for field_name in sorted(_ACTION_REQUEST_FIELDS):
+            if not isinstance(raw[field_name], Mapping):
+                raise ValueError(f"{field_name} must be a canonical payload object")
+        return cls(
+            trigger=dict(raw["trigger"]),
+            exit_order_intent=dict(raw["exit_order_intent"]),
+            protection_state=dict(raw["protection_state"]),
+        )
+
+
+@dataclass(frozen=True)
+class PaperProtectionActionAck:
+    status: str
+    trigger_event_id: str | None = None
+    exit_order_intent_event_id: str | None = None
+    protection_state_event_id: str | None = None
+    history_epoch: int | None = None
+    local_sequence: int | None = None
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "trigger_event_id": self.trigger_event_id,
+            "exit_order_intent_event_id": self.exit_order_intent_event_id,
+            "protection_state_event_id": self.protection_state_event_id,
+            "history_epoch": self.history_epoch,
+            "local_sequence": self.local_sequence,
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PaperProtectionActionAck":
+        return cls(
+            status=str(raw["status"]),
+            trigger_event_id=(
+                str(raw["trigger_event_id"])
+                if raw.get("trigger_event_id")
+                else None
+            ),
+            exit_order_intent_event_id=(
+                str(raw["exit_order_intent_event_id"])
+                if raw.get("exit_order_intent_event_id")
+                else None
+            ),
+            protection_state_event_id=(
+                str(raw["protection_state_event_id"])
+                if raw.get("protection_state_event_id")
+                else None
+            ),
+            history_epoch=(
+                int(raw["history_epoch"])
+                if raw.get("history_epoch") is not None
+                else None
+            ),
+            local_sequence=(
+                int(raw["local_sequence"])
+                if raw.get("local_sequence") is not None
+                else None
+            ),
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
+def protection_action_idempotency_key(
+    trigger_payload: Mapping[str, Any],
+) -> str:
+    """Anchor the whole bundle on the trigger's canonical identity.
+
+    The trigger is the fact the action exists to record, so its immutable
+    preassigned identity is the bundle's deterministic retry anchor.
+    """
+    return paper_evidence_idempotency_key(
+        PAPER_PROTECTION_TRIGGER_RECORDED, trigger_payload
+    )
+
+
+def validate_protection_action_request(
+    request: PaperProtectionActionRequest,
+) -> dict[str, dict[str, Any]]:
+    """Validate the three canonical payloads and their cross-fact consistency.
+
+    Structural consistency is proven here, so a caller cannot pair a trigger with
+    an unrelated exit intent or state. The ancestry, sequencing and evidence
+    checks that require canonical state are enforced by the writer inside the
+    transaction; nothing about this function touches the database.
+    """
+    trigger = validate_paper_evidence_payload(
+        PAPER_PROTECTION_TRIGGER_RECORDED, dict(request.trigger)
+    )
+    exit_order_intent = validate_paper_evidence_payload(
+        PAPER_ORDER_INTENT_RECORDED, dict(request.exit_order_intent)
+    )
+    protection_state = validate_paper_evidence_payload(
+        PAPER_PROTECTION_STATE_RECORDED, dict(request.protection_state)
+    )
+
+    trades = {
+        trigger["paper_trade_id"],
+        exit_order_intent["paper_trade_id"],
+        protection_state["paper_trade_id"],
+    }
+    if len(trades) != 1:
+        raise ValueError("protection action members must share one paper_trade_id")
+    if trigger["protection_plan_id"] != protection_state["protection_plan_id"]:
+        raise ValueError("protection action state must reference the trigger's plan")
+    if exit_order_intent["intent_role"] != "EXIT":
+        raise ValueError("protection action requires an EXIT order intent")
+    if str(protection_state["to_state"]) != ProtectionState.TRIGGERED.value:
+        raise ValueError("protection action must transition the plan to TRIGGERED")
+
+    return {
+        "trigger": trigger,
+        "exit_order_intent": exit_order_intent,
+        "protection_state": protection_state,
+    }
 
 
 @dataclass(frozen=True)
@@ -545,24 +731,33 @@ def quote_evidence_idempotency_key(payload: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "PAPER_ACTION_ARMED_STATES",
+    "PAPER_ACTION_EXIT_SIDE",
     "PAPER_ADMISSION_REQUEST_RECORDED",
     "PAPER_CAPITAL_POLICY_VERSION",
     "PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES",
+    "PAPER_PROTECTION_ACTION_COMMAND",
     "PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES",
     "PAPER_QUOTE_EVIDENCE_RECORDED",
     "PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME",
     "PAPER_TRIGGER_TYPES_REQUIRING_QUOTE",
+    "PAPER_V2_ALL_EVENT_TYPES",
+    "PAPER_V2_ATOMIC_ONLY_EVENT_TYPES",
     "PAPER_V2_WRITER_EVENT_TYPES",
     "PaperAdmissionAck",
     "PaperAdmissionRequest",
     "PaperCapitalPolicy",
+    "PaperProtectionActionAck",
+    "PaperProtectionActionRequest",
     "admission_request_idempotency_key",
     "admission_result_identities",
+    "protection_action_idempotency_key",
     "protection_transition_allowed",
     "protection_transition_requires_trigger",
     "quote_evidence_idempotency_key",
     "resolve_capital_policy",
     "validate_admission_request",
     "validate_admission_request_record_payload",
+    "validate_protection_action_request",
     "validate_quote_evidence_payload",
 ]

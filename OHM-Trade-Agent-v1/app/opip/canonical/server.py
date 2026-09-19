@@ -18,6 +18,8 @@ from app.opip.canonical.writer import CanonicalWriter
 from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionAck,
     PaperAdmissionRequest,
+    PaperProtectionActionAck,
+    PaperProtectionActionRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,6 +235,11 @@ class CanonicalWriterServer:
                     status="RETRYABLE",
                     error_code="WORKER_UNHEALTHY",
                 ).to_dict()
+            if method == "TRIGGER_PAPER_PROTECTION_ACTION":
+                return PaperProtectionActionAck(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
             return WriterAck(
                 status="RETRYABLE",
                 error_code="WORKER_UNHEALTHY",
@@ -248,6 +255,20 @@ class CanonicalWriterServer:
                     detail=str(exc),
                 ).to_dict()
             return self.writer.admit_paper_opportunity(request_model).to_dict()
+        if method == "TRIGGER_PAPER_PROTECTION_ACTION":
+            try:
+                action_request = PaperProtectionActionRequest.from_dict(
+                    request["request"]
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="INVALID_PROTECTION_ACTION_REQUEST",
+                    detail=str(exc),
+                ).to_dict()
+            return self.writer.trigger_paper_protection_action(
+                action_request
+            ).to_dict()
         if method == "CONFIRM_OPS_APPLIED":
             return self.writer.confirm_ops_applied(str(request["event_id"])).to_dict()
         if method == "MARK_HANDOFF_SUPERSEDED":

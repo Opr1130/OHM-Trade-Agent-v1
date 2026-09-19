@@ -37,12 +37,19 @@ EventType = Literal[
     # LOW priority, no ops handoff, validated payload.
     "paper_outcome.terminal.recorded",
     # B/C-1 Paper v2 execution ground truth. Opportunity disposition is writer-
-    # owned through the atomic admission RPC; protection/reconciliation remain
-    # unregistered until B/C-2.
+    # owned through the atomic admission RPC.
     "paper_execution.quote_evidence.recorded",
     "paper_execution.order_intent.recorded",
     "paper_execution.attempt.recorded",
     "paper_execution.fill.recorded",
+    # B/C-2 protection and terminal reconciliation ground truth. The protection
+    # trigger is listed for completeness of the paper v2 vocabulary but is
+    # writer-owned through the atomic protection action RPC; it is deliberately
+    # absent from the generic submission set.
+    "paper_protection.plan.recorded",
+    "paper_protection.state.recorded",
+    "paper_protection.trigger.recorded",
+    "paper_execution.reconciliation.recorded",
 ]
 OpsOperation = Literal["RECORD", "RELEASE"]
 HandoffStatus = Literal["PENDING", "APPLIED", "SUPERSEDED"]

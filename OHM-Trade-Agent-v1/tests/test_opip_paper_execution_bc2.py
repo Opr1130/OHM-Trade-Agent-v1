@@ -39,6 +39,7 @@ from app.opip.contracts.paper_execution_events import (
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_QUOTE_EVIDENCE_RECORDED,
     PaperAdmissionRequest,
+    PaperProtectionActionRequest,
     quote_evidence_idempotency_key,
 )
 from app.opip.decision_intelligence.events import (
@@ -478,14 +479,14 @@ def test_activation_accepted_with_canonical_positive_exposure(writer_env):
 
 
 def test_invalid_state_transition_is_rejected(writer_env):
-    """PLANNED -> TRIGGERED is not a supported runtime transition."""
+    """PLANNED -> DEGRADED is not a supported runtime transition."""
     writer, context = writer_env
     admission, _ = _entry_trade(writer, context, tag="state-invalid")
     assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
     ack = _submit(
         writer,
         PAPER_PROTECTION_STATE_RECORDED,
-        _state(admission, plan_id="plan-a", to_state="TRIGGERED"),
+        _state(admission, plan_id="plan-a", to_state="DEGRADED"),
     )
     assert ack.status == "REJECTED"
     assert "unsupported protection state transition" in str(ack.detail)
@@ -537,28 +538,33 @@ def test_state_seq_monotonicity_rejects_duplicate_and_regression(writer_env):
     assert regress.status == "REJECTED"
 
 
-def test_triggered_state_requires_committed_trigger_evidence(writer_env):
+def test_triggered_transition_requires_committed_trigger_evidence(writer_env):
+    """Defense in depth: the TRIGGERED rule itself still demands a real trigger.
+
+    The generic path refuses TRIGGERED outright, so this asserts the underlying
+    validator directly against a plan that has no committed trigger.
+    """
     writer, context = writer_env
     admission, _ = _entry_trade(writer, context, tag="state-trig")
     assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
     assert _submit(
         writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
     ).status == "OK"
-    # No trigger exists yet, so DEGRADED -> TRIGGERED is refused.
-    assert _submit(
-        writer,
-        PAPER_PROTECTION_STATE_RECORDED,
-        _state(admission, plan_id="plan-a", event_id="pstate-deg", seq=1,
-               from_state="ACTIVE", to_state="DEGRADED"),
-    ).status == "OK"
-    ack = _submit(
-        writer,
-        PAPER_PROTECTION_STATE_RECORDED,
-        _state(admission, plan_id="plan-a", event_id="pstate-trig", seq=2,
-               from_state="DEGRADED", to_state="TRIGGERED"),
-    )
-    assert ack.status == "REJECTED"
-    assert "without committed trigger evidence" in str(ack.detail)
+
+    with pytest.raises(ValueError, match="without committed trigger evidence"):
+        writer._validate_protection_state(  # noqa: SLF001
+            _state(
+                admission,
+                plan_id="plan-a",
+                event_id="pstate-deg",
+                seq=1,
+                from_state="ACTIVE",
+                to_state="TRIGGERED",
+            )
+        )
+    assert _rows(writer, PAPER_PROTECTION_STATE_RECORDED) == [
+        _state(admission, plan_id="plan-a")
+    ]
 
 
 def test_effective_plan_is_the_highest_activated_plan(writer_env):
@@ -595,6 +601,7 @@ def test_effective_plan_is_the_highest_activated_plan(writer_env):
 
 
 def _armed_trade(writer, context, *, tag):
+    """An admitted trade with positive canonical exposure and an ACTIVE plan."""
     admission, quote = _entry_trade(writer, context, tag=tag)
     assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
     assert _submit(
@@ -603,121 +610,551 @@ def _armed_trade(writer, context, *, tag):
     return admission, quote
 
 
-def test_trigger_requires_armed_plan(writer_env):
-    writer, context = writer_env
-    admission, _ = _entry_trade(writer, context, tag="trig-unarmed")
-    assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
-    ack = _submit(writer, PAPER_PROTECTION_TRIGGER_RECORDED, _trigger(admission, plan_id="plan-a"))
-    assert ack.status == "REJECTED"
-    assert "armed" in str(ack.detail)
+def _action_request(
+    context,
+    admission,
+    quote,
+    *,
+    trigger_id="trig-act",
+    trigger_seq=0,
+    trigger_type="STOP",
+    plan_id="plan-a",
+    exit_quantity=5.0,
+    exit_price=100.0,
+    exit_order_intent_id=None,
+    intent_seq=0,
+    state_event_id="pstate-act",
+    state_seq=1,
+    from_state="ACTIVE",
+    to_state="TRIGGERED",
+    quote_id=None,
+    trigger_overrides=None,
+    exit_overrides=None,
+    state_overrides=None,
+    ts="2026-09-18T16:00:04Z",
+):
+    """Build one complete atomic protection action request.
 
-
-def test_stop_trigger_requires_canonical_market_evidence(writer_env):
-    """Missing required evidence fails closed rather than firing."""
-    writer, context = writer_env
-    admission, _ = _armed_trade(writer, context, tag="trig-noevidence")
-    ack = _submit(
-        writer, PAPER_PROTECTION_TRIGGER_RECORDED, _trigger(admission, trigger_id="trig-none")
+    Defaults describe a valid STOP action against an armed plan with positive
+    canonical exposure, so each test overrides exactly the fact it is about.
+    """
+    if quote_id is not None:
+        evidence_ref = quote_id
+    elif trigger_type in {"STOP", "TARGET"}:
+        evidence_ref = quote["quote_evidence_id"]
+    else:
+        evidence_ref = None
+    trigger = _trigger(
+        admission,
+        plan_id=plan_id,
+        trigger_id=trigger_id,
+        seq=trigger_seq,
+        trigger_type=trigger_type,
+        quote_id=evidence_ref,
+        ts=ts,
     )
-    assert ack.status == "REJECTED"
-    assert "Level-1 market evidence" in str(ack.detail)
+    exit_order_intent = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "order_intent_id": exit_order_intent_id or f"exit-{trigger_id}",
+        "paper_trade_id": admission.paper_trade_id,
+        "decision_context_id": context["context_id"],
+        "intent_seq": intent_seq,
+        "intent_role": "EXIT",
+        "side": "SELL",
+        "order_type": "MARKET",
+        "requested_quantity": exit_quantity,
+        "requested_notional": exit_quantity * exit_price,
+        "reason_code": "PROTECTION_ACTION",
+        "intent_time": _exact(ts),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "reservation_id": admission.reservation_id,
+    }
+    protection_state = _state(
+        admission,
+        plan_id=plan_id,
+        event_id=state_event_id,
+        seq=state_seq,
+        from_state=from_state,
+        to_state=to_state,
+        ts=ts,
+    )
+    for overrides, target in (
+        (trigger_overrides, trigger),
+        (exit_overrides, exit_order_intent),
+        (state_overrides, protection_state),
+    ):
+        if overrides:
+            target.update(overrides)
+    return PaperProtectionActionRequest(
+        trigger=trigger,
+        exit_order_intent=exit_order_intent,
+        protection_state=protection_state,
+    )
 
 
-def test_stop_trigger_rejects_quote_from_wrong_venue(writer_env):
-    """Quote ancestry binding from B/C-1 applies to protection triggers too."""
+def _run_action(writer, context, admission, quote, **kwargs):
+    return writer.trigger_paper_protection_action(
+        _action_request(context, admission, quote, **kwargs)
+    )
+
+
+def _bundle_rows(writer):
+    return (
+        _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED),
+        _rows(writer, PAPER_ORDER_INTENT_RECORDED),
+        _rows(writer, PAPER_PROTECTION_STATE_RECORDED),
+    )
+
+
+def _plant_trigger(writer, trigger_payload):
+    """Artificially commit a lone trigger row, to model a contradictory state.
+
+    Used only to reach integrity states a correct writer cannot produce on its
+    own, so the fail-closed behaviour of the atomic action can be proven.
+    """
+    meta = writer._conn.execute(  # noqa: SLF001
+        "SELECT history_epoch, next_local_sequence FROM meta WHERE id = 1"
+    ).fetchone()
+    event_id = writer._insert_event_row_in_transaction(  # noqa: SLF001
+        event_type=PAPER_PROTECTION_TRIGGER_RECORDED,
+        idempotency_key=paper_evidence_idempotency_key(
+            PAPER_PROTECTION_TRIGGER_RECORDED, trigger_payload
+        ),
+        payload=trigger_payload,
+        history_epoch=int(meta["history_epoch"]),
+        local_sequence=int(meta["next_local_sequence"]),
+        now="2026-09-18T16:00:00Z",
+    )
+    writer._conn.commit()  # noqa: SLF001
+    return event_id
+
+
+# ---------------------------------------------------------------------------
+# 1. Direct path closure: a trigger only commits inside the atomic action
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_trigger_writerintent_is_rejected(writer_env):
+    """The generic WriterIntent path must never persist an action trigger."""
     writer, context = writer_env
-    admission, _ = _armed_trade(writer, context, tag="trig-venue")
-    foreign = _quote(context, quote_id="quote-foreign", venue="COINBASE")
-    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, foreign).status == "OK"
+    admission, quote = _armed_trade(writer, context, tag="closure-trigger")
+    payload = _trigger(
+        admission, trigger_id="trig-standalone", quote_id=quote["quote_evidence_id"]
+    )
+    ack = _submit(writer, PAPER_PROTECTION_TRIGGER_RECORDED, payload)
+    assert ack.status == "REJECTED"
+    assert "ATOMIC_TRIGGER_ACTION_REQUIRED" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+def test_generic_triggered_state_transition_is_rejected(writer_env):
+    """A producer must not assert TRIGGERED independently, even with evidence."""
+    writer, context = writer_env
+    admission, _ = _armed_trade(writer, context, tag="closure-triggered")
     ack = _submit(
         writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-venue", quote_id=foreign["quote_evidence_id"]),
-    )
-    assert ack.status == "REJECTED"
-    assert "venue" in str(ack.detail)
-
-
-def test_trigger_cannot_cite_future_quote_evidence(writer_env):
-    writer, context = writer_env
-    admission, _ = _armed_trade(writer, context, tag="trig-future")
-    future = _quote(context, quote_id="quote-future", ts="2026-09-18T16:00:09Z")
-    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, future).status == "OK"
-    ack = _submit(
-        writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(
+        PAPER_PROTECTION_STATE_RECORDED,
+        _state(
             admission,
-            trigger_id="trig-future",
-            quote_id=future["quote_evidence_id"],
-            ts="2026-09-18T16:00:04Z",
+            plan_id="plan-a",
+            event_id="pstate-generic-triggered",
+            seq=1,
+            from_state="ACTIVE",
+            to_state="TRIGGERED",
         ),
     )
     assert ack.status == "REJECTED"
-    assert "not proven available" in str(ack.detail)
+    assert "ATOMIC_TRIGGER_ACTION_REQUIRED" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_STATE_RECORDED) == [_state(admission, plan_id="plan-a")]
 
 
-def test_time_trigger_requires_exact_temporal_evidence(writer_env):
+def test_safe_generic_protection_transitions_still_work(writer_env):
+    """Closing TRIGGERED must not disable the safe non-trigger transitions."""
     writer, context = writer_env
-    admission, _ = _armed_trade(writer, context, tag="trig-time")
-    ok = _submit(
+    admission, _ = _armed_trade(writer, context, tag="closure-safe")
+    degraded = _submit(
         writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-time", trigger_type="TIME"),
+        PAPER_PROTECTION_STATE_RECORDED,
+        _state(
+            admission,
+            plan_id="plan-a",
+            event_id="pstate-safe-degraded",
+            seq=1,
+            from_state="ACTIVE",
+            to_state="DEGRADED",
+        ),
     )
-    assert ok.status == "OK", ok.detail
+    assert degraded.status == "OK", degraded.detail
+    recovered = _submit(
+        writer,
+        PAPER_PROTECTION_STATE_RECORDED,
+        _state(
+            admission,
+            plan_id="plan-a",
+            event_id="pstate-safe-active",
+            seq=2,
+            from_state="DEGRADED",
+            to_state="ACTIVE",
+        ),
+    )
+    assert recovered.status == "OK", recovered.detail
+    assert writer._effective_protection_state("plan-a").value == "ACTIVE"  # noqa: SLF001
 
-    bounded = _trigger(
+
+# ---------------------------------------------------------------------------
+# 2/4. Valid atomic actions
+# ---------------------------------------------------------------------------
+
+
+def test_valid_atomic_stop_commits_trigger_exit_intent_and_state(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-stop")
+    ack = _run_action(writer, context, admission, quote)
+    assert ack.status == "OK", ack.detail
+
+    triggers, intents, states = _bundle_rows(writer)
+    assert len(triggers) == 1
+    assert len(intents) == 2  # the entry intent plus the EXIT intent
+    assert len(states) == 2  # PLANNED->ACTIVE plus ACTIVE->TRIGGERED
+    exit_intent = next(
+        row for row in intents if row["order_intent_id"] == "exit-trig-act"
+    )
+    assert exit_intent["intent_role"] == "EXIT"
+    assert exit_intent["side"] == "SELL"
+    assert writer._effective_protection_state("plan-a").value == "TRIGGERED"  # noqa: SLF001
+
+    # Both derived facts name the trigger that caused them; the trigger payload is
+    # never mutated to carry the exit identity.
+    row = writer._conn.execute(  # noqa: SLF001
+        "SELECT causation_id FROM events WHERE idempotency_key = ?",
+        (paper_evidence_idempotency_key(PAPER_ORDER_INTENT_RECORDED, exit_intent),),
+    ).fetchone()
+    assert str(row["causation_id"]) == ack.trigger_event_id
+    assert "order_intent_id" not in triggers[0]
+
+
+def test_valid_atomic_time_action_uses_exact_temporal_evidence(writer_env):
+    """TIME uses the same single RPC; only the trigger evidence differs."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-time")
+    ack = _run_action(
+        writer,
+        context,
         admission,
-        trigger_id="trig-time-bounded",
+        quote,
+        trigger_id="trig-time-act",
         trigger_type="TIME",
-        # A fresh monotonic sequence: reusing trigger_seq 0 would be rejected by
-        # the sibling-ordering invariant before reaching the temporal rule this
-        # test exists to prove.
-        seq=1,
     )
-    bounded["trigger_time"] = {
-        "precision": "BOUNDED",
-        "basis": "MODEL_ASSIGNED",
-        "window_start": "2026-09-18T16:00:04Z",
-        "window_end": "2026-09-18T16:00:05Z",
-    }
-    ack = _submit(writer, PAPER_PROTECTION_TRIGGER_RECORDED, bounded)
+    assert ack.status == "OK", ack.detail
+    triggers, _intents, states = _bundle_rows(writer)
+    assert len(triggers) == 1
+    assert "market_evidence_ref" not in triggers[0]
+    assert len(states) == 2
+
+
+# ---------------------------------------------------------------------------
+# 5/6/7/8. Atomic action rejections
+# ---------------------------------------------------------------------------
+
+
+def test_exit_quantity_beyond_exposure_rolls_back_the_whole_bundle(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-overclose")
+    ack = _run_action(writer, context, admission, quote, exit_quantity=6.0)
     assert ack.status == "REJECTED"
-    assert "exact temporal evidence" in str(ack.detail)
+    assert "exceeds canonical remaining exposure" in str(ack.detail)
+    triggers, intents, states = _bundle_rows(writer)
+    assert triggers == []
+    assert len(intents) == 1  # only the entry intent
+    assert len(states) == 1  # only PLANNED->ACTIVE
 
 
-def test_trigger_sequence_integrity(writer_env):
+@pytest.mark.parametrize("field_name", ["reservation_id", "decision_context_id"])
+def test_invalid_exit_ancestry_rolls_back_the_whole_bundle(writer_env, field_name):
     writer, context = writer_env
-    admission, quote = _armed_trade(writer, context, tag="trig-seq")
-    first = _trigger(admission, trigger_id="trig-a", seq=0, quote_id=quote["quote_evidence_id"])
-    assert _submit(writer, PAPER_PROTECTION_TRIGGER_RECORDED, first).status == "OK"
-    dup = _submit(
+    admission, quote = _armed_trade(writer, context, tag=f"act-anc-{field_name}")
+    ack = _run_action(
         writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-b", seq=0, quote_id=quote["quote_evidence_id"]),
+        context,
+        admission,
+        quote,
+        exit_overrides={field_name: "wrong-ancestry"},
     )
-    assert dup.status == "REJECTED"
-    assert "already committed" in str(dup.detail)
+    assert ack.status == "REJECTED"
+    triggers, _intents, _states = _bundle_rows(writer)
+    assert triggers == []
 
 
-def test_trigger_alone_changes_nothing_economically(writer_env):
-    """A trigger is not an exit: no quantity, P/L or terminal state changes."""
+def test_exit_intent_with_wrong_paper_trade_is_rejected(writer_env):
     writer, context = writer_env
-    admission, quote = _armed_trade(writer, context, tag="trig-noexit")
-    before = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    admission, quote = _armed_trade(writer, context, tag="act-anc-trade")
+    ack = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        exit_overrides={"paper_trade_id": "PTV2:foreign"},
+    )
+    assert ack.status == "REJECTED"
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
 
+
+def test_trigger_against_a_superseded_plan_is_rejected(writer_env):
+    """Only the effective (highest activated) plan may trigger an action."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-plan")
     assert _submit(
         writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-noexit", quote_id=quote["quote_evidence_id"]),
+        PAPER_PROTECTION_PLAN_RECORDED,
+        _plan(admission, plan_id="plan-b", plan_seq=1, stop_price=95.0),
     ).status == "OK"
+    assert _submit(
+        writer,
+        PAPER_PROTECTION_STATE_RECORDED,
+        _state(admission, plan_id="plan-b", event_id="pstate-b", seq=0),
+    ).status == "OK"
+    # plan-b is now effective, so plan-a may not fire.
+    ack = _run_action(writer, context, admission, quote, plan_id="plan-a")
+    assert ack.status == "REJECTED"
+    assert "not the effective activated plan" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
 
-    after = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
-    assert after == before
-    assert after["remaining_quantity"] == 5.0
-    # No reconciliation exists merely because protection triggered.
-    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []
+
+def test_trigger_against_an_unarmed_plan_is_rejected(writer_env):
+    """A PLANNED plan has no proven exposure and cannot fire an action."""
+    writer, context = writer_env
+    admission, quote = _entry_trade(writer, context, tag="act-unarmed")
+    assert _submit(
+        writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")
+    ).status == "OK"
+    ack = _run_action(writer, context, admission, quote)
+    assert ack.status == "REJECTED"
+    assert "activated protection plan" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+def test_bad_trigger_evidence_rolls_back_the_whole_bundle(writer_env):
+    """Missing, mismatched or future evidence must never fire an action."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-evidence")
+
+    missing = _run_action(writer, context, admission, quote, quote_id="")
+    assert missing.status == "REJECTED"
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+    foreign = _quote(context, quote_id="quote-act-foreign", venue="COINBASE")
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, foreign).status == "OK"
+    wrong_venue = _run_action(
+        writer, context, admission, quote, quote_id=foreign["quote_evidence_id"]
+    )
+    assert wrong_venue.status == "REJECTED"
+    assert "venue" in str(wrong_venue.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+    future = _quote(context, quote_id="quote-act-future", ts="2026-09-18T16:00:09Z")
+    assert _submit(writer, PAPER_QUOTE_EVIDENCE_RECORDED, future).status == "OK"
+    future_ack = _run_action(
+        writer, context, admission, quote, quote_id=future["quote_evidence_id"]
+    )
+    assert future_ack.status == "REJECTED"
+    assert "not proven available" in str(future_ack.detail)
+    # No EXIT intent and no TRIGGERED state leaked from any rejected attempt.
+    _triggers, intents, states = _bundle_rows(writer)
+    assert len(intents) == 1
+    assert len(states) == 1
+
+    bounded = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-act-bounded",
+        trigger_type="TIME",
+        trigger_overrides={
+            "trigger_time": {
+                "precision": "BOUNDED",
+                "basis": "MODEL_ASSIGNED",
+                "window_start": "2026-09-18T16:00:04Z",
+                "window_end": "2026-09-18T16:00:05Z",
+            }
+        },
+    )
+    assert bounded.status == "REJECTED"
+    assert "exact temporal evidence" in str(bounded.detail)
+
+
+def test_state_sequence_conflict_rolls_back_the_whole_bundle(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-state-seq")
+    ack = _run_action(
+        writer, context, admission, quote, state_event_id="pstate-conflict", state_seq=0
+    )
+    assert ack.status == "REJECTED"
+    assert "already committed" in str(ack.detail)
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+
+
+def test_trigger_sequence_conflict_rolls_back_the_whole_bundle(writer_env):
+    """A distinct trigger identity reusing a committed trigger_seq is refused."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-trig-seq")
+    request = _action_request(context, admission, quote)
+    # A committed trigger already occupies seq 0 for this plan while the plan is
+    # still armed, so a new action must not reuse that sequence value.
+    _plant_trigger(writer, dict(request.trigger))
+
+    ack = writer.trigger_paper_protection_action(
+        _action_request(
+            context,
+            admission,
+            quote,
+            trigger_id="trig-act-2",
+            trigger_seq=0,
+            state_event_id="pstate-act-2",
+        )
+    )
+    assert ack.status == "REJECTED"
+    assert "already committed" in str(ack.detail)
+    # The planted trigger remains the only trigger, and no EXIT intent or
+    # TRIGGERED state leaked from the refused bundle.
+    triggers, intents, states = _bundle_rows(writer)
+    assert len(triggers) == 1
+    assert len(intents) == 1
+    assert len(states) == 1
+
+
+def test_invalid_exit_intent_sequence_rolls_back_the_whole_bundle(writer_env):
+    """An intent_seq outside the frozen contract refuses the whole bundle.
+
+    B/C-1's frozen order-intent contract bounds intent_seq only as a
+    non-negative integer, so this assertion pins that contract rather than
+    inventing a stricter sequencing rule B/C-1 never had.
+    """
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-intent-seq")
+    ack = _run_action(writer, context, admission, quote, intent_seq=-1)
+    assert ack.status == "REJECTED"
+    _triggers, intents, _states = _bundle_rows(writer)
+    assert len(intents) == 1  # only the entry intent remains
+    assert ack.trigger_event_id is None
+
+
+# ---------------------------------------------------------------------------
+# 13/14. Crash safety: rollback is proven at the database level
+# ---------------------------------------------------------------------------
+
+
+def _fail_nth_insert(monkeypatch, writer, n):
+    original = writer._insert_event_row_in_transaction  # noqa: SLF001
+    calls = {"count": 0}
+
+    def _wrapped(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == n:
+            raise ValueError(f"injected failure at insert {n}")
+        return original(**kwargs)
+
+    monkeypatch.setattr(writer, "_insert_event_row_in_transaction", _wrapped)
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3])
+def test_partial_failure_never_leaves_a_partial_bundle(
+    writer_env, monkeypatch, fail_at
+):
+    """Failure after the trigger/EXIT insert must commit nothing at all."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag=f"act-fail-{fail_at}")
+    _fail_nth_insert(monkeypatch, writer, fail_at)
+
+    ack = _run_action(writer, context, admission, quote)
+    assert ack.status == "REJECTED"
+    assert _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == []
+    assert _rows(writer, PAPER_PROTECTION_STATE_RECORDED) == [
+        _state(admission, plan_id="plan-a")
+    ]
+
+
+def test_failed_transaction_leaves_the_writer_usable(writer_env, monkeypatch):
+    """After a rolled-back bundle the same action can still commit cleanly."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-fail-recover")
+    _fail_nth_insert(monkeypatch, writer, 2)
+    assert _run_action(writer, context, admission, quote).status == "REJECTED"
+
+    monkeypatch.undo()
+    recovered = _run_action(writer, context, admission, quote)
+    assert recovered.status == "OK", recovered.detail
+    assert len(_rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 15-19. Idempotency of the bundle
+# ---------------------------------------------------------------------------
+
+
+def test_ack_loss_retry_is_idempotent(writer_env):
+    """A retry of the identical request is DUPLICATE_OK, never a second action."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-retry")
+    request = _action_request(context, admission, quote)
+    first = writer.trigger_paper_protection_action(request)
+    assert first.status == "OK", first.detail
+
+    retry = writer.trigger_paper_protection_action(request)
+    assert retry.status == "DUPLICATE_OK"
+    assert retry.trigger_event_id == first.trigger_event_id
+    assert retry.exit_order_intent_event_id == first.exit_order_intent_event_id
+    assert retry.protection_state_event_id == first.protection_state_event_id
+
+    triggers, intents, states = _bundle_rows(writer)
+    assert len(triggers) == 1
+    assert len(intents) == 2
+    assert len(states) == 2
+
+
+@pytest.mark.parametrize("member", ["trigger", "exit", "state"])
+def test_changed_bundle_member_payload_fails_closed(writer_env, member):
+    """Same identities, different payload, must conflict rather than re-commit."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag=f"act-change-{member}")
+    request = _action_request(context, admission, quote)
+    assert writer.trigger_paper_protection_action(request).status == "OK"
+
+    changed = request.as_dict()
+    if member == "trigger":
+        changed["trigger"]["reference_price"] = 89.0
+    elif member == "exit":
+        changed["exit_order_intent"]["requested_quantity"] = 4.0
+    else:
+        changed["protection_state"]["reason_code"] = "DIFFERENT"
+    conflict = writer.trigger_paper_protection_action(
+        PaperProtectionActionRequest.from_dict(changed)
+    )
+    assert conflict.status == "REJECTED"
+    assert conflict.error_code == "IDEMPOTENCY_PAYLOAD_CONFLICT"
+    # Nothing extra was committed, and the original facts are intact.
+    triggers, intents, states = _bundle_rows(writer)
+    assert len(triggers) == 1
+    assert len(intents) == 2
+    assert len(states) == 2
+
+
+def test_partially_committed_bundle_fails_closed_without_repair(writer_env):
+    """A pre-existing fragment is an integrity contradiction, not a resumable job."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-partial")
+    request = _action_request(context, admission, quote)
+    _plant_trigger(writer, dict(request.trigger))
+
+    ack = writer.trigger_paper_protection_action(request)
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "PROTECTION_ACTION_BUNDLE_INCOMPLETE"
+    assert "refusing to reconstruct" in str(ack.detail)
+    # The missing EXIT intent and state were NOT manufactured.
+    _triggers, intents, states = _bundle_rows(writer)
+    assert len(intents) == 1
+    assert len(states) == 1
 
 
 def test_concurrent_sibling_plans_cannot_share_a_sequence(writer_env):
@@ -736,6 +1173,158 @@ def test_concurrent_sibling_plans_cannot_share_a_sequence(writer_env):
 
     assert sorted(item.status for item in results) == ["OK", "REJECTED"]
     assert len(_rows(writer, PAPER_PROTECTION_PLAN_RECORDED)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 20-25. Trigger is not exit; residual protection; capacity; restart
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_bundle_is_economically_inert(writer_env):
+    """Trigger, EXIT intent and TRIGGERED state change no quantity and no P/L."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-inert")
+    before = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    fills_before = _rows(writer, PAPER_FILL_RECORDED)
+
+    assert _run_action(writer, context, admission, quote).status == "OK"
+
+    after = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert after == before
+    assert after["remaining_quantity"] == 5.0
+    assert _rows(writer, PAPER_FILL_RECORDED) == fills_before
+    # No economic exit and no terminal state resulted from protection alone.
+    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []
+    # The reservation is still active: triggering is not a release event.
+    _version, reserved, active = writer._portfolio_state("USD")  # noqa: SLF001
+    assert (reserved, active) == (500.0, 1)
+
+
+def test_target_partial_exit_leaves_residual_exposure_protected(writer_env):
+    """A partial TARGET action leaves the residual position and its protection."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-target")
+    ack = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-target",
+        trigger_type="TARGET",
+        exit_quantity=2.0,
+    )
+    assert ack.status == "OK", ack.detail
+    # The bundle itself changed no quantity.
+    assert writer._canonical_fill_totals(admission.paper_trade_id)["remaining_quantity"] == 5.0  # noqa: SLF001
+
+    # Only a canonical SELL fill reduces exposure.
+    _leg(writer, context, admission, tag="act-target-exit", role="EXIT", side="SELL",
+         quantity=2.0, price=110.0, quote_id=quote["quote_evidence_id"],
+         ts="2026-09-18T16:30:00Z")
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["remaining_quantity"] == 3.0
+    # Residual exposure is still protected and still not terminal.
+    assert writer._effective_protection_state("plan-a").value == "TRIGGERED"  # noqa: SLF001
+    assert writer._effective_protection_plan(admission.paper_trade_id)["protection_plan_id"] == "plan-a"  # noqa: SLF001
+    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []
+
+
+def test_stop_full_exit_does_not_auto_verify_reconciliation(writer_env):
+    """A full-size STOP request still only reaches reconciliation via its rules."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-stop-full")
+    ack = _run_action(writer, context, admission, quote, trigger_id="trig-stop-full")
+    assert ack.status == "OK", ack.detail
+
+    _leg(writer, context, admission, tag="act-stop-full-exit", role="EXIT", side="SELL",
+         quantity=5.0, price=90.0, quote_id=quote["quote_evidence_id"],
+         ts="2026-09-18T16:30:00Z")
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["remaining_quantity"] == 0.0
+    # Nothing terminalized on its own.
+    assert _rows(writer, PAPER_RECONCILIATION_RECORDED) == []
+    _version, reserved, active = writer._portfolio_state("USD")  # noqa: SLF001
+    assert (reserved, active) == (500.0, 1)
+
+
+def test_reservation_releases_only_after_final_verified_following_an_action(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-release")
+    assert _run_action(writer, context, admission, quote).status == "OK"
+    # Active through trigger and TRIGGERED.
+    assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
+
+    _leg(writer, context, admission, tag="act-release-exit", role="EXIT", side="SELL",
+         quantity=5.0, price=110.0, quote_id=quote["quote_evidence_id"],
+         ts="2026-09-18T16:30:00Z")
+    assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
+
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    flat = _submit(
+        writer,
+        PAPER_RECONCILIATION_RECORDED,
+        _reconciliation(admission, recon_id="recon-act-flat", seq=0,
+                        terminal="FLAT_AWAITING_RECONCILIATION", position_state="FLAT",
+                        entry=totals["entry_quantity"], exit_qty=totals["exit_quantity"],
+                        remaining=0.0, gross=totals["gross_pnl"],
+                        costs=totals["execution_costs"]),
+    )
+    assert flat.status == "OK", flat.detail
+    # Still reserved through unverified FLAT.
+    assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
+
+    verified = _submit(
+        writer,
+        PAPER_RECONCILIATION_RECORDED,
+        _reconciliation(admission, recon_id="recon-act-final", seq=1,
+                        terminal="FINAL_VERIFIED", position_state="FLAT",
+                        entry=totals["entry_quantity"], exit_qty=totals["exit_quantity"],
+                        remaining=0.0, gross=totals["gross_pnl"],
+                        costs=totals["execution_costs"]),
+    )
+    assert verified.status == "OK", verified.detail
+    assert writer._portfolio_state("USD")[1:] == (0.0, 0)  # noqa: SLF001
+
+
+def test_action_release_stays_quote_currency_separate(writer_env):
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-usd")
+    assert _run_action(writer, context, admission, quote).status == "OK"
+
+    # The USD action must not touch the USDT portfolio.
+    assert writer._verified_paper_trade_ids("USDT") == set()  # noqa: SLF001
+    assert writer._portfolio_state("USDT")[1:] == (0.0, 0)  # noqa: SLF001
+    assert writer._portfolio_state("USD")[1:] == (500.0, 1)  # noqa: SLF001
+
+
+def test_restart_reconstructs_the_committed_action_from_canonical_evidence(
+    writer_env, tmp_path
+):
+    """A reopened writer reproduces the action's authority deterministically."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="act-restart")
+    ack = _run_action(writer, context, admission, quote)
+    assert ack.status == "OK", ack.detail
+
+    db_path = tmp_path / "canonical.sqlite3"
+    expected_totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    expected_plan = writer._effective_protection_plan(admission.paper_trade_id)  # noqa: SLF001
+    writer.close()
+
+    reopened = CanonicalWriter(db_path)
+    try:
+        assert reopened._effective_protection_state("plan-a").value == "TRIGGERED"  # noqa: SLF001
+        assert reopened._canonical_fill_totals(admission.paper_trade_id) == expected_totals  # noqa: SLF001
+        assert reopened._effective_protection_plan(admission.paper_trade_id) == expected_plan  # noqa: SLF001
+        assert len(_rows(reopened, PAPER_PROTECTION_TRIGGER_RECORDED)) == 1
+        assert len(_rows(reopened, PAPER_PROTECTION_STATE_RECORDED)) == 2
+        # The bundle is still idempotent across a restart.
+        replay = reopened.trigger_paper_protection_action(
+            _action_request(context, admission, quote)
+        )
+        assert replay.status == "DUPLICATE_OK"
+    finally:
+        reopened.close()
 
 
 # ---------------------------------------------------------------------------
@@ -840,18 +1429,25 @@ def test_unresolved_evidence_is_recordable_and_never_releases_capacity(writer_en
 
 
 def test_reservation_stays_active_through_protection_and_partial_exit(writer_env):
+    """Reservation survives plan, activation, atomic trigger and a partial exit."""
     writer, context = writer_env
     admission, quote = _round_trip(writer, context, tag="release-partial", exit_quantity=2.0)
     assert _submit(writer, PAPER_PROTECTION_PLAN_RECORDED, _plan(admission, plan_id="plan-a")).status == "OK"
     assert _submit(
         writer, PAPER_PROTECTION_STATE_RECORDED, _state(admission, plan_id="plan-a")
     ).status == "OK"
-    assert _submit(
+    # Remaining canonical exposure is 3.0 after the partial exit fill, so the
+    # action's exit request must stay inside it.
+    action = _run_action(
         writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-partial", quote_id=quote["quote_evidence_id"]),
-    ).status == "OK"
-    # Still reserved through plan, activation, trigger and a partial exit.
+        context,
+        admission,
+        quote,
+        trigger_id="trig-partial",
+        exit_quantity=3.0,
+    )
+    assert action.status == "OK", action.detail
+    # Still reserved through plan, activation, atomic action and a partial exit.
     _version, reserved, count = writer._portfolio_state("USD")  # noqa: SLF001
     assert (reserved, count) == (500.0, 1)
 
@@ -934,10 +1530,8 @@ def test_restart_reconstructs_protection_authority_from_canonical_evidence(write
     """A fresh writer on the same store reproduces the same authority state."""
     writer, context = writer_env
     admission, quote = _armed_trade(writer, context, tag="restart")
-    assert _submit(
-        writer,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
-        _trigger(admission, trigger_id="trig-restart", quote_id=quote["quote_evidence_id"]),
+    assert _run_action(
+        writer, context, admission, quote, trigger_id="trig-restart"
     ).status == "OK"
     db_path = tmp_path / "canonical.sqlite3"
     expected_state = writer._effective_protection_state("plan-a")  # noqa: SLF001

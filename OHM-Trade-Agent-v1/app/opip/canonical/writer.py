@@ -9,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
 from app.opip.canonical.paths import (
@@ -56,23 +56,31 @@ from app.opip.contracts.paper_execution_events import (
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_execution_runtime import (
+    PAPER_ACTION_ARMED_STATES,
+    PAPER_ACTION_EXIT_SIDE,
     PAPER_ADMISSION_REQUEST_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
     PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
     PAPER_TRIGGER_TYPES_REQUIRING_EXACT_TIME,
     PAPER_TRIGGER_TYPES_REQUIRING_QUOTE,
+    PAPER_V2_ALL_EVENT_TYPES,
+    PAPER_V2_ATOMIC_ONLY_EVENT_TYPES,
     PAPER_V2_WRITER_EVENT_TYPES,
     PaperAdmissionAck,
     PaperAdmissionRequest,
+    PaperProtectionActionAck,
+    PaperProtectionActionRequest,
     admission_request_idempotency_key,
     admission_result_identities,
+    protection_action_idempotency_key,
     protection_transition_allowed,
     protection_transition_requires_trigger,
     quote_evidence_idempotency_key,
     resolve_capital_policy,
     validate_admission_request,
     validate_admission_request_record_payload,
+    validate_protection_action_request,
     validate_quote_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import (
@@ -132,7 +140,7 @@ IDEMPOTENT_PAYLOAD_EVENT_TYPES = frozenset(
     # strategy/execution provenance) is exactly what makes two otherwise
     # identical submissions different facts rather than duplicates.
     | PAPER_OUTCOME_EVENT_TYPES
-    | PAPER_V2_WRITER_EVENT_TYPES
+    | PAPER_V2_ALL_EVENT_TYPES
 )
 
 #: Wall-clock / hash fields that may move on an otherwise identical snapshot.
@@ -943,6 +951,334 @@ class CanonicalWriter:
             except sqlite3.Error as exc:
                 self._conn.rollback()
                 return PaperAdmissionAck(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    # ------------------------------------------------------------------
+    # B/C-2 writer-owned atomic protection action
+    # ------------------------------------------------------------------
+
+    def _protection_action_bundle(
+        self,
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> list[tuple[str, str, str, Mapping[str, Any]]]:
+        """Role-ordered ``(role, event_type, idempotency_key, payload)`` for the bundle."""
+        trigger = payloads["trigger"]
+        exit_order_intent = payloads["exit_order_intent"]
+        protection_state = payloads["protection_state"]
+        return [
+            (
+                "trigger",
+                PAPER_PROTECTION_TRIGGER_RECORDED,
+                protection_action_idempotency_key(trigger),
+                trigger,
+            ),
+            (
+                "exit_order_intent",
+                PAPER_ORDER_INTENT_RECORDED,
+                paper_evidence_idempotency_key(
+                    PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+                ),
+                exit_order_intent,
+            ),
+            (
+                "protection_state",
+                PAPER_PROTECTION_STATE_RECORDED,
+                paper_evidence_idempotency_key(
+                    PAPER_PROTECTION_STATE_RECORDED, protection_state
+                ),
+                protection_state,
+            ),
+        ]
+
+    @staticmethod
+    def _canonical_payload_json(payload: Mapping[str, object]) -> str:
+        return json.dumps(dict(payload), separators=(",", ":"), sort_keys=True)
+
+    def _existing_protection_action_result(
+        self,
+        payloads: Mapping[str, Mapping[str, Any]],
+    ) -> PaperProtectionActionAck | None:
+        """Deterministic retry resolution for the atomic protection bundle.
+
+        A retry is ``DUPLICATE_OK`` only when all three facts already exist with
+        byte-identical payloads. A partially committed bundle is an integrity
+        contradiction and fails closed: missing artifacts are never manufactured
+        from current mutable state.
+        """
+        roles = ("trigger", "exit_order_intent", "protection_state")
+        found: dict[str, tuple[Any, Mapping[str, Any]]] = {}
+        for role, event_type, key, payload in self._protection_action_bundle(payloads):
+            row = self._conn.execute(
+                """
+                SELECT event_id, history_epoch, local_sequence, payload_json
+                FROM events
+                WHERE event_type = ? AND idempotency_key = ?
+                """,
+                (event_type, key),
+            ).fetchone()
+            if row is not None:
+                found[role] = (row, payload)
+        if not found:
+            return None
+        if len(found) != 3:
+            present = ",".join(sorted(found))
+            missing = ",".join(sorted(set(roles) - set(found)))
+            return PaperProtectionActionAck(
+                status="REJECTED",
+                error_code="PROTECTION_ACTION_BUNDLE_INCOMPLETE",
+                detail=(
+                    "protection action bundle is only partially committed "
+                    f"(present={present}; missing={missing}); refusing to "
+                    "reconstruct missing evidence"
+                ),
+            )
+        for role in roles:
+            row, payload = found[role]
+            try:
+                stored = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="PROTECTION_ACTION_BUNDLE_CORRUPT",
+                    detail=f"persisted {role} payload is invalid JSON",
+                )
+            if self._canonical_payload_json(stored) != self._canonical_payload_json(
+                payload
+            ):
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    trigger_event_id=str(found["trigger"][0]["event_id"]),
+                    error_code="IDEMPOTENCY_PAYLOAD_CONFLICT",
+                    detail=(
+                        f"{role} identity already committed with a different payload"
+                    ),
+                )
+        state_row = found["protection_state"][0]
+        return PaperProtectionActionAck(
+            status="DUPLICATE_OK",
+            trigger_event_id=str(found["trigger"][0]["event_id"]),
+            exit_order_intent_event_id=str(found["exit_order_intent"][0]["event_id"]),
+            protection_state_event_id=str(state_row["event_id"]),
+            history_epoch=int(state_row["history_epoch"]),
+            local_sequence=int(state_row["local_sequence"]),
+        )
+
+    def trigger_paper_protection_action(
+        self,
+        request: PaperProtectionActionRequest,
+    ) -> PaperProtectionActionAck:
+        """Atomically record a protection trigger, its EXIT intent and TRIGGERED state.
+
+        The three facts either all commit or none do, so a trigger is never
+        stranded without the EXIT order intent it caused and a producer cannot
+        assert TRIGGERED independently. Nothing here changes exposure: position
+        quantity and economics move only when canonical B/C-1 fills later commit.
+        """
+        with self._lock:
+            try:
+                payloads = validate_protection_action_request(request)
+            except (TypeError, ValueError) as exc:
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="INVALID_PROTECTION_ACTION_REQUEST",
+                    detail=str(exc),
+                )
+
+            existing = self._existing_protection_action_result(payloads)
+            if existing is not None:
+                return existing
+
+            trigger = payloads["trigger"]
+            exit_order_intent = payloads["exit_order_intent"]
+            protection_state = payloads["protection_state"]
+            paper_trade_id = str(trigger["paper_trade_id"])
+            plan_id = str(trigger["protection_plan_id"])
+            now = _utc_now()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                meta = self._conn.execute(
+                    "SELECT history_epoch, next_local_sequence, schema_version "
+                    "FROM meta WHERE id = 1"
+                ).fetchone()
+                if meta is None:
+                    raise ValueError("canonical meta row missing")
+                if int(meta["schema_version"]) != SCHEMA_VERSION:
+                    self._conn.rollback()
+                    return PaperProtectionActionAck(
+                        status="REJECTED",
+                        error_code="DB_SCHEMA_MISMATCH",
+                    )
+                history_epoch = int(meta["history_epoch"])
+                next_sequence = int(meta["next_local_sequence"])
+
+                # A. canonical trade, reservation and decision-context ancestry.
+                admission = self._admitted_trade(paper_trade_id)
+                context_id = str(admission["decision_context_id"])
+                self._load_context_by_id(context_id)
+                if str(admission.get("reservation_id")) != str(
+                    exit_order_intent.get("reservation_id")
+                ):
+                    raise ValueError(
+                        "protection action EXIT intent reservation does not match "
+                        "the admission reservation"
+                    )
+                if str(exit_order_intent.get("decision_context_id")) != context_id:
+                    raise ValueError(
+                        "protection action EXIT intent decision context does not "
+                        "match the admitted trade"
+                    )
+
+                # B. only the effective (highest activated) plan may act.
+                effective_plan = self._effective_protection_plan(paper_trade_id)
+                if effective_plan is None:
+                    raise ValueError(
+                        "protection action requires an activated protection plan"
+                    )
+                if str(effective_plan["protection_plan_id"]) != plan_id:
+                    raise ValueError(
+                        "protection action plan is not the effective activated plan"
+                    )
+
+                # C. the plan must be armed, and the transition must start there.
+                current_state = self._effective_protection_state(plan_id)
+                if current_state not in PAPER_ACTION_ARMED_STATES:
+                    raise ValueError(
+                        "protection action requires an armed (ACTIVE or DEGRADED) plan"
+                    )
+                if str(protection_state["from_state"]) != current_state.value:
+                    raise ValueError(
+                        "protection action state does not start from the effective "
+                        "canonical state"
+                    )
+
+                # D. exposure is proven by canonical fills alone.
+                totals = self._canonical_fill_totals(paper_trade_id)
+                remaining = float(totals["remaining_quantity"])
+                if remaining <= 0:
+                    raise ValueError(
+                        "protection action requires positive canonical exposure"
+                    )
+
+                # F. the EXIT intent must reduce exposure without over-closing it.
+                if str(exit_order_intent["intent_role"]) != "EXIT":
+                    raise ValueError(
+                        "protection action requires an EXIT order intent"
+                    )
+                if str(exit_order_intent["side"]) != PAPER_ACTION_EXIT_SIDE:
+                    raise ValueError(
+                        "protection action EXIT intent must use side "
+                        f"{PAPER_ACTION_EXIT_SIDE}"
+                    )
+                requested_quantity = float(exit_order_intent["requested_quantity"])
+                if requested_quantity <= 0:
+                    raise ValueError(
+                        "protection action EXIT quantity must be positive"
+                    )
+                if requested_quantity > remaining + 1e-9:
+                    raise ValueError(
+                        "protection action EXIT quantity exceeds canonical "
+                        "remaining exposure"
+                    )
+
+                # E and G. frozen trigger evidence, B/C-1 order-intent ancestry,
+                # and trigger sequence monotonicity.
+                self._validate_protection_trigger(trigger)
+                self._validate_paper_execution_ancestry(
+                    PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+                )
+
+                # Deterministic insertion order: trigger, EXIT intent, TRIGGERED
+                # state. The EXIT intent and the state both name the trigger they
+                # were caused by; the trigger payload itself is never mutated to
+                # carry the exit identity.
+                trigger_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_PROTECTION_TRIGGER_RECORDED,
+                    idempotency_key=protection_action_idempotency_key(trigger),
+                    payload=trigger,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence,
+                    now=now,
+                    correlation_id=context_id,
+                )
+                exit_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_ORDER_INTENT_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_ORDER_INTENT_RECORDED, exit_order_intent
+                    ),
+                    payload=exit_order_intent,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence + 1,
+                    now=now,
+                    causation_id=trigger_event_id,
+                    correlation_id=context_id,
+                )
+                # Validated after the trigger row exists in this transaction, so
+                # the TRIGGERED rule is satisfied by the fact committed with it.
+                self._validate_protection_state(protection_state)
+                state_event_id = self._insert_event_row_in_transaction(
+                    event_type=PAPER_PROTECTION_STATE_RECORDED,
+                    idempotency_key=paper_evidence_idempotency_key(
+                        PAPER_PROTECTION_STATE_RECORDED, protection_state
+                    ),
+                    payload=protection_state,
+                    history_epoch=history_epoch,
+                    local_sequence=next_sequence + 2,
+                    now=now,
+                    causation_id=trigger_event_id,
+                    correlation_id=context_id,
+                )
+                state_sequence = next_sequence + 2
+                self._conn.execute(
+                    """
+                    INSERT INTO watermarks (
+                        stream, history_epoch, local_sequence, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(stream) DO UPDATE SET
+                        history_epoch = excluded.history_epoch,
+                        local_sequence = excluded.local_sequence,
+                        updated_at = excluded.updated_at
+                    """,
+                    (PAPER_EXECUTION_STREAM, history_epoch, state_sequence, now),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE meta
+                    SET next_local_sequence = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (state_sequence + 1, now),
+                )
+                self._conn.commit()
+                return PaperProtectionActionAck(
+                    status="OK",
+                    trigger_event_id=trigger_event_id,
+                    exit_order_intent_event_id=exit_event_id,
+                    protection_state_event_id=state_event_id,
+                    history_epoch=history_epoch,
+                    local_sequence=state_sequence,
+                )
+            except (TypeError, ValueError) as exc:
+                self._conn.rollback()
+                return PaperProtectionActionAck(
+                    status="REJECTED",
+                    error_code="INVALID_PROTECTION_ACTION",
+                    detail=str(exc),
+                )
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                existing = self._existing_protection_action_result(payloads)
+                if existing is not None:
+                    return existing
+                return PaperProtectionActionAck(
+                    status="RETRYABLE",
+                    error_code="INTEGRITY_CONFLICT",
+                )
+            except sqlite3.Error as exc:
+                self._conn.rollback()
+                return PaperProtectionActionAck(
                     status="RETRYABLE",
                     error_code="SQLITE_ERROR",
                     detail=str(exc),
@@ -2473,11 +2809,22 @@ class CanonicalWriter:
             self._validate_protection_plan(payload)
             return
         if event_type == PAPER_PROTECTION_STATE_RECORDED:
+            # TRIGGERED is writer-owned: it is the third fact of the atomic
+            # protection action, so a generic state submission must not assert it
+            # even when trigger evidence happens to exist. The safe non-trigger
+            # transitions below stay available on the generic path.
+            if str(payload.get("to_state")) == ProtectionState.TRIGGERED.value:
+                raise ValueError(
+                    "ATOMIC_TRIGGER_ACTION_REQUIRED: a TRIGGERED protection state "
+                    "commits only through the atomic protection action RPC"
+                )
             self._validate_protection_state(payload)
             return
         if event_type == PAPER_PROTECTION_TRIGGER_RECORDED:
-            self._validate_protection_trigger(payload)
-            return
+            raise ValueError(
+                "ATOMIC_TRIGGER_ACTION_REQUIRED: a protection trigger commits only "
+                "through the atomic protection action RPC"
+            )
         if event_type == PAPER_RECONCILIATION_RECORDED:
             self._validate_reconciliation(payload)
             return
@@ -2605,6 +2952,15 @@ class CanonicalWriter:
             raise ValueError("invalid priority")
         if not intent.idempotency_key.strip():
             raise ValueError("idempotency_key required")
+        # Checked before the registration gate so the refusal names the real
+        # problem: an action trigger is not merely unregistered, it is only
+        # meaningful inside the atomic protection action bundle.
+        if intent.event_type in PAPER_V2_ATOMIC_ONLY_EVENT_TYPES:
+            raise ValueError(
+                "ATOMIC_TRIGGER_ACTION_REQUIRED: a protection trigger commits only "
+                "through the atomic protection action RPC, never as a standalone "
+                "WriterIntent"
+            )
         if intent.event_type not in ACCEPTED_EVENT_TYPES:
             raise ValueError("unsupported event_type")
 
@@ -2640,7 +2996,7 @@ class CanonicalWriter:
             return FEATURE_BUS_STREAM
         if event_type in PAPER_OUTCOME_EVENT_TYPES:
             return PAPER_OUTCOME_STREAM
-        if event_type in PAPER_V2_WRITER_EVENT_TYPES:
+        if event_type in PAPER_V2_ALL_EVENT_TYPES:
             return PAPER_EXECUTION_STREAM
         return STREAM_EARLY_WATCH
 
@@ -2651,7 +3007,7 @@ class CanonicalWriter:
             and event_type not in FEATURE_BUS_EVENT_TYPES
             and event_type not in DECISION_INTELLIGENCE_EVENT_TYPES
             and event_type not in PAPER_OUTCOME_EVENT_TYPES
-            and event_type not in PAPER_V2_WRITER_EVENT_TYPES
+            and event_type not in PAPER_V2_ALL_EVENT_TYPES
         )
 
     def _upsert_alert_identity_projection(

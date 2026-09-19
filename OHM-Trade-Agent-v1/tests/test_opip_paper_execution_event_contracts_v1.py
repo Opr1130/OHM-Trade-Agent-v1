@@ -10,6 +10,7 @@ from app.opip.contracts.paper_execution import (
     QualifiedOpportunityDisposition,
 )
 from app.opip.contracts.paper_execution_runtime import (
+    PAPER_V2_ATOMIC_ONLY_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
 )
 
@@ -612,16 +613,19 @@ def test_paper_v2_writer_registration_boundary_after_bc2():
     # This is unchanged by B/C-2.
     assert PAPER_OPPORTUNITY_DISPOSITION_RECORDED not in ACCEPTED_EVENT_TYPES
 
-    # B/C-2 arrived: protection and terminal reconciliation are now registered,
-    # so their runtime authority is the canonical writer. This assertion is the
-    # phase boundary that previously held them frozen out; it is updated rather
-    # than dropped so the registration set stays explicitly pinned.
+    # B/C-2 arrived: plan and state and terminal reconciliation are registered, so
+    # their runtime authority is the canonical writer. The protection TRIGGER is
+    # deliberately NOT registered: it is writer-owned through the atomic
+    # protection action RPC, so a standalone trigger can never be submitted. This
+    # phase-boundary assertion is updated rather than dropped so the registration
+    # set stays explicitly pinned.
     assert {
         PAPER_PROTECTION_PLAN_RECORDED,
         PAPER_PROTECTION_STATE_RECORDED,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
         PAPER_RECONCILIATION_RECORDED,
     } <= ACCEPTED_EVENT_TYPES
+    assert PAPER_PROTECTION_TRIGGER_RECORDED not in ACCEPTED_EVENT_TYPES
+    assert PAPER_PROTECTION_TRIGGER_RECORDED in PAPER_V2_ATOMIC_ONLY_EVENT_TYPES
 
     registered_frozen_events = PAPER_EXECUTION_EVENT_TYPES & ACCEPTED_EVENT_TYPES
     assert registered_frozen_events == {
@@ -630,7 +634,6 @@ def test_paper_v2_writer_registration_boundary_after_bc2():
         PAPER_FILL_RECORDED,
         PAPER_PROTECTION_PLAN_RECORDED,
         PAPER_PROTECTION_STATE_RECORDED,
-        PAPER_PROTECTION_TRIGGER_RECORDED,
         PAPER_RECONCILIATION_RECORDED,
     }
 
