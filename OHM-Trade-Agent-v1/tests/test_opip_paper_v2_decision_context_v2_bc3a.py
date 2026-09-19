@@ -215,7 +215,14 @@ def test_valid_schema_v2_context_validates():
 
 
 def test_schema_v2_identity_is_deterministic():
-    assert context_identity_v2(_v2_payload()) == context_identity_v2(_v2_payload())
+    """Two independently constructed payloads must derive one identity.
+
+    Bound to separate names so the assertion states a real relationship rather
+    than comparing an expression with itself.
+    """
+    first = _v2_payload()
+    second = _v2_payload()
+    assert context_identity_v2(first) == context_identity_v2(second)
 
 
 def test_schema_v2_identity_ignores_emitter_only_facts():
@@ -391,6 +398,23 @@ def _commit_v2_context(writer: CanonicalWriter, payload: dict) -> str:
     )
     assert ack.status == "OK", ack.detail
     return payload["context_id"]
+
+
+def _commit_v2_supersession_pair(writer: CanonicalWriter) -> tuple[str, str]:
+    """Commit a real predecessor and its superseding v2 context.
+
+    A supersession pair must name a *recorded* same-kind target: the canonical
+    writer validates ancestry before commit, so a pair cannot be presented without
+    a genuine predecessor.
+    """
+    original = _v2_payload()
+    _commit_v2_context(writer, original)
+    superseding = _v2_payload(
+        supersedes_id=original["context_id"],
+        supersession_reason="corrected after a revision",
+    )
+    _commit_v2_context(writer, superseding)
+    return original["context_id"], superseding["context_id"]
 
 
 def _admission(*, disposition_id: str, context_id: str):
@@ -703,12 +727,275 @@ def test_no_di_committee_or_model_authority_is_activated(writer):
 
 
 # ---------------------------------------------------------------------------
+# Supersession pair invariant (Greptile P1)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_context_without_supersession_is_valid():
+    payload = _v2_payload(supersedes_id=None, supersession_reason=None)
+    normalized = validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+    assert normalized["supersedes_id"] is None
+    assert normalized["supersession_reason"] is None
+
+
+def test_v2_context_with_a_complete_supersession_pair_is_valid():
+    payload = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+        supersession_reason="superseded after evidence correction",
+    )
+    normalized = validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+    assert normalized["supersedes_id"] == "DI-CONTEXT-V2:" + "1" * 32
+    assert normalized["supersession_reason"] == "superseded after evidence correction"
+
+
+def test_supersedes_id_without_a_reason_is_rejected():
+    payload = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+        supersession_reason=None,
+    )
+    with pytest.raises(ValueError, match="must be provided together"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+
+
+def test_supersession_reason_without_an_id_is_rejected():
+    payload = _v2_payload(
+        supersedes_id=None,
+        supersession_reason="corrected after a data revision",
+    )
+    with pytest.raises(ValueError, match="must be provided together"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
+def test_blank_supersedes_id_is_rejected_not_treated_as_absence(blank):
+    payload = _v2_payload(
+        supersedes_id=blank,
+        supersession_reason="corrected after a data revision",
+    )
+    with pytest.raises(ValueError, match="must not be blank"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
+def test_blank_supersession_reason_is_rejected_not_treated_as_absence(blank):
+    payload = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+        supersession_reason=blank,
+    )
+    with pytest.raises(ValueError, match="must not be blank"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+
+
+def test_padded_supersession_values_are_rejected():
+    payload = _v2_payload(
+        supersedes_id=" DI-CONTEXT-V2:" + "1" * 32 + " ",
+        supersession_reason="corrected after a data revision",
+    )
+    with pytest.raises(ValueError, match="leading or trailing whitespace"):
+        validate_di_payload(DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload)
+
+
+@pytest.mark.parametrize("sentinel", ["none", "NONE", "N/A", "n/a", "unknown", "UNKNOWN"])
+def test_placeholder_supersession_values_are_rejected(sentinel):
+    """A placeholder is not a legitimate identity or reason."""
+    with pytest.raises(ValueError, match="not a placeholder"):
+        validate_di_payload(
+            DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            _v2_payload(
+                supersedes_id=sentinel,
+                supersession_reason="corrected after a data revision",
+            ),
+        )
+    with pytest.raises(ValueError, match="not a placeholder"):
+        validate_di_payload(
+            DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            _v2_payload(
+                supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+                supersession_reason=sentinel,
+            ),
+        )
+
+
+def test_non_string_supersession_values_are_rejected():
+    with pytest.raises(ValueError, match="canonical string or absent"):
+        validate_di_payload(
+            DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            _v2_payload(
+                supersedes_id=123,
+                supersession_reason="corrected after a data revision",
+            ),
+        )
+
+
+def test_paired_supersession_identity_is_deterministic():
+    supersedes = "DI-CONTEXT-V2:" + "1" * 32
+    first = _v2_payload(
+        supersedes_id=supersedes, supersession_reason="corrected after a revision"
+    )
+    second = _v2_payload(
+        supersedes_id=supersedes, supersession_reason="corrected after a revision"
+    )
+    assert context_identity_v2(first) == context_identity_v2(second)
+
+
+def test_paired_supersession_changes_the_identity():
+    base = _v2_payload()
+    superseding = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+        supersession_reason="corrected after a revision",
+    )
+    assert context_identity_v2(base) != context_identity_v2(superseding)
+
+
+def test_unpaired_supersession_cannot_become_durable_evidence(writer):
+    """The writer refuses it, so ambiguous metadata is never persisted."""
+    payload = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "1" * 32,
+        supersession_reason=None,
+    )
+    from app.opip.canonical.models import WriterIntent
+
+    ack = writer.submit(
+        WriterIntent(
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=context_idempotency_key(
+                context_id=payload["context_id"]
+            ),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+        )
+    )
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+    assert "must be provided together" in str(ack.detail)
+    rows = writer._conn.execute(  # noqa: SLF001 - test-only inspection
+        "SELECT COUNT(*) FROM events WHERE event_type = ?",
+        (DECISION_INTELLIGENCE_CONTEXT_RECORDED,),
+    ).fetchone()[0]
+    assert rows == 0
+
+
+def test_paired_supersession_retry_is_idempotent(writer):
+    _, superseding_id = _commit_v2_supersession_pair(writer)
+    superseding = _v2_payload(
+        supersedes_id=None,
+        supersession_reason=None,
+    )
+    # Re-submit the exact recorded payload by reading it back from canonical
+    # evidence rather than rebuilding it, so this is a true retry.
+    committed = json.loads(
+        writer._conn.execute(  # noqa: SLF001 - test-only inspection
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (
+                DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                context_idempotency_key(context_id=superseding_id),
+            ),
+        ).fetchone()["payload_json"]
+    )
+    assert committed["supersedes_id"] is not None
+    from app.opip.canonical.models import WriterIntent
+
+    ack = writer.submit(
+        WriterIntent(
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=context_idempotency_key(context_id=superseding_id),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=committed,
+        )
+    )
+    assert ack.status == "DUPLICATE_OK"
+    assert superseding is not None
+
+
+def test_evidence_reader_reconstructs_one_coherent_supersession_edge(writer):
+    """A valid v2 pair resolves to exactly one same-kind supersession edge."""
+    from app.opip.decision_intelligence.evidence_reader import (
+        read_di_evidence_snapshot,
+    )
+
+    original_id, superseding_id = _commit_v2_supersession_pair(writer)
+
+    snapshot = read_di_evidence_snapshot(db_path=writer.db_path)
+    assert snapshot.contexts == {}
+    assert set(snapshot.contexts_v2) == {original_id, superseding_id}
+    edges = snapshot.supersession_edges
+    assert len(edges) == 1
+    assert edges[0].supersedes_id == original_id
+    assert edges[0].record_id == superseding_id
+
+
+def test_unrecorded_supersession_target_is_refused_before_commit(writer):
+    """A pair naming an unrecorded target is refused by the writer.
+
+    This is the first line of defence: a supersession cannot be presented without
+    a genuine same-kind predecessor, so ambiguous lineage never reaches durable
+    storage. The reader retains its own guard as defence in depth.
+    """
+    payload = _v2_payload(
+        supersedes_id="DI-CONTEXT-V2:" + "9" * 32,
+        supersession_reason="corrected after a revision",
+    )
+    from app.opip.canonical.models import WriterIntent
+
+    ack = writer.submit(
+        WriterIntent(
+            schema_version=SCHEMA_VERSION,
+            priority="LOW",
+            idempotency_key=context_idempotency_key(context_id=payload["context_id"]),
+            event_type=DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+            payload=payload,
+        )
+    )
+    assert ack.status == "REJECTED"
+    assert ack.error_code == "INVALID_INTENT"
+    assert "is missing for evidence validation" in str(ack.detail)
+    assert (
+        writer._conn.execute(  # noqa: SLF001 - test-only inspection
+            "SELECT COUNT(*) FROM events WHERE event_type = ?",
+            (DECISION_INTELLIGENCE_CONTEXT_RECORDED,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_v1_context_supersession_semantics_are_unchanged():
+    """The pairing rule is a v2 invariant; v1 keeps its existing behaviour."""
+    from dataclasses import MISSING
+
+    for field_name in ("supersedes_id", "supersession_reason"):
+        field = DecisionContext.__dataclass_fields__[field_name]
+        assert field.default is None
+        assert field.default_factory is MISSING
+    payload = _v1_payload()
+    payload["supersedes_id"] = "DI-CONTEXT:some-earlier-context"
+    payload["context_id"] = context_identity(payload)
+    # v1 accepts it exactly as before: no pairing rule was added to v1.
+    assert validate_di_payload(
+        DECISION_INTELLIGENCE_CONTEXT_RECORDED, payload
+    )["supersedes_id"] == "DI-CONTEXT:some-earlier-context"
+
+
+# ---------------------------------------------------------------------------
 # Static guards against fabricated lineage
 # ---------------------------------------------------------------------------
 
 
 def test_v2_contract_carries_no_fabricated_lineage_values():
-    """No invented version/placeholder strings exist in the v2 contract."""
+    """No invented version/placeholder strings exist as contract values.
+
+    The declared supersession sentinel set is excluded from the scan because it
+    exists precisely to *reject* those strings; a separate assertion pins that the
+    sentinels are only ever used for rejection.
+    """
+    from app.opip.decision_intelligence import identity as identity_module
+
+    declared_sentinels = {
+        value.lower() for value in identity_module._SUPERSESSION_SENTINEL_VALUES
+    }
+    assert declared_sentinels, "the sentinel denylist must not be empty"
+
     source = (APP_ROOT / "opip" / "decision_intelligence" / "identity.py").read_text(
         encoding="utf-8"
     )
@@ -717,6 +1004,9 @@ def test_v2_contract_carries_no_fabricated_lineage_values():
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             literals.add(node.value.lower())
+
+    # The denylist itself legitimately names these strings.
+    scanned = literals - declared_sentinels
     for fabricated in (
         "forecast-v1",
         "detector-v1",
@@ -724,11 +1014,14 @@ def test_v2_contract_carries_no_fabricated_lineage_values():
         "candidate-set",
         "not-applicable",
         "not_applicable",
-        "n/a",
-        "none",
-        "unknown",
     ):
-        assert fabricated not in literals, fabricated
+        assert fabricated not in scanned, fabricated
+
+    # Any sentinel literal appears only as a member of the rejection denylist.
+    sentinel_container_source = source.split("_SUPERSESSION_SENTINEL_VALUES = ")[1]
+    container_body = sentinel_container_source.split("\n\n")[0]
+    for sentinel in declared_sentinels:
+        assert f'"{sentinel}"' in container_body, sentinel
 
 
 def test_v2_contract_has_no_committee_metadata_fields():

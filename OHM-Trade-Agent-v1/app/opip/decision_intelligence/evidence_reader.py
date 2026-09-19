@@ -182,8 +182,16 @@ from app.opip.decision_intelligence.serialization import canonicalize_nested
 #: Every Decision Intelligence event type shares this stream namespace.
 DI_EVENT_TYPE_PREFIX = "decision_intelligence."
 
-#: Payload schema version this reader can interpret (P1A is exactly 1).
+#: Payload schema version this reader can interpret for Decision Intelligence
+#: events other than the decision context (P1A is exactly 1).
 DI_PAYLOAD_SCHEMA_VERSION = 1
+
+#: Payload schema versions interpretable for the decision-context event. Both
+#: context contract versions are carried by this one event type, so the reader
+#: must accept either rather than treating v2 as uninterpretable.
+DI_CONTEXT_PAYLOAD_SCHEMA_VERSIONS: frozenset[int] = frozenset(
+    {DECISION_CONTEXT_SCHEMA_VERSION, DECISION_CONTEXT_SCHEMA_VERSION_V2}
+)
 
 #: Anomaly codes. Explicit, bounded, and stable for downstream filtering.
 #:
@@ -1671,6 +1679,11 @@ def _event_type_for(record_type: type) -> str:
     for event_type, candidate in _RECORD_TYPES_BY_EVENT.items():
         if candidate is record_type:
             return event_type
+    if record_type is DecisionContextV2:
+        # Both context schema versions are carried by the same canonical event
+        # type, so a v2 context resolves to the context event rather than being
+        # unmapped. Without this a v2 supersession edge could not be named.
+        return DECISION_INTELLIGENCE_CONTEXT_RECORDED
     raise DIEvidenceIntegrityError(
         f"no canonical event type maps to {record_type.__name__}"
     )
@@ -1698,11 +1711,16 @@ def _decode_known_payload(
         )
 
     version = raw.get("schema_version")
-    if type(version) is not int or version != DI_PAYLOAD_SCHEMA_VERSION:
+    supported_versions = (
+        DI_CONTEXT_PAYLOAD_SCHEMA_VERSIONS
+        if event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED
+        else frozenset({DI_PAYLOAD_SCHEMA_VERSION})
+    )
+    if type(version) is not int or version not in supported_versions:
         raise DIIncompatibleSchemaError(
             f"committed {event_type} payload schema_version={version!r} is not "
             f"interpretable by this build (supported "
-            f"{DI_PAYLOAD_SCHEMA_VERSION}, event {event_id})"
+            f"{sorted(supported_versions)}, event {event_id})"
         )
 
     try:

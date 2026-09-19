@@ -328,6 +328,61 @@ DECISION_CONTEXT_SCHEMA_VERSION_V2 = 2
 DECISION_CONTEXT_V2_IDENTITY_DOMAIN = "DI-CONTEXT-V2"
 
 
+#: Placeholder values callers might reach for when they mean "there is no
+#: supersession". They are rejected rather than silently treated as absence, so a
+#: fabricated or misused value can never be recorded as metadata.
+_SUPERSESSION_SENTINEL_VALUES = frozenset({"none", "n/a", "unknown"})
+
+
+def _normalize_supersession_pair(
+    supersedes_id: object,
+    supersession_reason: object,
+) -> tuple[str | None, str | None]:
+    """Validate the optional supersession pair, failing closed.
+
+    A supersession is a two-part claim: which record is corrected, and why. Half a
+    claim is ambiguous, so ``supersedes_id`` and ``supersession_reason`` must
+    either both be absent or both be present.
+
+    Nothing is ever converted to absence. An empty, whitespace-only, padded or
+    placeholder value is rejected rather than quietly dropped, because "absent"
+    and "present but blank" are different facts and silently collapsing them would
+    let a caller evade the pairing rule.
+    """
+    normalized: list[str | None] = []
+    for field_name, raw in (
+        ("supersedes_id", supersedes_id),
+        ("supersession_reason", supersession_reason),
+    ):
+        if raw is None:
+            normalized.append(None)
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"{field_name} must be a canonical string or absent")
+        text = raw.strip()
+        if not text:
+            raise ValueError(
+                f"{field_name} must not be blank; omit the field instead of "
+                "sending an empty value"
+            )
+        if raw != text:
+            raise ValueError(
+                f"{field_name} must not have leading or trailing whitespace"
+            )
+        if text.lower() in _SUPERSESSION_SENTINEL_VALUES:
+            raise ValueError(
+                f"{field_name} must be a real value, not a placeholder"
+            )
+        normalized.append(text)
+
+    normalized_id, normalized_reason = normalized
+    if (normalized_id is None) != (normalized_reason is None):
+        raise ValueError(
+            "supersedes_id and supersession_reason must be provided together"
+        )
+    return normalized_id, normalized_reason
+
+
 @dataclass(frozen=True)
 class DecisionContextV2:
     """Point-in-time context from the real production qualification path.
@@ -400,6 +455,14 @@ class DecisionContextV2:
 
         if not isinstance(self.provenance, Provenance):
             raise ValueError("provenance must be a Provenance contract")
+
+        # A supersession is a two-part claim, so it is all-or-nothing and never
+        # silently normalized.
+        supersedes_id, supersession_reason = _normalize_supersession_pair(
+            self.supersedes_id, self.supersession_reason
+        )
+        object.__setattr__(self, "supersedes_id", supersedes_id)
+        object.__setattr__(self, "supersession_reason", supersession_reason)
 
         if (
             type(self.schema_version) is not int
