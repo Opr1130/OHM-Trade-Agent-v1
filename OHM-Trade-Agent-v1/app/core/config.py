@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     paper_trade_pending_ttl_hours: int = Field(default=24, ge=1, le=168)
     paper_trade_max_hold_hours: int = Field(default=24, ge=1, le=168)
     paper_trade_candle_interval_minutes: int = Field(default=15)
+    # B/C-3 Paper v2 paper-only assumptions. A Paper v2 attempt, fill or
+    # STOP/TARGET action must cite canonical Level-1 quote evidence that was
+    # observed no longer ago than this, so a stale book can never justify a
+    # simulated fill. Simulation assumption only: no live effect.
+    paper_v2_quote_max_age_seconds: int = Field(default=15, ge=1, le=300)
 
     # Margin Intelligence v1 is advisory/manual only. The configured ceiling
     # mirrors what the account is permitted to use, while validation remains
