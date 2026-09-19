@@ -165,6 +165,90 @@ class PaperPortfolioState:
         )
 
 
+@dataclass(frozen=True)
+class PaperV2ExecutionState:
+    """Read-only projection of one Paper-v2 trade's canonical progress.
+
+    Exists so the producer can resume from canonical evidence instead of process
+    memory: it reports which stages are already committed, with the identities
+    needed to continue only the missing ones. It carries no capability - reading
+    progress confers no authority to change anything.
+    """
+
+    status: str
+    disposition_id: str | None = None
+    admitted: bool = False
+    paper_trade_id: str | None = None
+    reservation_id: str | None = None
+    quote_currency: str | None = None
+    decision_context_id: str | None = None
+    expected_portfolio_version: int | None = None
+    disposition: str | None = None
+    entry_order_intent_id: str | None = None
+    execution_attempt_id: str | None = None
+    fill_id: str | None = None
+    filled_quantity: float = 0.0
+    remaining_quantity: float = 0.0
+    protection_plan: dict[str, Any] | None = None
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2ExecutionState":
+        return cls(
+            status=str(raw["status"]),
+            disposition_id=(
+                str(raw["disposition_id"]) if raw.get("disposition_id") else None
+            ),
+            admitted=bool(raw.get("admitted", False)),
+            paper_trade_id=(
+                str(raw["paper_trade_id"]) if raw.get("paper_trade_id") else None
+            ),
+            reservation_id=(
+                str(raw["reservation_id"]) if raw.get("reservation_id") else None
+            ),
+            quote_currency=(
+                str(raw["quote_currency"]) if raw.get("quote_currency") else None
+            ),
+            decision_context_id=(
+                str(raw["decision_context_id"])
+                if raw.get("decision_context_id")
+                else None
+            ),
+            expected_portfolio_version=(
+                int(raw["expected_portfolio_version"])
+                if raw.get("expected_portfolio_version") is not None
+                else None
+            ),
+            disposition=(
+                str(raw["disposition"]) if raw.get("disposition") else None
+            ),
+            entry_order_intent_id=(
+                str(raw["entry_order_intent_id"])
+                if raw.get("entry_order_intent_id")
+                else None
+            ),
+            execution_attempt_id=(
+                str(raw["execution_attempt_id"])
+                if raw.get("execution_attempt_id")
+                else None
+            ),
+            fill_id=str(raw["fill_id"]) if raw.get("fill_id") else None,
+            filled_quantity=float(raw.get("filled_quantity") or 0.0),
+            remaining_quantity=float(raw.get("remaining_quantity") or 0.0),
+            protection_plan=(
+                dict(raw["protection_plan"])
+                if isinstance(raw.get("protection_plan"), dict)
+                else None
+            ),
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
 @dataclass
 class PendingHandoff:
     event_id: str

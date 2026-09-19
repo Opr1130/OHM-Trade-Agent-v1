@@ -12,7 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.opip.canonical.models import PaperPortfolioState, WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PaperV2ExecutionState,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.canonical.protocol import recv_json, send_json
 from app.opip.canonical.writer import CanonicalWriter
 from app.opip.contracts.paper_execution_runtime import (
@@ -238,6 +243,18 @@ class CanonicalWriterServer:
                 ).to_dict()
             return self.writer.paper_portfolio_state(
                 str(request.get("quote_currency") or "")
+            ).to_dict()
+        if method == "GET_PAPER_V2_EXECUTION_STATE":
+            # Read-only progress projection, gated on health for the same reason:
+            # a degraded writer must not offer apparently valid progress that a
+            # restart would resume from.
+            if self._health_status() != "OK":
+                return PaperV2ExecutionState(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_execution_state(
+                str(request.get("disposition_id") or "")
             ).to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.

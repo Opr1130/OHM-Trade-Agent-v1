@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 from app.opip.canonical.models import (
     PaperPortfolioState,
+    PaperV2ExecutionState,
     PendingHandoff,
     WriterAck,
     WriterIntent,
@@ -780,6 +781,151 @@ class CanonicalWriter:
             reserved_capital=float(reserved_capital),
             active_reservations=int(active_reservations),
         )
+
+    def paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState:
+        """Read-only projection of one Paper-v2 trade's canonical progress.
+
+        Pure read: holds the writer lock, inspects already-committed canonical
+        evidence, and reports which stages exist. It writes nothing - no event, no
+        sequence, no watermark, no idempotency row, no reservation.
+
+        The trade identity is derived from the disposition identity, so a restart
+        can ask about a trade before admission has happened.
+        """
+        if (
+            not isinstance(disposition_id, str)
+            or not disposition_id
+            or disposition_id != disposition_id.strip()
+        ):
+            return PaperV2ExecutionState(
+                status="REJECTED",
+                error_code="MALFORMED_DISPOSITION_ID",
+                detail="disposition_id must be a non-empty canonical string",
+            )
+        with self._lock:
+            try:
+                return self._paper_v2_execution_state_unlocked(disposition_id)
+            except (TypeError, ValueError) as exc:
+                return PaperV2ExecutionState(
+                    status="REJECTED",
+                    disposition_id=disposition_id,
+                    error_code="EXECUTION_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2ExecutionState(
+                    status="RETRYABLE",
+                    disposition_id=disposition_id,
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_execution_state_unlocked(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        import json as _json
+
+        paper_trade_id, reservation_id = admission_result_identities(disposition_id)
+        state: dict = {
+            "status": "OK",
+            "disposition_id": disposition_id,
+            "paper_trade_id": paper_trade_id,
+            "reservation_id": reservation_id,
+        }
+
+        # Admission request (writer-owned record of the frozen request payload).
+        request_key = admission_request_idempotency_key(disposition_id)
+        request_row = self._conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (PAPER_ADMISSION_REQUEST_RECORDED, request_key),
+        ).fetchone()
+        if request_row is not None:
+            stored = _json.loads(str(request_row["payload_json"]))
+            state.update(
+                {
+                    "expected_portfolio_version": stored.get(
+                        "expected_portfolio_version"
+                    ),
+                    "quote_currency": stored.get("quote_currency"),
+                    "decision_context_id": stored.get("decision_context_id"),
+                    "disposition": stored.get("guard_result"),
+                }
+            )
+
+        # The committed disposition is the reservation authority.
+        disposition_row = self._conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                paper_evidence_idempotency_key(
+                    PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                    {"disposition_id": disposition_id},
+                ),
+            ),
+        ).fetchone()
+        if disposition_row is not None:
+            committed = _json.loads(str(disposition_row["payload_json"]))
+            state.update(
+                {
+                    "disposition": committed.get("disposition"),
+                    "quote_currency": committed.get("quote_currency"),
+                    "decision_context_id": committed.get("decision_context_id"),
+                }
+            )
+            if committed.get("disposition") == "ADMITTED":
+                state["admitted"] = True
+
+        # Execution progress for this trade, from committed evidence only.
+        orders = [
+            order
+            for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED)
+            if order.get("paper_trade_id") == paper_trade_id
+        ]
+        entry = next(
+            (order for order in orders if order.get("intent_role") == "ENTRY"), None
+        )
+        if entry is not None:
+            state["entry_order_intent_id"] = str(entry["order_intent_id"])
+            order_id = str(entry["order_intent_id"])
+            attempt = next(
+                (
+                    item
+                    for item in self._committed_paper_rows(
+                        PAPER_EXECUTION_ATTEMPT_RECORDED
+                    )
+                    if item.get("order_intent_id") == order_id
+                ),
+                None,
+            )
+            if attempt is not None:
+                state["execution_attempt_id"] = str(attempt["execution_attempt_id"])
+            fill = next(
+                (
+                    item
+                    for item in self._committed_paper_rows(PAPER_FILL_RECORDED)
+                    if item.get("order_intent_id") == order_id
+                ),
+                None,
+            )
+            if fill is not None:
+                state["fill_id"] = str(fill["fill_id"])
+
+        totals = self._canonical_fill_totals(paper_trade_id)
+        state["filled_quantity"] = float(totals["entry_quantity"])
+        state["remaining_quantity"] = float(totals["remaining_quantity"])
+
+        plans = sorted(
+            (
+                plan
+                for plan in self._committed_paper_rows(PAPER_PROTECTION_PLAN_RECORDED)
+                if plan.get("paper_trade_id") == paper_trade_id
+            ),
+            key=lambda plan: int(plan["plan_seq"]),
+        )
+        if plans:
+            state["protection_plan"] = plans[0]
+
+        return PaperV2ExecutionState.from_dict(state)
 
     def admit_paper_opportunity(
         self,

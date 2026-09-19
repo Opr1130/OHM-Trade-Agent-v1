@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from app.opip.canonical.models import (
     PaperPortfolioState,
+    PaperV2ExecutionState,
     PendingHandoff,
     WriterAck,
     WriterIntent,
@@ -37,6 +38,8 @@ class WriterClient(Protocol):
     ) -> PaperProtectionActionAck: ...
 
     def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState: ...
+
+    def get_paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -119,6 +122,17 @@ class CanonicalWriterClient:
         )
         return PaperPortfolioState.from_dict(response)
 
+    def get_paper_v2_execution_state(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        response = self._roundtrip(
+            {
+                "method": "GET_PAPER_V2_EXECUTION_STATE",
+                "disposition_id": disposition_id,
+            }
+        )
+        return PaperV2ExecutionState.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -194,6 +208,18 @@ class InProcessWriterClient:
                 {
                     "method": "GET_PAPER_PORTFOLIO_STATE",
                     "quote_currency": quote_currency,
+                }
+            )
+        )
+
+    def get_paper_v2_execution_state(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        return PaperV2ExecutionState.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "GET_PAPER_V2_EXECUTION_STATE",
+                    "disposition_id": disposition_id,
                 }
             )
         )
