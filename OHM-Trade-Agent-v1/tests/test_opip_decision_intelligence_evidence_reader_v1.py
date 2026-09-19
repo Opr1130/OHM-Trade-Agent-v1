@@ -1369,7 +1369,11 @@ def test_known_payload_with_future_schema_version_fails_closed(tmp_path):
 
     def _bump_version(current: str) -> str:
         payload = json.loads(current)
-        payload["schema_version"] = 2
+        # The context event now interprets schema versions 1 and 2, so an
+        # unsupported *future* version must be one beyond both. The invariant
+        # asserted here is unchanged: a version this build cannot interpret fails
+        # closed rather than being coerced into a neighbour.
+        payload["schema_version"] = 3
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     _rewrite_payload(db, event_id, _bump_version)

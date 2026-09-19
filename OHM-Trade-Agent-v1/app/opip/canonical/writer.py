@@ -1634,7 +1634,20 @@ class CanonicalWriter:
             raise ValueError("supersedes_id is invalid")
 
         if event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED:
-            self._load_context_by_id(supersedes_id)
+            superseded = self._load_context_by_id(supersedes_id)
+            # Context schema versions are distinct semantic contracts: they require
+            # different facts, use different identity domains, and reconstruct into
+            # separate typed stores. A cross-version supersession would therefore be
+            # writer-accepted evidence the reader cannot reconstruct safely, so it is
+            # refused before commit. Same-version supersession is unchanged.
+            superseded_version = superseded.get("schema_version")
+            superseding_version = payload.get("schema_version")
+            if superseded_version != superseding_version:
+                raise ValueError(
+                    "cross-version decision context supersession is not allowed "
+                    f"(target schema_version={superseded_version!r}, "
+                    f"superseding schema_version={superseding_version!r})"
+                )
             return
 
         if event_type == DECISION_INTELLIGENCE_REQUEST_RECORDED:

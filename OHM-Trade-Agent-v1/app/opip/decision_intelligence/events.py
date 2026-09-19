@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Mapping, Type
 
 from app.opip.contracts.identity import ConsumedInputWatermark
-from app.opip.decision_intelligence.identity import DecisionContext, Provenance
+from app.opip.decision_intelligence.identity import (
+    DECISION_CONTEXT_SCHEMA_VERSION,
+    DECISION_CONTEXT_SCHEMA_VERSION_V2,
+    DECISION_CONTEXT_V2_IDENTITY_DOMAIN,
+    DecisionContext,
+    DecisionContextV2,
+    Provenance,
+)
 from app.opip.decision_intelligence.contracts import (
     AdvisoryStance,
     CommitteeAssessmentSummary,
@@ -85,6 +93,7 @@ _REPEATED_STRING_FIELDS = (
 )
 _IDENTITY_BUILDERS = {
     DecisionContext: lambda payload: context_identity(payload),
+    DecisionContextV2: lambda payload: context_identity_v2(payload),
     CommitteeRequest: lambda payload: request_identity(payload),
     CommitteeRequestTransition: lambda payload: transition_identity(payload),
     CommitteeRoleResult: lambda payload: role_result_identity(payload),
@@ -94,6 +103,7 @@ _IDENTITY_BUILDERS = {
 }
 _IDENTITY_FIELDS = {
     DecisionContext: "context_id",
+    DecisionContextV2: "context_id",
     CommitteeRequest: "request_id",
     CommitteeRequestTransition: "transition_id",
     CommitteeRoleResult: "result_id",
@@ -101,6 +111,25 @@ _IDENTITY_FIELDS = {
     ModelInvocation: "invocation_id",
     ComparisonRecord: "comparison_id",
 }
+
+#: Context schema version to its contract. Version 1 keeps its exact existing
+#: behaviour; version 2 carries the production point-in-time context. Any other
+#: version fails closed rather than being coerced into a neighbour.
+_CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION: Mapping[int, type] = MappingProxyType(
+    {
+        DECISION_CONTEXT_SCHEMA_VERSION: DecisionContext,
+        DECISION_CONTEXT_SCHEMA_VERSION_V2: DecisionContextV2,
+    }
+)
+
+#: The context event carries every registered DecisionContext schema version.
+_REGISTERED_CONTEXT_SCHEMA_VERSIONS: frozenset[int] = frozenset(
+    _CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION
+)
+
+#: Every non-context Decision Intelligence event accepts exactly this version.
+_SINGLE_DI_PAYLOAD_SCHEMA_VERSION: frozenset[int] = frozenset({1})
+
 
 def _identity(event_type: str, *parts: object) -> str:
     return stable_hash(event_type, {"components": list(parts)})
@@ -235,6 +264,62 @@ def context_identity(context: Mapping[str, Any]) -> str:
         "supersession_reason": context.get("supersession_reason"),
     }
     return stable_hash("DI-CONTEXT", identity)
+
+
+def _identity_timestamp(value: Any, *, field_name: str) -> str:
+    """Canonical UTC rendering of a timestamp for v2 context identity.
+
+    Uses the same normalization as payload validation, so semantically identical
+    instants expressed differently - ``2026-09-19T12:00:00Z``,
+    ``2026-09-19T12:00:00+00:00``, another aware offset, or a ``datetime`` -
+    derive one identity instead of several. Without this, an identity computed from
+    the caller's representation would disagree with the identity recomputed from
+    the normalized payload and content-identity validation would fail.
+
+    An unusable value fails closed, and the field is named in the error so the
+    caller can tell which timestamp was rejected rather than receiving a bare parse
+    message.
+    """
+    try:
+        parsed = _timestamp(value, field_name)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an aware UTC timestamp") from exc
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def context_identity_v2(context: Mapping[str, Any]) -> str:
+    """Content-derived identity for a schema-v2 production context.
+
+    Uses a distinct ``DI-CONTEXT-V2`` domain so a v2 context can never collide
+    with a v1 context describing the same candidate and snapshot, and so a
+    restart reproduces the identical identity.
+
+    Deliberately excluded: ``emitted_at``, ``process_instance_id`` and
+    ``artifact_or_build_id``. Those describe the emitting run, not the decision
+    context, and including them would make an exact restart mint a different
+    semantic identity. Only real decision facts take part.
+    """
+    identity = {
+        "schema_version": context["schema_version"],
+        "candidate_id": str(context["candidate_id"]).strip(),
+        "episode_id": str(context["episode_id"]).strip(),
+        "instrument_version": str(context["instrument_version"]).strip(),
+        "snapshot_id": str(context["snapshot_id"]).strip(),
+        "snapshot_hash": str(context["snapshot_hash"]).strip(),
+        "evaluation_time": _identity_timestamp(
+            context["evaluation_time"], field_name="evaluation_time"
+        ),
+        "evidence_cutoff": _identity_timestamp(
+            context["evidence_cutoff"], field_name="evidence_cutoff"
+        ),
+        "policy_version": context["policy_version"],
+        "policy_fingerprint": context["policy_fingerprint"],
+        "environment": context["environment"],
+        "eligibility": context["eligibility"],
+        "supersedes_id": context.get("supersedes_id"),
+        "supersession_reason": context.get("supersession_reason"),
+    }
+    return stable_hash(DECISION_CONTEXT_V2_IDENTITY_DOMAIN, identity)
 
 
 def request_identity(request: Mapping[str, Any]) -> str:
@@ -419,7 +504,9 @@ def _normalized_record_payload(
 ) -> dict[str, Any]:
     record = record_type(**data)
     normalized = (
-        record.as_dict() if isinstance(record, DecisionContext) else asdict(record)
+        record.as_dict()
+        if isinstance(record, (DecisionContext, DecisionContextV2))
+        else asdict(record)
     )
     return _canonical_payload(normalized)
 
@@ -443,7 +530,21 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
         raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
     if "schema_version" not in payload:
         raise ValueError("DI payload schema_version is required")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    if type(payload["schema_version"]) is not int:
+        raise ValueError("unsupported DI payload schema_version")
+
+    version = payload["schema_version"]
+    if record_type is DecisionContext:
+        # The context event carries both schema versions. Version 1 keeps its
+        # exact existing validation; version 2 selects the production context
+        # contract; anything else fails closed rather than being coerced.
+        context_type = _CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION.get(version)
+        if context_type is None:
+            raise ValueError(
+                f"unsupported DI context schema_version: {version!r}"
+            )
+        record_type = context_type
+    elif version != 1:
         raise ValueError("unsupported DI payload schema_version")
 
     data = _strict_payload(payload, record_type)
@@ -476,17 +577,29 @@ class DIEventEnvelope:
             raise ValueError("DI event provenance is required")
         if self.event_type not in DECISION_INTELLIGENCE_EVENT_TYPES:
             raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
-        if (
-            type(self.payload_schema_version) is not int
-            or self.payload_schema_version != 1
-        ):
+        if type(self.payload_schema_version) is not int:
+            raise ValueError("DI event payload_schema_version must be an integer")
+        # Event-aware, mirroring validate_di_payload: the context event carries
+        # every registered DecisionContext schema version, while every other DI
+        # event accepts exactly 1. An unsupported version fails closed rather than
+        # being coerced.
+        supported_versions = (
+            _REGISTERED_CONTEXT_SCHEMA_VERSIONS
+            if self.event_type == DECISION_INTELLIGENCE_CONTEXT_RECORDED
+            else _SINGLE_DI_PAYLOAD_SCHEMA_VERSION
+        )
+        if self.payload_schema_version not in supported_versions:
             raise ValueError("unsupported DI event payload_schema_version")
         payload_version = self.payload.get("schema_version")
-        if (
-            type(payload_version) is not int
-            or payload_version != self.payload_schema_version
-        ):
+        if payload_version is None:
             raise ValueError("DI payload schema_version is required")
+        if type(payload_version) is not int:
+            raise ValueError("DI payload schema_version must be an integer")
+        if payload_version != self.payload_schema_version:
+            raise ValueError(
+                "DI payload schema_version must match the envelope "
+                "payload_schema_version"
+            )
         validate_di_payload(self.event_type, self.payload)
 
     @property

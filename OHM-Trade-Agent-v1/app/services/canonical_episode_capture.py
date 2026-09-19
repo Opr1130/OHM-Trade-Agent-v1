@@ -449,6 +449,34 @@ def _build_snapshot(
     return payload
 
 
+def canonical_episode_snapshot_hash(snapshot_payload: Mapping[str, Any]) -> str:
+    """Return the content hash of one canonical episode snapshot payload.
+
+    ``snapshot_id`` is an *identity* (``SNAP:``, derived from schema, episode and
+    symbol) and therefore does not change when the captured facts change. This
+    helper supplies the missing content hash so a decision can commit to the exact
+    snapshot contents it was taken against.
+
+    It is a pure function of the payload: canonical serialization makes it
+    independent of key ordering, any content mutation changes the digest, and no
+    current time, randomness, process identity, or Feature Bus state takes part.
+    The ``PSNAP:`` domain keeps it distinct from the ``SNAP:`` identity, so the two
+    can never be confused.
+    """
+    if not isinstance(snapshot_payload, Mapping):
+        raise ValueError("snapshot payload must be a mapping")
+    try:
+        encoded = json.dumps(
+            dict(snapshot_payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("snapshot payload is not canonically serializable") from exc
+    return _hash("PSNAP", encoded, length=32)
+
+
 def build_canonical_episode_snapshots(
     observations: Iterable[Any],
     *,
