@@ -15,6 +15,7 @@ import ast
 import hashlib
 import importlib
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,13 @@ from app.exchanges.kraken import KrakenClient
 from app.opip.canonical.client import InProcessWriterClient
 from app.opip.canonical.models import WriterAck
 from app.opip.canonical.server import CanonicalWriterServer
+from app.opip.contracts.episode_snapshot import (
+    CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE,
+    CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION,
+    canonical_episode_id,
+    canonical_snapshot_id,
+    validate_canonical_episode_snapshot,
+)
 from app.opip.contracts.identity import InstrumentVersion
 from app.opip.contracts.paper_execution_runtime import (
     DECISION_SNAPSHOT_EPISODE_RECORD_TYPE,
@@ -615,16 +623,69 @@ def test_process_instance_id_is_stable_within_a_process():
     assert first.startswith(f"{PROCESS_INSTANCE_PREFIX}:")
 
 
-def test_process_instance_id_differs_for_a_new_process():
-    """A restart is a different process instance, so it must not reuse the id."""
+def test_process_instance_id_survives_a_module_reload_in_the_same_process():
+    """A reload is not a restart, so it must not mint a second identity.
+
+    A module global would be rebound by ``reload``, handing one process two
+    identities. The sentinel is process-scoped instead, keyed by PID.
+    """
     import app.opip.contracts.process_identity as module
 
     first = process_instance_id()
     reloaded = importlib.reload(module)
     try:
-        assert reloaded.process_instance_id() != first
+        assert reloaded.process_instance_id() == first
     finally:
         importlib.reload(module)
+
+
+def test_process_instance_id_differs_for_a_real_new_process(tmp_path):
+    """A genuinely different process receives a different identifier."""
+    import subprocess
+
+    here = process_instance_id()
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from app.opip.contracts.process_identity import process_instance_id;"
+            " print(process_instance_id())",
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    child_id = child.stdout.strip()
+    assert child_id.startswith(f"{PROCESS_INSTANCE_PREFIX}:")
+    assert child_id != here
+
+
+def test_forked_child_does_not_inherit_the_parent_identity(tmp_path):
+    """A forked child inherits memory but not the PID, so it mints its own."""
+    import os
+    import subprocess
+
+    here = process_instance_id()
+    script = (
+        "import os, sys\n"
+        "from app.opip.contracts.process_identity import process_instance_id\n"
+        "if os.fork() == 0:\n"
+        "    print(process_instance_id())\n"
+        "    os._exit(0)\n"
+        "os.wait()\n"
+    )
+    if not hasattr(os, "fork"):
+        pytest.skip("fork is unavailable on this platform")
+    child = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if child.returncode != 0 or not child.stdout.strip():
+        pytest.skip("fork unavailable in this environment")
+    assert child.stdout.strip() != here
 
 
 def test_process_instance_id_never_enters_semantic_identity(env):
@@ -814,6 +875,329 @@ def test_producer_restart_is_idempotent_across_a_restart(tmp_path):
         assert len(_rows(second_server.writer, CTX_EVENT)) == 1
     finally:
         second_server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: the snapshot proof must prove a real canonical episode snapshot
+# ---------------------------------------------------------------------------
+
+
+def _minimal_fabricated_inner() -> dict:
+    """Only the fields the wrapper compares - no production facts at all."""
+    real = _snapshot_payload()
+    return {
+        "record_type": CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE,
+        "schema_version": 1,
+        "snapshot_id": real["snapshot_id"],
+        "episode_id": real["episode_id"],
+        "cohort_id": real["cohort_id"],
+    }
+
+
+def test_minimal_fabricated_inner_payload_is_rejected_even_with_correct_hash():
+    """A mapping that merely claims the record type is not an episode snapshot.
+
+    The wrapper's identity and content-hash checks are satisfied exactly here, so
+    only real shape validation can refuse it.
+    """
+    inner = _minimal_fabricated_inner()
+    # The PSNAP hash is internally correct for this payload.
+    wrapper = _wrapper(inner, snapshot_hash=episode_snapshot_hash(inner))
+    assert wrapper["snapshot_id"] == inner["snapshot_id"]
+    assert wrapper["snapshot_hash"] == episode_snapshot_hash(inner)
+
+    with pytest.raises(ValueError, match="invalid canonical episode snapshot fields"):
+        validate_decision_snapshot_payload(wrapper)
+    with pytest.raises(ValueError, match="invalid canonical episode snapshot fields"):
+        DecisionSnapshot.from_payload(inner)
+
+
+def test_missing_real_production_field_is_rejected():
+    inner = {key: value for key, value in _snapshot_payload().items()}
+    del inner["ml_feature_seed"]
+    with pytest.raises(ValueError, match="invalid canonical episode snapshot fields"):
+        validate_decision_snapshot_payload(
+            _wrapper(inner, snapshot_hash=episode_snapshot_hash(inner))
+        )
+
+
+def test_extra_inner_field_is_rejected():
+    inner = {**_snapshot_payload(), "unexpected_field": 1}
+    with pytest.raises(ValueError, match="invalid canonical episode snapshot fields"):
+        validate_decision_snapshot_payload(
+            _wrapper(inner, snapshot_hash=episode_snapshot_hash(inner))
+        )
+
+
+def test_bogus_episode_identity_is_rejected():
+    inner = {**_snapshot_payload(), "episode_id": "EP:" + "0" * 24}
+    with pytest.raises(ValueError, match="episode_id must be the canonical episode"):
+        validate_decision_snapshot_payload(
+            _wrapper(
+                inner,
+                episode_id=inner["episode_id"],
+                snapshot_hash=episode_snapshot_hash(inner),
+            )
+        )
+
+
+def test_bogus_snapshot_identity_is_rejected():
+    inner = {**_snapshot_payload(), "snapshot_id": "SNAP:" + "0" * 32}
+    with pytest.raises(ValueError, match="snapshot_id must be the canonical snapshot"):
+        validate_decision_snapshot_payload(
+            _wrapper(
+                inner,
+                snapshot_id=inner["snapshot_id"],
+                snapshot_hash=episode_snapshot_hash(inner),
+            )
+        )
+
+
+def test_real_builder_output_still_validates_unchanged():
+    inner = _snapshot_payload()
+    validated = validate_canonical_episode_snapshot(inner)
+    assert validated == inner
+    # And the builder's own identities are the contract's identities.
+    assert inner["episode_id"] == canonical_episode_id(
+        schema_version=inner["schema_version"],
+        cohort_id=inner["cohort_id"],
+        symbol=inner["symbol"],
+    )
+    assert inner["snapshot_id"] == canonical_snapshot_id(
+        schema_version=inner["schema_version"], episode_id=inner["episode_id"]
+    )
+
+
+def test_producer_and_canonical_validator_share_one_snapshot_contract():
+    """Neither layer may carry a second, drifting definition of the shape."""
+    from app.services import canonical_episode_capture as producer
+    from app.opip.contracts import paper_execution_runtime as canonical
+
+    assert producer.RECORD_TYPE == CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE
+    assert producer.SCHEMA_VERSION == CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION
+    assert (
+        canonical.DECISION_SNAPSHOT_EPISODE_RECORD_TYPE
+        == CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE
+    )
+    assert (
+        canonical.DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION
+        == CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION
+    )
+    # The producer routes identity through the shared primitives.
+    assert producer._canonical_episode_identity is canonical_episode_id
+    assert producer._canonical_snapshot_identity is canonical_snapshot_id
+
+
+def test_producer_self_validates_so_it_cannot_emit_a_non_canonical_record():
+    source = (
+        APP_ROOT / "services" / "canonical_episode_capture.py"
+    ).read_text(encoding="utf-8")
+    assert "return validate_canonical_episode_snapshot(payload)" in source
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("measurement_only", False),
+        ("advisory_only", False),
+        ("affects_ranking", True),
+        ("affects_telegram", True),
+        ("affects_pending_setup", True),
+        ("trade_authority_changed", True),
+        ("production_execution_gate_changed", True),
+    ],
+)
+def test_authority_flags_must_carry_their_production_meaning(field_name, value):
+    inner = {**_snapshot_payload(), field_name: value}
+    with pytest.raises(ValueError, match=field_name):
+        validate_canonical_episode_snapshot(inner)
+
+
+def test_non_kraken_source_exchange_is_rejected():
+    inner = {**_snapshot_payload(), "source_exchange": "OTHER"}
+    with pytest.raises(ValueError, match="source_exchange"):
+        validate_canonical_episode_snapshot(inner)
+
+
+@pytest.mark.parametrize("value", ["not-a-timestamp", "", "2026-09-19T12:00:00", 42])
+def test_decision_at_utc_must_be_an_aware_timestamp(value):
+    inner = {**_snapshot_payload(), "decision_at_utc": value}
+    with pytest.raises(ValueError, match="decision_at_utc"):
+        validate_canonical_episode_snapshot(inner)
+
+
+def test_non_finite_content_is_rejected():
+    inner = {**_snapshot_payload(), "components": {"bad": float("inf")}}
+    with pytest.raises(ValueError, match="not canonically serializable"):
+        validate_canonical_episode_snapshot(inner)
+
+
+@pytest.mark.parametrize("field_name", ["cohort_id", "episode_id", "snapshot_id", "symbol"])
+def test_non_canonical_identity_strings_are_rejected(field_name):
+    inner = {**_snapshot_payload(), field_name: "  padded  "}
+    with pytest.raises(ValueError, match=field_name):
+        validate_canonical_episode_snapshot(inner)
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: the snapshot decision boundary is the context evidence cutoff
+# ---------------------------------------------------------------------------
+
+
+def test_equivalent_decision_time_representations_are_accepted(env):
+    """A 'Z' suffix and an offset denote the same instant, so both bind."""
+    server, _ = env
+    payload = _snapshot_payload()
+    payload = {**payload, "decision_at_utc": "2026-09-19T12:00:00+00:00"}
+    run_paper_v2_opportunity(
+        _opportunity(snapshot_payload=payload, evidence_cutoff=NOW),
+        client=env[1],
+        kraken_client=_kraken([]),
+        settings=_Settings(),
+        now=NOW,
+    )
+    assert len(_rows(server.writer, PAPER_DECISION_SNAPSHOT_RECORDED)) == 1
+    assert len(_rows(server.writer, CTX_EVENT)) == 1
+
+
+def test_offset_representation_of_the_same_instant_is_accepted(env):
+    server, _ = env
+    payload = {**_snapshot_payload(), "decision_at_utc": "2026-09-19T14:00:00+02:00"}
+    run_paper_v2_opportunity(
+        _opportunity(snapshot_payload=payload, evidence_cutoff=NOW),
+        client=env[1],
+        kraken_client=_kraken([]),
+        settings=_Settings(),
+        now=NOW,
+    )
+    assert len(_rows(server.writer, CTX_EVENT)) == 1
+
+
+def test_snapshot_boundary_mismatch_is_rejected_before_every_write_and_read(env):
+    """A snapshot at T1 with evidence_cutoff T2 cannot become lineage."""
+    server, _ = env
+    calls: list[str] = []
+    snapshot_at = NOW - timedelta(minutes=5)
+    payload = _snapshot_payload(decision=snapshot_at)
+    with pytest.raises(
+        PaperV2ExecutionError, match="boundary does not match the evidence cutoff"
+    ):
+        run_paper_v2_opportunity(
+            _opportunity(snapshot_payload=payload, evidence_cutoff=NOW),
+            client=env[1],
+            kraken_client=_kraken(calls),
+            settings=_Settings(),
+            now=NOW,
+        )
+    assert calls == [], "no public book read may happen before the boundary check"
+    assert _total_event_count(server.writer) == 0, (
+        "no canonical write may happen before the boundary check"
+    )
+    assert _rows(server.writer, PAPER_DECISION_SNAPSHOT_RECORDED) == []
+    assert _event_ids(server.writer, "market.instrument_version.recorded") == []
+
+
+def test_evaluation_time_may_be_later_than_the_evidence_cutoff(env):
+    """The cutoff is the closed boundary; evaluation may follow it."""
+    server, _ = env
+    payload = _snapshot_payload()
+    run_paper_v2_opportunity(
+        _opportunity(
+            snapshot_payload=payload,
+            evidence_cutoff=NOW,
+            evaluation_time=NOW + timedelta(seconds=30),
+        ),
+        client=env[1],
+        kraken_client=_kraken([]),
+        settings=_Settings(),
+        now=NOW,
+    )
+    context = _rows(server.writer, CTX_EVENT)[0]
+    assert context["evidence_cutoff"] == "2026-09-19T12:00:00Z"
+    assert context["evaluation_time"] == "2026-09-19T12:00:30Z"
+
+
+def test_no_snapshot_expiration_window_is_introduced():
+    """Freshness stays the quote-evidence responsibility, captured at execution.
+
+    The decision snapshot is historical evidence: the contract binds it to the
+    decision instant and nothing else. No age or expiry concept may appear on the
+    snapshot path, and the boundary check must be an instant comparison rather
+    than a window.
+    """
+    adapter = (APP_ROOT / "services" / "paper_v2_decision_snapshot.py").read_text(
+        encoding="utf-8"
+    )
+    for token in ("max_age", "expiry", "expires", "stale", "snapshot_age", "timedelta"):
+        assert token not in adapter, token
+
+    producer = (APP_ROOT / "services" / "paper_v2_execution.py").read_text(
+        encoding="utf-8"
+    )
+    # The boundary check compares the two instants directly.
+    assert "decision_snapshot.decision_at != cutoff" in producer
+    # The quote-evidence freshness bound is untouched and still present.
+    assert "paper_v2_quote_max_age_seconds" in producer
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: the WriterIntent vocabulary knows the snapshot event
+# ---------------------------------------------------------------------------
+
+
+def test_writer_intent_vocabulary_includes_the_decision_snapshot_event():
+    import typing
+
+    from app.opip.canonical.models import EventType
+
+    vocabulary = set(typing.get_args(EventType))
+    assert PAPER_DECISION_SNAPSHOT_RECORDED in vocabulary
+    # The rest of the Paper v2 vocabulary is unchanged by this correction.
+    for existing in (
+        "paper_execution.quote_evidence.recorded",
+        "paper_execution.order_intent.recorded",
+        "paper_execution.attempt.recorded",
+        "paper_execution.fill.recorded",
+        "paper_protection.plan.recorded",
+        "paper_protection.state.recorded",
+        "paper_protection.trigger.recorded",
+        "paper_execution.reconciliation.recorded",
+    ):
+        assert existing in vocabulary, existing
+
+
+def test_writer_intent_round_trips_the_decision_snapshot_event_through_uds():
+    """The event survives canonical frame serialization byte-for-byte."""
+    import socket
+
+    from app.opip.canonical.models import WriterIntent
+    from app.opip.canonical.protocol import recv_json, send_json
+
+    snapshot = DecisionSnapshot.from_payload(_snapshot_payload())
+    intent = decision_snapshot_intent(build_decision_snapshot_payload(snapshot))
+    assert intent.event_type == PAPER_DECISION_SNAPSHOT_RECORDED
+
+    client_sock, server_sock = socket.socketpair()
+    try:
+        send_json(client_sock, intent.to_dict())
+        received = recv_json(server_sock)
+    finally:
+        client_sock.close()
+        server_sock.close()
+
+    assert received["event_type"] == PAPER_DECISION_SNAPSHOT_RECORDED
+    restored = WriterIntent.from_dict(received)
+    assert restored.event_type == PAPER_DECISION_SNAPSHOT_RECORDED
+    assert restored == intent
+    assert restored.payload["snapshot_id"] == snapshot.snapshot_id
+
+
+def test_decision_snapshot_event_is_registered_in_the_runtime_accepted_set():
+    from app.opip.canonical.writer import ACCEPTED_EVENT_TYPES
+    from app.opip.contracts.paper_execution_runtime import PAPER_V2_WRITER_EVENT_TYPES
+
+    assert PAPER_DECISION_SNAPSHOT_RECORDED in PAPER_V2_WRITER_EVENT_TYPES
+    assert PAPER_DECISION_SNAPSHOT_RECORDED in ACCEPTED_EVENT_TYPES
 
 
 # ---------------------------------------------------------------------------

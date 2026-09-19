@@ -42,6 +42,12 @@ EventType = Literal[
     "paper_execution.order_intent.recorded",
     "paper_execution.attempt.recorded",
     "paper_execution.fill.recorded",
+    # B/C-3 increment 6A decision snapshot. Owned by
+    # app.opip.contracts.paper_execution_runtime; restated here because the
+    # annotation cannot be computed from that frozenset. It is the durable proof
+    # of the canonical episode snapshot a decision was taken against, so a
+    # DecisionContext can cite it as real provenance.
+    "paper_execution.decision_snapshot.recorded",
     # B/C-2 protection and terminal reconciliation ground truth. The protection
     # trigger is listed for completeness of the paper v2 vocabulary but is
     # writer-owned through the atomic protection action RPC; it is deliberately

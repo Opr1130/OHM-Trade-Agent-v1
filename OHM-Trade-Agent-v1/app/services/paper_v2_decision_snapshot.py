@@ -44,14 +44,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
+from datetime import datetime
+
 from app.opip.canonical.decision_context_bridge import require_canonical_commit
+from app.opip.contracts.episode_snapshot import (
+    parse_decision_at_utc,
+    validate_canonical_episode_snapshot,
+)
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
 )
 from app.opip.contracts.paper_execution_runtime import (
-    DECISION_SNAPSHOT_EPISODE_RECORD_TYPE,
-    DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION,
     PAPER_DECISION_SNAPSHOT_RECORDED,
     decision_snapshot_idempotency_key,
     validate_decision_snapshot_payload,
@@ -67,16 +71,6 @@ class WriterSubmitClient(Protocol):
     """The only writer capability this adapter needs."""
 
     def submit(self, intent: Any) -> Any: ...
-
-
-def _canonical_identity(value: object, *, field_name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a canonical string")
-    if value != value.strip():
-        raise ValueError(f"{field_name} must not have leading or trailing whitespace")
-    if not value:
-        raise ValueError(f"{field_name} is required")
-    return value
 
 
 @dataclass(frozen=True)
@@ -99,23 +93,14 @@ class DecisionSnapshot:
             raise ValueError(
                 "snapshot_payload must be a canonical episode snapshot object"
             )
-        inner = dict(self.snapshot_payload)
-        if inner.get("record_type") != DECISION_SNAPSHOT_EPISODE_RECORD_TYPE:
-            raise ValueError(
-                "snapshot_payload record_type must be "
-                f"{DECISION_SNAPSHOT_EPISODE_RECORD_TYPE}"
-            )
-        if (
-            type(inner.get("schema_version")) is not int
-            or inner["schema_version"] != DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported canonical episode snapshot schema version")
+        # The shared contract is the authority on what a canonical episode
+        # snapshot is: exact field set, production flags, canonical
+        # serializability, and the deterministic EP:/SNAP: identity relationship.
+        # Validating here means the payload's own facts must derive the identities
+        # this record claims, so a constructed instance can never misdescribe it.
+        inner = validate_canonical_episode_snapshot(self.snapshot_payload)
 
-        for field_name in ("snapshot_id", "episode_id", "cohort_id"):
-            _canonical_identity(inner.get(field_name), field_name=f"snapshot_payload.{field_name}")
-
-        # The stated identities and hash must be the payload's own, so a
-        # constructed instance can never misdescribe its contents.
+        # The stated identities and hash must be the payload's own.
         for field_name in ("snapshot_id", "episode_id", "cohort_id"):
             if getattr(self, field_name) != inner[field_name]:
                 raise ValueError(
@@ -127,6 +112,16 @@ class DecisionSnapshot:
                 "snapshot_hash must equal the canonical episode snapshot content hash"
             )
         object.__setattr__(self, "snapshot_payload", inner)
+
+    @property
+    def decision_at(self) -> datetime:
+        """The snapshot's decision instant, normalized to UTC.
+
+        This is the evidence boundary the snapshot describes. It is exposed from
+        the validated payload rather than accepted as a separate caller fact, so
+        a caller cannot state a decision time the payload does not support.
+        """
+        return parse_decision_at_utc(self.snapshot_payload["decision_at_utc"])
 
     @classmethod
     def from_payload(

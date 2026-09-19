@@ -19,6 +19,11 @@ import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from app.opip.contracts.episode_snapshot import (
+    CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE,
+    CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION,
+    validate_canonical_episode_snapshot,
+)
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -51,14 +56,12 @@ PAPER_ADMISSION_REQUEST_RECORDED = "paper_execution.admission_request.recorded"
 PAPER_QUOTE_EVIDENCE_RECORDED = "paper_execution.quote_evidence.recorded"
 PAPER_DECISION_SNAPSHOT_RECORDED = "paper_execution.decision_snapshot.recorded"
 
-#: The inner record type a decision snapshot wrapper must carry. This is the
-#: record type of the canonical episode snapshot the production qualification
-#: path already builds; it is restated here as a contract constant so the
-#: canonical event validator does not depend on the producer-side service module.
-DECISION_SNAPSHOT_EPISODE_RECORD_TYPE = "CANONICAL_EPISODE_SNAPSHOT"
-
-#: The only supported canonical episode snapshot schema version.
-DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION = 1
+#: The inner record type and schema a decision snapshot wrapper must carry. These
+#: are the canonical episode snapshot contract's own values, re-exported under the
+#: Paper-v2 names so a reader of this module does not have to reach into the other
+#: contract to learn what it accepts.
+DECISION_SNAPSHOT_EPISODE_RECORD_TYPE = CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE
+DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION = CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION
 
 #: Events producers may submit through the ordinary WriterIntent path in B/C-1.
 #: Opportunity disposition remains writer-owned through the admission RPC.
@@ -825,17 +828,12 @@ def validate_decision_snapshot_payload(payload: Mapping[str, Any]) -> dict[str, 
     inner = payload.get("snapshot_payload")
     if not isinstance(inner, Mapping):
         raise ValueError("snapshot_payload must be a canonical episode snapshot object")
-    inner_payload = dict(inner)
-    if inner_payload.get("record_type") != DECISION_SNAPSHOT_EPISODE_RECORD_TYPE:
-        raise ValueError(
-            "snapshot_payload record_type must be "
-            f"{DECISION_SNAPSHOT_EPISODE_RECORD_TYPE}"
-        )
-    if (
-        type(inner_payload.get("schema_version")) is not int
-        or inner_payload["schema_version"] != DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION
-    ):
-        raise ValueError("unsupported canonical episode snapshot schema version")
+    # The nested payload is validated as a real canonical episode snapshot v1 by
+    # the shared contract: exact field set, production flags, canonical
+    # serializability and the deterministic EP:/SNAP: identity relationship. A
+    # mapping that merely claims the record type and carries matching ids is not
+    # enough, so an under-shaped payload cannot become execution lineage.
+    inner_payload = validate_canonical_episode_snapshot(inner)
 
     # The wrapper and the snapshot it carries must name the same decision subject.
     # Otherwise a wrapper could file one episode's contents under another's

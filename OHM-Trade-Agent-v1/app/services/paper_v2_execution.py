@@ -277,6 +277,21 @@ def run_paper_v2_opportunity(
     except ValueError as exc:
         raise PaperV2ExecutionError(f"decision snapshot rejected: {exc}") from exc
 
+    # --- 0c. bind the snapshot's decision boundary to the context cutoff ---
+    # The canonical episode snapshot is the evidence available at the scan decision
+    # boundary, and that boundary is the context's evidence_cutoff. They must name
+    # the same instant: if the snapshot were captured at a different moment, the
+    # context would cite evidence that was not what the decision consumed.
+    # ``evaluation_time`` is separately allowed to be equal or later, because the
+    # decision may be evaluated after the boundary is closed. This is a
+    # point-in-time check, deliberately not a snapshot-age expiration: execution
+    # market freshness remains the Level-1 quote-evidence responsibility.
+    cutoff = require_utc(opportunity.evidence_cutoff, field_name="evidence_cutoff")
+    if decision_snapshot.decision_at != cutoff:
+        raise PaperV2ExecutionError(
+            "decision snapshot boundary does not match the evidence cutoff"
+        )
+
     # --- 1. canonical instrument version -----------------------------------
     try:
         registered = ensure_instrument_version_registered(
