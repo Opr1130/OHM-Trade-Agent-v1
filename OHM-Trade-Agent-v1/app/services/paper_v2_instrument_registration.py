@@ -28,12 +28,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from app.opip.canonical.decision_context_bridge import (
+    COMMITTED_ACK_STATUSES,
+    CanonicalCommitError,
+    require_canonical_commit,
+)
 from app.opip.contracts.identity import ConsumedInputWatermark, InstrumentVersion
 from app.opip.features.publisher import instrument_version_intent
-
-#: Canonical ACK statuses that prove a record is durably committed. Anything
-#: else - REJECTED, RETRYABLE, SPOOLED, DISABLED - is not proof.
-COMMITTED_ACK_STATUSES = frozenset({"OK", "DUPLICATE_OK"})
 
 
 class InstrumentRegistrationError(RuntimeError):
@@ -103,36 +104,26 @@ def _require_committed_registration(
 ) -> RegisteredInstrument:
     """Convert a writer ACK into proof, or fail closed.
 
-    A missing ACK, a non-committed status, a missing event id or a missing
-    canonical sequence means persistence is unproven, so the Paper v2 path must
-    not continue on the assumption that the instrument exists.
+    Delegates the commit-proof rule to the canonical layer so registration and
+    context commit share one definition of "durably committed". A missing ACK, a
+    non-committed status, a missing event id or a missing canonical sequence means
+    persistence is unproven, so the Paper v2 path must not continue.
     """
-    what = f"instrument version {instrument_version_id}"
-    if ack is None:
-        raise InstrumentRegistrationError(
-            f"{what} was not acknowledged by the canonical writer"
+    try:
+        proof = require_canonical_commit(
+            ack,
+            idempotency_key=idempotency_key,
+            what=f"instrument version {instrument_version_id}",
         )
-    status = str(getattr(ack, "status", "") or "")
-    if status not in COMMITTED_ACK_STATUSES:
-        error_code = getattr(ack, "error_code", None)
-        raise InstrumentRegistrationError(
-            f"{what} was not proven committed (status={status or 'UNKNOWN'}"
-            f"{', error=' + str(error_code) if error_code else ''})"
-        )
-    event_id = getattr(ack, "event_id", None)
-    history_epoch = getattr(ack, "history_epoch", None)
-    local_sequence = getattr(ack, "local_sequence", None)
-    if not event_id or history_epoch is None or local_sequence is None:
-        raise InstrumentRegistrationError(
-            f"{what} acknowledgement is missing canonical identity or sequence"
-        )
+    except CanonicalCommitError as exc:
+        raise InstrumentRegistrationError(str(exc)) from exc
     return RegisteredInstrument(
         instrument_version_id=instrument_version_id,
-        idempotency_key=idempotency_key,
-        event_id=str(event_id),
-        history_epoch=int(history_epoch),
-        local_sequence=int(local_sequence),
-        status=status,
+        idempotency_key=proof.idempotency_key,
+        event_id=proof.event_id,
+        history_epoch=proof.history_epoch,
+        local_sequence=proof.local_sequence,
+        status=proof.status,
     )
 
 
