@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Mapping, Type
 
 from app.opip.contracts.identity import ConsumedInputWatermark
-from app.opip.decision_intelligence.identity import DecisionContext, Provenance
+from app.opip.decision_intelligence.identity import (
+    DECISION_CONTEXT_SCHEMA_VERSION,
+    DECISION_CONTEXT_SCHEMA_VERSION_V2,
+    DECISION_CONTEXT_V2_IDENTITY_DOMAIN,
+    DecisionContext,
+    DecisionContextV2,
+    Provenance,
+)
 from app.opip.decision_intelligence.contracts import (
     AdvisoryStance,
     CommitteeAssessmentSummary,
@@ -85,6 +93,7 @@ _REPEATED_STRING_FIELDS = (
 )
 _IDENTITY_BUILDERS = {
     DecisionContext: lambda payload: context_identity(payload),
+    DecisionContextV2: lambda payload: context_identity_v2(payload),
     CommitteeRequest: lambda payload: request_identity(payload),
     CommitteeRequestTransition: lambda payload: transition_identity(payload),
     CommitteeRoleResult: lambda payload: role_result_identity(payload),
@@ -94,6 +103,7 @@ _IDENTITY_BUILDERS = {
 }
 _IDENTITY_FIELDS = {
     DecisionContext: "context_id",
+    DecisionContextV2: "context_id",
     CommitteeRequest: "request_id",
     CommitteeRequestTransition: "transition_id",
     CommitteeRoleResult: "result_id",
@@ -101,6 +111,16 @@ _IDENTITY_FIELDS = {
     ModelInvocation: "invocation_id",
     ComparisonRecord: "comparison_id",
 }
+
+#: Context schema version to its contract. Version 1 keeps its exact existing
+#: behaviour; version 2 carries the production point-in-time context. Any other
+#: version fails closed rather than being coerced into a neighbour.
+_CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION: Mapping[int, type] = MappingProxyType(
+    {
+        DECISION_CONTEXT_SCHEMA_VERSION: DecisionContext,
+        DECISION_CONTEXT_SCHEMA_VERSION_V2: DecisionContextV2,
+    }
+)
 
 def _identity(event_type: str, *parts: object) -> str:
     return stable_hash(event_type, {"components": list(parts)})
@@ -235,6 +255,37 @@ def context_identity(context: Mapping[str, Any]) -> str:
         "supersession_reason": context.get("supersession_reason"),
     }
     return stable_hash("DI-CONTEXT", identity)
+
+
+def context_identity_v2(context: Mapping[str, Any]) -> str:
+    """Content-derived identity for a schema-v2 production context.
+
+    Uses a distinct ``DI-CONTEXT-V2`` domain so a v2 context can never collide
+    with a v1 context describing the same candidate and snapshot, and so a
+    restart reproduces the identical identity.
+
+    Deliberately excluded: ``emitted_at``, ``process_instance_id`` and
+    ``artifact_or_build_id``. Those describe the emitting run, not the decision
+    context, and including them would make an exact restart mint a different
+    semantic identity. Only real decision facts take part.
+    """
+    identity = {
+        "schema_version": context["schema_version"],
+        "candidate_id": str(context["candidate_id"]).strip(),
+        "episode_id": str(context["episode_id"]).strip(),
+        "instrument_version": str(context["instrument_version"]).strip(),
+        "snapshot_id": str(context["snapshot_id"]).strip(),
+        "snapshot_hash": str(context["snapshot_hash"]).strip(),
+        "evaluation_time": context["evaluation_time"],
+        "evidence_cutoff": context["evidence_cutoff"],
+        "policy_version": context["policy_version"],
+        "policy_fingerprint": context["policy_fingerprint"],
+        "environment": context["environment"],
+        "eligibility": context["eligibility"],
+        "supersedes_id": context.get("supersedes_id"),
+        "supersession_reason": context.get("supersession_reason"),
+    }
+    return stable_hash(DECISION_CONTEXT_V2_IDENTITY_DOMAIN, identity)
 
 
 def request_identity(request: Mapping[str, Any]) -> str:
@@ -419,7 +470,9 @@ def _normalized_record_payload(
 ) -> dict[str, Any]:
     record = record_type(**data)
     normalized = (
-        record.as_dict() if isinstance(record, DecisionContext) else asdict(record)
+        record.as_dict()
+        if isinstance(record, (DecisionContext, DecisionContextV2))
+        else asdict(record)
     )
     return _canonical_payload(normalized)
 
@@ -443,7 +496,21 @@ def validate_di_payload(event_type: str, payload: Mapping[str, Any]) -> Any:
         raise ValueError(_UNSUPPORTED_DI_EVENT_TYPE)
     if "schema_version" not in payload:
         raise ValueError("DI payload schema_version is required")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    if type(payload["schema_version"]) is not int:
+        raise ValueError("unsupported DI payload schema_version")
+
+    version = payload["schema_version"]
+    if record_type is DecisionContext:
+        # The context event carries both schema versions. Version 1 keeps its
+        # exact existing validation; version 2 selects the production context
+        # contract; anything else fails closed rather than being coerced.
+        context_type = _CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION.get(version)
+        if context_type is None:
+            raise ValueError(
+                f"unsupported DI context schema_version: {version!r}"
+            )
+        record_type = context_type
+    elif version != 1:
         raise ValueError("unsupported DI payload schema_version")
 
     data = _strict_payload(payload, record_type)

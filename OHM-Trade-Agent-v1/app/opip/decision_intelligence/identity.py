@@ -313,4 +313,133 @@ class DecisionContext:
                 )
 
 
-__all__ = ["DecisionContext", "Provenance"]
+#: Decision context schema versions this contract defines. Version 1 is the
+#: original committee-oriented context and remains the backward-compatibility
+#: authority: its fields, validation, serialization and identity output are
+#: frozen and must not change. Version 2 describes the point-in-time context
+#: that the real production qualification path can truthfully produce for Paper
+#: v2 execution lineage.
+DECISION_CONTEXT_SCHEMA_VERSION = 1
+DECISION_CONTEXT_SCHEMA_VERSION_V2 = 2
+
+#: Hash domain for the schema-v2 context identity. Deliberately distinct from the
+#: v1 ``DI-CONTEXT`` domain so a v1 and a v2 context that happen to share
+#: candidate/episode/snapshot facts can never collide.
+DECISION_CONTEXT_V2_IDENTITY_DOMAIN = "DI-CONTEXT-V2"
+
+
+@dataclass(frozen=True)
+class DecisionContextV2:
+    """Point-in-time context from the real production qualification path.
+
+    This is deliberately **not** a DI committee context. It records only facts the
+    synchronous production scan actually produces and that materially protect
+    point-in-time correctness, auditability and Paper-v2 execution lineage.
+
+    Fields that describe concepts this runtime does not have - the committee's
+    frozen evidence manifest, source-availability map and missingness map, an
+    ``evaluation_id``, a feature-generation version, a detector version, a
+    forecast/model version, a candidate-set reference and a consumed canonical
+    input watermark - are intentionally absent rather than carried as placeholders.
+    A later committee path that requires that metadata must fail closed on this
+    context instead of having it fabricated here.
+    """
+
+    context_id: str
+    candidate_id: str
+    episode_id: str
+    instrument_version: str
+    snapshot_id: str
+    snapshot_hash: str
+    evaluation_time: datetime
+    evidence_cutoff: datetime
+    policy_version: str
+    policy_fingerprint: str
+    environment: str
+    eligibility: bool
+    provenance: Provenance
+    schema_version: int = DECISION_CONTEXT_SCHEMA_VERSION_V2
+    supersedes_id: str | None = None
+    supersession_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "context_id",
+            "candidate_id",
+            "episode_id",
+            "instrument_version",
+            "snapshot_id",
+            "snapshot_hash",
+        ):
+            value = str(getattr(self, field_name) or "").strip()
+            if not value:
+                raise ValueError(f"{field_name} is required")
+            object.__setattr__(self, field_name, value)
+
+        for field_name in ("policy_version", "policy_fingerprint", "environment"):
+            value = str(getattr(self, field_name) or "").strip()
+            if not value:
+                raise ValueError(f"{field_name} is required")
+            object.__setattr__(self, field_name, value)
+
+        if not isinstance(self.eligibility, bool):
+            raise ValueError("eligibility must be a boolean")
+
+        object.__setattr__(
+            self,
+            "evaluation_time",
+            require_utc(self.evaluation_time, field_name="evaluation_time"),
+        )
+        object.__setattr__(
+            self,
+            "evidence_cutoff",
+            require_utc(self.evidence_cutoff, field_name="evidence_cutoff"),
+        )
+        if self.evidence_cutoff > self.evaluation_time:
+            raise ValueError("evidence_cutoff cannot be after evaluation_time")
+
+        if not isinstance(self.provenance, Provenance):
+            raise ValueError("provenance must be a Provenance contract")
+
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != DECISION_CONTEXT_SCHEMA_VERSION_V2
+        ):
+            raise ValueError("unsupported Decision Intelligence context schema_version")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "context_id": self.context_id,
+            "candidate_id": self.candidate_id,
+            "episode_id": self.episode_id,
+            "instrument_version": self.instrument_version,
+            "snapshot_id": self.snapshot_id,
+            "snapshot_hash": self.snapshot_hash,
+            "evaluation_time": _isoformat_z(self.evaluation_time),
+            "evidence_cutoff": _isoformat_z(self.evidence_cutoff),
+            "policy_version": self.policy_version,
+            "policy_fingerprint": self.policy_fingerprint,
+            "environment": self.environment,
+            "eligibility": self.eligibility,
+            "schema_version": self.schema_version,
+            "supersedes_id": self.supersedes_id,
+            "supersession_reason": self.supersession_reason,
+            "provenance": {
+                "producing_component": self.provenance.producing_component,
+                "artifact_or_build_id": self.provenance.artifact_or_build_id,
+                "process_instance_id": self.provenance.process_instance_id,
+                "emitted_at": _isoformat_z(self.provenance.emitted_at),
+                "source_record_refs": list(self.provenance.source_record_refs),
+                "schema_version": self.provenance.schema_version,
+            },
+        }
+
+
+__all__ = [
+    "DECISION_CONTEXT_SCHEMA_VERSION",
+    "DECISION_CONTEXT_SCHEMA_VERSION_V2",
+    "DECISION_CONTEXT_V2_IDENTITY_DOMAIN",
+    "DecisionContext",
+    "DecisionContextV2",
+    "Provenance",
+]

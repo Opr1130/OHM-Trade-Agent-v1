@@ -170,7 +170,13 @@ from app.opip.decision_intelligence.events import (
     DECISION_INTELLIGENCE_TRANSITION_RECORDED,
     validate_di_payload,
 )
-from app.opip.decision_intelligence.identity import DecisionContext, Provenance
+from app.opip.decision_intelligence.identity import (
+    DECISION_CONTEXT_SCHEMA_VERSION,
+    DECISION_CONTEXT_SCHEMA_VERSION_V2,
+    DecisionContext,
+    DecisionContextV2,
+    Provenance,
+)
 from app.opip.decision_intelligence.serialization import canonicalize_nested
 
 #: Every Decision Intelligence event type shares this stream namespace.
@@ -213,12 +219,23 @@ _RECORD_TYPES_BY_EVENT: Mapping[str, type] = MappingProxyType(
 _IDENTITY_FIELDS: Mapping[type, str] = MappingProxyType(
     {
         DecisionContext: "context_id",
+        DecisionContextV2: "context_id",
         CommitteeRequest: "request_id",
         CommitteeRequestTransition: "transition_id",
         CommitteeRoleResult: "result_id",
         CommitteeAssessmentSummary: "assessment_id",
         ModelInvocation: "invocation_id",
         ComparisonRecord: "comparison_id",
+    }
+)
+
+#: Context schema version to its contract, for version-aware reconstruction.
+#: Reconstructing a v2 context as v1 (or the reverse) would silently reinterpret
+#: committed evidence, so the version selects the contract explicitly.
+_CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION: Mapping[int, type] = MappingProxyType(
+    {
+        DECISION_CONTEXT_SCHEMA_VERSION: DecisionContext,
+        DECISION_CONTEXT_SCHEMA_VERSION_V2: DecisionContextV2,
     }
 )
 
@@ -255,6 +272,7 @@ _WATERMARK_FIELDS = frozenset({"consumed_input_watermark", "as_of_watermark"})
 
 _SNAPSHOT_MAPPING_FIELDS = (
     "contexts",
+    "contexts_v2",
     "requests",
     "transitions",
     "transition_history",
@@ -434,6 +452,7 @@ class DIEvidenceSnapshot:
     events: tuple[DIEvidenceEvent, ...]
     unknown_events: tuple[UnknownDIEvidenceEvent, ...]
     contexts: Mapping[str, DecisionContext]
+    contexts_v2: Mapping[str, DecisionContextV2]
     requests: Mapping[str, CommitteeRequest]
     transitions: Mapping[str, CommitteeRequestTransition]
     transition_history: Mapping[str, tuple[CommitteeRequestTransition, ...]]
@@ -810,7 +829,11 @@ def _reconstruct(
     rows: tuple[sqlite3.Row, ...],
 ) -> DIEvidenceSnapshot:
     by_type: dict[type, dict[str, Any]] = {
-        record_type: {} for record_type in _RECORD_TYPES_BY_EVENT.values()
+        record_type: {}
+        for record_type in (
+            *_RECORD_TYPES_BY_EVENT.values(),
+            DecisionContextV2,
+        )
     }
     events: list[DIEvidenceEvent] = []
     unknown_events: list[UnknownDIEvidenceEvent] = []
@@ -857,6 +880,22 @@ def _reconstruct(
             event_type=event_type,
             payload_json=str(row["payload_json"]),
         )
+        if record_type is DecisionContext:
+            # A context payload declares its own schema version. Rebuilding a v2
+            # context as v1 (or the reverse) would silently reinterpret committed
+            # evidence, so the version selects the contract explicitly and an
+            # unsupported version fails closed.
+            context_type = _CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION.get(
+                payload.get("schema_version")
+            )
+            if context_type is None:
+                raise DIIncompatibleSchemaError(
+                    f"decision context payload schema_version="
+                    f"{payload.get('schema_version')!r} for event {event_id} is "
+                    "not interpretable by this build "
+                    f"(supported {sorted(_CONTEXT_RECORD_TYPES_BY_SCHEMA_VERSION)})"
+                )
+            record_type = context_type
         record = _hydrate_record(
             event_id=event_id,
             event_type=event_type,
@@ -894,6 +933,7 @@ def _reconstruct(
             transitions_by_request.setdefault(record.request_id, []).append(record)
 
     contexts = by_type[DecisionContext]
+    contexts_v2 = by_type[DecisionContextV2]
     requests = by_type[CommitteeRequest]
 
     # Fail closed on impossible known-record relationships, frozen-manifest
@@ -929,6 +969,7 @@ def _reconstruct(
         events=tuple(events),
         unknown_events=tuple(unknown_events),
         contexts=dict(contexts),
+        contexts_v2=dict(contexts_v2),
         requests=dict(requests),
         transitions=dict(by_type[CommitteeRequestTransition]),
         transition_history={
@@ -1016,6 +1057,7 @@ def _reconstruct_lifecycles(
 _SUPERSESSION_OWNERSHIP_FIELDS: Mapping[type, tuple[str, ...]] = MappingProxyType(
     {
         DecisionContext: (),
+        DecisionContextV2: (),
         CommitteeRequest: ("context_id",),
         ModelInvocation: ("request_id",),
         CommitteeRoleResult: ("request_id",),
