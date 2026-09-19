@@ -131,9 +131,10 @@ _EVENT_PAYLOADS_BY_TYPE_SQL = (
     "ORDER BY history_epoch ASC, local_sequence ASC"
 )
 
-#: Execution states from which an attempt can still receive fills, and the
-#: terminal states from which it cannot. Terminal attempts release the unfilled
-#: remainder of their order, because no later fill can ever consume it.
+#: Execution states from which an attempt can still receive fills. This is the
+#: single definition of "fill-capable": fill validation and the exit-capacity
+#: projection both use it, so a live attempt cannot be forgotten by one while the
+#: other still honours it.
 _FILLABLE_EXECUTION_STATES = frozenset(
     {
         ExecutionState.ACCEPTED,
@@ -142,19 +143,14 @@ _FILLABLE_EXECUTION_STATES = frozenset(
         ExecutionState.FILLED,
     }
 )
-_TERMINAL_EXECUTION_STATES = frozenset(
-    {
-        ExecutionState.REJECTED,
-        ExecutionState.CANCELLED,
-        ExecutionState.EXPIRED,
-    }
-)
 
 #: Numeric tolerance for canonical Paper v2 quantity/price comparisons.
 _QUANTITY_TOLERANCE = 1e-9
 
-#: String values of the terminal execution states, for payload-level checks.
-_TERMINAL_STATE_VALUES = frozenset(state.value for state in _TERMINAL_EXECUTION_STATES)
+#: String values of the fill-capable execution states. The single definition of
+#: "this attempt can still receive fills", used both by fill validation and by the
+#: exit-capacity projection, so the two cannot drift apart.
+_FILLABLE_STATE_VALUES = frozenset(state.value for state in _FILLABLE_EXECUTION_STATES)
 
 #: Same idempotency key + different semantic payload is integrity corruption.
 #: Feature snapshots and rolling-state checkpoints are included after redacting
@@ -2277,12 +2273,7 @@ class CanonicalWriter:
             admission = self._admission_for_reservation(str(order["reservation_id"]))
             context = self._load_context_by_id(str(order["decision_context_id"]))
             state = ExecutionState(str(payload["execution_state"]))
-            fillable_states = {
-                ExecutionState.ACCEPTED,
-                ExecutionState.WORKING,
-                ExecutionState.PARTIALLY_FILLED,
-                ExecutionState.FILLED,
-            }
+            fillable_states = _FILLABLE_EXECUTION_STATES
             accepted_quantity = payload.get("accepted_quantity")
             if state in fillable_states:
                 if not isinstance(accepted_quantity, (int, float)) or isinstance(
@@ -2349,12 +2340,7 @@ class CanonicalWriter:
             raise ValueError("fill side does not match order intent")
 
         attempt_state = ExecutionState(str(attempt["execution_state"]))
-        fillable_states = {
-            ExecutionState.ACCEPTED,
-            ExecutionState.WORKING,
-            ExecutionState.PARTIALLY_FILLED,
-            ExecutionState.FILLED,
-        }
+        fillable_states = _FILLABLE_EXECUTION_STATES
         if attempt_state not in fillable_states:
             raise ValueError("fill cannot reference a non-fillable execution attempt")
         # Fills are sequenced within their parent execution attempt, which is the
@@ -2581,13 +2567,21 @@ class CanonicalWriter:
         protection EXIT must not claim them again or two pending exits could later
         both fill and over-close the trade.
 
-        An order is treated as dead once its latest attempt is terminal
-        (REJECTED/CANCELLED/EXPIRED): the producer has declared the order finished,
-        so its unfilled remainder stops counting here. Otherwise a failed exit
-        would permanently shrink ``available_exit_quantity`` and block a legitimate
-        replacement protection exit. Already-filled quantity is untouched: it is
-        canonical history and still reduces exposure through the fill-derived
-        totals.
+        An order is treated as dead only when it has at least one committed attempt
+        and *none* of them can still receive a fill. A higher ``attempt_seq`` does
+        not supersede an older attempt - B/C-1 freezes no supersession semantics,
+        and fill validation accepts a fill against any fill-capable attempt - so an
+        earlier WORKING or PARTIALLY_FILLED attempt keeps the unfilled remainder
+        reserved even when a later attempt was rejected, cancelled or expired.
+        Without that rule a live attempt could still fill while a replacement EXIT
+        claimed the same exposure.
+
+        Once every attempt for the order is non-fillable, the unfilled remainder is
+        provably dead and stops counting, so a failed exit no longer permanently
+        shrinks ``available_exit_quantity``. An order with no attempt yet is still a
+        live claim: it was committed precisely to consume that capacity.
+        Already-filled quantity is untouched either way: it is canonical history
+        and still reduces exposure through the fill-derived totals.
         """
         roles = self._order_role_by_id()
         filled_by_order: dict[str, float] = {}
@@ -2601,16 +2595,19 @@ class CanonicalWriter:
                 fill["quantity"]
             )
 
-        # Latest attempt per order, by canonical attempt sequence.
-        latest_attempt: dict[str, tuple[int, str]] = {}
+        # Committed attempts per order. An order is dead only when it has at least
+        # one attempt and *none* of them can still receive a fill. A higher
+        # attempt_seq does not supersede an older one: B/C-1 freezes no such
+        # semantics, and fill validation accepts fills against any fill-capable
+        # attempt, so an earlier WORKING attempt is still live evidence even if a
+        # later attempt was rejected.
+        attempts_by_order: dict[str, list[str]] = {}
         for attempt in self._committed_paper_rows(PAPER_EXECUTION_ATTEMPT_RECORDED):
             if attempt.get("paper_trade_id") != paper_trade_id:
                 continue
-            order_id = str(attempt["order_intent_id"])
-            candidate = (int(attempt["attempt_seq"]), str(attempt["execution_state"]))
-            current = latest_attempt.get(order_id)
-            if current is None or candidate[0] > current[0]:
-                latest_attempt[order_id] = candidate
+            attempts_by_order.setdefault(str(attempt["order_intent_id"]), []).append(
+                str(attempt["execution_state"])
+            )
 
         outstanding = 0.0
         for order in self._committed_paper_rows(PAPER_ORDER_INTENT_RECORDED):
@@ -2619,8 +2616,12 @@ class CanonicalWriter:
             if str(order["intent_role"]) != "EXIT":
                 continue
             order_id = str(order["order_intent_id"])
-            latest = latest_attempt.get(order_id)
-            if latest is not None and latest[1] in _TERMINAL_STATE_VALUES:
+            states = attempts_by_order.get(order_id)
+            # An order with no attempt yet is still a live claim against exit
+            # capacity: it was committed precisely to consume that capacity.
+            if states and not any(
+                state in _FILLABLE_STATE_VALUES for state in states
+            ):
                 continue
             unfilled = float(order["requested_quantity"]) - filled_by_order.get(
                 order_id, 0.0

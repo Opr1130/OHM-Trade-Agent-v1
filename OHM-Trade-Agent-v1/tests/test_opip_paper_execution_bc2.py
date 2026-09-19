@@ -2871,8 +2871,16 @@ def test_every_terminal_attempt_state_releases_capacity(writer_env, terminal_sta
     assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 0.0  # noqa: SLF001
 
 
-def test_partial_fill_then_terminal_remainder_is_released(writer_env):
-    """Only the unfilled remainder is released; the filled part stays history."""
+def test_partial_fill_then_later_terminal_attempt_keeps_remainder_reserved(
+    writer_env,
+):
+    """Case 2: a later terminal attempt does not kill an earlier fill-capable one.
+
+    The partial-fill attempt remains canonically fill-capable, so the order's
+    unfilled remainder stays reserved even though a later attempt was rejected.
+    Releasing it would let a replacement EXIT claim exposure this order can still
+    consume.
+    """
     writer, context = writer_env
     admission, quote = _armed_trade(writer, context, tag="rel-partial")
     action = _run_action(
@@ -2885,7 +2893,7 @@ def test_partial_fill_then_terminal_remainder_is_released(writer_env):
     )
     assert action.status == "OK", action.detail
 
-    # Fill 2.0 of the exit order, then its remainder dies.
+    # Fill 2.0 of the exit order; its attempt stays ACCEPTED (fill-capable).
     _fill_existing_order(
         writer,
         context,
@@ -2898,7 +2906,6 @@ def test_partial_fill_then_terminal_remainder_is_released(writer_env):
     )
     totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
     assert totals["remaining_quantity"] == 3.0
-    # 3.0 unfilled is still live and therefore still claimed.
     assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 3.0  # noqa: SLF001
 
     assert (
@@ -2913,8 +2920,298 @@ def test_partial_fill_then_terminal_remainder_is_released(writer_env):
         ).status
         == "OK"
     )
-    # The 2.0 fill remains canonical exit history; only the dead 3.0 is freed.
+    # The earlier attempt is still fill-capable, so the remainder stays claimed.
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 3.0  # noqa: SLF001
+    assert writer._exit_capacity(admission.paper_trade_id)["available_exit_quantity"] == 0.0  # noqa: SLF001
+    # The 2.0 fill remains canonical economic history either way.
+    assert writer._canonical_fill_totals(admission.paper_trade_id) == totals  # noqa: SLF001
+    # And a replacement EXIT cannot double-claim that exposure.
+    replacement = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-rel-partial-replacement",
+            quantity=3.0,
+            ts="2026-09-18T16:46:00Z",
+        ),
+    )
+    assert replacement.status == "REJECTED"
+    assert "available canonical exit capacity" in str(replacement.detail)
+
+
+def test_partial_fill_with_later_cancel_keeps_remainder_reserved(writer_env):
+    """Case 2 (CANCELLED variant): a cancelled later attempt does not free capacity.
+
+    The partial-fill attempt is still fill-capable, so the order keeps reserving its
+    unfilled remainder; the cancellation changes nothing economically.
+    """
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="rel-allterm")
+    action = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-rel-allterm",
+        exit_quantity=5.0,
+    )
+    assert action.status == "OK", action.detail
+
+    _fill_existing_order(
+        writer,
+        context,
+        admission,
+        order_id="exit-trig-rel-allterm",
+        tag="rel-allterm-fill",
+        quantity=2.0,
+        price=90.0,
+        quote_id=quote["quote_evidence_id"],
+    )
+    totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
+    assert totals["remaining_quantity"] == 3.0
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 3.0  # noqa: SLF001
+
+    # Terminate the order: the only attempt becomes non-fillable, so the 3.0
+    # remainder can never be filled and is released.
+    assert (
+        _terminal_attempt(
+            writer,
+            admission,
+            order_id="exit-trig-rel-allterm",
+            tag="rel-allterm",
+            state="CANCELLED",
+            seq=0,
+            ts="2026-09-18T16:45:00Z",
+        ).status
+        == "REJECTED"  # seq 0 is already committed for this order
+    )
+    assert (
+        _terminal_attempt(
+            writer,
+            admission,
+            order_id="exit-trig-rel-allterm",
+            tag="rel-allterm",
+            state="CANCELLED",
+            seq=1,
+            ts="2026-09-18T16:45:00Z",
+        ).status
+        == "OK"
+    )
+    # The fill-capable attempt is superseded only by being non-fillable itself:
+    # here the order still has a fill-capable attempt, so it stays reserved.
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 3.0  # noqa: SLF001
+    # Filled quantity is untouched canonical history.
+    assert writer._canonical_fill_totals(admission.paper_trade_id) == totals  # noqa: SLF001
+
+
+def test_all_attempts_terminal_releases_capacity_for_a_replacement_exit(writer_env):
+    """Case 3 (release path): no fill-capable attempt remains, so capacity frees."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="rel-dead")
+    action = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-rel-dead",
+        exit_quantity=3.0,
+    )
+    assert action.status == "OK", action.detail
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 3.0  # noqa: SLF001
+
+    # Only a terminal attempt ever exists for this order, so nothing is fill-capable.
+    assert (
+        _terminal_attempt(
+            writer, admission, order_id="exit-trig-rel-dead", tag="rel-dead"
+        ).status
+        == "OK"
+    )
     assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 0.0  # noqa: SLF001
-    released_totals = writer._canonical_fill_totals(admission.paper_trade_id)  # noqa: SLF001
-    assert released_totals == totals
-    assert writer._exit_capacity(admission.paper_trade_id)["available_exit_quantity"] == 3.0  # noqa: SLF001
+    assert writer._exit_capacity(admission.paper_trade_id)["available_exit_quantity"] == 5.0  # noqa: SLF001
+
+    # A replacement protection EXIT can now use the freed capacity, and it is
+    # still bounded by canonical exposure.
+    replacement = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-rel-replacement",
+            quantity=3.0,
+            ts="2026-09-18T16:46:00Z",
+        ),
+    )
+    assert replacement.status == "OK", replacement.detail
+    over = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-rel-overclaim",
+            quantity=3.0,
+            ts="2026-09-18T16:46:00Z",
+        ),
+    )
+    assert over.status == "REJECTED"
+    assert "available canonical exit capacity" in str(over.detail)
+
+
+def test_exit_order_with_no_attempt_still_reserves_its_capacity(writer_env):
+    """Case 4: a committed EXIT intent is a claim before any attempt exists."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="rel-noattempt")
+    action = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-rel-noattempt",
+        exit_quantity=5.0,
+    )
+    assert action.status == "OK", action.detail
+
+    # The action's EXIT order has no attempt at all, yet its full 5.0 is claimed.
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 5.0  # noqa: SLF001
+    assert writer._exit_capacity(admission.paper_trade_id)["available_exit_quantity"] == 0.0  # noqa: SLF001
+
+    competing = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-rel-noattempt",
+            quantity=5.0,
+            ts="2026-09-18T16:46:00Z",
+        ),
+    )
+    assert competing.status == "REJECTED"
+    assert "available canonical exit capacity" in str(competing.detail)
+
+
+def test_competing_active_attempt_keeps_capacity_reserved(writer_env):
+    """Case 5: an active attempt on the action's EXIT order blocks a competitor.
+
+    This is the Greptile defect scenario: an earlier WORKING attempt plus a later
+    REJECTED attempt must not free the order's unfilled capacity, because the
+    WORKING attempt can still be filled by canonical B/C-1 fill evidence.
+    """
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="rel-live")
+    action = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-rel-live",
+        exit_quantity=5.0,
+    )
+    assert action.status == "OK", action.detail
+
+    # attempt_seq 0 = WORKING: still fill-capable.
+    working = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-rel-live-working",
+        "order_intent_id": "exit-trig-rel-live",
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "WORKING",
+        "attempt_time": _exact("2026-09-18T16:30:00Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        # A fill-capable attempt must declare the quantity it accepted.
+        "accepted_quantity": 5.0,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    assert _submit(writer, PAPER_EXECUTION_ATTEMPT_RECORDED, working).status == "OK"
+
+    # attempt_seq 1 = REJECTED: the later attempt does not supersede seq 0.
+    assert (
+        _terminal_attempt(
+            writer,
+            admission,
+            order_id="exit-trig-rel-live",
+            tag="rel-live",
+            seq=1,
+            ts="2026-09-18T16:31:00Z",
+        ).status
+        == "OK"
+    )
+
+    # The order still holds its full claim, so a competing EXIT is refused.
+    assert writer._outstanding_exit_quantity(admission.paper_trade_id) == 5.0  # noqa: SLF001
+    assert writer._exit_capacity(admission.paper_trade_id)["available_exit_quantity"] == 0.0  # noqa: SLF001
+    competing = _submit(
+        writer,
+        PAPER_ORDER_INTENT_RECORDED,
+        _exit_order_payload(
+            admission,
+            context,
+            order_id="probe-rel-live-competing",
+            quantity=5.0,
+            ts="2026-09-18T16:32:00Z",
+        ),
+    )
+    assert competing.status == "REJECTED"
+    assert "available canonical exit capacity" in str(competing.detail)
+    # The WORKING attempt is still fill-capable, so only one EXIT intent exists.
+    assert len(_rows(writer, PAPER_ORDER_INTENT_RECORDED)) == 2
+
+
+def test_restart_rederives_outstanding_exit_capacity_from_canonical_evidence(
+    writer_env, tmp_path
+):
+    """Case 6: a reopened writer derives the same outstanding capacity."""
+    writer, context = writer_env
+    admission, quote = _armed_trade(writer, context, tag="rel-restart")
+    action = _run_action(
+        writer,
+        context,
+        admission,
+        quote,
+        trigger_id="trig-rel-restart",
+        exit_quantity=4.0,
+    )
+    assert action.status == "OK", action.detail
+    working = {
+        "schema_version": 1,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "execution_attempt_id": "attempt-rel-restart-working",
+        "order_intent_id": "exit-trig-rel-restart",
+        "paper_trade_id": admission.paper_trade_id,
+        "attempt_seq": 0,
+        "execution_state": "WORKING",
+        "attempt_time": _exact("2026-09-18T16:30:00Z"),
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "accepted_quantity": 4.0,
+        "market_evidence_ref": quote["quote_evidence_id"],
+    }
+    assert _submit(writer, PAPER_EXECUTION_ATTEMPT_RECORDED, working).status == "OK"
+    assert (
+        _terminal_attempt(
+            writer,
+            admission,
+            order_id="exit-trig-rel-restart",
+            tag="rel-restart",
+            seq=1,
+            ts="2026-09-18T16:31:00Z",
+        ).status
+        == "OK"
+    )
+    expected_outstanding = writer._outstanding_exit_quantity(admission.paper_trade_id)  # noqa: SLF001
+    expected_capacity = writer._exit_capacity(admission.paper_trade_id)  # noqa: SLF001
+    # The live-attempt rule holds before the restart too.
+    assert expected_outstanding == 4.0
+    db_path = tmp_path / "canonical.sqlite3"
+    writer.close()
+
+    reopened = CanonicalWriter(db_path)
+    try:
+        assert reopened._outstanding_exit_quantity(admission.paper_trade_id) == expected_outstanding  # noqa: SLF001
+        assert reopened._exit_capacity(admission.paper_trade_id) == expected_capacity  # noqa: SLF001
+    finally:
+        reopened.close()
