@@ -643,10 +643,11 @@ def test_concurrent_first_use_yields_one_identifier_per_process(monkeypatch):
 
     import app.opip.contracts.process_identity as module
 
-    # A PID with no existing entry forces a genuine first-use race.
+    # A PID with no existing entry forces a genuine first-use race, and the holder
+    # itself is cleared so the race covers holder publication too.
     fake_pid = 987_654_321
     monkeypatch.setattr(os, "getpid", lambda: fake_pid)
-    module._identity_registry().pop(fake_pid, None)  # noqa: SLF001 - test-only reset
+    monkeypatch.delitem(module._process_holder()["identities"], fake_pid, raising=False)  # noqa: SLF001
 
     thread_count = 32
     barrier = threading.Barrier(thread_count)

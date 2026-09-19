@@ -443,6 +443,26 @@ def _paper_v2_qualification_time() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _paper_v2_cutover_ready(settings) -> tuple[bool, str]:
+    """Whether Paper v2 may become the sole new-entry authority right now.
+
+    Selecting the mode is a request, not a grant. The cutover only proceeds once
+    both legacy paper engines are provably drained, because otherwise the scan would
+    silence the engines that still have obligations to manage. An unreadable legacy
+    state blocks the cutover rather than assuming it is empty.
+    """
+    try:
+        from app.services.paper_v2_cutover_readiness import evaluate_legacy_drain
+
+        equity = float(getattr(settings, "paper_trade_starting_equity", 0.0) or 0.0)
+        if equity <= 0:
+            return False, "legacy drain cannot be evaluated without paper equity"
+        drain = evaluate_legacy_drain(starting_equity=equity)
+    except Exception as exc:  # noqa: BLE001 - unreadable state must block cutover
+        return False, f"legacy drain unavailable: {type(exc).__name__}: {exc}"
+    return drain.ready, drain.reason
+
+
 def _route_paper_v2_opportunities(
     ranked_opportunities,
     *,
@@ -498,6 +518,7 @@ def _print_paper_v2_summary(summary) -> None:
     print("Paper v2 capacity rejected:", summary.capacity_rejected)
     print("Paper v2 SHORT unsupported:", summary.short_unsupported)
     print("Paper v2 WAIT not executable:", summary.wait_not_executable)
+    print("Paper v2 no-fill terminal (released):", summary.no_fill_terminal)
     print("Paper v2 handoff failures:", summary.handoff_failures)
     print("Paper v2 operational failures:", summary.operational_failures)
     print("Legacy paper authorities invoked:", summary.legacy_calls)
@@ -1949,6 +1970,16 @@ def main():
     if paper_v2:
         # Exclusive authority: O'Pip Paper v2 only. Neither legacy paper authority
         # is invoked, and no failure path below can reach one.
+        cutover_ready, cutover_reason = _paper_v2_cutover_ready(settings)
+        if not cutover_ready:
+            # Cutover requested but not safe: no new Paper-v2 entry, no new legacy
+            # entry either, and no fallback. Existing legacy obligations keep being
+            # managed by their own engine through its normal lifecycle.
+            print("===== PAPER V2 CUTOVER BLOCKED =====")
+            print("Legacy drain status:", cutover_reason)
+            print("Paper v2 new entries: 0 (draining)")
+            paper_v2 = False
+    if paper_v2:
         paper_v2_summary = _route_paper_v2_opportunities(
             ranked_opportunities,
             scan=scan,

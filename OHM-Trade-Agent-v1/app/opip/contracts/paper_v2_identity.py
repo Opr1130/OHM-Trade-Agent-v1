@@ -41,6 +41,20 @@ ENTRY_STAGE_SEQ = 0
 #: Protection plan sequence for the initial immutable plan.
 INITIAL_PROTECTION_PLAN_SEQ = 0
 
+#: Protection plan identity domain. Reproduces the producer's existing ``PPLAN``
+#: derivation, so plans committed before this module existed still resolve.
+PROTECTION_PLAN_ID_PREFIX = "PPLAN"
+
+
+def paper_v2_protection_plan_id(
+    paper_trade_id: str, *, plan_seq: int = INITIAL_PROTECTION_PLAN_SEQ
+) -> str:
+    """Canonical immutable protection-plan identity for one trade and sequence."""
+    return stable_hash(
+        PROTECTION_PLAN_ID_PREFIX,
+        {"paper_trade_id": str(paper_trade_id), "plan_seq": int(plan_seq)},
+    )
+
 
 def paper_v2_entry_order_intent_id(paper_trade_id: str) -> str:
     """Canonical ENTRY order-intent identity for one paper trade."""
@@ -116,11 +130,13 @@ __all__ = [
     "FILL_PREFIX",
     "INITIAL_PROTECTION_PLAN_SEQ",
     "NO_FILL_RECONCILIATION_PREFIX",
+    "PROTECTION_PLAN_ID_PREFIX",
     "QUOTE_EVIDENCE_PREFIX",
     "paper_v2_entry_attempt_id",
     "paper_v2_entry_fill_id",
     "paper_v2_entry_order_intent_id",
     "paper_v2_no_fill_reconciliation_id",
+    "paper_v2_protection_plan_id",
     "paper_v2_quote_evidence_id",
     "paper_v2_stage_payload_identity",
 ]

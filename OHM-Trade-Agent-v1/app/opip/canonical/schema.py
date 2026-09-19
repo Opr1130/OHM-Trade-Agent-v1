@@ -80,6 +80,22 @@ CREATE TABLE IF NOT EXISTS alert_ops_handoffs (
 CREATE INDEX IF NOT EXISTS idx_handoffs_pending
     ON alert_ops_handoffs(status)
     WHERE status = 'PENDING';
+
+-- Additive lookup indexes for Paper-v2 execution reads.
+--
+-- ``paper_v2_execution_state`` must answer "where is this trade" without scanning
+-- all historical paper events, because restart cost would otherwise grow with
+-- total history while the writer lock is held. Paper event payloads carry their
+-- ``paper_trade_id`` inside ``payload_json``, so a plain column index cannot serve
+-- a per-trade query. These two indexes are additive (``IF NOT EXISTS``, no table
+-- or column change), so an existing database opens unchanged and simply gains them
+-- on the next schema initialisation.
+CREATE INDEX IF NOT EXISTS idx_events_event_type
+    ON events(event_type);
+
+CREATE INDEX IF NOT EXISTS idx_events_paper_trade
+    ON events(json_extract(payload_json, '$.paper_trade_id'))
+    WHERE json_extract(payload_json, '$.paper_trade_id') IS NOT NULL;
 """
 
 

@@ -25,6 +25,7 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_FILL_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
     PAPER_PROTECTION_PLAN_RECORDED,
+    PAPER_RECONCILIATION_RECORDED,
 )
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_QUOTE_EVIDENCE_RECORDED,
@@ -410,11 +411,23 @@ def test_new_producer_instance_after_full_commit_resumes_without_duplication(tmp
         reopened.stop()
 
 
-def test_restart_after_admission_only_continues_from_canonical_evidence(env, monkeypatch):
-    """A failure after admission must resume, not re-admit with a new version."""
+def test_pre_attempt_quote_failure_terminalizes_and_releases(env, monkeypatch):
+    """A failure before any attempt ends the trade instead of leaking its reservation.
+
+    CONTRACT CHANGE (PR #255 remediation): this test previously asserted that a
+    quote-stage failure left the trade resumable and that a later call would complete
+    it. That encoded the reservation leak the ARB flagged: admission had already
+    reserved capital and a slot, and a pre-attempt failure left both held forever
+    because nothing terminal ever followed.
+
+    The corrected contract is that a provably pre-exposure failure ends in a truthful
+    zero-fill FINAL_VERIFIED reconciliation, which releases the reservation. A retry
+    therefore does not continue this trade - it would be a new opportunity with a new
+    disposition. Post-attempt resumption is covered separately (an accepted attempt
+    can still fill, so it is resumed rather than released).
+    """
     server, client = env
 
-    # First run fails at the quote stage, after admission has committed.
     with pytest.raises(PaperV2ExecutionError, match="quote unavailable"):
         _run(env, kraken=_kraken(error=KrakenTransportError("down")))
 
@@ -424,13 +437,21 @@ def test_restart_after_admission_only_continues_from_canonical_evidence(env, mon
     assert len(_rows(writer, PAPER_ORDER_INTENT_RECORDED)) == 1
     assert _rows(writer, PAPER_EXECUTION_ATTEMPT_RECORDED) == []
     assert _rows(writer, PAPER_FILL_RECORDED) == []
+    # No exposure, and the reservation is released rather than leaked.
+    reconciliation = _rows(writer, PAPER_RECONCILIATION_RECORDED)
+    assert len(reconciliation) == 1
+    assert reconciliation[0]["terminal_reconciliation_state"] == "FINAL_VERIFIED"
+    assert reconciliation[0]["remaining_quantity"] == 0.0
+    assert writer.paper_portfolio_state("USD").active_reservations == 0
+    assert writer.paper_portfolio_state("USD").reserved_capital == 0.0
 
-    # Second run resumes: same trade, no second admission, completes the rest.
-    result = _run(env)
-    assert result.status == "EXECUTED"
-    assert writer.paper_portfolio_state("USD").portfolio_version == 1
-    assert len(_rows(writer, PAPER_ORDER_INTENT_RECORDED)) == 1
-    assert len(_rows(writer, PAPER_FILL_RECORDED)) == 1
+    # A retry returns the existing terminal result idempotently; it must not reopen
+    # the trade or add execution evidence to a FINAL_VERIFIED record.
+    retry = _run(env)
+    assert retry.status == "NO_FILL_TERMINAL"
+    assert _rows(writer, PAPER_FILL_RECORDED) == []
+    assert len(_rows(writer, PAPER_RECONCILIATION_RECORDED)) == 1
+    assert writer.paper_portfolio_state("USD").active_reservations == 0
 
 
 def test_progress_seam_reports_committed_stages(env):
@@ -536,7 +557,7 @@ def _fill_portfolio(env, *, count: int):
         _run(
             env,
             _opportunity(
-                snapshot_at=NOW + timedelta(seconds=index),
+                snapshot_at=NOW - timedelta(seconds=60 + index),
                 candidate_id=f"filler-c-{index}",
             ),
         )
@@ -554,7 +575,7 @@ def test_capacity_rejection_stops_the_opportunity_without_fallback(env):
     result = _run(
         env,
         _opportunity(
-            snapshot_at=NOW + timedelta(seconds=100), candidate_id="c-over"
+            snapshot_at=NOW - timedelta(seconds=100), candidate_id="c-over"
         ),
     )
     assert result.status == "CAPACITY_REJECTED"
@@ -568,7 +589,7 @@ def test_capital_rejection_stops_the_opportunity(env):
     result = _run(
         env,
         _opportunity(
-            snapshot_at=NOW + timedelta(seconds=200),
+            snapshot_at=NOW - timedelta(seconds=200),
             candidate_id="c-big",
             requested_capital=10_001.0,
             requested_reservation_amount=10_001.0,
@@ -745,7 +766,7 @@ def test_portfolio_state_is_reread_for_each_opportunity(env):
     _run(
         env,
         _opportunity(
-            snapshot_at=NOW + timedelta(seconds=1), candidate_id="c-b"
+            snapshot_at=NOW - timedelta(seconds=1), candidate_id="c-b"
         ),
     )
 
@@ -760,7 +781,7 @@ def test_usd_and_usdt_remain_independent(env):
     _run(
         env,
         _opportunity(
-            snapshot_at=NOW + timedelta(seconds=1),
+            snapshot_at=NOW - timedelta(seconds=1),
             candidate_id="c-usdt",
             quote_currency="USDT",
             # The instrument identity must stay coherent with the registered

@@ -74,7 +74,12 @@ class _EchoTransport:
 
     def request(self, endpoint, params, timeout_seconds):
         self._requests.append((endpoint, params.get("symbol")))
-        ts = QUOTE_PUBLISHED_AT.isoformat()
+        # Published just before the read returns, relative to real time. The scan's
+        # decision boundary comes from the real wall clock (``main`` reads it), so the
+        # book must be contemporaneous with it rather than pinned to a fixture time.
+        ts = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).replace(microsecond=0).isoformat()
         return {
             "symbol": params.get("symbol"),
             "bids": [{"price": 99.9, "qty": 10.0, "publication_ts": ts}],
@@ -321,12 +326,6 @@ def _isolated_scan_persistence(monkeypatch, tmp_path):
     to paper-authority routing.
     """
     _isolate_scan_persistence(monkeypatch, tmp_path)
-    # The producer validates market-data freshness against this clock, which is
-    # real wall-clock time in production. Freeze it so the fixture book's fixed
-    # source timestamp is deterministic.
-    monkeypatch.setattr(
-        "app.services.paper_v2_scan_router.system_utc_clock", lambda: EXECUTION_NOW
-    )
 
 
 def _install_scan(
@@ -339,11 +338,34 @@ def _install_scan(
     ranked_override=None,
     universe=None,
     router_recorder=None,
+    drain=None,
 ):
-    """Drive the real ``main()`` with only the outer seams stubbed."""
+    """Drive the real ``main()`` with only the outer seams stubbed.
+
+    ``drain`` is the cutover-readiness verdict the scan should observe. ``None``
+    means "legacy is drained", which is the state an active-mode test needs; a
+    verdict string lets a test assert the blocked path.
+    """
     calls = _Calls()
     snapshot = snapshot or _snapshot(direction=direction)
     settings = _Settings(paper_v2_mode=mode)
+
+    if drain is not None:
+        # Stub the legacy-drain evaluation, not the interlock: the scan's decision
+        # logic under test is unchanged, only its view of legacy state.
+        monkeypatch.setattr(
+            scan_opportunities,
+            "_paper_v2_cutover_ready",
+            lambda _settings: (False, drain),
+        )
+    elif mode == "active":
+        # Active-mode tests are about routing, not legacy drain, so legacy is
+        # reported drained. The blocked path is covered by its own tests.
+        monkeypatch.setattr(
+            scan_opportunities,
+            "_paper_v2_cutover_ready",
+            lambda _settings: (True, "drained"),
+        )
 
     monkeypatch.setattr(scan_opportunities, "get_settings", lambda: settings)
     monkeypatch.setattr(

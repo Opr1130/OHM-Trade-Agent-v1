@@ -99,6 +99,63 @@ def ensure_bridge_files(
         shared_file.chmod(0o644)
 
 
+def outstanding_admitted_signals(
+    *,
+    signals_file: Path = SIGNALS_FILE,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Legacy signals admitted but not yet an open worker position.
+
+    Read-only seam over the same bridge state and the same predicate the admission
+    path uses (``admission_status == ADMITTED``, not already an active worker
+    signal, and not expired). Exists so a cutover check can ask "does any legacy
+    obligation still need the legacy engine?" without mutating anything - the
+    equivalent scan previously lived only inside ``publish_qualified_long``, which
+    is a mutating admission path and unsuitable for a readiness read.
+
+    ``now`` defaults to the current utc instant. An unreadable signal file raises
+    rather than reading as empty, so a caller cannot mistake "unknown" for "drained".
+    """
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    signals_file.parent.mkdir(parents=True, exist_ok=True)
+    lock = signals_file.parent / f".{signals_file.name}.lock"
+    with registry_lock(lock):
+        payload = load_json(signals_file)
+    rows = payload.get("signals") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+
+    try:
+        from app.services.freqtrade_result_ingest import freqtrade_dry_run_status
+
+        authoritative = freqtrade_dry_run_status()
+    except Exception as exc:
+        raise PaperAdmissionRejected(
+            f"AUTHORITATIVE_CAPACITY_UNAVAILABLE:{type(exc).__name__}"
+        ) from exc
+    if authoritative.get("status") != "OK":
+        raise PaperAdmissionRejected("AUTHORITATIVE_CAPACITY_UNAVAILABLE")
+    active_signal_ids = {
+        str(value) for value in (authoritative.get("active_signal_ids") or [])
+    }
+
+    outstanding: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        expiry = _parse(row.get("expires_at"))
+        if (
+            str(row.get("admission_status") or "").upper() == "ADMITTED"
+            and str(row.get("signal_id") or "") not in active_signal_ids
+            and expiry is not None
+            and expiry >= moment
+        ):
+            outstanding.append(row)
+    return outstanding
+
+
 def publish_qualified_long(
     *,
     episode_id: str,

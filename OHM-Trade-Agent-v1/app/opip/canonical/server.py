@@ -14,6 +14,7 @@ from typing import Any
 
 from app.opip.canonical.models import (
     PaperPortfolioState,
+    PaperV2ActiveExposures,
     PaperV2ExecutionState,
     WriterAck,
     WriterIntent,
@@ -256,6 +257,16 @@ class CanonicalWriterServer:
             return self.writer.paper_v2_execution_state(
                 str(request.get("disposition_id") or "")
             ).to_dict()
+        if method == "GET_PAPER_V2_ACTIVE_EXPOSURES":
+            # Read-only exposure projection, gated on health like the other reads.
+            # An unhealthy store must not return an apparently authoritative
+            # exposure set: an empty list would read as "nothing is held".
+            if self._health_status() != "OK":
+                return PaperV2ActiveExposures(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_active_exposures().to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

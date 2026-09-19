@@ -172,6 +172,92 @@ class PaperPortfolioState:
 
 
 @dataclass(frozen=True)
+class PaperV2ActiveExposure:
+    """One canonical Paper-v2 position that still has remaining exposure.
+
+    Read-only, derived only from committed canonical execution evidence. Every
+    field is canonically provable; a fact that cannot be proven is absent rather
+    than guessed. There is no reservation-only entry here: an admitted trade with
+    no fills has no exposure and is not listed.
+    """
+
+    paper_trade_id: str
+    disposition_id: str
+    symbol: str
+    quote_currency: str
+    direction: str
+    filled_quantity: float
+    exited_quantity: float
+    remaining_quantity: float
+    protection_plan_id: str | None = None
+    protection_state: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2ActiveExposure":
+        return cls(
+            paper_trade_id=str(raw["paper_trade_id"]),
+            disposition_id=str(raw["disposition_id"]),
+            symbol=str(raw["symbol"]),
+            quote_currency=str(raw["quote_currency"]),
+            direction=str(raw["direction"]),
+            filled_quantity=float(raw.get("filled_quantity") or 0.0),
+            exited_quantity=float(raw.get("exited_quantity") or 0.0),
+            remaining_quantity=float(raw.get("remaining_quantity") or 0.0),
+            protection_plan_id=(
+                str(raw["protection_plan_id"])
+                if raw.get("protection_plan_id")
+                else None
+            ),
+            protection_state=(
+                str(raw["protection_state"])
+                if raw.get("protection_state")
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PaperV2ActiveExposures:
+    """Read-only projection of every canonically active Paper-v2 exposure.
+
+    An active exposure is one whose committed execution evidence proves a positive
+    remaining quantity. A reservation with no fills is not exposure, and a fully
+    reconciled trade is no longer active. Health-gated like the other canonical
+    read projections: an unhealthy store never returns an apparently authoritative
+    exposure set.
+    """
+
+    status: str
+    exposures: list[PaperV2ActiveExposure] = field(default_factory=list)
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "exposures": [item.to_dict() for item in self.exposures],
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2ActiveExposures":
+        entries = raw.get("exposures")
+        return cls(
+            status=str(raw["status"]),
+            exposures=[
+                PaperV2ActiveExposure.from_dict(item)
+                for item in (entries if isinstance(entries, list) else [])
+            ],
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
+@dataclass(frozen=True)
 class PaperV2ExecutionState:
     """Read-only projection of one Paper-v2 trade's canonical progress.
 
@@ -190,12 +276,28 @@ class PaperV2ExecutionState:
     decision_context_id: str | None = None
     expected_portfolio_version: int | None = None
     disposition: str | None = None
+    #: The approved reservation, from the committed admission request. Needed to
+    #: write a truthful terminal reconciliation, which must state the canonical
+    #: reservation exactly.
+    requested_reservation_amount: float | None = None
     entry_order_intent_id: str | None = None
     execution_attempt_id: str | None = None
     fill_id: str | None = None
     filled_quantity: float = 0.0
     remaining_quantity: float = 0.0
     protection_plan: dict[str, Any] | None = None
+    #: Committed stage payloads, copied verbatim from canonical evidence. A restart
+    #: resumes from these instead of rebuilding a stage from mutable runtime state,
+    #: which is what keeps a committed stage immutable across a restart.
+    entry_order_intent: dict[str, Any] | None = None
+    execution_attempt: dict[str, Any] | None = None
+    quote_evidence: dict[str, Any] | None = None
+    fill: dict[str, Any] | None = None
+    terminal_reconciliation: dict[str, Any] | None = None
+    #: Whether the committed ENTRY attempt can still receive fills. A caller must
+    #: not treat a trade as safely releasable while this is true, because exposure
+    #: could still appear.
+    entry_attempt_fill_capable: bool = False
     error_code: str | None = None
     detail: str | None = None
 
@@ -232,6 +334,11 @@ class PaperV2ExecutionState:
             disposition=(
                 str(raw["disposition"]) if raw.get("disposition") else None
             ),
+            requested_reservation_amount=(
+                float(raw["requested_reservation_amount"])
+                if raw.get("requested_reservation_amount") is not None
+                else None
+            ),
             entry_order_intent_id=(
                 str(raw["entry_order_intent_id"])
                 if raw.get("entry_order_intent_id")
@@ -249,6 +356,32 @@ class PaperV2ExecutionState:
                 dict(raw["protection_plan"])
                 if isinstance(raw.get("protection_plan"), dict)
                 else None
+            ),
+            entry_order_intent=(
+                dict(raw["entry_order_intent"])
+                if isinstance(raw.get("entry_order_intent"), dict)
+                else None
+            ),
+            execution_attempt=(
+                dict(raw["execution_attempt"])
+                if isinstance(raw.get("execution_attempt"), dict)
+                else None
+            ),
+            quote_evidence=(
+                dict(raw["quote_evidence"])
+                if isinstance(raw.get("quote_evidence"), dict)
+                else None
+            ),
+            fill=(
+                dict(raw["fill"]) if isinstance(raw.get("fill"), dict) else None
+            ),
+            terminal_reconciliation=(
+                dict(raw["terminal_reconciliation"])
+                if isinstance(raw.get("terminal_reconciliation"), dict)
+                else None
+            ),
+            entry_attempt_fill_capable=bool(
+                raw.get("entry_attempt_fill_capable", False)
             ),
             error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
             detail=(str(raw["detail"]) if raw.get("detail") else None),

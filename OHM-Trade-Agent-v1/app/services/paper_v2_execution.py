@@ -59,8 +59,10 @@ from app.opip.contracts.paper_v2_identity import (
     paper_v2_entry_attempt_id,
     paper_v2_entry_fill_id,
     paper_v2_entry_order_intent_id,
+    paper_v2_no_fill_reconciliation_id,
     paper_v2_quote_evidence_id,
 )
+from app.opip.contracts.paper_economics import paper_economics_for_version
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_ECONOMIC_MODEL_VERSION,
@@ -71,6 +73,7 @@ from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_FILL_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
+    PAPER_RECONCILIATION_RECORDED,
     paper_evidence_idempotency_key,
 )
 from app.opip.contracts.paper_execution_runtime import (
@@ -394,137 +397,268 @@ def run_paper_v2_opportunity(
     reservation_id = progress.reservation_id
     _require(bool(reservation_id), "admitted trade has no canonical reservation")
 
-    # --- 4. ENTRY order intent --------------------------------------------
-    entry_order_id = paper_v2_entry_order_intent_id(paper_trade_id)
-    entry_payload = {
-        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-        "engine": ENGINE_OPIP_PAPER_V2,
-        "order_intent_id": entry_order_id,
-        "paper_trade_id": paper_trade_id,
-        "decision_context_id": context_id,
-        "intent_seq": 0,
-        "intent_role": "ENTRY",
-        "side": "BUY",
-        "order_type": "MARKET",
-        "requested_quantity": float(opportunity.requested_quantity),
-        "requested_notional": float(opportunity.requested_notional),
-        "reason_code": "PAPER_V2_ENTRY",
-        "intent_time": {
-            "precision": "EXACT",
-            "basis": "SOURCE_REPORTED",
-            "occurred_at": iso_z(moment, field_name="intent_time"),
-        },
-        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-        "reservation_id": reservation_id,
-    }
-    _submit(
-        client,
-        event_type=PAPER_ORDER_INTENT_RECORDED,
-        key=paper_evidence_idempotency_key(PAPER_ORDER_INTENT_RECORDED, entry_payload),
-        payload=entry_payload,
-        what="ENTRY order intent",
-    )
+    # From here the trade owns a reservation, so every failure below must leave
+    # canonical evidence that releases it - unless exposure can still appear.
+    try:
+        return _advance_admitted_trade(
+            opportunity,
+            client=client,
+            kraken_client=kraken_client,
+            settings=settings,
+            execution_clock=execution_clock,
+            progress=progress,
+            context_id=context_id,
+            disposition_id=disposition_id,
+            paper_trade_id=paper_trade_id,
+            reservation_id=reservation_id,
+        )
+    except _PreExposureStop as stop:
+        _terminalize_zero_fill(
+            client,
+            progress=progress,
+            reservation_id=reservation_id,
+            paper_trade_id=paper_trade_id,
+            reason=stop.reason,
+            execution_clock=execution_clock,
+        )
+        raise PaperV2ExecutionError(stop.reason) from stop
 
-    # --- 5/6. fresh public pre-trade book -> canonical quote evidence ------
-    # The freshness clock is read inside this call, after the venue response.
-    quote, received_at = _commit_quote(
+
+def _advance_admitted_trade(
+    opportunity: PaperV2Opportunity,
+    *,
+    client: Any,
+    kraken_client: Any,
+    settings: Any,
+    execution_clock: Callable[[], datetime],
+    progress: Any,
+    context_id: str,
+    disposition_id: str,
+    paper_trade_id: str,
+    reservation_id: str,
+) -> PaperV2ExecutionResult:
+    """Resume this trade from the first stage that is not yet committed.
+
+    Every stage below is reused verbatim when it is already committed. That is what
+    keeps a deterministic identity idempotent across a restart: the payload, not
+    just the key, has to match, and it only does because a committed stage is never
+    regenerated from mutable runtime state.
+    """
+    entry_order_id = paper_v2_entry_order_intent_id(paper_trade_id)
+    attempt_id = paper_v2_entry_attempt_id(entry_order_id)
+    fill_id = paper_v2_entry_fill_id(entry_order_id)
+
+    # --- 3b. an already-terminal trade is returned, never reopened ---------
+    # A zero-fill terminal record is a closed outcome. Advancing past it would try
+    # to add execution evidence to a FINAL_VERIFIED trade, which the canonical
+    # writer refuses, so the existing terminal result is returned instead. This is
+    # what makes a completed-or-closed trade a pure idempotent resume.
+    if progress.terminal_reconciliation is not None:
+        return PaperV2ExecutionResult(
+            status="NO_FILL_TERMINAL",
+            disposition_id=disposition_id,
+            paper_trade_id=paper_trade_id,
+            reservation_id=reservation_id,
+            entry_order_intent_id=progress.entry_order_intent_id,
+            protection_plan_id=(
+                str(progress.protection_plan["protection_plan_id"])
+                if isinstance(progress.protection_plan, Mapping)
+                else None
+            ),
+            detail="trade is already terminally reconciled with zero fills",
+        )
+
+    # --- 4. protection geometry, durably frozen BEFORE any exposure --------
+    # A fill reaches canonical exposure, and a crash between that fill and plan
+    # persistence would leave exposed quantity whose stop and targets existed only
+    # in process memory. The frozen B/C-2 contract already allows a plan to be
+    # recorded before it is activated, so the immutable plan is committed here -
+    # ahead of the ENTRY intent that could become a fill.
+    plan_id = _ensure_protection_plan(
         opportunity,
         client=client,
-        kraken_client=kraken_client,
+        progress=progress,
         settings=settings,
-        clock=execution_clock,
-    )
-
-    # --- 6b. the committed ask must still be an executable qualified entry -
-    # Pure validation against already-committed evidence: geometry, reserved
-    # capital and displayed depth. Nothing is resized, extrapolated or filled
-    # partially, so a quote that cannot support the approved trade produces no
-    # exposure at all.
-    _require_executable_entry(opportunity, quote=quote)
-
-    # --- 7. execution attempt ---------------------------------------------
-    attempt_moment = require_utc(execution_clock(), field_name="attempt_time")
-    attempt_id = paper_v2_entry_attempt_id(entry_order_id)
-    attempt_payload = {
-        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-        "engine": ENGINE_OPIP_PAPER_V2,
-        "execution_attempt_id": attempt_id,
-        "order_intent_id": entry_order_id,
-        "paper_trade_id": paper_trade_id,
-        "attempt_seq": 0,
-        "execution_state": "ACCEPTED",
-        "attempt_time": {
-            "precision": "EXACT",
-            "basis": "SOURCE_REPORTED",
-            "occurred_at": iso_z(attempt_moment, field_name="attempt_time"),
-        },
-        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-        "accepted_quantity": float(opportunity.requested_quantity),
-        "market_evidence_ref": quote["quote_evidence_id"],
-    }
-    _submit(
-        client,
-        event_type=PAPER_EXECUTION_ATTEMPT_RECORDED,
-        key=paper_evidence_idempotency_key(
-            PAPER_EXECUTION_ATTEMPT_RECORDED, attempt_payload
+        moment=_next_execution_moment(
+            execution_clock,
+            floor=require_utc(
+                opportunity.evidence_cutoff, field_name="evidence_cutoff"
+            ),
+            field_name="plan_time",
         ),
-        payload=attempt_payload,
-        what="execution attempt",
     )
 
-    # --- 8. quote-backed fill ---------------------------------------------
-    fill_quantity = float(opportunity.requested_quantity)
-    # A long ENTRY executes against the ask side of the committed book.
-    executable_price = float(quote["best_ask"])
-    fill_moment = require_utc(execution_clock(), field_name="fill_time")
-    fill_id = paper_v2_entry_fill_id(entry_order_id)
-    cost = _cost_components(fill_quantity, executable_price, settings=settings)
-    fill_payload = {
-        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-        "engine": ENGINE_OPIP_PAPER_V2,
-        "fill_id": fill_id,
-        "execution_attempt_id": attempt_id,
-        "order_intent_id": entry_order_id,
-        "paper_trade_id": paper_trade_id,
-        "fill_seq": 0,
-        "side": "BUY",
-        "quantity": fill_quantity,
-        "price": executable_price,
-        "fee_cost": cost["fee_cost"],
-        "spread_cost": cost["spread_cost"],
-        "slippage_cost": cost["slippage_cost"],
-        "other_supported_cost": cost["other_supported_cost"],
-        "fill_time": {
-            "precision": "EXACT",
-            "basis": "SOURCE_REPORTED",
-            "occurred_at": iso_z(fill_moment, field_name="fill_time"),
-        },
-        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
-        "market_evidence_ref": quote["quote_evidence_id"],
-    }
-    _submit(
-        client,
-        event_type=PAPER_FILL_RECORDED,
-        key=paper_evidence_idempotency_key(PAPER_FILL_RECORDED, fill_payload),
-        payload=fill_payload,
-        what="fill",
-    )
+    # --- 5. ENTRY order intent (reuse committed) ---------------------------
+    if progress.entry_order_intent is not None:
+        entry_payload = dict(progress.entry_order_intent)
+    else:
+        intent_moment = _next_execution_moment(
+            execution_clock,
+            floor=require_utc(
+                opportunity.evidence_cutoff, field_name="evidence_cutoff"
+            ),
+            field_name="intent_time",
+        )
+        entry_payload = {
+            "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
+            "engine": ENGINE_OPIP_PAPER_V2,
+            "order_intent_id": entry_order_id,
+            "paper_trade_id": paper_trade_id,
+            "decision_context_id": context_id,
+            "intent_seq": 0,
+            "intent_role": "ENTRY",
+            "side": "BUY",
+            "order_type": "MARKET",
+            "requested_quantity": float(opportunity.requested_quantity),
+            "requested_notional": float(opportunity.requested_notional),
+            "reason_code": "PAPER_V2_ENTRY",
+            "intent_time": {
+                "precision": "EXACT",
+                "basis": "SOURCE_REPORTED",
+                "occurred_at": iso_z(intent_moment, field_name="intent_time"),
+            },
+            "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+            "reservation_id": reservation_id,
+        }
+        _submit(
+            client,
+            event_type=PAPER_ORDER_INTENT_RECORDED,
+            key=paper_evidence_idempotency_key(
+                PAPER_ORDER_INTENT_RECORDED, entry_payload
+            ),
+            payload=entry_payload,
+            what="ENTRY order intent",
+        )
+
+    # --- 6/7. execution quote and attempt ---------------------------------
+    # An already-committed attempt is never rebound to a different quote: its
+    # committed evidence reference is immutable, so a restart reuses the exact quote
+    # it consumed instead of reading the market again under the same identity.
+    if progress.execution_attempt is not None:
+        attempt_payload = dict(progress.execution_attempt)
+        committed_quote = progress.quote_evidence
+        if not isinstance(committed_quote, Mapping):
+            raise PaperV2ExecutionError(
+                "committed attempt cites quote evidence that cannot be resolved"
+            )
+        quote = dict(committed_quote)
+        attempt_floor = _temporal_instant(
+            attempt_payload["attempt_time"], field_name="attempt_time"
+        )
+    else:
+        # No attempt yet, so the quote must satisfy the execution contract now. The
+        # pre-attempt failures below provably occur before any exposure exists, so
+        # they are raised as pre-exposure stops that can be terminalized.
+        try:
+            quote, received_at = _commit_quote(
+                opportunity,
+                client=client,
+                kraken_client=kraken_client,
+                settings=settings,
+                clock=execution_clock,
+            )
+        except PaperV2ExecutionError as exc:
+            raise _PreExposureStop(str(exc)) from exc
+        attempt_floor = received_at
+        # The committed ask must still be an executable qualified entry: geometry,
+        # reserved capital and displayed depth. Nothing is resized, extrapolated or
+        # filled partially, so a quote that cannot support the approved trade
+        # produces no exposure at all.
+        try:
+            _require_executable_entry(opportunity, quote=quote)
+        except PaperV2ExecutionError as exc:
+            raise _PreExposureStop(str(exc)) from exc
+        attempt_moment = _next_execution_moment(
+            execution_clock, floor=attempt_floor, field_name="attempt_time"
+        )
+        attempt_payload = {
+            "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
+            "engine": ENGINE_OPIP_PAPER_V2,
+            "execution_attempt_id": attempt_id,
+            "order_intent_id": entry_order_id,
+            "paper_trade_id": paper_trade_id,
+            "attempt_seq": 0,
+            "execution_state": "ACCEPTED",
+            "attempt_time": {
+                "precision": "EXACT",
+                "basis": "SOURCE_REPORTED",
+                "occurred_at": iso_z(attempt_moment, field_name="attempt_time"),
+            },
+            "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+            "accepted_quantity": float(opportunity.requested_quantity),
+            "market_evidence_ref": quote["quote_evidence_id"],
+        }
+        _submit(
+            client,
+            event_type=PAPER_EXECUTION_ATTEMPT_RECORDED,
+            key=paper_evidence_idempotency_key(
+                PAPER_EXECUTION_ATTEMPT_RECORDED, attempt_payload
+            ),
+            payload=attempt_payload,
+            what="execution attempt",
+        )
+
+    # --- 8. quote-backed fill (reuse committed) ----------------------------
+    if progress.fill is not None:
+        fill_payload = dict(progress.fill)
+        fill_quantity = float(fill_payload["quantity"])
+    else:
+        # Rebuilt only from committed facts: the committed accepted quantity, the
+        # committed quote, and the frozen economics for this execution's model
+        # version. No fresh Kraken read, and no mutable setting can change what this
+        # attempt's fill costs.
+        fill_quantity = float(attempt_payload["accepted_quantity"])
+        if (
+            abs(fill_quantity - float(opportunity.requested_quantity))
+            > _QUANTITY_TOLERANCE
+        ):
+            raise PaperV2ExecutionError(
+                "committed attempt quantity does not match the approved request"
+            )
+        # A long ENTRY executes against the ask side of the committed book.
+        executable_price = float(quote["best_ask"])
+        economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
+        cost = economics.cost_components(fill_quantity, executable_price)
+        fill_moment = _next_execution_moment(
+            execution_clock, floor=attempt_floor, field_name="fill_time"
+        )
+        fill_payload = {
+            "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
+            "engine": ENGINE_OPIP_PAPER_V2,
+            "fill_id": fill_id,
+            "execution_attempt_id": attempt_id,
+            "order_intent_id": entry_order_id,
+            "paper_trade_id": paper_trade_id,
+            "fill_seq": 0,
+            "side": "BUY",
+            "quantity": fill_quantity,
+            "price": executable_price,
+            "fee_cost": cost["fee_cost"],
+            "spread_cost": cost["spread_cost"],
+            "slippage_cost": cost["slippage_cost"],
+            "other_supported_cost": cost["other_supported_cost"],
+            "fill_time": {
+                "precision": "EXACT",
+                "basis": "SOURCE_REPORTED",
+                "occurred_at": iso_z(fill_moment, field_name="fill_time"),
+            },
+            "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+            "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+            "market_evidence_ref": quote["quote_evidence_id"],
+        }
+        _submit(
+            client,
+            event_type=PAPER_FILL_RECORDED,
+            key=paper_evidence_idempotency_key(PAPER_FILL_RECORDED, fill_payload),
+            payload=fill_payload,
+            what="fill",
+        )
 
     # --- 9. exposure from canonical fills only ----------------------------
     progress = client.get_paper_v2_execution_state(disposition_id)
     _require(
         float(progress.filled_quantity) > 0,
         "no canonical exposure after the fill; refusing to protect a hypothetical position",
-    )
-
-    # --- 10. immutable protection plan ------------------------------------
-    plan_id = _ensure_protection_plan(
-        opportunity,
-        client=client,
-        progress=progress,
-        settings=settings,
-        moment=moment,
     )
 
     return PaperV2ExecutionResult(
@@ -601,6 +735,126 @@ def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping
             "requested quantity exceeds the displayed Level-1 ask quantity; "
             "no approved depth or partial-fill model exists"
         )
+
+
+class _PreExposureStop(RuntimeError):
+    """A fail-closed stop that provably occurred before any exposure existed.
+
+    Only raised where canonical evidence proves no fill exists and no fill-capable
+    attempt is outstanding, so the caller may terminalize the trade as a zero-fill
+    trade. Anything else propagates unchanged, because releasing a reservation that
+    could still become exposure would free capacity against a live trade.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _next_execution_moment(
+    clock: Callable[[], datetime], *, floor: datetime, field_name: str
+) -> datetime:
+    """Take an execution reading, refusing a clock that regressed.
+
+    Canonical chronology must never go backwards: ``fill_time < attempt_time`` would
+    record an execution that finished before it began. Silently rewriting the
+    reading to ``floor`` would fabricate chronology, so a regression fails closed and
+    the trade resumes later when the clock is valid again.
+    """
+    moment = require_utc(clock(), field_name=field_name)
+    if moment < floor:
+        raise _PreExposureStop(
+            f"{field_name} regressed behind the causal floor for this execution"
+        )
+    return moment
+
+
+def _temporal_instant(value: Any, *, field_name: str) -> datetime:
+    """The instant from a committed canonical temporal-evidence object."""
+    if not isinstance(value, Mapping):
+        raise PaperV2ExecutionError(f"{field_name} is not canonical temporal evidence")
+    occurred = value.get("occurred_at")
+    if not isinstance(occurred, str) or not occurred:
+        raise PaperV2ExecutionError(f"{field_name} has no exact occurrence instant")
+    try:
+        parsed = datetime.fromisoformat(occurred.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PaperV2ExecutionError(
+            f"{field_name} is not a parseable instant"
+        ) from exc
+    return require_utc(parsed, field_name=field_name)
+
+
+def _terminalize_zero_fill(
+    client: Any,
+    *,
+    progress: Any,
+    reservation_id: str,
+    paper_trade_id: str,
+    reason: str,
+    execution_clock: Callable[[], datetime],
+) -> None:
+    """Write the truthful terminal record for a trade that provably never filled.
+
+    Not a success, and not a strategy rejection: the trade reached no exposure, so it
+    is terminalized as a zero-fill FINAL_VERIFIED trade whose reservation the
+    canonical portfolio projection can then release. The writer independently
+    refuses this when canonical evidence cannot prove release is safe, so capacity is
+    never freed against a trade that could still fill.
+
+    An already-committed terminal record is left alone, so a restart does not reopen
+    a closed trade.
+    """
+    if progress.terminal_reconciliation is not None:
+        return
+    if float(progress.filled_quantity) > 0:
+        # Exposure exists: this is not a zero-fill trade and must be reconciled on
+        # its own evidence rather than released here.
+        return
+    if bool(getattr(progress, "entry_attempt_fill_capable", False)):
+        # A fill-capable attempt is outstanding and may still become exposure, so
+        # releasing now would be unsafe. It is resumed instead.
+        return
+
+    moment = require_utc(execution_clock(), field_name="reconciled_time")
+    payload = {
+        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "reconciliation_id": paper_v2_no_fill_reconciliation_id(paper_trade_id),
+        "paper_trade_id": paper_trade_id,
+        "reconciliation_seq": 0,
+        # The trade never held a position, so its truthful terminal state is that
+        # there is no position rather than one that was closed.
+        "position_state": "NO_POSITION",
+        "terminal_reconciliation_state": "FINAL_VERIFIED",
+        "filled_entry_quantity": 0.0,
+        "filled_exit_quantity": 0.0,
+        "remaining_quantity": 0.0,
+        "reserved_capital": float(progress.requested_reservation_amount or 0.0),
+        "realized_gross_pnl": 0.0,
+        "recorded_execution_costs": 0.0,
+        "realized_net_pnl": 0.0,
+        "reconciled_time": {
+            "precision": "EXACT",
+            "basis": "SOURCE_REPORTED",
+            "occurred_at": iso_z(moment, field_name="reconciled_time"),
+        },
+        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+    }
+    try:
+        _submit(
+            client,
+            event_type=PAPER_RECONCILIATION_RECORDED,
+            key=paper_evidence_idempotency_key(
+                PAPER_RECONCILIATION_RECORDED, payload
+            ),
+            payload=payload,
+            what=f"zero-fill terminal reconciliation ({reason})",
+        )
+    except (ValueError, RuntimeError):
+        # A refused release is not a reason to hide the original failure: the
+        # reservation stays active, which is the fail-closed outcome.
+        return
 
 
 def _admit(
@@ -721,16 +975,16 @@ def _commit_quote(
 def _cost_components(
     quantity: float, price: float, *, settings: Any
 ) -> dict[str, float]:
-    """Frozen execution-model cost components. No new slippage model is invented."""
-    fee_rate = float(getattr(settings, "paper_trade_fee_rate", 0.004))
-    slippage_bps = float(getattr(settings, "paper_trade_slippage_bps", 10.0))
-    notional = float(quantity) * float(price)
-    return {
-        "fee_cost": notional * fee_rate,
-        "spread_cost": 0.0,
-        "slippage_cost": notional * (slippage_bps / 10_000.0),
-        "other_supported_cost": 0.0,
-    }
+    """Deprecated shim retained for callers outside this module.
+
+    Fill economics are resolved from the frozen economic-model version (see
+    :mod:`app.opip.contracts.paper_economics`), not from mutable settings, so the
+    producer no longer calls this. It stays only so an external caller does not
+    break, and it delegates to the same frozen coefficients.
+    """
+    del settings
+    economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
+    return economics.cost_components(quantity, price)
 
 
 def _ensure_protection_plan(
@@ -747,11 +1001,12 @@ def _ensure_protection_plan(
     from trade and sequence, so rebuilding it after a settings change would
     silently rewrite committed economics under the same identity.
     """
-    committed = progress.protection_plan
-    if isinstance(committed, Mapping):
-        existing = dict(committed)
-        # Same identity + divergent economics must fail closed, which the canonical
-        # writer enforces on submission; here we simply reuse the committed plan.
+    plan = progress.protection_plan
+    if isinstance(plan, Mapping):
+        # Reuse is mandatory, not an optimization: the plan identity is
+        # deterministic from trade and sequence, so rebuilding it after a settings
+        # change would silently rewrite committed economics under the same identity.
+        existing = dict(plan)
         return str(existing.get("protection_plan_id") or "") or None
 
     payload = build_protection_plan_payload(

@@ -48,37 +48,31 @@ import uuid
 #: episode, instrument or trade identities.
 PROCESS_INSTANCE_PREFIX = "PROC"
 
-_REGISTRY_ATTRIBUTE = "_opip_process_instance_registry"
-_LOCK_ATTRIBUTE = "_opip_process_instance_lock"
+_HOLDER_ATTRIBUTE = "_opip_process_instance_holder"
 
 
-def _registry_lock() -> threading.Lock:
-    """Return the process-scoped initialization lock, creating it atomically.
+def _new_holder() -> dict:
+    """A fresh process-scoped holder: one shared lock plus the PID registry."""
+    return {"lock": threading.Lock(), "identities": {}}
 
-    ``dict.setdefault`` is atomic under the GIL, so two threads racing here still
-    receive one lock object: whichever loses gets the winner's. The lock therefore
-    survives a module reload exactly like the registry it guards, which is what
-    makes "one identity per process" hold across reloads *and* across threads.
+
+def _process_holder() -> dict:
+    """Return the one process-scoped holder, publishing it atomically.
+
+    ``sys.__dict__.setdefault`` is atomic under the GIL, so concurrent first callers
+    all receive the *same* holder even though several may construct a candidate. A
+    check-then-``setattr`` pattern did not guarantee that: two threads could each
+    publish their own holder, and each would then own a different lock and a
+    different registry, so one process could mint two identities.
+
+    Keeping the holder on ``sys`` rather than in this module is what makes it survive
+    ``importlib.reload``: a module global is module-object scoped, so a reload would
+    hand the same process a second identity.
     """
-    holder = getattr(sys, _REGISTRY_ATTRIBUTE, None)
-    if not isinstance(holder, dict):
-        holder = {}
-        setattr(sys, _REGISTRY_ATTRIBUTE, holder)
-    lock = holder.get(_LOCK_ATTRIBUTE)
-    if lock is None:
-        lock = holder.setdefault(_LOCK_ATTRIBUTE, threading.Lock())
-    return lock
-
-
-def _identity_registry() -> dict[int, str]:
-    holder = getattr(sys, _REGISTRY_ATTRIBUTE, None)
-    if not isinstance(holder, dict):
-        holder = {}
-        setattr(sys, _REGISTRY_ATTRIBUTE, holder)
-    registry = holder.get("identities")
-    if not isinstance(registry, dict):
-        registry = holder.setdefault("identities", {})
-    return registry
+    holder = sys.__dict__.get(_HOLDER_ATTRIBUTE)
+    if isinstance(holder, dict):
+        return holder
+    return sys.__dict__.setdefault(_HOLDER_ATTRIBUTE, _new_holder())
 
 
 def process_instance_id() -> str:
@@ -88,17 +82,17 @@ def process_instance_id() -> str:
     lifetime, so every record a process emits shares one instance identity. A
     separate process - or the same code after a restart - mints its own.
 
-    Initialization is synchronized, so concurrent first callers in one process
-    cannot publish two registries and observe two different identifiers.
+    Both the holder publication and first mint are synchronized, so concurrent first
+    callers in one process cannot observe two different identifiers.
     """
     pid = os.getpid()
-    registry = _identity_registry()
+    holder = _process_holder()
+    registry = holder["identities"]
     existing = registry.get(pid)
     if existing is not None:
         return existing
-    with _registry_lock():
+    with holder["lock"]:
         # Re-check under the lock: another thread may have minted while we waited.
-        registry = _identity_registry()
         existing = registry.get(pid)
         if existing is not None:
             return existing

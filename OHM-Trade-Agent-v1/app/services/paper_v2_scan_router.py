@@ -140,6 +140,10 @@ class PaperV2RouterSummary:
     wait_not_executable: int = 0
     handoff_failures: int = 0
     operational_failures: int = 0
+    #: Trades that ended in a provably pre-exposure no-fill terminal state, so their
+    #: reservation was released. Distinct from an operational failure, which leaves
+    #: the trade unresolved.
+    no_fill_terminal: int = 0
     details: list[str] = field(default_factory=list)
 
     @property
@@ -381,6 +385,11 @@ def _route_one(
         summary.capital_rejected += 1
     elif status == "CAPACITY_REJECTED":
         summary.capacity_rejected += 1
+    elif status == "NO_FILL_TERMINAL":
+        # A provably pre-exposure failure that was closed and released. Distinct
+        # from an operational failure: the trade ended safely and its capacity
+        # returned to the portfolio.
+        summary.no_fill_terminal += 1
     else:
         summary.operational_failures += 1
     summary.record(f"{status} {symbol}: {str(getattr(result, 'detail', '') or '')}")
