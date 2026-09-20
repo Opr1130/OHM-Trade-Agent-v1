@@ -9,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.opip.canonical.models import (
     PaperPortfolioState,
@@ -331,6 +331,42 @@ class CanonicalWriter:
                 self._release_store_lock_best_effort()
             raise
 
+    @classmethod
+    def for_reads(cls, db_path: Path) -> "CanonicalWriter":
+        """Construct a read-only analytical reader over a canonical store.
+
+        Used by the analytics plane to read the verified canonical *replica* rather
+        than the authoritative production store. It deliberately differs from the
+        writer constructor in three ways, each of which is the point of the method:
+
+        * **No store lock.** Aggregation must never contend with the production
+          writer, whose lock is held for its whole lifetime.
+        * **Read-only connection.** ``connect(..., read_only=True)`` means SQLite
+          itself refuses a write, so a derived analytical read cannot mutate
+          canonical evidence even by defect.
+        * **No schema initialization.** A reader must not create or migrate anything.
+
+        The query implementation is shared with the writer on purpose: a second
+        implementation of the same projections would be a second source of truth for
+        canonical economics.
+        """
+        instance = cls.__new__(cls)
+        instance.db_path = canonical_store_path(db_path)
+        instance._lock = threading.Lock()
+        instance._read_only = True
+        instance._store_lock = None
+        instance._conn = connect(instance.db_path, read_only=True)
+        instance._request_lifecycle_projection = {}
+        instance._request_lifecycle_projection_watermark = (0, -1)
+        instance._role_result_idempotency_by_id = {}
+        instance._role_result_projection_watermark = (0, -1)
+        return instance
+
+    @property
+    def is_read_only(self) -> bool:
+        """Whether this instance is a derived analytical reader."""
+        return bool(getattr(self, "_read_only", False))
+
     def _close_connection_best_effort(self) -> None:
         connection = getattr(self, "_conn", None)
         if connection is None:
@@ -496,15 +532,20 @@ class CanonicalWriter:
     def close(self) -> None:
         with self._lock:
             try:
-                # Best-effort only: shutdown must not fail on a busy checkpoint.
-                # Callers that need proof of WAL durability use checkpoint_wal().
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except sqlite3.Error:
-                    pass
+                # A read-only reader owns neither the store lock nor a writable
+                # connection, so there is nothing to checkpoint and no ownership to
+                # release. Skipping the checkpoint also avoids touching a replica.
+                if not self.is_read_only:
+                    # Best-effort only: shutdown must not fail on a busy checkpoint.
+                    # Callers that need proof of WAL durability use checkpoint_wal().
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except sqlite3.Error:
+                        pass
                 self._conn.close()
             finally:
-                self._store_lock.release()
+                if self._store_lock is not None:
+                    self._store_lock.release()
 
     def checkpoint_wal(self) -> None:
         """Flush the WAL into the main DB file and prove the flush completed.
@@ -1079,6 +1120,50 @@ class CanonicalWriter:
         )
         return PaperV2Ledger(status="OK", entries=entries)
 
+    def _event_id_by_idempotency_key(self, idempotency_key: str) -> str | None:
+        """The committed ``event_id`` for an exact idempotency key.
+
+        ``events`` carries ``UNIQUE (idempotency_key)``, so this is an index lookup on
+        the frozen event-identity contract. Using it keeps lineage resolution bounded
+        instead of scanning a whole event family per trade under the writer lock.
+        """
+        if not idempotency_key:
+            return None
+        row = self._conn.execute(
+            "SELECT event_id FROM events WHERE idempotency_key = ? LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        return str(row["event_id"]) if row is not None else None
+
+    def _event_id_by_idempotency_prefix(self, prefix: str) -> str | None:
+        """The committed ``event_id`` for the unique key starting with ``prefix``.
+
+        Used where the frozen key embeds a value this reader does not hold (the
+        instrument-version key also carries its reference-data fingerprint). Implemented
+        as an explicit half-open range rather than ``LIKE`` so SQLite can use the
+        unique index on ``idempotency_key``; a ``LIKE`` prefix is not rewritten to an
+        index range under the default collation.
+
+        Uniqueness is enforced by key, but the prefix may still match more than one
+        key in principle, so ambiguity is refused rather than resolved arbitrarily.
+        """
+        if not prefix:
+            return None
+        # The smallest string strictly greater than every string starting with
+        # ``prefix`` is the prefix with its final character incremented.
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        rows = self._conn.execute(
+            "SELECT event_id FROM events "
+            "WHERE idempotency_key >= ? AND idempotency_key < ? "
+            "ORDER BY idempotency_key ASC",
+            (prefix, upper),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise ValueError("canonical identity prefix is ambiguous")
+        return str(rows[0]["event_id"])
+
     def _ledger_lineage(
         self, paper_trade_id: str, *, context: Mapping[str, object] | None
     ) -> tuple[str, ...]:
@@ -1097,26 +1182,29 @@ class CanonicalWriter:
         if isinstance(context, Mapping):
             snapshot_id = str(context.get("snapshot_id") or "")
             instrument_version_id = str(context.get("instrument_version") or "")
-            for event_type, identity_field, identity in (
-                (
-                    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-                    "context_id",
-                    str(context.get("context_id") or ""),
-                ),
-                (
-                    PAPER_DECISION_SNAPSHOT_RECORDED,
-                    "snapshot_id",
-                    snapshot_id,
-                ),
-                (
-                    MARKET_INSTRUMENT_VERSION_RECORDED,
-                    "instrument_version_id",
-                    instrument_version_id,
-                ),
-            ):
-                event_id = self._event_id_for_identity(
-                    event_type, identity_field, identity
+            context_id = str(context.get("context_id") or "")
+
+            # Identity lookups go through the frozen event idempotency contracts,
+            # which ``events`` indexes uniquely. Resolving them by JSON-path identity
+            # instead scanned each event family per trade under the writer lock.
+            identities: list[str | None] = [
+                self._event_id_by_idempotency_key(
+                    context_idempotency_key(context_id=context_id)
                 )
+                if context_id
+                else None,
+                self._event_id_by_idempotency_key(
+                    f"{PAPER_DECISION_SNAPSHOT_RECORDED}:{snapshot_id}"
+                )
+                if snapshot_id
+                else None,
+                self._event_id_by_idempotency_prefix(
+                    f"{MARKET_INSTRUMENT_VERSION_RECORDED}:{instrument_version_id}:"
+                )
+                if instrument_version_id
+                else None,
+            ]
+            for event_id in identities:
                 if event_id is not None and event_id not in referenced:
                     referenced.append(event_id)
 
@@ -1129,26 +1217,65 @@ class CanonicalWriter:
                 ordered.append(event_id)
         return tuple(ordered)
 
-    def _event_id_for_identity(
-        self, event_type: str, identity_field: str, identity: str
-    ) -> str | None:
-        """The committed ``event_id`` of the record with this canonical identity.
+    def _fill_temporal_extreme(
+        self,
+        fills: Sequence[Mapping[str, Any]],
+        *,
+        want_earliest: bool,
+    ) -> dict[str, Any] | None:
+        """Select the temporally earliest (or latest) fill, or refuse.
 
-        Used to complete a trade's audit lineage: several displayed fields (candidate,
-        episode, cohort, policy version) come from the decision context and its
-        snapshot rather than from records carrying ``paper_trade_id``, so a dossier
-        that cited only trade-indexed events could not trace those fields to the
-        records that produced them.
+        Fill collections are in canonical **commit** order, which is not occurrence
+        order: a source-reported fill can arrive after a later-occurring one. Choosing
+        ``fills[0]``/``fills[-1]`` therefore attributes latency, holding duration,
+        recent-trade ordering and the equity timeline to the wrong instant.
+
+        Ordering is derived from canonical temporal evidence instead:
+
+        * every fill must carry a provable window (``EXACT`` as a point, ``BOUNDED``
+          as its interval);
+        * the extreme is accepted only when it is unambiguously extreme - the
+          earliest candidate's window must end before every other candidate's window
+          starts (and symmetrically for the latest);
+        * ``UNKNOWN`` evidence, or overlapping windows that admit more than one
+          ordering, yields ``None``.
+
+        ``None`` means "the instant cannot be proven", never "commit order will do":
+        callers propagate it as unavailable rather than manufacturing a timestamp.
         """
-        if not identity:
+        if not fills:
             return None
-        rows = self._conn.execute(
-            f"SELECT event_id FROM events WHERE event_type = ? "
-            f"AND json_extract(payload_json, '$.{identity_field}') = ? "
-            f"ORDER BY history_epoch ASC, local_sequence ASC LIMIT 1",
-            (event_type, identity),
-        ).fetchall()
-        return str(rows[0]["event_id"]) if rows else None
+        windows: list[tuple[Mapping[str, Any], datetime, datetime]] = []
+        for fill in fills:
+            evidence = fill.get("fill_time")
+            if not isinstance(evidence, Mapping) or str(
+                evidence.get("precision")
+            ) not in {"EXACT", "BOUNDED"}:
+                return None
+            try:
+                start, end = self._temporal_bounds(evidence, field_name="fill_time")
+            except ValueError:
+                return None
+            windows.append((fill, start, end))
+
+        if want_earliest:
+            extreme = min(windows, key=lambda item: (item[1], item[2]))
+            # Unambiguous only if it finishes before every other window begins.
+            if any(
+                other[1] < extreme[2]
+                for other in windows
+                if other is not extreme
+            ):
+                return None
+        else:
+            extreme = max(windows, key=lambda item: (item[2], item[1]))
+            if any(
+                other[2] > extreme[1]
+                for other in windows
+                if other is not extreme
+            ):
+                return None
+        return dict(extreme[0]["fill_time"])
 
     def _paper_trade_event_ids(self, paper_trade_id: str) -> tuple[str, ...]:
         """Committed ``event_id``s referencing one trade, in commit order.
@@ -1220,13 +1347,11 @@ class CanonicalWriter:
                 value = inner.get("cohort_id")
                 cohort_id = str(value) if value else None
 
-        disposition = next(
-            (
-                record
-                for record in self._admitted_dispositions()
-                if str(record.get("paper_trade_id") or "") == paper_trade_id
-            ),
-            {},
+        # The admitting disposition is carried on the item, so this read never
+        # re-enumerates admitted history per trade. Rescanning it here made the whole
+        # ledger read grow quadratically with admitted trade count.
+        disposition_time = (
+            dict(item.disposition_time) if item.disposition_time else None
         )
 
         entry_fills = item.entry_fills
@@ -1263,11 +1388,7 @@ class CanonicalWriter:
             native_symbol=item.native_symbol,
             policy_version=_context_str("policy_version"),
             policy_fingerprint=_context_str("policy_fingerprint"),
-            disposition_time=(
-                dict(disposition["disposition_time"])
-                if isinstance(disposition.get("disposition_time"), Mapping)
-                else None
-            ),
+            disposition_time=disposition_time,
             evaluation_time=_context_str("evaluation_time"),
             entry_intent_time=(
                 dict(entry_order["intent_time"])
@@ -1280,17 +1401,11 @@ class CanonicalWriter:
                 and isinstance(entry_attempt.get("attempt_time"), Mapping)
                 else None
             ),
-            first_entry_fill_time=(
-                dict(entry_fills[0]["fill_time"])
-                if entry_fills
-                and isinstance(entry_fills[0].get("fill_time"), Mapping)
-                else None
+            first_entry_fill_time=self._fill_temporal_extreme(
+                entry_fills, want_earliest=True
             ),
-            last_exit_fill_time=(
-                dict(exit_fills[-1]["fill_time"])
-                if exit_fills
-                and isinstance(exit_fills[-1].get("fill_time"), Mapping)
-                else None
+            last_exit_fill_time=self._fill_temporal_extreme(
+                exit_fills, want_earliest=False
             ),
             entry_quantity=item.entry_quantity,
             exited_quantity=item.exited_quantity,
@@ -1508,6 +1623,11 @@ class CanonicalWriter:
             disposition_id=str(disposition.get("disposition_id") or "") or None,
             decision_context_id=context_id,
             reservation_id=str(disposition.get("reservation_id") or "") or None,
+            disposition_time=(
+                dict(disposition["disposition_time"])
+                if isinstance(disposition.get("disposition_time"), Mapping)
+                else None
+            ),
             quote_currency=(
                 instrument_quote_currency
                 or str(disposition.get("quote_currency") or "")

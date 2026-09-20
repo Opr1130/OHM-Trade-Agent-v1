@@ -14,22 +14,33 @@ import pytest
 
 from app.api import cockpit
 from app.opip.cockpit.ledger import PaperV2Ledger
-from app.opip.cockpit.trust import Completeness, Freshness
+from app.opip.cockpit.trust import Completeness
 
 
 class _ReadOnlyClient:
-    """A canonical client stub exposing only the ledger read."""
+    """A canonical *reader* stub exposing only the ledger read.
+
+    Mirrors ``CanonicalWriter.for_reads``: the cockpit consumes a read-only reader
+    over the verified replica, not a writer client.
+    """
 
     def __init__(self, ledger: PaperV2Ledger) -> None:
         self._ledger = ledger
+        self.closed = False
 
-    def get_paper_v2_ledger(self) -> PaperV2Ledger:
+    def paper_v2_ledger(self) -> PaperV2Ledger:
         return self._ledger
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _ExplodingClient:
-    def get_paper_v2_ledger(self):  # noqa: ANN201 - deliberately fails
+    def paper_v2_ledger(self):  # noqa: ANN201 - deliberately fails
         raise RuntimeError("socket closed")
+
+    def close(self) -> None:
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -57,36 +68,27 @@ def test_every_cockpit_route_is_a_get():
 
 
 def test_cockpit_module_imports_no_write_surface():
-    """The API module must not import or call any write surface.
+    """The cockpit must reach canonical evidence only through a read-only reader.
 
-    Checked structurally via the module AST rather than by substring: a docstring
-    that explains *why* the surface is read-only must not be mistaken for a write
-    path, while a real import or call to a mutating API must be caught.
+    Checked structurally via the module AST rather than by substring, so a docstring
+    explaining the boundary is not mistaken for a write path.
+
+    ``CanonicalWriter`` *is* imported, but only as the read-only replica factory: the
+    module must construct it via ``for_reads`` and must never call a mutating method
+    or the ``submit`` path.
     """
     import ast
     import pathlib
 
-    tree = ast.parse(pathlib.Path(cockpit.__file__).read_text(encoding="utf-8"))
-
-    imported_modules: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported_modules.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported_modules.add(node.module)
-
-    for banned in (
-        "app.opip.canonical.writer",
-        "app.services.paper_v2_execution",
-        "app.services.paper_v2_protection_runtime",
-    ):
-        assert banned not in imported_modules, f"cockpit API imports {banned}"
+    source = pathlib.Path(cockpit.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
 
     called_attributes = {
         node.func.attr
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
+    # Only names that cannot collide with ordinary string/dict methods.
     for banned_call in (
         "submit",
         "trigger_paper_protection_action",
@@ -94,10 +96,111 @@ def test_cockpit_module_imports_no_write_surface():
         "place_order",
         "cancel_order",
         "withdraw",
+        "initialize_schema",
+        "checkpoint_wal",
     ):
         assert banned_call not in called_attributes, (
             f"cockpit API calls write surface {banned_call!r}"
         )
+
+    # Any CanonicalWriter construction must be the read-only replica factory.
+    assert "for_reads" in called_attributes, (
+        "cockpit API should obtain canonical evidence via CanonicalWriter.for_reads"
+    )
+    assert "CanonicalWriter(" not in source, (
+        "cockpit API must not construct a writable CanonicalWriter"
+    )
+
+    # And it must not reach the production writer/provider seam at all.
+    for banned_module in (
+        "app.services.paper_v2_execution",
+        "app.services.paper_v2_protection_runtime",
+        "app.services.paper_v2_scan_router",
+    ):
+        assert banned_module not in source, (
+            f"cockpit API must not use the trading-host writer path {banned_module}"
+        )
+
+
+def test_cockpit_reads_the_replica_not_the_production_store():
+    """Analytics must resolve the replica, never the live canonical path.
+
+    Architecture requirement: the analytical workload belongs on the analytics plane.
+    If the cockpit fell back to the production canonical path it would both run
+    analytics on the trading host and contend with the production writer.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(cockpit.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+
+    assert "app.opip.learning.canonical_replica" in imported, (
+        "cockpit must resolve its store through the canonical replica seam"
+    )
+    assert "app.opip.canonical.paths" not in imported, (
+        "cockpit must not resolve the production canonical path"
+    )
+    # The production path resolver must not be reachable from this module.
+    resolved_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            resolved_names.update(alias.asname or alias.name for alias in node.names)
+    assert "canonical_db_path" not in resolved_names
+    assert "db_path" not in resolved_names
+
+
+def test_replica_reader_is_unavailable_when_no_replica_is_present(monkeypatch):
+    """With no replica the cockpit reports unavailable and computes nothing.
+
+    This is what structurally prevents the trading host from executing analytics:
+    the host has no replica, so the endpoints cannot reach an authoritative store.
+    """
+    monkeypatch.setattr(cockpit, "_replica_db_path", lambda: None)
+
+    payload = cockpit.cockpit_overview(x_webhook_secret=None)
+
+    assert payload["portfolios"] == []
+    assert payload["trust"]["is_healthy"] is False
+    assert payload["details"]
+    assert payload["source"] == "canonical_replica_ledger"
+
+
+def test_replica_reader_opens_read_only_and_takes_no_store_lock(tmp_path):
+    """``for_reads`` must be read-only and lock-free, unlike the writer constructor.
+
+    Proven directly rather than by inspection: SQLite refuses a write, and the
+    production writer can still be opened for the same store afterwards, which would
+    be impossible if the reader had taken the exclusive store lock.
+    """
+    from pathlib import Path
+
+    from app.opip.canonical.writer import CanonicalWriter
+
+    store = Path(tmp_path) / "canonical.sqlite3"
+    writer = CanonicalWriter(store)
+    writer.close()
+
+    reader = CanonicalWriter.for_reads(store)
+    try:
+        assert reader.is_read_only is True
+        assert reader.paper_v2_ledger().status == "OK"
+        # SQLite itself refuses the write.
+        with pytest.raises(Exception):
+            reader._conn.execute("CREATE TABLE rw_check (a)")  # noqa: SLF001
+
+        # No exclusive store lock: a writer can still take the same store.
+        second = CanonicalWriter(store)
+        second.close()
+    finally:
+        reader.close()
 
 
 def test_cockpit_api_declares_no_post_or_put_routes():
@@ -112,7 +215,7 @@ def test_cockpit_api_declares_no_post_or_put_routes():
 
 
 def test_overview_reports_unavailable_writer_rather_than_empty_success(monkeypatch):
-    monkeypatch.setattr(cockpit, "_writer_client", lambda: None)
+    monkeypatch.setattr(cockpit, "_replica_reader", lambda: None)
 
     payload = cockpit.cockpit_overview(x_webhook_secret=None)
 
@@ -129,11 +232,11 @@ def test_unavailable_overview_has_the_same_shape_as_a_healthy_one(monkeypatch):
     omitted the overview's own keys, so callers would only discover the different
     schema when something was already wrong.
     """
-    monkeypatch.setattr(cockpit, "_writer_client", lambda: None)
+    monkeypatch.setattr(cockpit, "_replica_reader", lambda: None)
     unavailable = cockpit.cockpit_overview(x_webhook_secret=None)
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
     healthy = cockpit.cockpit_overview(x_webhook_secret=None)
 
@@ -143,13 +246,13 @@ def test_unavailable_overview_has_the_same_shape_as_a_healthy_one(monkeypatch):
 
 
 def test_unavailable_trade_list_has_the_same_shape_as_a_healthy_one(monkeypatch):
-    monkeypatch.setattr(cockpit, "_writer_client", lambda: None)
+    monkeypatch.setattr(cockpit, "_replica_reader", lambda: None)
     unavailable = cockpit.cockpit_trades(
         quote_currency=None, limit=25, x_webhook_secret=None
     )
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
     healthy = cockpit.cockpit_trades(
         quote_currency=None, limit=25, x_webhook_secret=None
@@ -163,7 +266,7 @@ def test_unavailable_trade_list_has_the_same_shape_as_a_healthy_one(monkeypatch)
 def test_overview_reports_an_unhealthy_ledger_trust_state(monkeypatch):
     monkeypatch.setattr(
         cockpit,
-        "_writer_client",
+        "_replica_reader",
         lambda: _ReadOnlyClient(
             PaperV2Ledger(status="RETRYABLE", error_code="WORKER_UNHEALTHY")
         ),
@@ -179,7 +282,7 @@ def test_overview_reports_an_unhealthy_ledger_trust_state(monkeypatch):
 
 def test_read_failure_does_not_raise_into_the_caller(monkeypatch):
     """A client that blows up surfaces as an unhealthy envelope, not a 500."""
-    monkeypatch.setattr(cockpit, "_writer_client", lambda: _ExplodingClient())
+    monkeypatch.setattr(cockpit, "_replica_reader", lambda: _ExplodingClient())
 
     payload = cockpit.cockpit_overview(x_webhook_secret=None)
 
@@ -195,7 +298,7 @@ def test_read_failure_does_not_raise_into_the_caller(monkeypatch):
 
 def test_overview_carries_the_full_semantic_and_trust_envelope(monkeypatch):
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
 
     payload = cockpit.cockpit_overview(x_webhook_secret=None)
@@ -226,7 +329,7 @@ def test_overview_carries_the_full_semantic_and_trust_envelope(monkeypatch):
 
 def test_trade_list_reports_its_population_and_filters(monkeypatch):
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
 
     payload = cockpit.cockpit_trades(
@@ -245,7 +348,7 @@ def test_unsupported_currency_filter_fails_safely(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
 
     with pytest.raises(HTTPException) as excinfo:
@@ -257,7 +360,7 @@ def test_unsupported_currency_filter_fails_safely(monkeypatch):
 
 def test_currency_filter_is_normalised_but_validated(monkeypatch):
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
     payload = cockpit.cockpit_trades(
         quote_currency="usdt", limit=10, x_webhook_secret=None
@@ -270,7 +373,7 @@ def test_out_of_range_limit_fails_safely(monkeypatch, limit):
     from fastapi import HTTPException
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
 
     with pytest.raises(HTTPException) as excinfo:
@@ -289,7 +392,7 @@ def test_unknown_trade_is_404_when_the_ledger_is_healthy(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
 
     with pytest.raises(HTTPException) as excinfo:
@@ -301,7 +404,7 @@ def test_missing_trade_in_an_unhealthy_ledger_is_not_claimed_as_absent(monkeypat
     """An unreadable ledger cannot prove a trade does not exist."""
     monkeypatch.setattr(
         cockpit,
-        "_writer_client",
+        "_replica_reader",
         lambda: _ReadOnlyClient(PaperV2Ledger(status="RETRYABLE")),
     )
 
@@ -318,7 +421,7 @@ def test_empty_trade_id_is_rejected(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
     with pytest.raises(HTTPException) as excinfo:
         cockpit.cockpit_trade_detail("   ", x_webhook_secret=None)
@@ -400,7 +503,7 @@ def test_trade_detail_returns_the_dossier_fields(monkeypatch):
     )
     monkeypatch.setattr(
         cockpit,
-        "_writer_client",
+        "_replica_reader",
         lambda: _ReadOnlyClient(PaperV2Ledger(status="OK", entries=(entry,))),
     )
 
@@ -423,7 +526,7 @@ def test_trade_detail_returns_the_dossier_fields(monkeypatch):
 
 def test_responses_are_json_serialisable(monkeypatch):
     monkeypatch.setattr(
-        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+        cockpit, "_replica_reader", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
     )
     for payload in (
         cockpit.cockpit_overview(x_webhook_secret=None),

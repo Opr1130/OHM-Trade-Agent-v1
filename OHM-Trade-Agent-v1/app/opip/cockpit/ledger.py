@@ -710,6 +710,30 @@ def build_ledger(ledger: PaperV2Ledger) -> PaperLedger:
     return PaperLedger(entries=rows, trust=trust)
 
 
+def read_paper_ledger_from_reader(reader: Any) -> PaperLedger:
+    """Build the analytical ledger envelope from a read-only canonical reader.
+
+    The reader is the analytics-plane entry point: ``CanonicalWriter.for_reads`` over
+    the verified canonical replica. It is a different seam from the writer RPC on
+    purpose, so the analytical workload cannot run against the authoritative
+    production store or hold the production writer's lock.
+
+    Fails closed: an unreadable replica yields an explicit ``UNAVAILABLE`` envelope
+    with a reason rather than an empty ledger that would read as "no trades".
+    """
+    try:
+        ledger = reader.paper_v2_ledger()
+    except Exception as exc:  # noqa: BLE001 - an unreadable replica is reported
+        from app.opip.cockpit.trust import unavailable
+
+        return PaperLedger(
+            entries=(),
+            trust=unavailable(f"REPLICA_LEDGER_READ_FAILED:{type(exc).__name__}"),
+            details=("canonical replica ledger read failed",),
+        )
+    return build_ledger(ledger)
+
+
 def read_paper_ledger(client: Any) -> PaperLedger:
     """Read the canonical ledger and build the analytical envelope.
 
@@ -744,6 +768,7 @@ __all__ = [
     "latency_interval",
     "point_latency_seconds",
     "read_paper_ledger",
+    "read_paper_ledger_from_reader",
     "temporal_interval",
     "temporal_point",
 ]

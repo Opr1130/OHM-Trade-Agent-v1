@@ -35,7 +35,8 @@ from fastapi.responses import FileResponse
 from app.core.config import get_settings
 from app.opip.cockpit.ledger import (
     COCKPIT_LEDGER_PROJECTION_VERSION,
-    read_paper_ledger,
+    PaperLedger,
+    read_paper_ledger_from_reader,
 )
 from app.opip.cockpit.portfolio import (
     COCKPIT_PORTFOLIO_PROJECTION_VERSION,
@@ -61,19 +62,43 @@ def _require_secret(value: str | None) -> None:
         )
 
 
-def _writer_client():
-    """The canonical *read* client, or ``None`` when it cannot be constructed.
+def _replica_db_path() -> Path | None:
+    """The verified canonical replica's SQLite path, or ``None`` when absent.
 
-    Returns ``None`` rather than raising so the caller can report an unreadable
-    store as an explicit trust state instead of a 500 that hides the cause.
+    The cockpit's analytical workload belongs on the analytics plane, so this is the
+    *only* store the cockpit reads. It is resolved from the existing replica
+    configuration (``OPIP_CANONICAL_REPLICA_ROOT``, the single knob the replica
+    bridge already uses) rather than from the live production path.
+
+    Returning ``None`` when the replica is absent is deliberate and is what keeps
+    analytics off the trading host: with no replica present the cockpit reports an
+    explicit unavailable state and computes nothing, instead of silently falling back
+    to reading the authoritative production store or the writer RPC.
     """
     try:
-        from app.services.paper_v2_scan_router import _writer_client as resolve
+        from app.opip.learning.canonical_replica import replica_db_path
 
-        return resolve()
-    except Exception:  # noqa: BLE001
-        # An unavailable writer is reported through the response envelope rather
-        # than raised, so the caller can surface an explicit trust state.
+        path = replica_db_path()
+    except Exception:  # noqa: BLE001 - unreadable configuration is reported, not raised
+        return None
+    return path if path.is_file() else None
+
+
+def _replica_reader():
+    """A read-only reader over the replica, or ``None`` when it is unavailable.
+
+    ``CanonicalWriter.for_reads`` opens the store ``mode=ro`` and takes no store
+    lock, so aggregation cannot contend with, or write to, the authoritative
+    production store.
+    """
+    path = _replica_db_path()
+    if path is None:
+        return None
+    try:
+        from app.opip.canonical.writer import CanonicalWriter
+
+        return CanonicalWriter.for_reads(path)
+    except Exception:  # noqa: BLE001 - an unopenable replica is reported, not raised
         return None
 
 
@@ -121,7 +146,7 @@ def _unavailable_overview(reason: str) -> dict:
     return {
         "as_of": as_of,
         "timezone": "UTC",
-        "source": "canonical_paper_v2_ledger",
+        "source": "canonical_replica_ledger",
         "trust": trust,
         "projection_version": COCKPIT_PORTFOLIO_PROJECTION_VERSION,
         "ledger_projection_version": COCKPIT_LEDGER_PROJECTION_VERSION,
@@ -161,22 +186,57 @@ def _unavailable_trade_detail(reason: str) -> dict:
     }
 
 
+def _load_ledger() -> tuple[PaperLedger, str | None]:
+    """Read the analytical ledger from the replica, closing the reader afterwards.
+
+    Returns the ledger plus an unavailability reason when the replica could not be
+    read. The reader is always closed so a per-request read cannot leak a SQLite
+    handle on the analytics plane.
+    """
+    reader = _replica_reader()
+    if reader is None:
+        return _unavailable_ledger("CANONICAL_REPLICA_UNAVAILABLE"), (
+            "CANONICAL_REPLICA_UNAVAILABLE"
+        )
+    try:
+        ledger = read_paper_ledger_from_reader(reader)
+    finally:
+        try:
+            reader.close()
+        except Exception:  # noqa: BLE001 - shutdown must not mask the read result
+            pass
+    return ledger, None
+
+
+def _unavailable_ledger(reason: str) -> PaperLedger:
+    from app.opip.cockpit.trust import unavailable
+
+    return PaperLedger(
+        entries=(),
+        trust=unavailable(reason),
+        details=(f"canonical replica unavailable: {reason}",),
+    )
+
+
 @router.get("/api/cockpit/overview")
 def cockpit_overview(
     x_webhook_secret: str | None = Header(default=None),
 ) -> dict:
-    """Owner overview: per-currency portfolio analytics and attention items."""
-    _require_secret(x_webhook_secret)
-    client = _writer_client()
-    if client is None:
-        return _unavailable_overview("CANONICAL_WRITER_UNAVAILABLE")
+    """Owner overview: per-currency portfolio analytics and attention items.
 
-    ledger = read_paper_ledger(client)
+    Computed from the verified canonical replica on the analytics plane. The trading
+    host holds no replica, so this endpoint cannot run the analytical workload there.
+    """
+    _require_secret(x_webhook_secret)
+    ledger, reason = _load_ledger()
+    if reason is not None:
+        return _unavailable_overview(reason)
+
     overview = build_overview(ledger, now=datetime.now(timezone.utc))
     payload = overview.to_dict()
     payload["as_of"] = _now()
     payload["timezone"] = "UTC"
-    payload["source"] = "canonical_paper_v2_ledger"
+    payload["source"] = "canonical_replica_ledger"
     return payload
 
 
@@ -191,13 +251,10 @@ def cockpit_trades(
     currency = _parse_currency(quote_currency)
     _parse_limit(limit)
 
-    client = _writer_client()
-    if client is None:
-        return _unavailable_trades(
-            "CANONICAL_WRITER_UNAVAILABLE", currency=currency, limit=limit
-        )
+    ledger, reason = _load_ledger()
+    if reason is not None:
+        return _unavailable_trades(reason, currency=currency, limit=limit)
 
-    ledger = read_paper_ledger(client)
     rows = [
         row
         for row in ledger.entries
@@ -235,11 +292,10 @@ def cockpit_trade_detail(
             detail="paper_trade_id is required",
         )
 
-    client = _writer_client()
-    if client is None:
-        return _unavailable_trade_detail("CANONICAL_WRITER_UNAVAILABLE")
+    ledger, reason = _load_ledger()
+    if reason is not None:
+        return _unavailable_trade_detail(reason)
 
-    ledger = read_paper_ledger(client)
     match = next(
         (row for row in ledger.entries if row.paper_trade_id == wanted), None
     )

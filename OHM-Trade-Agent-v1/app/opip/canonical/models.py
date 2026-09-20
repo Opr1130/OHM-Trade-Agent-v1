@@ -321,6 +321,9 @@ class PaperV2ProtectionWorkItem:
     disposition_id: str | None = None
     decision_context_id: str | None = None
     reservation_id: str | None = None
+    #: The admission disposition's canonical occurrence time, carried so analytical
+    #: consumers do not have to re-enumerate admitted history to find it.
+    disposition_time: dict[str, Any] | None = None
     quote_currency: str | None = None
     instrument_version: str | None = None
     native_symbol: str | None = None
@@ -374,6 +377,10 @@ class PaperV2ProtectionWorkItem:
             value = raw.get(key)
             return int(value) if value is not None else None
 
+        def _opt_dict(key: str) -> dict[str, Any] | None:
+            value = raw.get(key)
+            return dict(value) if isinstance(value, dict) else None
+
         def _dicts(key: str) -> list[dict[str, Any]]:
             value = raw.get(key)
             return [dict(item) for item in value] if isinstance(value, list) else []
@@ -383,6 +390,7 @@ class PaperV2ProtectionWorkItem:
             disposition_id=_opt_str("disposition_id"),
             decision_context_id=_opt_str("decision_context_id"),
             reservation_id=_opt_str("reservation_id"),
+            disposition_time=_opt_dict("disposition_time"),
             quote_currency=_opt_str("quote_currency"),
             instrument_version=_opt_str("instrument_version"),
             native_symbol=_opt_str("native_symbol"),

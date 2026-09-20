@@ -400,6 +400,49 @@ leaves Grafana responsible for the evidence that already lands in PostgreSQL
 **This gap is recorded, not worked around.** Adding a canonical Paper-v2 analytics
 stream is a candidate follow-up requiring explicit owner architecture approval.
 
+### 10.4 Analytics-plane separation (ARB ruling implemented)
+
+ARB ruled that the Paper-v2 analytical workload must not run on the trading host, and
+that the existing verified canonical replica must be preferred over any new
+Paper-v2 evidence pipeline. That ruling is now implemented:
+
+```text
+production canonical SQLite            (sole economic authority, on the trading host)
+        |
+existing verified copy-only replica    (read-only, non-authoritative)
+        |
+analytics plane / caller
+        |
+CanonicalWriter.for_reads(store)       (mode=ro, no store lock, no schema init)
+        |
+Paper-v2 ledger + portfolio read models
+        |
+read-only Cockpit response
+```
+
+Rules honoured:
+
+- **Production canonical SQLite remains the sole economic authority.** The cockpit
+  reads only the replica; the live production path is not reachable from
+  `app/api/cockpit.py`.
+- **The replica is read-only and non-authoritative.** `for_reads` opens
+  `mode=ro`, so SQLite itself refuses a write; nothing computed flows back to
+  canonical.
+- **No new droplet, no second database technology, no new scheduler, no duplicate
+  economic authority.** The projection implementation is *shared* between the
+  authoritative writer and the replica reader, because a replica-only query
+  implementation would be a second source of truth for canonical economics.
+- **The trading host retains no analytical workload.** With no replica present the
+  cockpit reports an explicit `UNAVAILABLE` state and computes nothing; it never
+  falls back to the live store or the writer RPC.
+- **Failure isolation.** A missing or unreadable replica degrades the cockpit only;
+  production is unaffected, and an unreadable replica is never reported as an empty
+  but healthy ledger.
+
+Deployment note: the analytics plane must mount the replica (or the cockpit process
+must run where the replica is present). Where the replica is absent the cockpit is
+correctly inert rather than silently reading production.
+
 ### 9.4 Deferred items confirmed against the context
 
 The context's own deferrals match §8 exactly: no composite Intelligence Score, no
