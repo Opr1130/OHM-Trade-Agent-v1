@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 
 from app.api.dashboard import router as dashboard_router
+from app.api.cockpit import router as cockpit_router
 from app.api.routes import router
 from app.core.config import get_settings
 from app.services.legacy_tradingview_guard import evaluate_legacy_tradingview_request
@@ -44,6 +45,7 @@ async def fence_legacy_tradingview(request: Request, call_next):
 
 app.include_router(router)
 app.include_router(dashboard_router)
+app.include_router(cockpit_router)
 
 
 @app.on_event("startup")
