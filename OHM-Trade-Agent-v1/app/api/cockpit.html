@@ -181,19 +181,22 @@ function request(path){
   });
 }
 
-function renderTrust(trust,valuation,foot){
+function renderTrust(trust,valuation,portfolioUncertainty){
   var bar=document.getElementById("trustbar");
   var dims=[
     ["Freshness",trust&&trust.freshness],
     ["Completeness",trust&&trust.completeness],
     ["Simulation fidelity",trust&&trust.fidelity],
-    ["Statistical uncertainty",trust&&trust.uncertainty],
+    /* Statistical uncertainty is a property of the metrics, not of the read, so it
+       reflects the selected portfolio's posture rather than the ledger's. Showing
+       "NONE" here while every aggregate abstains would overstate the evidence. */
+    ["Statistical uncertainty",portfolioUncertainty||(trust&&trust.uncertainty)],
     ["Valuation coverage",valuation&&valuation.status?valuation.status:"UNKNOWN"]
   ];
   var html="";
   for(var i=0;i<dims.length;i++){
     var v=dims[i][1]||"UNKNOWN";
-    var c=(v==="LIVE"||v==="COMPLETE")?"good":(v==="UNKNOWN"||v==="STALE"||v==="UNAVAILABLE"||v==="INCOMPLETE"?"warn":"");
+    var c=(v==="LIVE"||v==="COMPLETE")?"good":(v==="UNKNOWN"||v==="STALE"||v==="UNAVAILABLE"||v==="INCOMPLETE"||v==="INSUFFICIENT_EVIDENCE"?"warn":"");
     html+='<div class="tr"><div class="lbl">'+esc(dims[i][0])+'</div><div class="val '+c+'">'+esc(v)+'</div></div>';
   }
   bar.innerHTML=html;
@@ -207,7 +210,6 @@ function primaryCard(label,value,sub,clsName,help){
 
 function renderOverview(){
   var ov=state.overview;if(!ov)return;
-  renderTrust(ov.trust,ov.valuation);
   document.getElementById("asof").textContent="as-of "+(ov.as_of||"?")+" ("+(ov.timezone||"UTC")+")";
   document.getElementById("projver").textContent="portfolio "+ov.projection_version+" | ledger "+(ov.ledger_projection_version||"-");
 
@@ -219,6 +221,8 @@ function renderOverview(){
   }).join("");
   var port=null;
   for(var i=0;i<ports.length;i++){if(ports[i].quote_currency===state.currency)port=ports[i];}
+
+  renderTrust(ov.trust,ov.valuation,port?port.uncertainty:null);
 
   if(!port){
     document.getElementById("primary").innerHTML='<div class="empty">No canonical Paper-v2 portfolio evidence available.</div>';

@@ -243,7 +243,7 @@ def test_strategy_axis_is_policy_version_not_an_invented_strategy_name():
 
     The document records strategy identity as DERIVABLE from the decision context.
     If a canonical strategy name were ever added, the cockpit contract would need
-    updating, so this pins the current truthful shape.
+    updating, so this pins the current truthful form.
     """
     from app.opip.canonical.decision_context_bridge import DecisionContextFacts
 
@@ -349,7 +349,7 @@ def test_contract_document_forbids_invented_statistical_thresholds():
     assert "Do **not** promote reviewer-supplied N_eff" in protocol_text
 
     # (d) no *asserted* universal threshold. An asserted threshold would appear as a
-    #     rule rather than as a quoted prohibition, so pin the rule-shaped forms.
+    #     rule rather than as a quoted prohibition, so pin the rule-form patterns.
     for asserted in (
         "require N >=",
         "require N >",

@@ -4,7 +4,7 @@ Derives the owner-level portfolio view from the reconciled ledger: the realized
 equity/return trajectory, realized drawdown, strategy/version contribution, recent
 settled trades, current watch and attention items.
 
-The two rules that shape this module
+The two rules that govern this module
 ------------------------------------
 
 **Marked-equity drawdown is reported as UNKNOWN, not zero.** No canonical evidence
