@@ -306,7 +306,54 @@ def test_cockpit_service_app_mounts_only_the_cockpit_router():
         assert forbidden not in paths, f"{forbidden} reachable from the analytics plane"
 
 
+def test_trading_app_does_not_mount_the_cockpit_analytics_router():
+    """The trading process must not expose analytics endpoints.
+
+    Review finding (valid, Greptile P1): the live trading application mounted the
+    cockpit router, leaving replica-reading endpoints available inside the trading
+    process. That crosses the production/analytics plane boundary, and the endpoints
+    could never succeed there because the replica is absent.
+
+    Checked via the AST so the comment explaining the omission is not mistaken for a
+    mount.
+    """
+    import ast
+
+    source = (REPO / "app" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            # Any include_router(...) argument must not be a cockpit router.
+            for argument in node.args:
+                name = getattr(argument, "id", None)
+                if name:
+                    imported.add(name)
+
+    assert "cockpit_router" not in imported
+    assert "app.api.cockpit" not in {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+
+
+def test_cockpit_is_reachable_only_through_the_analytics_plane_app():
+    """The dedicated service remains the single serving path."""
+    from app.api import cockpit_service
+
+    paths = _app_api_paths(cockpit_service.app)
+    assert "/api/cockpit/overview" in paths
+    assert "/cockpit" in paths
+
+
 def test_cockpit_service_app_exposes_no_write_routes():
+    """The analytics-plane app accepts only read methods."""
     from app.api import cockpit_service
 
     spec = cockpit_service.app.openapi()
