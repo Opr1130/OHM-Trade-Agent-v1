@@ -67,11 +67,9 @@ from app.opip.contracts.paper_execution_events import (
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_v2_identity import (
-    paper_v2_attempt_id,
     paper_v2_entry_attempt_id,
     paper_v2_entry_fill_id,
     paper_v2_entry_order_intent_id,
-    paper_v2_fill_id,
     paper_v2_no_fill_reconciliation_id,
     paper_v2_protection_plan_id,
 )

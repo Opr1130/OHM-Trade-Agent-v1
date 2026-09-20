@@ -49,7 +49,6 @@ from app.opip.contracts.paper_execution_runtime import (
 from app.opip.contracts.serialization import iso_z
 from app.services.paper_v2_execution import (
     PaperV2Opportunity,
-    build_disposition_id,
     run_paper_v2_opportunity,
 )
 from app.services.paper_v2_protection_runtime import (

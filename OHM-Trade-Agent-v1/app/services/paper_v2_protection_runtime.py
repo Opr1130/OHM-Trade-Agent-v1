@@ -63,10 +63,8 @@ from app.opip.contracts.paper_execution import (
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_FILL_RECORDED,
-    PAPER_ORDER_INTENT_RECORDED,
     PAPER_PROTECTION_PLAN_RECORDED,
     PAPER_PROTECTION_STATE_RECORDED,
-    PAPER_PROTECTION_TRIGGER_RECORDED,
     PAPER_RECONCILIATION_RECORDED,
     paper_evidence_idempotency_key,
     validate_paper_evidence_payload,
