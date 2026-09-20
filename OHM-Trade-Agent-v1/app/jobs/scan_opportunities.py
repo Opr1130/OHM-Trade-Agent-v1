@@ -653,6 +653,58 @@ def _recover_outstanding_paper_v2_trades(settings) -> None:
         )
 
 
+def _run_paper_v2_protection_sweep(settings, *, requested: bool):
+    """Advance protection/EXIT/reconciliation for committed Paper-v2 exposure.
+
+    Runs on the existing scheduled scan instead of a new scheduler, and
+    deliberately *independently* of new-entry authority. Cutover readiness governs
+    who may open a new position; it must never abandon one that is already open. So
+    this sweep still protects existing exposure when the mode is off, or when the
+    legacy drain verdict is DRAINING or UNAVAILABLE.
+
+    Fail-soft in the sense that it never aborts the market scan, but fail-*closed*
+    for new authority: an unavailable or unsafe result withholds new Paper-v2
+    admissions rather than being reported as healthy. It never falls back to a
+    legacy authority.
+
+    ``requested`` only controls verbosity. A deployment that never enabled Paper v2
+    should not print a lifecycle block on every scan, but a lifecycle *failure* is
+    always reported because it can withhold new authority.
+    """
+    try:
+        from app.services.paper_v2_protection_runtime import run_protection_sweep
+
+        client = _paper_v2_writer_client()
+        if client is None:
+            print("PAPER V2 protection: canonical writer unavailable")
+            return None
+        from app.services.paper_v2_scan_router import _kraken_client
+
+        result = run_protection_sweep(
+            client, kraken_client=_kraken_client(), settings=settings
+        )
+    except Exception as exc:  # noqa: BLE001 - must not abort the market scan
+        print(
+            "PAPER V2 protection sweep failed:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    if requested or result.considered > 0:
+        print("===== PAPER V2 PROTECTION / EXIT SWEEP =====")
+        print("Trades considered:", result.considered)
+        print("Plans activated:", result.activated)
+        print("Protection triggers:", result.triggered)
+        print("EXIT attempts:", result.exit_attempted)
+        print("EXIT fills:", result.filled)
+        print("Partial target exits:", result.partially_exited)
+        print("Trades terminalized:", result.terminalized)
+        print("Retryable lifecycle work:", result.retryable)
+        print("New admissions allowed:", result.new_admissions_allowed)
+        for detail in result.details:
+            print("  PAPER V2 protection:", detail)
+    return result
+
+
 def _print_paper_v2_summary(summary) -> None:
     """Operator-observable accounting for the active Paper-v2 route."""
     if summary is None:
@@ -2103,8 +2155,22 @@ def main():
     # admission, so an interrupted accepted attempt is completed even if the
     # opportunity that created it never qualifies again. It cannot admit, requalify
     # or change any economics - it only continues committed trades.
-    if authority.paper_v2_routing:
-        _recover_outstanding_paper_v2_trades(settings)
+    #
+    # Both the entry recovery and the protection sweep run on the existing scan
+    # cadence and independent of new-entry authority: an obligation created by
+    # Paper v2 stays protected even if the mode is later switched off or the legacy
+    # drain verdict becomes unavailable. Authority gates NEW entries, not the safety
+    # of positions that already exist.
+    _recover_outstanding_paper_v2_trades(settings)
+    protection_sweep = _run_paper_v2_protection_sweep(
+        settings, requested=authority.requested
+    )
+    # Protection of existing exposure outranks admission of new exposure. An
+    # unavailable or unsafe sweep withholds new Paper-v2 entries this scan; it never
+    # authorizes a legacy fallback.
+    lifecycle_healthy = (
+        protection_sweep is not None and protection_sweep.new_admissions_allowed
+    )
 
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
@@ -2149,15 +2215,27 @@ def main():
     if authority.paper_v2_routing:
         # Granted: O'Pip Paper v2 is the sole NEW paper-entry authority. Neither
         # legacy authority is invoked, and no failure path below can reach one.
-        paper_v2_summary = _route_paper_v2_opportunities(
-            ranked_opportunities,
-            scan=scan,
-            decision_at=decision_at,
-            stamp=paper_v2_stamp,
-            settings=settings,
-            opip=opip,
-        )
-        _print_paper_v2_summary(paper_v2_summary)
+        if not lifecycle_healthy:
+            # Existing exposure could not be advanced safely this scan, so the
+            # lifecycle state is not healthy enough to take on more. Withhold new
+            # authority only; recovery retries on the next scan and no legacy
+            # authority is reached.
+            print("===== PAPER V2 ADMISSIONS WITHHELD =====")
+            print("Reason: existing protection lifecycle is not healthy this scan")
+            print("New Paper-v2 entries: 0")
+            print("New Freqtrade entries: 0")
+            print("New Paper-v1 enrollments: 0")
+            print("Legacy fallback: none")
+        else:
+            paper_v2_summary = _route_paper_v2_opportunities(
+                ranked_opportunities,
+                scan=scan,
+                decision_at=decision_at,
+                stamp=paper_v2_stamp,
+                settings=settings,
+                opip=opip,
+            )
+            _print_paper_v2_summary(paper_v2_summary)
     elif authority.legacy_new_entry_allowed:
         freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
             ranked_opportunities,

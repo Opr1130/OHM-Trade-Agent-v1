@@ -223,7 +223,7 @@ def _require(condition: bool, message: str) -> None:
         raise PaperV2ExecutionError(message)
 
 
-def _submit(
+def submit_canonical_event(
     client: Any,
     *,
     event_type: str,
@@ -561,7 +561,7 @@ def _advance_admitted_trade(
         client=client,
         progress=progress,
         settings=settings,
-        moment=_next_execution_moment(
+        moment=next_execution_moment(
             execution_clock,
             floor=require_utc(
                 opportunity.evidence_cutoff, field_name="evidence_cutoff"
@@ -575,7 +575,7 @@ def _advance_admitted_trade(
     if progress.entry_order_intent is not None:
         entry_payload = dict(progress.entry_order_intent)
     else:
-        intent_moment = _next_execution_moment(
+        intent_moment = next_execution_moment(
             execution_clock,
             floor=require_utc(
                 opportunity.evidence_cutoff, field_name="evidence_cutoff"
@@ -604,7 +604,7 @@ def _advance_admitted_trade(
             "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
             "reservation_id": reservation_id,
         }
-        _submit(
+        submit_canonical_event(
             client,
             event_type=PAPER_ORDER_INTENT_RECORDED,
             key=paper_evidence_idempotency_key(
@@ -626,7 +626,7 @@ def _advance_admitted_trade(
                 "committed attempt cites quote evidence that cannot be resolved"
             )
         quote = dict(committed_quote)
-        attempt_floor = _temporal_instant(
+        attempt_floor = temporal_instant(
             attempt_payload["attempt_time"], field_name="attempt_time"
         )
     else:
@@ -634,7 +634,7 @@ def _advance_admitted_trade(
         # pre-attempt failures provably occur before any exposure exists and before
         # any fill-capable attempt, so they may be terminalized as a zero-fill trade.
         try:
-            quote, received_at = _commit_quote(
+            quote, received_at = commit_execution_quote(
                 opportunity,
                 client=client,
                 kraken_client=kraken_client,
@@ -647,9 +647,9 @@ def _advance_admitted_trade(
             # produces no exposure at all.
             _require_executable_entry(opportunity, quote=quote)
         except PaperV2ExecutionError as exc:
-            raise _PreAttemptTerminalStop(str(exc)) from exc
+            raise PreAttemptTerminalStop(str(exc)) from exc
         attempt_floor = received_at
-        attempt_moment = _next_execution_moment(
+        attempt_moment = next_execution_moment(
             execution_clock,
             floor=attempt_floor,
             field_name="attempt_time",
@@ -672,7 +672,7 @@ def _advance_admitted_trade(
             "accepted_quantity": float(opportunity.requested_quantity),
             "market_evidence_ref": quote["quote_evidence_id"],
         }
-        _submit(
+        submit_canonical_event(
             client,
             event_type=PAPER_EXECUTION_ATTEMPT_RECORDED,
             key=paper_evidence_idempotency_key(
@@ -694,7 +694,7 @@ def _advance_admitted_trade(
         fill_quantity = float(attempt_payload["accepted_quantity"])
         if (
             abs(fill_quantity - float(opportunity.requested_quantity))
-            > _QUANTITY_TOLERANCE
+            > QUANTITY_TOLERANCE
         ):
             raise PaperV2ExecutionError(
                 "committed attempt quantity does not match the approved request"
@@ -703,7 +703,7 @@ def _advance_admitted_trade(
         executable_price = float(quote["best_ask"])
         economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
         cost = economics.cost_components(fill_quantity, executable_price)
-        fill_moment = _next_execution_moment(
+        fill_moment = next_execution_moment(
             execution_clock,
             floor=attempt_floor,
             field_name="fill_time",
@@ -735,7 +735,7 @@ def _advance_admitted_trade(
             "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
             "market_evidence_ref": quote["quote_evidence_id"],
         }
-        _submit(
+        submit_canonical_event(
             client,
             event_type=PAPER_FILL_RECORDED,
             key=paper_evidence_idempotency_key(PAPER_FILL_RECORDED, fill_payload),
@@ -768,7 +768,7 @@ def _advance_admitted_trade(
 _NOTIONAL_TOLERANCE_USD = 0.01
 
 #: Quantity tolerance for the displayed Level-1 depth check.
-_QUANTITY_TOLERANCE = 1e-9
+QUANTITY_TOLERANCE = 1e-9
 
 
 def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping[str, Any]) -> None:
@@ -819,14 +819,14 @@ def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping
         )
 
     ask_quantity = float(quote["ask_quantity"])
-    if quantity > ask_quantity + _QUANTITY_TOLERANCE:
+    if quantity > ask_quantity + QUANTITY_TOLERANCE:
         raise PaperV2ExecutionError(
             "requested quantity exceeds the displayed Level-1 ask quantity; "
             "no approved depth or partial-fill model exists"
         )
 
 
-class _PreAttemptTerminalStop(RuntimeError):
+class PreAttemptTerminalStop(RuntimeError):
     """A fail-closed stop that provably occurred BEFORE any fill-capable attempt.
 
     Only this shape may be terminalized as a zero-fill trade, because only here does
@@ -840,7 +840,7 @@ class _PreAttemptTerminalStop(RuntimeError):
         self.reason = reason
 
 
-class _ExecutionRetryRequired(RuntimeError):
+class ExecutionRetryRequired(RuntimeError):
     """The trade cannot safely continue now, but must NOT be released.
 
     Raised once a fill-capable attempt exists, or once exposure already does: the
@@ -853,7 +853,7 @@ class _ExecutionRetryRequired(RuntimeError):
         self.reason = reason
 
 
-def _next_execution_moment(
+def next_execution_moment(
     clock: Callable[[], datetime],
     *,
     floor: datetime,
@@ -877,8 +877,8 @@ def _next_execution_moment(
     if moment < floor:
         message = f"{field_name} regressed behind the causal floor for this execution"
         if release_safe:
-            raise _PreAttemptTerminalStop(message)
-        raise _ExecutionRetryRequired(message)
+            raise PreAttemptTerminalStop(message)
+        raise ExecutionRetryRequired(message)
     return moment
 
 
@@ -962,10 +962,10 @@ def _complete_committed_fill(
     executable_price = float(quote["best_ask"])
     economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
     cost = economics.cost_components(fill_quantity, executable_price)
-    attempt_floor = _temporal_instant(
+    attempt_floor = temporal_instant(
         attempt["attempt_time"], field_name="attempt_time"
     )
-    fill_moment = _next_execution_moment(
+    fill_moment = next_execution_moment(
         execution_clock,
         floor=attempt_floor,
         field_name="fill_time",
@@ -995,7 +995,7 @@ def _complete_committed_fill(
         "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
         "market_evidence_ref": str(attempt["market_evidence_ref"]),
     }
-    _submit(
+    submit_canonical_event(
         client,
         event_type=PAPER_FILL_RECORDED,
         key=paper_evidence_idempotency_key(PAPER_FILL_RECORDED, fill_payload),
@@ -1004,7 +1004,7 @@ def _complete_committed_fill(
     )
 
 
-def _temporal_instant(value: Any, *, field_name: str) -> datetime:
+def temporal_instant(value: Any, *, field_name: str) -> datetime:
     """The instant from a committed canonical temporal-evidence object."""
     if not isinstance(value, Mapping):
         raise PaperV2ExecutionError(f"{field_name} is not canonical temporal evidence")
@@ -1077,7 +1077,7 @@ def _terminalize_zero_fill(
         "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
     }
     try:
-        _submit(
+        submit_canonical_event(
             client,
             event_type=PAPER_RECONCILIATION_RECORDED,
             key=paper_evidence_idempotency_key(
@@ -1159,7 +1159,7 @@ def _admit(
     )
 
 
-def _commit_quote(
+def commit_execution_quote(
     opportunity: PaperV2Opportunity,
     *,
     client: Any,
@@ -1197,7 +1197,7 @@ def _commit_quote(
     except QuoteEvidenceUnavailableError as exc:
         raise PaperV2ExecutionError(f"execution quote unavailable: {exc}") from exc
 
-    _submit(
+    submit_canonical_event(
         client,
         event_type=PAPER_QUOTE_EVIDENCE_RECORDED,
         key=quote_evidence_idempotency_key(payload),
@@ -1240,7 +1240,7 @@ def _ensure_protection_plan(
         tp1_fraction=float(getattr(settings, "paper_v2_tp1_fraction", 0.5)),
         max_hold_seconds=int(getattr(settings, "paper_v2_max_hold_seconds", 86_400)),
     )
-    _submit(
+    submit_canonical_event(
         client,
         event_type="paper_protection.plan.recorded",
         key=protection_plan_idempotency_key(payload),
@@ -1251,9 +1251,18 @@ def _ensure_protection_plan(
 
 
 __all__ = [
+    "ExecutionRetryRequired",
     "PaperV2ExecutionError",
     "PaperV2ExecutionResult",
     "PaperV2Opportunity",
+    "PreAttemptTerminalStop",
+    "QUANTITY_TOLERANCE",
     "build_disposition_id",
+    "commit_execution_quote",
+    "next_execution_moment",
+    "recover_after_admitted_failure",
+    "recover_outstanding_paper_v2_trades",
     "run_paper_v2_opportunity",
+    "submit_canonical_event",
+    "temporal_instant",
 ]

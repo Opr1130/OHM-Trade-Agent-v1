@@ -16,6 +16,8 @@ from app.opip.canonical.models import (
     PaperV2ActiveExposure,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2ProtectionWork,
+    PaperV2ProtectionWorkItem,
     PaperV2RecoverableExecutions,
     PendingHandoff,
     WriterAck,
@@ -65,9 +67,11 @@ from app.opip.contracts.paper_execution_events import (
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_v2_identity import (
+    paper_v2_attempt_id,
     paper_v2_entry_attempt_id,
     paper_v2_entry_fill_id,
     paper_v2_entry_order_intent_id,
+    paper_v2_fill_id,
     paper_v2_no_fill_reconciliation_id,
     paper_v2_protection_plan_id,
 )
@@ -1035,6 +1039,197 @@ class CanonicalWriter:
                 )
         entries.sort(key=lambda entry: entry["paper_trade_id"])
         return PaperV2RecoverableExecutions(status="OK", entries=entries)
+
+    def paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        """Read-only projection of trades requiring protection/exit attention.
+
+        Pure read. Enumerates admitted trades once, then reads each trade's
+        lifecycle through the per-trade ``paper_trade_id`` expression index rather
+        than scanning historical event families per trade, so cost scales with the
+        number of live trades times their own events, not with total canonical
+        history. Includes trades that are flat but not yet ``FINAL_VERIFIED``, which
+        are absent from the active-exposure projection once the SELL fill lands.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_protection_work_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2ProtectionWork(
+                    status="REJECTED",
+                    error_code="PROTECTION_WORK_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2ProtectionWork(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_protection_work_unlocked(self) -> PaperV2ProtectionWork:
+        final_verified = self._final_verified_trade_ids()
+        items: list[PaperV2ProtectionWorkItem] = []
+        for disposition in self._admitted_dispositions():
+            paper_trade_id = str(disposition.get("paper_trade_id") or "")
+            if not paper_trade_id:
+                continue
+            items.append(
+                self._protection_work_item(
+                    paper_trade_id,
+                    disposition=disposition,
+                    final_verified=paper_trade_id in final_verified,
+                )
+            )
+        items.sort(key=lambda item: item.paper_trade_id)
+        return PaperV2ProtectionWork(status="OK", items=items)
+
+    def _paper_trade_events(self, event_type: str, paper_trade_id: str) -> list[dict]:
+        """Committed records of one event type for one trade, in commit order."""
+        rows = self._conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.paper_trade_id') = ? "
+            "ORDER BY history_epoch ASC, local_sequence ASC",
+            (event_type, paper_trade_id),
+        ).fetchall()
+        return [
+            validate_paper_evidence_payload(
+                event_type, json.loads(str(row["payload_json"]))
+            )
+            for row in rows
+        ]
+
+    def _protection_work_item(
+        self,
+        paper_trade_id: str,
+        *,
+        disposition: Mapping[str, object],
+        final_verified: bool,
+    ) -> PaperV2ProtectionWorkItem:
+        totals = self._canonical_totals_for_trade(
+            paper_trade_id, paper_v2_entry_order_intent_id(paper_trade_id)
+        )
+        entry_fills = [
+            fill
+            for fill in self._paper_fills_for_trade(paper_trade_id)
+            if str(fill["order_intent_id"]) == paper_v2_entry_order_intent_id(
+                paper_trade_id
+            )
+        ]
+        exit_fills = [
+            fill
+            for fill in self._paper_fills_for_trade(paper_trade_id)
+            if str(fill["order_intent_id"])
+            != paper_v2_entry_order_intent_id(paper_trade_id)
+        ]
+        orders = self._paper_trade_events(
+            PAPER_ORDER_INTENT_RECORDED, paper_trade_id
+        )
+        exit_orders = [
+            order for order in orders if str(order["intent_role"]) == "EXIT"
+        ]
+        attempts = self._paper_trade_events(
+            PAPER_EXECUTION_ATTEMPT_RECORDED, paper_trade_id
+        )
+        exit_order_ids = {str(order["order_intent_id"]) for order in exit_orders}
+        exit_attempts = [
+            attempt
+            for attempt in attempts
+            if str(attempt["order_intent_id"]) in exit_order_ids
+        ]
+        triggers = self._paper_trade_events(
+            PAPER_PROTECTION_TRIGGER_RECORDED, paper_trade_id
+        )
+        states = self._paper_trade_events(
+            PAPER_PROTECTION_STATE_RECORDED, paper_trade_id
+        )
+        reconciliations = self._paper_trade_events(
+            PAPER_RECONCILIATION_RECORDED, paper_trade_id
+        )
+
+        plan = self._latest_protection_plan(paper_trade_id)
+        plan_id = str(plan["protection_plan_id"]) if plan else None
+        state_value = (
+            self._effective_protection_state(plan_id).value if plan_id else None
+        )
+        state_seq = max((int(item["state_seq"]) for item in states), default=None)
+        trigger_seq = max((int(item["trigger_seq"]) for item in triggers), default=None)
+        latest_reconciliation = (
+            max(reconciliations, key=lambda item: int(item["reconciliation_seq"]))
+            if reconciliations
+            else None
+        )
+        # An EXIT order is fill-capable while it has an attempt in a fillable state
+        # and no committed fill for that order yet.
+        filled_order_ids = {str(fill["order_intent_id"]) for fill in exit_fills}
+        exit_fill_capable = any(
+            str(attempt["execution_state"]) in _FILLABLE_STATE_VALUES
+            and str(attempt["order_intent_id"]) not in filled_order_ids
+            for attempt in exit_attempts
+        )
+        context_id = str(disposition.get("decision_context_id") or "") or None
+        quote_evidence: dict[str, dict[str, Any]] = {}
+        for record in list(triggers) + list(exit_attempts):
+            quote_ref = record.get("market_evidence_ref")
+            if isinstance(quote_ref, str) and quote_ref and quote_ref not in quote_evidence:
+                try:
+                    quote_evidence[quote_ref] = self._load_quote_evidence_by_id(quote_ref)
+                except ValueError:
+                    continue
+        instrument_version = None
+        native_symbol = None
+        if context_id:
+            try:
+                context = self._load_context_by_id(context_id)
+            except ValueError:
+                context = None
+            if isinstance(context, Mapping):
+                instrument_version = str(context.get("instrument_version") or "") or None
+                snapshot_id = str(context.get("snapshot_id") or "")
+                snapshot = (
+                    self._load_decision_snapshot_by_id(snapshot_id)
+                    if snapshot_id
+                    else {}
+                )
+                inner = snapshot.get("snapshot_payload") if snapshot else None
+                if isinstance(inner, Mapping):
+                    base = str(inner.get("base_asset") or "")
+                    native_symbol = (
+                        f"{base}/USD" if base else None
+                    )
+
+        return PaperV2ProtectionWorkItem(
+            paper_trade_id=paper_trade_id,
+            disposition_id=str(disposition.get("disposition_id") or "") or None,
+            decision_context_id=context_id,
+            reservation_id=str(disposition.get("reservation_id") or "") or None,
+            quote_currency=str(disposition.get("quote_currency") or "") or None,
+            instrument_version=instrument_version,
+            native_symbol=native_symbol,
+            entry_quantity=float(totals["entry_quantity"]),
+            exited_quantity=float(totals["exit_quantity"]),
+            remaining_quantity=float(totals["remaining_quantity"]),
+            gross_pnl=float(totals["gross_pnl"]),
+            execution_costs=float(totals["execution_costs"]),
+            reserved_capital=float(
+                disposition.get("requested_reservation_amount") or 0.0
+            ),
+            protection_plan=plan,
+            protection_state=state_value,
+            plan_seq=int(plan["plan_seq"]) if plan else None,
+            state_seq=state_seq,
+            trigger_seq=trigger_seq,
+            triggers=triggers,
+            protection_states=states,
+            exit_order_intents=exit_orders,
+            exit_attempts=exit_attempts,
+            exit_fills=exit_fills,
+            entry_fills=entry_fills,
+            latest_reconciliation=latest_reconciliation,
+            quote_evidence=quote_evidence,
+            exit_attempt_fill_capable=exit_fill_capable,
+            final_verified=final_verified,
+        )
 
     def paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState:
         """Read-only projection of one Paper-v2 trade's canonical progress.
@@ -3348,6 +3543,23 @@ class CanonicalWriter:
             ):
                 activated.append((int(plan["plan_seq"]), plan_id))
         return sorted(activated)
+
+    def _latest_protection_plan(self, paper_trade_id: str) -> dict | None:
+        """The highest-sequenced *committed* plan for a trade, activated or not.
+
+        ``_effective_protection_plan`` deliberately returns only plans that state
+        evidence proves activated, which is the right answer for trigger validation
+        but the wrong one for arming: a plan committed before exposure is precisely
+        the plan that has not been activated yet. Protection work therefore needs
+        the latest committed revision, which is what this returns.
+
+        Read through the per-trade ``paper_trade_id`` index so it never scans the
+        plan history of other trades.
+        """
+        plans = self._paper_trade_events(PAPER_PROTECTION_PLAN_RECORDED, paper_trade_id)
+        if not plans:
+            return None
+        return max(plans, key=lambda plan: int(plan["plan_seq"]))
 
     def _effective_protection_plan(self, paper_trade_id: str) -> dict | None:
         """The effective plan is the highest activated plan_seq for the trade."""

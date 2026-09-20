@@ -16,6 +16,7 @@ from app.opip.canonical.models import (
     PaperPortfolioState,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2ProtectionWork,
     PaperV2RecoverableExecutions,
     WriterAck,
     WriterIntent,
@@ -278,6 +279,15 @@ class CanonicalWriterServer:
                     error_code="WORKER_UNHEALTHY",
                 ).to_dict()
             return self.writer.paper_v2_recoverable_executions().to_dict()
+        if method == "GET_PAPER_V2_PROTECTION_WORK":
+            # Read-only protection/exit work projection, health-gated for the same
+            # reason: an unhealthy store must not report "nothing to protect".
+            if self._health_status() != "OK":
+                return PaperV2ProtectionWork(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_protection_work().to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

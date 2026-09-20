@@ -624,13 +624,19 @@ def test_active_mode_excludes_both_legacy_authorities(monkeypatch, writer_env):
     assert rows == 1
 
 
-def test_active_mode_never_falls_back_after_a_paper_v2_failure(monkeypatch):
+def test_active_mode_never_falls_back_after_a_paper_v2_failure(monkeypatch, writer_env):
     def _explode(ranked, **kwargs):
         raise RuntimeError("paper v2 router exploded")
+
+    server, client = writer_env
+    set_writer_client_for_tests(client)
+    set_kraken_client_for_tests(KrakenClient(transport=_EchoTransport(requests=[])))
 
     _settings, calls, _observer, _ranked = _install_scan(
         monkeypatch, mode="active", router_recorder=_explode
     )
+    # The lifecycle sweep is healthy (no committed exposure), so the router is
+    # reached and its failure must propagate rather than become a legacy execution.
     with pytest.raises(RuntimeError):
         scan_opportunities.main()
     # The failure is not converted into a legacy execution.

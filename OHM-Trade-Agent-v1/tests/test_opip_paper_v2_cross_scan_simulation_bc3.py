@@ -11,11 +11,13 @@ proves the invariants that only appear across scans:
 * S3  an interrupted, accepted-but-unfilled attempt survives the loss of its
       opportunity and is completed by canonical recovery in a fresh process;
 * S4  a restart reproduces every projection byte-for-byte and never re-executes;
-* S5  the *canonical closure contract* removes exposure and releases capacity
-      exactly once (see "Known gap" — no production exit producer exists yet);
+* S5  the **production protection runtime** closes the filled exposure end-to-end:
+     it arms the committed plan, triggers the atomic B/C-2 protection action on a
+     fresh public book, executes the committed EXIT order into a SELL fill,
+     reconciles FLAT -> FINAL_VERIFIED and releases capacity exactly once;
 * S6  the freed capacity is genuinely reusable by a later candidate;
 * S7  the legacy drain gate moves DRAINING -> READY across scans with no
-      configuration change, and only then may Paper v2 admit;
+     configuration change, and only then may Paper v2 admit;
 * S8  an unreadable legacy state fails closed to UNAVAILABLE and recovers.
 
 Test order is significant and intentional: the module-scoped ``env`` fixture
@@ -30,25 +32,20 @@ rejects such a selection with an explicit message naming the missing earlier
 phases, rather than letting it fail as an incidental ``KeyError``. It never skips
 or weakens an assertion. Run the module whole.
 
-Known gap this module does NOT close
-------------------------------------
+The lifecycle gap this module previously documented is closed
+------------------------------------------------------------
 
-Filled Paper-v2 exposure has **no production path to closure**. As of this commit:
+Earlier revisions of this module recorded a known gap: filled Paper-v2 exposure had
+no production path to closure, because nothing in ``app/`` called
+``trigger_paper_protection_action``, nothing constructed an EXIT order intent, no
+production code produced a SELL fill, and the only reconciliation producer was the
+zero-fill terminalizer.
 
-* nothing in ``app/`` calls ``trigger_paper_protection_action`` (the writer RPC and
-  client method exist, but no production caller does);
-* nothing in ``app/`` constructs an EXIT order intent;
-* no production code produces a SELL fill;
-* the only reconciliation producer in ``app/`` is the zero-fill terminalizer, which
-  by design refuses once exposure exists.
-
-Consequently a trade that reaches a fill keeps its reservation and slot for the
-lifetime of the canonical store: capacity consumed by a filled Paper-v2 trade is
-never returned. S5 exercises the writer's closure *contract* with hand-built
-canonical evidence, which is why it is not presented as an end-to-end lifecycle
-proof. Wiring a production exit/close producer is B/C-2 scope and is not part of
-this cutover-wiring change; until it exists, operating Paper v2 with the mode
-``active`` can exhaust capacity.
+That gap is closed. ``app/services/paper_v2_protection_runtime.py`` is now the
+production path, invoked from the existing scheduled scan, and S5 drives **it**
+rather than assembling evidence by hand. S5 therefore asserts the runtime's own
+deterministic EXIT order identity, which is only possible if the action really went
+through the writer's atomic protection-action RPC.
 
 Stubs and the invariants that stay real
 ---------------------------------------
@@ -89,27 +86,18 @@ import pytest
 
 from app.exchanges.kraken import KrakenClient
 from app.opip.canonical.client import InProcessWriterClient
-from app.opip.canonical.models import WriterIntent
-from app.opip.canonical.paths import SCHEMA_VERSION
 from app.opip.canonical.server import CanonicalWriterServer
 from app.opip.contracts.identity import InstrumentVersion
-from app.opip.contracts.paper_execution import (
-    ENGINE_OPIP_PAPER_V2,
-    PAPER_ECONOMIC_MODEL_VERSION,
-    PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-    PAPER_EXECUTION_MODEL_VERSION,
-)
 from app.opip.contracts.paper_execution_events import (
     PAPER_EXECUTION_ATTEMPT_RECORDED,
     PAPER_FILL_RECORDED,
     PAPER_ORDER_INTENT_RECORDED,
     PAPER_PROTECTION_PLAN_RECORDED,
+    PAPER_PROTECTION_TRIGGER_RECORDED,
     PAPER_RECONCILIATION_RECORDED,
-    paper_evidence_idempotency_key,
 )
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_QUOTE_EVIDENCE_RECORDED,
-    quote_evidence_idempotency_key,
 )
 from app.services.paper_v2_execution import (
     PaperV2ExecutionError,
@@ -128,9 +116,6 @@ QUALIFICATION_TIME = NOW + timedelta(seconds=5)
 #: The fixture book's own source instant. Earlier than every execution reading,
 #: which is the real production ordering the writer enforces.
 QUOTE_PUBLISHED_AT = "2026-09-19T11:59:59Z"
-#: A later instant used for the canonical closure of an already-open exposure.
-CLOSURE_TS = "2026-09-19T14:00:00Z"
-
 #: Canonical event types the simulation counts and inspects.
 CTX_EVENT = "decision_intelligence.context.recorded"
 DISPOSITION_EVENT = "paper_execution.opportunity_disposition.recorded"
@@ -178,19 +163,26 @@ class _BookTransport:
         ask: float = 100.0,
         bid_qty: float = 10.0,
         ask_qty: float = 12.0,
+        publication_ts: str | None = None,
     ) -> None:
         self.requests: list[tuple[str, Any]] = []
         self._bid = float(bid)
         self._ask = float(ask)
         self._bid_qty = float(bid_qty)
         self._ask_qty = float(ask_qty)
+        #: The venue's own publication instant. Distinct successive readings must
+        #: carry distinct instants: quote evidence is committed under an identity
+        #: derived from that instant, so re-reading at the same instant with a
+        #: different price is (correctly) refused as a payload conflict.
+        self._publication_ts = publication_ts or QUOTE_PUBLISHED_AT
 
     def request(self, endpoint, params, timeout_seconds):
         self.requests.append((endpoint, params.get("symbol")))
+        ts = self._publication_ts
         return {
             "symbol": params.get("symbol"),
-            "bids": [{"price": self._bid, "qty": self._bid_qty, "publication_ts": QUOTE_PUBLISHED_AT}],
-            "asks": [{"price": self._ask, "qty": self._ask_qty, "publication_ts": QUOTE_PUBLISHED_AT}],
+            "bids": [{"price": self._bid, "qty": self._bid_qty, "publication_ts": ts}],
+            "asks": [{"price": self._ask, "qty": self._ask_qty, "publication_ts": ts}],
         }
 
     def telemetry_snapshot(self) -> dict:
@@ -265,7 +257,7 @@ _REQUIRES: dict[str, tuple[str, ...]] = {
         "BTCUSD",
         "SOLUSD",
     ),
-    "test_s5_canonical_closure_removes_exposure_and_releases_once": (
+    "test_s5_production_runtime_closes_paper_v2_exposure_and_releases_capacity": (
         "BTCUSD",
         "SOLUSD",
     ),
@@ -383,7 +375,7 @@ def _snapshot_payload(*, symbol: str, decision: datetime = NOW) -> dict:
     )[0]
 
 
-def _opportunity(production_symbol: str) -> PaperV2Opportunity:
+def _opportunity(production_symbol: str, *, stop_price: float = 90.0) -> PaperV2Opportunity:
     """A qualified LONG opportunity for one production symbol.
 
     Geometry and capital are the approved, already-qualified facts the producer
@@ -419,7 +411,7 @@ def _opportunity(production_symbol: str) -> PaperV2Opportunity:
         entry_low=99.0,
         entry_high=101.0,
         chase_limit=102.0,
-        stop_price=90.0,
+        stop_price=stop_price,
         target_prices=(110.0, 120.0),
     )
 
@@ -527,27 +519,6 @@ def _first_sequence(writer, event_type: str) -> int:
 
 def _family_counts(writer) -> dict[str, int]:
     return {event_type: _count(writer, event_type) for event_type in _EXECUTION_FAMILIES}
-
-
-def _submit(writer, event_type: str, payload: dict):
-    """Submit one raw canonical evidence record through the real writer."""
-    if event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
-        key = quote_evidence_idempotency_key(payload)
-    else:
-        key = paper_evidence_idempotency_key(event_type, payload)
-    return writer.submit(
-        WriterIntent(
-            schema_version=SCHEMA_VERSION,
-            priority="LOW",
-            idempotency_key=key,
-            event_type=event_type,
-            payload=dict(payload),
-        )
-    )
-
-
-def _exact(ts: str) -> dict:
-    return {"precision": "EXACT", "basis": "SOURCE_REPORTED", "occurred_at": ts}
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +798,7 @@ def test_s3_interrupted_accepted_attempt_survives_loss_of_opportunity(env):
         readings, fallback=QUALIFICATION_TIME + timedelta(seconds=60)
     )
     with pytest.raises(PaperV2ExecutionError):
-        _run(env, _opportunity("SOLUSD"), clock=clock)
+        _run(env, _opportunity("SOLUSD", stop_price=50.0), clock=clock)
 
     state = env.client.get_paper_v2_execution_state(disposition_id)
     assert state.status == "OK"
@@ -947,151 +918,159 @@ def test_s4_restart_reproduces_projections_and_never_re_executes(env):
 # ===========================================================================
 
 
-def test_s5_canonical_closure_removes_exposure_and_releases_once(env):
-    """Proves the *canonical closure contract* releases exposure and capacity once.
+def _closure_sweep(env, *, published_at: str, bid: float, ask: float):
+    """Run the REAL protection runtime against a fresh public book.
 
-    Scope: this exercises the writer's frozen rules — exit-capacity, aggregate
-    conservation and terminal reconciliation — and proves they accept a truthful
-    EXIT + FINAL_VERIFIED closure and release the reservation exactly once, while
-    refusing to delete rows or mutate the frozen ENTRY fill.
-
-    It is deliberately NOT presented as an end-to-end production lifecycle proof.
-    No production entry point currently produces an exit fill or a non-zero-fill
-    reconciliation: ``trigger_paper_protection_action`` has no production caller,
-    nothing constructs an EXIT order intent, and the only reconciliation producer in
-    ``app/`` is the zero-fill terminalizer. The closure below is therefore hand-built
-    canonical evidence, and it demonstrates the *contract* a future production exit
-    producer must satisfy rather than proving one exists. See the module docstring's
-    "Known gap" section.
+    ``published_at`` is the venue's own publication instant and the execution clock
+    is one second later, so the book is genuinely fresh under the frozen
+    ``paper_v2_quote_max_age_seconds`` window instead of being widened for the test.
     """
+    from app.services.paper_v2_protection_runtime import run_protection_sweep
+
+    moment = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    return run_protection_sweep(
+        env.client,
+        kraken_client=KrakenClient(
+            transport=_BookTransport(bid=bid, ask=ask, publication_ts=published_at)
+        ),
+        settings=_Settings(),
+        execution_clock=_fixed_clock(moment + timedelta(seconds=1)),
+    )
+
+
+def test_s5_production_runtime_closes_paper_v2_exposure_and_releases_capacity(env):
+    """The PRODUCTION protection runtime closes a canonically filled position.
+
+    Entry came from the real producer in S1. Closure now comes from the real
+    production runtime: it reads the canonical protection projection, arms the
+    committed plan, evaluates a fresh public book that crosses the committed stop,
+    commits the **atomic B/C-2 protection action**, executes the committed EXIT
+    order into a SELL fill, reconciles ``FLAT_AWAITING_RECONCILIATION`` then
+    ``FINAL_VERIFIED``, and releases capacity exactly once.
+
+    Nothing in this test hand-builds an EXIT order intent, a SELL attempt, a SELL
+    fill or a reconciliation: the EXIT order identity asserted below is the
+    runtime's own deterministic derivation, which is only reachable if the action
+    really went through the writer's atomic protection-action RPC.
+
+    BTCUSD's committed stop is 90.0 while SOLUSD's is 50.0, so the market condition
+    below closes BTC and provably leaves SOL open. That isolation is the point: one
+    trade reaching terminal closure must not disturb another's protection, and SOL
+    must remain a live, armed obligation afterwards.
+    """
+    from app.opip.contracts.paper_v2_identity import paper_v2_exit_order_intent_id
+
     writer = env.server.writer
     btc = _EVIDENCE["trades"]["BTCUSD"]
     paper_trade_id = btc["paper_trade_id"]
-
     state = env.client.get_paper_v2_execution_state(btc["disposition_id"])
     assert state.status == "OK"
     quantity = float(state.fill["quantity"])
-    quote_id = btc["quote_evidence_id"]
-    context_id = btc["decision_context_id"]
-    reservation_id = btc["reservation_id"]
     reserved = float(state.requested_reservation_amount)
 
     pre_portfolio = env.client.get_paper_portfolio_state("USD")
     assert pre_portfolio.active_reservations == 2
     assert pre_portfolio.reserved_capital == pytest.approx(1_000.0)
 
-    # The frozen ENTRY fill is history: the closure appends, it never mutates.
+    # The frozen ENTRY fill is history: closure appends, it never mutates.
     entry_fills_before = [
         row
         for row in _rows(writer, PAPER_FILL_RECORDED)
         if row["paper_trade_id"] == paper_trade_id
     ]
     assert len(entry_fills_before) == 1
+    assert _count(writer, PAPER_PROTECTION_TRIGGER_RECORDED) == 0
+    assert _count(writer, PAPER_RECONCILIATION_RECORDED) == 0
 
-    exit_order_id = f"exit-close-{paper_trade_id}"
-    assert (
-        _submit(
-            writer,
-            PAPER_ORDER_INTENT_RECORDED,
-            {
-                "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-                "engine": ENGINE_OPIP_PAPER_V2,
-                "order_intent_id": exit_order_id,
-                "paper_trade_id": paper_trade_id,
-                "decision_context_id": context_id,
-                "intent_seq": 0,
-                "intent_role": "EXIT",
-                "side": "SELL",
-                "order_type": "MARKET",
-                "requested_quantity": quantity,
-                "requested_notional": quantity * 110.0,
-                "reason_code": "CANONICAL_CLOSURE",
-                "intent_time": _exact(CLOSURE_TS),
-                "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-                "reservation_id": reservation_id,
-            },
-        ).status
-        == "OK"
+    # --- 1. arm the committed plan (no market evidence required) -------------
+    # These instants sit after every committed lifecycle stage, including SOL's
+    # recovered fill, so the runtime's causal clock is genuinely satisfied.
+    armed = _closure_sweep(
+        env, published_at="2026-09-19T12:06:19Z", bid=99.9, ask=100.0
+    )
+    assert armed.activated == 2, armed.details
+    assert armed.new_admissions_allowed is True
+
+    # --- 2. a fresh public bid crosses the committed stop --------------------
+    triggered = _closure_sweep(
+        env, published_at="2026-09-19T12:07:19Z", bid=90.0, ask=90.5
+    )
+    assert triggered.triggered == 1, triggered.details
+    triggers = [
+        row
+        for row in _rows(writer, PAPER_PROTECTION_TRIGGER_RECORDED)
+        if row["paper_trade_id"] == paper_trade_id
+    ]
+    assert len(triggers) == 1
+    assert triggers[0]["trigger_type"] == "STOP"
+    # The trigger price is the quote's own executable price, not a level the book
+    # never showed.
+    assert float(triggers[0]["reference_price"]) == 90.0
+    exit_orders = [
+        row
+        for row in _rows(writer, PAPER_ORDER_INTENT_RECORDED)
+        if row["paper_trade_id"] == paper_trade_id and row["intent_role"] == "EXIT"
+    ]
+    assert len(exit_orders) == 1
+    assert exit_orders[0]["order_intent_id"] == paper_v2_exit_order_intent_id(
+        paper_trade_id,
+        protection_plan_id=triggers[0]["protection_plan_id"],
+        trigger_seq=0,
+    )
+    # STOP claims the full canonical remaining exposure.
+    assert float(exit_orders[0]["requested_quantity"]) == quantity
+
+    # A trigger is not an exit: exposure and reservation are untouched so far.
+    assert env.client.get_paper_v2_execution_state(
+        btc["disposition_id"]
+    ).remaining_quantity == pytest.approx(quantity)
+    assert env.client.get_paper_portfolio_state("USD").active_reservations == 2
+
+    # --- 3. execute the committed EXIT order into a SELL fill ----------------
+    executed = _closure_sweep(
+        env, published_at="2026-09-19T12:08:19Z", bid=90.0, ask=90.5
+    )
+    assert executed.exit_attempted == 1, executed.details
+    exits = [
+        row
+        for row in _rows(writer, PAPER_FILL_RECORDED)
+        if row["paper_trade_id"] == paper_trade_id and row["side"] == "SELL"
+    ]
+    assert len(exits) == 1
+    assert float(exits[0]["quantity"]) == quantity
+    # A long exits into the bid.
+    assert float(exits[0]["price"]) == 90.0
+    assert env.client.get_paper_v2_execution_state(
+        btc["disposition_id"]
+    ).remaining_quantity == pytest.approx(0.0)
+
+    # Flat, but still reserved: a fill alone never releases capacity.
+    assert env.client.get_paper_portfolio_state("USD").active_reservations == 2
+
+    # --- 4. reconcile FLAT, then verify terminal ----------------------------
+    for _ in range(2):
+        _closure_sweep(env, published_at="2026-09-19T12:09:19Z", bid=90.0, ask=90.5)
+
+    reconciliations = [
+        row
+        for row in _rows(writer, PAPER_RECONCILIATION_RECORDED)
+        if row["paper_trade_id"] == paper_trade_id
+    ]
+    assert [row["terminal_reconciliation_state"] for row in reconciliations] == [
+        "FLAT_AWAITING_RECONCILIATION",
+        "FINAL_VERIFIED",
+    ]
+    final = reconciliations[-1]
+    assert float(final["remaining_quantity"]) == pytest.approx(0.0)
+    assert float(final["filled_entry_quantity"]) == pytest.approx(quantity)
+    assert float(final["filled_exit_quantity"]) == pytest.approx(quantity)
+    # 5 units bought at 100.0 and sold at 90.0.
+    assert float(final["realized_gross_pnl"]) == pytest.approx(-50.0)
+    assert float(final["realized_net_pnl"]) == pytest.approx(
+        float(final["realized_gross_pnl"]) - float(final["recorded_execution_costs"])
     )
 
-    exit_attempt_id = f"attempt-exit-close-{paper_trade_id}"
-    assert (
-        _submit(
-            writer,
-            PAPER_EXECUTION_ATTEMPT_RECORDED,
-            {
-                "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-                "engine": ENGINE_OPIP_PAPER_V2,
-                "execution_attempt_id": exit_attempt_id,
-                "order_intent_id": exit_order_id,
-                "paper_trade_id": paper_trade_id,
-                "attempt_seq": 0,
-                "execution_state": "ACCEPTED",
-                "attempt_time": _exact(CLOSURE_TS),
-                "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-                "accepted_quantity": quantity,
-                "market_evidence_ref": quote_id,
-            },
-        ).status
-        == "OK"
-    )
-
-    assert (
-        _submit(
-            writer,
-            PAPER_FILL_RECORDED,
-            {
-                "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-                "engine": ENGINE_OPIP_PAPER_V2,
-                "fill_id": f"fill-exit-close-{paper_trade_id}",
-                "execution_attempt_id": exit_attempt_id,
-                "order_intent_id": exit_order_id,
-                "paper_trade_id": paper_trade_id,
-                "fill_seq": 0,
-                "side": "SELL",
-                "quantity": quantity,
-                "price": 110.0,
-                "fee_cost": 0.25,
-                "spread_cost": 0.25,
-                "slippage_cost": 0.25,
-                "other_supported_cost": 0.25,
-                "fill_time": _exact(CLOSURE_TS),
-                "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
-                "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
-                "market_evidence_ref": quote_id,
-            },
-        ).status
-        == "OK"
-    )
-
-    totals = writer._canonical_fill_totals(paper_trade_id)  # noqa: SLF001
-    assert totals["remaining_quantity"] == pytest.approx(0.0)
-
-    reconciliation = {
-        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
-        "engine": ENGINE_OPIP_PAPER_V2,
-        "reconciliation_id": f"recon-close-{paper_trade_id}",
-        "paper_trade_id": paper_trade_id,
-        "reconciliation_seq": 0,
-        "position_state": "FLAT",
-        "terminal_reconciliation_state": "FINAL_VERIFIED",
-        "filled_entry_quantity": totals["entry_quantity"],
-        "filled_exit_quantity": totals["exit_quantity"],
-        "remaining_quantity": totals["remaining_quantity"],
-        "reserved_capital": reserved,
-        "realized_gross_pnl": totals["gross_pnl"],
-        "recorded_execution_costs": totals["execution_costs"],
-        "realized_net_pnl": totals["gross_pnl"] - totals["execution_costs"],
-        "reconciled_time": _exact(CLOSURE_TS),
-        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
-    }
-    assert _submit(writer, PAPER_RECONCILIATION_RECORDED, reconciliation).status == "OK"
-
-    after_state = env.client.get_paper_v2_execution_state(btc["disposition_id"])
-    assert after_state.remaining_quantity == pytest.approx(0.0)
-
-    # The committed ENTRY fill is byte-for-byte unchanged and still present; only
-    # a new EXIT fill was appended.
+    # The committed ENTRY fill is byte-for-byte unchanged; only a SELL appended.
     entry_fills_after = [
         row
         for row in _rows(writer, PAPER_FILL_RECORDED)
@@ -1100,8 +1079,13 @@ def test_s5_canonical_closure_removes_exposure_and_releases_once(env):
     assert entry_fills_after[0] == entry_fills_before[0]
     assert len(entry_fills_after) == 2
 
+    # Isolation: BTC is gone and its capacity returned; SOL is untouched.
     exposures = env.client.get_paper_v2_active_exposures().exposures
     assert [exposure.symbol for exposure in exposures] == ["SOLUSD"]
+    sol = env.client.get_paper_v2_execution_state(
+        _EVIDENCE["trades"]["SOLUSD"]["disposition_id"]
+    )
+    assert sol.remaining_quantity == pytest.approx(5.0)
 
     released = env.client.get_paper_portfolio_state("USD")
     assert released.active_reservations == pre_portfolio.active_reservations - 1
@@ -1109,15 +1093,31 @@ def test_s5_canonical_closure_removes_exposure_and_releases_once(env):
         pre_portfolio.reserved_capital - reserved
     )
 
-    # An exact replay resolves idempotently and never releases a second time.
-    duplicate = _submit(writer, PAPER_RECONCILIATION_RECORDED, reconciliation)
-    assert duplicate.status == "DUPLICATE_OK"
-    after_duplicate = env.client.get_paper_portfolio_state("USD")
-    assert (after_duplicate.active_reservations, after_duplicate.reserved_capital) == (
+    # An extra sweep is inert for the closed trade. Quote evidence is deliberately
+    # excluded from this comparison: SOL is still an armed obligation, so every scan
+    # legitimately reads a fresh public book to evaluate its triggers. What must not
+    # move is any execution evidence - no new trigger, EXIT order, attempt, fill or
+    # reconciliation.
+    lifecycle_families = tuple(
+        family
+        for family in _EXECUTION_FAMILIES
+        if family != PAPER_QUOTE_EVIDENCE_RECORDED
+    )
+
+    def _lifecycle_counts() -> dict[str, int]:
+        return {family: _count(writer, family) for family in lifecycle_families}
+
+    before_counts = _lifecycle_counts()
+    idle = _closure_sweep(
+        env, published_at="2026-09-19T12:10:19Z", bid=90.0, ask=90.5
+    )
+    assert (idle.triggered, idle.exit_attempted, idle.terminalized) == (0, 0, 0)
+    assert _lifecycle_counts() == before_counts
+    after_idle = env.client.get_paper_portfolio_state("USD")
+    assert (after_idle.active_reservations, after_idle.reserved_capital) == (
         released.active_reservations,
         released.reserved_capital,
     )
-    assert _count(writer, PAPER_RECONCILIATION_RECORDED) == 1
 
 
 # ===========================================================================

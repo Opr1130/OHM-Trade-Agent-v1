@@ -10,6 +10,7 @@ from app.opip.canonical.models import (
     PaperPortfolioState,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2ProtectionWork,
     PaperV2RecoverableExecutions,
     PendingHandoff,
     WriterAck,
@@ -46,6 +47,8 @@ class WriterClient(Protocol):
     def get_paper_v2_active_exposures(self) -> PaperV2ActiveExposures: ...
 
     def get_paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions: ...
+
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -149,6 +152,10 @@ class CanonicalWriterClient:
         )
         return PaperV2RecoverableExecutions.from_dict(response)
 
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        response = self._roundtrip({"method": "GET_PAPER_V2_PROTECTION_WORK"})
+        return PaperV2ProtectionWork.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -251,6 +258,13 @@ class InProcessWriterClient:
         return PaperV2RecoverableExecutions.from_dict(
             self._server.dispatch_for_tests(
                 {"method": "GET_PAPER_V2_RECOVERABLE_EXECUTIONS"}
+            )
+        )
+
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        return PaperV2ProtectionWork.from_dict(
+            self._server.dispatch_for_tests(
+                {"method": "GET_PAPER_V2_PROTECTION_WORK"}
             )
         )
 
