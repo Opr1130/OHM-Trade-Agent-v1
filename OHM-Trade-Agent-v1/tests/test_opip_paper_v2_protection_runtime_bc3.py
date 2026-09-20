@@ -189,13 +189,15 @@ def _candidate_id(production_symbol: str) -> str:
     return "OPIPC:" + (base + "0" * 20)[:20]
 
 
-def _instrument_version(production_symbol: str) -> InstrumentVersion:
+def _instrument_version(
+    production_symbol: str, *, quote_currency: str = "USD", native_symbol: str | None = None
+) -> InstrumentVersion:
     base = _symbol_base(production_symbol)
     return InstrumentVersion(
         venue="kraken",
         base_asset=base,
-        quote_currency="USD",
-        venue_instrument_id=_native_symbol(production_symbol),
+        quote_currency=quote_currency,
+        venue_instrument_id=native_symbol or _native_symbol(production_symbol),
         version=1,
         reference_data_version=f"ref-{base.lower()}",
         observed_at_utc=NOW - timedelta(minutes=5),
@@ -249,7 +251,12 @@ def _snapshot_payload(*, symbol: str) -> dict:
     )[0]
 
 
-def _opportunity(production_symbol: str) -> PaperV2Opportunity:
+def _opportunity(
+    production_symbol: str,
+    *,
+    quote_currency: str = "USD",
+    native_symbol: str | None = None,
+) -> PaperV2Opportunity:
     """An already-qualified LONG opportunity with approved geometry."""
     from app.opip.decision.versioning import (
         GATE_POLICY_VERSION,
@@ -257,7 +264,11 @@ def _opportunity(production_symbol: str) -> PaperV2Opportunity:
     )
 
     snapshot = _snapshot_payload(symbol=production_symbol)
-    version = _instrument_version(production_symbol)
+    version = _instrument_version(
+        production_symbol,
+        quote_currency=quote_currency,
+        native_symbol=native_symbol,
+    )
     return PaperV2Opportunity(
         candidate_id=_candidate_id(production_symbol),
         episode_id=snapshot["episode_id"],
@@ -271,11 +282,11 @@ def _opportunity(production_symbol: str) -> PaperV2Opportunity:
         qualification_policy_version=GATE_POLICY_VERSION,
         qualification_policy_fingerprint=gate_policy_fingerprint(),
         instrument_version=version,
-        quote_currency="USD",
+        quote_currency=quote_currency,
         requested_capital=500.0,
         requested_reservation_amount=500.0,
         decision_time=QUALIFICATION_TIME,
-        native_symbol=_native_symbol(production_symbol),
+        native_symbol=native_symbol or _native_symbol(production_symbol),
         requested_quantity=5.0,
         requested_notional=500.0,
         entry_low=99.0,
@@ -296,12 +307,16 @@ def _open_entry(
     *,
     clock: _Clock,
     symbol: str = "BTCUSD",
+    quote_currency: str = "USD",
+    native_symbol: str | None = None,
     bid: float = 99.9,
     ask: float = 100.0,
     bid_qty: float = 10.0,
 ) -> dict:
     """Create a real Paper-v2 entry exposure through the production producer."""
-    opportunity = _opportunity(symbol)
+    opportunity = _opportunity(
+        symbol, quote_currency=quote_currency, native_symbol=native_symbol
+    )
     transport = _BookTransport(
         clock=clock, bid=bid, ask=ask, bid_qty=bid_qty, ask_qty=bid_qty
     )
@@ -1452,6 +1467,57 @@ def test_protection_work_is_correct_alongside_a_large_unrelated_history(env):
     assert after.remaining_quantity == before.remaining_quantity
     assert after.protection_state == ProtectionState.ACTIVE.value
     assert _count(env, PAPER_QUOTE_EVIDENCE_RECORDED, trade_id) >= quotes_before
+
+
+def test_protection_work_uses_the_registered_instrument_market(env):
+    """Exit evidence must target the registered venue market, not a rebuilt symbol.
+
+    Reconstructing ``base/USD`` from an asset code would point a non-USD-quoted
+    position at the wrong market entirely. The projection must report the registered
+    instrument version's exact ``venue_instrument_id`` and quote currency, which is
+    the same authority the entry path validated against.
+
+    The venue symbol here (``BTC/USDT``) is unreachable by formatting the asset code,
+    so the assertion discriminates between "resolved from the registry" and "guessed".
+    """
+    clock = _Clock(QUALIFICATION_TIME)
+    trade = _open_entry(
+        env,
+        clock=clock,
+        symbol="BTCUSDT",
+        quote_currency="USDT",
+        native_symbol="BTC/USDT",
+    )
+    trade_id = trade["paper_trade_id"]
+
+    item = _item(env, trade_id)
+    assert item.native_symbol == "BTC/USDT"
+    assert item.quote_currency == "USDT"
+    registered = env.client.get_paper_v2_active_exposures().exposures
+    assert [exposure.symbol for exposure in registered] == ["BTCUSDT"]
+
+    # Arming needs no market read, but the exit path does: prove the runtime asks the
+    # venue for the registered market and for nothing else.
+    assert _sweep(env, clock=clock).activated == 1
+    _next_scan(clock)
+    transport = _transport(clock, bid=90.0, ask=90.5)
+    triggered = _sweep(env, clock=clock, transport=transport)
+    assert triggered.triggered == 1, triggered.details
+    _next_scan(clock)
+    executed = _sweep(env, clock=clock, transport=transport)
+    assert executed.exit_attempted == 1, executed.details
+
+    requested_symbols = {symbol for _endpoint, symbol in transport.requests}
+    assert requested_symbols == {"BTC/USDT"}
+    assert "BTC/USD" not in requested_symbols
+
+    exits = [
+        row
+        for row in _rows(env, PAPER_FILL_RECORDED, trade_id)
+        if row["side"] == "SELL"
+    ]
+    assert len(exits) == 1
+    assert float(exits[0]["quantity"]) == 5.0
 
 
 def test_an_unavailable_protection_sweep_withholds_new_authority_and_never_falls_back(env):

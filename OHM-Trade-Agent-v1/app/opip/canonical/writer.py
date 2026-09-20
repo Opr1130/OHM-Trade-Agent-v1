@@ -1174,8 +1174,15 @@ class CanonicalWriter:
                     quote_evidence[quote_ref] = self._load_quote_evidence_by_id(quote_ref)
                 except ValueError:
                     continue
+        # Exit evidence must be requested from the exact instrument the position was
+        # opened on, resolved from the registered canonical instrument version rather
+        # than reconstructed from the asset code. Rebuilding a symbol such as
+        # ``base/USD`` would silently point a non-USD-quoted position at the wrong
+        # market. Both the venue symbol and the quote currency are taken from the
+        # registry, which is the same authority the entry path validated against.
         instrument_version = None
         native_symbol = None
+        instrument_quote_currency = None
         if context_id:
             try:
                 context = self._load_context_by_id(context_id)
@@ -1183,17 +1190,17 @@ class CanonicalWriter:
                 context = None
             if isinstance(context, Mapping):
                 instrument_version = str(context.get("instrument_version") or "") or None
-                snapshot_id = str(context.get("snapshot_id") or "")
-                snapshot = (
-                    self._load_decision_snapshot_by_id(snapshot_id)
-                    if snapshot_id
-                    else {}
-                )
-                inner = snapshot.get("snapshot_payload") if snapshot else None
-                if isinstance(inner, Mapping):
-                    base = str(inner.get("base_asset") or "")
+            if instrument_version:
+                try:
+                    instrument = self._load_instrument_version_by_id(instrument_version)
+                except ValueError:
+                    instrument = None
+                if isinstance(instrument, Mapping):
                     native_symbol = (
-                        f"{base}/USD" if base else None
+                        str(instrument.get("venue_instrument_id") or "") or None
+                    )
+                    instrument_quote_currency = (
+                        str(instrument.get("quote_currency") or "") or None
                     )
 
         return PaperV2ProtectionWorkItem(
@@ -1201,7 +1208,11 @@ class CanonicalWriter:
             disposition_id=str(disposition.get("disposition_id") or "") or None,
             decision_context_id=context_id,
             reservation_id=str(disposition.get("reservation_id") or "") or None,
-            quote_currency=str(disposition.get("quote_currency") or "") or None,
+            quote_currency=(
+                instrument_quote_currency
+                or str(disposition.get("quote_currency") or "")
+                or None
+            ),
             instrument_version=instrument_version,
             native_symbol=native_symbol,
             entry_quantity=float(totals["entry_quantity"]),
