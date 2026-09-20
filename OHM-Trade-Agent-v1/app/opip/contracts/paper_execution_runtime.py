@@ -19,6 +19,11 @@ import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from app.opip.contracts.episode_snapshot import (
+    CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE,
+    CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION,
+    validate_canonical_episode_snapshot,
+)
 from app.opip.contracts.paper_execution import (
     ENGINE_OPIP_PAPER_V2,
     PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -42,9 +47,21 @@ from app.opip.contracts.paper_execution_events import (
     validate_paper_evidence_payload,
 )
 from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
+from app.opip.contracts.serialization import (
+    EPISODE_SNAPSHOT_HASH_PREFIX,
+    episode_snapshot_hash,
+)
 
 PAPER_ADMISSION_REQUEST_RECORDED = "paper_execution.admission_request.recorded"
 PAPER_QUOTE_EVIDENCE_RECORDED = "paper_execution.quote_evidence.recorded"
+PAPER_DECISION_SNAPSHOT_RECORDED = "paper_execution.decision_snapshot.recorded"
+
+#: The inner record type and schema a decision snapshot wrapper must carry. These
+#: are the canonical episode snapshot contract's own values, re-exported under the
+#: Paper-v2 names so a reader of this module does not have to reach into the other
+#: contract to learn what it accepts.
+DECISION_SNAPSHOT_EPISODE_RECORD_TYPE = CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE
+DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION = CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION
 
 #: Events producers may submit through the ordinary WriterIntent path in B/C-1.
 #: Opportunity disposition remains writer-owned through the admission RPC.
@@ -57,6 +74,11 @@ PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES = frozenset(
         PAPER_FILL_RECORDED,
     }
 )
+
+#: B/C-3 producer events: evidence the Paper v2 execution path owns which is
+#: neither B/C-1 admission/quote nor B/C-2 protection. The decision snapshot is
+#: the durable proof of the snapshot a decision was taken against.
+PAPER_BC3_WRITER_EVENT_TYPES = frozenset({PAPER_DECISION_SNAPSHOT_RECORDED})
 
 #: Field-diagnostic prefixes shared by every canonical payload error message,
 #: so the same wording cannot drift between contract validators.
@@ -84,7 +106,9 @@ PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES = frozenset(
 
 #: Every Paper v2 event family a producer may submit through WriterIntent.
 PAPER_V2_WRITER_EVENT_TYPES = (
-    PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES | PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES
+    PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES
+    | PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES
+    | PAPER_BC3_WRITER_EVENT_TYPES
 )
 
 #: Command name for the writer-owned atomic protection action RPC.
@@ -735,11 +759,122 @@ def quote_evidence_idempotency_key(payload: Mapping[str, Any]) -> str:
     return f"{PAPER_QUOTE_EVIDENCE_RECORDED}:{normalized['quote_evidence_id']}"
 
 
+_DECISION_SNAPSHOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "engine",
+        "snapshot_id",
+        "episode_id",
+        "cohort_id",
+        "snapshot_hash",
+        "snapshot_payload",
+    }
+)
+
+
+def validate_decision_snapshot_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the canonical decision-snapshot wrapper, failing closed.
+
+    The wrapper exists so a decision can cite the exact snapshot it was taken
+    against as durable canonical evidence. The inner payload is the production
+    canonical episode snapshot itself, unchanged; the wrapper only binds it to a
+    durable record.
+
+    The content binding is the point of this validator. A caller-supplied hash is
+    never authoritative: ``snapshot_hash`` must equal the canonical content hash
+    recomputed from the nested payload, so a wrapper cannot assert one snapshot's
+    identity over another snapshot's contents, and a fabricated hash has no path
+    to acceptance. The ``PSNAP:`` domain is required as well, so a snapshot
+    *identity* (``SNAP:``) can never stand in for a content hash.
+    """
+    if not isinstance(payload, Mapping):
+        raise ValueError("decision snapshot payload must be a mapping")
+    fields = frozenset(str(key) for key in payload)
+    missing = sorted(_DECISION_SNAPSHOT_FIELDS - fields)
+    extra = sorted(fields - _DECISION_SNAPSHOT_FIELDS)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(_FIELD_MISSING_PREFIX + ",".join(missing))
+        if extra:
+            details.append(_FIELD_EXTRA_PREFIX + ",".join(extra))
+        raise ValueError(
+            "invalid decision snapshot fields: " + "; ".join(details)
+        )
+
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported decision snapshot schema version")
+    if payload.get("engine") != ENGINE_OPIP_PAPER_V2:
+        raise ValueError("decision snapshot engine must be OPIP_PAPER_V2")
+
+    snapshot_id = _canonical_identity(
+        payload.get("snapshot_id"), field_name="snapshot_id"
+    )
+    episode_id = _canonical_identity(
+        payload.get("episode_id"), field_name="episode_id"
+    )
+    cohort_id = _canonical_identity(payload.get("cohort_id"), field_name="cohort_id")
+    snapshot_hash = _canonical_identity(
+        payload.get("snapshot_hash"), field_name="snapshot_hash"
+    )
+    if not snapshot_hash.startswith(f"{EPISODE_SNAPSHOT_HASH_PREFIX}:"):
+        raise ValueError(
+            "snapshot_hash must be a canonical episode snapshot content hash"
+        )
+
+    inner = payload.get("snapshot_payload")
+    if not isinstance(inner, Mapping):
+        raise ValueError("snapshot_payload must be a canonical episode snapshot object")
+    # The nested payload is validated as a real canonical episode snapshot v1 by
+    # the shared contract: exact field set, production flags, canonical
+    # serializability and the deterministic EP:/SNAP: identity relationship. A
+    # mapping that merely claims the record type and carries matching ids is not
+    # enough, so an incomplete payload cannot become execution lineage.
+    inner_payload = validate_canonical_episode_snapshot(inner)
+
+    # The wrapper and the snapshot it carries must name the same decision subject.
+    # Otherwise a wrapper could file one episode's contents under another's
+    # identity.
+    if inner_payload.get("snapshot_id") != snapshot_id:
+        raise ValueError("wrapper snapshot_id must equal the nested snapshot identity")
+    if inner_payload.get("episode_id") != episode_id:
+        raise ValueError("wrapper episode_id must equal the nested episode identity")
+    if inner_payload.get("cohort_id") != cohort_id:
+        raise ValueError("wrapper cohort_id must equal the nested cohort identity")
+
+    if episode_snapshot_hash(inner_payload) != snapshot_hash:
+        raise ValueError(
+            "snapshot_hash must equal the canonical episode snapshot content hash"
+        )
+
+    return dict(payload)
+
+
+def decision_snapshot_idempotency_key(payload: Mapping[str, Any]) -> str:
+    """Idempotency key anchored on snapshot *identity*, never on content.
+
+    A retry of byte-identical content under the same snapshot identity therefore
+    resolves as ``DUPLICATE_OK``, while different content filed under the same
+    snapshot identity reaches the writer's same-key conflict check and is refused.
+    Keying on content instead would turn a genuine correction into a silent
+    second record, and keying on the wrapper as a whole would defeat retries.
+    """
+    normalized = validate_decision_snapshot_payload(payload)
+    return f"{PAPER_DECISION_SNAPSHOT_RECORDED}:{normalized['snapshot_id']}"
+
+
 __all__ = [
+    "DECISION_SNAPSHOT_EPISODE_RECORD_TYPE",
+    "DECISION_SNAPSHOT_EPISODE_SCHEMA_VERSION",
     "PAPER_ACTION_ARMED_STATES",
     "PAPER_ACTION_EXIT_SIDE",
     "PAPER_ADMISSION_REQUEST_RECORDED",
+    "PAPER_BC3_WRITER_EVENT_TYPES",
     "PAPER_CAPITAL_POLICY_VERSION",
+    "PAPER_DECISION_SNAPSHOT_RECORDED",
     "PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES",
     "PAPER_PROTECTION_ACTION_COMMAND",
     "PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES",
@@ -756,6 +891,7 @@ __all__ = [
     "PaperProtectionActionRequest",
     "admission_request_idempotency_key",
     "admission_result_identities",
+    "decision_snapshot_idempotency_key",
     "protection_action_idempotency_key",
     "protection_transition_allowed",
     "protection_transition_requires_trigger",
@@ -763,6 +899,7 @@ __all__ = [
     "resolve_capital_policy",
     "validate_admission_request",
     "validate_admission_request_record_payload",
+    "validate_decision_snapshot_payload",
     "validate_protection_action_request",
     "validate_quote_evidence_payload",
 ]

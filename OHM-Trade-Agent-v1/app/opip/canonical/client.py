@@ -6,7 +6,16 @@ import socket
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PaperV2ActiveExposures,
+    PaperV2ExecutionState,
+    PaperV2ProtectionWork,
+    PaperV2RecoverableExecutions,
+    PendingHandoff,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.contracts.paper_execution_runtime import (
     PaperAdmissionAck,
     PaperAdmissionRequest,
@@ -30,6 +39,16 @@ class WriterClient(Protocol):
     def trigger_paper_protection_action(
         self, request: PaperProtectionActionRequest
     ) -> PaperProtectionActionAck: ...
+
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState: ...
+
+    def get_paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState: ...
+
+    def get_paper_v2_active_exposures(self) -> PaperV2ActiveExposures: ...
+
+    def get_paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions: ...
+
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -103,6 +122,40 @@ class CanonicalWriterClient:
         )
         return PaperProtectionActionAck.from_dict(response)
 
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        response = self._roundtrip(
+            {
+                "method": "GET_PAPER_PORTFOLIO_STATE",
+                "quote_currency": quote_currency,
+            }
+        )
+        return PaperPortfolioState.from_dict(response)
+
+    def get_paper_v2_execution_state(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        response = self._roundtrip(
+            {
+                "method": "GET_PAPER_V2_EXECUTION_STATE",
+                "disposition_id": disposition_id,
+            }
+        )
+        return PaperV2ExecutionState.from_dict(response)
+
+    def get_paper_v2_active_exposures(self) -> PaperV2ActiveExposures:
+        response = self._roundtrip({"method": "GET_PAPER_V2_ACTIVE_EXPOSURES"})
+        return PaperV2ActiveExposures.from_dict(response)
+
+    def get_paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions:
+        response = self._roundtrip(
+            {"method": "GET_PAPER_V2_RECOVERABLE_EXECUTIONS"}
+        )
+        return PaperV2RecoverableExecutions.from_dict(response)
+
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        response = self._roundtrip({"method": "GET_PAPER_V2_PROTECTION_WORK"})
+        return PaperV2ProtectionWork.from_dict(response)
+
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
             {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
@@ -169,6 +222,49 @@ class InProcessWriterClient:
         return WriterAck.from_dict(
             self._server.dispatch_for_tests(
                 {"method": "CONFIRM_OPS_APPLIED", "event_id": event_id}
+            )
+        )
+
+    def get_paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        return PaperPortfolioState.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "GET_PAPER_PORTFOLIO_STATE",
+                    "quote_currency": quote_currency,
+                }
+            )
+        )
+
+    def get_paper_v2_execution_state(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        return PaperV2ExecutionState.from_dict(
+            self._server.dispatch_for_tests(
+                {
+                    "method": "GET_PAPER_V2_EXECUTION_STATE",
+                    "disposition_id": disposition_id,
+                }
+            )
+        )
+
+    def get_paper_v2_active_exposures(self) -> PaperV2ActiveExposures:
+        return PaperV2ActiveExposures.from_dict(
+            self._server.dispatch_for_tests(
+                {"method": "GET_PAPER_V2_ACTIVE_EXPOSURES"}
+            )
+        )
+
+    def get_paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions:
+        return PaperV2RecoverableExecutions.from_dict(
+            self._server.dispatch_for_tests(
+                {"method": "GET_PAPER_V2_RECOVERABLE_EXECUTIONS"}
+            )
+        )
+
+    def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        return PaperV2ProtectionWork.from_dict(
+            self._server.dispatch_for_tests(
+                {"method": "GET_PAPER_V2_PROTECTION_WORK"}
             )
         )
 

@@ -77,6 +77,15 @@ class Settings(BaseSettings):
         default="off",
         pattern=r"^(off|shadow)$",
     )
+    # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
+    # enables it: activation is an explicit operator decision, so an unknown or
+    # malformed value must fail Settings parsing rather than silently enabling a
+    # new execution path. Activation is paper-only. It grants no funded, live or
+    # exchange authority, and it cannot create order-placement capability.
+    opip_paper_v2_mode: str = Field(
+        default="off",
+        pattern=r"^(off|active)$",
+    )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).
@@ -127,6 +136,17 @@ class Settings(BaseSettings):
     paper_trade_pending_ttl_hours: int = Field(default=24, ge=1, le=168)
     paper_trade_max_hold_hours: int = Field(default=24, ge=1, le=168)
     paper_trade_candle_interval_minutes: int = Field(default=15)
+    # B/C-3 Paper v2 paper-only assumptions. A Paper v2 attempt, fill or
+    # STOP/TARGET action must cite canonical Level-1 quote evidence that was
+    # observed no longer ago than this, so a stale book can never justify a
+    # simulated fill. Simulation assumption only: no live effect.
+    paper_v2_quote_max_age_seconds: int = Field(default=15, ge=1, le=300)
+    # B/C-3 Paper v2 protection policy. These are the only protection assumptions
+    # that are not already carried by the qualified opportunity: the stop and
+    # target prices come from the opportunity's own plan, while the first target's
+    # share and the maximum hold are policy. Bounded, paper-only, no live effect.
+    paper_v2_tp1_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    paper_v2_max_hold_seconds: int = Field(default=86_400, ge=1, le=604_800)
 
     # Margin Intelligence v1 is advisory/manual only. The configured ceiling
     # mirrors what the account is permitted to use, while validation remains

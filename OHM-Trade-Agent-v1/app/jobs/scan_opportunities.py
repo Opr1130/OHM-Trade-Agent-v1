@@ -1,6 +1,7 @@
 import logging
 import inspect
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -395,6 +396,334 @@ def _paper_trade_enabled_safe() -> bool:
         return False
 
 
+# --- B/C-3 Increment 6B: Paper-v2 mode split ---------------------------------
+# The paper authority is selected by mode, never by availability. These labels are
+# metadata only: they never influence execution, ranking or admission.
+PAPER_ENGINE_FREQTRADE_DRY_RUN = "FREQTRADE_DRY_RUN"
+PAPER_ENGINE_OPIP_PAPER_V2 = "OPIP_PAPER_V2"
+#: A LONG that is not immediately actionable. Recorded distinctly so a wait is
+#: never relabelled as a Paper-v2 executed request.
+PAPER_ENGINE_PAPER_V2_WAIT = "OPIP_PAPER_V2_WAIT_NOT_EXECUTABLE"
+#: Cutover requested but legacy is still draining, or the legacy state could not be
+#: read. Both authorize no new entry in either authority, and they are distinct
+#: labels because the operator action required differs.
+PAPER_ENGINE_PAPER_V2_DRAINING = "OPIP_PAPER_V2_DRAINING"
+PAPER_ENGINE_PAPER_V2_UNAVAILABLE = "OPIP_PAPER_V2_UNAVAILABLE"
+PAPER_ENGINE_NO_AUTHORITATIVE_SHORT = "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
+#: Engine-neutral description of the legacy authority, used only when it applies.
+PAPER_ENGINE_LEGACY_LABEL = "v1 authoritative paper engine"
+PAPER_ENGINE_PAPER_V2_LABEL = "O'Pip Paper v2"
+
+# --- resolved scan-level paper authority ------------------------------------
+# Requesting Paper v2 and being granted it are separate facts. Collapsing them into
+# one boolean made a blocked cutover fall back to ordinary legacy admission, which
+# would create the very legacy obligations the cutover exists to drain and could
+# prevent the cutover from ever completing. The resolved state is therefore an
+# explicit authority, computed once per scan and used by every dependent decision.
+AUTHORITY_LEGACY = "LEGACY"
+AUTHORITY_PAPER_V2_READY = "PAPER_V2_READY"
+AUTHORITY_PAPER_V2_DRAINING = "PAPER_V2_DRAINING"
+AUTHORITY_PAPER_V2_UNAVAILABLE = "PAPER_V2_UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class PaperAuthority:
+    """The one resolved paper authority for this scan.
+
+    ``requested`` records what the operator configured; ``granted`` records what the
+    runtime may actually do. Only ``AUTHORITY_PAPER_V2_READY`` authorizes new
+    Paper-v2 entries, and only ``AUTHORITY_LEGACY`` authorizes new legacy entries.
+    """
+
+    requested: bool
+    granted: str
+    reason: str
+
+    @property
+    def paper_v2_routing(self) -> bool:
+        """Whether new Paper-v2 entries are authorized this scan."""
+        return self.granted == AUTHORITY_PAPER_V2_READY
+
+    @property
+    def legacy_new_entry_allowed(self) -> bool:
+        """Whether a legacy authority may create NEW entries this scan.
+
+        Only LEGACY may. DRAINING and UNAVAILABLE exist precisely to stop new legacy
+        obligations while the legacy engines finish ones they already own.
+        """
+        return self.granted == AUTHORITY_LEGACY
+
+    @property
+    def engine_label(self) -> str:
+        """The truthful engine label for telemetry. Descriptive only."""
+        if self.granted == AUTHORITY_PAPER_V2_READY:
+            return PAPER_ENGINE_PAPER_V2_LABEL
+        if self.granted == AUTHORITY_PAPER_V2_DRAINING:
+            return "O'Pip Paper v2 (draining legacy)"
+        if self.granted == AUTHORITY_PAPER_V2_UNAVAILABLE:
+            return "O'Pip Paper v2 (legacy state unavailable)"
+        return PAPER_ENGINE_LEGACY_LABEL
+
+
+def _paper_v2_active_safe(settings) -> bool:
+    """Resolve Paper-v2 activation fail-closed, for routing and metadata alike."""
+    try:
+        from app.services.paper_v2_activation import paper_v2_active
+
+        return bool(paper_v2_active(settings))
+    except Exception:
+        return False
+
+
+def _paper_v2_writer_client():
+    """The canonical writer client, or ``None`` when it cannot be constructed.
+
+    Returns ``None`` rather than raising so the caller can decide: an unreadable
+    canonical store must fail closed for Paper-v2 authority, not abort the scan.
+    """
+    try:
+        from app.services.paper_v2_scan_router import _writer_client
+
+        return _writer_client()
+    except Exception:  # noqa: BLE001 - an unavailable writer fails closed upstream
+        return None
+
+
+def _legacy_drain_status(settings):
+    """Read the legacy drain status, or ``None`` when it cannot be evaluated."""
+    try:
+        from app.services.paper_v2_cutover_readiness import evaluate_legacy_drain
+
+        equity = float(getattr(settings, "paper_trade_starting_equity", 0.0) or 0.0)
+        if equity <= 0:
+            return None
+        return evaluate_legacy_drain(starting_equity=equity)
+    except Exception:  # noqa: BLE001 - unreadable state must block cutover
+        return None
+
+
+def _resolve_paper_authority(settings) -> PaperAuthority:
+    """Resolve this scan's paper authority exactly once.
+
+    Called before any decision that depends on it, so routing, lineage, telemetry,
+    the action-gate portfolio source and the operator summary all agree.
+    """
+    if not _paper_v2_active_safe(settings):
+        return PaperAuthority(
+            requested=False,
+            granted=AUTHORITY_LEGACY,
+            reason="Paper v2 was not requested",
+        )
+    status = _legacy_drain_status(settings)
+    if status is None:
+        return PaperAuthority(
+            requested=True,
+            granted=AUTHORITY_PAPER_V2_UNAVAILABLE,
+            reason=(
+                "legacy paper state could not be read, so cutover cannot be proven "
+                "safe"
+            ),
+        )
+    if status.ready:
+        return PaperAuthority(
+            requested=True, granted=AUTHORITY_PAPER_V2_READY, reason=status.reason
+        )
+    if not status.status or status.status == "UNAVAILABLE":
+        return PaperAuthority(
+            requested=True,
+            granted=AUTHORITY_PAPER_V2_UNAVAILABLE,
+            reason=status.reason,
+        )
+    return PaperAuthority(
+        requested=True, granted=AUTHORITY_PAPER_V2_DRAINING, reason=status.reason
+    )
+
+
+def _paper_lineage_attribution(
+    *, paper_enabled: bool, direction: str, valid_now: bool, authority: "PaperAuthority"
+) -> tuple[bool, str]:
+    """The (paper_requested, paper_engine) lineage pair for one opportunity.
+
+    Mode-aware without changing the inactive path: under LEGACY this returns exactly
+    the historical values. Under READY only a LONG that is immediately actionable is
+    a Paper-v2 request - a WAIT or a SHORT is recorded as not requested rather than
+    being relabelled as one. Under DRAINING and UNAVAILABLE neither authority may
+    create an entry, so the label says so instead of claiming an engine acted.
+    """
+    if direction != "LONG":
+        return False, PAPER_ENGINE_NO_AUTHORITATIVE_SHORT
+    if authority.legacy_new_entry_allowed:
+        return bool(paper_enabled and direction == "LONG"), PAPER_ENGINE_FREQTRADE_DRY_RUN
+    if authority.paper_v2_routing:
+        if valid_now:
+            return True, PAPER_ENGINE_OPIP_PAPER_V2
+        return False, PAPER_ENGINE_PAPER_V2_WAIT
+    if authority.granted == AUTHORITY_PAPER_V2_DRAINING:
+        return False, PAPER_ENGINE_PAPER_V2_DRAINING
+    return False, PAPER_ENGINE_PAPER_V2_UNAVAILABLE
+
+
+def _paper_v2_qualification_time() -> datetime:
+    """The one qualification instant for a scan's Paper-v2 stamp."""
+    return datetime.now(timezone.utc)
+
+
+def _paper_v2_cutover_ready(settings) -> tuple[bool, str]:
+    """Deprecated compatibility shim: use :func:`_resolve_paper_authority`.
+
+    Retained only so an existing caller does not break. It delegates to the authority
+    resolver, so it cannot disagree with the state the scan actually uses.
+    """
+    authority = _resolve_paper_authority(settings)
+    return authority.granted == AUTHORITY_PAPER_V2_READY, authority.reason
+
+
+def _route_paper_v2_opportunities(
+    ranked_opportunities,
+    *,
+    scan,
+    decision_at,
+    stamp,
+    settings,
+    opip,
+):
+    """Route every eligible opportunity to O'Pip Paper v2, and only to it.
+
+    Thin by design: the scan owns ordering and telemetry, the router owns the
+    handoff. A router failure is reported and never falls back to a legacy paper
+    authority.
+    """
+    from app.services.paper_v2_scan_router import (
+        PaperV2ScanFacts,
+        route_qualified_opportunities,
+    )
+
+    universe_assets = ()
+    universe = getattr(scan, "universe", None)
+    if universe is not None:
+        universe_assets = tuple(getattr(universe, "assets", ()) or ())
+    if not universe_assets:
+        # Without the exact metadata this scan already observed, no execution
+        # instrument can be proven. Fail closed rather than re-request AssetPairs.
+        print(
+            "PAPER V2: universe metadata unavailable; no Paper-v2 execution attempted"
+        )
+        return None
+    return route_qualified_opportunities(
+        ranked_opportunities,
+        scan_facts=PaperV2ScanFacts(
+            snapshots=tuple(getattr(scan, "snapshots", ()) or ()),
+            decision_at=decision_at,
+            universe_assets=universe_assets,
+        ),
+        stamp=stamp,
+        settings=settings,
+        opip=opip,
+    )
+
+
+def _recover_outstanding_paper_v2_trades(settings) -> None:
+    """Continue committed Paper-v2 lifecycle work before new admissions.
+
+    Uses the existing scheduled scan as the recovery opportunity rather than adding a
+    scheduler, and is fail-soft: a recovery failure is reported and never blocks the
+    scan or falls back to a legacy authority.
+    """
+    try:
+        from app.services.paper_v2_execution import (
+            recover_outstanding_paper_v2_trades,
+        )
+
+        client = _paper_v2_writer_client()
+        if client is None:
+            print("PAPER V2 recovery: canonical writer unavailable")
+            return
+        summary = recover_outstanding_paper_v2_trades(client)
+        print("===== PAPER V2 LIFECYCLE RECOVERY =====")
+        print("Recovery status:", summary.get("status"))
+        print("Outstanding trades considered:", summary.get("considered"))
+        print("Outstanding trades completed:", summary.get("completed"))
+        print("Outstanding trades retryable:", summary.get("retryable"))
+        for detail in summary.get("details") or []:
+            print("  PAPER V2 recovery:", detail)
+    except Exception as exc:  # noqa: BLE001 - recovery must never block the scan
+        print(
+            "PAPER V2 recovery failed:",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _run_paper_v2_protection_sweep(settings, *, requested: bool):
+    """Advance protection/EXIT/reconciliation for committed Paper-v2 exposure.
+
+    Runs on the existing scheduled scan instead of a new scheduler, and
+    deliberately *independently* of new-entry authority. Cutover readiness governs
+    who may open a new position; it must never abandon one that is already open. So
+    this sweep still protects existing exposure when the mode is off, or when the
+    legacy drain verdict is DRAINING or UNAVAILABLE.
+
+    Fail-soft in the sense that it never aborts the market scan, but fail-*closed*
+    for new authority: an unavailable or unsafe result withholds new Paper-v2
+    admissions rather than being reported as healthy. It never falls back to a
+    legacy authority.
+
+    ``requested`` only controls verbosity. A deployment that never enabled Paper v2
+    should not print a lifecycle block on every scan, but a lifecycle *failure* is
+    always reported because it can withhold new authority.
+    """
+    try:
+        from app.services.paper_v2_protection_runtime import run_protection_sweep
+
+        client = _paper_v2_writer_client()
+        if client is None:
+            print("PAPER V2 protection: canonical writer unavailable")
+            return None
+        from app.services.paper_v2_scan_router import _kraken_client
+
+        result = run_protection_sweep(
+            client, kraken_client=_kraken_client(), settings=settings
+        )
+    except Exception as exc:  # noqa: BLE001 - must not abort the market scan
+        print(
+            "PAPER V2 protection sweep failed:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    if requested or result.considered > 0:
+        print("===== PAPER V2 PROTECTION / EXIT SWEEP =====")
+        print("Trades considered:", result.considered)
+        print("Plans activated:", result.activated)
+        print("Protection triggers:", result.triggered)
+        print("EXIT attempts:", result.exit_attempted)
+        print("EXIT fills:", result.filled)
+        print("Partial target exits:", result.partially_exited)
+        print("Trades terminalized:", result.terminalized)
+        print("Retryable lifecycle work:", result.retryable)
+        print("New admissions allowed:", result.new_admissions_allowed)
+        for detail in result.details:
+            print("  PAPER V2 protection:", detail)
+    return result
+
+
+def _print_paper_v2_summary(summary) -> None:
+    """Operator-observable accounting for the active Paper-v2 route."""
+    if summary is None:
+        print("Paper v2 routing: not attempted (no universe metadata)")
+        return
+    print("===== PAPER V2 ROUTING (active authority) =====")
+    print("Paper v2 executed:", summary.executed)
+    print("Paper v2 capital rejected:", summary.capital_rejected)
+    print("Paper v2 capacity rejected:", summary.capacity_rejected)
+    print("Paper v2 SHORT unsupported:", summary.short_unsupported)
+    print("Paper v2 WAIT not executable:", summary.wait_not_executable)
+    print("Paper v2 no-fill terminal (released):", summary.no_fill_terminal)
+    print("Paper v2 handoff failures:", summary.handoff_failures)
+    print("Paper v2 operational failures:", summary.operational_failures)
+    print("Legacy paper authorities invoked:", summary.legacy_calls)
+    for detail in summary.details:
+        print("  PAPER V2:", detail)
+
+
 def _direction_counts(candidates):
     return (
         sum(c.trade_direction == "LONG" for c in candidates),
@@ -525,6 +854,7 @@ def _prepare_qualified_lineage(
     scan,
     decision_at,
     settings,
+    authority=None,
 ) -> tuple[int, int]:
     """Create immutable signal/journey identity before any qualified Telegram send."""
     try:
@@ -540,6 +870,13 @@ def _prepare_qualified_lineage(
         )
         return 0, len(ranked_opportunities)
 
+    # The lineage metadata must describe the authority that actually owns this
+    # opportunity. Prefer the authority the scan already resolved so lineage cannot
+    # disagree with routing; fall back to resolving here for direct callers.
+    resolved_authority = (
+        authority if authority is not None else _resolve_paper_authority(settings)
+    )
+
     prepared = 0
     failures = 0
     for ranked in ranked_opportunities:
@@ -548,6 +885,12 @@ def _prepare_qualified_lineage(
         alert = opportunity.alert
         plan = opportunity.plan
         direction = str(snapshot.trade_direction or "LONG").upper()
+        paper_requested, paper_engine = _paper_lineage_attribution(
+            paper_enabled=paper_enabled,
+            direction=direction,
+            valid_now=bool(plan.valid_now),
+            authority=resolved_authority,
+        )
         try:
             episode_id = canonical_episode_id(
                 scan.snapshots,
@@ -592,12 +935,8 @@ def _prepare_qualified_lineage(
                     "market_regime": alert.get("market_regime"),
                     "economic_target_2_move_pct": alert.get("economic_target_2_move_pct"),
                     "target_attainability_score": alert.get("target_attainability_score"),
-                    "paper_requested": bool(paper_enabled and direction == "LONG"),
-                    "paper_engine": (
-                        "FREQTRADE_DRY_RUN"
-                        if direction == "LONG"
-                        else "NO_AUTHORITATIVE_SHORT_ENGINE_V1"
-                    ),
+                    "paper_requested": paper_requested,
+                    "paper_engine": paper_engine,
                 },
             )
             alert["signal_id"] = signal_id
@@ -887,16 +1226,27 @@ def _assess_price_movement(snapshot, settings, market_intelligence=None):
 
 
 
-def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None):
+def _apply_ranked_action_gates(ranked_opportunities, *, settings, opip=None, authority=None, client=None):
     """Apply scarce-capital/portfolio eligibility in global rank order.
 
     Approved candidates are added to a projected exposure list so lower-ranked
     signals cannot independently allocate the same capital/position slots.
     A vetoed higher-ranked candidate does not block the next-best candidate.
+
+    The existing-position source is authority-aware: under the legacy authority it
+    remains the legacy registry, and under a granted Paper-v2 authority it is
+    committed canonical evidence. The portfolio rules themselves are unchanged.
     """
     try:
-        projected_trades = list(get_active_trades())
+        if authority is None:
+            projected_trades = list(get_active_trades())
+        else:
+            from app.services.paper_v2_portfolio_source import projected_positions
+
+            projected_trades = list(projected_positions(authority, client=client))
     except Exception as exc:
+        # Unreadable existing-position state fails closed for the whole gate: an
+        # unknown portfolio must not authorize new exposure.
         print(
             "ACTION GATE unavailable; no new trade alert authorized:",
             f"{type(exc).__name__}: {exc}",
@@ -1754,11 +2104,22 @@ def main():
                 ranked.profit_ranking.total_score
             )
 
+    # Resolve this scan's paper authority once, before any decision that depends on
+    # it, so routing, lineage, telemetry, the action-gate portfolio source and the
+    # operator summary all agree.
+    authority = _resolve_paper_authority(settings)
+    print("Paper authority:", authority.granted)
+    print("Paper authority reason:", authority.reason)
+
     # A few extension tests replace this helper with the older two-argument
     # seam.  Pass the observer only when the active implementation supports it.
     action_gate_kwargs = {"settings": settings}
     if "opip" in inspect.signature(_apply_ranked_action_gates).parameters:
         action_gate_kwargs["opip"] = opip
+    if "authority" in inspect.signature(_apply_ranked_action_gates).parameters:
+        action_gate_kwargs["authority"] = authority
+    if "client" in inspect.signature(_apply_ranked_action_gates).parameters:
+        action_gate_kwargs["client"] = _paper_v2_writer_client()
     actionable_ranked_opportunities = _apply_ranked_action_gates(
         ranked_opportunities,
         **action_gate_kwargs,
@@ -1774,10 +2135,42 @@ def main():
         scan=scan,
         decision_at=decision_at,
         settings=settings,
+        authority=authority,
     )
     print("Qualified signal lineages prepared before Telegram:", lineage_prepared)
     print("Qualified signal lineage failures:", lineage_failures)
     opip.record_qualified(ranked_opportunities)
+
+    # Capture the Paper-v2 qualification stamp once, immediately after final
+    # qualification is recorded, and only when Paper-v2 routing is actually granted.
+    paper_v2_stamp = None
+    if authority.paper_v2_routing:
+        from app.services.paper_v2_scan_router import capture_qualification_stamp
+
+        paper_v2_stamp = capture_qualification_stamp(
+            qualification_time=_paper_v2_qualification_time()
+        )
+
+    # Lifecycle recovery of already-authorized Paper-v2 work runs before any new
+    # admission, so an interrupted accepted attempt is completed even if the
+    # opportunity that created it never qualifies again. It cannot admit, requalify
+    # or change any economics - it only continues committed trades.
+    #
+    # Both the entry recovery and the protection sweep run on the existing scan
+    # cadence and independent of new-entry authority: an obligation created by
+    # Paper v2 stays protected even if the mode is later switched off or the legacy
+    # drain verdict becomes unavailable. Authority gates NEW entries, not the safety
+    # of positions that already exist.
+    _recover_outstanding_paper_v2_trades(settings)
+    protection_sweep = _run_paper_v2_protection_sweep(
+        settings, requested=authority.requested
+    )
+    # Protection of existing exposure outranks admission of new exposure. An
+    # unavailable or unsafe sweep withholds new Paper-v2 entries this scan; it never
+    # authorizes a legacy fallback.
+    lifecycle_healthy = (
+        protection_sweep is not None and protection_sweep.new_admissions_allowed
+    )
 
     for ranked in ranked_opportunities:
         opportunity = ranked.opportunity
@@ -1819,25 +2212,71 @@ def main():
     print("Telegram notifications sent:", sent)
     print("Price movement notifications sent:", movement_notifications_sent)
     print("Price movement notification failures:", movement_notification_failures)
-    freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
-        ranked_opportunities,
-        scan=scan,
-        decision_at=decision_at,
-        settings=settings,
-    )
-    shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
-        ranked_opportunities,
-        scan=scan,
-        decision_at=decision_at,
-        settings=settings,
-    )
-    print("Authoritative Freqtrade paper signals published:", freqtrade_published)
-    print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
-    print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
-    print("Shadow simulator failures:", shadow_failures)
+    if authority.paper_v2_routing:
+        # Granted: O'Pip Paper v2 is the sole NEW paper-entry authority. Neither
+        # legacy authority is invoked, and no failure path below can reach one.
+        if not lifecycle_healthy:
+            # Existing exposure could not be advanced safely this scan, so the
+            # lifecycle state is not healthy enough to take on more. Withhold new
+            # authority only; recovery retries on the next scan and no legacy
+            # authority is reached.
+            print("===== PAPER V2 ADMISSIONS WITHHELD =====")
+            print("Reason: existing protection lifecycle is not healthy this scan")
+            print("New Paper-v2 entries: 0")
+            print("New Freqtrade entries: 0")
+            print("New Paper-v1 enrollments: 0")
+            print("Legacy fallback: none")
+        else:
+            paper_v2_summary = _route_paper_v2_opportunities(
+                ranked_opportunities,
+                scan=scan,
+                decision_at=decision_at,
+                stamp=paper_v2_stamp,
+                settings=settings,
+                opip=opip,
+            )
+            _print_paper_v2_summary(paper_v2_summary)
+    elif authority.legacy_new_entry_allowed:
+        freqtrade_published, freqtrade_failures = _publish_freqtrade_paper_opportunities(
+            ranked_opportunities,
+            scan=scan,
+            decision_at=decision_at,
+            settings=settings,
+        )
+        shadow_enrolled, shadow_failures = _maybe_enroll_paper_opportunities(
+            ranked_opportunities,
+            scan=scan,
+            decision_at=decision_at,
+            settings=settings,
+        )
+        print("Authoritative Freqtrade paper signals published:", freqtrade_published)
+        print("Authoritative Freqtrade bridge failures:", freqtrade_failures)
+        print("Shadow simulator lifecycles enrolled:", shadow_enrolled)
+        print("Shadow simulator failures:", shadow_failures)
+    else:
+        # Cutover requested but not granted (DRAINING or UNAVAILABLE). No new entry
+        # in EITHER authority: creating new legacy obligations while trying to drain
+        # legacy obligations could prevent the cutover from ever completing. Existing
+        # legacy obligations keep being managed by their own engine, whose lifecycle
+        # this scan does not touch.
+        print("===== PAPER V2 CUTOVER NOT GRANTED =====")
+        print("Resolved authority:", authority.granted)
+        print("Reason:", authority.reason)
+        print("New Freqtrade entries: 0")
+        print("New Paper-v1 enrollments: 0")
+        print("New Paper-v2 entries: 0")
     paper_admission_eligible = opip.record_paper_admission_eligibility(
         ranked_opportunities,
-        paper_enabled=_paper_trade_enabled_safe(),
+        # In a granted Paper-v2 authority the authority is Paper v2, so eligibility
+        # must be reported from the resolved authority rather than from the legacy
+        # paper-control switch.
+        paper_enabled=(
+            True
+            if authority.granted != AUTHORITY_LEGACY
+            else _paper_trade_enabled_safe()
+        ),
+        engine_label=authority.engine_label,
+        paper_v2=authority.paper_v2_routing,
     )
     opip.finalize(
         scan_context=_opip_scan_context(scan, technical_candidate_count, scan_compute_context),

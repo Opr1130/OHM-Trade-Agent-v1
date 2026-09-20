@@ -20,6 +20,15 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from app.opip.contracts.episode_snapshot import (
+    CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE,
+    CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION,
+    CANONICAL_EPISODE_SOURCE_EXCHANGE,
+    canonical_episode_id as _canonical_episode_identity,
+    canonical_snapshot_id as _canonical_snapshot_identity,
+    validate_canonical_episode_snapshot,
+)
+from app.opip.contracts.serialization import episode_snapshot_hash
 from app.services.p1_intelligence_contracts import build_live_scan_snapshot
 from app.services.p1_shadow_outbox import (
     DEFAULT_DEAD_LETTER_FILE,
@@ -31,8 +40,8 @@ from app.services.p1_shadow_outbox import (
 from app.services.registry_io import registry_lock
 
 
-SCHEMA_VERSION = 1
-RECORD_TYPE = "CANONICAL_EPISODE_SNAPSHOT"
+SCHEMA_VERSION = CANONICAL_EPISODE_SNAPSHOT_SCHEMA_VERSION
+RECORD_TYPE = CANONICAL_EPISODE_SNAPSHOT_RECORD_TYPE
 ML_FEATURE_SEED_SCHEMA_VERSION = 1
 
 
@@ -271,10 +280,10 @@ def canonical_episode_id(
     if normalized not in observed:
         raise ValueError(f"{normalized} is not present in the canonical cohort")
     cohort_id = canonical_cohort_id(rows, decision_at=decision_at)
-    return _hash(
-        "EP",
-        f"{SCHEMA_VERSION}|{cohort_id}|{normalized}",
-        length=24,
+    return _canonical_episode_identity(
+        schema_version=SCHEMA_VERSION,
+        cohort_id=cohort_id,
+        symbol=normalized,
     )
 
 
@@ -304,15 +313,14 @@ def _build_snapshot(
     if not symbol:
         raise ValueError("market observation symbol is required")
 
-    episode_id = _hash(
-        "EP",
-        f"{SCHEMA_VERSION}|{cohort_id}|{symbol}",
-        length=24,
+    episode_id = _canonical_episode_identity(
+        schema_version=SCHEMA_VERSION,
+        cohort_id=cohort_id,
+        symbol=symbol,
     )
-    snapshot_id = _hash(
-        "SNAP",
-        f"{SCHEMA_VERSION}|{episode_id}",
-        length=32,
+    snapshot_id = _canonical_snapshot_identity(
+        schema_version=SCHEMA_VERSION,
+        episode_id=episode_id,
     )
     ranked = candidate_index.get(symbol)
     decision_reference_price = _decision_reference_price(observation, scan_source)
@@ -435,7 +443,7 @@ def _build_snapshot(
         "suppressed": suppressed,
         "reasons": reasons,
         "components": components,
-        "source_exchange": "KRAKEN_SPOT",
+        "source_exchange": CANONICAL_EPISODE_SOURCE_EXCHANGE,
         "scan_source": str(scan_source or "LIVE_FULL_MARKET"),
         "measurement_only": True,
         "advisory_only": True,
@@ -445,8 +453,11 @@ def _build_snapshot(
         "trade_authority_changed": False,
         "production_execution_gate_changed": False,
     }
-    json.dumps(payload, sort_keys=True, allow_nan=False)
-    return payload
+    # Self-validate against the shared contract so the producer and the canonical
+    # Paper-v2 validator cannot drift: the producer either emits a record the
+    # canonical contract accepts, or it emits nothing and the caller dead-letters
+    # it. This replaces a bare json.dumps check, which only proved serializability.
+    return validate_canonical_episode_snapshot(payload)
 
 
 def canonical_episode_snapshot_hash(snapshot_payload: Mapping[str, Any]) -> str:
@@ -462,19 +473,13 @@ def canonical_episode_snapshot_hash(snapshot_payload: Mapping[str, Any]) -> str:
     current time, randomness, process identity, or Feature Bus state takes part.
     The ``PSNAP:`` domain keeps it distinct from the ``SNAP:`` identity, so the two
     can never be confused.
+
+    The digest itself is implemented once at the contracts layer, because the
+    canonical event validator must bind a snapshot's exact contents too and the
+    two layers must not each own a hashing convention. This name is preserved as
+    the producer-facing entry point and returns that same value unchanged.
     """
-    if not isinstance(snapshot_payload, Mapping):
-        raise ValueError("snapshot payload must be a mapping")
-    try:
-        encoded = json.dumps(
-            dict(snapshot_payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("snapshot payload is not canonically serializable") from exc
-    return _hash("PSNAP", encoded, length=32)
+    return episode_snapshot_hash(snapshot_payload)
 
 
 def build_canonical_episode_snapshots(

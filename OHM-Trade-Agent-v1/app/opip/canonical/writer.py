@@ -11,7 +11,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.opip.canonical.models import PendingHandoff, WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PaperV2ActiveExposure,
+    PaperV2ActiveExposures,
+    PaperV2ExecutionState,
+    PaperV2ProtectionWork,
+    PaperV2ProtectionWorkItem,
+    PaperV2RecoverableExecutions,
+    PendingHandoff,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.canonical.paths import (
     EVENT_SCHEMA_VERSION,
     SCHEMA_VERSION,
@@ -55,10 +66,18 @@ from app.opip.contracts.paper_execution_events import (
     paper_evidence_idempotency_key,
     validate_paper_evidence_payload,
 )
+from app.opip.contracts.paper_v2_identity import (
+    paper_v2_entry_attempt_id,
+    paper_v2_entry_fill_id,
+    paper_v2_entry_order_intent_id,
+    paper_v2_no_fill_reconciliation_id,
+    paper_v2_protection_plan_id,
+)
 from app.opip.contracts.paper_execution_runtime import (
     PAPER_ACTION_ARMED_STATES,
     PAPER_ACTION_EXIT_SIDE,
     PAPER_ADMISSION_REQUEST_RECORDED,
+    PAPER_DECISION_SNAPSHOT_RECORDED,
     PAPER_EXECUTION_BC1_WRITER_EVENT_TYPES,
     PAPER_PROTECTION_BC2_WRITER_EVENT_TYPES,
     PAPER_QUOTE_EVIDENCE_RECORDED,
@@ -72,6 +91,7 @@ from app.opip.contracts.paper_execution_runtime import (
     PaperProtectionActionRequest,
     admission_request_idempotency_key,
     admission_result_identities,
+    decision_snapshot_idempotency_key,
     protection_action_idempotency_key,
     protection_transition_allowed,
     protection_transition_requires_trigger,
@@ -79,6 +99,7 @@ from app.opip.contracts.paper_execution_runtime import (
     resolve_capital_policy,
     validate_admission_request,
     validate_admission_request_record_payload,
+    validate_decision_snapshot_payload,
     validate_protection_action_request,
     validate_quote_evidence_payload,
 )
@@ -86,6 +107,7 @@ from app.opip.contracts.paper_outcome import (
     PAPER_OUTCOME_EVENT_TYPES,
     PAPER_OUTCOME_PRIORITY,
     PAPER_OUTCOME_STREAM,
+    QUOTE_CURRENCIES,
     PAPER_OUTCOME_TERMINAL_RECORDED,
     assert_supersession_consistent,
     terminal_outcome_idempotency_key,
@@ -715,6 +737,810 @@ class CanonicalWriter:
                 else None
             ),
         )
+
+    def paper_portfolio_state(self, quote_currency: str) -> PaperPortfolioState:
+        """Read-only projection of one paper portfolio's concurrency token.
+
+        Exists so a Paper-v2 producer can obtain the authoritative
+        ``expected_portfolio_version`` before constructing the already-frozen
+        admission request. Nothing else is exposed: not the underlying event rows,
+        not another portfolio's figures.
+
+        This is a pure read. It holds the existing writer lock, validates the quote
+        currency against the existing canonical rule, and delegates to the existing
+         ``_portfolio_state`` projection - it does not reimplement it. It performs
+        no write of any kind, so it cannot insert an event, consume a local
+        sequence, change the history epoch, advance a watermark, create an
+        idempotency row or reservation, or mutate canonical evidence.
+        """
+        # Canonical identity discipline: a padded or malformed currency is
+        # rejected rather than silently normalized, so the caller cannot ask for
+        # one portfolio and read another.
+        if (
+            not isinstance(quote_currency, str)
+            or not quote_currency
+            or quote_currency != quote_currency.strip()
+        ):
+            return PaperPortfolioState(
+                status="REJECTED",
+                error_code="MALFORMED_QUOTE_CURRENCY",
+                detail="quote_currency must be a non-empty canonical string",
+            )
+        if quote_currency not in QUOTE_CURRENCIES:
+            return PaperPortfolioState(
+                status="REJECTED",
+                error_code="UNSUPPORTED_QUOTE_CURRENCY",
+                detail=f"unsupported quote_currency: {quote_currency!r}",
+            )
+        with self._lock:
+            try:
+                version, reserved_capital, active_reservations = (
+                    self._portfolio_state(quote_currency)
+                )
+            except (TypeError, ValueError) as exc:
+                return PaperPortfolioState(
+                    status="REJECTED",
+                    error_code="PORTFOLIO_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperPortfolioState(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+        return PaperPortfolioState(
+            status="OK",
+            quote_currency=quote_currency,
+            portfolio_version=int(version),
+            reserved_capital=float(reserved_capital),
+            active_reservations=int(active_reservations),
+        )
+
+    def paper_v2_active_exposures(self) -> PaperV2ActiveExposures:
+        """Read-only projection of every canonically active Paper-v2 exposure.
+
+        Pure read: holds the writer lock, inspects committed canonical evidence, and
+        reports each trade whose fills leave a positive remaining quantity. It
+        writes nothing. An admitted reservation with no fills has no exposure and is
+        not listed; a fully reconciled trade is no longer active.
+
+        This is the canonical source of truth for "what is O'Pip Paper v2 holding".
+        It deliberately derives exposure from committed fills and reconciliations
+        rather than from scanner-local or process state, so a later scan cannot
+        believe the portfolio is empty while canonical exposure exists.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_active_exposures_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2ActiveExposures(
+                    status="REJECTED",
+                    error_code="ACTIVE_EXPOSURE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2ActiveExposures(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _load_decision_snapshot_by_id(self, snapshot_id: str) -> dict:
+        """Load one committed decision-snapshot wrapper by its identity.
+
+        The decision snapshot uses its own contract rather than the paper-evidence
+        contract, so it is addressed and validated separately instead of being
+        forced through the evidence loader.
+        """
+        row = self._conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (
+                PAPER_DECISION_SNAPSHOT_RECORDED,
+                f"{PAPER_DECISION_SNAPSHOT_RECORDED}:{snapshot_id}",
+            ),
+        ).fetchone()
+        if row is None:
+            return {}
+        raw = json.loads(str(row["payload_json"]))
+        return validate_decision_snapshot_payload(raw)
+
+    def _decision_symbol_for_trade(self, paper_trade_id: str) -> str:
+        """The production decision symbol for one trade, from canonical evidence.
+
+        The action gate compares production symbols (``SOLUSD``), not venue aliases
+        (``SOL/USD``), so the symbol is read from the committed decision snapshot
+        the trade's context cites. A trade whose symbol cannot be proven returns an
+        empty string rather than a guessed alias.
+        """
+        order = self._optional_paper_event_by_identity(
+            PAPER_ORDER_INTENT_RECORDED,
+            paper_v2_entry_order_intent_id(paper_trade_id),
+        )
+        if order is None:
+            return ""
+        context_id = str(order.get("decision_context_id") or "")
+        if not context_id:
+            return ""
+        context = self._load_context_by_id(context_id)
+        snapshot_id = str(context.get("snapshot_id") or "")
+        if not snapshot_id:
+            return ""
+        snapshot = self._load_decision_snapshot_by_id(snapshot_id)
+        if not snapshot:
+            return ""
+        inner = snapshot.get("snapshot_payload")
+        if not isinstance(inner, Mapping):
+            return ""
+        return str(inner.get("symbol") or "")
+
+    def _paper_v2_active_exposures_unlocked(self) -> PaperV2ActiveExposures:
+        """Derive active exposure from committed canonical fills.
+
+        Candidate trades come from committed ADMITTED dispositions, then each is
+        narrowed to its own committed fills through the per-trade index. A trade
+        with no remaining quantity never appears, so reservation-only admissions and
+        closed trades are both excluded by construction rather than by filtering
+        convention.
+        """
+        exposures: list[PaperV2ActiveExposure] = []
+        for disposition in self._admitted_dispositions():
+            disposition_id = str(disposition.get("disposition_id") or "")
+            if not disposition_id:
+                continue
+            paper_trade_id = str(disposition.get("paper_trade_id") or "")
+            if not paper_trade_id:
+                continue
+            totals = self._canonical_totals_for_trade(
+                paper_trade_id,
+                paper_v2_entry_order_intent_id(paper_trade_id),
+            )
+            if float(totals["remaining_quantity"]) <= 0:
+                # No exposure: either never filled, or fully closed.
+                continue
+            plan = self._optional_paper_event_by_identity(
+                PAPER_PROTECTION_PLAN_RECORDED,
+                paper_v2_protection_plan_id(paper_trade_id),
+            )
+            plan_id = (
+                str(plan["protection_plan_id"]) if plan is not None else None
+            )
+            exposures.append(
+                PaperV2ActiveExposure(
+                    paper_trade_id=paper_trade_id,
+                    disposition_id=disposition_id,
+                    symbol=self._decision_symbol_for_trade(paper_trade_id),
+                    quote_currency=str(disposition.get("quote_currency") or ""),
+                    # This frozen engine is long-only; the direction is a property
+                    # of the engine rather than of the disposition payload.
+                    direction="LONG",
+                    filled_quantity=float(totals["entry_quantity"]),
+                    exited_quantity=float(totals["exit_quantity"]),
+                    remaining_quantity=float(totals["remaining_quantity"]),
+                    remaining_notional_basis=self._remaining_notional_basis(
+                        paper_trade_id,
+                        paper_v2_entry_order_intent_id(paper_trade_id),
+                        remaining_quantity=float(totals["remaining_quantity"]),
+                        entry_quantity=float(totals["entry_quantity"]),
+                    ),
+                    protection_plan_id=plan_id,
+                    protection_state=(
+                        self._effective_protection_state(plan_id).value
+                        if plan_id
+                        else None
+                    ),
+                )
+            )
+        exposures.sort(key=lambda item: item.paper_trade_id)
+        return PaperV2ActiveExposures(status="OK", exposures=exposures)
+
+    def _remaining_notional_basis(
+        self,
+        paper_trade_id: str,
+        entry_order_id: str,
+        *,
+        remaining_quantity: float,
+        entry_quantity: float,
+    ) -> float:
+        """Committed cost basis of the quantity still held, in quote currency.
+
+        Derived from the trade's own committed entry fills - the average committed
+        entry price applied to the remaining quantity - so it is frozen by evidence
+        rather than by a later market read. No mark-to-market model is applied: Paper
+        v2 has no frozen market-risk model, and inventing one here would silently
+        change portfolio-risk semantics.
+        """
+        if entry_quantity <= 0:
+            return 0.0
+        committed_notional = 0.0
+        for fill in self._paper_fills_for_trade(paper_trade_id):
+            if str(fill["order_intent_id"]) != entry_order_id:
+                continue
+            committed_notional += float(fill["quantity"]) * float(fill["price"])
+        average_entry_price = committed_notional / entry_quantity
+        return remaining_quantity * average_entry_price
+
+    def paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions:
+        """Read-only projection of committed trades needing lifecycle continuation.
+
+        Pure read. Lists trades with a fill-capable ENTRY attempt and no fill, with
+        the committed attempt and quote payloads needed to finish the fill. Recovery
+        must work without the original opportunity qualifying again, so this is
+        driven by canonical evidence rather than by a fresh scan.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_recoverable_executions_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2RecoverableExecutions(
+                    status="REJECTED",
+                    error_code="RECOVERABLE_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2RecoverableExecutions(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_recoverable_executions_unlocked(
+        self,
+    ) -> PaperV2RecoverableExecutions:
+        """Fill-capable attempts that have no committed fill yet.
+
+        Scoped to the fill-capable states, so the candidate set is the number of live
+        attempts rather than the size of canonical history.
+        """
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for state_value in sorted(_FILLABLE_STATE_VALUES):
+            rows = self._conn.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = ? "
+                "AND json_extract(payload_json, '$.execution_state') = ? "
+                "ORDER BY history_epoch ASC, local_sequence ASC",
+                (PAPER_EXECUTION_ATTEMPT_RECORDED, state_value),
+            ).fetchall()
+            for row in rows:
+                attempt = validate_paper_evidence_payload(
+                    PAPER_EXECUTION_ATTEMPT_RECORDED,
+                    json.loads(str(row["payload_json"])),
+                )
+                paper_trade_id = str(attempt.get("paper_trade_id") or "")
+                if not paper_trade_id or paper_trade_id in seen:
+                    continue
+                order_id = str(attempt.get("order_intent_id") or "")
+                if not order_id:
+                    continue
+                if (
+                    self._optional_paper_event_by_identity(
+                        PAPER_FILL_RECORDED, paper_v2_entry_fill_id(order_id)
+                    )
+                    is not None
+                ):
+                    # Already filled; nothing to continue.
+                    continue
+                quote_ref = attempt.get("market_evidence_ref")
+                if not isinstance(quote_ref, str) or not quote_ref:
+                    continue
+                seen.add(paper_trade_id)
+                entries.append(
+                    {
+                        "paper_trade_id": paper_trade_id,
+                        "execution_attempt_id": str(
+                            attempt["execution_attempt_id"]
+                        ),
+                        "execution_attempt": attempt,
+                        "quote_evidence": self._load_quote_evidence_by_id(quote_ref),
+                    }
+                )
+        entries.sort(key=lambda entry: entry["paper_trade_id"])
+        return PaperV2RecoverableExecutions(status="OK", entries=entries)
+
+    def paper_v2_protection_work(self) -> PaperV2ProtectionWork:
+        """Read-only projection of trades requiring protection/exit attention.
+
+        Pure read. Enumerates admitted trades once, then reads each trade's
+        lifecycle through the per-trade ``paper_trade_id`` expression index rather
+        than scanning historical event families per trade, so cost scales with the
+        number of live trades times their own events, not with total canonical
+        history. Includes trades that are flat but not yet ``FINAL_VERIFIED``, which
+        are absent from the active-exposure projection once the SELL fill lands.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_protection_work_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2ProtectionWork(
+                    status="REJECTED",
+                    error_code="PROTECTION_WORK_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2ProtectionWork(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_protection_work_unlocked(self) -> PaperV2ProtectionWork:
+        final_verified = self._final_verified_trade_ids()
+        items: list[PaperV2ProtectionWorkItem] = []
+        for disposition in self._admitted_dispositions():
+            paper_trade_id = str(disposition.get("paper_trade_id") or "")
+            if not paper_trade_id:
+                continue
+            items.append(
+                self._protection_work_item(
+                    paper_trade_id,
+                    disposition=disposition,
+                    final_verified=paper_trade_id in final_verified,
+                )
+            )
+        items.sort(key=lambda item: item.paper_trade_id)
+        return PaperV2ProtectionWork(status="OK", items=items)
+
+    def _paper_trade_events(self, event_type: str, paper_trade_id: str) -> list[dict]:
+        """Committed records of one event type for one trade, in commit order."""
+        rows = self._conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.paper_trade_id') = ? "
+            "ORDER BY history_epoch ASC, local_sequence ASC",
+            (event_type, paper_trade_id),
+        ).fetchall()
+        return [
+            validate_paper_evidence_payload(
+                event_type, json.loads(str(row["payload_json"]))
+            )
+            for row in rows
+        ]
+
+    def _protection_work_item(
+        self,
+        paper_trade_id: str,
+        *,
+        disposition: Mapping[str, object],
+        final_verified: bool,
+    ) -> PaperV2ProtectionWorkItem:
+        totals = self._canonical_totals_for_trade(
+            paper_trade_id, paper_v2_entry_order_intent_id(paper_trade_id)
+        )
+        entry_fills = [
+            fill
+            for fill in self._paper_fills_for_trade(paper_trade_id)
+            if str(fill["order_intent_id"]) == paper_v2_entry_order_intent_id(
+                paper_trade_id
+            )
+        ]
+        exit_fills = [
+            fill
+            for fill in self._paper_fills_for_trade(paper_trade_id)
+            if str(fill["order_intent_id"])
+            != paper_v2_entry_order_intent_id(paper_trade_id)
+        ]
+        orders = self._paper_trade_events(
+            PAPER_ORDER_INTENT_RECORDED, paper_trade_id
+        )
+        exit_orders = [
+            order for order in orders if str(order["intent_role"]) == "EXIT"
+        ]
+        attempts = self._paper_trade_events(
+            PAPER_EXECUTION_ATTEMPT_RECORDED, paper_trade_id
+        )
+        exit_order_ids = {str(order["order_intent_id"]) for order in exit_orders}
+        exit_attempts = [
+            attempt
+            for attempt in attempts
+            if str(attempt["order_intent_id"]) in exit_order_ids
+        ]
+        triggers = self._paper_trade_events(
+            PAPER_PROTECTION_TRIGGER_RECORDED, paper_trade_id
+        )
+        states = self._paper_trade_events(
+            PAPER_PROTECTION_STATE_RECORDED, paper_trade_id
+        )
+        reconciliations = self._paper_trade_events(
+            PAPER_RECONCILIATION_RECORDED, paper_trade_id
+        )
+
+        plan = self._latest_protection_plan(paper_trade_id)
+        plan_id = str(plan["protection_plan_id"]) if plan else None
+        state_value = (
+            self._effective_protection_state(plan_id).value if plan_id else None
+        )
+        state_seq = max((int(item["state_seq"]) for item in states), default=None)
+        trigger_seq = max((int(item["trigger_seq"]) for item in triggers), default=None)
+        latest_reconciliation = (
+            max(reconciliations, key=lambda item: int(item["reconciliation_seq"]))
+            if reconciliations
+            else None
+        )
+        # An EXIT order is fill-capable while it has an attempt in a fillable state
+        # and no committed fill for that order yet.
+        filled_order_ids = {str(fill["order_intent_id"]) for fill in exit_fills}
+        exit_fill_capable = any(
+            str(attempt["execution_state"]) in _FILLABLE_STATE_VALUES
+            and str(attempt["order_intent_id"]) not in filled_order_ids
+            for attempt in exit_attempts
+        )
+        context_id = str(disposition.get("decision_context_id") or "") or None
+        quote_evidence: dict[str, dict[str, Any]] = {}
+        for record in list(triggers) + list(exit_attempts):
+            quote_ref = record.get("market_evidence_ref")
+            if isinstance(quote_ref, str) and quote_ref and quote_ref not in quote_evidence:
+                try:
+                    quote_evidence[quote_ref] = self._load_quote_evidence_by_id(quote_ref)
+                except ValueError:
+                    continue
+        # Exit evidence must be requested from the exact instrument the position was
+        # opened on, resolved from the registered canonical instrument version rather
+        # than reconstructed from the asset code. Rebuilding a symbol such as
+        # ``base/USD`` would silently point a non-USD-quoted position at the wrong
+        # market. Both the venue symbol and the quote currency are taken from the
+        # registry, which is the same authority the entry path validated against.
+        instrument_version = None
+        native_symbol = None
+        instrument_quote_currency = None
+        if context_id:
+            try:
+                context = self._load_context_by_id(context_id)
+            except ValueError:
+                context = None
+            if isinstance(context, Mapping):
+                instrument_version = str(context.get("instrument_version") or "") or None
+            if instrument_version:
+                try:
+                    instrument = self._load_instrument_version_by_id(instrument_version)
+                except ValueError:
+                    instrument = None
+                if isinstance(instrument, Mapping):
+                    native_symbol = (
+                        str(instrument.get("venue_instrument_id") or "") or None
+                    )
+                    instrument_quote_currency = (
+                        str(instrument.get("quote_currency") or "") or None
+                    )
+
+        return PaperV2ProtectionWorkItem(
+            paper_trade_id=paper_trade_id,
+            disposition_id=str(disposition.get("disposition_id") or "") or None,
+            decision_context_id=context_id,
+            reservation_id=str(disposition.get("reservation_id") or "") or None,
+            quote_currency=(
+                instrument_quote_currency
+                or str(disposition.get("quote_currency") or "")
+                or None
+            ),
+            instrument_version=instrument_version,
+            native_symbol=native_symbol,
+            entry_quantity=float(totals["entry_quantity"]),
+            exited_quantity=float(totals["exit_quantity"]),
+            remaining_quantity=float(totals["remaining_quantity"]),
+            gross_pnl=float(totals["gross_pnl"]),
+            execution_costs=float(totals["execution_costs"]),
+            reserved_capital=float(
+                disposition.get("requested_reservation_amount") or 0.0
+            ),
+            protection_plan=plan,
+            protection_state=state_value,
+            plan_seq=int(plan["plan_seq"]) if plan else None,
+            state_seq=state_seq,
+            trigger_seq=trigger_seq,
+            triggers=triggers,
+            protection_states=states,
+            exit_order_intents=exit_orders,
+            exit_attempts=exit_attempts,
+            exit_fills=exit_fills,
+            entry_fills=entry_fills,
+            latest_reconciliation=latest_reconciliation,
+            quote_evidence=quote_evidence,
+            exit_attempt_fill_capable=exit_fill_capable,
+            final_verified=final_verified,
+        )
+
+    def paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState:
+        """Read-only projection of one Paper-v2 trade's canonical progress.
+
+        Pure read: holds the writer lock, inspects already-committed canonical
+        evidence, and reports which stages exist. It writes nothing - no event, no
+        sequence, no watermark, no idempotency row, no reservation.
+
+        The trade identity is derived from the disposition identity, so a restart
+        can ask about a trade before admission has happened.
+        """
+        if (
+            not isinstance(disposition_id, str)
+            or not disposition_id
+            or disposition_id != disposition_id.strip()
+        ):
+            return PaperV2ExecutionState(
+                status="REJECTED",
+                error_code="MALFORMED_DISPOSITION_ID",
+                detail="disposition_id must be a non-empty canonical string",
+            )
+        with self._lock:
+            try:
+                return self._paper_v2_execution_state_unlocked(disposition_id)
+            except (TypeError, ValueError) as exc:
+                return PaperV2ExecutionState(
+                    status="REJECTED",
+                    disposition_id=disposition_id,
+                    error_code="EXECUTION_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2ExecutionState(
+                    status="RETRYABLE",
+                    disposition_id=disposition_id,
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _optional_paper_event_by_identity(
+        self, event_type: str, identity: str
+    ) -> dict | None:
+        """Load one committed Paper-v2 record by its deterministic identity.
+
+        A targeted lookup on the UNIQUE ``idempotency_key`` index, not a scan of
+        the event history. Returns ``None`` when the stage has not committed, so a
+        caller can use absence to decide what still needs to happen. A committed
+        record whose stored payload no longer validates is integrity corruption and
+        raises rather than reading as absent.
+        """
+        contract = paper_event_contract(event_type)
+        key = paper_evidence_idempotency_key(
+            event_type, {contract.identity_field: identity}
+        )
+        row = self._conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (event_type, key),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"persisted {event_type} payload is invalid JSON"
+            ) from exc
+        return validate_paper_evidence_payload(event_type, raw)
+
+    def _paper_fills_for_trade(self, paper_trade_id: str) -> list[dict]:
+        """Committed Paper-v2 fills for one trade, in commit order.
+
+        Uses the additive ``paper_trade_id`` expression index, so this is a
+        per-trade lookup rather than a scan of all historical fills.
+        """
+        rows = self._conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.paper_trade_id') = ? "
+            "ORDER BY history_epoch ASC, local_sequence ASC",
+            (PAPER_FILL_RECORDED, paper_trade_id),
+        ).fetchall()
+        return [validate_paper_evidence_payload(PAPER_FILL_RECORDED, json.loads(str(row["payload_json"]))) for row in rows]
+
+    def _validate_zero_fill_release_is_safe(self, paper_trade_id: str) -> None:
+        """Refuse a zero-fill terminalization while exposure could still appear.
+
+        A terminal reconciliation releases reserved capital and a position slot, so
+        it may only be written when canonical evidence proves the trade can never
+        produce exposure: no committed fill exists, and no committed ENTRY attempt
+        is still in a fill-capable state. A crashed-but-accepted attempt is
+        therefore *not* releasable - it must be resumed and reconciled, because
+        releasing it would free capacity against a trade that can still fill.
+        """
+        fills = self._paper_fills_for_trade(paper_trade_id)
+        if fills:
+            raise ValueError(
+                "ZERO_FILL_RELEASE_UNSAFE: a committed fill exists for this trade, so a "
+                "zero-fill terminal reconciliation cannot describe it"
+            )
+        for state_value in _FILLABLE_STATE_VALUES:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = ? "
+                "AND json_extract(payload_json, '$.paper_trade_id') = ? "
+                "AND json_extract(payload_json, '$.execution_state') = ? "
+                "LIMIT 1",
+                (
+                    PAPER_EXECUTION_ATTEMPT_RECORDED,
+                    paper_trade_id,
+                    state_value,
+                ),
+            ).fetchall()
+            if rows:
+                raise ValueError(
+                    "ZERO_FILL_RELEASE_UNSAFE: a fill-capable ENTRY attempt is "
+                    f"outstanding (execution_state={state_value}); resume it rather "
+                    "than releasing the reservation"
+                )
+
+    def _paper_v2_execution_state_unlocked(
+        self, disposition_id: str
+    ) -> PaperV2ExecutionState:
+        """Committed Paper-v2 progress for one trade, read by deterministic identity.
+
+        Every stage this producer can create has a deterministic identity derived
+        from the trade, so each is fetched through the UNIQUE ``idempotency_key``
+        index. Nothing here scans historical event families, so restart cost does
+        not grow with total canonical history while the writer lock is held.
+
+        Payloads - not just identities - are returned, because a restart must reuse
+        the committed stage verbatim rather than rebuild it.
+        """
+        paper_trade_id, reservation_id = admission_result_identities(disposition_id)
+        state: dict = {
+            "status": "OK",
+            "disposition_id": disposition_id,
+            "paper_trade_id": paper_trade_id,
+            "reservation_id": reservation_id,
+        }
+
+        # Admission request (writer-owned record of the frozen request payload).
+        request_row = self._conn.execute(
+            "SELECT payload_json FROM events WHERE event_type = ? AND idempotency_key = ?",
+            (
+                PAPER_ADMISSION_REQUEST_RECORDED,
+                admission_request_idempotency_key(disposition_id),
+            ),
+        ).fetchone()
+        if request_row is not None:
+            stored = json.loads(str(request_row["payload_json"]))
+            state.update(
+                {
+                    "expected_portfolio_version": stored.get(
+                        "expected_portfolio_version"
+                    ),
+                    "quote_currency": stored.get("quote_currency"),
+                    "decision_context_id": stored.get("decision_context_id"),
+                    "disposition": stored.get("guard_result"),
+                    "requested_reservation_amount": stored.get(
+                        "requested_reservation_amount"
+                    ),
+                }
+            )
+
+        # The committed disposition is the reservation authority.
+        disposition = self._optional_paper_event_by_identity(
+            PAPER_OPPORTUNITY_DISPOSITION_RECORDED, disposition_id
+        )
+        if disposition is not None:
+            state.update(
+                {
+                    "disposition": disposition.get("disposition"),
+                    "quote_currency": disposition.get("quote_currency"),
+                    "decision_context_id": disposition.get("decision_context_id"),
+                }
+            )
+            if disposition.get("disposition") == "ADMITTED":
+                state["admitted"] = True
+
+        # Each stage below is addressed by the identity this producer derives.
+        entry_order_id = paper_v2_entry_order_intent_id(paper_trade_id)
+        attempt_id = paper_v2_entry_attempt_id(entry_order_id)
+        fill_id = paper_v2_entry_fill_id(entry_order_id)
+
+        entry = self._optional_paper_event_by_identity(
+            PAPER_ORDER_INTENT_RECORDED, entry_order_id
+        )
+        if entry is not None:
+            state["entry_order_intent_id"] = entry_order_id
+            state["entry_order_intent"] = entry
+
+        attempt = self._optional_paper_event_by_identity(
+            PAPER_EXECUTION_ATTEMPT_RECORDED, attempt_id
+        )
+        if attempt is not None:
+            state["execution_attempt_id"] = attempt_id
+            state["execution_attempt"] = attempt
+            state["entry_attempt_fill_capable"] = (
+                str(attempt.get("execution_state")) in _FILLABLE_STATE_VALUES
+            )
+            quote_ref = attempt.get("market_evidence_ref")
+            if isinstance(quote_ref, str) and quote_ref:
+                state["quote_evidence"] = self._load_quote_evidence_by_id(quote_ref)
+
+        fill = self._optional_paper_event_by_identity(
+            PAPER_FILL_RECORDED, fill_id
+        )
+        if fill is not None:
+            state["fill_id"] = fill_id
+            state["fill"] = fill
+            if "quote_evidence" not in state:
+                quote_ref = fill.get("market_evidence_ref")
+                if isinstance(quote_ref, str) and quote_ref:
+                    state["quote_evidence"] = self._load_quote_evidence_by_id(
+                        quote_ref
+                    )
+
+        # Totals from this trade's committed fills only: entry from the targeted
+        # fill identity, exits from the per-trade index.
+        totals = self._canonical_totals_for_trade(paper_trade_id, entry_order_id)
+        state["filled_quantity"] = float(totals["entry_quantity"])
+        state["remaining_quantity"] = float(totals["remaining_quantity"])
+
+        plan = self._optional_paper_event_by_identity(
+            PAPER_PROTECTION_PLAN_RECORDED,
+            paper_v2_protection_plan_id(paper_trade_id),
+        )
+        if plan is not None:
+            state["protection_plan"] = plan
+
+        terminal = self._optional_paper_event_by_identity(
+            PAPER_RECONCILIATION_RECORDED,
+            paper_v2_no_fill_reconciliation_id(paper_trade_id),
+        )
+        if terminal is not None:
+            state["terminal_reconciliation"] = terminal
+
+        return PaperV2ExecutionState.from_dict(state)
+
+    def _canonical_totals_for_trade(
+        self, paper_trade_id: str, entry_order_id: str
+    ) -> dict:
+        """Exposure and economics for one trade from its committed fills.
+
+        Same arithmetic as :meth:`_canonical_fill_totals`, but scoped to one trade
+        through the per-trade index so a single trade's state never requires
+        scanning the whole fill history. The entry order's role is known by
+        construction from its identity rather than by reading every order intent.
+        """
+        entry_quantity = 0.0
+        exit_quantity = 0.0
+        gross_pnl = 0.0
+        execution_costs = 0.0
+        for fill in self._paper_fills_for_trade(paper_trade_id):
+            order_id = str(fill["order_intent_id"])
+            if order_id == entry_order_id:
+                role = "ENTRY"
+            else:
+                role = self._order_roles_for_trade(paper_trade_id).get(order_id)
+                if role is None:
+                    raise ValueError(
+                        "canonical fill has no committed parent order intent role"
+                    )
+            if role not in {"ENTRY", "EXIT"}:
+                raise ValueError(
+                    "canonical fill parent order has an unsupported intent_role"
+                )
+            quantity = float(fill["quantity"])
+            notional = quantity * float(fill["price"])
+            execution_costs += (
+                float(fill["fee_cost"])
+                + float(fill["spread_cost"])
+                + float(fill["slippage_cost"])
+                + float(fill["other_supported_cost"])
+            )
+            if role == "ENTRY":
+                entry_quantity += quantity
+                gross_pnl -= notional
+            else:
+                exit_quantity += quantity
+                gross_pnl += notional
+        return {
+            "entry_quantity": entry_quantity,
+            "exit_quantity": exit_quantity,
+            "remaining_quantity": entry_quantity - exit_quantity,
+            "gross_pnl": gross_pnl,
+            "execution_costs": execution_costs,
+        }
+
+    def _order_roles_for_trade(self, paper_trade_id: str) -> dict[str, str]:
+        """Committed order-intent roles for one trade, from the per-trade index."""
+        rows = self._conn.execute(
+            "SELECT payload_json FROM events "
+            "WHERE event_type = ? "
+            "AND json_extract(payload_json, '$.paper_trade_id') = ?",
+            (PAPER_ORDER_INTENT_RECORDED, paper_trade_id),
+        ).fetchall()
+        roles: dict[str, str] = {}
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            roles[str(payload["order_intent_id"])] = str(payload["intent_role"])
+        return roles
 
     def admit_paper_opportunity(
         self,
@@ -2454,6 +3280,14 @@ class CanonicalWriter:
         if intent.event_type == PAPER_QUOTE_EVIDENCE_RECORDED:
             normalized = validate_quote_evidence_payload(intent.payload)
             expected_key = quote_evidence_idempotency_key(normalized)
+        elif intent.event_type == PAPER_DECISION_SNAPSHOT_RECORDED:
+            # The decision snapshot verifies its own content binding, so a
+            # fabricated or mismatched hash cannot reach the store. Its key is
+            # anchored on snapshot identity, so an identical retry is
+            # DUPLICATE_OK while different content under the same identity hits
+            # the same-key conflict check below.
+            normalized = validate_decision_snapshot_payload(intent.payload)
+            expected_key = decision_snapshot_idempotency_key(normalized)
         else:
             if intent.event_type not in PAPER_V2_WRITER_EVENT_TYPES:
                 raise ValueError("Paper v2 event is not registered for runtime")
@@ -2719,6 +3553,23 @@ class CanonicalWriter:
                 activated.append((int(plan["plan_seq"]), plan_id))
         return sorted(activated)
 
+    def _latest_protection_plan(self, paper_trade_id: str) -> dict | None:
+        """The highest-sequenced *committed* plan for a trade, activated or not.
+
+        ``_effective_protection_plan`` deliberately returns only plans that state
+        evidence proves activated, which is the right answer for trigger validation
+        but the wrong one for arming: a plan committed before exposure is precisely
+        the plan that has not been activated yet. Protection work therefore needs
+        the latest committed revision, which is what this returns.
+
+        Read through the per-trade ``paper_trade_id`` index so it never scans the
+        plan history of other trades.
+        """
+        plans = self._paper_trade_events(PAPER_PROTECTION_PLAN_RECORDED, paper_trade_id)
+        if not plans:
+            return None
+        return max(plans, key=lambda plan: int(plan["plan_seq"]))
+
     def _effective_protection_plan(self, paper_trade_id: str) -> dict | None:
         """The effective plan is the highest activated plan_seq for the trade."""
         activated = self._activated_plan_ids(paper_trade_id)
@@ -2759,10 +3610,18 @@ class CanonicalWriter:
     def _verified_paper_trade_ids(self, quote_currency: str) -> set[str]:
         """Trades whose economics are FINAL_VERIFIED, so capacity may be released."""
         verified: set[str] = set()
+        # A zero-fill terminal trade is truthfully NO_POSITION (it never held one),
+        # while a trade that held exposure and closed is FLAT. Both release capacity,
+        # so both states must be accepted here - requiring FLAT alone left a failed
+        # pre-fill trade's reservation permanently active.
+        releasable_states = {
+            PositionState.FLAT.value,
+            PositionState.NO_POSITION.value,
+        }
         for record in self._committed_paper_rows(PAPER_RECONCILIATION_RECORDED):
             if (
                 record.get("terminal_reconciliation_state") == "FINAL_VERIFIED"
-                and record.get("position_state") == PositionState.FLAT.value
+                and record.get("position_state") in releasable_states
                 # Tolerance rather than float equality: the frozen contract
                 # already requires exactly zero remaining for this state, and an
                 # equality check on floats is unreliable by construction.
@@ -3199,6 +4058,14 @@ class CanonicalWriter:
             )
         if terminal != TerminalReconciliationState.FINAL_VERIFIED.value:
             return
+        # A terminal reconciliation releases reserved capital and a position slot,
+        # so it may only be written when canonical evidence proves the trade can no
+        # longer produce exposure. Checked structurally here rather than trusted to
+        # producer convention: a zero-fill terminalization while a fill-capable
+        # ENTRY attempt is still outstanding would release capacity against a trade
+        # that can still fill.
+        if float(totals["entry_quantity"]) <= 0:
+            self._validate_zero_fill_release_is_safe(paper_trade_id)
         for field_name, canonical in (
             ("realized_gross_pnl", totals["gross_pnl"]),
             ("recorded_execution_costs", totals["execution_costs"]),

@@ -735,9 +735,19 @@ def validate_paper_evidence_payload(
                 "filled_exit_quantity + remaining_quantity"
             )
         if reconciliation_state is TerminalReconciliationState.FINAL_VERIFIED:
-            if position_state is not PositionState.FLAT or remaining > 0.0:
+            # A trade that never filled has no position to be flat *from*, so its
+            # truthful terminal position state is NO_POSITION. A trade that did hold
+            # exposure and is now closed is FLAT. Requiring FLAT unconditionally
+            # made a zero-fill terminal reconciliation inexpressible, which left a
+            # failed pre-fill trade's reservation permanently active.
+            expected_position_state = (
+                PositionState.FLAT if entry > 0 else PositionState.NO_POSITION
+            )
+            if position_state is not expected_position_state or remaining > 0.0:
                 raise ValueError(
-                    "FINAL_VERIFIED reconciliation requires FLAT position and zero remaining quantity"
+                    "FINAL_VERIFIED reconciliation requires "
+                    f"{expected_position_state.value} position and zero remaining "
+                    "quantity"
                 )
             if normalized.get("unresolved_reason") is not None:
                 raise ValueError(

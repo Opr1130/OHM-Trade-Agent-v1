@@ -12,7 +12,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.opip.canonical.models import WriterAck, WriterIntent
+from app.opip.canonical.models import (
+    PaperPortfolioState,
+    PaperV2ActiveExposures,
+    PaperV2ExecutionState,
+    PaperV2ProtectionWork,
+    PaperV2RecoverableExecutions,
+    WriterAck,
+    WriterIntent,
+)
 from app.opip.canonical.protocol import recv_json, send_json
 from app.opip.canonical.writer import CanonicalWriter
 from app.opip.contracts.paper_execution_runtime import (
@@ -227,6 +235,59 @@ class CanonicalWriterServer:
             # Read-only diagnostics remain available while fail-closed.
             rows = [h.__dict__ for h in self.writer.list_pending_handoffs()]
             return {"status": "OK", "handoffs": rows}
+        if method == "GET_PAPER_PORTFOLIO_STATE":
+            # A read-only projection. It is deliberately still gated on canonical
+            # health: an unsafe or unavailable writer must not hand a producer an
+            # apparently valid concurrency token to build an admission on.
+            if self._health_status() != "OK":
+                return PaperPortfolioState(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_portfolio_state(
+                str(request.get("quote_currency") or "")
+            ).to_dict()
+        if method == "GET_PAPER_V2_EXECUTION_STATE":
+            # Read-only progress projection, gated on health for the same reason:
+            # a degraded writer must not offer apparently valid progress that a
+            # restart would resume from.
+            if self._health_status() != "OK":
+                return PaperV2ExecutionState(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_execution_state(
+                str(request.get("disposition_id") or "")
+            ).to_dict()
+        if method == "GET_PAPER_V2_ACTIVE_EXPOSURES":
+            # Read-only exposure projection, gated on health like the other reads.
+            # An unhealthy store must not return an apparently authoritative
+            # exposure set: an empty list would read as "nothing is held".
+            if self._health_status() != "OK":
+                return PaperV2ActiveExposures(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_active_exposures().to_dict()
+        if method == "GET_PAPER_V2_RECOVERABLE_EXECUTIONS":
+            # Read-only lifecycle-recovery projection, gated on health for the same
+            # reason: an unhealthy store must not report an empty work list that
+            # would let outstanding trades be treated as finished.
+            if self._health_status() != "OK":
+                return PaperV2RecoverableExecutions(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_recoverable_executions().to_dict()
+        if method == "GET_PAPER_V2_PROTECTION_WORK":
+            # Read-only protection/exit work projection, health-gated for the same
+            # reason: an unhealthy store must not report "nothing to protect".
+            if self._health_status() != "OK":
+                return PaperV2ProtectionWork(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_protection_work().to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":
