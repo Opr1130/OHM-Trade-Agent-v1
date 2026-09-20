@@ -16,6 +16,8 @@ from app.opip.canonical.models import (
     PaperV2ActiveExposure,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2Ledger,
+    PaperV2LedgerEntry,
     PaperV2ProtectionWork,
     PaperV2ProtectionWorkItem,
     PaperV2RecoverableExecutions,
@@ -1037,6 +1039,232 @@ class CanonicalWriter:
                 )
         entries.sort(key=lambda entry: entry["paper_trade_id"])
         return PaperV2RecoverableExecutions(status="OK", entries=entries)
+
+    def paper_v2_ledger(self) -> PaperV2Ledger:
+        """Read-only ledger of every committed Paper-v2 trade's canonical facts.
+
+        Pure read. Built on the same per-trade indexed reads as the protection
+        projection, so the cost is bounded by live trade count times each trade's
+        own events rather than by total canonical history. It returns only committed
+        facts and performs no aggregation or verdict - derived semantics belong to
+        the analytical layer.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_ledger_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2Ledger(
+                    status="REJECTED",
+                    error_code="LEDGER_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2Ledger(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_ledger_unlocked(self) -> PaperV2Ledger:
+        work = self._paper_v2_protection_work_unlocked()
+        if work.status != "OK":
+            return PaperV2Ledger(
+                status=work.status,
+                error_code=work.error_code,
+                detail=work.detail,
+            )
+        entries = tuple(
+            self._ledger_entry_from_item(item) for item in work.items
+        )
+        return PaperV2Ledger(status="OK", entries=entries)
+
+    def _paper_trade_event_ids(self, paper_trade_id: str) -> tuple[str, ...]:
+        """Committed ``event_id``s referencing one trade, in commit order.
+
+        Read through the per-trade ``paper_trade_id`` expression index so the audit
+        lineage for one trade never scans the whole event table.
+        """
+        rows = self._conn.execute(
+            "SELECT event_id FROM events "
+            "WHERE json_extract(payload_json, '$.paper_trade_id') = ? "
+            "ORDER BY history_epoch ASC, local_sequence ASC",
+            (paper_trade_id,),
+        ).fetchall()
+        return tuple(str(row["event_id"]) for row in rows)
+
+    def _ledger_entry_from_item(
+        self, item: PaperV2ProtectionWorkItem
+    ) -> PaperV2LedgerEntry:
+        """Enrich one committed per-trade item into ledger facts."""
+        paper_trade_id = item.paper_trade_id
+        # Reuse the item's already-bounded reads; only the facts it does not carry
+        # are read here, each through the same per-trade index.
+        orders = self._paper_trade_events(PAPER_ORDER_INTENT_RECORDED, paper_trade_id)
+        entry_order = next(
+            (order for order in orders if str(order.get("intent_role")) == "ENTRY"),
+            None,
+        )
+        entry_order_id = (
+            str(entry_order["order_intent_id"]) if entry_order else None
+        )
+        attempts = self._paper_trade_events(
+            PAPER_EXECUTION_ATTEMPT_RECORDED, paper_trade_id
+        )
+        entry_attempt = next(
+            (
+                attempt
+                for attempt in attempts
+                if entry_order_id is not None
+                and str(attempt.get("order_intent_id")) == entry_order_id
+            ),
+            None,
+        )
+
+        context = None
+        snapshot = None
+        if item.decision_context_id:
+            try:
+                context = self._load_context_by_id(item.decision_context_id)
+            except ValueError:
+                context = None
+        if isinstance(context, Mapping):
+            snapshot_id = str(context.get("snapshot_id") or "")
+            if snapshot_id:
+                try:
+                    snapshot = self._load_decision_snapshot_by_id(snapshot_id)
+                except ValueError:
+                    snapshot = None
+
+        def _context_str(key: str) -> str | None:
+            if isinstance(context, Mapping):
+                value = context.get(key)
+                return str(value) if value else None
+            return None
+
+        cohort_id = None
+        if isinstance(snapshot, Mapping):
+            inner = snapshot.get("snapshot_payload")
+            if isinstance(inner, Mapping):
+                value = inner.get("cohort_id")
+                cohort_id = str(value) if value else None
+
+        disposition = next(
+            (
+                record
+                for record in self._admitted_dispositions()
+                if str(record.get("paper_trade_id") or "") == paper_trade_id
+            ),
+            {},
+        )
+
+        entry_fills = item.entry_fills
+        exit_fills = item.exit_fills
+        entry_price_vwap = (
+            sum(float(f["quantity"]) * float(f["price"]) for f in entry_fills)
+            / sum(float(f["quantity"]) for f in entry_fills)
+            if entry_fills and sum(float(f["quantity"]) for f in entry_fills) > 0
+            else None
+        )
+        exit_price_vwap = (
+            sum(float(f["quantity"]) * float(f["price"]) for f in exit_fills)
+            / sum(float(f["quantity"]) for f in exit_fills)
+            if exit_fills and sum(float(f["quantity"]) for f in exit_fills) > 0
+            else None
+        )
+
+        def _sum_field(fills: list[dict], key: str) -> float:
+            return sum(float(fill.get(key) or 0.0) for fill in fills)
+
+        all_fills = list(entry_fills) + list(exit_fills)
+        plan = item.protection_plan
+
+        return PaperV2LedgerEntry(
+            paper_trade_id=paper_trade_id,
+            disposition_id=item.disposition_id,
+            decision_context_id=item.decision_context_id,
+            reservation_id=item.reservation_id,
+            candidate_id=_context_str("candidate_id"),
+            episode_id=_context_str("episode_id"),
+            cohort_id=cohort_id,
+            quote_currency=item.quote_currency,
+            instrument_version=item.instrument_version,
+            native_symbol=item.native_symbol,
+            policy_version=_context_str("policy_version"),
+            policy_fingerprint=_context_str("policy_fingerprint"),
+            disposition_time=(
+                dict(disposition["disposition_time"])
+                if isinstance(disposition.get("disposition_time"), Mapping)
+                else None
+            ),
+            evaluation_time=_context_str("evaluation_time"),
+            entry_intent_time=(
+                dict(entry_order["intent_time"])
+                if entry_order and isinstance(entry_order.get("intent_time"), Mapping)
+                else None
+            ),
+            entry_attempt_time=(
+                dict(entry_attempt["attempt_time"])
+                if entry_attempt
+                and isinstance(entry_attempt.get("attempt_time"), Mapping)
+                else None
+            ),
+            first_entry_fill_time=(
+                dict(entry_fills[0]["fill_time"])
+                if entry_fills
+                and isinstance(entry_fills[0].get("fill_time"), Mapping)
+                else None
+            ),
+            last_exit_fill_time=(
+                dict(exit_fills[-1]["fill_time"])
+                if exit_fills
+                and isinstance(exit_fills[-1].get("fill_time"), Mapping)
+                else None
+            ),
+            entry_quantity=item.entry_quantity,
+            exited_quantity=item.exited_quantity,
+            remaining_quantity=item.remaining_quantity,
+            gross_pnl=item.gross_pnl,
+            fee_cost=_sum_field(all_fills, "fee_cost"),
+            spread_cost=_sum_field(all_fills, "spread_cost"),
+            slippage_cost=_sum_field(all_fills, "slippage_cost"),
+            other_cost=_sum_field(all_fills, "other_supported_cost"),
+            execution_costs=item.execution_costs,
+            reserved_capital=item.reserved_capital,
+            entry_price_vwap=entry_price_vwap,
+            exit_price_vwap=exit_price_vwap,
+            execution_model_version=(
+                str(entry_order["execution_model_version"])
+                if entry_order and entry_order.get("execution_model_version")
+                else None
+            ),
+            economic_model_version=(
+                str(entry_fills[0]["economic_model_version"])
+                if entry_fills and entry_fills[0].get("economic_model_version")
+                else None
+            ),
+            protection_plan=plan,
+            protection_state=item.protection_state,
+            plan_seq=item.plan_seq,
+            trigger_types=tuple(
+                str(trigger.get("trigger_type") or "") for trigger in item.triggers
+            ),
+            target_trigger_count=sum(
+                1
+                for trigger in item.triggers
+                if str(trigger.get("trigger_type")) == "TARGET"
+            ),
+            entry_order_intent=entry_order,
+            entry_attempt=entry_attempt,
+            exit_order_intents=tuple(item.exit_order_intents),
+            exit_attempts=tuple(item.exit_attempts),
+            entry_fills=tuple(entry_fills),
+            exit_fills=tuple(exit_fills),
+            protection_states=tuple(item.protection_states),
+            triggers=tuple(item.triggers),
+            latest_reconciliation=item.latest_reconciliation,
+            final_verified=item.final_verified,
+            event_ids=self._paper_trade_event_ids(paper_trade_id),
+        )
 
     def paper_v2_protection_work(self) -> PaperV2ProtectionWork:
         """Read-only projection of trades requiring protection/exit attention.
