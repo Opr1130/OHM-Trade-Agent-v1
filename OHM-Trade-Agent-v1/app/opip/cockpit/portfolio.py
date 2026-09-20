@@ -57,6 +57,16 @@ NO_MARK_EVIDENCE = "NO_CANONICAL_MARK_EVIDENCE"
 #: quietly downgraded.
 NO_INTERVAL_ESTIMATOR = "NO_REGISTERED_INTERVAL_ESTIMATOR"
 
+#: Reported when a per-trade expectancy point estimate is withheld.
+#:
+#: ``paper.net_expectancy`` is registered with ``SHOW_INTERVAL``, and the
+#: statistical protocol requires abstention when evidence cannot support the
+#: registered form. Dividing net P/L by trade count produces a *point* estimate,
+#: which is precisely the unsupported form, so the value is withheld and the reason
+#: is surfaced instead. Sums and counts are unaffected because they do not carry an
+#: interval requirement.
+EXPECTANCY_REQUIRES_INTERVAL = "EXPECTANCY_WITHHELD_REQUIRES_INTERVAL_ESTIMATOR"
+
 
 @dataclass(frozen=True)
 class ValuationPosture:
@@ -154,6 +164,7 @@ class StrategyContribution:
             "policy_fingerprint": self.policy_fingerprint,
             "settled_trades": self.settled_trades,
             "realized_net_pnl": self.realized_net_pnl,
+            # Withheld point estimate; ``None`` renders as UNKNOWN in the UI.
             "expectancy_quote_currency": self.expectancy_quote_currency,
             "winning_trades": self.winning_trades,
             "losing_trades": self.losing_trades,
@@ -450,7 +461,10 @@ def build_strategy_contribution(
                 policy_fingerprint=fingerprint,
                 settled_trades=len(members),
                 realized_net_pnl=net,
-                expectancy_quote_currency=net / len(members) if members else None,
+                # Withheld: see EXPECTANCY_REQUIRES_INTERVAL. A bare net/count is the
+                # point form the registry says requires an interval, and no estimator
+                # is registered, so abstaining is the prescribed behaviour.
+                expectancy_quote_currency=None,
                 winning_trades=sum(
                     1
                     for member in members
@@ -473,7 +487,7 @@ def build_strategy_contribution(
                     )
                 ),
                 uncertainty=Uncertainty.INSUFFICIENT_EVIDENCE,
-                uncertainty_reasons=(NO_INTERVAL_ESTIMATOR,),
+                uncertainty_reasons=(NO_INTERVAL_ESTIMATOR, EXPECTANCY_REQUIRES_INTERVAL),
             )
         )
     contributions.sort(
@@ -628,9 +642,9 @@ def build_currency_portfolio(
         equity_series=points,
         drawdown=drawdown,
         realized_net_pnl=realized_net,
-        expectancy_quote_currency=(
-            realized_net / len(settled) if settled else None
-        ),
+        # Withheld for the same reason as the per-strategy figure: the registered
+        # net_expectancy requires an interval and no estimator is registered.
+        expectancy_quote_currency=None,
         gross_pnl=sum(row.gross_pnl for row in settled),
         execution_costs=sum(row.execution_costs for row in settled),
         open_positions=len(open_rows),
@@ -650,7 +664,11 @@ def build_currency_portfolio(
         current_watch=open_rows,
         attention=attention,
         uncertainty=Uncertainty.INSUFFICIENT_EVIDENCE,
-        uncertainty_reasons=(NO_INTERVAL_ESTIMATOR, *population_reasons),
+        uncertainty_reasons=(
+            NO_INTERVAL_ESTIMATOR,
+            EXPECTANCY_REQUIRES_INTERVAL,
+            *population_reasons,
+        ),
     )
 
 

@@ -51,6 +51,7 @@ from app.opip.contracts.paper_execution import (
     ExecutionState,
     PositionState,
     ProtectionState,
+    QualifiedOpportunityDisposition,
     TerminalReconciliationState,
 )
 from app.opip.contracts.paper_execution_events import (
@@ -135,6 +136,9 @@ from app.opip.decision_intelligence.events import (
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
+from app.opip.decision_intelligence.events import (
+    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+)
 from app.opip.market.instrument_version_store import instrument_version_from_payload
 
 MAX_PAYLOAD_BYTES = 16 * 1024
@@ -1078,6 +1082,77 @@ class CanonicalWriter:
         )
         return PaperV2Ledger(status="OK", entries=entries)
 
+    def _ledger_lineage(
+        self, paper_trade_id: str, *, context: Mapping[str, object] | None
+    ) -> tuple[str, ...]:
+        """The complete audit lineage for one trade, in canonical commit order.
+
+        Trade-indexed events alone do not cover every displayed field: the
+        disposition itself carries ``paper_trade_id``, but the decision context, its
+        decision snapshot and the instrument-version registration are referenced
+        *by identity* and supply candidate, episode, cohort, policy version and
+        fingerprint. Those records are resolved here and merged, so the dossier can
+        trace every displayed value to the record that produced it.
+        """
+        indexed = list(self._paper_trade_event_ids(paper_trade_id))
+
+        referenced: list[str] = []
+        if isinstance(context, Mapping):
+            snapshot_id = str(context.get("snapshot_id") or "")
+            instrument_version_id = str(context.get("instrument_version") or "")
+            for event_type, identity_field, identity in (
+                (
+                    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
+                    "context_id",
+                    str(context.get("context_id") or ""),
+                ),
+                (
+                    PAPER_DECISION_SNAPSHOT_RECORDED,
+                    "snapshot_id",
+                    snapshot_id,
+                ),
+                (
+                    MARKET_INSTRUMENT_VERSION_RECORDED,
+                    "instrument_version_id",
+                    instrument_version_id,
+                ),
+            ):
+                event_id = self._event_id_for_identity(
+                    event_type, identity_field, identity
+                )
+                if event_id is not None and event_id not in referenced:
+                    referenced.append(event_id)
+
+        # Deterministic ordering: referenced ancestry first (it is the upstream
+        # cause), then this trade's own committed events. Duplicates are dropped
+        # while preserving first occurrence.
+        ordered: list[str] = []
+        for event_id in (*referenced, *indexed):
+            if event_id not in ordered:
+                ordered.append(event_id)
+        return tuple(ordered)
+
+    def _event_id_for_identity(
+        self, event_type: str, identity_field: str, identity: str
+    ) -> str | None:
+        """The committed ``event_id`` of the record with this canonical identity.
+
+        Used to complete a trade's audit lineage: several displayed fields (candidate,
+        episode, cohort, policy version) come from the decision context and its
+        snapshot rather than from records carrying ``paper_trade_id``, so a dossier
+        that cited only trade-indexed events could not trace those fields to the
+        records that produced them.
+        """
+        if not identity:
+            return None
+        rows = self._conn.execute(
+            f"SELECT event_id FROM events WHERE event_type = ? "
+            f"AND json_extract(payload_json, '$.{identity_field}') = ? "
+            f"ORDER BY history_epoch ASC, local_sequence ASC LIMIT 1",
+            (event_type, identity),
+        ).fetchall()
+        return str(rows[0]["event_id"]) if rows else None
+
     def _paper_trade_event_ids(self, paper_trade_id: str) -> tuple[str, ...]:
         """Committed ``event_id``s referencing one trade, in commit order.
 
@@ -1263,7 +1338,7 @@ class CanonicalWriter:
             triggers=tuple(item.triggers),
             latest_reconciliation=item.latest_reconciliation,
             final_verified=item.final_verified,
-            event_ids=self._paper_trade_event_ids(paper_trade_id),
+            event_ids=self._ledger_lineage(paper_trade_id, context=context),
         )
 
     def paper_v2_protection_work(self) -> PaperV2ProtectionWork:
@@ -3101,14 +3176,26 @@ class CanonicalWriter:
             )
 
     def _admitted_dispositions(self, quote_currency: str | None = None) -> list[dict]:
+        """Committed ADMITTED dispositions, newest-last.
+
+        Filtered in SQL rather than in Python. The prior form read and validated
+        *every* historical disposition — including every rejection — on each call, so
+        a read that only needs admitted trades still grew with total rejection
+        history. Only ADMITTED rows can influence any caller's result, so the filter
+        is pushed into the query and every returned row is still fully validated.
+        """
         rows = self._conn.execute(
             """
             SELECT payload_json
             FROM events
             WHERE event_type = ?
+              AND json_extract(payload_json, '$.disposition') = ?
             ORDER BY history_epoch ASC, local_sequence ASC
             """,
-            (PAPER_OPPORTUNITY_DISPOSITION_RECORDED,),
+            (
+                PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
+                QualifiedOpportunityDisposition.ADMITTED.value,
+            ),
         ).fetchall()
         admitted: list[dict] = []
         for row in rows:
@@ -3120,8 +3207,6 @@ class CanonicalWriter:
                 PAPER_OPPORTUNITY_DISPOSITION_RECORDED,
                 raw,
             )
-            if payload.get("disposition") != "ADMITTED":
-                continue
             if quote_currency is not None and payload.get("quote_currency") != quote_currency:
                 continue
             admitted.append(payload)

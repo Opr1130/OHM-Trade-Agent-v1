@@ -286,7 +286,13 @@ def test_each_currency_keeps_its_own_drawdown():
 # ---------------------------------------------------------------------------
 
 
-def test_contribution_groups_by_policy_version_and_exposes_expectancy():
+def test_contribution_groups_by_policy_version_and_reports_sums_and_counts():
+    """Per-policy attribution exposes sums and counts, and withholds expectancy.
+
+    The registered ``paper.net_expectancy`` requires an interval; no estimator is
+    registered, so the point estimate is withheld rather than shown (see
+    ``test_contribution_withholds_the_unsupported_expectancy_point_estimate``).
+    """
     rows = [
         _settled(trade_id="PTV2:" + "1" * 64, net=10.0, exit_offset=600, policy_version="gate-v1"),
         _settled(trade_id="PTV2:" + "2" * 64, net=30.0, exit_offset=1200, policy_version="gate-v1"),
@@ -296,9 +302,9 @@ def test_contribution_groups_by_policy_version_and_exposes_expectancy():
 
     assert contribution["gate-v1"].settled_trades == 2
     assert contribution["gate-v1"].realized_net_pnl == pytest.approx(40.0)
-    assert contribution["gate-v1"].expectancy_quote_currency == pytest.approx(20.0)
     assert contribution["gate-v1"].winning_trades == 2
     assert contribution["gate-v2"].losing_trades == 1
+    assert contribution["gate-v1"].expectancy_quote_currency is None
 
 
 def test_contribution_carries_no_statistical_authority_it_has_not_earned():
@@ -574,6 +580,40 @@ def test_zero_verified_trades_reports_no_expectancy_rather_than_zero():
     assert portfolio.expectancy_quote_currency is None
     assert portfolio.realized_net_pnl == 0.0
     assert portfolio.strategy_contribution == ()
+
+
+def test_contribution_withholds_the_unsupported_expectancy_point_estimate():
+    """A point expectancy must not be displayed while its interval is unavailable.
+
+    Review finding (valid, raised independently by two reviewers): the projection
+    computed ``net / count`` and exposed it as expectancy while simultaneously
+    declaring that the registered metric requires an interval and that no estimator
+    exists. That contradicted the platform's own statistical posture, which requires
+    abstention when the registered form cannot be produced.
+    """
+    rows = [
+        _settled(trade_id="PTV2:" + "1" * 64, net=10.0, exit_offset=600),
+        _settled(trade_id="PTV2:" + "2" * 64, net=30.0, exit_offset=1200),
+    ]
+
+    item = build_strategy_contribution(rows)[0]
+    assert item.expectancy_quote_currency is None
+    assert "EXPECTANCY_WITHHELD_REQUIRES_INTERVAL_ESTIMATOR" in item.uncertainty_reasons
+    # Sums and counts remain available: they carry no interval requirement.
+    assert item.realized_net_pnl == pytest.approx(40.0)
+    assert item.settled_trades == 2
+
+    portfolio = build_currency_portfolio("USD", rows, now=NOW)
+    assert portfolio.expectancy_quote_currency is None
+    assert portfolio.realized_net_pnl == pytest.approx(40.0)
+    assert (
+        "EXPECTANCY_WITHHELD_REQUIRES_INTERVAL_ESTIMATOR"
+        in portfolio.uncertainty_reasons
+    )
+    # And the withheld form is what reaches the API payload.
+    payload = portfolio.to_dict()
+    assert payload["expectancy_quote_currency"] is None
+    assert payload["realized_net_pnl"] == pytest.approx(40.0)
 
 
 # ---------------------------------------------------------------------------

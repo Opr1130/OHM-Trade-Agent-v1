@@ -213,6 +213,24 @@ def test_page_never_persists_the_secret():
         assert forbidden not in script, f"cockpit page persists the secret via {forbidden}"
 
 
+def test_ui_guards_against_late_responses_overwriting_newer_views():
+    """A stale response must never replace newer data or a different trade.
+
+    Review finding (valid): requests were applied in completion order, so a slow
+    refresh could overwrite newer portfolio data and a late trade response could
+    render a dossier the URL no longer identifies.
+    """
+    script = _script_section(_read(COCKPIT_HTML))
+    assert "_overviewSeq" in script
+    assert "_tradeSeq" in script
+    # Both loaders must compare their generation before mutating the view.
+    assert script.count("seq!==_overviewSeq") >= 2
+    assert script.count("seq!==_tradeSeq") >= 2
+    # The trade loader must also confirm the route still names that trade.
+    assert "location.hash" in script
+    assert "decodeURIComponent(current[1])!==paperTradeId" in script
+
+
 def test_edge_allowlist_exposes_the_cockpit_routes():
     """The nginx edge uses exact matches with a 404 default.
 

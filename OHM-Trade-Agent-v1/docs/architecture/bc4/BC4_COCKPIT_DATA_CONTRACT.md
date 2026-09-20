@@ -269,6 +269,24 @@ Per `G_STATISTICAL_PROTOCOL.md`:
   P/L, expectancy and realized drawdown with explicit support/interval labels** —
   **no pass/fail gate and no invented "N ≥ 30"**.
 
+### 6.1 Withheld metrics (decision)
+
+Some registered metrics cannot be produced in their registered form yet. They are
+**withheld**, not substituted with an unsupported proxy:
+
+| Metric | Registered requirement | Status | Reason code |
+| --- | --- | --- | --- |
+| `paper.net_expectancy` | `SHOW_INTERVAL` | **WITHHELD** | `EXPECTANCY_WITHHELD_REQUIRES_INTERVAL_ESTIMATOR` |
+| `paper.in_position_mfe_pct` / `_mae_pct` | path coverage | DEFER | path not bound to holding interval |
+| `paper.capture_efficiency` | paired counterfactual | DEFER | counterfactual not implemented |
+
+Dividing net P/L by trade count yields a **point** estimate, which is precisely the
+form the registry says requires an interval. No interval estimator is registered,
+so the value is **not** emitted. Sums and counts remain available because they carry
+no interval requirement. This is abstention as the protocol prescribes, not a
+missing feature: the withheld state is surfaced with its reason so the UI renders
+`WITHHELD` rather than a number that would read as a supported statistic.
+
 ---
 
 ## 7. Projection boundaries (minimal, additive)

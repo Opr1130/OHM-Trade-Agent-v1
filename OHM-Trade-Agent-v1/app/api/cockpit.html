@@ -273,7 +273,7 @@ function renderOverview(){
   var val=dd.valuation||{};
   document.getElementById("primary").innerHTML=
     primaryCard("Realized Paper Net P&L",money(port.realized_net_pnl,c),(dd.realized_closed_trades||0)+" settled trades",cls(port.realized_net_pnl),"After modeled costs")
-    +primaryCard("Net Expectancy / Trade",money(port.expectancy_quote_currency,c),"No registered interval estimator",port.expectancy_quote_currency===null?"unknown":"","Evidence: INSUFFICIENT")
+    +primaryCard("Net Expectancy / Trade",'<span class="unknown">WITHHELD</span>',"Registered metric requires an interval; no estimator is registered","","Abstaining rather than showing an unsupported point estimate")
     +(val.is_known?primaryCard("Current Marked-Equity DD",money(dd.marked_current_drawdown,c),"",cls(dd.marked_current_drawdown)):primaryCard("Current Marked-Equity DD",'<span class="unknown">UNKNOWN</span>',"No canonical mark evidence",""))
     +(val.is_known?primaryCard("Max Marked-Equity DD",money(dd.marked_max_drawdown,c),"",cls(dd.marked_max_drawdown)):primaryCard("Max Marked-Equity DD",'<span class="unknown">UNKNOWN</span>',"No canonical mark evidence",""))
     +primaryCard("Open Paper Positions",String(port.open_positions||0),"Reserved "+money(port.reserved_capital,c),"")
@@ -321,7 +321,7 @@ function renderOverview(){
   document.getElementById("contribRows").innerHTML=contrib.length?contrib.map(function(s){
     return "<tr><td>"+esc(s.policy_version)+"</td><td class='num'>"+esc(s.settled_trades)+"</td>"
       +"<td class='num "+cls(s.realized_net_pnl)+"'>"+esc(money(s.realized_net_pnl,c))+"</td>"
-      +"<td class='num'>"+esc(money(s.expectancy_quote_currency,c))+"</td>"
+      +"<td class='num'>"+esc(s.expectancy_quote_currency===null?"WITHHELD":money(s.expectancy_quote_currency,c))+"</td>"
       +"<td class='num'>"+esc(s.winning_trades)+"</td><td class='num'>"+esc(s.losing_trades)+"</td>"
       +"<td class='num'>"+esc(money(s.realized_max_drawdown_quote_currency,c))+"</td>"
       +"<td><span class='chip'>"+esc(s.uncertainty)+"</span></td></tr>";
@@ -353,18 +353,25 @@ function renderOverview(){
   }).join(""):"<tr><td colspan='5' class='empty'>No open paper positions.</td></tr>";
 }
 
+/* Request generation guards. A slower earlier request must never overwrite the
+   view produced by a later one, and a trade dossier must not render if the route
+   has since moved to a different trade. */
+var _overviewSeq=0;
+var _tradeSeq=0;
+
 async function loadOverview(){
   var errBox=document.getElementById("err");
-  errBox.style.display="none";
+  var seq=++_overviewSeq;
   try{
     var ov=await request("/api/cockpit/overview");
+    if(seq!==_overviewSeq){return;} /* superseded by a newer refresh */
     state.overview=ov;
     if(ov.details&&ov.details.length&&!ov.portfolios.length){throw new Error(ov.details.join("; "));}
-    /* Authoritative read succeeded, so the unlock prompt is no longer needed. */
     var box=document.getElementById("unlockBox");
     if(box)box.style.display="none";
     renderOverview();
   }catch(e){
+    if(seq!==_overviewSeq){return;}
     errBox.style.display="block";
     errBox.textContent=String(e.message||e);
     if(String(e.message||"").indexOf("Unauthorized")===0){
@@ -446,11 +453,17 @@ function renderTradeDetail(payload){
 
 async function loadTrade(paperTradeId){
   var errBox=document.getElementById("err");
-  errBox.style.display="none";
+  var seq=++_tradeSeq;
   try{
     var payload=await request("/api/cockpit/trades/"+encodeURIComponent(paperTradeId));
+    if(seq!==_tradeSeq){return;} /* superseded by a newer navigation */
+    /* The route may have moved on while this request was in flight; never render a
+       dossier for a trade the URL no longer identifies. */
+    var current=String(location.hash||"").match(/^#trade\/(.+)$/);
+    if(!current||decodeURIComponent(current[1])!==paperTradeId){return;}
     renderTradeDetail(payload);
   }catch(e){
+    if(seq!==_tradeSeq){return;}
     errBox.style.display="block";errBox.textContent=String(e.message||e);
   }
 }

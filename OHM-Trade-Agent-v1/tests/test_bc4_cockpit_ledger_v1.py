@@ -793,6 +793,108 @@ def test_integration_bounded_read_uses_the_per_trade_index(writer_env):
     assert "idx_events_paper_trade" in detail, detail
 
 
+def test_integration_lineage_includes_referenced_ancestry_not_only_trade_events(writer_env):
+    """The dossier must be able to trace fields that come from referenced records.
+
+    Review finding (valid): lineage was built only from records carrying
+    ``paper_trade_id``. Candidate, episode, cohort, policy version and fingerprint are
+    read from the decision context, its decision snapshot and the instrument-version
+    registration - records referenced *by identity* - so those could not be traced.
+    """
+    from app.exchanges.kraken import KrakenClient
+    from app.services.paper_v2_execution import run_paper_v2_opportunity
+
+    server, client = writer_env
+    result = run_paper_v2_opportunity(
+        _opportunity(),
+        client=client,
+        kraken_client=KrakenClient(
+            transport=_BookTransport(publication_ts="2026-09-20T11:59:59Z")
+        ),
+        settings=_Settings(),
+        now=_QUALIFICATION,
+        clock=lambda: _QUALIFICATION,
+    )
+
+    row = next(
+        entry
+        for entry in read_paper_ledger(client).entries
+        if entry.paper_trade_id == result.paper_trade_id
+    )
+    assert row.event_ids
+
+    # Resolve each cited event id back to its event type in the canonical store.
+    placeholders = ",".join("?" for _ in row.event_ids)
+    rows = server.writer._conn.execute(  # noqa: SLF001 - test-only inspection
+        f"SELECT event_type FROM events WHERE event_id IN ({placeholders})",
+        tuple(row.event_ids),
+    ).fetchall()
+    types = {str(r["event_type"]) for r in rows}
+
+    # Trade-indexed families are present...
+    assert any("order_intent" in t for t in types)
+    assert any("fill" in t for t in types)
+    # ...and so are the referenced records that supply the displayed identity and
+    # policy fields, which carry no paper_trade_id of their own.
+    assert any("decision_intelligence.context" in t for t in types), types
+    assert any("instrument_version" in t for t in types), types
+
+
+def test_integration_lineage_is_deterministic_and_deduplicated(writer_env):
+    """Lineage must be stable across reads and free of duplicate ids."""
+    from app.exchanges.kraken import KrakenClient
+    from app.services.paper_v2_execution import run_paper_v2_opportunity
+
+    _server, client = writer_env
+    run_paper_v2_opportunity(
+        _opportunity(),
+        client=client,
+        kraken_client=KrakenClient(
+            transport=_BookTransport(publication_ts="2026-09-20T11:59:59Z")
+        ),
+        settings=_Settings(),
+        now=_QUALIFICATION,
+        clock=lambda: _QUALIFICATION,
+    )
+
+    first = [row.event_ids for row in read_paper_ledger(client).entries]
+    second = [row.event_ids for row in read_paper_ledger(client).entries]
+    assert first == second
+    for lineage in first:
+        assert len(lineage) == len(set(lineage)), "lineage contains duplicate event ids"
+
+
+def test_integration_expectancy_is_withheld_for_real_settled_evidence(writer_env):
+    """The withheld expectancy must hold on the real read path, not only in units."""
+    from app.exchanges.kraken import KrakenClient
+    from app.services.paper_v2_execution import run_paper_v2_opportunity
+
+    _server, client = writer_env
+    run_paper_v2_opportunity(
+        _opportunity(),
+        client=client,
+        kraken_client=KrakenClient(
+            transport=_BookTransport(publication_ts="2026-09-20T11:59:59Z")
+        ),
+        settings=_Settings(),
+        now=_QUALIFICATION,
+        clock=lambda: _QUALIFICATION,
+    )
+
+    from app.opip.cockpit.portfolio import build_overview
+
+    ledger = read_paper_ledger(client)
+    overview = build_overview(ledger, now=_QUALIFICATION)
+    for portfolio in overview.portfolios:
+        assert portfolio.expectancy_quote_currency is None
+        assert (
+            "EXPECTANCY_WITHHELD_REQUIRES_INTERVAL_ESTIMATOR"
+            in portfolio.uncertainty_reasons
+        )
+        for item in portfolio.strategy_contribution:
+            assert item.expectancy_quote_currency is None
+
+
 def test_replace_is_not_used_to_mutate_committed_rows():
     """Guard: a derived row must never be able to rewrite canonical evidence."""
     row = build_trade_row(_entry())
