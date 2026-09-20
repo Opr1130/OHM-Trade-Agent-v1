@@ -11,8 +11,8 @@ proves the invariants that only appear across scans:
 * S3  an interrupted, accepted-but-unfilled attempt survives the loss of its
       opportunity and is completed by canonical recovery in a fresh process;
 * S4  a restart reproduces every projection byte-for-byte and never re-executes;
-* S5  a fully-frozen canonical closure removes exposure and releases capacity
-      exactly once;
+* S5  the *canonical closure contract* removes exposure and releases capacity
+      exactly once (see "Known gap" — no production exit producer exists yet);
 * S6  the freed capacity is genuinely reusable by a later candidate;
 * S7  the legacy drain gate moves DRAINING -> READY across scans with no
       configuration change, and only then may Paper v2 admit;
@@ -30,9 +30,28 @@ rejects such a selection with an explicit message naming the missing earlier
 phases, rather than letting it fail as an incidental ``KeyError``. It never skips
 or weakens an assertion. Run the module whole.
 
+Known gap this module does NOT close
+------------------------------------
+
+Filled Paper-v2 exposure has **no production path to closure**. As of this commit:
+
+* nothing in ``app/`` calls ``trigger_paper_protection_action`` (the writer RPC and
+  client method exist, but no production caller does);
+* nothing in ``app/`` constructs an EXIT order intent;
+* no production code produces a SELL fill;
+* the only reconciliation producer in ``app/`` is the zero-fill terminalizer, which
+  by design refuses once exposure exists.
+
+Consequently a trade that reaches a fill keeps its reservation and slot for the
+lifetime of the canonical store: capacity consumed by a filled Paper-v2 trade is
+never returned. S5 exercises the writer's closure *contract* with hand-built
+canonical evidence, which is why it is not presented as an end-to-end lifecycle
+proof. Wiring a production exit/close producer is B/C-2 scope and is not part of
+this cutover-wiring change; until it exists, operating Paper v2 with the mode
+``active`` can exhaust capacity.
+
 Stubs and the invariants that stay real
 ---------------------------------------
-
 Only the seams below are faked. Each is a boundary the task explicitly allows;
 every stub documents the invariant that remains real.
 
@@ -929,13 +948,21 @@ def test_s4_restart_reproduces_projections_and_never_re_executes(env):
 
 
 def test_s5_canonical_closure_removes_exposure_and_releases_once(env):
-    """Proves exposure and capacity are released only by frozen canonical evidence.
+    """Proves the *canonical closure contract* releases exposure and capacity once.
 
-    REAL: the writer's exit-capacity, aggregate-conservation and terminal
-    reconciliation rules. No row is deleted, no old fill is mutated and no
-    projection is edited: the closure is a new EXIT order, attempt, fill and a
-    FINAL_VERIFIED reconciliation whose quantities/economics match canonical
-    fill totals exactly.
+    Scope: this exercises the writer's frozen rules — exit-capacity, aggregate
+    conservation and terminal reconciliation — and proves they accept a truthful
+    EXIT + FINAL_VERIFIED closure and release the reservation exactly once, while
+    refusing to delete rows or mutate the frozen ENTRY fill.
+
+    It is deliberately NOT presented as an end-to-end production lifecycle proof.
+    No production entry point currently produces an exit fill or a non-zero-fill
+    reconciliation: ``trigger_paper_protection_action`` has no production caller,
+    nothing constructs an EXIT order intent, and the only reconciliation producer in
+    ``app/`` is the zero-fill terminalizer. The closure below is therefore hand-built
+    canonical evidence, and it demonstrates the *contract* a future production exit
+    producer must satisfy rather than proving one exists. See the module docstring's
+    "Known gap" section.
     """
     writer = env.server.writer
     btc = _EVIDENCE["trades"]["BTCUSD"]
