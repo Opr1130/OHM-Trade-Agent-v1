@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>O'Pip Cockpit</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#e8eef7;background:#09111c;--panel:#101b2a;--line:#22354c;--muted:#8fa1b7;--good:#67d5a1;--bad:#ff818b;--warn:#f2c96d;--blue:#6ab5ff;--violet:#a99bff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% -20%,#142944 0,#09111c 38%),#09111c;min-height:100vh}
+.wrap{max-width:1500px;margin:0 auto;padding:20px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:12px}
+.brandline{display:flex;align-items:center;gap:10px}
+.mascot{display:block;width:40px;height:40px;object-fit:cover;border:1px solid #2a4059;border-radius:50%;background:#0d1825}
+.brand h1{margin:0;font-size:26px;letter-spacing:-.02em}
+.brand .sub{color:var(--muted);font-size:12px;margin-top:4px}
+.papermode{display:inline-flex;align-items:center;gap:7px;margin-top:8px;padding:5px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em;color:#ffd9a1;background:#3a2a12;border:1px solid #6d4f22}
+.papermode .led{width:7px;height:7px;border-radius:50%;background:var(--warn)}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:linear-gradient(180deg,rgba(17,29,44,.97),rgba(13,23,36,.97));border:1px solid #1f3147;border-radius:14px;padding:14px}
+.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s5{grid-column:span 5}.s6{grid-column:span 6}.s7{grid-column:span 7}.s8{grid-column:span 8}.s12{grid-column:span 12}
+.k{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#7890aa}
+.v{font-size:25px;font-weight:750;margin-top:5px;font-variant-numeric:tabular-nums}
+.v small{font-size:11px;font-weight:600;color:var(--muted);margin-left:6px}
+.mini{font-size:12px;color:var(--muted);margin-top:4px}
+.good{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}.blue{color:var(--blue)}.unknown{color:var(--warn);font-weight:700}
+.section-title{font-size:15px;font-weight:700;margin:0 0 10px}
+.table-wrap{overflow:auto;max-height:340px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{text-align:left;padding:7px;border-bottom:1px solid #1b2c40;font-size:12px;white-space:nowrap}
+.table td.num,.table th.num{text-align:right;font-variant-numeric:tabular-nums}
+.table th{color:#7890aa;font-weight:600;position:sticky;top:0;background:#101b2a}
+.trustbar{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px}
+.tr{padding:9px 11px;border-radius:10px;background:#0b1724;border:1px solid #20334a}
+.tr .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#7890aa}
+.tr .val{font-size:13px;font-weight:700;margin-top:3px}
+.chip{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:10px;border:1px solid #36506d;color:#b8c8d9;margin:0 4px 4px 0}
+.bar{height:9px;background:#0b1724;border:1px solid #20334a;border-radius:3px;position:relative;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#2f6ea8,#67d5a1)}
+.grid2{display:grid;grid-template-columns:120px 1fr 1fr;gap:6px;align-items:center;font-size:11px}
+.grid2 .d{font-variant-numeric:tabular-nums;color:#9fb0c2}
+.act{border-left:3px solid var(--bad);background:#160e13;padding:10px;border-radius:9px;margin-bottom:8px}
+.act.med{border-left-color:var(--warn)}
+.act .t{font-size:12px;font-weight:700}
+.act .b{font-size:11px;color:#b9c8d8;margin-top:4px;line-height:1.5}
+.nav{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap}
+.nav button{border:1px solid #2a3d56;background:#111e2d;color:#dce7f5;padding:7px 12px;border-radius:9px;cursor:pointer;font-size:12px}
+.nav button.active{background:#214a73;border-color:#3978ad}
+.err{display:none;background:#3c1821;border:1px solid #6b2937;color:#ffc0c7;padding:11px;border-radius:10px;margin-bottom:12px}
+.foot{font-size:11px;color:#6e8197;margin:14px 0 4px;line-height:1.6}
+.empty{color:#70869e;font-size:12px;padding:14px;text-align:center}
+.tabs{display:flex;gap:6px;margin-bottom:10px}
+.tabs button{border:1px solid #2a3d56;background:#0d1825;color:#b9c8d8;padding:5px 11px;border-radius:999px;cursor:pointer;font-size:11px}
+.tabs button.active{background:#214a73;color:#fff}
+.dl{display:grid;grid-template-columns:200px 1fr;gap:5px 12px;font-size:12px}
+.dl dt{color:#7890aa}.dl dd{margin:0;font-variant-numeric:tabular-nums}
+@media(max-width:1200px){.s2,.s3,.s4,.s5,.s6,.s7,.s8{grid-column:span 12}.trustbar{grid-template-columns:1fr 1fr}.top{flex-direction:column}}
+</style>
+</head>
+<body><div class="wrap">
+
+<div class="top">
+  <div class="brand">
+    <div class="brandline">
+      <img class="mascot" alt="O'Pip approved bird mascot" src="data:image/webp;base64,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">
+      <div>
+        <h1>O'Pip Cockpit</h1>
+        <div class="sub">Small. Watchful. Profitable. &mdash; read-only paper intelligence</div>
+      </div>
+    </div>
+    <div class="papermode"><span class="led"></span>PAPER MODE &mdash; NO LIVE ORDERS</div>
+  </div>
+  <div style="text-align:right">
+    <div class="mini" id="asof">as-of &mdash;</div>
+    <div class="mini" id="projver">projection &mdash;</div>
+    <div class="nav" style="justify-content:flex-end;margin-top:8px">
+      <button id="refreshBtn">Refresh</button>
+    </div>
+  </div>
+</div>
+
+<div class="err" id="err"></div>
+
+<div class="trustbar" id="trustbar"></div>
+
+<div class="tabs" id="currencyTabs"></div>
+
+<div id="overviewView">
+  <div class="grid">
+    <div class="card s12">
+      <div class="section-title">Primary economics &amp; risk</div>
+      <div class="grid" id="primary"></div>
+    </div>
+
+    <div class="card s8">
+      <div class="section-title">Realized equity trajectory &amp; drawdown</div>
+      <div class="mini" id="ddNote" style="margin-bottom:8px"></div>
+      <div id="equitySeries"></div>
+    </div>
+    <div class="card s4">
+      <div class="section-title">Drawdown detail</div>
+      <div class="dl" id="ddDetail"></div>
+    </div>
+
+    <div class="card s12">
+      <div class="section-title">Attention required</div>
+      <div id="attention"></div>
+    </div>
+
+    <div class="card s7">
+      <div class="section-title">Strategy / policy contribution</div>
+      <div class="table-wrap"><table class="table" id="contribTable">
+        <thead><tr><th>Policy version</th><th class="num">Settled</th><th class="num">Net P&amp;L</th><th class="num">Expectancy</th><th class="num">Win</th><th class="num">Loss</th><th class="num">Max DD</th><th>Evidence</th></tr></thead>
+        <tbody id="contribRows"></tbody></table></div>
+    </div>
+    <div class="card s5">
+      <div class="section-title">Opportunity accountability</div>
+      <div class="dl" id="accountability"></div>
+    </div>
+
+    <div class="card s7">
+      <div class="section-title">Recent settled paper trades</div>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Trade</th><th>Policy</th><th>Result</th><th>Exit</th><th class="num">Net P&amp;L</th><th class="num">R</th></tr></thead>
+        <tbody id="recentRows"></tbody></table></div>
+    </div>
+    <div class="card s5">
+      <div class="section-title">Current watch (open paper positions)</div>
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Pair</th><th>State</th><th>Protection</th><th class="num">Remaining</th><th class="num">Age</th></tr></thead>
+        <tbody id="watchRows"></tbody></table></div>
+    </div>
+  </div>
+</div>
+
+<div id="tradeView" style="display:none">
+  <div class="nav"><button id="backBtn">&larr; Back to overview</button></div>
+  <div id="tradeBody"></div>
+</div>
+
+<div class="foot">
+  Read-only. Every figure is derived from canonical Paper-v2 evidence by the
+  analytical projection; this page formats and links but never recomputes P&amp;L,
+  drawdown, eligibility, exposure or protection state. Paper only &mdash; no funded
+  or live order authority. <span id="trustFoot"></span>
+</div>
+
+</div>
+<script>
+"use strict";
+var state={secret:"",currency:null,overview:null};
+
+function esc(v){return String(v==null?"":v).replace(/[&<>"]/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
+
+/* Formatting only. This file deliberately contains no P&L, drawdown, exposure or
+   eligibility arithmetic: every displayed number arrives from the server. */
+function money(v,ccy){
+  if(v===null||v===undefined)return "UNKNOWN";
+  var n=Number(v);var s=Math.abs(n).toFixed(2);
+  return (n<0?"-":"")+s+" "+(ccy||"");
+}
+function num(v,d){if(v===null||v===undefined)return "UNKNOWN";return Number(v).toFixed(d==null?2:d);}
+function secsToAge(v){
+  if(v===null||v===undefined)return "UNKNOWN";
+  var s=Number(v);if(s<0)return "UNKNOWN";
+  if(s<3600)return Math.floor(s/60)+"m";
+  if(s<86400)return (s/3600).toFixed(1)+"h";
+  return (s/86400).toFixed(1)+"d";
+}
+function dt(v){if(!v)return "UNKNOWN";return String(v).replace("T"," ").replace("Z","");}
+function idShort(v){if(!v)return "-";return String(v).slice(0,13)+"\u2026";}
+function cls(v){return v>0?"good":(v<0?"bad":"");}
+
+function request(path){
+  var headers={};
+  if(state.secret)headers["x-webhook-secret"]=state.secret;
+  return fetch(path,{headers:headers}).then(function(r){
+    if(r.status===401){throw new Error("Unauthorized: an operator secret is required.");}
+    if(!r.ok){return r.text().then(function(t){throw new Error(r.status+": "+t.slice(0,200));});}
+    return r.json();
+  });
+}
+
+function renderTrust(trust,valuation,foot){
+  var bar=document.getElementById("trustbar");
+  var dims=[
+    ["Freshness",trust&&trust.freshness],
+    ["Completeness",trust&&trust.completeness],
+    ["Simulation fidelity",trust&&trust.fidelity],
+    ["Statistical uncertainty",trust&&trust.uncertainty],
+    ["Valuation coverage",valuation&&valuation.status?valuation.status:"UNKNOWN"]
+  ];
+  var html="";
+  for(var i=0;i<dims.length;i++){
+    var v=dims[i][1]||"UNKNOWN";
+    var c=(v==="LIVE"||v==="COMPLETE")?"good":(v==="UNKNOWN"||v==="STALE"||v==="UNAVAILABLE"||v==="INCOMPLETE"?"warn":"");
+    html+='<div class="tr"><div class="lbl">'+esc(dims[i][0])+'</div><div class="val '+c+'">'+esc(v)+'</div></div>';
+  }
+  bar.innerHTML=html;
+  var reasons=(trust&&trust.reasons)||[];
+  document.getElementById("trustFoot").textContent=reasons.length?("Trust notes: "+reasons.join(", ")):"";
+}
+
+function primaryCard(label,value,sub,clsName,help){
+  return '<div class="card s3"><div class="k">'+esc(label)+'</div><div class="v '+(clsName||"")+'">'+value+'</div><div class="mini">'+esc(sub||"")+'</div>'+(help?'<div class="mini">'+esc(help)+'</div>':'')+'</div>';
+}
+
+function renderOverview(){
+  var ov=state.overview;if(!ov)return;
+  renderTrust(ov.trust,ov.valuation);
+  document.getElementById("asof").textContent="as-of "+(ov.as_of||"?")+" ("+(ov.timezone||"UTC")+")";
+  document.getElementById("projver").textContent="portfolio "+ov.projection_version+" | ledger "+(ov.ledger_projection_version||"-");
+
+  var ports=ov.portfolios||[];
+  var tabs=document.getElementById("currencyTabs");
+  if(!state.currency&&ports.length){state.currency=ports[0].quote_currency;}
+  tabs.innerHTML=ports.map(function(p){
+    return '<button data-c="'+esc(p.quote_currency)+'" class="'+(p.quote_currency===state.currency?"active":"")+'">'+esc(p.quote_currency)+'</button>';
+  }).join("");
+  var port=null;
+  for(var i=0;i<ports.length;i++){if(ports[i].quote_currency===state.currency)port=ports[i];}
+
+  if(!port){
+    document.getElementById("primary").innerHTML='<div class="empty">No canonical Paper-v2 portfolio evidence available.</div>';
+    document.getElementById("equitySeries").innerHTML="";
+    document.getElementById("ddDetail").innerHTML="";
+    document.getElementById("attention").innerHTML='<div class="empty">No attention items.</div>';
+    document.getElementById("contribRows").innerHTML="";
+    document.getElementById("recentRows").innerHTML="";
+    document.getElementById("watchRows").innerHTML="";
+    document.getElementById("accountability").innerHTML="";
+    return;
+  }
+  var c=port.quote_currency;
+  var dd=port.drawdown||{};
+  var val=dd.valuation||{};
+  document.getElementById("primary").innerHTML=
+    primaryCard("Realized Paper Net P&L",money(port.realized_net_pnl,c),(dd.realized_closed_trades||0)+" settled trades",cls(port.realized_net_pnl),"After modeled costs")
+    +primaryCard("Net Expectancy / Trade",money(port.expectancy_quote_currency,c),"No registered interval estimator",port.expectancy_quote_currency===null?"unknown":"","Evidence: INSUFFICIENT")
+    +(val.is_known?primaryCard("Current Marked-Equity DD",money(dd.marked_current_drawdown,c),"",cls(dd.marked_current_drawdown)):primaryCard("Current Marked-Equity DD",'<span class="unknown">UNKNOWN</span>',"No canonical mark evidence",""))
+    +(val.is_known?primaryCard("Max Marked-Equity DD",money(dd.marked_max_drawdown,c),"",cls(dd.marked_max_drawdown)):primaryCard("Max Marked-Equity DD",'<span class="unknown">UNKNOWN</span>',"No canonical mark evidence",""))
+    +primaryCard("Open Paper Positions",String(port.open_positions||0),"Reserved "+money(port.reserved_capital,c),"")
+    +primaryCard("Realized Drawdown (separate series)",money(dd.realized_max_drawdown_quote_currency,c),"Peak-to-trough of realized equity","","Not the marked series");
+
+  document.getElementById("ddNote").textContent=val.is_known?"":"Marked-equity valuation is unavailable, so marked drawdown is UNKNOWN rather than zero. The realized-equity series below is a separate, explicitly named metric.";
+
+  var series=port.equity_series||[];
+  if(!series.length){document.getElementById("equitySeries").innerHTML='<div class="empty">No settled trades yet.</div>';}
+  else{
+    var maxAbs=0;
+    for(var j=0;j<series.length;j++){var d=Math.abs(series[j].drawdown_quote_currency||0);if(d>maxAbs)maxAbs=d;}
+    var rows="";
+    for(var k=0;k<series.length;k++){
+      var p=series[k];
+      var w=maxAbs>0?Math.round(100*Math.abs(p.drawdown_quote_currency||0)/maxAbs):0;
+      rows+='<div class="grid2"><span class="d">'+esc(dt(p.at))+'</span>'
+        +'<span class="d">cum '+esc(num(p.cumulative_net_pnl))+'</span>'
+        +'<span class="bar"><i style="width:'+w+'%"></i></span></div>';
+    }
+    document.getElementById("equitySeries").innerHTML=rows;
+  }
+
+  document.getElementById("ddDetail").innerHTML=
+    "<dt>Realized max DD</dt><dd>"+esc(money(dd.realized_max_drawdown_quote_currency,c))+"</dd>"
+    +"<dt>Realized current DD</dt><dd>"+esc(money(dd.realized_current_drawdown_quote_currency,c))+"</dd>"
+    +"<dt>Realized max DD %</dt><dd>"+(dd.realized_max_drawdown_pct===null||dd.realized_max_drawdown_pct===undefined?"UNKNOWN (no base)":esc(num(dd.realized_max_drawdown_pct))+"%")+"</dd>"
+    +"<dt>Time underwater</dt><dd>"+esc(secsToAge(dd.realized_time_underwater_seconds))+"</dd>"
+    +"<dt>Recovery duration</dt><dd>"+esc(secsToAge(dd.realized_recovery_duration_seconds))+"</dd>"
+    +"<dt>Settled trades</dt><dd>"+esc(dd.realized_closed_trades)+"</dd>"
+    +"<dt>Marked current DD</dt><dd><span class=\"unknown\">UNKNOWN</span></dd>"
+    +"<dt>Valuation reason</dt><dd>"+esc(val.reason||"UNKNOWN")+"</dd>";
+
+  var att=ov.attention||[];
+  document.getElementById("attention").innerHTML=att.length?att.map(function(a){
+    return '<div class="act '+((a.severity==="MEDIUM")?"med":"")+'"><div class="t">'+esc(a.code)+' &mdash; '+esc(a.summary)+'</div>'
+      +'<div class="b">Scope: '+esc(a.scope)+' | State: '+esc(a.state)+' | Age: '+esc(secsToAge(a.age_seconds))
+      +' | Authority affected: '+esc(a.authority_affected?"YES":"no")
+      +(a.action_required?'<br>Action: '+esc(a.action_required):'')
+      +(a.evidence_refs&&a.evidence_refs.length?'<br>Evidence: '+a.evidence_refs.map(function(e){return '<span class="chip">'+esc(e)+'</span>';}).join(""):'')
+      +'</div></div>';
+  }).join(""):'<div class="empty">No attention items.</div>';
+
+  var contrib=port.strategy_contribution||[];
+  document.getElementById("contribRows").innerHTML=contrib.length?contrib.map(function(s){
+    return "<tr><td>"+esc(s.policy_version)+"</td><td class='num'>"+esc(s.settled_trades)+"</td>"
+      +"<td class='num "+cls(s.realized_net_pnl)+"'>"+esc(money(s.realized_net_pnl,c))+"</td>"
+      +"<td class='num'>"+esc(money(s.expectancy_quote_currency,c))+"</td>"
+      +"<td class='num'>"+esc(s.winning_trades)+"</td><td class='num'>"+esc(s.losing_trades)+"</td>"
+      +"<td class='num'>"+esc(money(s.realized_max_drawdown_quote_currency,c))+"</td>"
+      +"<td><span class='chip'>"+esc(s.uncertainty)+"</span></td></tr>";
+  }).join(""):"<tr><td colspan='8' class='empty'>No settled trades yet.</td></tr>";
+
+  var acc=port.accountability||{};
+  document.getElementById("accountability").innerHTML=
+    "<dt>Admitted</dt><dd>"+esc(acc.admitted)+"</dd>"
+    +"<dt>Open positions</dt><dd>"+esc(acc.open_positions)+"</dd>"
+    +"<dt>Closed (settled)</dt><dd>"+esc(acc.closed_settled)+"</dd>"
+    +"<dt>Flat, unverified</dt><dd>"+esc(acc.flat_unverified)+"</dd>"
+    +"<dt>Rejected counts</dt><dd><span class=\"unknown\">UNAVAILABLE</span></dd>"
+    +"<dt>Reason</dt><dd>"+esc(acc.rejected_unavailable_reason||"")+"</dd>";
+
+  var recent=port.recent_settled_trades||[];
+  document.getElementById("recentRows").innerHTML=recent.length?recent.map(function(t){
+    return "<tr><td><a href='#trade/"+esc(t.paper_trade_id)+"'>"+esc(idShort(t.paper_trade_id))+"</a></td>"
+      +"<td>"+esc(t.policy_version||"-")+"</td><td>"+esc(t.economic_result)+"</td><td>"+esc(t.exit_mechanism)+"</td>"
+      +"<td class='num "+cls(t.net_pnl)+"'>"+esc(money(t.net_pnl,c))+"</td>"
+      +"<td class='num'>"+esc(t.early_close===null?"UNKNOWN":(t.early_close?"early":"full"))+"</td></tr>";
+  }).join(""):"<tr><td colspan='6' class='empty'>No settled trades yet.</td></tr>";
+
+  var watch=port.current_watch||[];
+  document.getElementById("watchRows").innerHTML=watch.length?watch.map(function(t){
+    return "<tr><td><a href='#trade/"+esc(t.paper_trade_id)+"'>"+esc(t.native_symbol||"-")+"</a></td>"
+      +"<td>"+esc(t.lifecycle_status)+"</td><td>"+esc(t.protection_state||"NONE")+"</td>"
+      +"<td class='num'>"+esc(num(t.remaining_quantity,4))+"</td>"
+      +"<td class='num'>"+esc(dt(t.first_entry_fill_at))+"</td></tr>";
+  }).join(""):"<tr><td colspan='5' class='empty'>No open paper positions.</td></tr>";
+}
+
+async function loadOverview(){
+  var errBox=document.getElementById("err");
+  errBox.style.display="none";
+  try{
+    var ov=await request("/api/cockpit/overview");
+    state.overview=ov;
+    if(ov.details&&ov.details.length&&!ov.portfolios.length){throw new Error(ov.details.join("; "));}
+    renderOverview();
+  }catch(e){
+    errBox.style.display="block";
+    errBox.textContent=String(e.message||e);
+    if(state.overview)renderOverview();
+  }
+}
+
+function renderTradeDetail(payload){
+  var body=document.getElementById("tradeBody");
+  if(!payload||!payload.found){
+    body.innerHTML='<div class="card"><div class="empty">'+esc((payload&&payload.details&&payload.details.join("; "))||"Trade not found.")+'</div></div>';
+    return;
+  }
+  var t=payload.trade;
+  var c=t.quote_currency||"";
+  function li(label,value,clsName){
+    return "<dt>"+esc(label)+"</dt><dd class='"+(clsName||"")+"'>"+value+"</dd>";
+  }
+  body.innerHTML=
+   '<div class="grid">'
+   +'<div class="card s6"><div class="section-title">Identity</div><div class="dl">'
+    +li("Trade id","<span class='chip'>"+esc(t.paper_trade_id)+"</span>")
+    +li("Opportunity / episode",esc(t.episode_id||"-"))
+    +li("Candidate",esc(t.candidate_id||"-"))
+    +li("Cohort",esc(t.cohort_id||"-"))
+    +li("Pair",esc(t.native_symbol||"-"))
+    +li("Quote currency",esc(c))
+    +li("Direction",esc(t.direction))
+    +li("Engine",esc(t.engine))
+    +li("Policy version",esc(t.policy_version||"-"))
+    +li("Policy fingerprint","<span class='chip'>"+esc(t.policy_fingerprint||"-")+"</span>")
+    +li("Instrument version",esc(t.instrument_version||"-"))
+   +'</div></div>'
+   +'<div class="card s6"><div class="section-title">Lifecycle</div><div class="dl">'
+    +li("Status",esc(t.lifecycle_status))
+    +li("Dispositioned",esc(dt(t.disposition_at)))
+    +li("Entry intent",esc(dt(t.entry_intent_at)))
+    +li("Entry attempt",esc(dt(t.entry_attempt_at)))
+    +li("First entry fill",esc(dt(t.first_entry_fill_at)))
+    +li("Last exit fill",esc(dt(t.last_exit_fill_at)))
+    +li("Holding",t.holding_seconds===null?"UNKNOWN":esc(secsToAge(t.holding_seconds)))
+    +li("Protection state",esc(t.protection_state||"NONE"))
+    +li("Terminal reconciliation",esc(t.terminal_reconciliation_state||"UNRESOLVED"))
+   +'</div></div>'
+   +'<div class="card s6"><div class="section-title">Economic reconciliation</div><div class="dl">'
+    +li("Requested quantity",esc(num(t.requested_entry_quantity,4)))
+    +li("Entry / exit / remaining",esc(num(t.entry_quantity,4))+" / "+esc(num(t.exited_quantity,4))+" / "+esc(num(t.remaining_quantity,4)))
+    +li("Entry VWAP / notional",esc(num(t.entry_price_vwap))+" / "+esc(money(t.entry_notional,c)))
+    +li("Exit VWAP / notional",esc(num(t.exit_price_vwap))+" / "+esc(money(t.exit_notional,c)))
+    +li("Gross P&L","<span class='"+cls(t.gross_pnl)+"'>"+esc(money(t.gross_pnl,c))+"</span>")
+    +li("Fees / spread / slippage",esc(num(t.fee_cost))+" / "+esc(num(t.spread_cost))+" / "+esc(num(t.slippage_cost)))
+    +li("Other cost",esc(num(t.other_cost)))
+    +li("Execution costs",esc(money(t.execution_costs,c)))
+    +li("Net P&L","<span class='"+cls(t.net_pnl)+"'>"+esc(money(t.net_pnl,c))+"</span>")
+    +li("Definitive","<span class='"+(t.net_pnl_definitive?"good":"warn")+"'>"+esc(t.net_pnl_definitive?"YES (FINAL_VERIFIED)":"NO - indicative")+"</span>")
+    +li("Economics source",esc(t.economics_source))
+    +li("Economic model",esc(t.economic_model_version||"-"))
+   +'</div></div>'
+   +'<div class="card s6"><div class="section-title">Planned vs observed</div><div class="dl">'
+    +li("Plan seq",esc(t.plan_seq===null?"UNKNOWN":t.plan_seq))
+    +li("Planned stop",esc(num(t.planned_stop_price)))
+    +li("Planned targets",(t.planned_targets||[]).map(function(x){return "<span class='chip'>"+esc(x.target_id)+" @ "+esc(num(x.price))+" ("+esc(x.fraction)+")</span>";}).join("")||"-")
+    +li("Planned max hold",t.planned_max_hold_seconds===null?"UNKNOWN":esc(secsToAge(t.planned_max_hold_seconds)))
+    +li("Early close",t.early_close===null?"UNKNOWN (unprovable)":esc(t.early_close?"YES":"NO"))
+    +li("Economic result",esc(t.economic_result))
+    +li("Execution result",esc(t.execution_result))
+    +li("Exit mechanism",esc(t.exit_mechanism))
+    +li("All mechanisms",(t.exit_mechanisms||[]).map(function(m){return "<span class='chip'>"+esc(m)+"</span>";}).join("")||"-")
+   +'</div></div>'
+   +'<div class="card s12"><div class="section-title">Canonical audit trail</div>'
+    +'<div class="mini">Every displayed figure traces to these committed canonical records. Projection '+esc(payload.projection_version)+'.</div>'
+    +'<div style="margin-top:8px">'+(t.event_ids||[]).map(function(e){return "<span class='chip'>"+esc(e)+"</span>";}).join("")+'</div>'
+   +'</div>'
+   +'</div>';
+}
+
+async function loadTrade(paperTradeId){
+  var errBox=document.getElementById("err");
+  errBox.style.display="none";
+  try{
+    var payload=await request("/api/cockpit/trades/"+encodeURIComponent(paperTradeId));
+    renderTradeDetail(payload);
+  }catch(e){
+    errBox.style.display="block";errBox.textContent=String(e.message||e);
+  }
+}
+
+function route(){
+  var h=String(location.hash||"");
+  var m=h.match(/^#trade\/(.+)$/);
+  if(m){
+    document.getElementById("overviewView").style.display="none";
+    document.getElementById("tradeView").style.display="block";
+    loadTrade(decodeURIComponent(m[1]));
+  }else{
+    document.getElementById("tradeView").style.display="none";
+    document.getElementById("overviewView").style.display="block";
+  }
+}
+
+document.getElementById("currencyTabs").addEventListener("click",function(e){
+  var b=e.target.closest("button[data-c]");if(!b)return;
+  state.currency=b.getAttribute("data-c");renderOverview();
+});
+document.getElementById("refreshBtn").addEventListener("click",loadOverview);
+document.getElementById("backBtn").addEventListener("click",function(){location.hash="";});
+window.addEventListener("hashchange",route);
+
+loadOverview().then(route);
+</script>
+</body>
+</html>

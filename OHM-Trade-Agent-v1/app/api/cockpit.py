@@ -27,8 +27,10 @@ differently-scoped population under the caller's assumed scope.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, status
+from fastapi.responses import HTMLResponse
 
 from app.core.config import get_settings
 from app.opip.cockpit.ledger import read_paper_ledger
@@ -37,6 +39,8 @@ from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
 from app.services.secret_auth import secret_matches
 
 router = APIRouter()
+
+COCKPIT_FILE = Path(__file__).with_name("cockpit.html")
 
 #: Upper bound on rows returned by the trade list, so a wide query cannot produce an
 #: unbounded response. The ledger itself is bounded by committed trade count.
@@ -206,6 +210,19 @@ def cockpit_trade_detail(
         "found": True,
         "trade": match.to_dict(),
     }
+
+
+@router.get("/cockpit", response_class=HTMLResponse)
+def cockpit_page() -> str:
+    """Serve the read-only Cockpit v1 page.
+
+    A static document that reads the cockpit endpoints. It holds no authority: the
+    page can only issue the ``GET`` requests above, and it performs no P&L,
+    drawdown, exposure or eligibility arithmetic of its own - it formats and links
+    the values the projection supplies. Note the served page needs no secret; the
+    endpoints it calls do, so the data stays protected even though the shell is not.
+    """
+    return COCKPIT_FILE.read_text(encoding="utf-8")
 
 
 def route_methods() -> dict[str, set[str]]:
