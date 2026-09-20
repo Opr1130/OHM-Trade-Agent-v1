@@ -135,7 +135,13 @@ def temporal_point(evidence: Any) -> datetime | None:
 
 
 def temporal_interval(evidence: Any) -> tuple[datetime, datetime] | None:
-    """The defensible occurrence interval, from EXACT or BOUNDED evidence."""
+    """The defensible occurrence interval, from EXACT or BOUNDED evidence.
+
+    A well-formed interval must run forwards. A BOUNDED window whose end precedes
+    its start describes no real occurrence, so it is refused here rather than being
+    returned for a caller to interpret: a reversed window would otherwise yield a
+    latency that looks plausible while resting on impossible chronology.
+    """
     if not isinstance(evidence, Mapping):
         return None
     precision = str(evidence.get("precision"))
@@ -145,9 +151,25 @@ def temporal_interval(evidence: Any) -> tuple[datetime, datetime] | None:
     if precision == "BOUNDED":
         start = _parse_instant(evidence.get("window_start"))
         end = _parse_instant(evidence.get("window_end"))
-        if start is None or end is None:
+        if start is None or end is None or end < start:
             return None
         return (start, end)
+    return None
+
+
+def _instant_window(value: Any) -> tuple[datetime, datetime] | None:
+    """An occurrence window from canonical temporal evidence *or* an ISO instant.
+
+    A latency's start point is usually temporal evidence (a fill, a trigger), but the
+    decision instant is persisted as a plain ISO-8601 string on the decision context.
+    Both describe one provable moment, so both normalize to the same window form
+    rather than forcing callers to reformat canonical facts.
+    """
+    if isinstance(value, Mapping):
+        return temporal_interval(value)
+    if isinstance(value, str):
+        point = _parse_instant(value)
+        return (point, point) if point is not None else None
     return None
 
 
@@ -166,8 +188,8 @@ def latency_interval(
     duration at all, so this refuses rather than reporting a negative latency or
     silently clamping to zero.
     """
-    start_window = temporal_interval(start)
-    end_window = temporal_interval(end)
+    start_window = _instant_window(start)
+    end_window = _instant_window(end)
     if start_window is None or end_window is None:
         return None
     low = (end_window[0] - start_window[1]).total_seconds()
@@ -589,7 +611,13 @@ def build_trade_row(entry: PaperV2LedgerEntry) -> ReconciledPaperTrade:
         holding_seconds=holding,
         holding_seconds_interval=holding_interval,
         entry_latency_seconds=latency_interval(
-            entry.entry_intent_time, entry.first_entry_fill_time
+            # The registered ``paper.entry_latency`` is
+            # ``first_entry_fill_time - decision_time``, so the measurement starts at
+            # the decision context's evaluation instant rather than at the entry
+            # order intent. Starting later would silently omit the decision-to-order
+            # interval and report a flattering latency under the registered name.
+            entry.evaluation_time,
+            entry.first_entry_fill_time,
         ),
         exit_latency_seconds=latency_interval(
             (

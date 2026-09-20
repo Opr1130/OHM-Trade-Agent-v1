@@ -574,3 +574,142 @@ def test_zero_verified_trades_reports_no_expectancy_rather_than_zero():
     assert portfolio.expectancy_quote_currency is None
     assert portfolio.realized_net_pnl == 0.0
     assert portfolio.strategy_contribution == ()
+
+
+# ---------------------------------------------------------------------------
+# Review regressions
+# ---------------------------------------------------------------------------
+
+
+def test_released_reservations_are_not_counted_as_current_capital():
+    """Reserved capital must reflect holdings, not lifetime admissions.
+
+    Review finding (valid): canonical portfolio state releases a reservation at
+    FINAL_VERIFIED, so summing every trade's original reservation overstated current
+    occupancy and could imply the portfolio was capacity-constrained when it was not.
+    """
+    settled = _settled(trade_id="PTV2:" + "1" * 64, net=10.0, exit_offset=600)
+    open_row = build_trade_row(
+        _entry(
+            paper_trade_id="PTV2:" + "2" * 64,
+            latest_reconciliation=None,
+            final_verified=False,
+            exit_fills=(),
+            exited_quantity=0.0,
+            remaining_quantity=5.0,
+            last_exit_fill_time=None,
+            reserved_capital=500.0,
+        )
+    )
+    portfolio = build_currency_portfolio("USD", [settled, open_row], now=NOW)
+
+    # Only the still-held reservation counts, not the settled trade's 500.
+    assert portfolio.reserved_capital == pytest.approx(500.0)
+    assert portfolio.settled_trades == 1
+
+
+def test_settled_population_mismatch_between_series_and_pnl_is_declared():
+    """A settled trade that cannot be placed in time is reported, not hidden.
+
+    Review finding (valid): realized P/L legitimately includes settled trades whose
+    close instant is unprovable, while the equity series cannot place them, so a
+    consumer comparing the two would see an unexplained mismatch.
+    """
+    placeable = _settled(trade_id="PTV2:" + "1" * 64, net=10.0, exit_offset=600)
+    unplaceable = build_trade_row(
+        _entry(
+            paper_trade_id="PTV2:" + "2" * 64,
+            latest_reconciliation={
+                "reconciliation_seq": 1,
+                "terminal_reconciliation_state": "FINAL_VERIFIED",
+                "position_state": "FLAT",
+            },
+            final_verified=True,
+            last_exit_fill_time=None,
+        )
+    )
+    portfolio = build_currency_portfolio("USD", [placeable, unplaceable], now=NOW)
+
+    assert portfolio.settled_trades == 2
+    assert portfolio.settled_trades_in_equity_series == 1
+    assert "SETTLED_TRADES_UNPLACED_IN_TIME_SERIES" in portfolio.uncertainty_reasons
+    # All three series facts are published so the mismatch is explainable.
+    payload = portfolio.to_dict()
+    assert payload["settled_trades"] == 2
+    assert payload["settled_trades_in_equity_series"] == 1
+
+
+def test_contribution_groups_by_fingerprint_not_only_version_label():
+    """Two cohorts sharing a version label are still different strategies.
+
+    Review finding (valid): merging them attributed one cohort's economics to the
+    other's configuration and made the aggregate unattributable.
+    """
+    first = build_trade_row(
+        _entry(
+            paper_trade_id="PTV2:" + "1" * 64,
+            policy_version="gate-v1",
+            policy_fingerprint="fp-a",
+            latest_reconciliation={
+                "reconciliation_seq": 1,
+                "terminal_reconciliation_state": "FINAL_VERIFIED",
+                "position_state": "FLAT",
+                "realized_net_pnl": 10.0,
+            },
+            final_verified=True,
+        )
+    )
+    second = build_trade_row(
+        _entry(
+            paper_trade_id="PTV2:" + "2" * 64,
+            policy_version="gate-v1",
+            policy_fingerprint="fp-b",
+            latest_reconciliation={
+                "reconciliation_seq": 1,
+                "terminal_reconciliation_state": "FINAL_VERIFIED",
+                "position_state": "FLAT",
+                "realized_net_pnl": 99.0,
+            },
+            final_verified=True,
+        )
+    )
+
+    contributions = build_strategy_contribution([first, second])
+
+    assert len(contributions) == 2
+    assert {item.policy_fingerprint for item in contributions} == {"fp-a", "fp-b"}
+    assert all(item.settled_trades == 1 for item in contributions)
+    # Each cohort's economics stay with its own configuration.
+    by_fp = {item.policy_fingerprint: item for item in contributions}
+    assert by_fp["fp-a"].realized_net_pnl == pytest.approx(10.0)
+    assert by_fp["fp-b"].realized_net_pnl == pytest.approx(99.0)
+
+
+def test_entry_latency_starts_at_the_registered_decision_instant():
+    """Findings (valid): measuring from the order intent omits decision-to-order time."""
+    row = build_trade_row(
+        _entry(
+            evaluation_time=(NOW - timedelta(seconds=90))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            entry_intent_time=_exact(-30),
+            first_entry_fill_time=_exact(0),
+        )
+    )
+    low, high = row.entry_latency_seconds
+    # From the decision instant (t-90) to the fill (t+0), not from the intent (t-30).
+    assert (low, high) == pytest.approx((90.0, 90.0))
+
+
+def test_reversed_bounded_evidence_is_refused_rather_than_inverted():
+    """Chronology the evidence cannot support must not yield a plausible latency."""
+    from app.opip.cockpit.ledger import latency_interval, temporal_interval
+
+    reversed_window = {
+        "precision": "BOUNDED",
+        "basis": "LOCALLY_OBSERVED",
+        "window_start": _exact(120)["occurred_at"],
+        "window_end": _exact(60)["occurred_at"],
+    }
+    assert temporal_interval(reversed_window) is None
+    assert latency_interval(reversed_window, _exact(300)) is None

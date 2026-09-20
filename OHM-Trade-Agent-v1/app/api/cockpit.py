@@ -33,8 +33,14 @@ from fastapi import APIRouter, Header, HTTPException, status
 from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
-from app.opip.cockpit.ledger import read_paper_ledger
-from app.opip.cockpit.portfolio import build_overview
+from app.opip.cockpit.ledger import (
+    COCKPIT_LEDGER_PROJECTION_VERSION,
+    read_paper_ledger,
+)
+from app.opip.cockpit.portfolio import (
+    COCKPIT_PORTFOLIO_PROJECTION_VERSION,
+    build_overview,
+)
 from app.opip.contracts.paper_outcome import QUOTE_CURRENCIES
 from app.services.secret_auth import secret_matches
 
@@ -90,19 +96,65 @@ def _parse_limit(value: int) -> int:
     return value
 
 
-def _empty_envelope(reason: str) -> dict:
-    """The payload for an unreadable store.
-
-    Deliberately not an empty-but-healthy payload: it names the failure so a
-    consumer cannot read "unavailable" as "nothing happened".
-    """
+def _unavailable(reason: str) -> tuple[dict, str]:
+    """Shared unavailable-state pieces: the trust envelope and the timestamp."""
     from app.opip.cockpit.trust import unavailable
 
+    return unavailable(reason).to_dict(), _now()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _unavailable_overview(reason: str) -> dict:
+    """The overview payload for an unreadable store.
+
+    Shaped exactly like a healthy overview - same keys, empty collections - so a
+    consumer can process the unavailable case through one code path instead of
+    discovering a different schema only when something is wrong. It is never an
+    empty-but-healthy payload: the trust envelope names the failure.
+    """
+    trust, as_of = _unavailable(reason)
     return {
-        "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "trust": unavailable(reason).to_dict(),
+        "as_of": as_of,
+        "timezone": "UTC",
+        "source": "canonical_paper_v2_ledger",
+        "trust": trust,
+        "projection_version": COCKPIT_PORTFOLIO_PROJECTION_VERSION,
+        "ledger_projection_version": COCKPIT_LEDGER_PROJECTION_VERSION,
         "valuation": {"status": "UNKNOWN", "is_known": False},
+        "portfolios": [],
+        "attention": [],
+        "details": [reason],
+    }
+
+
+def _unavailable_trades(reason: str, *, currency: str | None, limit: int) -> dict:
+    """The trade-list payload for an unreadable store, shaped like the healthy one."""
+    trust, as_of = _unavailable(reason)
+    return {
+        "as_of": as_of,
+        "timezone": "UTC",
+        "trust": trust,
+        "projection_version": COCKPIT_LEDGER_PROJECTION_VERSION,
+        "filters": {"quote_currency": currency, "limit": limit},
+        "population": "canonical Paper-v2 trades",
+        "count": 0,
         "entries": [],
+        "details": [reason],
+    }
+
+
+def _unavailable_trade_detail(reason: str) -> dict:
+    """The trade-detail payload for an unreadable store."""
+    trust, as_of = _unavailable(reason)
+    return {
+        "as_of": as_of,
+        "timezone": "UTC",
+        "projection_version": COCKPIT_LEDGER_PROJECTION_VERSION,
+        "trust": trust,
+        "found": False,
         "details": [reason],
     }
 
@@ -115,12 +167,12 @@ def cockpit_overview(
     _require_secret(x_webhook_secret)
     client = _writer_client()
     if client is None:
-        return _empty_envelope("CANONICAL_WRITER_UNAVAILABLE")
+        return _unavailable_overview("CANONICAL_WRITER_UNAVAILABLE")
 
     ledger = read_paper_ledger(client)
     overview = build_overview(ledger, now=datetime.now(timezone.utc))
     payload = overview.to_dict()
-    payload["as_of"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    payload["as_of"] = _now()
     payload["timezone"] = "UTC"
     payload["source"] = "canonical_paper_v2_ledger"
     return payload
@@ -139,7 +191,9 @@ def cockpit_trades(
 
     client = _writer_client()
     if client is None:
-        return _empty_envelope("CANONICAL_WRITER_UNAVAILABLE")
+        return _unavailable_trades(
+            "CANONICAL_WRITER_UNAVAILABLE", currency=currency, limit=limit
+        )
 
     ledger = read_paper_ledger(client)
     rows = [
@@ -152,7 +206,7 @@ def cockpit_trades(
         reverse=True,
     )
     return {
-        "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "as_of": _now(),
         "timezone": "UTC",
         "trust": ledger.trust.to_dict(),
         "projection_version": ledger.projection_version,
@@ -181,7 +235,7 @@ def cockpit_trade_detail(
 
     client = _writer_client()
     if client is None:
-        return _empty_envelope("CANONICAL_WRITER_UNAVAILABLE")
+        return _unavailable_trade_detail("CANONICAL_WRITER_UNAVAILABLE")
 
     ledger = read_paper_ledger(client)
     match = next(
@@ -191,20 +245,17 @@ def cockpit_trade_detail(
         # A missing trade in an *unhealthy* ledger is not evidence of absence, so
         # that case is reported distinctly rather than as a plain 404.
         if not ledger.trust.is_healthy:
-            return {
-                "as_of": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-                "trust": ledger.trust.to_dict(),
-                "found": False,
-                "details": list(ledger.details),
-            }
+            payload = _unavailable_trade_detail("LEDGER_NOT_HEALTHY")
+            payload["trust"] = ledger.trust.to_dict()
+            payload["details"] = list(ledger.details) or payload["details"]
+            payload["projection_version"] = ledger.projection_version
+            return payload
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="unknown paper trade"
         )
 
     return {
-        "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "as_of": _now(),
         "timezone": "UTC",
         "projection_version": ledger.projection_version,
         "found": True,

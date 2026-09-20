@@ -235,6 +235,12 @@ class CurrencyPortfolio:
     execution_costs: float = 0.0
     open_positions: int = 0
     reserved_capital: float = 0.0
+    #: Settled trades, and how many of them could be placed on the equity time
+    #: series. These can legitimately differ (a settled trade whose close instant is
+    #: unprovable cannot be placed), so both are published instead of letting a
+    #: consumer discover an unexplained mismatch between the series and realized P/L.
+    settled_trades: int = 0
+    settled_trades_in_equity_series: int = 0
     strategy_contribution: tuple[StrategyContribution, ...] = ()
     recent_settled_trades: tuple[ReconciledPaperTrade, ...] = ()
     accountability: AccountabilitySummary = field(
@@ -265,6 +271,8 @@ class CurrencyPortfolio:
             "execution_costs": self.execution_costs,
             "open_positions": self.open_positions,
             "reserved_capital": self.reserved_capital,
+            "settled_trades": self.settled_trades,
+            "settled_trades_in_equity_series": self.settled_trades_in_equity_series,
             "strategy_contribution": [
                 item.to_dict() for item in self.strategy_contribution
             ],
@@ -416,31 +424,30 @@ def build_strategy_contribution(
 ) -> tuple[StrategyContribution, ...]:
     """Per-policy-version contribution over settled trades only.
 
+    Grouped by policy version **and** fingerprint. Two cohorts that share a version
+    label but were produced under different policy content are different strategies:
+    merging them would attribute one cohort's economics to the other's
+    configuration and make the aggregate unattributable.
+
     Ordered by realized net P/L for readability, **not** as a ranking verdict:
     with no registered interval estimator the ordering carries no statistical
     authority, which is why every entry states ``INSUFFICIENT_EVIDENCE``.
     """
-    grouped: dict[str, list[ReconciledPaperTrade]] = {}
+    grouped: dict[tuple[str, str | None], list[ReconciledPaperTrade]] = {}
     for row in rows:
         if not row.is_settled:
             continue
-        grouped.setdefault(str(row.policy_version or "UNKNOWN"), []).append(row)
+        key = (str(row.policy_version or "UNKNOWN"), row.policy_fingerprint or None)
+        grouped.setdefault(key, []).append(row)
 
     contributions: list[StrategyContribution] = []
-    for policy_version, members in grouped.items():
+    for (policy_version, fingerprint), members in grouped.items():
         net = sum(member.net_pnl for member in members)
         points = build_realized_equity_series(members)
         contributions.append(
             StrategyContribution(
                 policy_version=policy_version,
-                policy_fingerprint=next(
-                    (
-                        member.policy_fingerprint
-                        for member in members
-                        if member.policy_fingerprint
-                    ),
-                    None,
-                ),
+                policy_fingerprint=fingerprint,
                 settled_trades=len(members),
                 realized_net_pnl=net,
                 expectancy_quote_currency=net / len(members) if members else None,
@@ -469,7 +476,13 @@ def build_strategy_contribution(
                 uncertainty_reasons=(NO_INTERVAL_ESTIMATOR,),
             )
         )
-    contributions.sort(key=lambda item: (-item.realized_net_pnl, item.policy_version))
+    contributions.sort(
+        key=lambda item: (
+            -item.realized_net_pnl,
+            item.policy_version,
+            item.policy_fingerprint or "",
+        )
+    )
     return tuple(contributions)
 
 
@@ -578,6 +591,27 @@ def build_currency_portfolio(
 
     realized_net = sum(row.net_pnl for row in settled)
 
+    # Reserved capital counts only reservations that are still held. Canonical
+    # portfolio state releases a reservation once its trade is FINAL_VERIFIED, so
+    # summing every historical admission would overstate current capital occupancy
+    # and could imply the portfolio is capacity-constrained when it is not.
+    outstanding_reservations = tuple(
+        row for row in members if not row.net_pnl_definitive
+    )
+
+    # The realized equity series can only place trades whose close instant is
+    # provable, while realized P/L legitimately includes every settled trade. Those
+    # two populations can therefore differ by a small number of rows. That is
+    # reported explicitly rather than hidden, because a consumer comparing the
+    # series' final value against realized P/L would otherwise see an unexplained
+    # mismatch.
+    placed_in_series = len(points)
+    settled_count = len(settled)
+    unplaced_settled = settled_count - placed_in_series
+    population_reasons: list[str] = []
+    if unplaced_settled > 0:
+        population_reasons.append("SETTLED_TRADES_UNPLACED_IN_TIME_SERIES")
+
     recent = sorted(
         settled,
         key=lambda row: (
@@ -600,7 +634,11 @@ def build_currency_portfolio(
         gross_pnl=sum(row.gross_pnl for row in settled),
         execution_costs=sum(row.execution_costs for row in settled),
         open_positions=len(open_rows),
-        reserved_capital=sum(row.reserved_capital for row in members),
+        reserved_capital=sum(
+            row.reserved_capital for row in outstanding_reservations
+        ),
+        settled_trades=settled_count,
+        settled_trades_in_equity_series=placed_in_series,
         strategy_contribution=build_strategy_contribution(members),
         recent_settled_trades=tuple(recent),
         accountability=AccountabilitySummary(
@@ -612,7 +650,7 @@ def build_currency_portfolio(
         current_watch=open_rows,
         attention=attention,
         uncertainty=Uncertainty.INSUFFICIENT_EVIDENCE,
-        uncertainty_reasons=(NO_INTERVAL_ESTIMATOR,),
+        uncertainty_reasons=(NO_INTERVAL_ESTIMATOR, *population_reasons),
     )
 
 

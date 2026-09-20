@@ -46,6 +46,9 @@
 .nav button{border:1px solid #2a3d56;background:#111e2d;color:#dce7f5;padding:7px 12px;border-radius:9px;cursor:pointer;font-size:12px}
 .nav button.active{background:#214a73;border-color:#3978ad}
 .err{display:none;background:#3c1821;border:1px solid #6b2937;color:#ffc0c7;padding:11px;border-radius:10px;margin-bottom:12px}
+.unlock{margin-bottom:12px}
+.secret{display:flex;gap:8px;margin-top:9px}
+.secret input{flex:1;background:#08121d;border:1px solid #2b4059;color:#fff;border-radius:9px;padding:9px}
 .foot{font-size:11px;color:#6e8197;margin:14px 0 4px;line-height:1.6}
 .empty{color:#70869e;font-size:12px;padding:14px;text-align:center}
 .tabs{display:flex;gap:6px;margin-bottom:10px}
@@ -73,8 +76,18 @@
     <div class="mini" id="asof">as-of &mdash;</div>
     <div class="mini" id="projver">projection &mdash;</div>
     <div class="nav" style="justify-content:flex-end;margin-top:8px">
+      <button id="unlockBtn">Unlock</button>
       <button id="refreshBtn">Refresh</button>
     </div>
+  </div>
+</div>
+
+<div class="card unlock" id="unlockBox">
+  <div class="k">Secure analytics</div>
+  <div class="mini">Enter the existing operator/webhook secret. It stays in this browser tab, is sent only as a request header, and is never stored or written to disk.</div>
+  <div class="secret">
+    <input id="secretInput" type="password" placeholder="operator secret" autocomplete="off" />
+    <button class="btn" id="secretApply">Apply</button>
   </div>
 </div>
 
@@ -126,7 +139,7 @@
     <div class="card s5">
       <div class="section-title">Current watch (open paper positions)</div>
       <div class="table-wrap"><table class="table">
-        <thead><tr><th>Pair</th><th>State</th><th>Protection</th><th class="num">Remaining</th><th class="num">Age</th></tr></thead>
+        <thead><tr><th>Pair</th><th>State</th><th>Protection</th><th class="num">Remaining</th><th>First fill (UTC)</th></tr></thead>
         <tbody id="watchRows"></tbody></table></div>
     </div>
   </div>
@@ -175,10 +188,23 @@ function request(path){
   var headers={};
   if(state.secret)headers["x-webhook-secret"]=state.secret;
   return fetch(path,{headers:headers}).then(function(r){
-    if(r.status===401){throw new Error("Unauthorized: an operator secret is required.");}
+    if(r.status===401){throw new Error("Unauthorized: enter the operator secret above.");}
     if(!r.ok){return r.text().then(function(t){throw new Error(r.status+": "+t.slice(0,200));});}
     return r.json();
   });
+}
+
+/* The secret lives only in this variable for the lifetime of the tab: it is never
+   persisted to storage or a cookie, and it is sent only as a request header. The
+   page shell is public, but every endpoint it reads requires this secret, so no
+   data is reachable without it. */
+function applySecret(){
+  var input=document.getElementById("secretInput");
+  state.secret=input?String(input.value||""):"";
+  if(input)input.value="";
+  var box=document.getElementById("unlockBox");
+  if(box)box.style.display="none";
+  loadOverview().then(function(){route();});
 }
 
 function renderTrust(trust,valuation,portfolioUncertainty){
@@ -316,7 +342,7 @@ function renderOverview(){
     return "<tr><td><a href='#trade/"+esc(t.paper_trade_id)+"'>"+esc(t.native_symbol||"-")+"</a></td>"
       +"<td>"+esc(t.lifecycle_status)+"</td><td>"+esc(t.protection_state||"NONE")+"</td>"
       +"<td class='num'>"+esc(num(t.remaining_quantity,4))+"</td>"
-      +"<td class='num'>"+esc(dt(t.first_entry_fill_at))+"</td></tr>";
+      +"<td>"+esc(dt(t.first_entry_fill_at))+"</td></tr>";
   }).join(""):"<tr><td colspan='5' class='empty'>No open paper positions.</td></tr>";
 }
 
@@ -327,10 +353,17 @@ async function loadOverview(){
     var ov=await request("/api/cockpit/overview");
     state.overview=ov;
     if(ov.details&&ov.details.length&&!ov.portfolios.length){throw new Error(ov.details.join("; "));}
+    /* Authoritative read succeeded, so the unlock prompt is no longer needed. */
+    var box=document.getElementById("unlockBox");
+    if(box)box.style.display="none";
     renderOverview();
   }catch(e){
     errBox.style.display="block";
     errBox.textContent=String(e.message||e);
+    if(String(e.message||"").indexOf("Unauthorized")===0){
+      var box2=document.getElementById("unlockBox");
+      if(box2)box2.style.display="block";
+    }
     if(state.overview)renderOverview();
   }
 }
@@ -434,6 +467,16 @@ document.getElementById("currencyTabs").addEventListener("click",function(e){
 });
 document.getElementById("refreshBtn").addEventListener("click",loadOverview);
 document.getElementById("backBtn").addEventListener("click",function(){location.hash="";});
+document.getElementById("secretApply").addEventListener("click",applySecret);
+document.getElementById("secretInput").addEventListener("keydown",function(e){
+  if(e.key==="Enter")applySecret();
+});
+document.getElementById("unlockBtn").addEventListener("click",function(){
+  var box=document.getElementById("unlockBox");
+  if(box){box.style.display="block";}
+  var input=document.getElementById("secretInput");
+  if(input){input.focus();}
+});
 window.addEventListener("hashchange",route);
 
 loadOverview().then(route);

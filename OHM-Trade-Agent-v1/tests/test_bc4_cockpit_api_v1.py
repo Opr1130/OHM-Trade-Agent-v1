@@ -116,10 +116,48 @@ def test_overview_reports_unavailable_writer_rather_than_empty_success(monkeypat
 
     payload = cockpit.cockpit_overview(x_webhook_secret=None)
 
-    assert payload["entries"] == []
+    assert payload["portfolios"] == []
     assert payload["trust"]["is_healthy"] is False
     assert payload["details"]
     assert payload["as_of"]
+
+
+def test_unavailable_overview_has_the_same_shape_as_a_healthy_one(monkeypatch):
+    """A consumer must process the unavailable case through one code path.
+
+    Review finding (valid): the unavailable payload used an ``entries`` key and
+    omitted the overview's own keys, so callers would only discover the different
+    schema when something was already wrong.
+    """
+    monkeypatch.setattr(cockpit, "_writer_client", lambda: None)
+    unavailable = cockpit.cockpit_overview(x_webhook_secret=None)
+
+    monkeypatch.setattr(
+        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+    )
+    healthy = cockpit.cockpit_overview(x_webhook_secret=None)
+
+    assert set(unavailable) == set(healthy)
+    assert isinstance(unavailable["portfolios"], list)
+    assert isinstance(unavailable["attention"], list)
+
+
+def test_unavailable_trade_list_has_the_same_shape_as_a_healthy_one(monkeypatch):
+    monkeypatch.setattr(cockpit, "_writer_client", lambda: None)
+    unavailable = cockpit.cockpit_trades(
+        quote_currency=None, limit=25, x_webhook_secret=None
+    )
+
+    monkeypatch.setattr(
+        cockpit, "_writer_client", lambda: _ReadOnlyClient(PaperV2Ledger(status="OK"))
+    )
+    healthy = cockpit.cockpit_trades(
+        quote_currency=None, limit=25, x_webhook_secret=None
+    )
+
+    assert set(unavailable) == set(healthy)
+    assert unavailable["count"] == 0
+    assert unavailable["filters"] == healthy["filters"]
 
 
 def test_overview_reports_an_unhealthy_ledger_trust_state(monkeypatch):
@@ -272,6 +310,8 @@ def test_missing_trade_in_an_unhealthy_ledger_is_not_claimed_as_absent(monkeypat
     assert payload["found"] is False
     assert payload["trust"]["is_healthy"] is False
     assert payload["details"]
+    # Shape-consistent with the healthy detail payload.
+    assert {"as_of", "timezone", "projection_version", "found"} <= set(payload)
 
 
 def test_empty_trade_id_is_rejected(monkeypatch):

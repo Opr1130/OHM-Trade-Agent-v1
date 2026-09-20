@@ -191,11 +191,69 @@ def test_page_renders_unknown_explicitly():
     assert "marked" in served.lower()
 
 
-def test_page_has_no_secret_persistence():
-    """The page must not store credentials."""
+def test_page_has_a_way_to_supply_the_operator_secret():
+    """The page must let an operator authenticate; otherwise every read 401s.
+
+    Review finding (valid): the page had no way to populate the secret, so with a
+    configured webhook secret every request was rejected and the cockpit was
+    unusable.
+    """
+    served = _read(COCKPIT_HTML)
+    assert 'id="secretInput"' in served
+    assert "applySecret" in served
+    assert 'type="password"' in served
+    # The secret is sent only as a request header.
+    assert "x-webhook-secret" in served
+
+
+def test_page_never_persists_the_secret():
+    """Authentication is in-memory only: no storage, no cookie."""
     script = _script_section(_read(COCKPIT_HTML))
-    for forbidden in ("localStorage", "sessionStorage", "document.cookie"):
-        assert forbidden not in script, f"cockpit page persists state via {forbidden}"
+    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
+        assert forbidden not in script, f"cockpit page persists the secret via {forbidden}"
+
+
+def test_edge_allowlist_exposes_the_cockpit_routes():
+    """The nginx edge uses exact matches with a 404 default.
+
+    Review finding (valid, and the most consequential one): the routes were
+    registered in FastAPI but absent from the edge allowlist, so the whole cockpit
+    was unreachable in the deployed topology.
+    """
+    conf = (REPO / "deploy" / "nginx" / "dashboard-sidecar.conf").read_text(
+        encoding="utf-8"
+    )
+    assert "location = /cockpit" in conf
+    assert "location = /api/cockpit/overview" in conf
+    assert "location = /api/cockpit/trades" in conf
+    assert "location ^~ /api/cockpit/trades/" in conf
+
+
+def test_edge_allowlist_keeps_cockpit_routes_get_only():
+    """Every cockpit location must deny non-GET at the edge.
+
+    Read-only authority is enforced at the boundary, so the edge is part of the
+    guarantee rather than a separate policy.
+    """
+    conf = (REPO / "deploy" / "nginx" / "dashboard-sidecar.conf").read_text(
+        encoding="utf-8"
+    )
+    # Collect each location block and assert the cockpit *proxy* ones deny writes.
+    # A redirect-only block (``return 308``) proxies nothing, so it needs no
+    # method restriction; only blocks that reach the backend must be GET-only.
+    blocks = re.split(r"\n\s*location ", conf)
+    cockpit_blocks = [block for block in blocks if "/cockpit" in block.split("{")[0]]
+    assert cockpit_blocks, "no cockpit location blocks found"
+    checked = 0
+    for block in cockpit_blocks:
+        if "return 308" in block:
+            continue
+        assert "limit_except GET" in block, (
+            f"cockpit proxy location does not restrict methods: {block.splitlines()[0]!r}"
+        )
+        assert "deny all" in block
+        checked += 1
+    assert checked >= 4, f"expected the cockpit proxy locations to be checked, got {checked}"
 
 
 def test_page_does_not_hardcode_illustrative_numbers():
