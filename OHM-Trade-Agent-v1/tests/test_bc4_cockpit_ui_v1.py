@@ -47,8 +47,51 @@ def test_cockpit_page_is_served_from_the_module_directory():
     assert COCKPIT_HTML.is_file()
 
 
-def test_served_page_matches_the_file_on_disk():
-    assert cockpit.cockpit_page() == _read(COCKPIT_HTML)
+def test_cockpit_page_is_served_as_a_static_file():
+    """The page must be streamed as a fixed asset, not returned as computed HTML.
+
+    Returning file text through an ``HTMLResponse`` is a reflected-XSS pattern when
+    the text could contain input; streaming a constant asset keeps request data
+    structurally unable to reach the response body.
+    """
+    from fastapi.responses import FileResponse
+
+    response = cockpit.cockpit_page()
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == COCKPIT_HTML
+    assert response.media_type == "text/html"
+
+
+def test_cockpit_page_route_does_not_declare_an_html_response_class():
+    """No route may declare ``HTMLResponse`` or a ``response_class``.
+
+    Checked via the AST so the docstring that *explains* why this pattern is
+    avoided is not mistaken for the pattern itself.
+    """
+    import ast
+
+    tree = ast.parse(
+        __import__("pathlib").Path(cockpit.__file__).read_text(encoding="utf-8")
+    )
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    assert "HTMLResponse" not in imported
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            for keyword in decorator.keywords:
+                assert keyword.arg != "response_class", (
+                    f"{node.name} declares response_class={keyword.arg}"
+                )
 
 
 def test_cockpit_reuses_the_approved_mascot_byte_for_byte():

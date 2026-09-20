@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
 from app.opip.cockpit.ledger import read_paper_ledger
@@ -212,17 +212,23 @@ def cockpit_trade_detail(
     }
 
 
-@router.get("/cockpit", response_class=HTMLResponse)
-def cockpit_page() -> str:
-    """Serve the read-only Cockpit v1 page.
+@router.get("/cockpit")
+def cockpit_page() -> FileResponse:
+    """Serve the read-only Cockpit v1 page as a static asset.
 
-    A static document that reads the cockpit endpoints. It holds no authority: the
-    page can only issue the ``GET`` requests above, and it performs no P&L,
-    drawdown, exposure or eligibility arithmetic of its own - it formats and links
-    the values the projection supplies. Note the served page needs no secret; the
-    endpoints it calls do, so the data stays protected even though the shell is not.
+    Served with ``FileResponse`` rather than by returning a computed HTML string:
+    the page is a fixed repository asset, not per-request content, and streaming it
+    as a file keeps it structurally impossible for request data to reach the
+    response body. (Returning file text as an ``HTMLResponse`` is modelled as a
+    reflected-XSS sink precisely because that pattern *can* reflect input.)
+
+    The page holds no authority: it can only issue the ``GET`` requests above, and
+    it performs no P&L, drawdown, exposure or eligibility arithmetic of its own - it
+    formats and links the values the projection supplies. The page shell is public,
+    but the endpoints it calls require the operator secret, so the data remains
+    protected.
     """
-    return COCKPIT_FILE.read_text(encoding="utf-8")
+    return FileResponse(COCKPIT_FILE, media_type="text/html")
 
 
 def route_methods() -> dict[str, set[str]]:
