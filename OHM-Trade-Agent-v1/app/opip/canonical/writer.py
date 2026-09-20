@@ -136,9 +136,6 @@ from app.opip.decision_intelligence.events import (
     validate_di_payload,
 )
 from app.opip.decision_intelligence.serialization import canonical_serialize
-from app.opip.decision_intelligence.events import (
-    DECISION_INTELLIGENCE_CONTEXT_RECORDED,
-)
 from app.opip.market.instrument_version_store import instrument_version_from_payload
 
 MAX_PAYLOAD_BYTES = 16 * 1024
