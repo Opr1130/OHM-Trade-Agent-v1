@@ -16,6 +16,7 @@ from app.opip.canonical.models import (
     PaperPortfolioState,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2RecoverableExecutions,
     WriterAck,
     WriterIntent,
 )
@@ -267,6 +268,16 @@ class CanonicalWriterServer:
                     error_code="WORKER_UNHEALTHY",
                 ).to_dict()
             return self.writer.paper_v2_active_exposures().to_dict()
+        if method == "GET_PAPER_V2_RECOVERABLE_EXECUTIONS":
+            # Read-only lifecycle-recovery projection, gated on health for the same
+            # reason: an unhealthy store must not report an empty work list that
+            # would let outstanding trades be treated as finished.
+            if self._health_status() != "OK":
+                return PaperV2RecoverableExecutions(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_recoverable_executions().to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

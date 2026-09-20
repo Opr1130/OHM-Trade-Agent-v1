@@ -16,6 +16,7 @@ from app.opip.canonical.models import (
     PaperV2ActiveExposure,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2RecoverableExecutions,
     PendingHandoff,
     WriterAck,
     WriterIntent,
@@ -914,6 +915,12 @@ class CanonicalWriter:
                     filled_quantity=float(totals["entry_quantity"]),
                     exited_quantity=float(totals["exit_quantity"]),
                     remaining_quantity=float(totals["remaining_quantity"]),
+                    remaining_notional_basis=self._remaining_notional_basis(
+                        paper_trade_id,
+                        paper_v2_entry_order_intent_id(paper_trade_id),
+                        remaining_quantity=float(totals["remaining_quantity"]),
+                        entry_quantity=float(totals["entry_quantity"]),
+                    ),
                     protection_plan_id=plan_id,
                     protection_state=(
                         self._effective_protection_state(plan_id).value
@@ -924,6 +931,110 @@ class CanonicalWriter:
             )
         exposures.sort(key=lambda item: item.paper_trade_id)
         return PaperV2ActiveExposures(status="OK", exposures=exposures)
+
+    def _remaining_notional_basis(
+        self,
+        paper_trade_id: str,
+        entry_order_id: str,
+        *,
+        remaining_quantity: float,
+        entry_quantity: float,
+    ) -> float:
+        """Committed cost basis of the quantity still held, in quote currency.
+
+        Derived from the trade's own committed entry fills - the average committed
+        entry price applied to the remaining quantity - so it is frozen by evidence
+        rather than by a later market read. No mark-to-market model is applied: Paper
+        v2 has no frozen market-risk model, and inventing one here would silently
+        change portfolio-risk semantics.
+        """
+        if entry_quantity <= 0:
+            return 0.0
+        committed_notional = 0.0
+        for fill in self._paper_fills_for_trade(paper_trade_id):
+            if str(fill["order_intent_id"]) != entry_order_id:
+                continue
+            committed_notional += float(fill["quantity"]) * float(fill["price"])
+        average_entry_price = committed_notional / entry_quantity
+        return remaining_quantity * average_entry_price
+
+    def paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions:
+        """Read-only projection of committed trades needing lifecycle continuation.
+
+        Pure read. Lists trades with a fill-capable ENTRY attempt and no fill, with
+        the committed attempt and quote payloads needed to finish the fill. Recovery
+        must work without the original opportunity qualifying again, so this is
+        driven by canonical evidence rather than by a fresh scan.
+        """
+        with self._lock:
+            try:
+                return self._paper_v2_recoverable_executions_unlocked()
+            except (TypeError, ValueError) as exc:
+                return PaperV2RecoverableExecutions(
+                    status="REJECTED",
+                    error_code="RECOVERABLE_STATE_UNAVAILABLE",
+                    detail=str(exc),
+                )
+            except sqlite3.Error as exc:
+                return PaperV2RecoverableExecutions(
+                    status="RETRYABLE",
+                    error_code="SQLITE_ERROR",
+                    detail=str(exc),
+                )
+
+    def _paper_v2_recoverable_executions_unlocked(
+        self,
+    ) -> PaperV2RecoverableExecutions:
+        """Fill-capable attempts that have no committed fill yet.
+
+        Scoped to the fill-capable states, so the candidate set is the number of live
+        attempts rather than the size of canonical history.
+        """
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for state_value in sorted(_FILLABLE_STATE_VALUES):
+            rows = self._conn.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = ? "
+                "AND json_extract(payload_json, '$.execution_state') = ? "
+                "ORDER BY history_epoch ASC, local_sequence ASC",
+                (PAPER_EXECUTION_ATTEMPT_RECORDED, state_value),
+            ).fetchall()
+            for row in rows:
+                attempt = validate_paper_evidence_payload(
+                    PAPER_EXECUTION_ATTEMPT_RECORDED,
+                    json.loads(str(row["payload_json"])),
+                )
+                paper_trade_id = str(attempt.get("paper_trade_id") or "")
+                if not paper_trade_id or paper_trade_id in seen:
+                    continue
+                order_id = str(attempt.get("order_intent_id") or "")
+                if not order_id:
+                    continue
+                if (
+                    self._optional_paper_event_by_identity(
+                        PAPER_FILL_RECORDED, paper_v2_entry_fill_id(order_id)
+                    )
+                    is not None
+                ):
+                    # Already filled; nothing to continue.
+                    continue
+                quote_ref = attempt.get("market_evidence_ref")
+                if not isinstance(quote_ref, str) or not quote_ref:
+                    continue
+                seen.add(paper_trade_id)
+                entries.append(
+                    {
+                        "paper_trade_id": paper_trade_id,
+                        "execution_attempt_id": str(
+                            attempt["execution_attempt_id"]
+                        ),
+                        "execution_attempt": attempt,
+                        "quote_evidence": self._load_quote_evidence_by_id(quote_ref),
+                    }
+                )
+        entries.sort(key=lambda entry: entry["paper_trade_id"])
+        return PaperV2RecoverableExecutions(status="OK", entries=entries)
 
     def paper_v2_execution_state(self, disposition_id: str) -> PaperV2ExecutionState:
         """Read-only projection of one Paper-v2 trade's canonical progress.

@@ -397,8 +397,11 @@ def run_paper_v2_opportunity(
     reservation_id = progress.reservation_id
     _require(bool(reservation_id), "admitted trade has no canonical reservation")
 
-    # From here the trade owns a reservation, so every failure below must leave
-    # canonical evidence that releases it - unless exposure can still appear.
+    # From here the trade owns a reservation, so every failure below must reach a
+    # decided outcome. Which outcome is safe cannot be inferred from the exception
+    # site: a submit may have committed before its ACK was lost, a timeout may have
+    # committed, and a disconnect may have committed. Canonical state is therefore
+    # re-read before anything is released.
     try:
         return _advance_admitted_trade(
             opportunity,
@@ -412,16 +415,95 @@ def run_paper_v2_opportunity(
             paper_trade_id=paper_trade_id,
             reservation_id=reservation_id,
         )
-    except _PreExposureStop as stop:
-        _terminalize_zero_fill(
-            client,
-            progress=progress,
-            reservation_id=reservation_id,
+    except Exception as exc:
+        return recover_after_admitted_failure(
+            exc,
+            client=client,
+            disposition_id=disposition_id,
             paper_trade_id=paper_trade_id,
-            reason=stop.reason,
             execution_clock=execution_clock,
         )
-        raise PaperV2ExecutionError(stop.reason) from stop
+
+
+def recover_after_admitted_failure(
+    error: BaseException,
+    *,
+    client: Any,
+    disposition_id: str,
+    paper_trade_id: str,
+    execution_clock: Callable[[], datetime],
+) -> PaperV2ExecutionResult:
+    """Decide a safely committed outcome for a failed admitted trade.
+
+    Reads canonical state rather than trusting the exception site, then classifies:
+
+    * terminal record exists -> return it idempotently, never reopen;
+    * exposure exists (a fill committed, possibly even though the ACK was lost) ->
+      never release; report completion of the exposure stage;
+    * a fill-capable attempt exists -> retain the reservation and require retry;
+    * otherwise nothing can produce exposure -> terminalize zero-fill and release.
+
+    The writer remains the final authority on release: it revalidates unsafe release
+    independently, so a misclassification here cannot free capacity that could still
+    be consumed.
+    """
+    reason = str(error) or type(error).__name__
+    try:
+        progress = client.get_paper_v2_execution_state(disposition_id)
+    except Exception as read_error:  # noqa: BLE001 - unreadable state must not release
+        raise PaperV2ExecutionError(
+            f"{reason}; canonical recovery state unreadable "
+            f"({type(read_error).__name__}) so nothing was released"
+        ) from error
+
+    if getattr(progress, "status", "") != "OK":
+        raise PaperV2ExecutionError(
+            f"{reason}; canonical recovery state unavailable "
+            f"({getattr(progress, 'error_code', None) or progress.status}) so nothing "
+            "was released"
+        ) from error
+
+    # CASE D: already terminal.
+    if progress.terminal_reconciliation is not None:
+        return PaperV2ExecutionResult(
+            status="NO_FILL_TERMINAL",
+            disposition_id=disposition_id,
+            paper_trade_id=paper_trade_id,
+            reservation_id=progress.reservation_id,
+            entry_order_intent_id=progress.entry_order_intent_id,
+            protection_plan_id=(
+                str(progress.protection_plan["protection_plan_id"])
+                if isinstance(progress.protection_plan, Mapping)
+                else None
+            ),
+            detail=f"already terminally reconciled ({reason})",
+        )
+
+    # CASE C: exposure exists. Never release, never zero-fill terminalize.
+    if float(progress.filled_quantity) > 0:
+        raise PaperV2ExecutionError(
+            f"{reason}; canonical fill already committed, so exposure exists and the "
+            "trade must be reconciled rather than released"
+        ) from error
+
+    # CASE B: a fill-capable attempt exists. Retain the reservation and retry.
+    if bool(getattr(progress, "entry_attempt_fill_capable", False)):
+        raise PaperV2ExecutionError(
+            f"{reason}; a fill-capable ENTRY attempt is outstanding, so the "
+            "reservation is retained and the attempt must be resumed"
+        ) from error
+
+    # CASE A: nothing can produce exposure, so release via a truthful zero-fill
+    # terminal record.
+    _terminalize_zero_fill(
+        client,
+        progress=progress,
+        reservation_id=progress.reservation_id,
+        paper_trade_id=paper_trade_id,
+        reason=reason,
+        execution_clock=execution_clock,
+    )
+    raise PaperV2ExecutionError(reason) from error
 
 
 def _advance_admitted_trade(
@@ -485,6 +567,7 @@ def _advance_admitted_trade(
                 opportunity.evidence_cutoff, field_name="evidence_cutoff"
             ),
             field_name="plan_time",
+            release_safe=True,
         ),
     )
 
@@ -498,6 +581,7 @@ def _advance_admitted_trade(
                 opportunity.evidence_cutoff, field_name="evidence_cutoff"
             ),
             field_name="intent_time",
+            release_safe=True,
         )
         entry_payload = {
             "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -546,9 +630,9 @@ def _advance_admitted_trade(
             attempt_payload["attempt_time"], field_name="attempt_time"
         )
     else:
-        # No attempt yet, so the quote must satisfy the execution contract now. The
-        # pre-attempt failures below provably occur before any exposure exists, so
-        # they are raised as pre-exposure stops that can be terminalized.
+        # No attempt yet, so the quote must satisfy the execution contract now. These
+        # pre-attempt failures provably occur before any exposure exists and before
+        # any fill-capable attempt, so they may be terminalized as a zero-fill trade.
         try:
             quote, received_at = _commit_quote(
                 opportunity,
@@ -557,19 +641,19 @@ def _advance_admitted_trade(
                 settings=settings,
                 clock=execution_clock,
             )
-        except PaperV2ExecutionError as exc:
-            raise _PreExposureStop(str(exc)) from exc
-        attempt_floor = received_at
-        # The committed ask must still be an executable qualified entry: geometry,
-        # reserved capital and displayed depth. Nothing is resized, extrapolated or
-        # filled partially, so a quote that cannot support the approved trade
-        # produces no exposure at all.
-        try:
+            # The committed ask must still be an executable qualified entry: geometry,
+            # reserved capital and displayed depth. Nothing is resized, extrapolated
+            # or filled partially, so a quote that cannot support the approved trade
+            # produces no exposure at all.
             _require_executable_entry(opportunity, quote=quote)
         except PaperV2ExecutionError as exc:
-            raise _PreExposureStop(str(exc)) from exc
+            raise _PreAttemptTerminalStop(str(exc)) from exc
+        attempt_floor = received_at
         attempt_moment = _next_execution_moment(
-            execution_clock, floor=attempt_floor, field_name="attempt_time"
+            execution_clock,
+            floor=attempt_floor,
+            field_name="attempt_time",
+            release_safe=True,
         )
         attempt_payload = {
             "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -620,7 +704,12 @@ def _advance_admitted_trade(
         economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
         cost = economics.cost_components(fill_quantity, executable_price)
         fill_moment = _next_execution_moment(
-            execution_clock, floor=attempt_floor, field_name="fill_time"
+            execution_clock,
+            floor=attempt_floor,
+            field_name="fill_time",
+            # An accepted attempt already exists, so this trade can still produce
+            # exposure: a regression here must be retried, never released.
+            release_safe=False,
         )
         fill_payload = {
             "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
@@ -737,13 +826,26 @@ def _require_executable_entry(opportunity: PaperV2Opportunity, *, quote: Mapping
         )
 
 
-class _PreExposureStop(RuntimeError):
-    """A fail-closed stop that provably occurred before any exposure existed.
+class _PreAttemptTerminalStop(RuntimeError):
+    """A fail-closed stop that provably occurred BEFORE any fill-capable attempt.
 
-    Only raised where canonical evidence proves no fill exists and no fill-capable
-    attempt is outstanding, so the caller may terminalize the trade as a zero-fill
-    trade. Anything else propagates unchanged, because releasing a reservation that
-    could still become exposure would free capacity against a live trade.
+    Only this shape may be terminalized as a zero-fill trade, because only here does
+    canonical evidence prove the trade can no longer produce exposure. Raising this
+    after an accepted attempt existed would release capacity that could still be
+    consumed, so the two situations are separate types rather than one.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _ExecutionRetryRequired(RuntimeError):
+    """The trade cannot safely continue now, but must NOT be released.
+
+    Raised once a fill-capable attempt exists, or once exposure already does: the
+    reservation is retained, the retryable state is surfaced, and a later recovery
+    continues from committed canonical evidence.
     """
 
     def __init__(self, reason: str) -> None:
@@ -752,7 +854,11 @@ class _PreExposureStop(RuntimeError):
 
 
 def _next_execution_moment(
-    clock: Callable[[], datetime], *, floor: datetime, field_name: str
+    clock: Callable[[], datetime],
+    *,
+    floor: datetime,
+    field_name: str,
+    release_safe: bool,
 ) -> datetime:
     """Take an execution reading, refusing a clock that regressed.
 
@@ -760,13 +866,142 @@ def _next_execution_moment(
     record an execution that finished before it began. Silently rewriting the
     reading to ``floor`` would fabricate chronology, so a regression fails closed and
     the trade resumes later when the clock is valid again.
+
+    ``release_safe`` selects the failure shape, because the safe next action differs:
+    a regression before any fill-capable attempt leaves a trade that provably cannot
+    produce exposure (releasable), while one afterwards leaves a trade that still can
+    (retained and retried). Using one exception for both let a post-attempt
+    regression reach the zero-fill release path.
     """
     moment = require_utc(clock(), field_name=field_name)
     if moment < floor:
-        raise _PreExposureStop(
-            f"{field_name} regressed behind the causal floor for this execution"
-        )
+        message = f"{field_name} regressed behind the causal floor for this execution"
+        if release_safe:
+            raise _PreAttemptTerminalStop(message)
+        raise _ExecutionRetryRequired(message)
     return moment
+
+
+def recover_outstanding_paper_v2_trades(
+    client: Any,
+    *,
+    execution_clock: Callable[[], datetime] | None = None,
+) -> dict:
+    """Continue committed Paper-v2 trades that still need lifecycle work.
+
+    Recovery of already-authorized work, not new trading. It is driven entirely by
+    canonical evidence, so an interrupted accepted attempt is completed even if the
+    originating opportunity never qualifies again - which the normal scan path could
+    not guarantee.
+
+    Invariants: it cannot admit, cannot requalify or rerank, cannot change the
+    decision context, quantity, plan geometry, economics or instrument, cannot fetch
+    a new quote under an existing committed attempt, cannot call legacy execution,
+    and is idempotent. A trade that cannot safely proceed keeps its reservation and
+    is reported as retryable rather than being released or retried unsafely.
+    """
+    clock = execution_clock or system_utc_clock
+    summary: dict[str, Any] = {
+        "status": "OK",
+        "considered": 0,
+        "completed": 0,
+        "retryable": 0,
+        "details": [],
+    }
+    try:
+        projection = client.get_paper_v2_recoverable_executions()
+    except Exception as exc:  # noqa: BLE001 - unreadable work list must be reported
+        summary["status"] = "UNAVAILABLE"
+        summary["details"].append(f"recoverable projection failed: {type(exc).__name__}")
+        return summary
+    if str(getattr(projection, "status", "") or "") != "OK":
+        summary["status"] = "UNAVAILABLE"
+        summary["details"].append(
+            "recoverable projection unavailable: "
+            f"{getattr(projection, 'error_code', None) or projection.status}"
+        )
+        return summary
+
+    for entry in projection.entries:
+        summary["considered"] += 1
+        paper_trade_id = str(entry.get("paper_trade_id") or "")
+        try:
+            _complete_committed_fill(
+                client, entry=entry, execution_clock=clock
+            )
+            summary["completed"] += 1
+            summary["details"].append(f"completed fill for {paper_trade_id}")
+        except Exception as exc:  # noqa: BLE001 - one trade must not stop the sweep
+            summary["retryable"] += 1
+            summary["details"].append(
+                f"retryable {paper_trade_id}: {type(exc).__name__}: {exc}"
+            )
+    return summary
+
+
+def _complete_committed_fill(
+    client: Any,
+    *,
+    entry: Mapping[str, Any],
+    execution_clock: Callable[[], datetime],
+) -> None:
+    """Finish the fill for an already-committed, fill-capable ENTRY attempt.
+
+    Built only from committed facts - the committed accepted quantity, the committed
+    quote the attempt cites, and the frozen economics for this execution's model
+    version. It reads no market data and consults no mutable setting, so the fill it
+    produces is the one the original execution would have produced.
+    """
+    attempt = entry["execution_attempt"]
+    quote = entry["quote_evidence"]
+    if not isinstance(attempt, Mapping) or not isinstance(quote, Mapping):
+        raise PaperV2ExecutionError("recovery entry is missing committed payloads")
+
+    entry_order_id = str(attempt["order_intent_id"])
+    fill_quantity = float(attempt["accepted_quantity"])
+    executable_price = float(quote["best_ask"])
+    economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
+    cost = economics.cost_components(fill_quantity, executable_price)
+    attempt_floor = _temporal_instant(
+        attempt["attempt_time"], field_name="attempt_time"
+    )
+    fill_moment = _next_execution_moment(
+        execution_clock,
+        floor=attempt_floor,
+        field_name="fill_time",
+        release_safe=False,
+    )
+    fill_payload = {
+        "schema_version": PAPER_EXECUTION_CONTRACT_SCHEMA_VERSION,
+        "engine": ENGINE_OPIP_PAPER_V2,
+        "fill_id": paper_v2_entry_fill_id(entry_order_id),
+        "execution_attempt_id": str(attempt["execution_attempt_id"]),
+        "order_intent_id": entry_order_id,
+        "paper_trade_id": str(attempt["paper_trade_id"]),
+        "fill_seq": 0,
+        "side": "BUY",
+        "quantity": fill_quantity,
+        "price": executable_price,
+        "fee_cost": cost["fee_cost"],
+        "spread_cost": cost["spread_cost"],
+        "slippage_cost": cost["slippage_cost"],
+        "other_supported_cost": cost["other_supported_cost"],
+        "fill_time": {
+            "precision": "EXACT",
+            "basis": "SOURCE_REPORTED",
+            "occurred_at": iso_z(fill_moment, field_name="fill_time"),
+        },
+        "execution_model_version": PAPER_EXECUTION_MODEL_VERSION,
+        "economic_model_version": PAPER_ECONOMIC_MODEL_VERSION,
+        "market_evidence_ref": str(attempt["market_evidence_ref"]),
+    }
+    _submit(
+        client,
+        event_type=PAPER_FILL_RECORDED,
+        key=paper_evidence_idempotency_key(PAPER_FILL_RECORDED, fill_payload),
+        payload=fill_payload,
+        what="recovered fill",
+    )
 
 
 def _temporal_instant(value: Any, *, field_name: str) -> datetime:
@@ -970,21 +1205,6 @@ def _commit_quote(
         what="quote evidence",
     )
     return payload, received_at
-
-
-def _cost_components(
-    quantity: float, price: float, *, settings: Any
-) -> dict[str, float]:
-    """Deprecated shim retained for callers outside this module.
-
-    Fill economics are resolved from the frozen economic-model version (see
-    :mod:`app.opip.contracts.paper_economics`), not from mutable settings, so the
-    producer no longer calls this. It stays only so an external caller does not
-    break, and it delegates to the same frozen coefficients.
-    """
-    del settings
-    economics = paper_economics_for_version(PAPER_ECONOMIC_MODEL_VERSION)
-    return economics.cost_components(quantity, price)
 
 
 def _ensure_protection_plan(

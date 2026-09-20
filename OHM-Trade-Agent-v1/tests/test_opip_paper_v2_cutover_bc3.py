@@ -14,6 +14,7 @@ the repository default is asserted to stay ``off``.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,7 @@ from app.services.paper_v2_scan_router import (
 from app.jobs import scan_opportunities
 
 NOW = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
+CTX_EVENT = "decision_intelligence.context.recorded"
 #: The execution instant the router's clock is frozen to. Later than qualification
 #: and later than the book's source timestamp, which is the real ordering.
 EXECUTION_NOW = NOW + timedelta(seconds=10)
@@ -328,6 +330,42 @@ def _isolated_scan_persistence(monkeypatch, tmp_path):
     _isolate_scan_persistence(monkeypatch, tmp_path)
 
 
+def _rows(writer, event_type: str) -> list[dict]:
+    rows = writer._conn.execute(  # noqa: SLF001 - test-only canonical inspection
+        "SELECT payload_json FROM events WHERE event_type = ? ORDER BY local_sequence",
+        (event_type,),
+    ).fetchall()
+    return [json.loads(str(row["payload_json"])) for row in rows]
+
+
+def _drain_status(kind: str):
+    """A ``LegacyDrainStatus`` for one legacy-state scenario.
+
+    ``kind`` names the legacy condition; the tests assert the authority the resolver
+    derives from it. ``None`` means "unreadable", which is a distinct input from
+    "drained" and must not be conflated with it.
+    """
+    from app.services.paper_v2_cutover_readiness import LegacyDrainStatus
+
+    if kind is None:
+        return None
+    if kind == "drained":
+        return LegacyDrainStatus(status="READY", reason="legacy drained")
+    if kind == "unreadable":
+        # An unreadable legacy state is a distinct input from "drained": it must
+        # resolve to UNAVAILABLE, not be treated as empty.
+        return None
+    if kind == "unavailable":
+        return LegacyDrainStatus(
+            status="UNAVAILABLE", reason="legacy state unreadable"
+        )
+    return LegacyDrainStatus(
+        status="DRAINING",
+        reason=f"legacy obligations remain: {kind}",
+        freqtrade_open_trades=1,
+    )
+
+
 def _install_scan(
     monkeypatch,
     *,
@@ -351,20 +389,20 @@ def _install_scan(
     settings = _Settings(paper_v2_mode=mode)
 
     if drain is not None:
-        # Stub the legacy-drain evaluation, not the interlock: the scan's decision
-        # logic under test is unchanged, only its view of legacy state.
+        # Stub the legacy-STATE VIEW, not the decision logic: the authority resolver
+        # under test is unchanged, only its input is controlled.
         monkeypatch.setattr(
             scan_opportunities,
-            "_paper_v2_cutover_ready",
-            lambda _settings: (False, drain),
+            "_legacy_drain_status",
+            lambda _settings: _drain_status(drain),
         )
     elif mode == "active":
         # Active-mode tests are about routing, not legacy drain, so legacy is
-        # reported drained. The blocked path is covered by its own tests.
+        # reported drained. The blocked paths have their own tests.
         monkeypatch.setattr(
             scan_opportunities,
-            "_paper_v2_cutover_ready",
-            lambda _settings: (True, "drained"),
+            "_legacy_drain_status",
+            lambda _settings: _drain_status("drained"),
         )
 
     monkeypatch.setattr(scan_opportunities, "get_settings", lambda: settings)
@@ -860,6 +898,202 @@ def test_scan_module_does_not_import_decision_intelligence():
 
 def _fail_if_called(*args, **kwargs):
     raise AssertionError("Paper v2 must not be reached when the mode is off")
+
+
+# ---------------------------------------------------------------------------
+# Authority resolution: requested vs granted
+# ---------------------------------------------------------------------------
+
+
+def _resolve_with_drain(mode: str, drain):
+    """Resolve authority with the legacy-state view controlled."""
+    from types import SimpleNamespace
+
+    from app.jobs import scan_opportunities
+
+    settings = SimpleNamespace(
+        opip_paper_v2_mode=mode, paper_trade_starting_equity=10_000.0
+    )
+    original = scan_opportunities._legacy_drain_status
+    scan_opportunities._legacy_drain_status = lambda _s: _drain_status(drain)
+    try:
+        return scan_opportunities._resolve_paper_authority(settings)
+    finally:
+        scan_opportunities._legacy_drain_status = original
+
+
+@pytest.mark.parametrize(
+    ("mode", "drain", "expected"),
+    [
+        ("off", None, "LEGACY"),
+        ("active", "drained", "PAPER_V2_READY"),
+        ("active", "freqtrade_open", "PAPER_V2_DRAINING"),
+        ("active", "paper_v1_open", "PAPER_V2_DRAINING"),
+        ("active", "unreadable", "PAPER_V2_UNAVAILABLE"),
+        ("active", None, "PAPER_V2_UNAVAILABLE"),
+    ],
+)
+def test_resolved_authority_distinguishes_request_from_grant(mode, drain, expected):
+    """Requested configuration and granted authority are separate facts."""
+    authority = _resolve_with_drain(mode, drain)
+
+    assert authority.granted == expected
+    # Only READY authorizes new Paper-v2 entry, and only LEGACY authorizes new legacy
+    # entry, so the two can never both be true.
+    assert authority.paper_v2_routing is (expected == "PAPER_V2_READY")
+    assert authority.legacy_new_entry_allowed is (expected == "LEGACY")
+    assert not (authority.paper_v2_routing and authority.legacy_new_entry_allowed)
+
+
+@pytest.mark.parametrize(
+    ("mode", "drain", "expected"),
+    [
+        ("off", None, "LEGACY"),
+        ("active", "drained", "PAPER_V2_READY"),
+        ("active", "freqtrade_open", "PAPER_V2_DRAINING"),
+        ("active", "unavailable", "PAPER_V2_UNAVAILABLE"),
+        ("active", None, "PAPER_V2_UNAVAILABLE"),
+    ],
+)
+def test_blocked_cutover_never_creates_a_new_legacy_entry(
+    monkeypatch, mode, drain, expected
+):
+    """The core regression: a blocked cutover must not fall back to legacy admission.
+
+    Previously a blocked cutover set an internal flag false, which routed straight
+    into the legacy branch and created the very legacy obligations the cutover was
+    waiting to drain - so the cutover could never complete.
+    """
+    _settings, calls, _observer, _ranked = _install_scan(
+        monkeypatch, mode=mode, drain=drain
+    )
+    scan_opportunities.main()
+
+    if expected == "LEGACY":
+        assert calls.freqtrade == 1
+        assert calls.paper_v1 == 1
+    else:
+        # DRAINING and UNAVAILABLE create no new obligation in either authority.
+        assert calls.freqtrade == 0, expected
+        assert calls.paper_v1 == 0, expected
+
+
+def test_draining_authority_reports_the_blocking_reason(monkeypatch, capsys):
+    _install_scan(monkeypatch, mode="active", drain="freqtrade_open")
+    scan_opportunities.main()
+    out = capsys.readouterr().out
+    assert "PAPER V2 CUTOVER NOT GRANTED" in out
+    assert "PAPER_V2_DRAINING" in out
+    assert "New Freqtrade entries: 0" in out
+    assert "New Paper-v1 enrollments: 0" in out
+    assert "New Paper-v2 entries: 0" in out
+
+
+def test_unavailable_authority_is_distinct_from_draining(monkeypatch, capsys):
+    """An unreadable legacy state must not be reported as ordinary draining."""
+    _install_scan(monkeypatch, mode="active", drain="unreadable")
+    scan_opportunities.main()
+    out = capsys.readouterr().out
+    assert "PAPER_V2_UNAVAILABLE" in out
+    assert "PAPER_V2_DRAINING" not in out
+
+
+def test_lineage_under_draining_claims_no_engine(monkeypatch):
+    """Lineage must not claim Paper v2 acted when authority is only requested."""
+    _settings, calls, _observer, _ranked = _install_scan(
+        monkeypatch, mode="active", drain="freqtrade_open"
+    )
+    scan_opportunities.main()
+    assert _lineage_pairs(calls) == [(False, "OPIP_PAPER_V2_DRAINING")]
+
+
+def test_lineage_under_unavailable_claims_no_engine(monkeypatch):
+    _settings, calls, _observer, _ranked = _install_scan(
+        monkeypatch, mode="active", drain="unreadable"
+    )
+    scan_opportunities.main()
+    assert _lineage_pairs(calls) == [(False, "OPIP_PAPER_V2_UNAVAILABLE")]
+
+
+def test_draining_becomes_ready_without_a_configuration_change(monkeypatch, writer_env):
+    """C8: the cutover completes on its own once legacy drains."""
+    server, client = writer_env
+    set_writer_client_for_tests(client)
+    set_kraken_client_for_tests(KrakenClient(transport=_EchoTransport(requests=[])))
+
+    # Scan N: legacy still holds an obligation, so no new entry anywhere.
+    _install_scan(monkeypatch, mode="active", drain="freqtrade_open")
+    scan_opportunities.main()
+    assert _rows(server.writer, CTX_EVENT) == []
+
+    # The legacy obligation closes through its own lifecycle and no configuration
+    # changes. Scan N+1 grants the cutover.
+    _install_scan(monkeypatch, mode="active", drain="drained")
+    scan_opportunities.main()
+    assert len(_rows(server.writer, CTX_EVENT)) == 1
+
+
+@pytest.mark.parametrize(
+    "mode", ["Active", "ACTIVE", " active ", "", "unexpected", 1, True, None]
+)
+def test_malformed_activation_takes_the_legacy_path(monkeypatch, mode):
+    """C9: only the exact canonical value may request the cutover.
+
+    A near-miss must be ordinary OFF, not an activation - and it must reach the
+    historical legacy path rather than the blocked-cutover path, because no cutover
+    was requested.
+    """
+    _settings, calls, _observer, _ranked = _install_scan(
+        monkeypatch, mode=mode, drain="unreadable"
+    )
+    scan_opportunities.main()
+    assert calls.freqtrade == 1
+    assert calls.paper_v1 == 1
+    assert calls.router == 0
+
+
+def test_exact_active_requests_the_cutover(monkeypatch, writer_env):
+    """C10: the exact canonical value is the only one that requests activation."""
+    server, client = writer_env
+    set_writer_client_for_tests(client)
+    set_kraken_client_for_tests(KrakenClient(transport=_EchoTransport(requests=[])))
+    _settings, calls, _observer, _ranked = _install_scan(
+        monkeypatch, mode="active", drain="drained"
+    )
+    scan_opportunities.main()
+    assert calls.freqtrade == 0
+    assert calls.paper_v1 == 0
+    assert len(_rows(server.writer, CTX_EVENT)) == 1
+
+
+def test_no_dual_authority_across_every_state(monkeypatch):
+    """No scan state may create a new entry in both authorities."""
+    labels: list[str] = []
+    for mode, drain in (
+        ("off", None),
+        ("active", "drained"),
+        ("active", "freqtrade_open"),
+        ("active", "unreadable"),
+        ("active", None),
+    ):
+        _settings, calls, _observer, _ranked = _install_scan(
+            monkeypatch, mode=mode, drain=drain
+        )
+        scan_opportunities.main()
+        legacy_created = (calls.freqtrade + calls.paper_v1) > 0
+        label = mode if mode == "off" else f"{mode}/{drain}"
+        labels.append(label)
+        if label == "off":
+            assert legacy_created
+        else:
+            # Every requested-cutover state either routes Paper v2 (never legacy) or
+            # creates nothing at all. New legacy entry is never one of the outcomes.
+            assert not legacy_created, label
+
+    assert "off" in labels
+    assert "active/drained" in labels
+    assert "active/freqtrade_open" in labels
+    assert "active/None" in labels
 
 
 def _lineage_pairs(calls) -> list[tuple[bool, str]]:

@@ -925,6 +925,795 @@ def test_drain_reports_not_ok_freqtrade_status_as_unavailable(monkeypatch):
     assert status.status == module.DRAIN_UNAVAILABLE
 
 
+# ---------------------------------------------------------------------------
+# Blocker 2 / AG1-AG10 — canonical Paper-v2 exposure reaches the action gate
+# ---------------------------------------------------------------------------
+
+
+def _gate_candidate(symbol: str = "SOLUSD", direction: str = "LONG", capital: float = 500.0):
+    from app.services.entry_exit_advisor import EntryExitPlan
+
+    plan = EntryExitPlan(
+        symbol=symbol,
+        valid_now=True,
+        entry_style="MARKET",
+        entry_low=99.0,
+        entry_high=101.0,
+        chase_limit=102.0,
+        stop_price=90.0,
+        target_1=110.0,
+        target_2=120.0,
+        reward_to_risk_1=1.0,
+        reward_to_risk_2=2.0,
+        risk_level="MEDIUM",
+        reason="qualified",
+        direction=direction,
+    )
+    candidate = {
+        "economic_qualified": True,
+        "recommended_capital": capital,
+        "symbol": symbol,
+    }
+    return candidate, plan
+
+
+def _canonical_positions(client):
+    from app.services.paper_v2_portfolio_source import canonical_portfolio_positions
+
+    return canonical_portfolio_positions(client)
+
+
+def test_ag1_duplicate_symbol_is_rejected_from_canonical_exposure(env):
+    """AG1: a canonical Paper-v2 fill must block a new candidate on that symbol."""
+    from app.services.portfolio_risk import evaluate_portfolio_risk
+
+    _server, client = env
+    _run(env)
+    positions = _canonical_positions(client)
+    assert [p.symbol for p in positions] == ["SOLUSD"]
+
+    decision = evaluate_portfolio_risk(
+        active_trades=positions,
+        proposed_symbol="SOLUSD",
+        proposed_direction="LONG",
+        proposed_capital=500.0,
+        account_capital=10_000.0,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "symbol already active"
+
+
+def test_ag2_max_positions_counts_canonical_exposure(env):
+    """AG2: canonical positions count toward the simultaneous-position limit."""
+    from app.services.portfolio_risk import evaluate_portfolio_risk
+
+    _server, client = env
+    _run(env)
+    positions = _canonical_positions(client)
+
+    decision = evaluate_portfolio_risk(
+        active_trades=positions,
+        proposed_symbol="ADAUSD",
+        proposed_direction="LONG",
+        proposed_capital=100.0,
+        account_capital=10_000.0,
+        max_positions=1,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "maximum simultaneous positions reached"
+
+
+def test_ag3_same_direction_concentration_counts_canonical_exposure(env):
+    """AG3: canonical LONG exposure counts toward same-direction concentration."""
+    from app.services.portfolio_risk import evaluate_portfolio_risk
+
+    _server, client = env
+    _run(env)
+    positions = _canonical_positions(client)
+
+    decision = evaluate_portfolio_risk(
+        active_trades=positions,
+        proposed_symbol="ADAUSD",
+        proposed_direction="LONG",
+        proposed_capital=100.0,
+        account_capital=10_000.0,
+        max_same_direction=1,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "same-direction concentration limit reached"
+
+
+def test_ag4_gross_exposure_uses_canonical_notional_basis(env):
+    """AG4: the canonical notional basis drives the gross-exposure limit."""
+    from app.services.portfolio_risk import evaluate_portfolio_risk
+
+    _server, client = env
+    _run(env)
+    positions = _canonical_positions(client)
+    # 500 committed notional against 1,000 of account capital already breaches a
+    # 40% gross-exposure ceiling, so the basis is materially present.
+    assert positions[0].capital == pytest.approx(500.0)
+
+    decision = evaluate_portfolio_risk(
+        active_trades=positions,
+        proposed_symbol="ADAUSD",
+        proposed_direction="LONG",
+        proposed_capital=100.0,
+        account_capital=1_000.0,
+        max_gross_exposure_pct=40.0,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "gross exposure limit exceeded"
+
+
+def _seed_reserved_trade(env) -> str:
+    """Commit an admitted trade with a reservation and no fill.
+
+    Built through the real canonical ancestry so the state under test is exactly the
+    production "reserved but never filled" state.
+    """
+    from app.opip.canonical.decision_context_bridge import (
+        DecisionContextFacts,
+        commit_decision_context,
+    )
+    from app.opip.contracts.paper_execution_runtime import (
+        PaperAdmissionRequest,
+        admission_result_identities,
+    )
+    from app.services.paper_v2_decision_snapshot import (
+        DecisionSnapshot,
+        commit_decision_snapshot,
+    )
+    from app.services.paper_v2_instrument_registration import (
+        ensure_instrument_version_registered,
+    )
+
+    _server, client = env
+    disposition_id = "PDISP:" + "f" * 32
+    paper_trade_id, _ = admission_result_identities(disposition_id)
+    registered = ensure_instrument_version_registered(_version(), client=client)
+    snapshot = DecisionSnapshot.from_payload(_snapshot_payload())
+    snapshot_proof = commit_decision_snapshot(snapshot, client=client)
+    context_id, _proof = commit_decision_context(
+        DecisionContextFacts(
+            candidate_id="OPIPC:" + "a" * 20,
+            episode_id=snapshot.episode_id,
+            instrument_version_id=INSTRUMENT_VERSION_ID,
+            instrument_registration_event_id=registered.event_id,
+            snapshot_record_event_id=snapshot_proof.event_id,
+            snapshot_id=snapshot.snapshot_id,
+            snapshot_hash=snapshot.snapshot_hash,
+            evaluation_time=QUALIFICATION_TIME,
+            evidence_cutoff=NOW,
+            policy_version="OPIP-GATE-POLICY-TEST",
+            policy_fingerprint="GPF:" + "a" * 16,
+            producing_component="test",
+            artifact_or_build_id="ACF:" + "0" * 64,
+            process_instance_id="PROC:test",
+            emitted_at=QUALIFICATION_TIME,
+            source_record_refs=(),
+        ),
+        client=client,
+    )
+    ack = client.admit_paper_opportunity(
+        PaperAdmissionRequest(
+            disposition_id=disposition_id,
+            decision_context_id=context_id,
+            disposition_seq=0,
+            quote_currency="USD",
+            requested_capital=500.0,
+            disposition_time={
+                "precision": "EXACT",
+                "basis": "SOURCE_REPORTED",
+                "occurred_at": "2026-09-19T12:00:00Z",
+            },
+            expected_portfolio_version=0,
+            capital_policy_version="paper-capital-v1",
+            portfolio_equity_limit=10_000.0,
+            portfolio_position_limit=3,
+            requested_reservation_amount=500.0,
+        )
+    )
+    assert ack.status in {"OK", "DUPLICATE_OK"}, ack.detail
+    return paper_trade_id
+
+
+def test_ag5_fully_closed_exposure_does_not_constrain_the_gate(env):
+    """AG5: a trade with no remaining quantity must not constrain the gate.
+
+    `test_ag6_zero_fill_terminal_is_not_exposure` covers the released variant. A
+    *filled and then fully exited* trade is not producible in this slice: the
+    producer has no exit path, and the exit lifecycle belongs to the frozen B/C-2
+    protection action. What is provable here is that the projection excludes any
+    trade whose canonical remaining quantity is zero.
+    """
+    _server, client = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    result = client.get_paper_v2_active_exposures()
+    assert result.status == "OK"
+    assert result.exposures == []
+
+
+def test_ag6_zero_fill_terminal_is_not_exposure(env):
+    """AG6: a released zero-fill trade must not count as a position."""
+    _server, client = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    assert _rows(_server.writer, RECON_EVENT)
+    assert client.get_paper_v2_active_exposures().exposures == []
+
+
+def test_ag7_reservation_only_is_not_exposure(env):
+    """AG7: a reservation with no fill is protected by admission accounting."""
+    _server, client = env
+    _seed_reserved_trade(env)
+    # Admission accounting sees it...
+    assert _server.writer.paper_portfolio_state("USD").active_reservations == 1
+    # ...and it is not exposure.
+    assert client.get_paper_v2_active_exposures().exposures == []
+
+
+def test_ag8_unreadable_canonical_exposure_fails_closed(env):
+    """AG8: an unreadable canonical portfolio must not authorize entries."""
+    from app.services.paper_v2_portfolio_source import canonical_portfolio_positions
+
+    server, client = env
+    _run(env)
+    server.mark_worker_unhealthy_for_tests("TEST")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        canonical_portfolio_positions(client)
+
+
+def test_ag9_repeated_read_does_not_duplicate_exposure(env):
+    """AG9: reading twice must not double-count the same canonical position."""
+    _server, client = env
+    _run(env)
+    first = _canonical_positions(client)
+    second = _canonical_positions(client)
+    assert len(first) == 1
+    assert len(second) == 1
+    assert first[0].capital == second[0].capital
+
+
+def test_ag10_exposure_is_identical_across_restart(tmp_path):
+    """AG10: the projection is a function of canonical evidence, not of process state."""
+    from app.opip.canonical.client import InProcessWriterClient
+    from app.opip.canonical.server import CanonicalWriterServer
+
+    db_path = tmp_path / "canonical.sqlite3"
+    first = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "a.sock")
+    try:
+        env = (first, InProcessWriterClient(first))
+        _run(env)
+        before = first.writer.paper_v2_active_exposures()
+    finally:
+        first.stop()
+
+    second = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "b.sock")
+    try:
+        after = second.writer.paper_v2_active_exposures()
+    finally:
+        second.stop()
+    assert before.exposures == after.exposures
+
+
+def test_action_gate_uses_canonical_positions_under_paper_v2_authority(env, monkeypatch):
+    """The gate integration: canonical exposure reaches the real gate."""
+    from app.jobs import scan_opportunities
+
+    server, client = env
+    _run(env)
+
+    authority = scan_opportunities.PaperAuthority(
+        requested=True, granted=scan_opportunities.AUTHORITY_PAPER_V2_READY, reason="t"
+    )
+    feasible, _plan = _gate_candidate(symbol="SOLUSD")
+    ranked = SimpleNamespace(
+        rank=1,
+        opportunity=SimpleNamespace(
+            alert=feasible, snapshot=SimpleNamespace(trade_direction="LONG"), plan=_plan
+        ),
+        profit_ranking=SimpleNamespace(total_score=1.0),
+    )
+    from app.jobs.scan_opportunities import _apply_ranked_action_gates
+
+    result = _apply_ranked_action_gates(
+        [ranked],
+        settings=SimpleNamespace(account_equity=10_000.0),
+        authority=authority,
+        client=client,
+    )
+    # The canonical SOLUSD exposure blocks the duplicate-symbol candidate.
+    assert result == []
+    assert feasible["portfolio_risk_reason"] == "symbol already active"
+
+
+# ---------------------------------------------------------------------------
+# Blocker 3 / RCV1-RCV10 — post-admission recovery
+# ---------------------------------------------------------------------------
+
+
+def test_rcv1_lost_plan_ack_recovers_from_canonical_state(env):
+    """RCV1: a committed plan whose ACK was lost must not be rebuilt or conflict."""
+    server, _client = env
+    _run(env)
+    committed_plan = _rows(server.writer, PLAN_EVENT)[0]
+    later = QUALIFICATION_TIME + timedelta(seconds=500)
+    _run(env, clock=_clock(later), now=later)
+    assert _rows(server.writer, PLAN_EVENT) == [committed_plan]
+
+
+def test_rcv2_lost_entry_ack_recovers_exact_committed_payload(env):
+    """RCV2: recovery reuses the committed ENTRY payload without a new timestamp."""
+    server, _ = env
+    _run(env)
+    committed = _rows(server.writer, INTENT_EVENT)[0]
+    later = QUALIFICATION_TIME + timedelta(seconds=600)
+    _run(env, clock=_clock(later), now=later)
+    assert _rows(server.writer, INTENT_EVENT) == [committed]
+    assert len(_rows(server.writer, INTENT_EVENT)) == 1
+
+
+def test_rcv3_lost_attempt_ack_is_never_zero_fill_terminalized(env):
+    """RCV3: a committed accepted attempt must be resumed, never released."""
+    server, _ = env
+    readings = iter(
+        [
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME + timedelta(seconds=10),
+            QUALIFICATION_TIME - timedelta(seconds=30),
+        ]
+    )
+
+    def _clock_seq():
+        try:
+            return next(readings)
+        except StopIteration:
+            return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=_clock_seq)
+
+    # The attempt is fill-capable, so no terminal record may exist and the
+    # reservation stays active.
+    assert len(_rows(server.writer, ATTEMPT_EVENT)) == 1
+    assert _rows(server.writer, RECON_EVENT) == []
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 1
+
+
+def test_rcv4_lost_fill_ack_does_not_duplicate_the_fill(env):
+    """RCV4: a committed fill seen again is not duplicated."""
+    server, _ = env
+    first = _run(env)
+    second = _run(env)
+    assert first.fill_id == second.fill_id
+    assert len(_rows(server.writer, FILL_EVENT)) == 1
+    assert _rows(server.writer, RECON_EVENT) == []
+
+
+def test_rcv5_fill_failure_retains_reservation_then_completes(env):
+    """RCV5: a failed fill keeps the reservation, and recovery completes it."""
+    server, _ = env
+    readings = iter(
+        [
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME + timedelta(seconds=10),
+            QUALIFICATION_TIME - timedelta(seconds=30),
+        ]
+    )
+
+    def _clock_seq():
+        try:
+            return next(readings)
+        except StopIteration:
+            return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=_clock_seq)
+    assert _rows(server.writer, FILL_EVENT) == []
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 1
+
+    # Recovery with a valid clock completes from committed facts.
+    result = _run(env, clock=_clock_seq)
+    assert result.status == "EXECUTED"
+    assert len(_rows(server.writer, FILL_EVENT)) == 1
+
+
+def test_rcv6_clock_regression_semantics_split_at_the_attempt(env):
+    """RCV6: a regression before an attempt releases; after it, retains.
+
+    This is the semantic distinction the two stop types exist for. A regression
+    before any fill-capable attempt leaves a trade that provably cannot produce
+    exposure, so releasing it is safe. The same regression afterwards leaves a trade
+    that still can, so the reservation must be retained.
+    """
+    server, _ = env
+
+    # Before any attempt: the first reading already regresses, so the trade cannot
+    # have become exposure and is released.
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=lambda: QUALIFICATION_TIME - timedelta(seconds=10))
+    assert len(_rows(server.writer, RECON_EVENT)) == 1
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 0
+
+    # Control: the post-attempt regression is covered separately and retains the
+    # reservation (`test_rcv3_lost_attempt_ack_is_never_zero_fill_terminalized`).
+
+
+def test_rcv6b_clock_regression_after_attempt_retains_reservation(env):
+    """The post-attempt half of the same distinction."""
+    server, _ = env
+    readings = [
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME + timedelta(seconds=10),
+        QUALIFICATION_TIME - timedelta(seconds=30),
+    ]
+
+    def _clock_seq():
+        if readings:
+            return readings.pop(0)
+        return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError, match="regressed"):
+        _run(env, clock=_clock_seq)
+    assert _rows(server.writer, RECON_EVENT) == []
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 1
+
+
+def test_rcv7_restart_recovers_from_canonical_state(tmp_path):
+    """RCV7: a fresh process recovers without new qualification."""
+    from app.opip.canonical.client import InProcessWriterClient
+    from app.opip.canonical.server import CanonicalWriterServer
+    from app.services.paper_v2_execution import recover_outstanding_paper_v2_trades
+
+    db_path = tmp_path / "canonical.sqlite3"
+    first = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "a.sock")
+    try:
+        env = (first, InProcessWriterClient(first))
+        # Interrupt before the fill by regressing the fill clock.
+        readings = iter(
+            [
+                QUALIFICATION_TIME,
+                QUALIFICATION_TIME,
+                QUALIFICATION_TIME,
+                QUALIFICATION_TIME + timedelta(seconds=10),
+                QUALIFICATION_TIME - timedelta(seconds=30),
+            ]
+        )
+
+        def _clock_seq():
+            try:
+                return next(readings)
+            except StopIteration:
+                return QUALIFICATION_TIME + timedelta(seconds=60)
+
+        with pytest.raises(PaperV2ExecutionError):
+            _run(env, clock=_clock_seq)
+        assert _rows(first.writer, FILL_EVENT) == []
+    finally:
+        first.stop()
+
+    second = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "b.sock")
+    try:
+        client = InProcessWriterClient(second)
+        summary = recover_outstanding_paper_v2_trades(
+            client, execution_clock=lambda: QUALIFICATION_TIME + timedelta(seconds=90)
+        )
+        assert summary["status"] == "OK"
+        assert summary["considered"] == 1
+        assert summary["completed"] == 1
+        assert len(_rows(second.writer, FILL_EVENT)) == 1
+    finally:
+        second.stop()
+
+
+def test_rcv8_recovery_does_not_need_the_opportunity_again(env):
+    """RCV8: the sweep completes work with no scan and no opportunity at all."""
+    from app.services.paper_v2_execution import recover_outstanding_paper_v2_trades
+
+    server, client = env
+    readings = iter(
+        [
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME + timedelta(seconds=10),
+            QUALIFICATION_TIME - timedelta(seconds=30),
+        ]
+    )
+
+    def _clock_seq():
+        try:
+            return next(readings)
+        except StopIteration:
+            return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=_clock_seq)
+
+    # No opportunity, no scan, no market read - only committed evidence.
+    summary = recover_outstanding_paper_v2_trades(
+        client, execution_clock=lambda: QUALIFICATION_TIME + timedelta(seconds=120)
+    )
+    assert summary["completed"] == 1
+    assert len(_rows(server.writer, FILL_EVENT)) == 1
+    assert len(_rows(server.writer, ATTEMPT_EVENT)) == 1
+
+
+def test_rcv9_recovery_ignores_terminal_no_fill_trades(env):
+    """RCV9: a completed zero-fill trade is not reopened by the sweep."""
+    from app.services.paper_v2_execution import recover_outstanding_paper_v2_trades
+
+    server, client = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    before = _rows(server.writer, RECON_EVENT)
+    summary = recover_outstanding_paper_v2_trades(client)
+    assert summary["considered"] == 0
+    assert _rows(server.writer, RECON_EVENT) == before
+
+
+def test_rcv10_recovery_ignores_completed_exposure(env):
+    """RCV10: a completed trade is not re-executed by the sweep."""
+    from app.services.paper_v2_execution import recover_outstanding_paper_v2_trades
+
+    server, client = env
+    _run(env)
+    summary = recover_outstanding_paper_v2_trades(client)
+    assert summary["considered"] == 0
+    assert len(_rows(server.writer, FILL_EVENT)) == 1
+
+
+def test_recovery_projection_is_health_gated(env):
+    """An unhealthy store must not report an empty work list."""
+    from app.opip.canonical.models import PaperV2RecoverableExecutions
+
+    server, client = env
+    server.mark_worker_unhealthy_for_tests("TEST")
+    result = client.get_paper_v2_recoverable_executions()
+    assert isinstance(result, PaperV2RecoverableExecutions)
+    assert result.status == "RETRYABLE"
+    assert result.error_code == "WORKER_UNHEALTHY"
+
+
+# ---------------------------------------------------------------------------
+# CAP1-CAP7 — reservation / exposure / capacity conservation
+# ---------------------------------------------------------------------------
+
+
+def test_cap1_released_reservation_frees_capacity_for_the_next_trade(env):
+    """CAP1: a pre-attempt failure releases capacity for a later trade."""
+    server, _ = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    state = server.writer.paper_portfolio_state("USD")
+    assert state.active_reservations == 0
+    assert state.reserved_capital == 0.0
+
+
+def test_cap2_accepted_attempt_still_consumes_capacity(env):
+    """CAP2: an unresolved accepted attempt keeps its reservation."""
+    server, _ = env
+    readings = iter(
+        [
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME,
+            QUALIFICATION_TIME + timedelta(seconds=10),
+            QUALIFICATION_TIME - timedelta(seconds=30),
+        ]
+    )
+
+    def _clock_seq():
+        try:
+            return next(readings)
+        except StopIteration:
+            return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=_clock_seq)
+    state = server.writer.paper_portfolio_state("USD")
+    assert state.active_reservations == 1
+    assert state.reserved_capital == pytest.approx(500.0)
+
+
+def test_cap3_filled_trade_remains_active_and_counted(env):
+    """CAP3: a filled trade keeps its slot and shows as exposure."""
+    server, client = env
+    _run(env)
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 1
+    assert len(client.get_paper_v2_active_exposures().exposures) == 1
+
+
+def test_cap5_duplicate_reconciliation_does_not_double_release(env):
+    """CAP5: re-reading after a terminal record does not release twice."""
+    server, client = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    first = server.writer.paper_portfolio_state("USD")
+    # A retry returns the terminal result and adds no second reconciliation.
+    retry = _run(env)
+    assert retry.status == "NO_FILL_TERMINAL"
+    second = server.writer.paper_portfolio_state("USD")
+    assert (first.active_reservations, first.reserved_capital) == (
+        second.active_reservations,
+        second.reserved_capital,
+    )
+    assert len(_rows(server.writer, RECON_EVENT)) == 1
+
+
+def test_cap6_restart_does_not_change_reserved_capital(tmp_path):
+    """CAP6: reserved capital is a function of committed evidence."""
+    from app.opip.canonical.client import InProcessWriterClient
+    from app.opip.canonical.server import CanonicalWriterServer
+
+    db_path = tmp_path / "canonical.sqlite3"
+    first = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "a.sock")
+    try:
+        env = (first, InProcessWriterClient(first))
+        _run(env)
+        before = first.writer.paper_portfolio_state("USD")
+    finally:
+        first.stop()
+    second = CanonicalWriterServer(db_path=db_path, socket_path=tmp_path / "b.sock")
+    try:
+        after = second.writer.paper_portfolio_state("USD")
+    finally:
+        second.stop()
+    assert (before.active_reservations, before.reserved_capital) == (
+        after.active_reservations,
+        after.reserved_capital,
+    )
+
+
+def test_cap7_exposure_and_reservation_do_not_double_count(env):
+    """CAP7: the action gate counts exposure; the portfolio counts reservations.
+
+    A filled trade consumes reserved capital (admission accounting) and appears once
+    as exposure (portfolio risk). It must not appear twice in either projection.
+    """
+    _server, client = env
+    _run(env)
+    exposures = client.get_paper_v2_active_exposures().exposures
+    assert len(exposures) == 1
+    positions = _canonical_positions(client)
+    assert len(positions) == 1
+    ids = [p.paper_trade_id for p in positions]
+    assert len(ids) == len(set(ids))
+
+
+def test_conservation_no_state_hides_a_fill_capable_reservation(env):
+    """A fill-capable attempt must never coexist with a released reservation."""
+    server, _ = env
+    readings = [
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME,
+        QUALIFICATION_TIME + timedelta(seconds=10),
+        QUALIFICATION_TIME - timedelta(seconds=30),
+    ]
+
+    def _clock_seq():
+        if readings:
+            return readings.pop(0)
+        return QUALIFICATION_TIME + timedelta(seconds=60)
+
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, clock=_clock_seq)
+
+    state = server.writer.paper_v2_execution_state(_disposition_id(env[1]))
+    portfolio = server.writer.paper_portfolio_state("USD")
+    assert state.entry_attempt_fill_capable is True
+    assert portfolio.active_reservations == 1, (
+        "a fill-capable attempt must retain its reservation"
+    )
+
+
+def test_conservation_existing_exposure_is_never_free_capacity(env):
+    """Exposure must always be visible to capacity accounting."""
+    server, client = env
+    _run(env)
+    exposures = client.get_paper_v2_active_exposures().exposures
+    assert exposures[0].remaining_quantity > 0
+    assert server.writer.paper_portfolio_state("USD").active_reservations == 1
+
+
+def test_conservation_terminal_trade_consumes_no_active_capacity(env):
+    """A terminal zero-fill trade must not consume capacity."""
+    server, _ = env
+    with pytest.raises(PaperV2ExecutionError):
+        _run(env, kraken=_kraken(requests=[], stale=True))
+    assert len(_rows(server.writer, RECON_EVENT)) == 1
+    portfolio = server.writer.paper_portfolio_state("USD")
+    assert portfolio.active_reservations == 0
+    assert portfolio.reserved_capital == 0.0
+
+
+def test_indexes_are_additive_on_an_existing_database(tmp_path):
+    """An existing canonical DB gains the new indexes without a data rewrite.
+
+    The remediation added lookup indexes for Paper-v2 reads. An existing deployment
+    must open unchanged and simply acquire them, so this builds a database with the
+    pre-remediation index set, reopens it through current initialisation, and proves
+    the events survived and the indexes now exist.
+    """
+    import sqlite3
+
+    from app.opip.canonical.paths import SCHEMA_VERSION
+    from app.opip.canonical.schema import DDL, connect, initialize_schema
+
+    db_path = tmp_path / "legacy.sqlite3"
+
+    # A database created without the new indexes, holding one real event.
+    legacy = sqlite3.connect(str(db_path))
+    legacy.row_factory = sqlite3.Row
+    legacy.executescript(DDL)
+    legacy.execute(
+        "INSERT INTO meta (id, schema_version, history_epoch, next_local_sequence,"
+        " created_at, updated_at) VALUES (1, ?, 1, 2, 'x', 'x')",
+        (SCHEMA_VERSION,),
+    )
+    legacy.execute(
+        "INSERT INTO events (event_id, schema_version, event_type, history_epoch,"
+        " local_sequence, recorded_at, idempotency_key, payload_json)"
+        " VALUES ('EVT:1', 1, 'market.instrument_version.recorded', 1, 1, 'x',"
+        " 'market.instrument_version.recorded:INSTR:kraken:SOL:USD:1',"
+        " '{\"paper_trade_id\": \"PTV2:abc\"}')",
+    )
+    legacy.commit()
+    before = legacy.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    legacy.execute("DROP INDEX IF EXISTS idx_events_event_type")
+    legacy.execute("DROP INDEX IF EXISTS idx_events_paper_trade")
+    legacy.commit()
+    names = {
+        str(row[0])
+        for row in legacy.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    assert "idx_events_event_type" not in names
+    assert "idx_events_paper_trade" not in names
+    legacy.close()
+
+    # Reopening through current initialisation must add them, not reset anything.
+    connection = connect(db_path)
+    try:
+        initialize_schema(connection, now_iso="2026-09-19T12:00:00Z")
+        after = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        assert after == before, "existing events must be preserved"
+        index_names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert "idx_events_event_type" in index_names
+    assert "idx_events_paper_trade" in index_names
+
+
+def test_reads_work_on_a_database_with_the_new_indexes(tmp_path):
+    """Both new read projections work against an initialised store."""
+    from app.opip.canonical.writer import CanonicalWriter
+
+    writer = CanonicalWriter(tmp_path / "canonical.sqlite3")
+    try:
+        assert writer.paper_v2_execution_state("PDISP:" + "0" * 32).status == "OK"
+        assert writer.paper_v2_active_exposures().status == "OK"
+        assert writer.paper_v2_recoverable_executions().status == "OK"
+    finally:
+        writer.close()
+
+
 def test_router_summary_reports_no_legacy_calls():
     from app.services.paper_v2_scan_router import PaperV2RouterSummary
 

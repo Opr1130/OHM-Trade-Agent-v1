@@ -189,6 +189,13 @@ class PaperV2ActiveExposure:
     filled_quantity: float
     exited_quantity: float
     remaining_quantity: float
+    #: The canonical economic basis of the *remaining* exposure, in quote currency:
+    #: the committed cost basis of the quantity still held, derived from the trade's
+    #: own committed entry fills. It is deliberately not mark-to-market - no
+    #: market-risk model is frozen for Paper v2 - and deliberately not the raw
+    #: quantity, which is not a currency amount. The existing portfolio gate compares
+    #: position size against account capital, so it needs this basis.
+    remaining_notional_basis: float = 0.0
     protection_plan_id: str | None = None
     protection_state: str | None = None
 
@@ -206,6 +213,9 @@ class PaperV2ActiveExposure:
             filled_quantity=float(raw.get("filled_quantity") or 0.0),
             exited_quantity=float(raw.get("exited_quantity") or 0.0),
             remaining_quantity=float(raw.get("remaining_quantity") or 0.0),
+            remaining_notional_basis=float(
+                raw.get("remaining_notional_basis") or 0.0
+            ),
             protection_plan_id=(
                 str(raw["protection_plan_id"])
                 if raw.get("protection_plan_id")
@@ -251,6 +261,45 @@ class PaperV2ActiveExposures:
             exposures=[
                 PaperV2ActiveExposure.from_dict(item)
                 for item in (entries if isinstance(entries, list) else [])
+            ],
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
+@dataclass(frozen=True)
+class PaperV2RecoverableExecutions:
+    """Read-only projection of committed Paper-v2 trades that need continuation.
+
+    Lifecycle recovery must not depend on the original opportunity qualifying again,
+    so this lists work that is already authorized and merely incomplete: a committed
+    ENTRY attempt that is still fill-capable with no fill yet. Each entry carries the
+    committed payloads needed to finish it, so recovery never re-derives anything and
+    never needs the originating scan.
+
+    This projection cannot admit: it reports existing trades only.
+    """
+
+    status: str
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "entries": [dict(entry) for entry in self.entries],
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2RecoverableExecutions":
+        entries = raw.get("entries")
+        return cls(
+            status=str(raw["status"]),
+            entries=[
+                dict(entry) for entry in (entries if isinstance(entries, list) else [])
             ],
             error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
             detail=(str(raw["detail"]) if raw.get("detail") else None),
