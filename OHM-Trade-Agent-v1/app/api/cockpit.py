@@ -71,7 +71,9 @@ def _writer_client():
         from app.services.paper_v2_scan_router import _writer_client as resolve
 
         return resolve()
-    except Exception:  # noqa: BLE001 - an unavailable writer is reported, not raised
+    except Exception:  # noqa: BLE001
+        # An unavailable writer is reported through the response envelope rather
+        # than raised, so the caller can surface an explicit trust state.
         return None
 
 

@@ -687,7 +687,7 @@ def _opportunity():
     )
 
 
-@pytest.fixture()
+@pytest.fixture
 def writer_env(tmp_path: Path):
     server = CanonicalWriterServer(
         db_path=tmp_path / "canonical.sqlite3",

@@ -83,10 +83,10 @@
 </div>
 
 <div class="card unlock" id="unlockBox">
-  <div class="k">Secure analytics</div>
+  <label class="k" for="secretInput">Secure analytics &mdash; operator secret</label>
   <div class="mini">Enter the existing operator/webhook secret. It stays in this browser tab, is sent only as a request header, and is never stored or written to disk.</div>
   <div class="secret">
-    <input id="secretInput" type="password" placeholder="operator secret" autocomplete="off" />
+    <input id="secretInput" name="secretInput" type="password" placeholder="operator secret" autocomplete="off" />
     <button class="btn" id="secretApply">Apply</button>
   </div>
 </div>
@@ -172,15 +172,22 @@ function money(v,ccy){
   var n=Number(v);var s=Math.abs(n).toFixed(2);
   return (n<0?"-":"")+s+" "+(ccy||"");
 }
-function num(v,d){if(v===null||v===undefined)return "UNKNOWN";return Number(v).toFixed(d==null?2:d);}
+function num(v,d){
+  if(v===null||v===undefined){return "UNKNOWN";}
+  return Number(v).toFixed(d==null?2:d);
+}
 function secsToAge(v){
-  if(v===null||v===undefined)return "UNKNOWN";
-  var s=Number(v);if(s<0)return "UNKNOWN";
-  if(s<3600)return Math.floor(s/60)+"m";
-  if(s<86400)return (s/3600).toFixed(1)+"h";
+  if(v===null||v===undefined){return "UNKNOWN";}
+  var s=Number(v);
+  if(s<0){return "UNKNOWN";}
+  if(s<3600){return Math.floor(s/60)+"m";}
+  if(s<86400){return (s/3600).toFixed(1)+"h";}
   return (s/86400).toFixed(1)+"d";
 }
-function dt(v){if(!v)return "UNKNOWN";return String(v).replace("T"," ").replace("Z","");}
+function dt(v){
+  if(!v){return "UNKNOWN";}
+  return String(v).replace("T"," ").replace("Z","");
+}
 function idShort(v){if(!v)return "-";return String(v).slice(0,13)+"\u2026";}
 function cls(v){return v>0?"good":(v<0?"bad":"");}
 
