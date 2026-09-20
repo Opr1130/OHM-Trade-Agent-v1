@@ -439,9 +439,22 @@ Rules honoured:
   production is unaffected, and an unreadable replica is never reported as an empty
   but healthy ledger.
 
-Deployment note: the analytics plane must mount the replica (or the cockpit process
-must run where the replica is present). Where the replica is absent the cockpit is
-correctly inert rather than silently reading production.
+Deployment wiring (implemented):
+
+- The Cockpit analytical API runs as a dedicated **read-only service on the
+  analytics plane**, defined in the existing `deploy/analytics/docker-compose.yml`
+  as `opip-cockpit`. It reuses the existing repository image and mounts the verified
+  replica read-only at `/app/canonical-replica` (the path the replica module already
+  expects), with `OPIP_CANONICAL_REPLICA_ROOT` pointing at it.
+- It runs `app.api.cockpit_service:app`, a cockpit-only ASGI app rather than the
+  trading entry point, so the analytics-plane container physically cannot start
+  trading subsystems, and it holds no exchange, Telegram or order authority.
+- **The trading host no longer advertises cockpit routes.** The dashboard sidecar's
+  exact-match allowlist is unchanged from before this PR. Proxying `/api/cockpit/*`
+  there would return `CANONICAL_REPLICA_UNAVAILABLE` for every request, because the
+  trading host has no replica; advertising an inert analytics route is misleading,
+  so it is not declared. The Cockpit is reached the same way Grafana is, on the
+  analytics plane.
 
 ### 9.4 Deferred items confirmed against the context
 

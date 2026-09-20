@@ -231,47 +231,96 @@ def test_ui_guards_against_late_responses_overwriting_newer_views():
     assert "decodeURIComponent(current[1])!==paperTradeId" in script
 
 
-def test_edge_allowlist_exposes_the_cockpit_routes():
-    """The nginx edge uses exact matches with a 404 default.
+def test_edge_allowlist_does_not_advertise_cockpit_analytics_on_the_trading_host():
+    """The trading host must not expose cabin routes it cannot serve.
 
-    Review finding (valid, and the most consequential one): the routes were
-    registered in FastAPI but absent from the edge allowlist, so the whole cockpit
-    was unreachable in the deployed topology.
+    Review finding (valid, Greptile P1 at the previous head): the Cockpit reads only
+    the verified replica, which is absent on the trading host, so proxying
+    ``/api/cockpit/*`` there would return ``CANONICAL_REPLICA_UNAVAILABLE`` for every
+    request. Advertising an inert analytics route is misleading, so it is not
+    declared. The Cockpit is served from the analytics plane instead.
     """
     conf = (REPO / "deploy" / "nginx" / "dashboard-sidecar.conf").read_text(
         encoding="utf-8"
     )
-    assert "location = /cockpit" in conf
-    assert "location = /api/cockpit/overview" in conf
-    assert "location = /api/cockpit/trades" in conf
-    assert "location ^~ /api/cockpit/trades/" in conf
+    assert "/api/cockpit" not in conf
+    # The pre-existing dashboard surface is untouched.
+    assert "location = /dashboard" in conf
+    assert "location = /api/analytics/summary" in conf
+    assert "location = /api/analytics/intelligence" in conf
 
 
-def test_edge_allowlist_keeps_cockpit_routes_get_only():
-    """Every cockpit location must deny non-GET at the edge.
+def test_cockpit_is_served_from_the_analytics_plane_with_the_replica_mounted():
+    """The analytical API must run where the replica lives.
 
-    Read-only authority is enforced at the boundary, so the edge is part of the
-    guarantee rather than a separate policy.
+    Review finding (valid, Greptile P1): the API must run on the analytics plane, or
+    its serving container must receive the verified read-only replica mount. This
+    asserts the service definition that satisfies it.
     """
+    compose = (REPO / "deploy" / "analytics" / "docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "opip-cockpit:" in compose
+    # Reuses the existing repository image and the existing replica bridge.
+    assert "opip-data-platform:${OPIP_DEPLOYED_SHA:-local}" in compose
+    assert "/var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro" in (
+        compose
+    )
+    assert "OPIP_CANONICAL_REPLICA_ROOT: /app/canonical-replica" in compose
+    # Serves the cockpit-only app, never the trading entry point.
+    assert "app.api.cockpit_service:app" in compose
+    assert "app.main:app" not in compose
+    # No credentials and no write capability.
+    assert "cap_drop" in compose
+    assert "no-new-privileges:true" in compose
+
+
+def _app_api_paths(app) -> set[str]:
+    """The concrete API paths an ASGI app exposes.
+
+    Read from the generated OpenAPI document rather than from ``app.routes``: a
+    FastAPI version may represent an included router as an opaque wrapper, so route
+    introspection is not portable. The schema is the framework's own statement of
+    what is reachable.
+    """
+    return set(app.openapi().get("paths", {}) or {})
+
+
+def test_cockpit_service_app_mounts_only_the_cockpit_router():
+    """The analytics-plane app must not be able to start trading subsystems."""
+    from app.api import cockpit_service
+
+    paths = _app_api_paths(cockpit_service.app)
+    assert any(path.startswith("/api/cockpit/") for path in paths), paths
+    assert "/cockpit" in paths, paths
+    # Trading-facing surfaces must not be reachable from the analytics plane.
+    for forbidden in (
+        "/api/paper",
+        "/api/telegram",
+        "/api/orders",
+        "/api/analytics/summary",
+        "/api/analytics/intelligence",
+        "/dashboard",
+        "/api/opip/zero-trade-explanation",
+    ):
+        assert forbidden not in paths, f"{forbidden} reachable from the analytics plane"
+
+
+def test_cockpit_service_app_exposes_no_write_routes():
+    from app.api import cockpit_service
+
+    spec = cockpit_service.app.openapi()
+    allowed = {"get", "head"}
+    for path, operations in (spec.get("paths") or {}).items():
+        assert set(operations) <= allowed, f"{path} exposes {sorted(operations)}"
+
+
+def test_edge_allowlist_does_not_declare_cockpit_locations():
+    """No cockpit location may remain on the trading-host proxy."""
     conf = (REPO / "deploy" / "nginx" / "dashboard-sidecar.conf").read_text(
         encoding="utf-8"
     )
-    # Collect each location block and assert the cockpit *proxy* ones deny writes.
-    # A redirect-only block (``return 308``) proxies nothing, so it needs no
-    # method restriction; only blocks that reach the backend must be GET-only.
-    blocks = re.split(r"\n\s*location ", conf)
-    cockpit_blocks = [block for block in blocks if "/cockpit" in block.split("{")[0]]
-    assert cockpit_blocks, "no cockpit location blocks found"
-    checked = 0
-    for block in cockpit_blocks:
-        if "return 308" in block:
-            continue
-        assert "limit_except GET" in block, (
-            f"cockpit proxy location does not restrict methods: {block.splitlines()[0]!r}"
-        )
-        assert "deny all" in block
-        checked += 1
-    assert checked >= 4, f"expected the cockpit proxy locations to be checked, got {checked}"
+    assert "cockpit" not in conf.lower()
 
 
 def test_page_does_not_hardcode_illustrative_numbers():

@@ -173,6 +173,66 @@ services:
         max-size: 10m
         max-file: "5"
 
+  # B/C-4 read-only Cockpit service.
+  #
+  # Serves the analytical Cockpit API on the analytics plane, where the verified
+  # canonical replica is mounted. This is what keeps the Paper-v2 ledger/portfolio
+  # workload off the trading host: the trading host has no replica, so it cannot
+  # compute analytics even by misconfiguration.
+  #
+  # Reuses the existing repository image and the existing replica bridge; it adds no
+  # droplet, database, scheduler or credentials. It runs the cockpit-only ASGI app
+  # rather than the trading entry point, so this container cannot start trading
+  # subsystems, and it holds no exchange or Telegram authority.
+  opip-cockpit:
+    build:
+      context: ../..
+    image: opip-data-platform:${OPIP_DEPLOYED_SHA:-local}
+    container_name: opip-cockpit
+    restart: unless-stopped
+    env_file:
+      - /etc/opip-data-platform.env
+    environment:
+      OPIP_CANONICAL_REPLICA_ROOT: /app/canonical-replica
+      PYTHONDONTWRITEBYTECODE: "1"
+    command:
+      - uvicorn
+      - app.api.cockpit_service:app
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8000"
+    volumes:
+      # The verified canonical replica, read-only, at the path the replica module
+      # already expects. Same host root the learning-plane jobs mount.
+      - /var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro
+    networks:
+      opip-analytics:
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: "0.25"
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/cockpit', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
   opip-data-admin:
     profiles: ["admin"]
     build:
