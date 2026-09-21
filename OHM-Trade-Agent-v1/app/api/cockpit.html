@@ -83,10 +83,10 @@
 </div>
 
 <div class="card unlock" id="unlockBox">
-  <label class="k" for="secretInput">Secure analytics &mdash; operator secret</label>
-  <div class="mini">Enter the existing operator/webhook secret. It stays in this browser tab, is sent only as a request header, and is never stored or written to disk.</div>
+  <label class="k" for="secretInput">Secure analytics &mdash; Cockpit read-only secret</label>
+  <div class="mini">Enter the Cockpit read-only secret. It is distinct from the trading operator/webhook secret, stays in this browser tab, is sent only as a request header, and is never stored or written to disk.</div>
   <div class="secret">
-    <input id="secretInput" name="secretInput" type="password" placeholder="operator secret" autocomplete="off" />
+    <input id="secretInput" name="secretInput" type="password" placeholder="Cockpit read-only secret" autocomplete="off" />
     <button class="btn" id="secretApply">Apply</button>
   </div>
 </div>
@@ -195,7 +195,7 @@ function request(path){
   var headers={};
   if(state.secret)headers["x-webhook-secret"]=state.secret;
   return fetch(path,{headers:headers}).then(function(r){
-    if(r.status===401){throw new Error("Unauthorized: enter the operator secret above.");}
+    if(r.status===401){throw new Error("Unauthorized: enter the Cockpit read-only secret above.");}
     if(!r.ok){return r.text().then(function(t){throw new Error(r.status+": "+t.slice(0,200));});}
     return r.json();
   });
