@@ -342,12 +342,15 @@ def test_readme_documents_the_publish_network_rationale():
 # Executed Docker layers
 # ---------------------------------------------------------------------------
 
-#: Small images to probe with, in preference order, as (image, listener command).
+#: Images to probe with, in preference order, as (image, serve command). Each serves the
+#: mounted directory so the response body can prove the answer came from our container.
 _PROBE_IMAGES: tuple[tuple[str, list[str]], ...] = (
-    ("busybox:1.37", ["nc", "-l", "-p", "8080"]),
-    ("busybox:latest", ["nc", "-l", "-p", "8080"]),
-    ("python:3.12-slim", ["python", "-m", "http.server", "8080"]),
+    ("busybox:1.37", ["httpd", "-f", "-p", "8080", "-h", "/srv"]),
+    ("busybox:latest", ["httpd", "-f", "-p", "8080", "-h", "/srv"]),
+    ("python:3.12-slim", ["python", "-m", "http.server", "8080", "--directory", "/srv"]),
 )
+
+_PROBE_TOKEN = "opip-bc4e4-publish-probe-ok"
 
 
 def _docker(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -372,7 +375,8 @@ def _resolve_probe_image() -> tuple[str, list[str]] | None:
     """First usable (image, command), preferring one already present locally."""
     override = os.environ.get("OPIP_DOCKER_PROBE_IMAGE", "").strip()
     candidates = (
-        ((override, ["nc", "-l", "-p", "8080"]),) + _PROBE_IMAGES
+        ((override, ["python", "-m", "http.server", "8080", "--directory", "/srv"]),)
+        + _PROBE_IMAGES
         if override
         else _PROBE_IMAGES
     )
@@ -391,42 +395,136 @@ def _free_loopback_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _tcp_reachable(host: str, port: int, *, attempts: int = 40) -> bool:
+def _probe_container_id(compose_path: Path, project: str) -> str:
+    """Resolve the container id through Compose, never by guessing its name.
+
+    Guessing ``<project>-<service>-1`` is fragile, and a wrong name makes `docker port`
+    print nothing to stdout, which is indistinguishable from a missing mapping. Compose
+    labels are the authoritative handle.
+    """
+    listed = _docker("compose", "-f", str(compose_path), "ps", "-q", "probe", check=False)
+    if listed.returncode == 0 and listed.stdout.strip():
+        return listed.stdout.split()[0]
+
+    by_label = _docker(
+        "ps",
+        "-aq",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+        check=False,
+    )
+    assert by_label.stdout.strip(), (
+        "could not resolve the probe container: "
+        f"compose ps -> {listed.stdout!r}/{listed.stderr!r}; "
+        f"label filter -> {by_label.stdout!r}/{by_label.stderr!r}"
+    )
+    return by_label.stdout.split()[0]
+
+
+def _http_token_present(host: str, port: int, *, attempts: int = 40) -> tuple[bool, str]:
+    """Fetch ``/`` and report whether the probe's token came back.
+
+    A bare TCP connect is not sufficient evidence: Docker's proxy can complete the
+    handshake on the host port while nothing inside the container is serving, so a
+    connect-only check can pass on a container that serves nothing. Requiring our own
+    token in the body proves the request reached this container's listener.
+    """
+    import urllib.error
+    import urllib.request
+
+    last = ""
     for _ in range(attempts):
         try:
-            with socket.create_connection((host, port), timeout=2):
-                return True
-        except OSError:
-            time.sleep(0.5)
-    return False
+            with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
+                body = response.read().decode("utf-8", "replace")
+                if _PROBE_TOKEN in body:
+                    return True, body[:200]
+                last = f"status={response.status} body={body[:120]!r}"
+        except (urllib.error.URLError, OSError) as exc:
+            last = repr(exc)
+        time.sleep(0.5)
+    return False, last
 
 
-_PROBE_COMPOSE = """\
-name: {project}
-services:
-  probe:
-    image: {image}
-    command: {command}
-    ports:
-      - "127.0.0.1:{port}:8080"
-    networks:
-{networks}
-networks:
-{network_definitions}
-"""
+def _write_probe_server_root(directory: Path) -> Path:
+    """The directory the probe serves, containing a uniquely identifiable index."""
+    root = directory / "srv"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.html").write_text(
+        f"<html><body>{_PROBE_TOKEN}</body></html>\n", encoding="utf-8"
+    )
+    return root
 
-_INTERNAL_NETWORK = """\
-  {internal}:
-    driver: bridge
-    internal: true
-"""
 
-_PUBLISH_NETWORK = """\
-  {publish}:
-    driver: bridge
-    driver_opts:
-      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
-"""
+def _container_ports_report(container: str) -> str:
+    """Everything needed to diagnose a port-mapping assertion from one CI run."""
+    port = _docker("port", container, check=False)
+    inspect = _docker(
+        "inspect",
+        container,
+        "--format",
+        "{{json .NetworkSettings.Ports}}",
+        check=False,
+    )
+    networks = _docker(
+        "inspect",
+        container,
+        "--format",
+        "{{json .NetworkSettings.Networks}}",
+        check=False,
+    )
+    ps = _docker("ps", "-a", "--no-trunc", check=False)
+    return (
+        f"\n  docker port rc={port.returncode} stdout={port.stdout!r} stderr={port.stderr!r}"
+        f"\n  Ports    = {inspect.stdout.strip() or inspect.stderr.strip()!r}"
+        f"\n  Networks = {networks.stdout.strip() or networks.stderr.strip()!r}"
+        f"\n  docker ps -a:\n{ps.stdout}"
+    )
+
+
+
+def _probe_compose_data(
+    project: str,
+    image: str,
+    command: list[str],
+    port: int,
+    server_root: Path,
+    *,
+    with_publish_network: bool,
+) -> dict:  # type: ignore[type-arg]
+    """The probe topology as data.
+
+    Built as a mapping and serialized by PyYAML rather than by string templating: a
+    hand-rolled template has to re-solve YAML quoting, and a Windows path containing
+    backslashes is silently invalid inside a double-quoted scalar.
+    """
+    internal = f"{project}-internal"
+    publish = f"{project}-publish"
+    networks: dict[str, dict] = {  # type: ignore[type-arg]
+        internal: {"driver": "bridge", "internal": True}
+    }
+    attached = [internal]
+    if with_publish_network:
+        networks[publish] = {
+            "driver": "bridge",
+            "driver_opts": {
+                "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"
+            },
+        }
+        attached.append(publish)
+    return {
+        "name": project,
+        "services": {
+            "probe": {
+                "image": image,
+                "command": command,
+                "ports": [f"127.0.0.1:{port}:8080"],
+                "volumes": [f"{server_root}:/srv:ro"],
+                "networks": {name: None for name in attached},
+            }
+        },
+        "networks": networks,
+    }
 
 
 def _write_probe_compose(
@@ -438,26 +536,16 @@ def _write_probe_compose(
     *,
     with_publish_network: bool,
 ) -> Path:
-    networks = (
-        f"      {project}-internal:\n      {project}-publish:\n"
-        if with_publish_network
-        else f"      {project}-internal:\n"
+    data = _probe_compose_data(
+        project,
+        image,
+        command,
+        port,
+        _write_probe_server_root(directory),
+        with_publish_network=with_publish_network,
     )
-    definitions = _INTERNAL_NETWORK.format(internal=f"{project}-internal")
-    if with_publish_network:
-        definitions += _PUBLISH_NETWORK.format(publish=f"{project}-publish")
     path = directory / "docker-compose.probe.yml"
-    path.write_text(
-        _PROBE_COMPOSE.format(
-            project=project,
-            image=image,
-            command=command,
-            port=port,
-            networks=networks,
-            network_definitions=definitions,
-        ),
-        encoding="utf-8",
-    )
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
 
 
@@ -497,6 +585,63 @@ requires_docker_compose = pytest.mark.skipif(
 )
 
 
+def test_generated_probe_compose_is_valid_and_mirrors_the_cockpit_topology(tmp_path: Path):
+    """The probe file itself is verified locally, not only where Docker exists.
+
+    Otherwise a malformed generated file would first surface in CI, and a broken probe
+    would look like a broken fix.
+    """
+    for with_publish, suffix in (
+        (True, {"probe-project-internal", "probe-project-publish"}),
+        (False, {"probe-project-internal"}),
+    ):
+        directory = tmp_path / ("both" if with_publish else "internal-only")
+        directory.mkdir()
+        compose = _write_probe_compose(
+            directory,
+            "probe-project",
+            "busybox:1.37",
+            ["httpd", "-f", "-p", "8080", "-h", "/srv"],
+            43210,
+            with_publish_network=with_publish,
+        )
+        rendered = yaml.safe_load(compose.read_text(encoding="utf-8"))
+        assert rendered["name"] == "probe-project"
+        service = rendered["services"]["probe"]
+        assert set(service["networks"]) == suffix, service["networks"]
+        # The publish syntax matches the Cockpit's exactly.
+        assert service["ports"] == ["127.0.0.1:43210:8080"], service["ports"]
+        # The served directory is mounted so the response body can be attributed.
+        assert service["volumes"] == [
+            f"{directory / 'srv'}:/srv:ro"
+        ], service["volumes"]
+        assert (directory / "srv" / "index.html").is_file()
+        assert _PROBE_TOKEN in (directory / "srv" / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+        # The internal network mirrors the analytics network; the publish network mirrors
+        # the Cockpit publish network, including the loopback default.
+        assert rendered["networks"]["probe-project-internal"]["internal"] is True
+        if with_publish:
+            publish = rendered["networks"]["probe-project-publish"]
+            assert publish["driver"] == "bridge"
+            assert publish.get("internal") is not True
+            assert (
+                publish["driver_opts"]["com.docker.network.bridge.host_binding_ipv4"]
+                == "127.0.0.1"
+            )
+            # The probe mirrors the production network namespaces exactly, so a passing
+            # probe is meaningful for the real file.
+            cockpit_networks = _cockpit_networks()
+            assert cockpit_networks[ANALYTICS_NETWORK]["internal"] is True
+            assert cockpit_networks[PUBLISH_NETWORK]["driver"] == publish["driver"]
+            assert (
+                cockpit_networks[PUBLISH_NETWORK]["driver_opts"]
+                == publish["driver_opts"]
+            )
+
+
 @requires_docker_compose
 def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path):
     """Executed proof of the fix on real Docker.
@@ -520,29 +665,38 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
         up = _docker("compose", "-f", str(compose), "up", "-d", check=False, timeout=600)
         assert up.returncode == 0, up.stderr
 
-        container = f"{project}-probe-1"
+        container = _probe_container_id(compose, project)
 
-        # Wait for a listener inside the container before judging the host mapping.
-        assert _tcp_reachable("127.0.0.1", port), (
-            "the published port never became reachable on host loopback; "
-            f"docker port output: {_docker('port', container, check=False).stdout!r}"
+        def report() -> str:
+            return _container_ports_report(container)
+
+        # Definitive reachability: our own token must come back from the served file, so
+        # this cannot pass on a container that serves nothing.
+        served, detail = _http_token_present("127.0.0.1", port)
+        assert served, (
+            "the published port never served this container's content on host loopback; "
+            f"last observation: {detail}{report()}"
         )
 
         # A real host mapping exists, with a concrete HostIp and HostPort.
-        published = _docker("port", container, check=False).stdout.strip()
-        assert published, "docker port is empty: no host mapping was created"
-        assert f"127.0.0.1:{port}" in published, published
+        published = _docker("port", container, check=False)
+        assert published.stdout.strip(), (
+            f"docker port is empty: no host mapping was created.  {report()}"
+        )
+        assert f"127.0.0.1:{port}" in published.stdout, f"{published.stdout!r}{report()}"
 
         mappings = _published_host_ips(container)
-        assert mappings, "NetworkSettings.Ports has no real mapping (null)"
+        assert mappings, f"NetworkSettings.Ports has no real mapping (null){report()}"
         for host_ip, host_port, container_port in mappings:
-            assert host_ip == "127.0.0.1", mappings
-            assert host_port == str(port), mappings
-            assert container_port == "8080/tcp", mappings
+            assert host_ip == "127.0.0.1", f"{mappings}{report()}"
+            assert host_port == str(port), f"{mappings}{report()}"
+            assert container_port == "8080/tcp", f"{mappings}{report()}"
 
         # And nothing was published on a public interface.
-        assert "0.0.0.0" not in published, published
-        assert not any(host_ip in {"0.0.0.0", "::", "[::]"} for host_ip, _, _ in mappings)
+        assert "0.0.0.0" not in published.stdout, published.stdout
+        assert not any(
+            host_ip in {"0.0.0.0", "::", "[::]"} for host_ip, _, _ in mappings
+        ), mappings
 
         # The internal network is still attached alongside the publish network.
         inspect = yaml.safe_load(
@@ -553,8 +707,8 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
                 "{{json .NetworkSettings.Networks}}",
             ).stdout
         )
-        assert f"{project}_internal" in inspect, inspect
-        assert f"{project}_publish" in inspect, inspect
+        assert f"{project}_internal" in inspect, f"{inspect}{report()}"
+        assert f"{project}_publish" in inspect, f"{inspect}{report()}"
     finally:
         _docker("compose", "-f", str(compose), "down", "-v", "--remove-orphans", check=False)
 
@@ -583,7 +737,7 @@ def test_runtime_internal_only_control_case(tmp_path: Path):
     try:
         up = _docker("compose", "-f", str(compose), "up", "-d", check=False, timeout=600)
         assert up.returncode == 0, up.stderr
-        container = f"{project}-probe-1"
+        container = _probe_container_id(compose, project)
         time.sleep(3)
 
         mappings = _published_host_ips(container)
