@@ -26,13 +26,13 @@ differently-scoped population under the caller's assumed scope.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, status
 from fastapi.responses import FileResponse
 
-from app.core.config import get_settings
 from app.opip.cockpit.ledger import (
     COCKPIT_LEDGER_PROJECTION_VERSION,
     PaperLedger,
@@ -49,16 +49,39 @@ router = APIRouter()
 
 COCKPIT_FILE = Path(__file__).with_name("cockpit.html")
 
+#: The Cockpit's OWN credential, read straight from the environment.
+#:
+#: Deliberately *not* the trading host's operator secret. That value also gates
+#: ``POST /operator/mode``, ``POST /operator/orders`` and
+#: ``PATCH /operator/orders/{trade_id}`` on the trading host, so it carries order
+#: creation and modification authority. Copying it onto the externally reachable
+#: analytics plane would place an order-capable credential on a read-only surface,
+#: which is exactly what the production/analytics plane separation forbids.
+#:
+#: Reading it directly from the environment (rather than through ``Settings``) also
+#: means this process never constructs the trading application's settings object and
+#: therefore has no dependency on any trading-host credential at all.
+COCKPIT_SECRET_ENV = "OPIP_COCKPIT_SECRET"
+
+
+def _cockpit_secret() -> str:
+    return os.environ.get(COCKPIT_SECRET_ENV, "").strip()
+
+
 #: Upper bound on rows returned by the trade list, so a wide query cannot produce an
 #: unbounded response. The ledger itself is bounded by committed trade count.
 MAX_TRADES = 500
 
 
 def _require_secret(value: str | None) -> None:
-    if not secret_matches(value, get_settings().webhook_secret):
+    expected = _cockpit_secret()
+    # Fail closed. An unset or empty secret must never degrade to "no authentication
+    # required": that would silently turn a read-only analytical surface into an open
+    # one. A misconfigured deployment returns 401 for everything.
+    if not expected or not secret_matches(value, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid dashboard secret",
+            detail="Invalid cockpit secret",
         )
 
 

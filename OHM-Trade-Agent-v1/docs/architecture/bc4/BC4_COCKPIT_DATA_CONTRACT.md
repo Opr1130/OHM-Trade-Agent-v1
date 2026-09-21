@@ -466,11 +466,17 @@ Deployment wiring (implemented):
   defect), no public interface may bind that port, and `docker port opip-cockpit` must
   confirm the listener belongs to this container rather than a stale process.
   `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all of those hold.
-- **The Cockpit receives a filtered environment, not the sealed analytics file.** It is
-  externally reachable, so bootstrap derives `/etc/opip-cockpit.env` with a strict
-  allowlist containing only `WEBHOOK_SECRET` and the Cockpit's own bind/port settings.
-  The PostgreSQL, shipper, learning, dashboard and Grafana credentials never reach it.
-  This follows the existing filtered-env pattern already used for Grafana.
+- **The Cockpit receives a filtered environment, and a dedicated read-only
+  credential.** It is externally reachable, so bootstrap derives
+  `/etc/opip-cockpit.env` with a strict allowlist containing only
+  `OPIP_COCKPIT_SECRET` and the Cockpit's own bind/port settings. The PostgreSQL,
+  shipper, learning, dashboard and Grafana credentials never reach it.
+- **The Cockpit credential is distinct from the trading host's operator secret.** That
+  secret also gates `POST /operator/mode`, `POST /operator/orders` and
+  `PATCH /operator/orders/{trade_id}`, so it carries order authority; placing it on the
+  analytics plane would leak trading capability to a read-only surface. The analytics
+  plane uses its own `OPIP_COCKPIT_SECRET`, and bootstrap refuses to proceed if any
+  order-capable trading credential is present in the sealed analytics env file.
 - **The trading host no longer advertises cockpit routes.** The dashboard sidecar's
   exact-match allowlist is unchanged from before this PR. Proxying `/api/cockpit/*`
   there would return `CANONICAL_REPLICA_UNAVAILABLE` for every request, because the

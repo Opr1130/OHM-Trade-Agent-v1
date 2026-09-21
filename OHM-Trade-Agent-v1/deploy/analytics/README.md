@@ -146,10 +146,21 @@ Requirements:
 ### Authentication
 
 `/cockpit` is a public static shell; every `/api/cockpit/*` read requires the
-existing operator secret in the `x-webhook-secret` header. The proxy must forward
-that header and must not inject or store the secret. A request without it returns
-401, which is also what the bootstrap preflight asserts to prove the API is served
-*and* gated.
+Cockpit's own secret in the `x-webhook-secret` header. The proxy must forward that
+header and must not inject or store the secret. A request without it returns 401.
+
+**The Cockpit secret must be a distinct value from the trading host's
+`WEBHOOK_SECRET`.** The trading host's secret is not merely a dashboard credential: it
+also gates `POST /operator/mode`, `POST /operator/orders` and
+`PATCH /operator/orders/{trade_id}`, so it carries order creation and modification
+authority. Copying it here would place an order-capable credential on an externally
+reachable read-only surface. The Cockpit therefore uses its own read-only
+`OPIP_COCKPIT_SECRET`, and bootstrap refuses to run at all if the sealed analytics env
+file contains `WEBHOOK_SECRET`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` or
+`TELEGRAM_BOT_TOKEN`.
+
+An unset or empty Cockpit secret fails closed: every read returns 401 rather than the
+surface becoming open.
 
 ### Reachability proof (and what it is not)
 

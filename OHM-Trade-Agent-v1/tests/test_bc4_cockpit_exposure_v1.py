@@ -229,15 +229,16 @@ def test_f_cockpit_still_reads_through_the_lock_free_read_only_reader(tmp_path):
 
 @pytest.fixture()
 def client(monkeypatch):
-    """A client over the analytics-plane app with a known operator secret."""
+    """A client over the analytics-plane app with a known cockpit secret.
+
+    The Cockpit reads its credential from the environment rather than from the trading
+    application's settings, so the fixture sets the environment variable.
+    """
     from fastapi.testclient import TestClient
 
-    from app.api import cockpit, cockpit_service
+    from app.api import cockpit_service
 
-    class _Settings:
-        webhook_secret = "expected-secret"
-
-    monkeypatch.setattr(cockpit, "get_settings", lambda: _Settings())
+    monkeypatch.setenv("OPIP_COCKPIT_SECRET", "expected-secret")
     return TestClient(cockpit_service.app)
 
 
@@ -509,14 +510,16 @@ def test_f_cockpit_receives_only_a_filtered_environment():
     ]
     keys = set(re.findall(r"^\s{4}([A-Z_]+)$", allowlist, flags=re.MULTILINE))
     assert keys == {
-        "WEBHOOK_SECRET",
+        "OPIP_COCKPIT_SECRET",
         "OPIP_COCKPIT_BIND_ADDRESS",
         "OPIP_COCKPIT_HOST_PORT",
         "OPIP_COCKPIT_HTTP_PORT",
     }, keys
 
-    # None of the unrelated credentials may be in the Cockpit's allowlist.
+    # None of the unrelated credentials may be in the Cockpit's allowlist, and in
+    # particular not the trading host's order-capable operator secret.
     for forbidden in (
+        "WEBHOOK_SECRET",
         "OPIP_POSTGRES_ADMIN_PASSWORD",
         "OPIP_SHIPPER_PASSWORD",
         "OPIP_LEARNING_DATABASE_PASSWORD",
@@ -529,16 +532,102 @@ def test_f_cockpit_receives_only_a_filtered_environment():
         assert forbidden not in keys, f"cockpit env allowlist leaks {forbidden}"
 
 
-def test_g_cockpit_authentication_secret_is_declared_for_the_analytics_plane():
-    """The API requires the operator secret, so the analytics plane must carry it.
-
-    Without it the service cannot read its own settings at all, so authentication would
-    fail closed with a server error rather than a clean 401.
-    """
+def test_g_cockpit_credential_is_fed_through_the_filtered_file():
+    """The Cockpit's own credential must be the only secret it receives."""
     text = ENV_EXAMPLE.read_text(encoding="utf-8")
-    assert "WEBHOOK_SECRET=" in text
-    # And it must be fed to the Cockpit through the filtered file.
-    assert "WEBHOOK_SECRET" in BOOTSTRAP_TEXT
+    assert "OPIP_COCKPIT_SECRET=" in text
+    assert "OPIP_COCKPIT_SECRET" in BOOTSTRAP_TEXT
+    # The filtered allowlist must not carry the trading host's order-capable secret.
+    allowlist = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("write_cockpit_env_file()") :
+        BOOTSTRAP_TEXT.index("write_cockpit_env_file\n")
+    ]
+    assert "WEBHOOK_SECRET" not in allowlist
+
+
+def test_g_cockpit_uses_its_own_read_only_credential_not_the_trading_secret():
+    """The Cockpit must not authenticate with the trading host's operator secret.
+
+    Review finding (valid, and serious): the trading host's WEBHOOK_SECRET also gates
+    POST /operator/mode, POST /operator/orders and PATCH /operator/orders/{trade_id},
+    so it carries order creation and modification authority. Copying it onto the
+    externally reachable analytics plane would place an order-capable credential on a
+    read-only surface.
+    """
+    import ast
+
+    source = (REPO / "app" / "api" / "cockpit.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # It must not read the trading application's settings at all.
+    modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "app.core.config" not in modules, "cockpit reads trading settings"
+    assert "get_settings" not in source
+    # It must not use the trading secret as its expected value. The header NAME
+    # `x-webhook-secret` is deliberately preserved as the auth mechanism, so this
+    # checks the settings lookup rather than the literal word.
+    assert "get_settings().webhook_secret" not in source
+    assert "settings.webhook_secret" not in source
+
+    # It reads its own credential from the environment.
+    assert "OPIP_COCKPIT_SECRET" in source
+    env_text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert "OPIP_COCKPIT_SECRET=" in env_text
+    # And the trading secret must not be declared on the analytics plane.
+    declared = [
+        line.strip()
+        for line in env_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not any(line.startswith("WEBHOOK_SECRET=") for line in declared), declared
+
+
+def test_g_bootstrap_refuses_order_capable_credentials_on_the_analytics_plane():
+    """A plane guard must fail closed rather than tolerate a trading credential."""
+    assert "guard_no_trading_credentials" in BOOTSTRAP_TEXT
+    guard = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("guard_no_trading_credentials()") :
+        BOOTSTRAP_TEXT.index("write_cockpit_env_file()")
+    ]
+    for key in ("WEBHOOK_SECRET", "KRAKEN_API_KEY", "KRAKEN_API_SECRET", "TELEGRAM_BOT_TOKEN"):
+        assert key in guard, f"plane guard does not reject {key}"
+    assert "must not be present on the analytics plane" in guard
+
+
+def test_g_cockpit_authentication_fails_closed_when_unconfigured(monkeypatch):
+    """An unset secret must yield 401, never an open read-only surface."""
+    from fastapi.testclient import TestClient
+
+    from app.api import cockpit, cockpit_service
+
+    monkeypatch.delenv("OPIP_COCKPIT_SECRET", raising=False)
+    client = TestClient(cockpit_service.app)
+
+    response = client.get(
+        "/api/cockpit/overview", headers={"x-webhook-secret": "anything"}
+    )
+    assert response.status_code == 401
+    assert cockpit._cockpit_secret() == ""  # noqa: SLF001
+
+
+def test_g_cockpit_rejects_the_trading_operator_secret(monkeypatch):
+    """The order-capable trading secret must not authenticate the Cockpit."""
+    from fastapi.testclient import TestClient
+
+    from app.api import cockpit_service
+
+    monkeypatch.setenv("OPIP_COCKPIT_SECRET", "cockpit-read-only-secret")
+    client = TestClient(cockpit_service.app)
+
+    rejected = client.get(
+        "/api/cockpit/overview",
+        headers={"x-webhook-secret": "the-trading-operator-secret"},
+    )
+    assert rejected.status_code == 401
 
 
 def test_g_gitleaks_allowlists_stay_narrowly_scoped():
@@ -584,7 +673,7 @@ def test_g_cockpit_secret_placeholder_is_not_credential_shaped():
     lines = [
         line.strip()
         for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
-        if line.strip().startswith("WEBHOOK_SECRET=") and not line.startswith("#")
+        if line.strip().startswith("OPIP_COCKPIT_SECRET=") and not line.startswith("#")
     ]
     assert len(lines) == 1, lines
     value = lines[0].split("=", 1)[1]

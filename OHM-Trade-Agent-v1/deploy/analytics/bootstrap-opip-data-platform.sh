@@ -106,6 +106,31 @@ write_grafana_env_file() {
 }
 write_grafana_env_file
 
+guard_no_trading_credentials() {
+  # The analytics plane is a separate trust boundary. The trading host's operator
+  # secret is not merely a dashboard credential: it also gates
+  # POST /operator/mode, POST /operator/orders and PATCH /operator/orders/{trade_id},
+  # so it can change trading mode and create or modify orders.
+  #
+  # Copying it here would place an order-capable credential on an externally
+  # reachable read-only surface, so this fails closed rather than tolerating it. The
+  # Cockpit has its own read-only OPIP_COCKPIT_SECRET instead.
+  local key
+  for key in \
+    WEBHOOK_SECRET \
+    KRAKEN_API_KEY \
+    KRAKEN_API_SECRET \
+    TELEGRAM_BOT_TOKEN; do
+    if awk -F= -v key="$key" '$1 == key {found=1; exit} END {exit !found}' "$ENV_FILE"; then
+      echo "$key must not be present on the analytics plane" >&2
+      echo "it carries trading/order authority and belongs only on the trading host" >&2
+      echo "the Cockpit uses its own read-only OPIP_COCKPIT_SECRET" >&2
+      exit 78
+    fi
+  done
+}
+guard_no_trading_credentials
+
 write_cockpit_env_file() {
   # The Cockpit is externally reachable through the reverse proxy, so it must not
   # load credentials it has no use for. The sealed analytics env file also holds the
@@ -120,7 +145,7 @@ write_cockpit_env_file() {
   # in compose.
   local temporary key
   local -a keys=(
-    WEBHOOK_SECRET
+    OPIP_COCKPIT_SECRET
     OPIP_COCKPIT_BIND_ADDRESS
     OPIP_COCKPIT_HOST_PORT
     OPIP_COCKPIT_HTTP_PORT
