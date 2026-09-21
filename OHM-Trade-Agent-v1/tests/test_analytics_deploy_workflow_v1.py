@@ -65,6 +65,7 @@ def test_cockpit_ready_receives_sealed_env_without_running_empty_stage():
     assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 3
     assert "sync_cockpit_settings()" in runner
     assert "sealed analytics environment must contain exactly one $key setting" in runner
+    assert "OPIP_COCKPIT_SECRET must be a non-placeholder secret of at least 24 characters" in runner
     assert 'mv -f -- "$temporary" "$ENV_FILE"' in runner
     assert "WEBHOOK_SECRET KRAKEN_API_KEY KRAKEN_API_SECRET TELEGRAM_BOT_TOKEN" in runner
 
