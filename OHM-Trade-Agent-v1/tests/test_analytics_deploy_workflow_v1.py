@@ -55,3 +55,46 @@ def test_remote_runner_records_real_local_evidence_without_mutable_secret_timest
     assert "7 * 86400" in bootstrap
     assert "health --require-ready" in bootstrap
     assert "restore drill must validate the attested PostgreSQL dump" in bootstrap
+
+
+def test_cockpit_ready_receives_sealed_env_without_running_empty_stage():
+    """Cockpit secret provisioning is narrow and does not reuse the PostgreSQL empty stage."""
+    workflow = (ROOT.parent / ".github/workflows/deploy-analytics.yml").read_text()
+    runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
+
+    assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 3
+    assert "sync_cockpit_settings()" in runner
+    assert "sealed analytics environment must contain exactly one $key setting" in runner
+    assert 'mv -f -- "$temporary" "$ENV_FILE"' in runner
+    assert "WEBHOOK_SECRET KRAKEN_API_KEY KRAKEN_API_SECRET TELEGRAM_BOT_TOKEN" in runner
+
+    cockpit_case = runner[runner.index("  cockpit-ready)") : runner.index("  backfill|shipper|reads-ready)")]
+    assert "sync_cockpit_settings" in cockpit_case
+    assert "bootstrap-opip-data-platform.sh" in cockpit_case
+    assert " empty" not in cockpit_case
+    assert "opip-postgres" not in cockpit_case
+    assert "opip-grafana" not in cockpit_case
+
+
+def test_cockpit_secret_sync_allowlist_is_exact():
+    """Only Cockpit-owned settings may be merged into the installed analytics env."""
+    runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
+    start = runner.index("sync_cockpit_settings()")
+    end = runner.index("\n}\n", start) + 3
+    sync = runner[start:end]
+
+    for key in (
+        "OPIP_COCKPIT_SECRET",
+        "OPIP_COCKPIT_BIND_ADDRESS",
+        "OPIP_COCKPIT_HOST_PORT",
+        "OPIP_COCKPIT_HTTP_PORT",
+    ):
+        assert key in sync
+
+    for forbidden in (
+        "OPIP_POSTGRES_ADMIN_PASSWORD",
+        "OPIP_SHIPPER_PASSWORD",
+        "OPIP_GRAFANA_ADMIN_PASSWORD",
+        "OPIP_ANALYTICS_DATABASE_URL",
+    ):
+        assert forbidden not in sync
