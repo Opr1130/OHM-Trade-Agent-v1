@@ -103,19 +103,23 @@ Cockpit was the `reads-ready` stage, which made an otherwise valid operational C
 wait on a seven-day PostgreSQL shipper soak it does not depend on. The fix separates
 the two claims; it does **not** relax either one, and it does not shorten the soak.
 
-`cockpit-ready` performs no PostgreSQL work at all: it starts no PostgreSQL, shipper or
-Grafana container, runs no migration, backfill, reconciliation or readiness check,
-enables no PostgreSQL or Grafana timer, and writes no PostgreSQL rollout evidence. That
-is enforced structurally - the PostgreSQL preflight, the PostgreSQL evidence write, the
-systemd unit install, and the backup/maintenance timers are all inside
-`if [[ "$STAGE" != "$COCKPIT_STAGE" ]]` guards. Cockpit state is written to its own
-`$STATE_ROOT/cockpit-ready.env`, never to `rollout.env`, so "this stage did not touch
+`cockpit-ready` performs no PostgreSQL work and depends on no PostgreSQL/Grafana
+setting. That is enforced structurally rather than by scattered guards: the Cockpit
+stage is dispatched **before** the PostgreSQL/Grafana plane, so a Cockpit run returns
+before the PostgreSQL DSN/password validations, the Grafana env derivation, the
+PostgreSQL data and state directories, the PGDATA ownership fix, `config/pg_hba.conf`,
+`rollout.env`, the PostgreSQL capacity floor, and the backup/maintenance timers are
+reached at all. A Cockpit deployment therefore cannot require unrelated PostgreSQL
+configuration, and cannot mutate PostgreSQL host state. Cockpit state is written to its
+own `$STATE_ROOT/cockpit-ready.env`, never to `rollout.env`, so "this stage did not touch
 PostgreSQL rollout evidence" is provable by inspection.
 
 Idempotent: the image tag is release-pinned, `compose up -d` recreates only when the
-definition changed, the replica is re-verified and reachability re-proven on every run,
-and readiness is recorded only after all of that succeeds. A failed attempt leaves no
-`COCKPIT_READY_*` marker.
+definition changed, and the replica, container health and reachability are re-proven on
+every run. `COCKPIT_READY_AT_UTC` and `COCKPIT_READY_SHA` are committed together by a
+single rename, so an interruption can never leave a new timestamp paired with an older
+release. Readiness is recorded only after every step succeeds, and a failed attempt
+leaves no marker.
 
 The sealed analytics environment file must already be installed (by the `empty` stage)
 because `cockpit-ready` needs `OPIP_COCKPIT_SECRET`. That is a secret-provisioning
@@ -127,20 +131,33 @@ requirement, not a PostgreSQL readiness gate: no PostgreSQL container is started
 1. The exact `opip-data-platform:$TARGET_SHA` image is built from the checked-out
    release. The tag is release-pinned, so a stale image from an earlier rollout cannot
    satisfy a different SHA, and PostgreSQL is not pulled or started to build it.
-2. The installed canonical replica is verified by invoking the **existing** verifier
-   CLI - the same `verify` subcommand the learning sync already uses - inside a one-off
-   container from that exact image, with `--network none` and the replica mounted
-   read-only. It re-checks, in one implementation: manifest presence/readability,
-   replica schema version, source release SHA equal to `TARGET_SHA`, canonical snapshot
-   presence, self-containment and hash/structure, companion artifacts, and freshness
-   against the existing replica freshness contract. The shell reproduces none of those
-   rules, and `--max-age-seconds` is deliberately not passed, so this stage cannot
-   widen the freshness bound.
-3. The container is started and the host-loopback preflight below must pass.
-4. Only then are `COCKPIT_READY_AT_UTC` and `COCKPIT_READY_SHA` recorded.
+2. The committed replica generation is resolved. The replica root is a *repository*:
+   installed bundles live under `generations/<id>` and are selected by a plain-text
+   `current` pointer, so the parent directory holds no manifest and no canonical
+   database. Resolution is delegated to the existing resolver rather than reimplemented,
+   and the resolved generation - never the parent - becomes the root the Cockpit reads.
+3. That generation is verified by invoking the **existing** verifier CLI - the same
+   `verify` subcommand the learning sync already uses - inside a one-off container from
+   that exact image, with `--network none` and the parent mounted read-only. It
+   re-checks: manifest presence/readability, replica schema version, source release SHA
+   equal to `TARGET_SHA`, canonical snapshot presence, self-containment and
+   hash/structure, companion artifacts, and freshness against the existing replica
+   freshness contract. The shell reproduces none of those rules, and
+   `--max-age-seconds` is deliberately not passed, so this stage cannot widen the
+   freshness bound.
+4. The resolved generation is written into `/etc/opip-cockpit.env` as
+   `OPIP_CANONICAL_REPLICA_ROOT`, so the Cockpit process reads the same bundle that was
+   verified. It is deliberately not pinned in compose, because a pinned parent is not a
+   bundle.
+5. The container is started, and a bounded health wait must observe `healthy` before the
+   host-loopback preflight below runs. `compose up -d` returns while the container is
+   still `starting`, so proving reachability immediately would fail a first deployment
+   even though the service becomes healthy moments later.
+6. Only then are `COCKPIT_READY_AT_UTC` and `COCKPIT_READY_SHA` recorded.
 
-A missing, unreadable, structurally invalid, SHA-mismatched or stale replica fails the
-stage closed before the Cockpit is started.
+The health wait never replaces the preflight, and neither replaces the verifier: a
+missing, unreadable, structurally invalid, SHA-mismatched or stale replica, or an
+unresolvable `current` pointer, fails the stage closed before the Cockpit is started.
 
 ## Canonical freshness contract
 
@@ -235,7 +252,7 @@ healthcheck is therefore **not** evidence that an operator can reach the Cockpit
 was the original defect: a passing healthcheck with no host-reachable endpoint.
 
 Both `cockpit-ready` and `reads-ready` run a separate host-side preflight (through the
-shared `cockpit_deploy` primitive) that fails closed:
+shared `cockpit_start` primitive) that fails closed:
 
 1. `OPIP_COCKPIT_BIND_ADDRESS` must be host loopback; any other value is refused,
    because the raw HTTP service must never be exposed beyond the host.

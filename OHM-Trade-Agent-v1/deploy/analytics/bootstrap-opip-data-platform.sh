@@ -16,10 +16,12 @@ STATE_FILE="$STATE_ROOT/rollout.env"
 # replica-backed Cockpit stage can never modify (or appear to modify) the
 # PostgreSQL rollout state. See write_cockpit_state.
 COCKPIT_STATE_FILE="$STATE_ROOT/cockpit-ready.env"
-# The verified canonical replica, as mounted read-only into the Cockpit container.
-# Held as one pair of constants so the compose mount and the readiness probe cannot
-# drift apart; a test asserts the compose mount matches these exact paths.
-COCKPIT_REPLICA_HOST_ROOT="/var/lib/opip-learning/canonical-replica"
+# The verified canonical replica. Installed generations live under
+# `generations/<id>` and are selected by a plain-text `current` pointer, so the parent
+# repository is NOT itself a bundle: it holds no manifest and no canonical database.
+# The parent is what gets mounted; the resolved generation is what the Cockpit must
+# read, and it is written into the Cockpit env file as OPIP_CANONICAL_REPLICA_ROOT.
+COCKPIT_REPLICA_PARENT_ROOT="/var/lib/opip-learning/canonical-replica"
 COCKPIT_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
 RESTORE_EVIDENCE="$STATE_ROOT/last-restore-drill.env"
@@ -61,8 +63,6 @@ require_uri_unreserved_password() {
     exit 78
   fi
 }
-require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD
-require_uri_unreserved_password OPIP_SHIPPER_PASSWORD
 
 require_grafana_verify_full() {
   if [[ "${OPIP_GRAFANA_DB_SSLMODE:-verify-full}" != "verify-full" ]]; then
@@ -70,7 +70,6 @@ require_grafana_verify_full() {
     exit 78
   fi
 }
-require_grafana_verify_full
 
 require_analytics_verify_full_dsn() {
   local name="$1" value="${!1:-}"
@@ -82,8 +81,6 @@ require_analytics_verify_full_dsn() {
     exit 78
   fi
 }
-require_analytics_verify_full_dsn OPIP_ANALYTICS_ADMIN_DATABASE_URL
-require_analytics_verify_full_dsn OPIP_ANALYTICS_DATABASE_URL
 
 write_grafana_env_file() {
   local temporary key
@@ -118,7 +115,6 @@ write_grafana_env_file() {
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$GRAFANA_ENV_FILE"
 }
-write_grafana_env_file
 
 guard_no_trading_credentials() {
   # The analytics plane is a separate trust boundary. The trading host's operator
@@ -175,8 +171,13 @@ write_cockpit_env_file() {
   # This mirrors the Grafana pattern: derive a dedicated env file from the sealed
   # source using a strict allowlist, so the Cockpit receives the minimum it needs -
   # its own authentication secret and its own bound/port configuration. Everything
-  # else the process requires (the replica root, the container port) is static and set
-  # in compose.
+  # else the process requires (the container port) is static and set in compose.
+  #
+  # ``$1`` is the container-side path of the committed replica generation. It is
+  # derived here rather than inherited from the environment so the Cockpit reads the
+  # generation the pointer actually names. The parent repository is never used as the
+  # replica root: it holds no manifest and no canonical database.
+  local replica_root="${1:-$COCKPIT_REPLICA_CONTAINER_ROOT}"
   local temporary key
   local -a keys=(
     OPIP_COCKPIT_SECRET
@@ -185,7 +186,7 @@ write_cockpit_env_file() {
     OPIP_COCKPIT_HTTP_PORT
   )
 
-  temporary="$(mktemp /etc/opip-cockpit.env.XXXXXX)"
+  temporary="$(mktemp "${COCKPIT_ENV_FILE}.XXXXXX")"
   : > "$temporary"
   for key in "${keys[@]}"; do
     if ! awk -F= -v key="$key" '$1 == key {print; found=1; exit} END {if (!found) exit 1}' \
@@ -195,11 +196,11 @@ write_cockpit_env_file() {
       exit 78
     fi
   done
+  printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$replica_root" >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
 }
-write_cockpit_env_file
 
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
@@ -300,32 +301,84 @@ cockpit_preflight() {
 }
 
 write_cockpit_state() {
-  # Record Cockpit readiness in its own file, never in rollout.env.
+  # Record the complete Cockpit readiness record in one atomic rename.
   #
-  # `rollout.env` is the PostgreSQL rollout evidence (DEPLOYED_SHA, EMPTY_*,
-  # SHIPPER_*, READS_READY_*), and a replica-backed Cockpit stage must not modify
-  # PostgreSQL rollout evidence at all. Keeping Cockpit state in a separate file makes
-  # that property provable by inspection rather than by argument.
-  local key="$1" value="$2" temporary
+  # `rollout.env` is the PostgreSQL rollout evidence (DEPLOYED_SHA, EMPTY_*, SHIPPER_*,
+  # READS_READY_*), and a replica-backed Cockpit stage must not modify PostgreSQL
+  # rollout evidence at all. Keeping Cockpit state in a separate file makes that
+  # property provable by inspection rather than by argument.
+  #
+  # The timestamp and the release SHA are committed together, in one temporary file
+  # followed by one rename. Updating them through two separate whole-file replacements
+  # would let an interruption between them leave a new timestamp paired with the
+  # previous release, which is internally inconsistent durable evidence for an
+  # operator. A reader now sees either the previous complete record or the new one.
+  local sha="$1" moment="$2" temporary
   install -d -o root -g root -m 0711 "$STATE_ROOT"
   temporary="$(mktemp "$COCKPIT_STATE_FILE.XXXXXX")"
-  : > "$temporary"
-  if [[ -e "$COCKPIT_STATE_FILE" ]]; then
-    awk -F= -v key="$key" '$1 != key' "$COCKPIT_STATE_FILE" > "$temporary"
-  fi
-  printf '%s=%q\n' "$key" "$value" >> "$temporary"
+  printf 'COCKPIT_READY_AT_UTC=%q\n' "$moment" > "$temporary"
+  printf 'COCKPIT_READY_SHA=%q\n' "$sha" >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_STATE_FILE"
+}
+
+cockpit_build_image() {
+  # Build the exact target image. The tag is release-pinned, so a stale image from an
+  # earlier analytics rollout cannot satisfy a different SHA, and rebuilding from the
+  # checked-out release is what makes the image provably match TARGET_SHA.
+  #
+  # Only the Cockpit service is built. PostgreSQL is not pulled, built or started in
+  # order to build the Cockpit image.
+  export OPIP_DEPLOYED_SHA="$TARGET_SHA"
+  docker compose -f "$COMPOSE" build opip-cockpit
+}
+
+cockpit_replica_root() {
+  # Resolve the committed replica generation, through the EXISTING resolver, and print
+  # its container-side path.
+  #
+  # This matters because the replica root is a *repository*: installed bundles live
+  # under `generations/<id>` and are selected by a plain-text `current` pointer, so the
+  # parent directory holds no manifest and no canonical database. Verifying or reading
+  # the parent would look for a bundle where none exists. The pointer semantics
+  # (pointer present, well-formed, naming an installed generation) are not reproduced
+  # here - `resolve` owns them and already fails closed on every case.
+  #
+  # Returns non-zero and prints nothing when the generation cannot be resolved, so each
+  # caller can choose how strict to be: `cockpit-ready` treats it as fatal, while
+  # `reads-ready` falls back to the parent mount so historical readiness never gains a
+  # replica dependency.
+  local resolved
+  [[ -d "$COCKPIT_REPLICA_PARENT_ROOT" ]] || return 1
+  resolved="$(
+    docker run --rm \
+      --network none \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges:true \
+      --pids-limit 64 \
+      --memory 256m \
+      --memory-swap 256m \
+      --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+      -e PYTHONDONTWRITEBYTECODE=1 \
+      -v "$COCKPIT_REPLICA_PARENT_ROOT:$COCKPIT_REPLICA_CONTAINER_ROOT:ro" \
+      "opip-data-platform:${TARGET_SHA}" \
+      python -m app.opip.learning.canonical_replica resolve \
+      --host-root "$COCKPIT_REPLICA_CONTAINER_ROOT" 2>/dev/null || true
+  )"
+  resolved="${resolved%%$'\n'*}"
+  [[ -n "$resolved" && "$resolved" != "$COCKPIT_REPLICA_CONTAINER_ROOT" ]] || return 1
+  printf '%s\n' "$resolved"
 }
 
 cockpit_verify_replica() {
   # Prove the canonical replica before the Cockpit is allowed to serve from it.
   #
   # This invokes the EXISTING verifier CLI - the same `verify` subcommand the learning
-  # sync already runs to validate a transferred generation - inside a one-off
-  # container built from the exact target image, with no network and the replica
-  # mounted read-only. In one implementation it re-checks:
+  # sync already runs to validate a transferred generation - inside a one-off container
+  # built from the exact target image, with no network and the parent mounted
+  # read-only. In one implementation it re-checks:
   #
   #   * manifest present, readable, and schema-compatible
   #   * source release SHA == TARGET_SHA (compatibility with the deployed release)
@@ -337,19 +390,13 @@ cockpit_verify_replica() {
   # NOT passed: the freshness bound is exactly the existing contract default, so this
   # stage cannot widen it. Missing, unreadable, structurally invalid, SHA-mismatched or
   # stale replicas all exit non-zero from the CLI and therefore fail this stage closed.
-  local image="opip-data-platform:${TARGET_SHA}"
-  local host_root="$COCKPIT_REPLICA_HOST_ROOT"
-  local container_root="$COCKPIT_REPLICA_CONTAINER_ROOT"
-
-  [[ -d "$host_root" ]] || {
-    echo "refusing cockpit-ready: canonical replica root is absent: $host_root" >&2
-    echo "the Cockpit reads only the verified replica and cannot serve without one" >&2
+  local resolved
+  if ! resolved="$(cockpit_replica_root)"; then
+    echo "refusing cockpit-ready: no committed canonical replica generation" >&2
+    echo "the replica root is a repository of generations selected by 'current'," >&2
+    echo "and no usable generation is committed at $COCKPIT_REPLICA_PARENT_ROOT" >&2
     exit 69
-  }
-  [[ -r "$host_root" ]] || {
-    echo "refusing cockpit-ready: canonical replica root is not readable: $host_root" >&2
-    exit 69
-  }
+  fi
 
   if ! docker run --rm \
     --network none \
@@ -361,10 +408,10 @@ cockpit_verify_replica() {
     --memory-swap 256m \
     --tmpfs /tmp:rw,noexec,nosuid,size=32m \
     -e PYTHONDONTWRITEBYTECODE=1 \
-    -v "$host_root:$container_root:ro" \
-    "$image" \
+    -v "$COCKPIT_REPLICA_PARENT_ROOT:$COCKPIT_REPLICA_CONTAINER_ROOT:ro" \
+    "opip-data-platform:${TARGET_SHA}" \
     python -m app.opip.learning.canonical_replica verify \
-    --root "$container_root" \
+    --root "$resolved" \
     --release-sha "$TARGET_SHA"; then
     echo "refusing cockpit-ready: the canonical replica did not verify for $TARGET_SHA" >&2
     echo "missing, unreadable, structurally invalid, SHA-mismatched or stale replicas fail closed" >&2
@@ -372,47 +419,151 @@ cockpit_verify_replica() {
   fi
 }
 
-cockpit_deploy() {
-  # The single Cockpit start primitive, shared by `cockpit-ready` and the historical
-  # `reads-ready` stage so the two paths cannot drift into separate implementations.
+cockpit_wait_healthy() {
+  # `compose up -d` returns while the container is still `starting`. With the configured
+  # 30s healthcheck interval, proving reachability immediately would fail a first
+  # deployment even though the service becomes healthy moments later, and the operator
+  # would have to run the same stage twice. The wait is bounded and never replaces the
+  # preflight, which still proves host-loopback exposure independently.
+  local attempt health
+  for attempt in $(seq 1 36); do
+    health="$(docker inspect \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      opip-cockpit 2>/dev/null || true)"
+    if [[ "$health" == "healthy" ]]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "cockpit container did not become healthy within the bounded wait" >&2
+  echo "last container health was '$health'" >&2
+  docker logs --tail 40 opip-cockpit >&2 || true
+  exit 69
+}
+
+cockpit_start() {
+  # Start the Cockpit, prove operator reachability, and only then record readiness.
   #
-  # Ordering is the safety property: build the exact release image, prove the
-  # replica, start the service, prove operator reachability - and only then record
-  # readiness. A failure at any step aborts the stage under `set -e` before any
-  # readiness marker is written, so a failed attempt can never leave a false
-  # COCKPIT_READY record.
+  # ``$1`` is the container-side replica root the Cockpit must read. It is written into
+  # the Cockpit env file so the process reads the committed generation rather than the
+  # parent repository, which contains neither a manifest nor a canonical database.
   #
-  # Idempotent: the image tag is SHA-pinned (a stale image cannot satisfy a different
-  # release), `compose up -d` recreates only when the definition changed, and the
-  # preflight is re-proven on every run.
-  export OPIP_DEPLOYED_SHA="$TARGET_SHA"
+  # Ordering is the safety property for the whole primitive: the image and the env file
+  # come first, then the service, then the bounded health wait, then the reachability
+  # proof, and readiness is recorded last. A failure at any step aborts the stage under
+  # `set -e` before any readiness marker is written, so a failed attempt can never leave
+  # a false COCKPIT_READY record.
+  #
+  # Idempotent: the image tag is release-pinned, `compose up -d` recreates only when the
+  # definition changed, and the health wait and preflight are re-proven on every run.
+  local replica_root="$1"
 
-  # Build only the Cockpit service. PostgreSQL is deliberately not started, pulled or
-  # otherwise touched in order to build the Cockpit image.
-  docker compose -f "$COMPOSE" build opip-cockpit
-
-  cockpit_verify_replica
-
+  write_cockpit_env_file "$replica_root"
   compose up -d opip-cockpit
+  cockpit_wait_healthy
   cockpit_preflight
 
-  write_cockpit_state COCKPIT_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  write_cockpit_state COCKPIT_READY_SHA "$TARGET_SHA"
+  write_cockpit_state "$TARGET_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   echo "cockpit_ready_sha=$TARGET_SHA"
+  echo "cockpit_replica_root=$replica_root"
   echo "cockpit_reads=verified_canonical_replica"
   echo "cockpit_historical_analytics_ready=false"
   echo "cockpit_raw_port_scope=host_loopback"
 }
 
-# Serialize with sync/capture/outcomes on the shared learning/analytics host.
-# Timers use this same lock and will skip rather than compete for RAM or files.
-exec 8>/var/lock/opip-learning-plane.lock
-if ! flock -w 300 8; then
-  echo "learning plane remained busy for five minutes; retry this stage later" >&2
-  exit 75
+cockpit_deploy_verified() {
+  # The `cockpit-ready` flow: build, prove the replica, then start.
+  #
+  # Replica verification belongs to this flow only. `reads-ready` starts the Cockpit
+  # through `cockpit_start` without a replica dependency, because historical
+  # PostgreSQL/Grafana readiness must not be blocked by an independent plane; the
+  # Cockpit reports replica unavailability through its own API instead.
+  local resolved
+  cockpit_build_image
+  # Verification precedes any container start, so the Cockpit can never serve from an
+  # unproven replica.
+  cockpit_verify_replica
+  if ! resolved="$(cockpit_replica_root)"; then
+    echo "refusing cockpit-ready: the verified replica generation is no longer resolvable" >&2
+    exit 69
+  fi
+  cockpit_start "$resolved"
+}
+
+analytics_host_lock() {
+  # Serialize with sync/capture/outcomes on the shared learning/analytics host. Timers
+  # use this same lock and will skip rather than compete for RAM or files. Taken by both
+  # planes, because both run work on that host.
+  exec 8>/var/lock/opip-learning-plane.lock
+  if ! flock -w 300 8; then
+    echo "learning plane remained busy for five minutes; retry this stage later" >&2
+    exit 75
+  fi
+}
+
+sync_release_checkout() {
+  # The target must still be current main, and this checkout is what the Cockpit image is
+  # built from, so both planes use it.
+  git -C "$REPO_ROOT" fetch --prune origin main
+  remote_main="$(git -C "$REPO_ROOT" rev-parse origin/main)"
+  [[ "$remote_main" == "$TARGET_SHA" ]] || {
+    echo "refusing analytics deploy: target is not current origin/main" >&2
+    exit 65
+  }
+  git -C "$REPO_ROOT" checkout -f main
+  git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
+}
+
+# ---------------------------------------------------------------------------
+# Cockpit-only stage
+# ---------------------------------------------------------------------------
+#
+# This dispatch sits BEFORE every PostgreSQL/Grafana validation and side effect below,
+# and returns immediately. That placement is the isolation guarantee: a Cockpit-only
+# deployment neither depends on nor mutates PostgreSQL/Grafana host state.
+#
+# Excluding the Cockpit later, with guards scattered around the PostgreSQL work, was not
+# sufficient: the shared prelude had already required the PostgreSQL admin and shipper
+# passwords, the verify-full DSNs and the Grafana settings, rewritten
+# /etc/opip-grafana.env, created the PostgreSQL data and state directories, re-derived
+# PGDATA ownership, rewritten config/pg_hba.conf, created rollout.env and enforced the
+# PostgreSQL capacity floor. A Cockpit deployment could therefore fail on unrelated
+# PostgreSQL configuration, or change PostgreSQL host state, while claiming to be
+# independent.
+#
+# `cockpit-ready` grants exactly one thing: the verified canonical replica is good and
+# the read-only Cockpit is reachable on host loopback. It writes only COCKPIT_READY_*,
+# in its own file, and never READS_READY_* or any other PostgreSQL rollout evidence.
+if [[ "$STAGE" == "$COCKPIT_STAGE" ]]; then
+  analytics_host_lock
+  sync_release_checkout
+  cockpit_deploy_verified
+  compose ps
+  echo "O'Pip analytics data-platform stage succeeded"
+  echo "stage=$STAGE"
+  echo "sha=$TARGET_SHA"
+  exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# PostgreSQL / Grafana plane
+# ---------------------------------------------------------------------------
+#
+# Every PostgreSQL/Grafana precondition and side effect lives below this line, and the
+# Cockpit-only stage has already returned.
+
+require_uri_unreserved_password OPIP_POSTGRES_ADMIN_PASSWORD
+require_uri_unreserved_password OPIP_SHIPPER_PASSWORD
+require_grafana_verify_full
+require_analytics_verify_full_dsn OPIP_ANALYTICS_ADMIN_DATABASE_URL
+require_analytics_verify_full_dsn OPIP_ANALYTICS_DATABASE_URL
+write_grafana_env_file
+
+analytics_host_lock
+
+# Capacity floor for the PostgreSQL plane. Running PostgreSQL is what needs the memory,
+# so this precondition belongs here rather than in the shared prelude.
 total_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
 if [[ ! "$total_kb" =~ ^[0-9]+$ ]] || (( total_kb < 1800 * 1024 )); then
   echo "analytics host must be resized to at least 2 GiB before PostgreSQL" >&2
@@ -428,14 +579,7 @@ now_epoch="$(date -u +%s)"
 backup_epoch=""
 restore_epoch=""
 
-git -C "$REPO_ROOT" fetch --prune origin main
-remote_main="$(git -C "$REPO_ROOT" rev-parse origin/main)"
-[[ "$remote_main" == "$TARGET_SHA" ]] || {
-  echo "refusing analytics deploy: target is not current origin/main" >&2
-  exit 65
-}
-git -C "$REPO_ROOT" checkout -f main
-git -C "$REPO_ROOT" reset --hard "$TARGET_SHA"
+sync_release_checkout
 
 install -d -o root -g root -m 0711 "$STATE_ROOT"
 install -d -o root -g root -m 0700 \
@@ -615,25 +759,18 @@ validate_promotion_evidence() {
 
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
 
-# `cockpit-ready` deploys the replica-backed read-only Cockpit and nothing else, so it
-# must perform no PostgreSQL work at all: not the TLS-key preflight (which pulls and
-# runs the PostgreSQL image purely to resolve its runtime UID/GID), not the analytics
-# image build for the PostgreSQL services, and not starting PostgreSQL. Everything in
-# this guard belongs to the PostgreSQL plane and is skipped for the Cockpit stage.
-if [[ "$STAGE" != "$COCKPIT_STAGE" ]]; then
-  validate_postgres_tls_key
-  # Both application services share the same immutable image tag; build once to
-  # avoid a concurrent BuildKit export race on the identical tag.
-  docker compose -f "$COMPOSE" build opip-shipper
-  compose up -d opip-postgres
-  wait_for_postgres
+validate_postgres_tls_key
+# Both application services share the same immutable image tag; build once to
+# avoid a concurrent BuildKit export race on the identical tag.
+docker compose -f "$COMPOSE" build opip-shipper
+compose up -d opip-postgres
+wait_for_postgres
 
-  # A fresh host may initialize the empty database first. Promotion beyond the
-  # empty stage requires a real dump, restore drill, and independently recorded
-  # off-host evidence after PostgreSQL is running.
-  if [[ "$STAGE" != "empty" ]]; then
-    validate_promotion_evidence
-  fi
+# A fresh host may initialize the empty database first. Promotion beyond the
+# empty stage requires a real dump, restore drill, and independently recorded
+# off-host evidence after PostgreSQL is running.
+if [[ "$STAGE" != "empty" ]]; then
+  validate_promotion_evidence
 fi
 
 if [[ "$STAGE" == "empty" ]]; then
@@ -705,58 +842,44 @@ elif [[ "$STAGE" == "reads-ready" ]]; then
   admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   admin_run python -m app.opip.data_platform.health --require-ready
-  # Start the read-only Cockpit through the same shared primitive `cockpit-ready`
-  # uses, so the two stages cannot drift into separate implementations. The Cockpit
-  # reads only the verified replica, so it belongs to the reads phase.
-  cockpit_deploy
+  # Start the read-only Cockpit through the same primitive `cockpit-ready` uses, so the
+  # two stages cannot drift into separate implementations. Replica verification is
+  # deliberately NOT part of this path: it belongs to `cockpit-ready`. Historical
+  # PostgreSQL/Grafana readiness must not be blocked by the replica plane, and when the
+  # committed generation cannot be resolved the Cockpit still starts against the parent
+  # mount and reports replica unavailability through its own API.
+  cockpit_build_image
+  cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")"
   # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
   # here, only after every historical gate above has passed. `cockpit-ready` never
   # writes these.
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_state READS_READY_SHA "$TARGET_SHA"
-elif [[ "$STAGE" == "$COCKPIT_STAGE" ]]; then
-  # Replica-backed, read-only Cockpit only.
-  #
-  # This path deliberately touches nothing in the PostgreSQL plane: it starts no
-  # PostgreSQL, shipper or Grafana container, runs no migration, backfill,
-  # reconciliation or readiness check, enables no PostgreSQL/Grafana timer, writes no
-  # PostgreSQL rollout evidence, and neither satisfies nor shortens the seven-day
-  # shipper soak that `reads-ready` requires. Readiness granted here means exactly one
-  # thing: the verified canonical replica is good and the read-only Cockpit is
-  # reachable on host loopback.
-  cockpit_deploy
 fi
 
-# PostgreSQL rollout evidence, PostgreSQL/Grafana systemd units and the PostgreSQL
-# backup and maintenance timers all belong to the PostgreSQL plane. `cockpit-ready`
-# writes only COCKPIT_READY_* (in its own file) and must not write DEPLOYED_SHA or any
-# other rollout evidence, nor enable PostgreSQL or Grafana timers, so this entire block
-# is skipped for the Cockpit stage.
-if [[ "$STAGE" != "$COCKPIT_STAGE" ]]; then
-  write_state DEPLOYED_SHA "$TARGET_SHA"
+write_state DEPLOYED_SHA "$TARGET_SHA"
 
-  install -o root -g root -m 0755 \
-    "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \
-    /usr/local/sbin/opip-data-platform-maintenance
-  install -o root -g root -m 0755 \
-    "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh" \
-    /usr/local/sbin/opip-postgres-backup
-  install -o root -g root -m 0755 \
-    "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh" \
-    /usr/local/sbin/opip-postgres-restore-drill
-  for unit in \
-    opip-data-platform-maintenance.service \
-    opip-data-platform-maintenance.timer \
-    opip-postgres-backup.service \
-    opip-postgres-backup.timer; do
-    install -o root -g root -m 0644 \
-      "$APP_ROOT/deploy/analytics/$unit" "/etc/systemd/system/$unit"
-  done
-  systemctl daemon-reload
-  systemctl enable --now opip-postgres-backup.timer
-  if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
-    systemctl enable --now opip-data-platform-maintenance.timer
-  fi
+install -o root -g root -m 0755 \
+  "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \
+  /usr/local/sbin/opip-data-platform-maintenance
+install -o root -g root -m 0755 \
+  "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh" \
+  /usr/local/sbin/opip-postgres-backup
+install -o root -g root -m 0755 \
+  "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh" \
+  /usr/local/sbin/opip-postgres-restore-drill
+for unit in \
+  opip-data-platform-maintenance.service \
+  opip-data-platform-maintenance.timer \
+  opip-postgres-backup.service \
+  opip-postgres-backup.timer; do
+  install -o root -g root -m 0644 \
+    "$APP_ROOT/deploy/analytics/$unit" "/etc/systemd/system/$unit"
+done
+systemctl daemon-reload
+systemctl enable --now opip-postgres-backup.timer
+if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
+  systemctl enable --now opip-data-platform-maintenance.timer
 fi
 
 compose ps

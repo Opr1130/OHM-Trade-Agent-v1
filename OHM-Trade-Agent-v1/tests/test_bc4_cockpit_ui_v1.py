@@ -266,7 +266,22 @@ def test_cockpit_is_served_from_the_analytics_plane_with_the_replica_mounted():
     assert "/var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro" in (
         compose
     )
-    assert "OPIP_CANONICAL_REPLICA_ROOT: /app/canonical-replica" in compose
+    # The mounted parent is a *repository* of installed generations selected by the
+    # plain-text `current` pointer, so it holds no manifest and no canonical database.
+    # Pin it as OPIP_CANONICAL_REPLICA_ROOT and the Cockpit reads a directory that is
+    # not a bundle. The root is therefore resolved by bootstrap and delivered through
+    # the service's filtered env file instead of being hard-coded here.
+    bootstrap = (
+        REPO / "deploy" / "analytics" / "bootstrap-opip-data-platform.sh"
+    ).read_text(encoding="utf-8")
+    import yaml as _yaml
+
+    service = _yaml.safe_load(compose)["services"]["opip-cockpit"]
+    assert "OPIP_CANONICAL_REPLICA_ROOT" not in service["environment"]
+    assert "env_file:" in compose
+    assert "/etc/opip-cockpit.env" in compose
+    assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in bootstrap
+    assert "python -m app.opip.learning.canonical_replica resolve" in bootstrap
     # Serves the cockpit-only app, never the trading entry point.
     assert "app.api.cockpit_service:app" in compose
     assert "app.main:app" not in compose

@@ -199,10 +199,24 @@ def test_f_replica_is_mounted_read_only_at_the_expected_path():
     assert replica, volumes
     assert replica[0].endswith(":ro"), replica[0]
     assert "/app/canonical-replica" in replica[0]
-    assert (
-        _service()["environment"]["OPIP_CANONICAL_REPLICA_ROOT"]
-        == "/app/canonical-replica"
+    assert replica[0] == (
+        "/var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro"
     )
+
+    # The service must NOT pin OPIP_CANONICAL_REPLICA_ROOT to the mounted parent.
+    #
+    # `current` + `generations/<id>` is how an installed replica is addressed: the
+    # parent directory is a repository of generations, so it holds no manifest and no
+    # canonical database. Pinning it here would point the Cockpit at a directory that is
+    # not a bundle. Bootstrap instead writes the resolved generation into
+    # /etc/opip-cockpit.env, which this service loads via env_file.
+    assert "OPIP_CANONICAL_REPLICA_ROOT" not in _service()["environment"]
+    assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in BOOTSTRAP_TEXT
+    assert (
+        'local replica_root="${1:-$COCKPIT_REPLICA_CONTAINER_ROOT}"' in BOOTSTRAP_TEXT
+    )
+    # The resolution itself is delegated to the existing resolver, never reimplemented.
+    assert "python -m app.opip.learning.canonical_replica resolve" in BOOTSTRAP_TEXT
 
 
 def test_f_cockpit_still_reads_through_the_lock_free_read_only_reader(tmp_path):
@@ -371,41 +385,49 @@ def test_i_bootstrap_declares_the_cockpit_exposure_contract():
 
 def test_i_preflight_runs_before_the_cockpit_is_declared_ready():
     """Ready state must not be written before reachability is proven."""
-    preflight_at = BOOTSTRAP_TEXT.index("cockpit_preflight\n")
-    ready_at = BOOTSTRAP_TEXT.index("COCKPIT_READY_AT_UTC")
-    assert preflight_at < ready_at
+    start = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("cockpit_start() {") :
+        BOOTSTRAP_TEXT.index("cockpit_deploy_verified() {")
+    ]
+    # The evidence write is the `write_cockpit_state` call, which records
+    # COCKPIT_READY_AT_UTC/COCKPIT_READY_SHA (the key set itself is asserted in
+    # tests/test_bc4_cockpit_ready_gate_v1.py).
+    assert start.index("cockpit_preflight") < start.index("write_cockpit_state ")
 
 
 def test_i_preflight_is_invoked_from_the_reads_ready_stage():
     """`reads-ready` must start the Cockpit, and both stages must share one primitive.
 
-    The Cockpit start/verify/preflight sequence used to be inlined in `reads-ready`.
-    It is now a single `cockpit_deploy` primitive called by both `reads-ready` and
+    The Cockpit start/health/preflight sequence used to be inlined in `reads-ready`. It
+    is now a single `cockpit_start` primitive used by both `reads-ready` and
     `cockpit-ready`, so the two stages cannot drift into separate implementations that
-    disagree about verification, exposure or ordering.
+    disagree about exposure or ordering.
+
+    Replica verification is deliberately NOT part of that primitive: it belongs to
+    `cockpit-ready`, because historical PostgreSQL/Grafana readiness must not be blocked
+    by the independent replica plane.
     """
     ready_stage = BOOTSTRAP_TEXT[
-        BOOTSTRAP_TEXT.index('require_stage SHIPPER_STARTED_AT_UTC') :
-        BOOTSTRAP_TEXT.index('elif [[ "$STAGE" == "$COCKPIT_STAGE" ]]')
+        BOOTSTRAP_TEXT.index('elif [[ "$STAGE" == "reads-ready" ]]') :
     ]
-    assert "cockpit_deploy" in ready_stage
+    assert "cockpit_start" in ready_stage
+    assert "cockpit_build_image" in ready_stage
+    assert "cockpit_verify_replica" not in ready_stage
 
     # Exactly one implementation of the start sequence exists...
     assert BOOTSTRAP_TEXT.count("compose up -d opip-cockpit") == 1
     assert BOOTSTRAP_TEXT.count("\n  cockpit_preflight\n") == 1
-    # ...it performs the reachability proof... 
-    deploy = BOOTSTRAP_TEXT[
-        BOOTSTRAP_TEXT.index("cockpit_deploy()") :
-        BOOTSTRAP_TEXT.index("# Serialize with sync/capture/outcomes")
+    # ...and it lives in the shared primitive, which proves reachability and waits for
+    # health before doing so.
+    start = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("cockpit_start() {") :
+        BOOTSTRAP_TEXT.index("cockpit_deploy_verified() {")
     ]
-    assert "cockpit_verify_replica" in deploy
-    assert "cockpit_preflight" in deploy
-    # ...and it verifies the replica before the container is started, so the Cockpit
-    # can never serve from an unproven replica.
-    assert deploy.index("cockpit_verify_replica") < deploy.index("compose up -d opip-cockpit")
+    assert "cockpit_wait_healthy" in start
+    assert start.index("compose up -d opip-cockpit") < start.index("cockpit_wait_healthy")
+    assert start.index("cockpit_wait_healthy") < start.index("cockpit_preflight")
     # Readiness is recorded only after the preflight succeeds.
-    assert deploy.index("compose up -d opip-cockpit") < deploy.index("cockpit_preflight")
-    assert deploy.index("cockpit_preflight") < deploy.index("COCKPIT_READY_AT_UTC")
+    assert start.index("cockpit_preflight") < start.index("write_cockpit_state ")
 
 
 def test_i_bootstrap_syntax_is_validated_in_ci():
@@ -530,7 +552,7 @@ def test_f_cockpit_receives_only_a_filtered_environment():
 
     allowlist = BOOTSTRAP_TEXT[
         BOOTSTRAP_TEXT.index("write_cockpit_env_file()") :
-        BOOTSTRAP_TEXT.index("write_cockpit_env_file\n")
+        BOOTSTRAP_TEXT.index("compose() {")
     ]
     keys = set(re.findall(r"^\s{4}([A-Z_]+)$", allowlist, flags=re.MULTILINE))
     assert keys == {
@@ -564,7 +586,7 @@ def test_g_cockpit_credential_is_fed_through_the_filtered_file():
     # The filtered allowlist must not carry the trading host's order-capable secret.
     allowlist = BOOTSTRAP_TEXT[
         BOOTSTRAP_TEXT.index("write_cockpit_env_file()") :
-        BOOTSTRAP_TEXT.index("write_cockpit_env_file\n")
+        BOOTSTRAP_TEXT.index("compose() {")
     ]
     assert "WEBHOOK_SECRET" not in allowlist
 
