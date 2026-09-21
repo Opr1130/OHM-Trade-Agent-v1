@@ -367,10 +367,42 @@ def test_cockpit_evidence_has_its_own_file_and_is_committed_atomically():
     assert "COCKPIT_READY_AT_UTC" in write_cockpit_state
     assert "COCKPIT_READY_SHA" in write_cockpit_state
 
-    # The readiness record is committed exactly once, with both values.
+    # The readiness record is committed exactly once, and only when the replica was
+    # verified for this release: health and loopback checks do not establish replica
+    # integrity, freshness or release binding, so an unverified start must not publish
+    # COCKPIT_READY_*.
     cockpit_start = _extract_function(BOOTSTRAP, "cockpit_start")
     assert cockpit_start.count("write_cockpit_state ") == 1
-    assert "write_cockpit_state \"$TARGET_SHA\"" in cockpit_start
+    assert 'write_cockpit_state "$TARGET_SHA"' in cockpit_start
+    code = _strip_comments(cockpit_start)
+    assert 'if [[ "$verification" == "verified" ]]; then' in code
+    assert code.index('if [[ "$verification" == "verified" ]]; then') < code.index(
+        "write_cockpit_state "
+    )
+    assert code.index("cockpit_preflight") < code.index("write_cockpit_state ")
+
+
+def test_cockpit_ready_evidence_is_only_published_after_replica_verification():
+    """COCKPIT_READY_* means "verified replica + reachable Cockpit"."""
+    # The verified flow passes the marker, so it publishes the evidence.
+    verified_flow = _strip_comments(
+        _extract_function(BOOTSTRAP, "cockpit_deploy_verified")
+    )
+    assert 'cockpit_start "$resolved" verified' in verified_flow
+
+    # `reads-ready` does not verify the replica, so it must not publish that evidence.
+    reads_ready = BOOTSTRAP[BOOTSTRAP.index('elif [[ "$STAGE" == "reads-ready" ]]') :]
+    assert "cockpit_verify_replica" not in reads_ready
+    assert "cockpit_start " in reads_ready
+    assert "unverified" in reads_ready
+    # The call site states its verification state explicitly.
+    call_line = next(
+        line
+        for line in reads_ready.splitlines()
+        if line.strip().startswith("cockpit_start ")
+    )
+    assert call_line.rstrip().endswith("unverified"), call_line
+    assert 'cockpit_start "$resolved" verified' in verified_flow
 
 
 def test_reads_ready_keeps_the_seven_day_soak_and_all_historical_gates():
@@ -1083,12 +1115,17 @@ class TestCockpitReadyBehaviour:
         assert state["READS_READY_SHA"] == TARGET_SHA
         assert state["DEPLOYED_SHA"] == TARGET_SHA
         assert "COCKPIT_READY" not in harness.state_file.read_text(encoding="utf-8")
-        assert _state_file(harness.cockpit_state_file)["COCKPIT_READY_SHA"] == TARGET_SHA
 
         # Crucially, historical readiness did not depend on the replica plane: the
-        # generation was resolved for the mount, but no replica verification ran.
+        # generation was resolved for the mount, but no replica verification ran...
         assert "canonical_replica resolve" in calls
         assert "canonical_replica verify" not in calls
+        # ...and because the replica was not verified, this path must publish no
+        # COCKPIT_READY_* evidence. Health and loopback checks prove neither replica
+        # integrity, freshness, nor release binding.
+        assert _state_file(harness.cockpit_state_file) == {}
+        assert "deliberately not recorded" in result.stdout
+        assert "cockpit_replica_verified=unverified" in result.stdout
 
     def test_reads_ready_still_refuses_a_short_soak(self, tmp_path: Path):
         harness = _Harness(tmp_path, "reads-ready")

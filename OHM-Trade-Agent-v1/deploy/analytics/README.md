@@ -103,6 +103,14 @@ Cockpit was the `reads-ready` stage, which made an otherwise valid operational C
 wait on a seven-day PostgreSQL shipper soak it does not depend on. The fix separates
 the two claims; it does **not** relax either one, and it does not shorten the soak.
 
+`COCKPIT_READY_*` means exactly one thing: **the replica verified for this release, and
+the read-only Cockpit is reachable on host loopback**. It is therefore published only by
+`cockpit-ready`. The shared start primitive also serves `reads-ready`, which must not
+depend on the replica plane and does not verify it; that path passes `unverified` and
+publishes no `COCKPIT_READY_*` evidence, because container health and a loopback binding
+establish neither replica integrity, freshness, nor release binding. `reads-ready` grants
+only `READS_READY_*`, which is its own claim.
+
 `cockpit-ready` performs no PostgreSQL work and depends on no PostgreSQL/Grafana
 setting. That is enforced structurally rather than by scattered guards: the Cockpit
 stage is dispatched **before** the PostgreSQL/Grafana plane, so a Cockpit run returns

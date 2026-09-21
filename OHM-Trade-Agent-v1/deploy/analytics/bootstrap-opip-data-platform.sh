@@ -442,11 +442,20 @@ cockpit_wait_healthy() {
 }
 
 cockpit_start() {
-  # Start the Cockpit, prove operator reachability, and only then record readiness.
+  # Start the Cockpit, prove operator reachability, and (only when the replica was
+  # verified) record readiness.
   #
   # ``$1`` is the container-side replica root the Cockpit must read. It is written into
   # the Cockpit env file so the process reads the committed generation rather than the
   # parent repository, which contains neither a manifest nor a canonical database.
+  #
+  # ``$2`` is ``verified`` only when that root passed the replica verifier for this
+  # release. COCKPIT_READY_* is published only in that case, because the marker means
+  # "verified replica + reachable Cockpit". Health and loopback checks prove neither
+  # replica integrity, freshness, nor release binding, so a caller that did not verify
+  # the replica must not publish that evidence. `reads-ready` is such a caller: it starts
+  # the Cockpit without a replica dependency (historical readiness must not depend on the
+  # replica plane) and grants only READS_READY_*, which is its own claim.
   #
   # Ordering is the safety property for the whole primitive: the image and the env file
   # come first, then the service, then the bounded health wait, then the reachability
@@ -457,17 +466,22 @@ cockpit_start() {
   # Idempotent: the image tag is release-pinned, `compose up -d` recreates only when the
   # definition changed, and the health wait and preflight are re-proven on every run.
   local replica_root="$1"
+  local verification="${2:-unverified}"
 
   write_cockpit_env_file "$replica_root"
   compose up -d opip-cockpit
   cockpit_wait_healthy
   cockpit_preflight
 
-  write_cockpit_state "$TARGET_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$verification" == "verified" ]]; then
+    write_cockpit_state "$TARGET_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  else
+    echo "cockpit_start: replica not verified; COCKPIT_READY_* deliberately not recorded"
+  fi
 
   echo "cockpit_ready_sha=$TARGET_SHA"
   echo "cockpit_replica_root=$replica_root"
-  echo "cockpit_reads=verified_canonical_replica"
+  echo "cockpit_replica_verified=$verification"
   echo "cockpit_historical_analytics_ready=false"
   echo "cockpit_raw_port_scope=host_loopback"
 }
@@ -475,10 +489,11 @@ cockpit_start() {
 cockpit_deploy_verified() {
   # The `cockpit-ready` flow: build, prove the replica, then start.
   #
-  # Replica verification belongs to this flow only. `reads-ready` starts the Cockpit
-  # through `cockpit_start` without a replica dependency, because historical
-  # PostgreSQL/Grafana readiness must not be blocked by an independent plane; the
-  # Cockpit reports replica unavailability through its own API instead.
+  # Replica verification belongs to this flow only, and it is what makes COCKPIT_READY_*
+  # a proven claim. `reads-ready` starts the Cockpit through `cockpit_start` without a
+  # replica dependency, because historical PostgreSQL/Grafana readiness must not be
+  # blocked by an independent plane; it therefore publishes no COCKPIT_READY_* evidence,
+  # and the Cockpit reports replica unavailability through its own API instead.
   local resolved
   cockpit_build_image
   # Verification precedes any container start, so the Cockpit can never serve from an
@@ -488,7 +503,7 @@ cockpit_deploy_verified() {
     echo "refusing cockpit-ready: the verified replica generation is no longer resolvable" >&2
     exit 69
   fi
-  cockpit_start "$resolved"
+  cockpit_start "$resolved" verified
 }
 
 analytics_host_lock() {
@@ -845,11 +860,13 @@ elif [[ "$STAGE" == "reads-ready" ]]; then
   # Start the read-only Cockpit through the same primitive `cockpit-ready` uses, so the
   # two stages cannot drift into separate implementations. Replica verification is
   # deliberately NOT part of this path: it belongs to `cockpit-ready`. Historical
-  # PostgreSQL/Grafana readiness must not be blocked by the replica plane, and when the
-  # committed generation cannot be resolved the Cockpit still starts against the parent
-  # mount and reports replica unavailability through its own API.
+  # PostgreSQL/Grafana readiness must not be blocked by the replica plane, so this path
+  # passes `unverified` and therefore publishes no COCKPIT_READY_* evidence - that marker
+  # means "verified replica + reachable Cockpit", which this path has not established.
+  # When the committed generation cannot be resolved the Cockpit still starts against
+  # the parent mount and reports replica unavailability through its own API.
   cockpit_build_image
-  cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")"
+  cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")" unverified
   # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
   # here, only after every historical gate above has passed. `cockpit-ready` never
   # writes these.
