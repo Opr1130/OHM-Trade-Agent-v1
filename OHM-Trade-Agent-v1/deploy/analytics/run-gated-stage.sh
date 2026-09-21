@@ -93,21 +93,40 @@ sync_cockpit_settings() {
     fi
   done
 
+  local canonical_count
   for key in "${keys[@]}"; do
-    count="$(grep -Ec "^${key}=" "$ENV_UPLOAD" || true)"
-    if [[ "$count" != "1" ]]; then
-      echo "sealed analytics environment must contain exactly one $key setting" >&2
+    count="$(grep -Ec "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_UPLOAD" || true)"
+    canonical_count="$(grep -Ec "^${key}=" "$ENV_UPLOAD" || true)"
+    if [[ "$count" != "1" || "$canonical_count" != "1" ]]; then
+      echo "sealed analytics environment must contain exactly one canonical $key setting" >&2
       exit 78
     fi
   done
 
-  local cockpit_secret_line cockpit_secret_value
+  local cockpit_secret_line cockpit_secret_value bind_line bind_value host_port_line host_port_value http_port_line http_port_value
   cockpit_secret_line="$(grep -E '^OPIP_COCKPIT_SECRET=' "$ENV_UPLOAD")"
   cockpit_secret_value="${cockpit_secret_line#OPIP_COCKPIT_SECRET=}"
-  if [[ -z "$cockpit_secret_value"     || "$cockpit_secret_value" == "set-cockpit-secret"     || ${#cockpit_secret_value} -lt 24 ]]; then
-    echo "OPIP_COCKPIT_SECRET must be a non-placeholder secret of at least 24 characters" >&2
+  bind_line="$(grep -E '^OPIP_COCKPIT_BIND_ADDRESS=' "$ENV_UPLOAD")"
+  bind_value="${bind_line#OPIP_COCKPIT_BIND_ADDRESS=}"
+  host_port_line="$(grep -E '^OPIP_COCKPIT_HOST_PORT=' "$ENV_UPLOAD")"
+  host_port_value="${host_port_line#OPIP_COCKPIT_HOST_PORT=}"
+  http_port_line="$(grep -E '^OPIP_COCKPIT_HTTP_PORT=' "$ENV_UPLOAD")"
+  http_port_value="${http_port_line#OPIP_COCKPIT_HTTP_PORT=}"
+
+  if [[ "$cockpit_secret_value" == "set-cockpit-secret" || ! "$cockpit_secret_value" =~ ^[A-Za-z0-9._~-]{24,}$ ]]; then
+    echo "OPIP_COCKPIT_SECRET must be a non-placeholder URL-safe secret of at least 24 characters" >&2
     exit 78
   fi
+  [[ "$bind_value" == "127.0.0.1" ]] || {
+    echo "OPIP_COCKPIT_BIND_ADDRESS must be exactly 127.0.0.1" >&2
+    exit 78
+  }
+  for key in "$host_port_value" "$http_port_value"; do
+    if [[ ! "$key" =~ ^[0-9]{1,5}$ ]] || (( 10#$key < 1 || 10#$key > 65535 )); then
+      echo "Cockpit ports must be decimal values from 1 through 65535" >&2
+      exit 78
+    fi
+  done
 
   temporary="$(mktemp /etc/opip-data-platform.env.XXXXXX)"
   awk -F= '
