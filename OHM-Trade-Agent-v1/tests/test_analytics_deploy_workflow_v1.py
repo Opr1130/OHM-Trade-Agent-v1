@@ -65,7 +65,11 @@ def test_cockpit_ready_receives_sealed_env_without_running_empty_stage():
     workflow = (ROOT.parent / ".github/workflows/deploy-analytics.yml").read_text()
     runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
 
-    assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 3
+    assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 2
+    assert "COCKPIT_SECRET: ${{ secrets.OPIP_COCKPIT_SECRET }}" in workflow
+    assert 'if [[ "$STAGE" == "empty" ]]; then' in workflow
+    assert 'elif [[ "$STAGE" == "cockpit-ready" ]]; then' in workflow
+    assert "OPIP_COCKPIT_BIND_ADDRESS=127.0.0.1" in workflow
     assert "sync_cockpit_settings()" in runner
     assert "sealed analytics environment must contain exactly one canonical $key setting" in runner
     assert "OPIP_COCKPIT_SECRET must be a non-placeholder URL-safe secret of at least 24 characters" in runner
