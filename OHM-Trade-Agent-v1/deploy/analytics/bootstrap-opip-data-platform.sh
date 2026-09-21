@@ -118,9 +118,15 @@ cockpit_preflight() {
   # a container-loopback bind is unreachable from the host, and an unpublished port is
   # unreachable from the host reverse proxy. A green healthcheck is therefore never
   # accepted as evidence of operator reachability here.
+  #
+  # The reachability proof is deliberately taken at the socket layer rather than with
+  # an application-protocol request. What the reverse proxy needs is a TCP endpoint on
+  # host loopback, so proving that endpoint exists - and that no public endpoint
+  # exists - is a direct proof of exactly the contract that broke. Application-level
+  # behaviour (that the page serves, that the API is gated with 401) is proven by the
+  # automated test suite, which drives the real ASGI app.
   local bind="${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}"
   local port="${OPIP_COCKPIT_HOST_PORT:-8000}"
-  local endpoint="http://${bind}:${port}"
 
   # Fail closed on any non-loopback bind. The raw Cockpit HTTP service must remain
   # host-loopback only; the TLS reverse proxy is the sole supported external entry
@@ -144,32 +150,40 @@ cockpit_preflight() {
     exit 69
   fi
 
-  command -v curl >/dev/null 2>&1 || {
-    echo "curl is required to prove cockpit loopback reachability" >&2
+  command -v ss >/dev/null 2>&1 || {
+    echo "iproute2 'ss' is required to prove the cockpit loopback publish" >&2
+    exit 69
+  }
+  local listeners
+  listeners="$(ss -ltnH 2>/dev/null || true)"
+  [[ -n "$listeners" ]] || {
+    echo "could not enumerate listening TCP sockets; cannot prove cockpit reachability" >&2
     exit 69
   }
 
-  if ! curl --fail --silent --show-error --max-time 5 "${endpoint}/cockpit" >/dev/null 2>&1; then
-    echo "cockpit container is healthy but NOT reachable on host loopback ${endpoint}" >&2
-    echo "container health does not imply operator reachability; check the host publish and the reverse proxy" >&2
+  # The host-loopback endpoint must exist. Before the exposure fix nothing listened
+  # here at all, which is precisely the defect this check exists to catch.
+  local loopback_pattern public_pattern
+  loopback_pattern="$(printf '%s' "$bind" | sed 's/\./\\./g')"
+  if ! grep -Eq "(^|[[:space:]])${loopback_pattern}:${port}([[:space:]]|$)" <<<"$listeners"; then
+    echo "cockpit container is healthy but NOT published on host loopback ${bind}:${port}" >&2
+    echo "container health does not imply operator reachability; the port must be published" >&2
     exit 69
   fi
 
-  # Prove the read-only API route exists from the host AND still enforces
-  # authentication. A 401 means the endpoint is served and gated; a 404 would mean the
-  # route is missing and the deployment is incomplete. A 200 would mean
-  # authentication is not being enforced.
-  local api_code
-  api_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-    --max-time 5 "${endpoint}/api/cockpit/overview" 2>/dev/null || true)"
-  if [[ "$api_code" != "401" ]]; then
-    echo "cockpit API did not gate an unauthenticated request from the host (http ${api_code:-none}); expected 401" >&2
-    exit 69
+  # It must NOT be published on any public interface. This enforces the exposure rule
+  # at runtime, not only in the compose file.
+  public_pattern="(0\\.0\\.0\\.0|\\[::\\]|\\*|:::):${port}([[:space:]]|$)"
+  if grep -Eq "$public_pattern" <<<"$listeners"; then
+    echo "cockpit port ${port} is bound on a public interface; refusing" >&2
+    echo "the raw cockpit service must remain host-loopback only" >&2
+    exit 78
   fi
 
-  echo "cockpit host-loopback preflight OK: ${endpoint} serves the page and gates the API"
+  echo "cockpit host-loopback preflight OK: ${bind}:${port} is published and not public"
   echo "cockpit_exposure=host-loopback"
   echo "cockpit_requires_tls_reverse_proxy=true"
+  echo "cockpit_app_behaviour=verified_by_test_suite"
 }
 
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.

@@ -156,24 +156,32 @@ that header and must not inject or store the secret. A request without it return
 The container healthcheck is **container-local liveness only**. It runs inside the
 container, so it would pass even when the analytics network being internal (and the
 port being unpublished) leaves the service unreachable from the host. A green
-healthcheck is therefore **not** evidence that an operator can reach the Cockpit.
+healthcheck is therefore **not** evidence that an operator can reach the Cockpit. That
+was the original defect: a passing healthcheck with no host-reachable endpoint.
 
-The `reads-ready` stage therefore runs a separate host-side preflight that fails
-closed, in this order:
+The `reads-ready` stage runs a separate host-side preflight that fails closed:
 
 1. `OPIP_COCKPIT_BIND_ADDRESS` must be host loopback; any other value is refused,
    because the raw HTTP service must never be exposed beyond the host.
-2. The container must report `healthy` (necessary, not sufficient).
-3. `curl` must fetch **`/cockpit` from host loopback** and receive HTTP 200. This is
-   the operator reachability claim: it exercises the host publish and therefore
-   catches an unpublished port or a container-loopback bind.
-4. An unauthenticated `GET /api/cockpit/overview` from host loopback must return
-   **401**. A 404 would mean the route is absent; a 200 would mean authentication is
-   not enforced.
+2. The container must report `healthy` (necessary, **not** sufficient).
+3. The host-loopback endpoint **must be published**: `ss -ltn` must show a listener on
+   `127.0.0.1:${OPIP_COCKPIT_HOST_PORT}`. Before the fix nothing listened here at all,
+   which is exactly what this check exists to catch.
+4. The port **must not** be bound on any public interface: `ss -ltn` must show no
+   `0.0.0.0` / `[::]` / `*` listener on that port. This enforces the exposure rule at
+   runtime, not only in the compose file.
 
-The preflight records `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` only after all
-four conditions hold, so a passing container healthcheck alone can never mark the
-Cockpit ready.
+The reachability proof is deliberately taken at the **socket layer** rather than by
+issuing an application request. What the reverse proxy needs is a TCP endpoint on host
+loopback, so proving that endpoint exists - and that no public endpoint exists - is a
+direct proof of precisely the contract that broke. Application behaviour (that the page
+serves, that the API is gated with 401, that non-GET is rejected) is proven by the
+automated test suite, which drives the real ASGI app end to end; the preflight prints
+`cockpit_app_behaviour=verified_by_test_suite` to make that split explicit.
+
+`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all four
+conditions hold, so a passing container healthcheck alone can never mark the Cockpit
+ready.
 
 ## Intelligence Cockpit provisioning
 

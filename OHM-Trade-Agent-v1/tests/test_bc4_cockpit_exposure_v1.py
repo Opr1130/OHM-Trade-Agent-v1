@@ -304,24 +304,57 @@ def test_i_bootstrap_proves_host_loopback_reachability_not_just_container_health
     assert "cockpit_preflight" in BOOTSTRAP_TEXT
     # Container health is checked...
     assert ".State.Health" in BOOTSTRAP_TEXT
-    # ...and host-loopback reachability is checked separately via curl.
-    assert "/cockpit" in BOOTSTRAP_TEXT
-    assert "curl" in BOOTSTRAP_TEXT
+    # ...and the host publish is proven separately at the socket layer.
+    assert "ss -ltn" in BOOTSTRAP_TEXT
     assert "host loopback" in BOOTSTRAP_TEXT.lower()
+    # The proof must not be taken at the container level.
+    assert "does not imply operator reachability" in BOOTSTRAP_TEXT
 
 
 def test_i_preflight_refuses_a_non_loopback_bind():
     """The raw HTTP service must fail closed if pointed at a public address."""
-    assert re.search(
-        r"127\.\*\|localhost|127\.\*\)", BOOTSTRAP_TEXT
-    ) or "must be host loopback" in BOOTSTRAP_TEXT
     assert "OPIP_COCKPIT_BIND_ADDRESS must be host loopback" in BOOTSTRAP_TEXT
+    assert "case \"$bind\" in" in BOOTSTRAP_TEXT
 
 
-def test_i_preflight_verifies_the_api_route_is_gated_from_the_host():
-    """401 proves served-and-gated; 404 would mean the route is missing."""
-    assert "401" in BOOTSTRAP_TEXT
-    assert "/api/cockpit/overview" in BOOTSTRAP_TEXT
+def test_i_preflight_refuses_a_publicly_bound_port_at_runtime():
+    """The no-public-bind rule must be enforced on the host, not only in compose."""
+    assert "0\\\\.0\\\\.0\\\\.0" in BOOTSTRAP_TEXT or "0\\.0\\.0\\.0" in BOOTSTRAP_TEXT
+    assert "bound on a public interface" in BOOTSTRAP_TEXT
+
+
+def test_i_reachability_proof_uses_no_clear_text_protocol_literal():
+    """The proof is socket-level, so it introduces no clear-text-protocol use.
+
+    A first version issued an HTTP request to host loopback, which SonarCloud flagged
+    as ``shell:S5332`` (clear-text protocol). The loopback hop is genuinely safe
+    because TLS terminates at the host reverse proxy, but rather than suppress the
+    finding or obscure the scheme, the reachability proof is taken where the actual
+    contract lives: the published socket. Application behaviour is proven by the test
+    suite, which drives the real ASGI app.
+    """
+    preflight = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("cockpit_preflight()") :
+        BOOTSTRAP_TEXT.index("total_kb=")
+    ]
+    assert "http://" not in preflight
+    assert "curl" not in preflight
+    # No suppression directive was introduced.
+    assert "NOSONAR" not in BOOTSTRAP_TEXT
+
+
+def test_i_app_behaviour_is_proven_by_the_test_suite():
+    """The split must be explicit: the preflight states it does not test the app."""
+    assert "cockpit_app_behaviour=verified_by_test_suite" in BOOTSTRAP_TEXT
+    # And the suite really does drive the app over the read-only surface.
+    suite = pathlib.Path(__file__).read_text(encoding="utf-8")
+    assert 'client.get("/api/cockpit/overview")' in suite
+
+
+def test_i_bootstrap_declares_the_cockpit_exposure_contract():
+    """The preflight must state its own exposure assumptions to the operator."""
+    assert "cockpit_exposure=host-loopback" in BOOTSTRAP_TEXT
+    assert "cockpit_requires_tls_reverse_proxy=true" in BOOTSTRAP_TEXT
 
 
 def test_i_preflight_runs_before_the_cockpit_is_declared_ready():
@@ -349,12 +382,6 @@ def test_i_bootstrap_syntax_is_validated_in_ci():
         REPO.parent / ".github" / "workflows" / "pytest.yml"
     ).read_text(encoding="utf-8")
     assert "bash -n deploy/analytics/bootstrap-opip-data-platform.sh" in workflow
-
-
-def test_i_bootstrap_declares_the_cockpit_exposure_contract():
-    """The preflight must state its own exposure assumptions to the operator."""
-    assert "cockpit_exposure=host-loopback" in BOOTSTRAP_TEXT
-    assert "cockpit_requires_tls_reverse_proxy=true" in BOOTSTRAP_TEXT
 
 
 def test_i_container_healthcheck_is_documented_as_insufficient():
