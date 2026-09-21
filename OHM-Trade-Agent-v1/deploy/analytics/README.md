@@ -111,6 +111,46 @@ publishes no `COCKPIT_READY_*` evidence, because container health and a loopback
 establish neither replica integrity, freshness, nor release binding. `reads-ready` grants
 only `READS_READY_*`, which is its own claim.
 
+### The Cockpit has its own Compose surface
+
+The Cockpit is defined in `deploy/analytics/docker-compose.cockpit.yml`, **not** in
+`docker-compose.yml`. Docker Compose interpolates the **entire file** it is given before
+selecting a single service, so a Cockpit-only deployment driven from the shared file
+failed on this host with:
+
+```
+error while interpolating services.opip-grafana.environment.GF_SECURITY_ADMIN_USER:
+required variable OPIP_GRAFANA_ADMIN_USER is missing a value:
+set in /etc/opip-data-platform.env
+```
+
+`cockpit-ready` was already dispatched before the PostgreSQL/Grafana shell plane and
+executed none of it, but the shared file's Grafana and PostgreSQL services carry
+mandatory `${...:?}` variables, and `docker compose -f docker-compose.yml build
+opip-cockpit` interpolated all of them. Shell-level isolation cannot isolate Compose
+interpolation; only a separate Compose file can.
+
+`docker-compose.cockpit.yml` therefore contains the Cockpit service and its network and
+nothing else. It interpolates only `OPIP_COCKPIT_*` and `OPIP_DEPLOYED_SHA`, all of which
+have defaults, so it renders and runs with every PostgreSQL/Grafana variable absent. It
+deliberately keeps `name: opip-data-platform` and an identical `opip-analytics` network
+definition, so the Cockpit stays in the same Compose project and joins the same internal
+network rather than creating a second network on an overlapping subnet.
+
+The service is defined exactly once. A second copy in the shared file would be dead
+configuration that could silently drift from the hardening here, so the Cockpit is not
+declared there; the shared file keeps the whole PostgreSQL/Grafana plane and its strict
+requirements unchanged.
+
+Every Cockpit build/start/status operation goes through the Cockpit-only surface
+(`cockpit_compose` in bootstrap); the PostgreSQL/Grafana stages keep using the shared
+file. To inspect or start the Cockpit manually:
+
+```bash
+docker compose --env-file /etc/opip-data-platform.env \
+  -f deploy/analytics/docker-compose.cockpit.yml ps
+```
+
 `cockpit-ready` performs no PostgreSQL work and depends on no PostgreSQL/Grafana
 setting. That is enforced structurally rather than by scattered guards: the Cockpit
 stage is dispatched **before** the PostgreSQL/Grafana plane, so a Cockpit run returns

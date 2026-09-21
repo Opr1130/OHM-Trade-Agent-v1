@@ -257,9 +257,9 @@ def test_cockpit_is_served_from_the_analytics_plane_with_the_replica_mounted():
     its serving container must receive the verified read-only replica mount. This
     asserts the service definition that satisfies it.
     """
-    compose = (REPO / "deploy" / "analytics" / "docker-compose.yml").read_text(
-        encoding="utf-8"
-    )
+    compose = (
+        REPO / "deploy" / "analytics" / "docker-compose.cockpit.yml"
+    ).read_text(encoding="utf-8")
     assert "opip-cockpit:" in compose
     # Reuses the existing repository image and the existing replica bridge.
     assert "opip-data-platform:${OPIP_DEPLOYED_SHA:-local}" in compose

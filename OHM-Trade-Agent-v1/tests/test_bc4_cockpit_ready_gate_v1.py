@@ -58,6 +58,10 @@ BOOTSTRAP = (REPO / "deploy/analytics/bootstrap-opip-data-platform.sh").read_tex
 RUNNER = (REPO / "deploy/analytics/run-gated-stage.sh").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github/workflows/deploy-analytics.yml").read_text(encoding="utf-8")
 COMPOSE_TEXT = (REPO / "deploy/analytics/docker-compose.yml").read_text(encoding="utf-8")
+# The Cockpit has its own Compose surface; see docker-compose.cockpit.yml.
+COCKPIT_COMPOSE_TEXT = (
+    REPO / "deploy/analytics/docker-compose.cockpit.yml"
+).read_text(encoding="utf-8")
 ENV_EXAMPLE = (REPO / "deploy/analytics/env.example").read_text(encoding="utf-8")
 README = (REPO / "deploy/analytics/README.md").read_text(encoding="utf-8")
 
@@ -225,7 +229,13 @@ def _shell_stage_vocabulary(script: str) -> tuple[str, ...]:
 
 
 def _cockpit_service() -> dict:  # type: ignore[type-arg]
-    return yaml.safe_load(COMPOSE_TEXT)["services"]["opip-cockpit"]
+    """The Cockpit service, from its own Compose surface.
+
+    It is not declared in the shared analytics file: Compose interpolates a whole file
+    before selecting a service, so keeping it there made a Cockpit-only deployment
+    require Grafana/PostgreSQL variables it does not use.
+    """
+    return yaml.safe_load(COCKPIT_COMPOSE_TEXT)["services"]["opip-cockpit"]
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +505,12 @@ def test_replica_verification_targets_the_resolved_generation_not_the_parent():
 def test_cockpit_reads_the_resolved_generation_through_its_env_file():
     """The Cockpit process must be told which generation to read."""
     write_env = _extract_function(BOOTSTRAP, "write_cockpit_env_file")
-    assert 'local replica_root="${1:-$COCKPIT_REPLICA_CONTAINER_ROOT}"' in write_env
+    # The generation is optional so the secret surface can be materialized before the
+    # generation is resolvable, and so a root the verifier has not confirmed is never
+    # recorded.
+    assert 'local replica_root="${1:-}"' in write_env
     assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in write_env
+    assert 'if [[ -n "$replica_root" ]]; then' in write_env
     # The compose service must not pin the parent over the derived value.
     environment = _cockpit_service()["environment"]
     assert "OPIP_CANONICAL_REPLICA_ROOT" not in environment
@@ -504,6 +518,26 @@ def test_cockpit_reads_the_resolved_generation_through_its_env_file():
         "OPIP_COCKPIT_HTTP_PORT": "${OPIP_COCKPIT_HTTP_PORT:-8000}",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+    # The generation is recorded before the container is started.
+    start = _extract_function(BOOTSTRAP, "cockpit_start")
+    assert 'write_cockpit_env_file "$replica_root"' in start
+    assert start.index('write_cockpit_env_file "$replica_root"') < start.index(
+        "cockpit_compose up -d opip-cockpit"
+    )
+
+
+def test_cockpit_secret_surface_is_materialized_before_the_build():
+    """Compose loads `env_file` in order to build, so it must exist by then.
+
+    /etc/opip-cockpit.env does not exist on a host that has never started the Cockpit,
+    and the image must already exist before the generation can be resolved, so the secret
+    surface is materialized first and the verified generation is added before start.
+    """
+    build = _extract_function(BOOTSTRAP, "cockpit_build_image")
+    assert "write_cockpit_env_file\n" in build
+    assert build.index("write_cockpit_env_file\n") < build.index(
+        "cockpit_compose build opip-cockpit"
+    )
 
 
 def test_replica_probe_container_is_offline_read_only_and_target_pinned():
@@ -549,13 +583,16 @@ def test_cockpit_waits_for_health_before_proving_reachability():
 
 def test_cockpit_uses_the_exact_target_image():
     """A stale image from an earlier rollout must not be able to satisfy this stage."""
-    assert "opip-data-platform:${OPIP_DEPLOYED_SHA:-local}" in COMPOSE_TEXT
+    assert "opip-data-platform:${OPIP_DEPLOYED_SHA:-local}" in COCKPIT_COMPOSE_TEXT
     build = _extract_function(BOOTSTRAP, "cockpit_build_image")
     assert 'export OPIP_DEPLOYED_SHA="$TARGET_SHA"' in build
     assert build.index('export OPIP_DEPLOYED_SHA="$TARGET_SHA"') < build.index(
         "build opip-cockpit"
     )
-    assert "docker compose -f \"$COMPOSE\" build opip-cockpit" in build
+    # Built through the Cockpit-only Compose file, so the shared analytics file (and its
+    # mandatory Grafana/PostgreSQL variables) is never interpolated.
+    assert "cockpit_compose build opip-cockpit" in build
+    assert 'docker compose -f "$COMPOSE" build opip-cockpit' not in BOOTSTRAP
     assert "opip-shipper" not in build
     assert "opip-postgres" not in build
 
@@ -666,15 +703,20 @@ def test_readme_states_the_required_reverse_proxy_routes():
 def test_no_new_infrastructure_or_dependency_is_introduced():
     """The change must reuse the existing plane: no new service, proxy or database."""
     compose = yaml.safe_load(COMPOSE_TEXT)
+    cockpit_compose = yaml.safe_load(COCKPIT_COMPOSE_TEXT)
+    # The shared analytics file keeps exactly the PostgreSQL/Grafana plane; the Cockpit
+    # moved to its own surface and is defined there once.
     assert sorted(compose["services"]) == [
-        "opip-cockpit",
         "opip-data-admin",
         "opip-grafana",
         "opip-postgres",
         "opip-shipper",
     ]
+    assert sorted(cockpit_compose["services"]) == ["opip-cockpit"]
+    # Nothing new was added anywhere.
+    combined = COMPOSE_TEXT + COCKPIT_COMPOSE_TEXT
     for forbidden in ("nginx", "traefik", "caddy", "redis", "mongo"):
-        assert forbidden not in COMPOSE_TEXT.lower()
+        assert forbidden not in combined.lower()
 
 
 def test_ci_still_syntax_checks_both_changed_shell_scripts():
