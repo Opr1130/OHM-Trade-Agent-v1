@@ -16,6 +16,7 @@ from app.opip.canonical.models import (
     PaperPortfolioState,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2Ledger,
     PaperV2ProtectionWork,
     PaperV2RecoverableExecutions,
     WriterAck,
@@ -288,6 +289,16 @@ class CanonicalWriterServer:
                     error_code="WORKER_UNHEALTHY",
                 ).to_dict()
             return self.writer.paper_v2_protection_work().to_dict()
+        if method == "GET_PAPER_V2_LEDGER":
+            # Read-only analytical ledger, health-gated: an unhealthy store must not
+            # report an empty ledger, which would silently understate realised
+            # economics as "no trades".
+            if self._health_status() != "OK":
+                return PaperV2Ledger(
+                    status="RETRYABLE",
+                    error_code="WORKER_UNHEALTHY",
+                ).to_dict()
+            return self.writer.paper_v2_ledger().to_dict()
 
         # Mutating control RPCs must not write after integrity is uncertain.
         if self._health_status() != "OK":

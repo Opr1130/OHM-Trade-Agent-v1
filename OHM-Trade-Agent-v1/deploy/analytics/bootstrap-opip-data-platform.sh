@@ -9,6 +9,7 @@ APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
 ENV_FILE="/etc/opip-data-platform.env"
 GRAFANA_ENV_FILE="/etc/opip-grafana.env"
+COCKPIT_ENV_FILE="/etc/opip-cockpit.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
@@ -105,8 +106,183 @@ write_grafana_env_file() {
 }
 write_grafana_env_file
 
+guard_no_trading_credentials() {
+  # The analytics plane is a separate trust boundary. The trading host's operator
+  # secret is not merely a dashboard credential: it also gates
+  # POST /operator/mode, POST /operator/orders and PATCH /operator/orders/{trade_id},
+  # so it can change trading mode and create or modify orders.
+  #
+  # Copying it here would place an order-capable credential on an externally
+  # reachable read-only surface, so this fails closed rather than tolerating it. The
+  # Cockpit has its own read-only OPIP_COCKPIT_SECRET instead.
+  #
+  # Two independent checks, because either alone is bypassable:
+  #
+  #   1. The sourced environment. This file has already been sourced with `set -a`,
+  #      so any name Bash accepted is already present as a variable. Checking the
+  #      environment directly covers every syntax Bash accepts, without this guard
+  #      having to re-implement Bash's parser.
+  #   2. A normalized scan of the file text. Assignment syntax is normalized before
+  #      comparison - leading whitespace and an optional `export ` prefix are
+  #      stripped - so `export WEBHOOK_SECRET=...` and `  WEBHOOK_SECRET=...` are
+  #      recognized rather than slipping past an exact first-field compare.
+  local key
+  for key in \
+    WEBHOOK_SECRET \
+    KRAKEN_API_KEY \
+    KRAKEN_API_SECRET \
+    TELEGRAM_BOT_TOKEN; do
+    if [[ -n "${!key:-}" ]] \
+      || awk -v key="$key" '
+           {
+             line = $0
+             sub(/^[[:space:]]+/, "", line)
+             sub(/^export[[:space:]]+/, "", line)
+             if (index(line, key "=") == 1) { found = 1; exit }
+           }
+           END { exit !found }
+         ' "$ENV_FILE"; then
+      echo "$key must not be present on the analytics plane" >&2
+      echo "it carries trading/order authority and belongs only on the trading host" >&2
+      echo "the Cockpit uses its own read-only OPIP_COCKPIT_SECRET" >&2
+      exit 78
+    fi
+  done
+}
+guard_no_trading_credentials
+
+write_cockpit_env_file() {
+  # The Cockpit is externally reachable through the reverse proxy, so it must not
+  # load credentials it has no use for. The sealed analytics env file also holds the
+  # PostgreSQL admin, shipper, learning and dashboard credentials and privileged
+  # database URLs; handing those to an internet-facing read-only service would put
+  # unrelated secrets on an unnecessary surface.
+  #
+  # This mirrors the Grafana pattern: derive a dedicated env file from the sealed
+  # source using a strict allowlist, so the Cockpit receives the minimum it needs -
+  # its own authentication secret and its own bound/port configuration. Everything
+  # else the process requires (the replica root, the container port) is static and set
+  # in compose.
+  local temporary key
+  local -a keys=(
+    OPIP_COCKPIT_SECRET
+    OPIP_COCKPIT_BIND_ADDRESS
+    OPIP_COCKPIT_HOST_PORT
+    OPIP_COCKPIT_HTTP_PORT
+  )
+
+  temporary="$(mktemp /etc/opip-cockpit.env.XXXXXX)"
+  : > "$temporary"
+  for key in "${keys[@]}"; do
+    if ! awk -F= -v key="$key" '$1 == key {print; found=1; exit} END {if (!found) exit 1}' \
+      "$ENV_FILE" >> "$temporary"; then
+      rm -f -- "$temporary"
+      echo "missing required Cockpit setting in $ENV_FILE: $key" >&2
+      exit 78
+    fi
+  done
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
+}
+write_cockpit_env_file
+
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
+}
+
+cockpit_preflight() {
+  # Prove the Cockpit is reachable to an OPERATOR, which is a different claim from
+  # the container being healthy.
+  #
+  # The container healthcheck runs inside the container and would pass even when
+  # nothing on the host can reach the service: the analytics network is internal, so
+  # a container-loopback bind is unreachable from the host, and an unpublished port is
+  # unreachable from the host reverse proxy. A green healthcheck is therefore never
+  # accepted as evidence of operator reachability here.
+  #
+  # The reachability proof is deliberately taken at the socket layer rather than with
+  # an application-protocol request. What the reverse proxy needs is a TCP endpoint on
+  # host loopback, so proving that endpoint exists - and that no public endpoint
+  # exists - is a direct proof of exactly the contract that broke. Application-level
+  # behaviour (that the page serves, that the API is gated with 401) is proven by the
+  # automated test suite, which drives the real ASGI app.
+  local bind="${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}"
+  local port="${OPIP_COCKPIT_HOST_PORT:-8000}"
+
+  # Fail closed on any non-loopback bind. The raw Cockpit HTTP service must remain
+  # host-loopback only; the TLS reverse proxy is the sole supported external entry
+  # point, so a public bind is refused rather than silently accepted.
+  case "$bind" in
+    127.*|localhost) ;;
+    *)
+      echo "OPIP_COCKPIT_BIND_ADDRESS must be host loopback, not '$bind'" >&2
+      echo "the cockpit must be reached through the host TLS reverse proxy" >&2
+      exit 78
+      ;;
+  esac
+
+  local health
+  health="$(docker inspect \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    opip-cockpit 2>/dev/null || true)"
+  if [[ "$health" != "healthy" ]]; then
+    echo "cockpit container health is '$health', not 'healthy'" >&2
+    echo "note: container health alone would not prove operator reachability" >&2
+    exit 69
+  fi
+
+  command -v ss >/dev/null 2>&1 || {
+    echo "iproute2 'ss' is required to prove the cockpit loopback publish" >&2
+    exit 69
+  }
+  local listeners
+  listeners="$(ss -ltnH 2>/dev/null || true)"
+  [[ -n "$listeners" ]] || {
+    echo "could not enumerate listening TCP sockets; cannot prove cockpit reachability" >&2
+    exit 69
+  }
+
+  # The host-loopback endpoint must exist. Before the exposure fix nothing listened
+  # here at all, which is precisely the defect this check exists to catch.
+  local loopback_pattern public_pattern
+  loopback_pattern="$(printf '%s' "$bind" | sed 's/\./\\./g')"
+  if ! grep -Eq "(^|[[:space:]])${loopback_pattern}:${port}([[:space:]]|$)" <<<"$listeners"; then
+    echo "cockpit container is healthy but NOT published on host loopback ${bind}:${port}" >&2
+    echo "container health does not imply operator reachability; the port must be published" >&2
+    exit 69
+  fi
+
+  # It must NOT be published on any public interface. This enforces the exposure rule
+  # at runtime, not only in the compose file.
+  public_pattern="(0\\.0\\.0\\.0|\\[::\\]|\\*|:::):${port}([[:space:]]|$)"
+  if grep -Eq "$public_pattern" <<<"$listeners"; then
+    echo "cockpit port ${port} is bound on a public interface; refusing" >&2
+    echo "the raw cockpit service must remain host-loopback only" >&2
+    exit 78
+  fi
+
+  # The listener must be this container's publish, not a stale or foreign process
+  # that happens to hold the port. `docker port` reports the mapping the Cockpit
+  # container itself declares, so it identifies the owner: a stale listener would not
+  # produce this mapping, and before the exposure fix the mapping was empty.
+  local published
+  published="$(docker port opip-cockpit 2>/dev/null || true)"
+  if [[ -z "$published" ]]; then
+    echo "opip-cockpit publishes no host port; it is unreachable from the reverse proxy" >&2
+    exit 69
+  fi
+  if ! grep -Eq -- "-> ${loopback_pattern}:${port}$" <<<"$published"; then
+    echo "opip-cockpit is not published on host loopback ${bind}:${port}" >&2
+    echo "published mappings: ${published//$'\n'/, }" >&2
+    exit 69
+  fi
+
+  echo "cockpit host-loopback preflight OK: ${bind}:${port} is published by opip-cockpit and not public"
+  echo "cockpit_exposure=host-loopback"
+  echo "cockpit_requires_tls_reverse_proxy=true"
+  echo "cockpit_publish_owner=opip-cockpit"
+  echo "cockpit_app_behaviour=verified_by_healthcheck_and_test_suite"
 }
 
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.
@@ -401,6 +577,12 @@ else
   admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   admin_run python -m app.opip.data_platform.health --require-ready
+  # Start the read-only Cockpit and prove operator reachability on host loopback.
+  # The Cockpit reads only the verified replica, so it belongs to the reads phase.
+  compose up -d opip-cockpit
+  cockpit_preflight
+  write_state COCKPIT_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_state COCKPIT_READY_SHA "$TARGET_SHA"
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_state READS_READY_SHA "$TARGET_SHA"
 fi

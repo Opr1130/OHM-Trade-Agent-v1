@@ -66,6 +66,9 @@ PostgreSQL is started with `ssl=on` and Grafana trusts only the mounted
 8. Start Grafana with
    `docker compose --env-file /etc/opip-data-platform.env -f deploy/analytics/docker-compose.yml up -d opip-grafana`,
    then configure TLS reverse proxy routing to the private bind endpoint.
+9. The `reads-ready` stage starts `opip-cockpit` (the read-only B/C-4 Cockpit) and
+   proves host-loopback reachability. Configure the reverse proxy for the Cockpit
+   paths below before treating the Cockpit as operator-available.
 
 The stages are deliberately non-collapsible. `empty` installs PostgreSQL and
 the additive schema; `offhost-verified` records an owner attestation only
@@ -109,6 +112,118 @@ been verified. After the first dump and after every material schema change, run
 `opip-postgres-restore-drill`; it restores
 into a temporary database, validates `ops.schema_version`, records evidence,
 and drops only that temporary database.
+
+## Read-only Cockpit exposure
+
+The B/C-4 Cockpit (`opip-cockpit`) answers Paper-v2 analytical questions from the
+verified canonical replica. It is exposed using the **same model as Grafana**: a
+loopback-published service behind the host's TLS reverse proxy. No new proxy platform
+is introduced, and this repository does not version-control the host proxy
+configuration.
+
+### Required reverse-proxy routes
+
+The external endpoint must terminate TLS and forward these four paths to the
+host-loopback Cockpit port. All four are GET-only and must not be cached.
+
+| External path | Proxied to |
+| --- | --- |
+| `/cockpit` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/cockpit` |
+| `/api/cockpit/overview` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/overview` |
+| `/api/cockpit/trades` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/trades` |
+| `/api/cockpit/trades/*` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/trades/*` (path parameter) |
+
+Requirements:
+
+- Terminate TLS at the proxy; do **not** expose `OPIP_COCKPIT_HOST_PORT` to the
+  Internet, and do not publish it on a public or VPC interface.
+- Restrict the proxied methods to GET. The API is read-only, and the edge should say
+  so rather than relying on the application alone.
+- Do not cache. Analytical responses are point-in-time and carry an `as_of`.
+- The four paths are the whole surface. `/api/cockpit/trades/*` is a prefix match for
+  the Trade Detail path parameter and exposes nothing beyond that route.
+
+### Authentication
+
+`/cockpit` is a public static shell; every `/api/cockpit/*` read requires the
+Cockpit's own secret in the `x-webhook-secret` header. The proxy must forward that
+header and must not inject or store the secret. A request without it returns 401.
+
+**The Cockpit secret must be a distinct value from the trading host's
+`WEBHOOK_SECRET`.** The trading host's secret is not merely a dashboard credential: it
+also gates `POST /operator/mode`, `POST /operator/orders` and
+`PATCH /operator/orders/{trade_id}`, so it carries order creation and modification
+authority. Copying it here would place an order-capable credential on an externally
+reachable read-only surface. The Cockpit therefore uses its own read-only
+`OPIP_COCKPIT_SECRET`, and bootstrap refuses to run at all if the sealed analytics env
+file contains `WEBHOOK_SECRET`, `KRAKEN_API_KEY`, `KRAKEN_API_SECRET` or
+`TELEGRAM_BOT_TOKEN`.
+
+An unset or empty Cockpit secret fails closed: every read returns 401 rather than the
+surface becoming open.
+
+### Reachability proof (and what it is not)
+
+The container healthcheck is **container-local liveness only**. It runs inside the
+container, so it would pass even when the analytics network being internal (and the
+port being unpublished) leaves the service unreachable from the host. A green
+healthcheck is therefore **not** evidence that an operator can reach the Cockpit. That
+was the original defect: a passing healthcheck with no host-reachable endpoint.
+
+The `reads-ready` stage runs a separate host-side preflight that fails closed:
+
+1. `OPIP_COCKPIT_BIND_ADDRESS` must be host loopback; any other value is refused,
+   because the raw HTTP service must never be exposed beyond the host.
+2. The container must report `healthy` (necessary, **not** sufficient).
+3. The host-loopback endpoint **must be published**: `ss -ltn` must show a listener on
+   `127.0.0.1:${OPIP_COCKPIT_HOST_PORT}`. Before the fix nothing listened here at all,
+   which is exactly what this check exists to catch.
+4. The port **must not** be bound on any public interface: `ss -ltn` must show no
+   `0.0.0.0` / `[::]` / `*` listener on that port. This enforces the exposure rule at
+   runtime, not only in the compose file.
+5. The listener **must belong to `opip-cockpit`**: `docker port opip-cockpit` must
+   report the loopback mapping. A stale or unrelated process holding the port would
+   not produce that mapping, so a green listener alone can never stand in for the
+   intended service.
+
+Where each app-level claim is proven:
+
+| Claim | Proven by |
+| --- | --- |
+| The page serves 200 on `/cockpit` | the container healthcheck, which issues a real GET inside the container |
+| The API returns 401 without the operator secret, 200 with it | the test suite, driving the real ASGI app |
+| Non-GET methods are rejected | the test suite |
+| The service is published on host loopback and only there | the preflight (steps 3-5) |
+
+The reachability proof is deliberately taken at the **socket layer** rather than by
+issuing an application request from the shell. What the reverse proxy needs is a TCP
+endpoint on host loopback that belongs to this container, so proving exactly that - and
+that no public endpoint exists - is a direct proof of the contract that broke.
+Application behaviour is proven where it actually lives (healthcheck and suite), and the
+preflight prints `cockpit_app_behaviour=verified_by_healthcheck_and_test_suite` so the
+split is explicit to an operator.
+
+`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all five
+conditions hold, so a passing container healthcheck alone can never mark the Cockpit
+ready.
+
+### Secret surface
+
+The Cockpit is reachable through the reverse proxy, so it must not receive credentials
+it has no use for. `/etc/opip-cockpit.env` is derived by bootstrap from the sealed
+analytics env file with a strict allowlist:
+
+```
+OPIP_COCKPIT_SECRET          (gates every /api/cockpit/* read; distinct from the
+                              trading host's order-capable WEBHOOK_SECRET)
+OPIP_COCKPIT_BIND_ADDRESS
+OPIP_COCKPIT_HOST_PORT
+OPIP_COCKPIT_HTTP_PORT
+```
+
+The sealed file also holds the PostgreSQL admin, shipper, learning and dashboard
+credentials and the privileged database URLs; none of those reach the Cockpit. This
+follows the existing filtered-env pattern already used for Grafana.
 
 ## Intelligence Cockpit provisioning
 

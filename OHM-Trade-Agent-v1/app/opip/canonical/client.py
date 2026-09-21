@@ -10,6 +10,7 @@ from app.opip.canonical.models import (
     PaperPortfolioState,
     PaperV2ActiveExposures,
     PaperV2ExecutionState,
+    PaperV2Ledger,
     PaperV2ProtectionWork,
     PaperV2RecoverableExecutions,
     PendingHandoff,
@@ -49,6 +50,8 @@ class WriterClient(Protocol):
     def get_paper_v2_recoverable_executions(self) -> PaperV2RecoverableExecutions: ...
 
     def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork: ...
+
+    def get_paper_v2_ledger(self) -> PaperV2Ledger: ...
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck: ...
 
@@ -155,6 +158,10 @@ class CanonicalWriterClient:
     def get_paper_v2_protection_work(self) -> PaperV2ProtectionWork:
         response = self._roundtrip({"method": "GET_PAPER_V2_PROTECTION_WORK"})
         return PaperV2ProtectionWork.from_dict(response)
+
+    def get_paper_v2_ledger(self) -> PaperV2Ledger:
+        response = self._roundtrip({"method": "GET_PAPER_V2_LEDGER"})
+        return PaperV2Ledger.from_dict(response)
 
     def confirm_ops_applied(self, event_id: str) -> WriterAck:
         response = self._roundtrip(
@@ -266,6 +273,11 @@ class InProcessWriterClient:
             self._server.dispatch_for_tests(
                 {"method": "GET_PAPER_V2_PROTECTION_WORK"}
             )
+        )
+
+    def get_paper_v2_ledger(self) -> PaperV2Ledger:
+        return PaperV2Ledger.from_dict(
+            self._server.dispatch_for_tests({"method": "GET_PAPER_V2_LEDGER"})
         )
 
     def mark_handoff_superseded(self, event_id: str) -> WriterAck:

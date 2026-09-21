@@ -321,6 +321,9 @@ class PaperV2ProtectionWorkItem:
     disposition_id: str | None = None
     decision_context_id: str | None = None
     reservation_id: str | None = None
+    #: The admission disposition's canonical occurrence time, carried so analytical
+    #: consumers do not have to re-enumerate admitted history to find it.
+    disposition_time: dict[str, Any] | None = None
     quote_currency: str | None = None
     instrument_version: str | None = None
     native_symbol: str | None = None
@@ -374,6 +377,10 @@ class PaperV2ProtectionWorkItem:
             value = raw.get(key)
             return int(value) if value is not None else None
 
+        def _opt_dict(key: str) -> dict[str, Any] | None:
+            value = raw.get(key)
+            return dict(value) if isinstance(value, dict) else None
+
         def _dicts(key: str) -> list[dict[str, Any]]:
             value = raw.get(key)
             return [dict(item) for item in value] if isinstance(value, list) else []
@@ -383,6 +390,7 @@ class PaperV2ProtectionWorkItem:
             disposition_id=_opt_str("disposition_id"),
             decision_context_id=_opt_str("decision_context_id"),
             reservation_id=_opt_str("reservation_id"),
+            disposition_time=_opt_dict("disposition_time"),
             quote_currency=_opt_str("quote_currency"),
             instrument_version=_opt_str("instrument_version"),
             native_symbol=_opt_str("native_symbol"),
@@ -455,6 +463,194 @@ class PaperV2ProtectionWork:
                 PaperV2ProtectionWorkItem.from_dict(item)
                 for item in (items if isinstance(items, list) else [])
             ],
+            error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
+            detail=(str(raw["detail"]) if raw.get("detail") else None),
+        )
+
+
+@dataclass(frozen=True)
+class PaperV2LedgerEntry:
+    """Committed per-trade facts for analytical consumption.
+
+    Read-only, derived only from committed canonical evidence: every field is a
+    fact the store already holds. This is the analytical ledger's *input* - it
+    carries no derived metric and no verdict, because deriving semantics belongs to
+    the cockpit layer, not to the canonical writer.
+
+    It deliberately carries the evidence payloads themselves (order intents,
+    attempts, fills, plan, reconciliation) so the Trade Detail dossier and the
+    audit drill-down can trace a displayed number back to the exact canonical
+    records, plus ``event_ids`` to name those records.
+    """
+
+    paper_trade_id: str
+    disposition_id: str | None = None
+    decision_context_id: str | None = None
+    reservation_id: str | None = None
+    candidate_id: str | None = None
+    episode_id: str | None = None
+    cohort_id: str | None = None
+    quote_currency: str | None = None
+    instrument_version: str | None = None
+    native_symbol: str | None = None
+
+    #: The decision-context policy identity. There is no canonical strategy *name*;
+    #: this version + fingerprint pair is the authoritative strategy axis.
+    policy_version: str | None = None
+    policy_fingerprint: str | None = None
+
+    #: Lifecycle instants, as canonical temporal evidence objects.
+    disposition_time: dict[str, Any] | None = None
+    evaluation_time: str | None = None
+    entry_intent_time: dict[str, Any] | None = None
+    entry_attempt_time: dict[str, Any] | None = None
+    first_entry_fill_time: dict[str, Any] | None = None
+    last_exit_fill_time: dict[str, Any] | None = None
+
+    entry_quantity: float = 0.0
+    exited_quantity: float = 0.0
+    remaining_quantity: float = 0.0
+
+    gross_pnl: float = 0.0
+    fee_cost: float = 0.0
+    spread_cost: float = 0.0
+    slippage_cost: float = 0.0
+    other_cost: float = 0.0
+    execution_costs: float = 0.0
+    reserved_capital: float = 0.0
+    entry_price_vwap: float | None = None
+    exit_price_vwap: float | None = None
+
+    execution_model_version: str | None = None
+    economic_model_version: str | None = None
+
+    protection_plan: dict[str, Any] | None = None
+    protection_state: str | None = None
+    plan_seq: int | None = None
+    trigger_types: tuple[str, ...] = ()
+    target_trigger_count: int = 0
+
+    entry_order_intent: dict[str, Any] | None = None
+    entry_attempt: dict[str, Any] | None = None
+    exit_order_intents: tuple[dict[str, Any], ...] = ()
+    exit_attempts: tuple[dict[str, Any], ...] = ()
+    entry_fills: tuple[dict[str, Any], ...] = ()
+    exit_fills: tuple[dict[str, Any], ...] = ()
+    protection_states: tuple[dict[str, Any], ...] = ()
+    triggers: tuple[dict[str, Any], ...] = ()
+    latest_reconciliation: dict[str, Any] | None = None
+
+    final_verified: bool = False
+    #: Canonical ``event_id``s of this trade's evidence, in commit order, so a
+    #: displayed result can be traced to the records that produced it.
+    event_ids: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2LedgerEntry":
+        def _opt_str(key: str) -> str | None:
+            value = raw.get(key)
+            return str(value) if value else None
+
+        def _opt_dict(key: str) -> dict[str, Any] | None:
+            value = raw.get(key)
+            return dict(value) if isinstance(value, dict) else None
+
+        def _dicts(key: str) -> tuple[dict[str, Any], ...]:
+            value = raw.get(key)
+            return tuple(dict(item) for item in value) if isinstance(value, list) else ()
+
+        def _opt_float(key: str) -> float | None:
+            value = raw.get(key)
+            return float(value) if value is not None else None
+
+        return cls(
+            paper_trade_id=str(raw["paper_trade_id"]),
+            disposition_id=_opt_str("disposition_id"),
+            decision_context_id=_opt_str("decision_context_id"),
+            reservation_id=_opt_str("reservation_id"),
+            candidate_id=_opt_str("candidate_id"),
+            episode_id=_opt_str("episode_id"),
+            cohort_id=_opt_str("cohort_id"),
+            quote_currency=_opt_str("quote_currency"),
+            instrument_version=_opt_str("instrument_version"),
+            native_symbol=_opt_str("native_symbol"),
+            policy_version=_opt_str("policy_version"),
+            policy_fingerprint=_opt_str("policy_fingerprint"),
+            disposition_time=_opt_dict("disposition_time"),
+            evaluation_time=_opt_str("evaluation_time"),
+            entry_intent_time=_opt_dict("entry_intent_time"),
+            entry_attempt_time=_opt_dict("entry_attempt_time"),
+            first_entry_fill_time=_opt_dict("first_entry_fill_time"),
+            last_exit_fill_time=_opt_dict("last_exit_fill_time"),
+            entry_quantity=float(raw.get("entry_quantity") or 0.0),
+            exited_quantity=float(raw.get("exited_quantity") or 0.0),
+            remaining_quantity=float(raw.get("remaining_quantity") or 0.0),
+            gross_pnl=float(raw.get("gross_pnl") or 0.0),
+            fee_cost=float(raw.get("fee_cost") or 0.0),
+            spread_cost=float(raw.get("spread_cost") or 0.0),
+            slippage_cost=float(raw.get("slippage_cost") or 0.0),
+            other_cost=float(raw.get("other_cost") or 0.0),
+            execution_costs=float(raw.get("execution_costs") or 0.0),
+            reserved_capital=float(raw.get("reserved_capital") or 0.0),
+            entry_price_vwap=_opt_float("entry_price_vwap"),
+            exit_price_vwap=_opt_float("exit_price_vwap"),
+            execution_model_version=_opt_str("execution_model_version"),
+            economic_model_version=_opt_str("economic_model_version"),
+            protection_plan=_opt_dict("protection_plan"),
+            protection_state=_opt_str("protection_state"),
+            plan_seq=(
+                int(raw["plan_seq"]) if raw.get("plan_seq") is not None else None
+            ),
+            trigger_types=tuple(str(item) for item in raw.get("trigger_types") or ()),
+            target_trigger_count=int(raw.get("target_trigger_count") or 0),
+            entry_order_intent=_opt_dict("entry_order_intent"),
+            entry_attempt=_opt_dict("entry_attempt"),
+            exit_order_intents=_dicts("exit_order_intents"),
+            exit_attempts=_dicts("exit_attempts"),
+            entry_fills=_dicts("entry_fills"),
+            exit_fills=_dicts("exit_fills"),
+            protection_states=_dicts("protection_states"),
+            triggers=_dicts("triggers"),
+            latest_reconciliation=_opt_dict("latest_reconciliation"),
+            final_verified=bool(raw.get("final_verified", False)),
+            event_ids=tuple(str(item) for item in raw.get("event_ids") or ()),
+        )
+
+
+@dataclass(frozen=True)
+class PaperV2Ledger:
+    """Read-only projection of every committed Paper-v2 trade's ledger facts.
+
+    Health-gated like the other canonical reads: a degraded store must not report
+    an empty ledger, because that would read as "no trades" and silently understate
+    realised economics.
+    """
+
+    status: str
+    entries: tuple[PaperV2LedgerEntry, ...] = ()
+    error_code: str | None = None
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "entries": [entry.to_dict() for entry in self.entries],
+            "error_code": self.error_code,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "PaperV2Ledger":
+        entries = raw.get("entries")
+        return cls(
+            status=str(raw["status"]),
+            entries=tuple(
+                PaperV2LedgerEntry.from_dict(entry)
+                for entry in (entries if isinstance(entries, list) else [])
+            ),
             error_code=(str(raw["error_code"]) if raw.get("error_code") else None),
             detail=(str(raw["detail"]) if raw.get("detail") else None),
         )

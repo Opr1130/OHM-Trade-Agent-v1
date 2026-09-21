@@ -45,6 +45,12 @@ async def fence_legacy_tradingview(request: Request, call_next):
 app.include_router(router)
 app.include_router(dashboard_router)
 
+# The B/C-4 Cockpit analytics router is deliberately NOT mounted here. It reads the
+# verified canonical replica, which exists only on the analytics plane, so serving it
+# from the trading process would both cross the production/analytics plane boundary
+# and expose endpoints that could never succeed. It is served exclusively by
+# ``app.api.cockpit_service:app`` on the analytics plane.
+
 
 @app.on_event("startup")
 def startup_event() -> None:
