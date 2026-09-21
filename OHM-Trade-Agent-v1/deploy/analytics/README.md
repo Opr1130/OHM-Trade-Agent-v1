@@ -169,13 +169,22 @@ single rename, so an interruption can never leave a new timestamp paired with an
 release. Readiness is recorded only after every step succeeds, and a failed attempt
 leaves no marker.
 
-For `cockpit-ready`, the owner-gated workflow uploads the existing sealed analytics
-environment and the remote runner atomically merges only the four `OPIP_COCKPIT_*`
-settings into the installed host environment before bootstrap. It refuses an upload
-missing any Cockpit setting and rejects trading/order credentials. This provisions
-`OPIP_COCKPIT_SECRET` without rerunning the PostgreSQL `empty` stage or rotating
+For `cockpit-ready`, the owner-gated workflow requires the
+`analytics-production` GitHub environment secret `OPIP_COCKPIT_SECRET`. The
+workflow constructs a minimal four-key Cockpit provisioning payload containing that
+secret plus the fixed loopback bind and Cockpit ports; it does **not** reuse or decode
+`OPIP_ANALYTICS_ENV_B64` for this stage. The remote runner validates that payload and
+atomically merges only the four `OPIP_COCKPIT_*` settings into the installed host
+environment before bootstrap. It refuses a missing, duplicate, placeholder, malformed,
+or low-entropy Cockpit secret and rejects trading/order credentials. This provisions
+the Cockpit independently without rerunning the PostgreSQL `empty` stage or rotating
 unrelated PostgreSQL/Grafana credentials. No PostgreSQL container is started, and
 `cockpit-ready` does not read, satisfy, advance or imply the soak or `reads-ready`.
+
+Operator prerequisite: create `OPIP_COCKPIT_SECRET` in the
+`analytics-production` environment before the first `cockpit-ready` run. Use a
+fresh URL-safe value of at least 24 characters and never place the value in repository
+files, issue/PR comments, or workflow logs.
 
 ### What `cockpit-ready` verifies before starting the Cockpit
 
