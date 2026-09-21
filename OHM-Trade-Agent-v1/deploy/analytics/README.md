@@ -219,6 +219,50 @@ The health wait never replaces the preflight, and neither replaces the verifier:
 missing, unreadable, structurally invalid, SHA-mismatched or stale replica, or an
 unresolvable `current` pointer, fails the stage closed before the Cockpit is started.
 
+### Why the Cockpit needs a second network
+
+The Cockpit is attached to **two** networks, and both are required:
+
+| Network | Internal | Purpose |
+| --- | --- | --- |
+| `opip-analytics` | `true` | the internal analytics plane it shares with the other analytics services |
+| `opip-cockpit-publish` | `false` | the ordinary bridge Docker needs in order to install the host-loopback publish |
+
+A container attached **only** to `internal: true` bridge networks receives no host port
+mapping. On the production engine that surfaced as a healthy container with no reachable
+endpoint at all:
+
+```
+docker port opip-cockpit                             -> empty
+docker inspect opip-cockpit --format '{{json .NetworkSettings.Ports}}'
+                                                     -> {"8000/tcp":null}
+ss -ltnp | grep ':8000'                              -> empty
+curl http://127.0.0.1:8000/cockpit                   -> connection refused
+```
+
+`cockpit-ready` failed its preflight with `cockpit container is healthy but NOT published
+on host loopback 127.0.0.1:8000` — the preflight did exactly what it is for. An internal
+bridge supplies no gateway/forwarding path for the requested mapping, so Docker accepted
+the service-level `127.0.0.1:8000:8000` declaration and produced no mapping.
+
+`opip-cockpit-publish` is used by the Cockpit and nothing else. It is deliberately **not**
+declared in the shared analytics Compose file, so no PostgreSQL or Grafana service can
+join it. No subnet is pinned, so Docker allocates a non-conflicting one.
+
+Exposure is still loopback-only, and is enforced in three independent places:
+
+1. the service port mapping is explicitly `${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}`;
+2. the publish network sets `com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"`
+   as defense in depth, so a future service that forgets an explicit bind still cannot
+   reach a public interface — this is not the primary guarantee;
+3. `cockpit_preflight` independently refuses any non-loopback bind and any public
+   listener at runtime.
+
+This was deliberately **not** solved by relaxing `internal: true`, binding `0.0.0.0`,
+using `network_mode: host`, adding a host-side forwarding shim, or connecting the
+container to a network by hand: each of those would either widen exposure or hide the
+defect instead of fixing the topology.
+
 ## Canonical freshness contract
 
 `ops.dashboard_freshness_v` is the single freshness result consumed by

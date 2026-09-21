@@ -82,7 +82,11 @@ services:
       # already expects. Same host root the learning-plane jobs mount.
       - /var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro
     networks:
+      # The internal analytics network the Cockpit shares with the analytics plane, and
+      # a dedicated non-internal network that makes the host publish work. Both are
+      # required; see the network comments at the bottom of this file.
       opip-analytics:
+      opip-cockpit-publish:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m
@@ -120,3 +124,35 @@ networks:
     ipam:
       config:
         - subnet: 172.29.0.0/24
+
+  # Dedicated publish network. Used by opip-cockpit and nothing else.
+  #
+  # Why this exists: Docker Compose correctly declares the host publish on the service,
+  # but a container attached ONLY to `internal: true` bridge networks receives no host
+  # port mapping. On the production engine that surfaced exactly as:
+  #
+  #   docker port opip-cockpit                     => empty
+  #   .NetworkSettings.Ports["8000/tcp"]           => null
+  #   ss -ltnp | grep :8000                        => empty
+  #
+  # while the container itself was healthy. An internal bridge does not supply the
+  # gateway/forwarding path Docker needs to install the requested mapping, so the
+  # Cockpit had no host-loopback endpoint for the TLS reverse proxy to reach.
+  #
+  # Attaching a second, ordinary bridge gives Docker that path while leaving the
+  # analytics network's `internal: true` isolation untouched. This is deliberately NOT
+  # solved by relaxing `internal: true`, by binding 0.0.0.0, by `network_mode: host`, or
+  # by any host-side forwarding shim: those would all widen exposure or hide the defect.
+  #
+  # No subnet is pinned: Docker allocates a non-conflicting one, so adding this network
+  # cannot collide with the analytics subnet or with a host that already uses 172.29.x.
+  opip-cockpit-publish:
+    driver: bridge
+    driver_opts:
+      # Defense in depth only. This makes 127.0.0.1 the default host binding address for
+      # any port published on this network, so a future service that forgets an explicit
+      # loopback bind still cannot reach a public interface. It is NOT the primary
+      # guarantee: the service-level port mapping is explicitly loopback, and
+      # `cockpit_preflight` independently refuses any non-loopback or public listener at
+      # runtime.
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
