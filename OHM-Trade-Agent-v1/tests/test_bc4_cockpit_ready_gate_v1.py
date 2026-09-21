@@ -125,6 +125,14 @@ def _extract_function(text: str, name: str) -> str:
     return text[start:end]
 
 
+def _remove_function(text: str, name: str) -> str:
+    """Drop a top-level function definition if present, keeping its call sites."""
+    marker = f"{name}() {{"
+    if marker not in text:
+        return text
+    return text.replace(_extract_function(text, name), "")
+
+
 def _extract_block(text: str, guard: str) -> tuple[int, int, str]:
     """Return the extent of `if <guard>; then ... fi`, matched by nesting depth.
 
@@ -714,6 +722,24 @@ _EXTRACTED_FUNCTIONS = (
     "cockpit_deploy_verified",
 )
 
+# Helpers the harness replaces, because they either touch the host directly or need
+# sealed settings the harness deliberately does not provide.
+_STUBBED_NAMES = (
+    "analytics_host_lock",
+    "sync_release_checkout",
+    "guard_no_trading_credentials",
+    "require_uri_unreserved_password",
+    "require_grafana_verify_full",
+    "require_analytics_verify_full_dsn",
+    "write_grafana_env_file",
+    "validate_postgres_tls_key",
+    "validate_promotion_evidence",
+    "wait_for_postgres",
+    "admin_run",
+    "systemctl",
+    "require_stage",
+)
+
 
 class _Harness:
     """Runs the real bootstrap control flow for one stage with host effects stubbed."""
@@ -738,7 +764,9 @@ class _Harness:
             encoding="utf-8",
         )
         self.replica_parent = tmp_path / "canonical-replica"
-        (self.replica_parent / "generations" / GENERATION_ID).mkdir(parents=True)
+        (self.replica_parent / "generations" / GENERATION_ID).mkdir(
+            parents=True, exist_ok=True
+        )
         (self.replica_parent / "current").write_text(GENERATION_ID, encoding="utf-8")
         self.compose_file = tmp_path / "docker-compose.yml"
         self.compose_file.write_text("services: {}\n", encoding="utf-8")
@@ -775,6 +803,13 @@ class _Harness:
 
         start = BOOTSTRAP.index(DISPATCH_GUARD)
         region = BOOTSTRAP[start:]
+        # The region re-defines several helpers after the dispatch. The harness must
+        # control those (they either have host-side effects or need sealed settings the
+        # harness does not provide), and a definition appended after the stub preamble
+        # would silently win. Drop those definitions from the region; their call sites
+        # remain, so the stubs and the harness's own extracted copies are what run.
+        for name in _EXTRACTED_FUNCTIONS + _STUBBED_NAMES:
+            region = _remove_function(region, name)
         # The harness must exercise the control flow only: taking the analytics-plane
         # lock or driving git would be a real side effect of testing, so both are stubbed
         # and their bodies must not be embedded.
@@ -782,6 +817,9 @@ class _Harness:
         assert "exec 8>" not in region
         assert "git -C" not in region
         assert "\ncompose ps\n" in region
+        # Every stub must actually be reachable: none may be re-defined by the region.
+        for name in _STUBBED_NAMES:
+            assert f"\n{name}() {{" not in region, f"{name} would override its stub"
         return script + "\n" + _STUB_PREAMBLE + "\n" + region
 
     def run(
@@ -842,6 +880,51 @@ def test_harness_embeds_the_real_control_flow(tmp_path: Path):
         assert "systemctl() {" in script
         assert "flock" not in script
         assert "git -C" not in script
+
+
+def test_harness_defines_every_variable_its_code_paths_reference(tmp_path: Path):
+    """The harness must not reference a constant it never defines.
+
+    Under `set -u` a missing constant aborts the harness at run time, and the harness is
+    only executed where bash exists (CI). This static check therefore runs everywhere
+    and catches the class of defect that would otherwise first appear in CI: embedded
+    control flow referencing a variable the harness does not define. That is exactly how
+    a stubbed helper removed from the region previously left the real helper's constants
+    dangling.
+    """
+    for stage in ("cockpit-ready", "reads-ready"):
+        script = _Harness(tmp_path / stage, stage).build_script()
+
+        assigned = set(re.findall(r"^[ \t]*([A-Z_][A-Z0-9_]*)=", script, flags=re.M))
+        # Names read from STATE_FILE at run time, supplied by the environment, or only
+        # referenced from stage branches this harness never executes.
+        allowed = {
+            "EMPTY_STARTED_AT_UTC",
+            "EMPTY_DEPLOY_COUNT",
+            "EMPTY_LAST_SHA",
+            "SHIPPER_STARTED_AT_UTC",
+            "SHIPPER_SHA",
+            "DEPLOYED_SHA",
+            "OFFHOST_EVIDENCE",
+            "RESTORE_EVIDENCE",
+            "ROLLBACK_EVIDENCE",
+            "OPIP_TEST_LOG",
+            "OPIP_TEST_VERIFY_RC",
+            "OPIP_TEST_RESOLVE_RC",
+            "OPIP_TEST_HEALTH",
+            "OPIP_TEST_GENERATION",
+        }
+
+        missing = []
+        for match in re.finditer(r"\$\{?([A-Z_][A-Z0-9_]*)", script):
+            name = match.group(1)
+            # `$VAR` must be defined; `${VAR:-...}` and `${VAR:+...}` are safe.
+            if script[match.end() : match.end() + 1] == ":":
+                continue
+            if name in assigned or name in allowed:
+                continue
+            missing.append(name)
+        assert not missing, f"undefined variables for {stage}: {sorted(set(missing))}"
 
 
 @requires_bash
