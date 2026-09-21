@@ -89,7 +89,7 @@ jobs:
           test -n "$USER"
           test -n "$SSH_KEY_B64"
           test -n "$KNOWN_HOSTS"
-          if [[ "$STAGE" == "empty" ]]; then
+          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
             test -n "$ANALYTICS_ENV_B64"
           fi
 
@@ -122,7 +122,7 @@ jobs:
           RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
           "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
           git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
-          if [[ "$STAGE" == "empty" ]]; then
+          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
             printf '%s' "$ANALYTICS_ENV_B64" | base64 --decode > analytics.env
             chmod 600 analytics.env
             scp -i ~/.ssh/opip_analytics -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -P "$PORT" analytics.env "$REMOTE:/tmp/opip-analytics-env-$GITHUB_RUN_ID"
@@ -143,7 +143,7 @@ jobs:
           PORT="${PORT:-22}"
           RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
           ENV_UPLOAD=""
-          if [[ "$STAGE" == "empty" ]]; then
+          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
             ENV_UPLOAD="/tmp/opip-analytics-env-$GITHUB_RUN_ID"
           fi
           ssh \
