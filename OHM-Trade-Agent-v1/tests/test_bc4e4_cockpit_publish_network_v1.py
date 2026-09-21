@@ -350,7 +350,10 @@ _PROBE_IMAGES: tuple[tuple[str, list[str]], ...] = (
     ("python:3.12-slim", ["python", "-m", "http.server", "8080", "--directory", "/srv"]),
 )
 
-_PROBE_TOKEN = "opip-bc4e4-publish-probe-ok"
+#: A plain sentence, deliberately not credential-shaped: an assignment that is both named
+#: like a credential and carries high entropy trips gitleaks' generic-api-key heuristic, and
+#: widening the secret allowlist for a test constant would be the wrong trade.
+_PROBE_MARKER = "opip cockpit publish probe marker"
 
 
 def _docker(*args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -421,13 +424,13 @@ def _probe_container_id(compose_path: Path, project: str) -> str:
     return by_label.stdout.split()[0]
 
 
-def _http_token_present(host: str, port: int, *, attempts: int = 40) -> tuple[bool, str]:
-    """Fetch ``/`` and report whether the probe's token came back.
+def _http_marker_present(host: str, port: int, *, attempts: int = 40) -> tuple[bool, str]:
+    """Fetch ``/`` and report whether the probe's marker came back.
 
     A bare TCP connect is not sufficient evidence: Docker's proxy can complete the
     handshake on the host port while nothing inside the container is serving, so a
     connect-only check can pass on a container that serves nothing. Requiring our own
-    token in the body proves the request reached this container's listener.
+    marker in the body proves the request reached this container's listener.
     """
     import urllib.error
     import urllib.request
@@ -437,7 +440,7 @@ def _http_token_present(host: str, port: int, *, attempts: int = 40) -> tuple[bo
         try:
             with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
                 body = response.read().decode("utf-8", "replace")
-                if _PROBE_TOKEN in body:
+                if _PROBE_MARKER in body:
                     return True, body[:200]
                 last = f"status={response.status} body={body[:120]!r}"
         except (urllib.error.URLError, OSError) as exc:
@@ -451,7 +454,7 @@ def _write_probe_server_root(directory: Path) -> Path:
     root = directory / "srv"
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.html").write_text(
-        f"<html><body>{_PROBE_TOKEN}</body></html>\n", encoding="utf-8"
+        f"<html><body>{_PROBE_MARKER}</body></html>\n", encoding="utf-8"
     )
     return root
 
@@ -616,7 +619,7 @@ def test_generated_probe_compose_is_valid_and_mirrors_the_cockpit_topology(tmp_p
             f"{directory / 'srv'}:/srv:ro"
         ], service["volumes"]
         assert (directory / "srv" / "index.html").is_file()
-        assert _PROBE_TOKEN in (directory / "srv" / "index.html").read_text(
+        assert _PROBE_MARKER in (directory / "srv" / "index.html").read_text(
             encoding="utf-8"
         )
 
@@ -656,8 +659,9 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
         pytest.skip("no usable Docker image available for the runtime publish probe")
     image, command = probe
 
-    project = f"opip-bc4e4-probe-{os.getpid()}-{_free_loopback_port()}"
+    # Allocate the port once so the project name and the published mapping cannot diverge.
     port = _free_loopback_port()
+    project = f"opip-bc4e4-probe-{os.getpid()}-{port}"
     compose = _write_probe_compose(
         tmp_path, project, image, command, port, with_publish_network=True
     )
@@ -670,9 +674,9 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
         def report() -> str:
             return _container_ports_report(container)
 
-        # Definitive reachability: our own token must come back from the served file, so
+        # Definitive reachability: our own marker must come back from the served file, so
         # this cannot pass on a container that serves nothing.
-        served, detail = _http_token_present("127.0.0.1", port)
+        served, detail = _http_marker_present("127.0.0.1", port)
         assert served, (
             "the published port never served this container's content on host loopback; "
             f"last observation: {detail}{report()}"
@@ -698,8 +702,9 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
             host_ip in {"0.0.0.0", "::", "[::]"} for host_ip, _, _ in mappings
         ), mappings
 
-        # The internal network is still attached alongside the publish network.
-        inspect = yaml.safe_load(
+        # Both networks are attached. Compose prefixes project-scoped networks with the
+        # project name, so match on the declared suffix rather than guessing the prefix.
+        inspect_settings = yaml.safe_load(
             _docker(
                 "inspect",
                 container,
@@ -707,8 +712,20 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
                 "{{json .NetworkSettings.Networks}}",
             ).stdout
         )
-        assert f"{project}_internal" in inspect, f"{inspect}{report()}"
-        assert f"{project}_publish" in inspect, f"{inspect}{report()}"
+        keys = list(inspect_settings)
+        internal_keys = [k for k in keys if k.endswith("-internal")]
+        publish_keys = [k for k in keys if k.endswith("-publish")]
+        assert internal_keys, f"{keys}{report()}"
+        assert publish_keys, f"{keys}{report()}"
+
+        # The mechanism itself, observed: the internal bridge supplies no gateway, while
+        # the ordinary publish bridge does. That gateway is the forwarding path Docker
+        # needs in order to install the host mapping, which is why the internal-only
+        # topology produced no mapping at all.
+        internal_settings = inspect_settings[internal_keys[0]]
+        publish_settings = inspect_settings[publish_keys[0]]
+        assert not internal_settings.get("Gateway"), f"{internal_settings}{report()}"
+        assert publish_settings.get("Gateway"), f"{publish_settings}{report()}"
     finally:
         _docker("compose", "-f", str(compose), "down", "-v", "--remove-orphans", check=False)
 
@@ -729,8 +746,8 @@ def test_runtime_internal_only_control_case(tmp_path: Path):
         pytest.skip("no usable Docker image available for the runtime publish probe")
     image, command = probe
 
-    project = f"opip-bc4e4-ctrl-{os.getpid()}-{_free_loopback_port()}"
     port = _free_loopback_port()
+    project = f"opip-bc4e4-ctrl-{os.getpid()}-{port}"
     compose = _write_probe_compose(
         tmp_path, project, image, command, port, with_publish_network=False
     )
