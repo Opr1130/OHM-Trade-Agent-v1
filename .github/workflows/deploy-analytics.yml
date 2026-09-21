@@ -125,7 +125,7 @@ jobs:
           if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
             printf '%s' "$ANALYTICS_ENV_B64" | base64 --decode > analytics.env
             chmod 600 analytics.env
-            scp -i ~/.ssh/opip_analytics -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -P "$PORT" analytics.env "$REMOTE:/tmp/opip-analytics-env-$GITHUB_RUN_ID"
+            cat analytics.env | "${SSH[@]}" "$REMOTE" "sudo -n install -o root -g root -m 0600 /dev/stdin '/tmp/opip-analytics-env-$GITHUB_RUN_ID'"
             rm -f analytics.env
           fi
 
