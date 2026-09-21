@@ -136,10 +136,10 @@ sync_cockpit_settings() {
     $1 != "OPIP_COCKPIT_HTTP_PORT" { print }
   ' "$ENV_FILE" > "$temporary"
   {
-    printf 'OPIP_COCKPIT_SECRET=%s\\n' "$cockpit_secret_value"
-    printf 'OPIP_COCKPIT_BIND_ADDRESS=%s\\n' "$bind_value"
-    printf 'OPIP_COCKPIT_HOST_PORT=%s\\n' "$host_port_value"
-    printf 'OPIP_COCKPIT_HTTP_PORT=%s\\n' "$http_port_value"
+    printf 'OPIP_COCKPIT_SECRET=%s\n' "$cockpit_secret_value"
+    printf 'OPIP_COCKPIT_BIND_ADDRESS=%s\n' "$bind_value"
+    printf 'OPIP_COCKPIT_HOST_PORT=%s\n' "$host_port_value"
+    printf 'OPIP_COCKPIT_HTTP_PORT=%s\n' "$http_port_value"
   } >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"

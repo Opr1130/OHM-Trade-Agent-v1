@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,7 +66,11 @@ def test_cockpit_ready_receives_sealed_env_without_running_empty_stage():
     workflow = (ROOT.parent / ".github/workflows/deploy-analytics.yml").read_text()
     runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
 
-    assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 3
+    assert workflow.count('[[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]') >= 2
+    assert "COCKPIT_SECRET: ${{ secrets.OPIP_COCKPIT_SECRET }}" in workflow
+    assert 'if [[ "$STAGE" == "empty" ]]; then' in workflow
+    assert 'elif [[ "$STAGE" == "cockpit-ready" ]]; then' in workflow
+    assert "OPIP_COCKPIT_BIND_ADDRESS=127.0.0.1" in workflow
     assert "sync_cockpit_settings()" in runner
     assert "sealed analytics environment must contain exactly one canonical $key setting" in runner
     assert "OPIP_COCKPIT_SECRET must be a non-placeholder URL-safe secret of at least 24 characters" in runner
@@ -108,4 +113,40 @@ def test_cockpit_secret_sync_allowlist_is_exact():
     assert '[[ "$bind_value" == "127.0.0.1" ]]' in sync
     assert "Cockpit ports must be decimal values from 1 through 65535" in sync
     assert "grep -E \"^${key}=\"" not in sync
-    assert "printf 'OPIP_COCKPIT_SECRET=%s\\\\n'" in sync
+    assert r"printf 'OPIP_COCKPIT_SECRET=%s\n'" in sync
+    assert r"printf 'OPIP_COCKPIT_SECRET=%s\\n'" not in sync
+
+
+def test_cockpit_secret_sync_writes_four_physical_env_records(tmp_path):
+    """The sync append block must serialize one Cockpit setting per physical line."""
+    runner = (ROOT / "deploy/analytics/run-gated-stage.sh").read_text()
+    start = runner.index("sync_cockpit_settings()")
+    end = runner.index("\n}\n", start) + 3
+    sync = runner[start:end]
+    printf_lines = [
+        line.strip()
+        for line in sync.splitlines()
+        if line.strip().startswith("printf 'OPIP_COCKPIT_")
+    ]
+    assert len(printf_lines) == 4
+
+    target = tmp_path / "cockpit.env"
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            "cockpit_secret_value=abcdefghijklmnopqrstuvwxyz012345",
+            "bind_value=127.0.0.1",
+            "host_port_value=8000",
+            "http_port_value=8000",
+            "{",
+            *[f"  {line}" for line in printf_lines],
+            f"}} > {str(target)!r}",
+        ]
+    )
+    subprocess.run(["bash", "-c", script], check=True)
+    assert target.read_text().splitlines() == [
+        "OPIP_COCKPIT_SECRET=abcdefghijklmnopqrstuvwxyz012345",
+        "OPIP_COCKPIT_BIND_ADDRESS=127.0.0.1",
+        "OPIP_COCKPIT_HOST_PORT=8000",
+        "OPIP_COCKPIT_HTTP_PORT=8000",
+    ]

@@ -82,6 +82,7 @@ jobs:
           SSH_KEY_B64: ${{ secrets.OPIP_ANALYTICS_SSH_KEY_B64 }}
           KNOWN_HOSTS: ${{ secrets.OPIP_ANALYTICS_KNOWN_HOSTS }}
           ANALYTICS_ENV_B64: ${{ secrets.OPIP_ANALYTICS_ENV_B64 }}
+          COCKPIT_SECRET: ${{ secrets.OPIP_COCKPIT_SECRET }}
           STAGE: ${{ steps.target.outputs.stage }}
         run: |
           set -euo pipefail
@@ -89,8 +90,11 @@ jobs:
           test -n "$USER"
           test -n "$SSH_KEY_B64"
           test -n "$KNOWN_HOSTS"
-          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
+          if [[ "$STAGE" == "empty" ]]; then
             test -n "$ANALYTICS_ENV_B64"
+          fi
+          if [[ "$STAGE" == "cockpit-ready" ]]; then
+            test -n "$COCKPIT_SECRET"
           fi
 
       - name: Configure pinned SSH identity
@@ -114,6 +118,7 @@ jobs:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
           STAGE: ${{ steps.target.outputs.stage }}
           ANALYTICS_ENV_B64: ${{ secrets.OPIP_ANALYTICS_ENV_B64 }}
+          COCKPIT_SECRET: ${{ secrets.OPIP_COCKPIT_SECRET }}
         run: |
           set -euo pipefail
           PORT="${PORT:-22}"
@@ -122,8 +127,18 @@ jobs:
           RELEASE_DIR="/var/tmp/opip-analytics-$TARGET_SHA-$GITHUB_RUN_ID"
           "${SSH[@]}" "$REMOTE" "sudo -n install -d -o root -g root -m 0700 '$RELEASE_DIR'"
           git archive --format=tar "$TARGET_SHA" | "${SSH[@]}" "$REMOTE" "sudo -n tar -xf - -C '$RELEASE_DIR'"
-          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
+          if [[ "$STAGE" == "empty" ]]; then
             printf '%s' "$ANALYTICS_ENV_B64" | base64 --decode > analytics.env
+          elif [[ "$STAGE" == "cockpit-ready" ]]; then
+            umask 077
+            {
+              printf 'OPIP_COCKPIT_SECRET=%s\n' "$COCKPIT_SECRET"
+              printf 'OPIP_COCKPIT_BIND_ADDRESS=127.0.0.1\n'
+              printf 'OPIP_COCKPIT_HOST_PORT=8000\n'
+              printf 'OPIP_COCKPIT_HTTP_PORT=8000\n'
+            } > analytics.env
+          fi
+          if [[ "$STAGE" == "empty" || "$STAGE" == "cockpit-ready" ]]; then
             chmod 600 analytics.env
             cat analytics.env | "${SSH[@]}" "$REMOTE" "sudo -n install -o root -g root -m 0600 /dev/stdin '/tmp/opip-analytics-env-$GITHUB_RUN_ID'"
             rm -f analytics.env
