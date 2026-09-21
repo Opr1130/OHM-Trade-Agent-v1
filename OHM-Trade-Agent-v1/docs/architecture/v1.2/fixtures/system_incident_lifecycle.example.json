@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "contract": "O'Pip Alert v2 system-incident governance",
+  "lifecycle": ["OPEN", "CHANGED", "ESCALATED", "RECOVERED"],
+  "state_file": "/app/data/system_incidents.json",
+  "schema_constant": "app.services.system_incidents.SCHEMA_VERSION",
+  "identity": {
+    "alert_family": "SYSTEM_HEALTH",
+    "rule": "SYSTEM_HEALTH:<semantic_scope>",
+    "must_not_use_as_identity": [
+      "current hour",
+      "raw exception text",
+      "changing sentence wording",
+      "complete asset list",
+      "stack trace",
+      "current price",
+      "current timestamp"
+    ],
+    "examples": [
+      "SYSTEM_HEALTH:KRAKEN:PUBLIC_CONNECTIVITY",
+      "SYSTEM_HEALTH:KRAKEN:READ_ONLY_CONNECTIVITY",
+      "SYSTEM_HEALTH:KRAKEN:READ_ONLY_AUTH",
+      "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT",
+      "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING",
+      "SYSTEM_HEALTH:KRAKEN:POSITION_VERIFICATION",
+      "SYSTEM_HEALTH:UNIFIED_CYCLE:OPERATOR_STATE",
+      "SYSTEM_HEALTH:INTERNAL:SERVICE"
+    ]
+  },
+  "notification_budget": {
+    "open": 1,
+    "escalation": 1,
+    "recovered": 1,
+    "rule": "one semantic incident produces at most one OPEN, one material escalation and one RECOVERED human notification; every additional occurrence increments occurrence_count and suppressed_notification_count"
+  },
+  "connectivity_recovery_rule": {
+    "owner_rule": "notify only after connectivity has failed to recover MORE THAN six consecutive recovery cycles",
+    "notify_after_consecutive_failures": 7,
+    "first_notification_cycle": 7,
+    "cycles_1_to_6": "SILENT (durable telemetry only)",
+    "cycles_after_7": "keep recovering; no repeated failure notification",
+    "recovery_cycle_definition": "one higher-level health probe; internal KrakenPublicTransport retries do not increment the recovery-cycle counter",
+    "not_applicable_classes": [
+      "KRAKEN_READ_ONLY_AUTH_FAILURE",
+      "KRAKEN_RATE_LIMITED",
+      "HELD_ASSET_PRICING_DEGRADED",
+      "POSITION_VERIFICATION_UNAVAILABLE",
+      "PROVIDER_RATE_LIMITED",
+      "DATA_PIPELINE_STALE",
+      "INTERNAL_SERVICE_FAILURE"
+    ]
+  },
+  "persisted_row_fields": [
+    "incident_id",
+    "incident_key",
+    "alert_family",
+    "incident_class",
+    "scope",
+    "state",
+    "severity",
+    "first_seen_at",
+    "last_seen_at",
+    "occurrence_count",
+    "consecutive_recovery_failures",
+    "suppressed_notification_count",
+    "latest_reason",
+    "metadata",
+    "notification_state",
+    "opened_notification_at",
+    "open_message_id",
+    "last_escalation_at",
+    "escalation_notification_at",
+    "escalation_message_id",
+    "recovered_at",
+    "recovered_notification_at",
+    "recovered_message_id",
+    "last_success_at"
+  ],
+  "never_persisted": [
+    "bot token",
+    "API key",
+    "auth header",
+    "private key",
+    "password",
+    "any credential value"
+  ],
+  "example": {
+    "incident_key": "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING",
+    "states": [
+      {"cycle": 1, "state": "OPEN", "action": "NOTIFY_OPEN", "occurrence_count": 1},
+      {"cycle": 2, "state": "CHANGED", "action": "SUPPRESS_ONGOING", "occurrence_count": 2},
+      {"cycle": 60, "state": "CHANGED", "action": "SUPPRESS_ONGOING", "occurrence_count": 60, "suppressed_notification_count": 59},
+      {"cycle": 61, "state": "RECOVERED", "action": "NOTIFY_RECOVERY", "occurrence_count": 60}
+    ]
+  },
+  "authority": {
+    "trading_authority": "unchanged",
+    "risk_authority": "unchanged",
+    "paper_v2_activation": "unchanged",
+    "trade_protection_events_affected": false,
+    "signal_statistics_affected": false
+  }
+}

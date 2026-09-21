@@ -130,11 +130,19 @@ class KrakenPublicTransport:
         params: dict[str, Any],
         *,
         timeout_seconds: float,
+        bypass_cache: bool = False,
     ) -> dict[str, Any]:
+        """Perform one public request, optionally bypassing the TTL cache.
+
+        ``bypass_cache`` exists for health/recovery probes: a TTL cache hit is
+        not evidence that provider connectivity recovered, so a recovery probe
+        must reach the network. Ordinary callers keep the cached default.
+        """
         key = self._cache_key(endpoint, params)
-        cached = self._cached(key)
-        if cached is not None:
-            return cached
+        if not bypass_cache:
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -200,6 +208,25 @@ class KrakenPublicTransport:
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+
+    def reset_connection(self) -> bool:
+        """Recreate the pooled HTTP client after a genuine low-level failure.
+
+        This is transport hygiene only. It never places, changes, cancels,
+        confirms, or even reads an order, and it cannot reach a trading
+        endpoint: the transport is the public market-data plane.
+        """
+
+        try:
+            with self._lock:
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._client = httpx.Client()
+            return True
+        except Exception:
+            return False
 
 
 _SHARED_TRANSPORT: KrakenPublicTransport | None = None

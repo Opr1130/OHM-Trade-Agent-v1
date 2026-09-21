@@ -100,32 +100,33 @@ def format_pending_setup_message(
 ) -> str:
     if result.status == "ENTRY_ZONE_REACHED":
         icon = "🟢"
-        title = "OHM ENTRY READY"
+        title = "ENTRY READY"
         action = "REVIEW ENTRY"
     elif result.status == "INVALIDATED":
         icon = "🔴"
-        title = "OHM SETUP INVALID"
-        action = "DO NOT ENTER — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
+        title = "SETUP INVALID"
+        action = "DO NOT ENTER — Cancel any open Kraken order manually; O'Pip uses a read-only Kraken key"
     elif result.status == "TOO_EXTENDED":
         icon = "⚠️"
-        title = "OHM DO NOT CHASE"
-        action = "WAIT — Cancel any open Kraken order manually; OHM uses a read-only Kraken key"
+        title = "DO NOT CHASE"
+        action = "WAIT — Cancel any open Kraken order manually; O'Pip uses a read-only Kraken key"
     else:
         icon = "ℹ️"
-        title = "OHM SETUP UPDATE"
+        title = "SETUP UPDATE"
         action = "WAIT"
 
     downside = _stop_downside_pct(setup, float(result.current_price))
     return (
         f"{icon} {title} — {display_market_label(setup.symbol)}\n"
+        f"Action: {action}\n"
         f"Price: {float(result.current_price):.8g}\n"
         f"Entry zone: {float(setup.entry_low):.8g} - {float(setup.entry_high):.8g}\n"
         f"Do not chase: {float(setup.chase_limit):.8g} | Stop: {float(setup.stop_price):.8g}\n"
         f"T1 / T2: {float(setup.target_1):.8g} / {float(setup.target_2):.8g}\n"
         f"Setup Score: {int(setup.confidence)}/100 (not probability) | Risk: {setup.risk_level.upper()} | Downside: {downside:.1f}%\n"
-        f"Reason: {one_line_reason(result.reason)}\n"
-        f"Action: {action}\n"
-        "Score is deterministic setup quality, not a calibrated probability."
+        f"Why: {one_line_reason(result.reason)}\n"
+        "Score is deterministic setup quality, not a calibrated probability. "
+        "No order was placed or changed."
     )
 
 

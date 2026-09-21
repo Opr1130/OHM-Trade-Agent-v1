@@ -7,10 +7,36 @@ from app.services.kraken_exposure_resolver import KrakenExposureResolver, Resolv
 from app.services.kraken_position_verification import KrakenPositionVerifier
 from app.services.position_materiality import refine_protection_action
 from app.services.asset_display_identity import display_market_label
+from app.services.alert_taxonomy import SYSTEM_HEALTH_FAMILY
+from app.services.alert_v2_format import (
+    format_system_incident_message,
+    outage_seconds_between,
+)
 from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
+from app.services.kraken_health import (
+    KrakenHealthScope,
+    KrakenScopeProbe,
+    public_connectivity_probe,
+    read_only_connectivity_probe,
+    transport_connection_reset,
+)
 from app.services.notification_policy import record_emitted, should_emit
-from app.services.telegram_delivery import record_telegram_suppression, send_tracked_telegram
+from app.services.system_incidents import (
+    SystemIncidentScope,
+    classify_degradation_reason,
+    confirm_incident_notification,
+    observe_degradation,
+    observe_recovery,
+    read_incidents,
+    release_incident_notification,
+    requires_owner_recovery_cycles,
+)
+from app.services.telegram_delivery import (
+    record_telegram_not_eligible,
+    record_telegram_suppression,
+    send_tracked_telegram,
+)
 from app.services.trade_monitor import monitor_trade
 from app.services.trade_monitor_notifier import send_monitor_update
 from app.services.trade_outcome_registry import update_active_observation
@@ -29,51 +55,91 @@ class MonitorRunSummary:
     failures: list[str]
 
 
-def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_TRADE_MONITOR") -> bool:
+def _telegram_configured(settings) -> bool:
+    return bool(
+        str(getattr(settings, "telegram_bot_token", "") or "").strip()
+        and str(getattr(settings, "telegram_chat_id", "") or "").strip()
+    )
+
+
+def _deliver_system_incident_decision(*, settings, decision) -> bool:
+    """Deliver one Alert-v2 system-incident decision, or record why it was not sent.
+
+    Delivery and incident state stay distinct: only a delivered message may mark
+    the incident as notified. A failed send releases the reservation so a later
+    cycle can retry without creating a second incident.
+    """
+
     now = datetime.now(timezone.utc)
-    hour_bucket = now.strftime("%Y%m%dT%H")
-    fingerprint = f"{hour_bucket}:{reason}"
-    if not should_emit(
-        identity=identity,
-        event_type="MONITOR_DEGRADED",
-        fingerprint=fingerprint,
-        cooldown_seconds=3600,
-        now=now,
-    ):
+    policy_identity = f"{SYSTEM_HEALTH_FAMILY}:{decision.scope}"
+
+    if not decision.should_notify:
         record_telegram_suppression(
-            identity=identity,
-            alert_family="MONITOR_DEGRADED",
-            event_type="MONITOR_DEGRADED",
-            fingerprint=fingerprint,
-            reason="NOTIFICATION_POLICY",
+            identity=policy_identity,
+            alert_family=SYSTEM_HEALTH_FAMILY,
+            event_type=decision.incident_class,
+            fingerprint=decision.incident_key,
+            reason=decision.reason,
             generated_at=now,
         )
         return False
-    message = (
-        "🚨 O'PIP MONITORING DEGRADED\n"
-        f"Reason: {reason}\n"
-        "Protection: stop/target/emergency monitoring may be incomplete\n"
-        "Action: VERIFY KRAKEN READ-ONLY CONNECTIVITY / POSITION STATE\n"
-        "No order was placed or changed."
+
+    message = format_system_incident_message(
+        decision,
+        outage_seconds=outage_seconds_between(
+            decision.first_seen_at, decision.recovered_at
+        ),
     )
+
+    if not _telegram_configured(settings):
+        record_telegram_not_eligible(
+            identity=policy_identity,
+            alert_family=SYSTEM_HEALTH_FAMILY,
+            event_type=decision.incident_class,
+            fingerprint=decision.incident_key,
+            reason="TELEGRAM_NOT_CONFIGURED",
+            generated_at=now,
+        )
+        release_incident_notification(decision=decision, now=now)
+        return False
+
     delivery = send_tracked_telegram(
         bot_token=settings.telegram_bot_token,
         chat_id=settings.telegram_chat_id,
         message=message,
-        identity=identity,
-        alert_family="MONITOR_DEGRADED",
-        event_type="MONITOR_DEGRADED",
-        fingerprint=fingerprint,
+        identity=policy_identity,
+        alert_family=SYSTEM_HEALTH_FAMILY,
+        event_type=decision.incident_class,
+        fingerprint=decision.incident_key,
         generated_at=now,
     )
     if delivery.delivered:
-        record_emitted(
-            identity=identity,
-            event_type="MONITOR_DEGRADED",
-            fingerprint=fingerprint,
+        confirm_incident_notification(
+            decision=decision,
+            message_id=delivery.message_id,
             now=now,
         )
+    else:
+        release_incident_notification(decision=decision, now=now)
     return delivery.delivered
+
+
+def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_TRADE_MONITOR") -> bool:
+    """Alert-v2 system-incident governance for one degradation occurrence.
+
+    Every occurrence is recorded durably. The owner is interrupted only when
+    incident governance says a human genuinely needs to act -- a new incident, a
+    material escalation, or a recovery. Repeated occurrences of one continuing
+    condition update counters instead of producing another message.
+    """
+
+    incident_class, scope = classify_degradation_reason(reason)
+    decision = observe_degradation(
+        incident_class=incident_class,
+        scope=scope,
+        reason=reason,
+    )
+    return _deliver_system_incident_decision(settings=settings, decision=decision)
 
 
 def _notify_monitor_degraded_safe(
@@ -95,6 +161,112 @@ def _notify_monitor_degraded_safe(
             f"{type(exc).__name__}: {exc}"
         )
         return False
+
+
+def _attempt_connectivity_recovery(
+    *,
+    scope: str,
+    incident_class: str,
+    settings,
+    failures: list[str],
+) -> None:
+    """Run exactly one bounded recovery cycle for one connectivity scope.
+
+    Recovery is proven on the same semantic scope that failed. A successful
+    public call cannot close a read-only incident and vice versa.
+    """
+
+    if scope == SystemIncidentScope.KRAKEN_PUBLIC.value:
+        health_scope = KrakenHealthScope.PUBLIC_CONNECTIVITY
+        probe_callable = public_connectivity_probe()
+        reset = transport_connection_reset()
+    elif scope == SystemIncidentScope.KRAKEN_READ_ONLY.value:
+        health_scope = KrakenHealthScope.READ_ONLY_CONNECTIVITY
+        probe_callable = read_only_connectivity_probe()
+        reset = None
+    else:
+        return
+
+    try:
+        probe = KrakenScopeProbe(connection_reset=reset)
+        result = probe.run(probe_callable, scope=health_scope)
+    except Exception as exc:
+        failures.append(
+            f"{scope}: recovery probe failed: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    if not result.success:
+        # Keep recovering. The incident stays open and the next cycle's
+        # degradation observation advances the consecutive-failure counter.
+        return
+
+    decision = observe_recovery(
+        incident_class=incident_class,
+        scope=scope,
+        evidence=f"authoritative {health_scope.value} probe succeeded",
+        authoritative=True,
+    )
+    if decision.should_notify:
+        try:
+            _deliver_system_incident_decision(settings=settings, decision=decision)
+        except Exception as exc:
+            failures.append(
+                f"{scope}: recovery notification failed: {type(exc).__name__}: {exc}"
+            )
+
+
+def _reconcile_system_incident_recovery(
+    *,
+    settings,
+    coverage_complete: bool,
+    degraded_scopes: set[str],
+    failures: list[str],
+) -> None:
+    """Close incidents whose failed scope is now provably healthy again.
+
+    Connectivity scopes need a fresh authoritative probe. Coverage-shaped scopes
+    (pricing, position verification, auth, internal state) need complete coverage
+    evidence. Nothing else may close an incident: a cache hit, a stale response
+    or a local registry value is not proof that the failed scope recovered.
+    """
+
+    try:
+        open_incidents = read_incidents(include_recovered=False)
+    except Exception as exc:
+        failures.append(
+            f"system-incident read failed: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    for row in open_incidents:
+        scope = str(row.get("scope") or "")
+        incident_class = str(row.get("incident_class") or "")
+        if not scope or scope in degraded_scopes:
+            continue
+        if requires_owner_recovery_cycles(incident_class):
+            _attempt_connectivity_recovery(
+                scope=scope,
+                incident_class=incident_class,
+                settings=settings,
+                failures=failures,
+            )
+            continue
+        if not coverage_complete:
+            continue
+        decision = observe_recovery(
+            incident_class=incident_class,
+            scope=scope,
+            evidence="coverage complete for all verified holdings",
+            authoritative=True,
+        )
+        if decision.should_notify:
+            try:
+                _deliver_system_incident_decision(settings=settings, decision=decision)
+            except Exception as exc:
+                failures.append(
+                    f"{scope}: recovery notification failed: {type(exc).__name__}: {exc}"
+                )
 
 
 def _notify_unmanaged_holding(*, settings, exposure: ResolvedExposure) -> bool:
@@ -196,10 +368,21 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     positions_unavailable = 0
     positions_unmanaged = 0
     degraded_symbols: list[str] = []
+    #: Scopes implicated as degraded during *this* cycle. A scope in this set
+    #: must not be closed as recovered in the same cycle that observed it failing.
+    degraded_scopes: set[str] = set()
+
+    def _record_degraded_scope(reason: str) -> None:
+        try:
+            _, scope = classify_degradation_reason(reason)
+        except Exception:
+            return
+        degraded_scopes.add(scope.value)
 
     if not resolution.coverage_complete:
         reason = resolution.reason or "Kraken exposure coverage is incomplete"
         failures.append(reason)
+        _record_degraded_scope(reason)
         _notify_monitor_degraded_safe(
             settings=settings,
             reason=reason,
@@ -310,10 +493,25 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             f"{len(degraded_symbols)} verified/expected holding(s) not fully protected: "
             + ", ".join(degraded_symbols[:8])
         )
+        _record_degraded_scope(reason)
         _notify_monitor_degraded_safe(
             settings=settings,
             reason=reason,
             failures=failures,
+        )
+
+    # Close incidents whose failed scope is provably healthy again. This runs
+    # after protection work so recovery can never delay a protection decision.
+    try:
+        _reconcile_system_incident_recovery(
+            settings=settings,
+            coverage_complete=bool(resolution.coverage_complete),
+            degraded_scopes=degraded_scopes,
+            failures=failures,
+        )
+    except Exception as exc:
+        failures.append(
+            f"system-incident recovery reconciliation failed: {type(exc).__name__}: {exc}"
         )
 
     return MonitorRunSummary(

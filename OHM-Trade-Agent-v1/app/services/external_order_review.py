@@ -104,26 +104,34 @@ def _format_review(
     volume: float | None,
     opened_at: str | None,
 ) -> str:
+    """Decision-first external-order card.
+
+    This is an EXTERNAL / OPERATOR card, never a system failure, a signal or an
+    O'Pip strategy result. Lengthy governance prose is intentionally left out of
+    the alert body: it lives in durable review history
+    (``/app/data/external_order_reviews.json``) and the future Cockpit view.
+    """
+
     limit_text = f"{limit_price:.10g}" if limit_price is not None else "N/A"
     current_text = f"{current_price:.10g}" if current_price is not None else "N/A"
     volume_text = f"{volume:.10g}" if volume is not None else "N/A"
     distance_text = "N/A"
     if limit_price is not None and current_price is not None:
-        distance_text = f"{_distance_to_limit_pct(side=side, current=current_price, limit_price=limit_price):+.2f}%"
+        distance_text = (
+            f"{_distance_to_limit_pct(side=side, current=current_price, limit_price=limit_price):+.2f}%"
+        )
 
     return (
-        "📌 OHM AI — EXTERNAL KRAKEN ORDER REVIEW\n\n"
-        f"Market: {display_market_label(pair or 'UNKNOWN')}\n"
+        f"📌 EXTERNAL ORDER — {display_market_label(pair or 'UNKNOWN')}\n"
+        "Action: NO ACTION — order left untouched\n"
         f"Side: {side or 'UNKNOWN'}\n"
-        f"Limit: {limit_text}\n"
-        f"Current: {current_text}\n"
-        f"Distance to limit: {distance_text}\n"
-        f"Quantity: {volume_text}\n"
-        f"Opened: {opened_at or 'N/A'}\n\n"
-        "Status: EXTERNAL / UNMANAGED\n\n"
-        "This is a one-time review only. OHM will leave the order untouched and will not attribute its prior gain/loss to the OHM strategy. "
-        "If you later adopt this position into LEGACY_MANAGED mode, OHM can monitor recovery and provide separate HOLD / REDUCE / EXIT guidance without contaminating normal OHM trade-learning results.\n\n"
-        f"Reference: {order_id[-8:]}"
+        f"Limit: {limit_text} | Current: {current_text} | Distance: {distance_text}\n"
+        f"Qty: {volume_text}\n"
+        f"Opened: {opened_at or 'N/A'}\n"
+        "Status: EXTERNAL / UNMANAGED\n"
+        "This is a one-time review only. No order was placed, changed, or cancelled; "
+        "no prior gain/loss is attributed to O'Pip.\n"
+        f"Ref: {order_id[-8:]}"
     )
 
 
