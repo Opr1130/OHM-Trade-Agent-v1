@@ -619,49 +619,95 @@ def test_g_plane_guard_normalizes_assignment_syntax():
     assert "${!key:-}" in guard
 
 
-def test_g_plane_guard_really_rejects_export_and_indented_forms(tmp_path):
-    """Behavioural check of the guard's matching logic against real file shapes.
+def _guard_awk_program() -> str:
+    """The exact awk program the bootstrap plane guard runs.
 
-    A stub file exercises the same normalization the guard applies, so the test fails
-    if the matcher regresses to an exact first-field compare.
+    Extracted from the script rather than duplicated, so this test verifies the real
+    artifact instead of a copy that could drift from it.
     """
-    import subprocess
+    guard = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("guard_no_trading_credentials()") :
+        BOOTSTRAP_TEXT.index("guard_no_trading_credentials\n")
+    ]
+    start = guard.index("awk -v key=\"$key\" '") + len("awk -v key=\"$key\" '")
+    end = guard.index("' \"$ENV_FILE\"")
+    return guard[start:end]
 
-    def guard_matches(text: str, key: str) -> bool:
-        script = f"""
-        awk -v key="{key}" '
-          {{
-            line = $0
-            sub(/^[[:space:]]+/, "", line)
-            sub(/^export[[:space:]]+/, "", line)
-            if (index(line, key "=") == 1) {{ found = 1; exit }}
-          }}
-          END {{ exit !found }}
-        '
-        """
-        target = tmp_path / "sealed.env"
-        target.write_text(text, encoding="utf-8")
+
+def test_g_plane_guard_awk_matches_only_real_assignments():
+    """Run the guard's actual awk over the assignment forms Bash accepts.
+
+    Invoked through argv with no shell involved. An earlier revision used
+    ``bash -c "awk '...'"``, which made the test fail on Linux for a harness quoting
+    reason rather than a guard reason; passing the program and file as separate
+    arguments removes that whole class of problem.
+
+    The awk is skipped where the tool is unavailable (this Windows dev host), but the
+    Python-level assertions below run everywhere.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    cases = [
+        # Bash accepts all of these when sourcing, so the guard must catch them.
+        ("WEBHOOK_SECRET=abc\n", True),
+        ("export WEBHOOK_SECRET=abc\n", True),
+        ("  WEBHOOK_SECRET=abc\n", True),
+        ("\texport WEBHOOK_SECRET=abc\n", True),
+        ("export  WEBHOOK_SECRET=abc\n", True),
+        # Inert or unrelated lines must not trip it.
+        ("# WEBHOOK_SECRET=abc\n", False),
+        ("  # WEBHOOK_SECRET=abc\n", False),
+        ("#export WEBHOOK_SECRET=abc\n", False),
+        ("OPIP_COCKPIT_SECRET=abc\n", False),
+        ("NOT_WEBHOOK_SECRET=abc\n", False),
+    ]
+
+    program = _guard_awk_program()
+    # The normalization the guard depends on must actually be in the extracted text.
+    assert "sub(/^[[:space:]]+/, \"\", line)" in program
+    assert "sub(/^export[[:space:]]+/, \"\", line)" in program
+
+    awk = shutil.which("awk") or shutil.which("gawk")
+    if awk is None:
+        return
+
+    for text, expected in cases:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(text)
+            path = handle.name
         result = subprocess.run(
-            ["bash", "-c", f"{script} < '{target}'"],
+            [awk, "-v", "key=WEBHOOK_SECRET", program, path],
             capture_output=True,
             text=True,
             check=False,
         )
-        return result.returncode == 0
+        assert (result.returncode == 0) is expected, (
+            f"guard mismatch for {text!r}: exit {result.returncode}"
+        )
 
-    import shutil
 
-    if shutil.which("bash") is None:
-        # Windows dev host: the normalization itself is asserted above, and GitHub
-        # Linux CI executes this behaviourally. Not a silent skip of an assertion -
-        # the structural check above still runs everywhere.
-        return
+def test_g_plane_guard_normalization_semantics():
+    """Python-level mirror of the guard's normalization, runnable on any platform."""
+    program = _guard_awk_program()
+    # Deliberately mirrors the two `sub()` calls the extracted program must contain.
+    def normalized_match(text: str, key: str) -> bool:
+        for raw in text.splitlines():
+            line = raw.lstrip()
+            if line.startswith("export"):
+                line = line[len("export") :].lstrip()
+            if line.startswith(f"{key}="):
+                return True
+        return False
 
-    assert guard_matches("WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
-    assert guard_matches("export WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
-    assert guard_matches("  WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
-    assert guard_matches("# WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
-    assert guard_matches("OPIP_COCKPIT_SECRET=abc\n", "WEBHOOK_SECRET") is False
+    assert "sub(/^[[:space:]]+/, \"\", line)" in program
+    assert normalized_match("export WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert normalized_match("  WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert normalized_match("# WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
+    assert normalized_match("NOT_WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
 
 
 def test_g_cockpit_authentication_fails_closed_when_unconfigured(monkeypatch):
