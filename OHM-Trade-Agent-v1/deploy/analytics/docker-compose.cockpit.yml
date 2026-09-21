@@ -156,3 +156,21 @@ networks:
       # `cockpit_preflight` independently refuses any non-loopback or public listener at
       # runtime.
       com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+      # Give back the egress the internal-only topology used to provide. An ordinary
+      # bridge masquerades container traffic, so attaching one would hand the Cockpit
+      # outbound Internet access it never had - a real capability increase even though its
+      # inbound mapping stays loopback-only. Disabling masquerade removes that egress.
+      #
+      # It does NOT affect the publish: inbound host->container traffic is delivered by
+      # Docker's proxy/DNAT to the container address and returns over the directly
+      # connected bridge, so no NAT is involved. The container's reply goes back to the
+      # gateway it is directly attached to. Only container-initiated egress needs
+      # masquerade, and the Cockpit needs none: it serves reads from the mounted replica.
+      #
+      # Residual, stated honestly: a directly attached bridge still makes the gateway
+      # address reachable at layer 2, so this removes Internet egress rather than all
+      # host-reachability. That residual is inherent to any topology that can be
+      # published, and the container's other controls (cap_drop ALL,
+      # no-new-privileges, read-only rootfs, no credentials) bound what a compromise
+      # could do with it.
+      com.docker.network.bridge.enable_ip_masquerade: "false"

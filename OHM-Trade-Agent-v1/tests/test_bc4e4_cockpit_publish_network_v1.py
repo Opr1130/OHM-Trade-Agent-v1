@@ -170,6 +170,17 @@ def test_7_the_publish_network_binds_host_ports_to_loopback_by_default():
     assert opts["com.docker.network.bridge.host_binding_ipv4"] == "127.0.0.1"
 
 
+def test_7b_the_publish_network_does_not_restore_outbound_internet_egress():
+    """The ordinary bridge must not hand back the egress that internal-only removed.
+
+    An ordinary bridge masquerades container traffic, so attaching one would give the
+    Cockpit outbound Internet access it never had. Masquerade is disabled to remove that,
+    which is safe because publishing is host->container and needs no NAT.
+    """
+    opts = _cockpit_networks()[PUBLISH_NETWORK]["driver_opts"]
+    assert opts["com.docker.network.bridge.enable_ip_masquerade"] == "false"
+
+
 def test_8_service_level_port_mapping_is_explicitly_loopback():
     """driver_opts alone is not the guarantee; the service mapping is explicit."""
     ports = _cockpit()["ports"]
@@ -223,9 +234,20 @@ def test_10_preflight_keeps_health_and_all_three_runtime_proofs():
     # And still fails closed on a non-loopback configured bind.
     assert "OPIP_COCKPIT_BIND_ADDRESS must be host loopback" in preflight
 
-    # No escape hatch was introduced.
-    assert "NOSONAR" not in BOOTSTRAP
-    assert "|| true" not in preflight.split("published=")[0].split("ss -ltnH")[0] or True
+    # No swallowed failures. Every `|| true` may only be a best-effort *capture* inside a
+    # command substitution, whose emptiness the next explicit check then tests; it must
+    # never wrap a decision. An earlier revision ended this test with `... or True`, which
+    # made the assertion vacuous for every possible preflight.
+    code = _strip_comments(preflight)
+    total = code.count("|| true")
+    captured = len(re.findall(r"\$\([^)]*\|\| true", code))
+    assert total == captured, (
+        "every `|| true` in the preflight must be a capture inside $( ), not a guard "
+        f"around a decision: total={total} captured={captured}"
+    )
+    for line in code.splitlines():
+        if "|| true" in line:
+            assert "exit" not in line, f"`|| true` swallows a failing exit: {line.strip()}"
 
 
 def test_10_preflight_still_runs_before_readiness_is_recorded():
@@ -511,7 +533,8 @@ def _probe_compose_data(
         networks[publish] = {
             "driver": "bridge",
             "driver_opts": {
-                "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"
+                "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1",
+                "com.docker.network.bridge.enable_ip_masquerade": "false",
             },
         }
         attached.append(publish)

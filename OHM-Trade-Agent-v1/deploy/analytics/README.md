@@ -228,9 +228,10 @@ The Cockpit is attached to **two** networks, and both are required:
 | `opip-analytics` | `true` | the internal analytics plane it shares with the other analytics services |
 | `opip-cockpit-publish` | `false` | the ordinary bridge Docker needs in order to install the host-loopback publish |
 
-A container attached **only** to `internal: true` bridge networks receives no host port
-mapping. On the production engine that surfaced as a healthy container with no reachable
-endpoint at all:
+A container attached **only** to `internal: true` bridge networks can end up with no host
+port mapping: Docker accepts the declared publish and installs nothing. How strictly an
+engine suppresses it is engine-dependent, but the effect is what production hit — a healthy
+container with no reachable endpoint at all:
 
 ```
 docker port opip-cockpit                             -> empty
@@ -241,9 +242,12 @@ curl http://127.0.0.1:8000/cockpit                   -> connection refused
 ```
 
 `cockpit-ready` failed its preflight with `cockpit container is healthy but NOT published
-on host loopback 127.0.0.1:8000` — the preflight did exactly what it is for. An internal
-bridge supplies no gateway/forwarding path for the requested mapping, so Docker accepted
-the service-level `127.0.0.1:8000:8000` declaration and produced no mapping.
+on host loopback 127.0.0.1:8000` — the preflight did exactly what it is for.
+
+Because the internal-only behaviour is not guaranteed to fail the same way everywhere, the
+two-network topology below is the **portable, tested** arrangement: it does not depend on
+an engine choosing to suppress the mapping, and the publish network is verified to carry a
+real gateway and a real host mapping by an executed Docker test.
 
 `opip-cockpit-publish` is used by the Cockpit and nothing else. It is deliberately **not**
 declared in the shared analytics Compose file, so no PostgreSQL or Grafana service can
@@ -257,6 +261,20 @@ Exposure is still loopback-only, and is enforced in three independent places:
    reach a public interface — this is not the primary guarantee;
 3. `cockpit_preflight` independently refuses any non-loopback bind and any public
    listener at runtime.
+
+**Egress is deliberately given back to the internal-only boundary.** An ordinary bridge
+masquerades container traffic, so attaching one would hand the Cockpit outbound Internet
+access it never had — a real capability increase even though its inbound mapping stays
+loopback-only. `com.docker.network.bridge.enable_ip_masquerade: "false"` removes that
+egress. It does not affect publishing: inbound host→container traffic is delivered to the
+container address and returns over the directly connected bridge, so no NAT is involved.
+The Cockpit needs no egress, since it only serves reads from the mounted replica.
+
+Stated honestly: a directly attached bridge still makes the gateway address reachable at
+layer 2, so this removes Internet egress rather than all host-reachability. That residual
+is inherent to any topology that can be published; the container's other controls
+(`cap_drop: ALL`, `no-new-privileges`, read-only rootfs, no credentials) bound what a
+compromise could do with it.
 
 This was deliberately **not** solved by relaxing `internal: true`, binding `0.0.0.0`,
 using `network_mode: host`, adding a host-side forwarding shim, or connecting the
