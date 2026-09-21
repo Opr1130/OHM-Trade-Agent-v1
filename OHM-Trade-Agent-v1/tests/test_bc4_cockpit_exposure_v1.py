@@ -541,6 +541,35 @@ def test_g_cockpit_authentication_secret_is_declared_for_the_analytics_plane():
     assert "WEBHOOK_SECRET" in BOOTSTRAP_TEXT
 
 
+def test_g_cockpit_secret_placeholder_is_not_credential_shaped():
+    """The placeholder must not trip the generic-api-key secret scan.
+
+    A hyphenated placeholder next to a ``*SECRET`` key reaches gitleaks'
+    generic-api-key entropy threshold, which fails the secret-scan gate on a string
+    that is not a secret. Rather than allowlisting it (the config requires allowlists
+    to stay narrow and forbids broad exclusions), the marker is kept obviously
+    synthetic. This guards against a future edit reintroducing a shaped value.
+    """
+    import math
+    from collections import Counter
+
+    lines = [
+        line.strip()
+        for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("WEBHOOK_SECRET=") and not line.startswith("#")
+    ]
+    assert len(lines) == 1, lines
+    value = lines[0].split("=", 1)[1]
+
+    counts = Counter(value)
+    length = len(value)
+    entropy = -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+    # gitleaks' bundled generic-api-key threshold is 3.7.
+    assert entropy < 3.4, f"placeholder entropy {entropy:.3f} is too credential-shaped"
+
+
 def test_i_preflight_proves_the_listener_belongs_to_the_cockpit():
     """A stale or foreign process holding the port must not satisfy the preflight.
 
