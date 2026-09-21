@@ -336,7 +336,7 @@ def test_i_reachability_proof_uses_no_clear_text_protocol_literal():
     """
     preflight = BOOTSTRAP_TEXT[
         BOOTSTRAP_TEXT.index("cockpit_preflight()") :
-        BOOTSTRAP_TEXT.index("total_kb=")
+        BOOTSTRAP_TEXT.index("write_cockpit_state()")
     ]
     assert "http://" not in preflight
     assert "curl" not in preflight
@@ -377,11 +377,35 @@ def test_i_preflight_runs_before_the_cockpit_is_declared_ready():
 
 
 def test_i_preflight_is_invoked_from_the_reads_ready_stage():
+    """`reads-ready` must start the Cockpit, and both stages must share one primitive.
+
+    The Cockpit start/verify/preflight sequence used to be inlined in `reads-ready`.
+    It is now a single `cockpit_deploy` primitive called by both `reads-ready` and
+    `cockpit-ready`, so the two stages cannot drift into separate implementations that
+    disagree about verification, exposure or ordering.
+    """
     ready_stage = BOOTSTRAP_TEXT[
         BOOTSTRAP_TEXT.index('require_stage SHIPPER_STARTED_AT_UTC') :
+        BOOTSTRAP_TEXT.index('elif [[ "$STAGE" == "$COCKPIT_STAGE" ]]')
     ]
-    assert "cockpit_preflight" in ready_stage
-    assert "compose up -d opip-cockpit" in ready_stage
+    assert "cockpit_deploy" in ready_stage
+
+    # Exactly one implementation of the start sequence exists...
+    assert BOOTSTRAP_TEXT.count("compose up -d opip-cockpit") == 1
+    assert BOOTSTRAP_TEXT.count("\n  cockpit_preflight\n") == 1
+    # ...it performs the reachability proof... 
+    deploy = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("cockpit_deploy()") :
+        BOOTSTRAP_TEXT.index("# Serialize with sync/capture/outcomes")
+    ]
+    assert "cockpit_verify_replica" in deploy
+    assert "cockpit_preflight" in deploy
+    # ...and it verifies the replica before the container is started, so the Cockpit
+    # can never serve from an unproven replica.
+    assert deploy.index("cockpit_verify_replica") < deploy.index("compose up -d opip-cockpit")
+    # Readiness is recorded only after the preflight succeeds.
+    assert deploy.index("compose up -d opip-cockpit") < deploy.index("cockpit_preflight")
+    assert deploy.index("cockpit_preflight") < deploy.index("COCKPIT_READY_AT_UTC")
 
 
 def test_i_bootstrap_syntax_is_validated_in_ci():

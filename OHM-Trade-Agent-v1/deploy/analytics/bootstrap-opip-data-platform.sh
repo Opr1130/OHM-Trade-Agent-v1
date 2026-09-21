@@ -12,6 +12,15 @@ GRAFANA_ENV_FILE="/etc/opip-grafana.env"
 COCKPIT_ENV_FILE="/etc/opip-cockpit.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
+# Cockpit readiness is recorded separately from PostgreSQL rollout evidence, so a
+# replica-backed Cockpit stage can never modify (or appear to modify) the
+# PostgreSQL rollout state. See write_cockpit_state.
+COCKPIT_STATE_FILE="$STATE_ROOT/cockpit-ready.env"
+# The verified canonical replica, as mounted read-only into the Cockpit container.
+# Held as one pair of constants so the compose mount and the readiness probe cannot
+# drift apart; a test asserts the compose mount matches these exact paths.
+COCKPIT_REPLICA_HOST_ROOT="/var/lib/opip-learning/canonical-replica"
+COCKPIT_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
 RESTORE_EVIDENCE="$STATE_ROOT/last-restore-drill.env"
 ROLLBACK_EVIDENCE="$STATE_ROOT/empty-rollback.env"
@@ -20,13 +29,18 @@ POSTGRES_TLS_CERT="/etc/opip-data-platform/tls/postgres-server.crt"
 POSTGRES_TLS_KEY="/etc/opip-data-platform/tls/postgres-server.key"
 
 if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "usage: $0 <40-char-main-sha> <empty|backfill|shipper|reads-ready>" >&2
+  echo "usage: $0 <40-char-main-sha> <empty|backfill|shipper|reads-ready|cockpit-ready>" >&2
   exit 64
 fi
 case "$STAGE" in
-  empty|backfill|shipper|reads-ready) ;;
+  empty|backfill|shipper|reads-ready|cockpit-ready) ;;
   *) echo "invalid rollout stage: $STAGE" >&2; exit 64 ;;
 esac
+# Two separate readiness planes. `cockpit-ready` covers ONLY the replica-backed
+# read-only Cockpit and grants no historical analytics readiness; `reads-ready`
+# covers PostgreSQL/Grafana historical reads and retains its mandatory seven-day
+# shipper soak. Neither implies the other.
+COCKPIT_STAGE="cockpit-ready"
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "run analytics bootstrap as root" >&2
   exit 77
@@ -285,6 +299,112 @@ cockpit_preflight() {
   echo "cockpit_app_behaviour=verified_by_healthcheck_and_test_suite"
 }
 
+write_cockpit_state() {
+  # Record Cockpit readiness in its own file, never in rollout.env.
+  #
+  # `rollout.env` is the PostgreSQL rollout evidence (DEPLOYED_SHA, EMPTY_*,
+  # SHIPPER_*, READS_READY_*), and a replica-backed Cockpit stage must not modify
+  # PostgreSQL rollout evidence at all. Keeping Cockpit state in a separate file makes
+  # that property provable by inspection rather than by argument.
+  local key="$1" value="$2" temporary
+  install -d -o root -g root -m 0711 "$STATE_ROOT"
+  temporary="$(mktemp "$COCKPIT_STATE_FILE.XXXXXX")"
+  : > "$temporary"
+  if [[ -e "$COCKPIT_STATE_FILE" ]]; then
+    awk -F= -v key="$key" '$1 != key' "$COCKPIT_STATE_FILE" > "$temporary"
+  fi
+  printf '%s=%q\n' "$key" "$value" >> "$temporary"
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$COCKPIT_STATE_FILE"
+}
+
+cockpit_verify_replica() {
+  # Prove the canonical replica before the Cockpit is allowed to serve from it.
+  #
+  # This invokes the EXISTING verifier CLI - the same `verify` subcommand the learning
+  # sync already runs to validate a transferred generation - inside a one-off
+  # container built from the exact target image, with no network and the replica
+  # mounted read-only. In one implementation it re-checks:
+  #
+  #   * manifest present, readable, and schema-compatible
+  #   * source release SHA == TARGET_SHA (compatibility with the deployed release)
+  #   * canonical snapshot present, self-contained, hash- and structurally verified
+  #   * companion paper-state / gap artifacts
+  #   * freshness against the existing canonical replica freshness contract
+  #
+  # The shell deliberately reproduces none of those rules, and `--max-age-seconds` is
+  # NOT passed: the freshness bound is exactly the existing contract default, so this
+  # stage cannot widen it. Missing, unreadable, structurally invalid, SHA-mismatched or
+  # stale replicas all exit non-zero from the CLI and therefore fail this stage closed.
+  local image="opip-data-platform:${TARGET_SHA}"
+  local host_root="$COCKPIT_REPLICA_HOST_ROOT"
+  local container_root="$COCKPIT_REPLICA_CONTAINER_ROOT"
+
+  [[ -d "$host_root" ]] || {
+    echo "refusing cockpit-ready: canonical replica root is absent: $host_root" >&2
+    echo "the Cockpit reads only the verified replica and cannot serve without one" >&2
+    exit 69
+  }
+  [[ -r "$host_root" ]] || {
+    echo "refusing cockpit-ready: canonical replica root is not readable: $host_root" >&2
+    exit 69
+  }
+
+  if ! docker run --rm \
+    --network none \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --pids-limit 64 \
+    --memory 256m \
+    --memory-swap 256m \
+    --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+    -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$host_root:$container_root:ro" \
+    "$image" \
+    python -m app.opip.learning.canonical_replica verify \
+    --root "$container_root" \
+    --release-sha "$TARGET_SHA"; then
+    echo "refusing cockpit-ready: the canonical replica did not verify for $TARGET_SHA" >&2
+    echo "missing, unreadable, structurally invalid, SHA-mismatched or stale replicas fail closed" >&2
+    exit 69
+  fi
+}
+
+cockpit_deploy() {
+  # The single Cockpit start primitive, shared by `cockpit-ready` and the historical
+  # `reads-ready` stage so the two paths cannot drift into separate implementations.
+  #
+  # Ordering is the safety property: build the exact release image, prove the
+  # replica, start the service, prove operator reachability - and only then record
+  # readiness. A failure at any step aborts the stage under `set -e` before any
+  # readiness marker is written, so a failed attempt can never leave a false
+  # COCKPIT_READY record.
+  #
+  # Idempotent: the image tag is SHA-pinned (a stale image cannot satisfy a different
+  # release), `compose up -d` recreates only when the definition changed, and the
+  # preflight is re-proven on every run.
+  export OPIP_DEPLOYED_SHA="$TARGET_SHA"
+
+  # Build only the Cockpit service. PostgreSQL is deliberately not started, pulled or
+  # otherwise touched in order to build the Cockpit image.
+  docker compose -f "$COMPOSE" build opip-cockpit
+
+  cockpit_verify_replica
+
+  compose up -d opip-cockpit
+  cockpit_preflight
+
+  write_cockpit_state COCKPIT_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_cockpit_state COCKPIT_READY_SHA "$TARGET_SHA"
+
+  echo "cockpit_ready_sha=$TARGET_SHA"
+  echo "cockpit_reads=verified_canonical_replica"
+  echo "cockpit_historical_analytics_ready=false"
+  echo "cockpit_raw_port_scope=host_loopback"
+}
+
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.
 # Timers use this same lock and will skip rather than compete for RAM or files.
 exec 8>/var/lock/opip-learning-plane.lock
@@ -494,18 +614,26 @@ validate_promotion_evidence() {
 }
 
 export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-validate_postgres_tls_key
-# Both application services share the same immutable image tag; build once to
-# avoid a concurrent BuildKit export race on the identical tag.
-docker compose -f "$COMPOSE" build opip-shipper
-compose up -d opip-postgres
-wait_for_postgres
 
-# A fresh host may initialize the empty database first. Promotion beyond the
-# empty stage requires a real dump, restore drill, and independently recorded
-# off-host evidence after PostgreSQL is running.
-if [[ "$STAGE" != "empty" ]]; then
-  validate_promotion_evidence
+# `cockpit-ready` deploys the replica-backed read-only Cockpit and nothing else, so it
+# must perform no PostgreSQL work at all: not the TLS-key preflight (which pulls and
+# runs the PostgreSQL image purely to resolve its runtime UID/GID), not the analytics
+# image build for the PostgreSQL services, and not starting PostgreSQL. Everything in
+# this guard belongs to the PostgreSQL plane and is skipped for the Cockpit stage.
+if [[ "$STAGE" != "$COCKPIT_STAGE" ]]; then
+  validate_postgres_tls_key
+  # Both application services share the same immutable image tag; build once to
+  # avoid a concurrent BuildKit export race on the identical tag.
+  docker compose -f "$COMPOSE" build opip-shipper
+  compose up -d opip-postgres
+  wait_for_postgres
+
+  # A fresh host may initialize the empty database first. Promotion beyond the
+  # empty stage requires a real dump, restore drill, and independently recorded
+  # off-host evidence after PostgreSQL is running.
+  if [[ "$STAGE" != "empty" ]]; then
+    validate_promotion_evidence
+  fi
 fi
 
 if [[ "$STAGE" == "empty" ]]; then
@@ -563,7 +691,7 @@ elif [[ "$STAGE" == "shipper" ]]; then
     write_state SHIPPER_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
   write_state SHIPPER_SHA "$TARGET_SHA"
-else
+elif [[ "$STAGE" == "reads-ready" ]]; then
   require_stage SHIPPER_STARTED_AT_UTC "shipper soak"
   # shellcheck disable=SC1090
   source "$STATE_FILE"
@@ -577,39 +705,58 @@ else
   admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   admin_run python -m app.opip.data_platform.health --require-ready
-  # Start the read-only Cockpit and prove operator reachability on host loopback.
-  # The Cockpit reads only the verified replica, so it belongs to the reads phase.
-  compose up -d opip-cockpit
-  cockpit_preflight
-  write_state COCKPIT_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  write_state COCKPIT_READY_SHA "$TARGET_SHA"
+  # Start the read-only Cockpit through the same shared primitive `cockpit-ready`
+  # uses, so the two stages cannot drift into separate implementations. The Cockpit
+  # reads only the verified replica, so it belongs to the reads phase.
+  cockpit_deploy
+  # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
+  # here, only after every historical gate above has passed. `cockpit-ready` never
+  # writes these.
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_state READS_READY_SHA "$TARGET_SHA"
+elif [[ "$STAGE" == "$COCKPIT_STAGE" ]]; then
+  # Replica-backed, read-only Cockpit only.
+  #
+  # This path deliberately touches nothing in the PostgreSQL plane: it starts no
+  # PostgreSQL, shipper or Grafana container, runs no migration, backfill,
+  # reconciliation or readiness check, enables no PostgreSQL/Grafana timer, writes no
+  # PostgreSQL rollout evidence, and neither satisfies nor shortens the seven-day
+  # shipper soak that `reads-ready` requires. Readiness granted here means exactly one
+  # thing: the verified canonical replica is good and the read-only Cockpit is
+  # reachable on host loopback.
+  cockpit_deploy
 fi
 
-write_state DEPLOYED_SHA "$TARGET_SHA"
+# PostgreSQL rollout evidence, PostgreSQL/Grafana systemd units and the PostgreSQL
+# backup and maintenance timers all belong to the PostgreSQL plane. `cockpit-ready`
+# writes only COCKPIT_READY_* (in its own file) and must not write DEPLOYED_SHA or any
+# other rollout evidence, nor enable PostgreSQL or Grafana timers, so this entire block
+# is skipped for the Cockpit stage.
+if [[ "$STAGE" != "$COCKPIT_STAGE" ]]; then
+  write_state DEPLOYED_SHA "$TARGET_SHA"
 
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \
-  /usr/local/sbin/opip-data-platform-maintenance
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh" \
-  /usr/local/sbin/opip-postgres-backup
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh" \
-  /usr/local/sbin/opip-postgres-restore-drill
-for unit in \
-  opip-data-platform-maintenance.service \
-  opip-data-platform-maintenance.timer \
-  opip-postgres-backup.service \
-  opip-postgres-backup.timer; do
-  install -o root -g root -m 0644 \
-    "$APP_ROOT/deploy/analytics/$unit" "/etc/systemd/system/$unit"
-done
-systemctl daemon-reload
-systemctl enable --now opip-postgres-backup.timer
-if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
-  systemctl enable --now opip-data-platform-maintenance.timer
+  install -o root -g root -m 0755 \
+    "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \
+    /usr/local/sbin/opip-data-platform-maintenance
+  install -o root -g root -m 0755 \
+    "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh" \
+    /usr/local/sbin/opip-postgres-backup
+  install -o root -g root -m 0755 \
+    "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh" \
+    /usr/local/sbin/opip-postgres-restore-drill
+  for unit in \
+    opip-data-platform-maintenance.service \
+    opip-data-platform-maintenance.timer \
+    opip-postgres-backup.service \
+    opip-postgres-backup.timer; do
+    install -o root -g root -m 0644 \
+      "$APP_ROOT/deploy/analytics/$unit" "/etc/systemd/system/$unit"
+  done
+  systemctl daemon-reload
+  systemctl enable --now opip-postgres-backup.timer
+  if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
+    systemctl enable --now opip-data-platform-maintenance.timer
+  fi
 fi
 
 compose ps

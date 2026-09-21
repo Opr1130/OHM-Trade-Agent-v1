@@ -13,7 +13,7 @@ def test_analytics_workflow_is_owner_gated_and_non_collapsible():
     assert "Require successful exact-SHA CI" in workflow
     assert (
         "prepare|activate|empty|backup|restore-drill|offhost-verified|"
-        "rollback-verified|backfill|shipper|reads-ready"
+        "rollback-verified|backfill|shipper|reads-ready|cockpit-ready"
     ) in workflow
     assert "does not merge, trade, or enable production reads" in workflow
     assert "Clean remote release and sealed environment" in workflow
@@ -38,7 +38,7 @@ def test_remote_runner_records_real_local_evidence_without_mutable_secret_timest
     assert "OPIP_RESTORE_DRILL_VERIFIED_AT_UTC" not in bootstrap
     assert "OPIP_EMPTY_ROLLBACK_VERIFIED_AT_UTC" not in bootstrap
 
-    assert 'backfill|shipper|reads-ready)' in runner
+    assert 'backfill|shipper|reads-ready|cockpit-ready)' in runner
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh"' in runner
     assert 'bash "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh"' in runner
     assert 'print "OPIP_DEPLOYED_SHA=" sha' in runner
