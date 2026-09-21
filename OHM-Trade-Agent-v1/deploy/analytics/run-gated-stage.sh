@@ -19,7 +19,7 @@ if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 64
 fi
 case "$STAGE" in
-  prepare|activate|empty|backup|restore-drill|offhost-verified|rollback-verified|backfill|shipper|reads-ready) ;;
+  prepare|activate|empty|backup|restore-drill|offhost-verified|rollback-verified|backfill|shipper|reads-ready|cockpit-ready) ;;
   *) echo "unsupported analytics stage" >&2; exit 64 ;;
 esac
 if [[ "$RELEASE_DIR" != /var/tmp/opip-analytics-"$TARGET_SHA"-* ]]; then
@@ -179,7 +179,9 @@ case "$STAGE" in
     mv -f -- "$temporary" "$STATE_ROOT/empty-rollback.env"
     echo "empty-stage rollback evidence recorded"
     ;;
-  backfill|shipper|reads-ready)
+  # `cockpit-ready` is forwarded like the other bootstrap stages, but the bootstrap
+  # itself routes it to the Cockpit-only path, which performs no PostgreSQL work.
+  backfill|shipper|reads-ready|cockpit-ready)
     bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" "$STAGE"
     ;;
 esac

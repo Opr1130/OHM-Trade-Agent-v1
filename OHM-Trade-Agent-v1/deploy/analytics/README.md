@@ -58,7 +58,8 @@ PostgreSQL is started with `ssl=on` and Grafana trusts only the mounted
    record that independent attestation. Run `rollback-verified` to record the
    two-empty-plus-restore evidence.
 6. Advance one explicit stage at a time: `backfill`, `shipper`, and
-   `reads-ready`.
+   `reads-ready`. The replica-backed Cockpit has its own independent stage,
+   `cockpit-ready`, which neither waits for nor advances this sequence.
 7. Only after `reads-ready` succeeds, configure the production dashboard with
    the read-only `opip_dashboard` credential, set
    `OPIP_DATA_PLATFORM_READS_ENABLED=true`, and keep the 1.5 second statement
@@ -66,9 +67,11 @@ PostgreSQL is started with `ssl=on` and Grafana trusts only the mounted
 8. Start Grafana with
    `docker compose --env-file /etc/opip-data-platform.env -f deploy/analytics/docker-compose.yml up -d opip-grafana`,
    then configure TLS reverse proxy routing to the private bind endpoint.
-9. The `reads-ready` stage starts `opip-cockpit` (the read-only B/C-4 Cockpit) and
-   proves host-loopback reachability. Configure the reverse proxy for the Cockpit
-   paths below before treating the Cockpit as operator-available.
+9. Start the read-only B/C-4 Cockpit with
+   `/deploy-analytics <40-char-sha> cockpit-ready`, or as part of `reads-ready`.
+   Both stages start it through the same shared primitive and prove host-loopback
+   reachability. Configure the reverse proxy for the Cockpit paths below before
+   treating the Cockpit as operator-available.
 
 The stages are deliberately non-collapsible. `empty` installs PostgreSQL and
 the additive schema; `offhost-verified` records an owner attestation only
@@ -79,6 +82,90 @@ backfill; and `reads-ready` requires a seven-day shipper soak plus a clean
 canonical freshness result (`ops.dashboard_freshness_v` must be LIVE for every
 required stream and for maintenance). A failed step leaves the production
 scanner and its file WAL unchanged.
+
+## Two independent readiness planes
+
+Analytics readiness here is two separate claims, and neither implies the other.
+
+| | `reads-ready` | `cockpit-ready` |
+| --- | --- | --- |
+| Scope | PostgreSQL/Grafana historical analytics | Replica-backed read-only Cockpit |
+| Evidence written | `READS_READY_AT_UTC`, `READS_READY_SHA` (in `rollout.env`) | `COCKPIT_READY_AT_UTC`, `COCKPIT_READY_SHA` (in `cockpit-ready.env`) |
+| Seven-day shipper soak | Required | Not involved |
+| PostgreSQL health/reconciliation gates | Required | Not involved |
+| PostgreSQL started | Yes | **No** |
+| Grafana/shipper started | As staged | **No** |
+| Historical analytics granted | Yes | **No** |
+
+`cockpit-ready` exists because the Cockpit reads only the verified canonical replica
+and needs no PostgreSQL historical read. Before it existed, the only way to start the
+Cockpit was the `reads-ready` stage, which made an otherwise valid operational Cockpit
+wait on a seven-day PostgreSQL shipper soak it does not depend on. The fix separates
+the two claims; it does **not** relax either one, and it does not shorten the soak.
+
+`COCKPIT_READY_*` means exactly one thing: **the replica verified for this release, and
+the read-only Cockpit is reachable on host loopback**. It is therefore published only by
+`cockpit-ready`. The shared start primitive also serves `reads-ready`, which must not
+depend on the replica plane and does not verify it; that path passes `unverified` and
+publishes no `COCKPIT_READY_*` evidence, because container health and a loopback binding
+establish neither replica integrity, freshness, nor release binding. `reads-ready` grants
+only `READS_READY_*`, which is its own claim.
+
+`cockpit-ready` performs no PostgreSQL work and depends on no PostgreSQL/Grafana
+setting. That is enforced structurally rather than by scattered guards: the Cockpit
+stage is dispatched **before** the PostgreSQL/Grafana plane, so a Cockpit run returns
+before the PostgreSQL DSN/password validations, the Grafana env derivation, the
+PostgreSQL data and state directories, the PGDATA ownership fix, `config/pg_hba.conf`,
+`rollout.env`, the PostgreSQL capacity floor, and the backup/maintenance timers are
+reached at all. A Cockpit deployment therefore cannot require unrelated PostgreSQL
+configuration, and cannot mutate PostgreSQL host state. Cockpit state is written to its
+own `$STATE_ROOT/cockpit-ready.env`, never to `rollout.env`, so "this stage did not touch
+PostgreSQL rollout evidence" is provable by inspection.
+
+Idempotent: the image tag is release-pinned, `compose up -d` recreates only when the
+definition changed, and the replica, container health and reachability are re-proven on
+every run. `COCKPIT_READY_AT_UTC` and `COCKPIT_READY_SHA` are committed together by a
+single rename, so an interruption can never leave a new timestamp paired with an older
+release. Readiness is recorded only after every step succeeds, and a failed attempt
+leaves no marker.
+
+The sealed analytics environment file must already be installed (by the `empty` stage)
+because `cockpit-ready` needs `OPIP_COCKPIT_SECRET`. That is a secret-provisioning
+requirement, not a PostgreSQL readiness gate: no PostgreSQL container is started, and
+`cockpit-ready` does not read, satisfy, advance or imply the soak or `reads-ready`.
+
+### What `cockpit-ready` verifies before starting the Cockpit
+
+1. The exact `opip-data-platform:$TARGET_SHA` image is built from the checked-out
+   release. The tag is release-pinned, so a stale image from an earlier rollout cannot
+   satisfy a different SHA, and PostgreSQL is not pulled or started to build it.
+2. The committed replica generation is resolved. The replica root is a *repository*:
+   installed bundles live under `generations/<id>` and are selected by a plain-text
+   `current` pointer, so the parent directory holds no manifest and no canonical
+   database. Resolution is delegated to the existing resolver rather than reimplemented,
+   and the resolved generation - never the parent - becomes the root the Cockpit reads.
+3. That generation is verified by invoking the **existing** verifier CLI - the same
+   `verify` subcommand the learning sync already uses - inside a one-off container from
+   that exact image, with `--network none` and the parent mounted read-only. It
+   re-checks: manifest presence/readability, replica schema version, source release SHA
+   equal to `TARGET_SHA`, canonical snapshot presence, self-containment and
+   hash/structure, companion artifacts, and freshness against the existing replica
+   freshness contract. The shell reproduces none of those rules, and
+   `--max-age-seconds` is deliberately not passed, so this stage cannot widen the
+   freshness bound.
+4. The resolved generation is written into `/etc/opip-cockpit.env` as
+   `OPIP_CANONICAL_REPLICA_ROOT`, so the Cockpit process reads the same bundle that was
+   verified. It is deliberately not pinned in compose, because a pinned parent is not a
+   bundle.
+5. The container is started, and a bounded health wait must observe `healthy` before the
+   host-loopback preflight below runs. `compose up -d` returns while the container is
+   still `starting`, so proving reachability immediately would fail a first deployment
+   even though the service becomes healthy moments later.
+6. Only then are `COCKPIT_READY_AT_UTC` and `COCKPIT_READY_SHA` recorded.
+
+The health wait never replaces the preflight, and neither replaces the verifier: a
+missing, unreadable, structurally invalid, SHA-mismatched or stale replica, or an
+unresolvable `current` pointer, fails the stage closed before the Cockpit is started.
 
 ## Canonical freshness contract
 
@@ -124,7 +211,9 @@ configuration.
 ### Required reverse-proxy routes
 
 The external endpoint must terminate TLS and forward these four paths to the
-host-loopback Cockpit port. All four are GET-only and must not be cached.
+host-loopback Cockpit port. The raw host-loopback endpoint is not reachable from
+outside the host: an HTTPS/TLS reverse proxy is still required for external access.
+All four paths are GET-only and must not be cached.
 
 | External path | Proxied to |
 | --- | --- |
@@ -170,7 +259,8 @@ port being unpublished) leaves the service unreachable from the host. A green
 healthcheck is therefore **not** evidence that an operator can reach the Cockpit. That
 was the original defect: a passing healthcheck with no host-reachable endpoint.
 
-The `reads-ready` stage runs a separate host-side preflight that fails closed:
+Both `cockpit-ready` and `reads-ready` run a separate host-side preflight (through the
+shared `cockpit_start` primitive) that fails closed:
 
 1. `OPIP_COCKPIT_BIND_ADDRESS` must be host loopback; any other value is refused,
    because the raw HTTP service must never be exposed beyond the host.
@@ -203,9 +293,11 @@ Application behaviour is proven where it actually lives (healthcheck and suite),
 preflight prints `cockpit_app_behaviour=verified_by_healthcheck_and_test_suite` so the
 split is explicit to an operator.
 
-`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all five
-conditions hold, so a passing container healthcheck alone can never mark the Cockpit
-ready.
+`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are recorded in
+`$STATE_ROOT/cockpit-ready.env` - never in the PostgreSQL rollout evidence - and only
+after the exact target image is built, the replica is verified, the container is
+healthy and all five conditions above hold. A passing container healthcheck alone can
+never mark the Cockpit ready, and a failed attempt leaves no marker at all.
 
 ### Secret surface
 
