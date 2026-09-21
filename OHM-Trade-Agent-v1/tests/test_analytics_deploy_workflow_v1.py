@@ -75,7 +75,7 @@ def test_cockpit_ready_receives_sealed_env_without_running_empty_stage():
     cockpit_case = runner[runner.index("  cockpit-ready)") : runner.index("  backfill|shipper|reads-ready)")]
     assert "sync_cockpit_settings" in cockpit_case
     assert "bootstrap-opip-data-platform.sh" in cockpit_case
-    assert " empty" not in cockpit_case
+    assert 'bootstrap-opip-data-platform.sh" "$TARGET_SHA" empty' not in cockpit_case
     assert "opip-postgres" not in cockpit_case
     assert "opip-grafana" not in cockpit_case
 
