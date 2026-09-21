@@ -101,6 +101,14 @@ sync_cockpit_settings() {
     fi
   done
 
+  local cockpit_secret_line cockpit_secret_value
+  cockpit_secret_line="$(grep -E '^OPIP_COCKPIT_SECRET=' "$ENV_UPLOAD")"
+  cockpit_secret_value="${cockpit_secret_line#OPIP_COCKPIT_SECRET=}"
+  if [[ -z "$cockpit_secret_value"     || "$cockpit_secret_value" == "set-cockpit-secret"     || ${#cockpit_secret_value} -lt 24 ]]; then
+    echo "OPIP_COCKPIT_SECRET must be a non-placeholder secret of at least 24 characters" >&2
+    exit 78
+  fi
+
   temporary="$(mktemp /etc/opip-data-platform.env.XXXXXX)"
   awk -F= '
     $1 != "OPIP_COCKPIT_SECRET" &&
