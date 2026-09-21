@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import random
 import threading
@@ -11,6 +12,8 @@ from typing import Any
 
 import httpx
 
+
+logger = logging.getLogger(__name__)
 
 KRAKEN_PUBLIC_BASE = "https://api.kraken.com/0/public"
 
@@ -215,15 +218,24 @@ class KrakenPublicTransport:
         This is transport hygiene only. It never places, changes, cancels,
         confirms, or even reads an order, and it cannot reach a trading
         endpoint: the transport is the public market-data plane.
+
+        A failed close of the previous client is not fatal (the pooled socket is
+        discarded either way), but it is reported rather than silently swallowed
+        so recovery telemetry stays truthful.
         """
 
         try:
             with self._lock:
-                try:
-                    self._client.close()
-                except Exception:
-                    pass
+                previous = self._client
                 self._client = httpx.Client()
+            try:
+                previous.close()
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                logger.warning(
+                    "Kraken public transport close failed during reset: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
             return True
         except Exception:
             return False
