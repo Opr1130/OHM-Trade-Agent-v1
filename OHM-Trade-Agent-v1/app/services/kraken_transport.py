@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import random
 import threading
@@ -11,6 +12,8 @@ from typing import Any
 
 import httpx
 
+
+logger = logging.getLogger(__name__)
 
 KRAKEN_PUBLIC_BASE = "https://api.kraken.com/0/public"
 
@@ -130,11 +133,19 @@ class KrakenPublicTransport:
         params: dict[str, Any],
         *,
         timeout_seconds: float,
+        bypass_cache: bool = False,
     ) -> dict[str, Any]:
+        """Perform one public request, optionally bypassing the TTL cache.
+
+        ``bypass_cache`` exists for health/recovery probes: a TTL cache hit is
+        not evidence that provider connectivity recovered, so a recovery probe
+        must reach the network. Ordinary callers keep the cached default.
+        """
         key = self._cache_key(endpoint, params)
-        cached = self._cached(key)
-        if cached is not None:
-            return cached
+        if not bypass_cache:
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -200,6 +211,34 @@ class KrakenPublicTransport:
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+
+    def reset_connection(self) -> bool:
+        """Recreate the pooled HTTP client after a genuine low-level failure.
+
+        This is transport hygiene only. It never places, changes, cancels,
+        confirms, or even reads an order, and it cannot reach a trading
+        endpoint: the transport is the public market-data plane.
+
+        A failed close of the previous client is not fatal (the pooled socket is
+        discarded either way), but it is reported rather than silently swallowed
+        so recovery telemetry stays truthful.
+        """
+
+        try:
+            with self._lock:
+                previous = self._client
+                self._client = httpx.Client()
+            try:
+                previous.close()
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                logger.warning(
+                    "Kraken public transport close failed during reset: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            return True
+        except Exception:
+            return False
 
 
 _SHARED_TRANSPORT: KrakenPublicTransport | None = None

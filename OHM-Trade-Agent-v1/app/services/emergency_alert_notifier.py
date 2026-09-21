@@ -39,14 +39,15 @@ def format_emergency_message(
     )
     reason = one_line_reason(*(result.reasons or []))
     return (
-        f"{icon} OHM RISK — {display_market_label(trade.symbol)}\n"
+        f"{icon} EMERGENCY RISK — {display_market_label(trade.symbol)}\n"
+        f"Action: {action}\n"
         f"Price: {float(result.current_price):.8g} | Entry: {float(trade.entry_price):.8g}\n"
         f"Risk: {result.severity.upper()} | Stop: {float(trade.stop_price):.8g}\n"
         f"Distance to stop: {float(result.stop_distance_pct):.1f}%\n"
         f"5m / 15m: {float(result.change_5m_pct):+.1f}% / {float(result.change_15m_pct):+.1f}%\n"
         f"T1 / T2: {float(trade.target_1):.8g} / {float(trade.target_2):.8g}\n"
-        f"Reason: {reason}\n"
-        f"Action: {action}"
+        f"Why: {reason}\n"
+        "No order was placed or changed."
     )
 
 

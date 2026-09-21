@@ -8,8 +8,29 @@ from app.services import (
     chief_alert_notifier,
     chief_analyst,
     notification_policy,
+    system_incidents,
     trade_outcome_registry,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolate_system_incident_registry(tmp_path, monkeypatch):
+    """Keep Alert-v2 incident governance inside the per-test temp directory.
+
+    ``system_incidents.STATE_FILE`` defaults to ``/app/data``. Redirecting it
+    keeps tests deterministic and platform-independent without changing any
+    production constant. The module reads the constant at call time, so this
+    patch is picked up by every caller (including the monitor runner).
+    """
+    monkeypatch.setattr(
+        system_incidents,
+        "STATE_FILE",
+        tmp_path / "system_incidents.json",
+    )
+    # The process-local already-delivered guard is intentionally process-global
+    # (it exists to block duplicate sends while storage is down), so it must not
+    # leak between tests.
+    system_incidents.reset_local_unconfirmed_deliveries_for_tests()
 
 
 @pytest.fixture(autouse=True)
