@@ -206,6 +206,14 @@ def test_page_has_a_way_to_supply_the_operator_secret():
     assert "x-webhook-secret" in served
 
 
+def test_page_names_the_cockpit_secret_and_rejects_trading_secret_wording():
+    """The UI must not instruct an operator to reuse an order-capable trading secret."""
+    served = _read(COCKPIT_HTML)
+    assert "Cockpit read-only secret" in served
+    assert "distinct from the trading operator/webhook secret" in served
+    assert "Enter the existing operator/webhook secret" not in served
+
+
 def test_page_never_persists_the_secret():
     """Authentication is in-memory only: no storage, no cookie."""
     script = _script_section(_read(COCKPIT_HTML))
