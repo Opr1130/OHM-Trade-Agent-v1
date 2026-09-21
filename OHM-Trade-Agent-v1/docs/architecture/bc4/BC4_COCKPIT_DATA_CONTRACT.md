@@ -442,10 +442,18 @@ Rules honoured:
 Deployment wiring (implemented):
 
 - The Cockpit analytical API runs as a dedicated **read-only service on the
-  analytics plane**, defined in the existing `deploy/analytics/docker-compose.yml`
-  as `opip-cockpit`. It reuses the existing repository image and mounts the verified
-  replica read-only at `/app/canonical-replica` (the path the replica module already
-  expects), with `OPIP_CANONICAL_REPLICA_ROOT` pointing at it.
+  analytics plane**, defined in its own minimal Compose surface
+  `deploy/analytics/docker-compose.cockpit.yml` as `opip-cockpit`. It reuses the existing
+  repository image and mounts the verified replica read-only at
+  `/app/canonical-replica` (the path the replica module already expects), with
+  `OPIP_CANONICAL_REPLICA_ROOT` pointing at it.
+  A dedicated file is required rather than a service in the shared analytics Compose
+  file: Docker Compose interpolates the entire file before selecting a service, so a
+  Cockpit-only deployment driven from the shared file failed on the mandatory
+  `${OPIP_GRAFANA_ADMIN_USER:?}` of `opip-grafana` even though the shell control flow for
+  `cockpit-ready` never reaches the Grafana plane. The Cockpit is defined exactly once;
+  the shared file keeps the PostgreSQL/Grafana plane and its strict requirements
+  unchanged. See `deploy/analytics/README.md`.
 - It runs `app.api.cockpit_service:app`, a cockpit-only ASGI app rather than the
   trading entry point, so the analytics-plane container physically cannot start
   trading subsystems, and it holds no exchange, Telegram or order authority.

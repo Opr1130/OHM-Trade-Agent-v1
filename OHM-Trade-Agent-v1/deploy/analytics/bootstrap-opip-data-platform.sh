@@ -7,6 +7,14 @@ ROOT="/opt/opip-learning"
 REPO_ROOT="$ROOT/repo"
 APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
+# The Cockpit has its own Compose surface. Docker Compose interpolates the entire file it
+# is given before selecting a service, and the shared analytics file carries mandatory
+# PostgreSQL/Grafana variables (for example `${OPIP_GRAFANA_ADMIN_USER:?}`), so a
+# Cockpit-only deployment served from that file failed on the analytics host even though
+# the shell control flow never reaches the Grafana plane. Every Cockpit build/start/status
+# operation goes through this file instead; the PostgreSQL/Grafana stages keep using
+# $COMPOSE.
+COCKPIT_COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.cockpit.yml"
 ENV_FILE="/etc/opip-data-platform.env"
 GRAFANA_ENV_FILE="/etc/opip-grafana.env"
 COCKPIT_ENV_FILE="/etc/opip-cockpit.env"
@@ -173,11 +181,18 @@ write_cockpit_env_file() {
   # its own authentication secret and its own bound/port configuration. Everything
   # else the process requires (the container port) is static and set in compose.
   #
-  # ``$1`` is the container-side path of the committed replica generation. It is
-  # derived here rather than inherited from the environment so the Cockpit reads the
-  # generation the pointer actually names. The parent repository is never used as the
-  # replica root: it holds no manifest and no canonical database.
-  local replica_root="${1:-$COCKPIT_REPLICA_CONTAINER_ROOT}"
+  # ``$1`` is the container-side path of the committed replica generation. It is optional:
+  #
+  #   * omitted - only the secret/port allowlist is written and the application default
+  #     (DEFAULT_REPLICA_ROOT, /app/canonical-replica) applies. Used to materialize the
+  #     secret surface before the generation can be known, because resolving the
+  #     generation needs the image that `cockpit_build_image` produces while Compose loads
+  #     this service's `env_file` in order to build.
+  #   * given - the verified generation is recorded, so the Cockpit reads the bundle the
+  #     pointer names rather than the parent repository.
+  #
+  # Omitting it never records a root the verifier has not confirmed.
+  local replica_root="${1:-}"
   local temporary key
   local -a keys=(
     OPIP_COCKPIT_SECRET
@@ -196,7 +211,9 @@ write_cockpit_env_file() {
       exit 78
     fi
   done
-  printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$replica_root" >> "$temporary"
+  if [[ -n "$replica_root" ]]; then
+    printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$replica_root" >> "$temporary"
+  fi
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
@@ -204,6 +221,19 @@ write_cockpit_env_file() {
 
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
+}
+
+cockpit_compose() {
+  # The Cockpit-only Compose surface. Used by every Cockpit build/start/status operation
+  # so the shared analytics file - and therefore its mandatory PostgreSQL/Grafana
+  # variables - is never interpolated for a Cockpit deployment.
+  #
+  # `--env-file` is passed for the same reason the historical stages pass it: the sealed
+  # analytics env file is the single source of the non-secret Cockpit settings
+  # (OPIP_COCKPIT_BIND_ADDRESS / OPIP_COCKPIT_HOST_PORT / OPIP_COCKPIT_HTTP_PORT). It
+  # contains no `${...:?}` requirement reachable from this file, and the Cockpit service
+  # needs none of the PostgreSQL/Grafana variables.
+  docker compose --env-file "$ENV_FILE" -f "$COCKPIT_COMPOSE" "$@"
 }
 
 cockpit_preflight() {
@@ -328,10 +358,25 @@ cockpit_build_image() {
   # earlier analytics rollout cannot satisfy a different SHA, and rebuilding from the
   # checked-out release is what makes the image provably match TARGET_SHA.
   #
-  # Only the Cockpit service is built. PostgreSQL is not pulled, built or started in
-  # order to build the Cockpit image.
+  # Only the Cockpit service is built, through the Cockpit-only Compose file, so the
+  # shared analytics file is never interpolated and no PostgreSQL/Grafana variable is
+  # required. PostgreSQL is not pulled, built or started in order to build this image.
+  #
+  # Compose loads this service definition - including its `env_file` - in order to build,
+  # and /etc/opip-cockpit.env does not exist yet on a host that has never started the
+  # Cockpit. Materialize the secret surface first so the file is loadable.
+  #
+  # Only when absent. An existing file may already record the generation that verified
+  # for the previous release, and this build has not proven itself yet: overwriting it
+  # here would drop that root, so a failed build or a failed replica verification would
+  # leave a working Cockpit unable to locate its bundle on the next recreation.
+  # `cockpit_start` rewrites the file with the newly verified generation immediately
+  # before the container starts, so a successful run always ends up authoritative.
   export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-  docker compose -f "$COMPOSE" build opip-cockpit
+  if [[ ! -e "$COCKPIT_ENV_FILE" ]]; then
+    write_cockpit_env_file
+  fi
+  cockpit_compose build opip-cockpit
 }
 
 cockpit_replica_root() {
@@ -469,7 +514,7 @@ cockpit_start() {
   local verification="${2:-unverified}"
 
   write_cockpit_env_file "$replica_root"
-  compose up -d opip-cockpit
+  cockpit_compose up -d opip-cockpit
   cockpit_wait_healthy
   cockpit_preflight
 
@@ -554,7 +599,9 @@ if [[ "$STAGE" == "$COCKPIT_STAGE" ]]; then
   analytics_host_lock
   sync_release_checkout
   cockpit_deploy_verified
-  compose ps
+  # Status through the Cockpit-only surface: parsing the shared analytics file here would
+  # reintroduce the interpolation dependency this stage exists to avoid.
+  cockpit_compose ps
   echo "O'Pip analytics data-platform stage succeeded"
   echo "stage=$STAGE"
   echo "sha=$TARGET_SHA"
@@ -867,6 +914,10 @@ elif [[ "$STAGE" == "reads-ready" ]]; then
   # the parent mount and reports replica unavailability through its own API.
   cockpit_build_image
   cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")" unverified
+  # The Cockpit is owned by its own Compose surface, so the shared-surface `compose ps`
+  # below cannot show it. Report its status here, or a successful historical-read
+  # deployment would describe only the PostgreSQL/Grafana plane to the operator.
+  cockpit_compose ps
   # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
   # here, only after every historical gate above has passed. `cockpit-ready` never
   # writes these.

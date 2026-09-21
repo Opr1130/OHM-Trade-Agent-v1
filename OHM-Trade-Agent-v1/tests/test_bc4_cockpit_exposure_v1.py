@@ -20,12 +20,22 @@ import yaml
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 COMPOSE = REPO / "deploy" / "analytics" / "docker-compose.yml"
+#: The Cockpit has its own Compose surface. Compose interpolates a whole file before
+#: selecting a service, and the shared analytics file carries mandatory Grafana/
+#: PostgreSQL variables, so a Cockpit-only deployment sourced from that file fails on
+#: `${OPIP_GRAFANA_ADMIN_USER:?}` even when the shell control flow never reaches the
+#: Grafana plane. The Cockpit is therefore defined once, in this file, and a dedicated
+#: suite (tests/test_bc4e1_cockpit_compose_isolation_v1.py) proves it renders with every
+#: PostgreSQL/Grafana variable absent.
+COCKPIT_COMPOSE = REPO / "deploy" / "analytics" / "docker-compose.cockpit.yml"
 ENV_EXAMPLE = REPO / "deploy" / "analytics" / "env.example"
 BOOTSTRAP = REPO / "deploy" / "analytics" / "bootstrap-opip-data-platform.sh"
 README = REPO / "deploy" / "analytics" / "README.md"
 
 COMPOSE_TEXT = COMPOSE.read_text(encoding="utf-8")
 COMPOSE_DATA = yaml.safe_load(COMPOSE_TEXT)
+COCKPIT_COMPOSE_TEXT = COCKPIT_COMPOSE.read_text(encoding="utf-8")
+COCKPIT_COMPOSE_DATA = yaml.safe_load(COCKPIT_COMPOSE_TEXT)
 BOOTSTRAP_TEXT = BOOTSTRAP.read_text(encoding="utf-8")
 README_TEXT = README.read_text(encoding="utf-8")
 
@@ -41,6 +51,14 @@ def _port_parts(mapping: str) -> list[str]:
 
 
 def _service(name: str = "opip-cockpit") -> dict:
+    """A service definition, read from whichever Compose surface owns it.
+
+    The Cockpit is defined in ``docker-compose.cockpit.yml``; Grafana and the other
+    analytics services remain in the shared file. Dispatching here keeps every
+    assertion below meaningful without duplicating the Cockpit definition anywhere.
+    """
+    if name == "opip-cockpit":
+        return COCKPIT_COMPOSE_DATA["services"][name]
     return COMPOSE_DATA["services"][name]
 
 
@@ -212,9 +230,9 @@ def test_f_replica_is_mounted_read_only_at_the_expected_path():
     # /etc/opip-cockpit.env, which this service loads via env_file.
     assert "OPIP_CANONICAL_REPLICA_ROOT" not in _service()["environment"]
     assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in BOOTSTRAP_TEXT
-    assert (
-        'local replica_root="${1:-$COCKPIT_REPLICA_CONTAINER_ROOT}"' in BOOTSTRAP_TEXT
-    )
+    # The generation is optional, so the secret surface can be materialized before the
+    # generation is resolvable, and an unverified root is never recorded.
+    assert 'local replica_root="${1:-}"' in BOOTSTRAP_TEXT
     # The resolution itself is delegated to the existing resolver, never reimplemented.
     assert "python -m app.opip.learning.canonical_replica resolve" in BOOTSTRAP_TEXT
 
