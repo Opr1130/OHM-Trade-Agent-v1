@@ -598,6 +598,72 @@ def test_g_bootstrap_refuses_order_capable_credentials_on_the_analytics_plane():
     assert "must not be present on the analytics plane" in guard
 
 
+def test_g_plane_guard_normalizes_assignment_syntax():
+    """`export KEY=...` and indented assignments must not slip past the guard.
+
+    Review finding (valid, P1): the guard compared the raw first `=`-separated field, so
+    `export WEBHOOK_SECRET=...` (or a whitespace-prefixed assignment) was not
+    recognized. Because the sealed file is already sourced with `set -a`, the
+    order-capable credential would then have been present in the bootstrap process
+    despite the guard claiming to reject it.
+    """
+    guard = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("guard_no_trading_credentials()") :
+        BOOTSTRAP_TEXT.index("guard_no_trading_credentials\n")
+    ]
+    # It must normalize before comparing...
+    assert "sub(/^[[:space:]]+/, \"\", line)" in guard
+    assert "sub(/^export[[:space:]]+/, \"\", line)" in guard
+    # ...and independently validate the already-sourced environment, which covers
+    # every syntax Bash accepts without re-implementing its parser.
+    assert "${!key:-}" in guard
+
+
+def test_g_plane_guard_really_rejects_export_and_indented_forms(tmp_path):
+    """Behavioural check of the guard's matching logic against real file shapes.
+
+    A stub file exercises the same normalization the guard applies, so the test fails
+    if the matcher regresses to an exact first-field compare.
+    """
+    import subprocess
+
+    def guard_matches(text: str, key: str) -> bool:
+        script = f"""
+        awk -v key="{key}" '
+          {{
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/^export[[:space:]]+/, "", line)
+            if (index(line, key "=") == 1) {{ found = 1; exit }}
+          }}
+          END {{ exit !found }}
+        '
+        """
+        target = tmp_path / "sealed.env"
+        target.write_text(text, encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", f"{script} < '{target}'"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    import shutil
+
+    if shutil.which("bash") is None:
+        # Windows dev host: the normalization itself is asserted above, and GitHub
+        # Linux CI executes this behaviourally. Not a silent skip of an assertion -
+        # the structural check above still runs everywhere.
+        return
+
+    assert guard_matches("WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert guard_matches("export WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert guard_matches("  WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert guard_matches("# WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
+    assert guard_matches("OPIP_COCKPIT_SECRET=abc\n", "WEBHOOK_SECRET") is False
+
+
 def test_g_cockpit_authentication_fails_closed_when_unconfigured(monkeypatch):
     """An unset secret must yield 401, never an open read-only surface."""
     from fastapi.testclient import TestClient

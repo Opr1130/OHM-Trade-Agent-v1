@@ -115,13 +115,33 @@ guard_no_trading_credentials() {
   # Copying it here would place an order-capable credential on an externally
   # reachable read-only surface, so this fails closed rather than tolerating it. The
   # Cockpit has its own read-only OPIP_COCKPIT_SECRET instead.
+  #
+  # Two independent checks, because either alone is bypassable:
+  #
+  #   1. The sourced environment. This file has already been sourced with `set -a`,
+  #      so any name Bash accepted is already present as a variable. Checking the
+  #      environment directly covers every syntax Bash accepts, without this guard
+  #      having to re-implement Bash's parser.
+  #   2. A normalized scan of the file text. Assignment syntax is normalized before
+  #      comparison - leading whitespace and an optional `export ` prefix are
+  #      stripped - so `export WEBHOOK_SECRET=...` and `  WEBHOOK_SECRET=...` are
+  #      recognized rather than slipping past an exact first-field compare.
   local key
   for key in \
     WEBHOOK_SECRET \
     KRAKEN_API_KEY \
     KRAKEN_API_SECRET \
     TELEGRAM_BOT_TOKEN; do
-    if awk -F= -v key="$key" '$1 == key {found=1; exit} END {exit !found}' "$ENV_FILE"; then
+    if [[ -n "${!key:-}" ]] \
+      || awk -v key="$key" '
+           {
+             line = $0
+             sub(/^[[:space:]]+/, "", line)
+             sub(/^export[[:space:]]+/, "", line)
+             if (index(line, key "=") == 1) { found = 1; exit }
+           }
+           END { exit !found }
+         ' "$ENV_FILE"; then
       echo "$key must not be present on the analytics plane" >&2
       echo "it carries trading/order authority and belongs only on the trading host" >&2
       echo "the Cockpit uses its own read-only OPIP_COCKPIT_SECRET" >&2

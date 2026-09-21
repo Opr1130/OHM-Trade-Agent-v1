@@ -214,7 +214,8 @@ it has no use for. `/etc/opip-cockpit.env` is derived by bootstrap from the seal
 analytics env file with a strict allowlist:
 
 ```
-WEBHOOK_SECRET               (gates every /api/cockpit/* read)
+OPIP_COCKPIT_SECRET          (gates every /api/cockpit/* read; distinct from the
+                              trading host's order-capable WEBHOOK_SECRET)
 OPIP_COCKPIT_BIND_ADDRESS
 OPIP_COCKPIT_HOST_PORT
 OPIP_COCKPIT_HTTP_PORT
