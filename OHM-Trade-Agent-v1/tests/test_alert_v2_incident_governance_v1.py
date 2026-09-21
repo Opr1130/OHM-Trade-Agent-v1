@@ -28,10 +28,12 @@ import httpx
 import pytest
 
 from app.services import (
+    active_trade_monitor_runner as runner,
     kraken_health as health,
     kraken_transport as transport,
     system_incidents as incidents,
 )
+from app.services.system_incidents import SystemIncidentScope
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1655,6 +1657,26 @@ def test_incident_contract_fixture_matches_code_constants(tmp_path):
         incidents.MONITOR_OWNED_SCOPES
     )
 
+    # Rate limiting must never be recoverable from generic exposure coverage.
+    rate_limit_scope = incidents.SystemIncidentScope.KRAKEN_RATE_LIMIT.value
+    assert rate_limit_scope not in contract["recovery_authority"]["coverage_based_scopes"]
+    assert rate_limit_scope in contract["recovery_authority"]["coverage_cannot_close"]
+    assert (
+        incidents.recovery_authority_for_scope(
+            incidents.SystemIncidentScope.KRAKEN_RATE_LIMIT
+        )
+        is incidents.RecoveryAuthority.RATE_LIMIT_CLEARED
+    )
+
+    # Delivery-durability outcomes must be documented.
+    outcomes = contract["delivery_durability"]["outcomes"]
+    assert set(outcomes) == {
+        "A_telegram_rejected",
+        "B_delivered_and_committed",
+        "C_delivered_commit_failed_reconciliation_recorded",
+        "D_delivered_no_durable_write_at_all",
+    }
+
     # Every persisted field must be produced by a freshly opened incident row.
     state = tmp_path / "_contract_probe.json"
     decision = _pricing(state)
@@ -1704,3 +1726,585 @@ def _coverage_resolution(*, coverage_complete: bool, reason: str = ""):
         coverage_complete=coverage_complete,
         reason=reason,
     )
+
+
+# ===========================================================================
+# 9. RATE-LIMIT RECOVERY REQUIRES SCOPE-MATCHED EVIDENCE
+# ===========================================================================
+
+
+def _open_rate_limit_incident(state, *, when=NOW):
+    """Open a rate-limit incident and confirm its OPEN notification."""
+
+    decision = _observe(
+        state,
+        klass=RATE_LIMIT_CLASS,
+        scope=RATE_LIMIT_SCOPE,
+        reason="Kraken public HTTP 429 for Ticker",
+        now=when,
+    )
+    assert decision.action == incidents.ACTION_NOTIFY_OPEN
+    assert decision.should_notify is True
+    _deliver(state, decision, when=when)
+    return decision
+
+
+def test_exposure_coverage_cannot_close_rate_limit(tmp_path):
+    """1. exposure coverage_complete=True does NOT close KRAKEN_RATE_LIMIT."""
+
+    state = tmp_path / "incidents.json"
+    _open_rate_limit_incident(state)
+
+    # Held-position coverage says nothing about whether Kraken is throttling.
+    assert (
+        SystemIncidentScope.KRAKEN_RATE_LIMIT.value
+        not in runner._COVERAGE_EVIDENCE_BY_SCOPE
+    )
+
+    failures: list[str] = []
+    runner._reconcile_system_incident_recovery(
+        settings=_settings(),
+        coverage_complete=True,
+        degraded_scopes=set(),
+        failures=failures,
+    )
+
+    row = _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")
+    assert row is not None
+    assert row["state"] == incidents.STATE_OPEN
+    assert row["recovered_at"] is None
+
+
+def test_pricing_coverage_cannot_close_rate_limit(tmp_path):
+    """2. pricing coverage does NOT close KRAKEN_RATE_LIMIT."""
+
+    state = tmp_path / "incidents.json"
+    _open_rate_limit_incident(state)
+
+    refused = incidents.observe_recovery(
+        incident_class=RATE_LIMIT_CLASS,
+        scope=RATE_LIMIT_SCOPE,
+        evidence_source=AUTH_PRICING,
+        evidence="coverage complete",
+        state_file=state,
+    )
+    assert refused.reason == "EVIDENCE_SOURCE_MISMATCH"
+    assert _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")["state"] == incidents.STATE_OPEN
+
+
+def test_position_verification_cannot_close_rate_limit(tmp_path):
+    """3. position verification does NOT close KRAKEN_RATE_LIMIT."""
+
+    state = tmp_path / "incidents.json"
+    _open_rate_limit_incident(state)
+
+    refused = incidents.observe_recovery(
+        incident_class=RATE_LIMIT_CLASS,
+        scope=RATE_LIMIT_SCOPE,
+        evidence_source=AUTH_POSITION,
+        evidence="position coverage complete",
+        state_file=state,
+    )
+    assert refused.reason == "EVIDENCE_SOURCE_MISMATCH"
+    assert _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")["state"] == incidents.STATE_OPEN
+
+
+def test_unrelated_public_success_cannot_close_rate_limit_scope(tmp_path):
+    """4. unrelated successful public call does not close the wrong rate-limit scope."""
+
+    state = tmp_path / "incidents.json"
+    _open_rate_limit_incident(state)
+
+    # A public *connectivity* recovery is not rate-limit evidence.
+    refused = incidents.observe_recovery(
+        incident_class=RATE_LIMIT_CLASS,
+        scope=RATE_LIMIT_SCOPE,
+        evidence_source=AUTH_PUBLIC,
+        evidence="public Time probe succeeded",
+        state_file=state,
+    )
+    assert refused.reason == "EVIDENCE_SOURCE_MISMATCH"
+
+    # And a public connectivity incident elsewhere is untouched by it.
+    assert _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")["state"] == incidents.STATE_OPEN
+
+
+def test_authoritative_rate_limit_cleared_evidence_closes_incident(tmp_path, monkeypatch):
+    """5. explicit authoritative rate-limit-cleared evidence DOES close the incident."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
+    )
+    _open_rate_limit_incident(state)
+
+    probes: list[str] = []
+
+    def succeeding_probe():
+        def probe():
+            probes.append("fresh")
+            return {"unixtime": 1}
+
+        return probe
+
+    monkeypatch.setattr(runner, "rate_limit_cleared_probe", succeeding_probe)
+
+    failures: list[str] = []
+    runner._attempt_rate_limit_recovery(
+        scope=SystemIncidentScope.KRAKEN_RATE_LIMIT.value,
+        incident_class=RATE_LIMIT_CLASS.value,
+        settings=_settings(),
+        failures=failures,
+    )
+
+    assert probes
+    row = _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")
+    assert row is not None
+    assert row["state"] == incidents.STATE_RECOVERED
+    assert row["recovery_authority"] == AUTH_RATE_LIMIT.value
+    assert failures == []
+
+
+def test_rate_limit_failure_class_is_not_treated_as_cleared(tmp_path, monkeypatch):
+    """Clearing requires rate-limit-cleared evidence, not a 429 or a network error."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
+    )
+    _open_rate_limit_incident(state)
+
+    for failure_text in (
+        "Kraken public HTTP 429 for Time",
+        "ConnectError: connection refused",
+    ):
+
+        def failing_probe(text=failure_text):
+            def probe():
+                raise RuntimeError(text)
+
+            return probe
+
+        monkeypatch.setattr(runner, "rate_limit_cleared_probe", failing_probe)
+        failures: list[str] = []
+        runner._attempt_rate_limit_recovery(
+            scope=SystemIncidentScope.KRAKEN_RATE_LIMIT.value,
+            incident_class=RATE_LIMIT_CLASS.value,
+            settings=_settings(),
+            failures=failures,
+        )
+
+        row = _row(state, "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT")
+        assert row["state"] == incidents.STATE_OPEN
+        assert row["recovered_at"] is None
+        # Rate limiting must never advance a connectivity recovery counter.
+        assert row["consecutive_recovery_failures"] == 0
+
+
+def test_rate_limit_recovery_notification_occurs_exactly_once(tmp_path, monkeypatch):
+    """6. recovered Telegram occurs exactly once after authoritative clearance."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "rate_limit_cleared_probe", lambda: (lambda: {"unixtime": 1}))
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=len(sent)),
+    )
+
+    _open_rate_limit_incident(state)
+
+    for _ in range(3):
+        failures: list[str] = []
+        runner._attempt_rate_limit_recovery(
+            scope=SystemIncidentScope.KRAKEN_RATE_LIMIT.value,
+            incident_class=RATE_LIMIT_CLASS.value,
+            settings=_settings(),
+            failures=failures,
+        )
+
+    assert len(sent) == 1
+    assert "SYSTEM RECOVERED" in sent[0]
+
+
+def test_http_429_remains_rate_limited_not_connectivity():
+    """7. HTTP 429 remains RATE_LIMITED, not connectivity failure."""
+
+    klass, scope = incidents.classify_degradation_reason(
+        "Kraken public HTTP 429 for Ticker"
+    )
+    assert klass is RATE_LIMIT_CLASS
+    assert scope is RATE_LIMIT_SCOPE
+    assert incidents.requires_owner_recovery_cycles(klass) is False
+    assert (
+        health.classify_failure_text("Kraken public HTTP 429 for Ticker")
+        is health.KrakenFailureClass.RATE_LIMITED
+    )
+
+
+# ===========================================================================
+# 10. TELEGRAM DELIVERY DURABILITY
+# ===========================================================================
+
+
+def _delivery_decision(state, *, cycles=7):
+    """Return an OPEN decision for the public connectivity scope."""
+
+    for _ in range(cycles - 1):
+        _failed_cycle(state)
+    decision = _failed_cycle(state)
+    assert decision.action == incidents.ACTION_NOTIFY_OPEN
+    return decision
+
+
+def test_telegram_delivered_with_confirm_success_commits_once(tmp_path, monkeypatch):
+    """8. Telegram delivered + confirm succeeds => committed once."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=1234),
+    )
+
+    decision = _delivery_decision(state)
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision
+    ) is True
+
+    assert len(sent) == 1
+    row = _row(state, PUBLIC_KEY)
+    assert row["open_message_id"] == 1234
+    assert row["opened_notification_at"] is not None
+    assert incidents.unconfirmed_delivery(
+        incident_id=decision.incident_id, kind=incidents.KIND_OPEN, state_file=state
+    ) is None
+    assert incidents.local_unconfirmed_deliveries() == ()
+
+
+def test_first_confirm_failure_then_retry_succeeds_without_duplicate(
+    tmp_path, monkeypatch
+):
+    """9. first confirm fails + later retry succeeds => no duplicate."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=4321),
+    )
+
+    real_confirm = incidents.confirm_incident_notification
+    calls = {"n": 0}
+
+    def flaky_confirm(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False
+        return real_confirm(**kwargs)
+
+    monkeypatch.setattr(runner, "confirm_incident_notification", flaky_confirm)
+
+    decision = _delivery_decision(state)
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision
+    ) is True
+
+    assert calls["n"] >= 2
+    assert len(sent) == 1
+    row = _row(state, PUBLIC_KEY)
+    assert row["open_message_id"] == 4321
+
+
+def test_all_confirms_fail_but_reconciliation_recorded_then_reconciled(
+    tmp_path, monkeypatch
+):
+    """10 + 14. all confirms fail + reconciliation succeeds => original message_id reconciled."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=5555),
+    )
+
+    real_confirm = incidents.confirm_incident_notification
+    allow = {"ok": False}
+
+    def gated_confirm(**kwargs):
+        if not allow["ok"]:
+            return False
+        return real_confirm(**kwargs)
+
+    monkeypatch.setattr(runner, "confirm_incident_notification", gated_confirm)
+
+    decision = _delivery_decision(state)
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision
+    ) is True
+    assert len(sent) == 1
+
+    evidence = incidents.unconfirmed_delivery(
+        incident_id=decision.incident_id, kind=incidents.KIND_OPEN, state_file=state
+    )
+    assert evidence is not None
+    assert evidence["message_id"] == 5555
+    assert incidents.local_unconfirmed_deliveries() == ()
+
+    # Storage recovers: a later delivery attempt reconciles the ORIGINAL message.
+    allow["ok"] = True
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision
+    ) is True
+
+    assert len(sent) == 1, "the already-delivered message must never be resent"
+    row = _row(state, PUBLIC_KEY)
+    assert row["open_message_id"] == 5555
+    assert row["opened_notification_at"] is not None
+
+
+def test_total_durability_failure_is_explicit_and_blocks_duplicate(
+    tmp_path, monkeypatch
+):
+    """11 + 12 + 13. confirm fails AND reconciliation fails => explicit failure, no resend."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=9999),
+    )
+
+    monkeypatch.setattr(
+        runner, "confirm_incident_notification", lambda **kwargs: False
+    )
+    monkeypatch.setattr(
+        runner, "record_unconfirmed_delivery", lambda **kwargs: False
+    )
+
+    decision = _delivery_decision(state)
+    failures: list[str] = []
+    result = runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision, failures=failures
+    )
+
+    assert len(sent) == 1
+    # The message WAS accepted by Telegram, so this is never reported as a failed
+    # send; but it is explicitly surfaced as a durability failure.
+    assert result is True
+    assert any("durability failure" in item for item in failures)
+    assert any(str(9999) in item for item in failures)
+
+    # 12. The local guard blocks a duplicate while storage is unavailable.
+    local = incidents.locally_remembered_delivery(
+        incident_id=decision.incident_id, kind=incidents.KIND_OPEN
+    )
+    assert local is not None
+    assert local["message_id"] == 9999
+
+    # A later attempt must reconcile rather than resend.
+    evidence = incidents.unconfirmed_delivery(
+        incident_id=decision.incident_id, kind=incidents.KIND_OPEN, state_file=state
+    )
+    assert evidence is not None
+    assert evidence["message_id"] == 9999
+
+    monkeypatch.setattr(runner, "confirm_incident_notification", lambda **kwargs: True)
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision, failures=failures
+    ) is True
+    assert len(sent) == 1, "no second human notification may be emitted"
+
+
+def test_local_delivery_guard_promotes_to_durable_when_storage_recovers(
+    tmp_path, monkeypatch
+):
+    """Transient storage failure: the local guard becomes durable, then is dropped."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=7777),
+    )
+    monkeypatch.setattr(runner, "confirm_incident_notification", lambda **kwargs: False)
+    monkeypatch.setattr(runner, "record_unconfirmed_delivery", lambda **kwargs: False)
+
+    decision = _delivery_decision(state)
+    runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision, failures=[]
+    )
+    assert len(incidents.local_unconfirmed_deliveries()) == 1
+
+    # Storage recovers: reconciliation sweep promotes the guard to durable state.
+    monkeypatch.setattr(runner, "record_unconfirmed_delivery", incidents.record_unconfirmed_delivery)
+    failures: list[str] = []
+    runner._reconcile_local_unconfirmed_deliveries(failures=failures)
+
+    assert incidents.local_unconfirmed_deliveries() == ()
+    assert failures == []
+    evidence = incidents.unconfirmed_delivery(
+        incident_id=decision.incident_id, kind=incidents.KIND_OPEN, state_file=state
+    )
+    assert evidence is not None
+    assert evidence["message_id"] == 7777
+    assert len(sent) == 1
+
+
+def test_persistent_storage_failure_keeps_guard_and_reports(tmp_path, monkeypatch):
+    """Persistent storage failure keeps the guard and reports unresolved evidence."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=8888),
+    )
+    monkeypatch.setattr(runner, "confirm_incident_notification", lambda **kwargs: False)
+    monkeypatch.setattr(runner, "record_unconfirmed_delivery", lambda **kwargs: False)
+
+    decision = _delivery_decision(state)
+    runner._deliver_system_incident_decision(
+        settings=_settings(), decision=decision, failures=[]
+    )
+
+    failures: list[str] = []
+    runner._reconcile_local_unconfirmed_deliveries(failures=failures)
+
+    # The guard is retained (still unresolved) and the condition is reported.
+    assert len(incidents.local_unconfirmed_deliveries()) == 1
+    assert any("durability failure persists" in item for item in failures)
+    assert any(str(8888) in item for item in failures)
+
+
+def test_no_duplicate_open_escalation_or_recovered_message_after_durability_failure(
+    tmp_path, monkeypatch
+):
+    """15. no second OPEN/ESCALATION/RECOVERED message for that delivery."""
+
+    state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(runner, "_confirm_sleep", lambda _: None)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=1111),
+    )
+    monkeypatch.setattr(runner, "confirm_incident_notification", lambda **kwargs: False)
+    monkeypatch.setattr(runner, "record_unconfirmed_delivery", lambda **kwargs: False)
+
+    decision = _delivery_decision(state)
+
+    for _ in range(5):
+        runner._deliver_system_incident_decision(
+            settings=_settings(), decision=decision, failures=[]
+        )
+
+    assert len(sent) == 1
+    assert sent[0].startswith("🛑 SYSTEM FAILURE — KRAKEN CONNECTIVITY")
+
+
+# ===========================================================================
+# 11. OLD-FINDING PROOF (re-verified on this head)
+# ===========================================================================
+
+
+def test_connectivity_outranks_derived_pricing_in_combined_reason():
+    """16. connectivity outranks derived pricing symptoms in combined reason."""
+
+    combined = (
+        "Kraken public pair discovery unavailable: "
+        "KrakenTransportError: ConnectError: connection refused; "
+        "USD/stable-quote pricing unavailable for held assets: ADA.S,ETH2.S"
+    )
+    klass, scope = incidents.classify_degradation_reason(combined)
+    assert klass is CONNECTIVITY_CLASS
+    assert scope is PUBLIC_SCOPE
+    assert incidents.requires_owner_recovery_cycles(klass) is True
+    assert (
+        health.classify_failure_text(combined) is health.KrakenFailureClass.CONNECTIVITY
+    )
+
+
+def test_pure_pricing_gap_remains_pricing():
+    """17. pure pricing gap remains pricing."""
+
+    klass, scope = incidents.classify_degradation_reason(PRICING_REASON)
+    assert klass is PRICING_CLASS
+    assert scope is PRICING_SCOPE
+    assert incidents.requires_owner_recovery_cycles(klass) is False
+
+
+def test_failed_recovered_delivery_remains_pending_and_retries(tmp_path):
+    """18 + 19. failed RECOVERED delivery stays pending, retries, once only."""
+
+    state = tmp_path / "incidents.json"
+    _open_public_incident(state)
+
+    recovered = _recover(state)
+    assert recovered.action == incidents.ACTION_NOTIFY_RECOVERY
+    incidents.release_incident_notification(decision=recovered, state_file=state)
+
+    # 19. The recovered row is still selected for reconciliation.
+    pending = incidents.pending_notification_decisions(state_file=state)
+    assert len(pending) == 1
+    assert pending[0].state == incidents.STATE_RECOVERED
+    assert pending[0].notification_kind == incidents.KIND_RECOVERY
+
+    assert _deliver(state, pending[0], message_id=6060) is True
+
+    row = _row(state, PUBLIC_KEY)
+    assert row["recovered_message_id"] == 6060
+    assert incidents.pending_notification_decisions(state_file=state) == []
+    # Exactly one recovery notification, and no duplicate incident.
+    assert len(json.loads(state.read_text(encoding="utf-8"))["incidents"]) == 1

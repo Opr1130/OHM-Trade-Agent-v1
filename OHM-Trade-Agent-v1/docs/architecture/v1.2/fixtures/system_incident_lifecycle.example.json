@@ -79,7 +79,33 @@
       "KRAKEN:POSITION_VERIFICATION",
       "KRAKEN:RATE_LIMIT"
     ],
+    "coverage_based_scopes": [
+      "KRAKEN:HELD_ASSET_PRICING",
+      "KRAKEN:POSITION_VERIFICATION"
+    ],
+    "coverage_cannot_close": [
+      "KRAKEN:RATE_LIMIT",
+      "UNIFIED_CYCLE:OPERATOR_STATE",
+      "INTERNAL:SERVICE",
+      "KRAKEN:READ_ONLY_AUTH"
+    ],
+    "rate_limit_recovery": {
+      "rule": "state specifically that recovery is proven by a fresh cache-bypassing request on the throttled scope that does not return 429",
+      "not_connectivity": "rate limiting is never treated as a connectivity outage and never advances a recovery-cycle counter",
+      "failure_nuance": "a probe failing as RATE_LIMITED proves throttling persists; a probe failing as CONNECTIVITY is not rate-limit evidence and cannot close the incident"
+    },
     "producer_owned_recovery": "UNIFIED_CYCLE:OPERATOR_STATE is closed by app/jobs/run_cycle.py, the component that can prove operator state readable"
+  },
+  "delivery_durability": {
+    "rule": "an already-delivered Telegram message is never silently lost or blindly resent",
+    "outcomes": {
+      "A_telegram_rejected": "notification stays pending and retryable; nothing is claimed",
+      "B_delivered_and_committed": "committed exactly once",
+      "C_delivered_commit_failed_reconciliation_recorded": "delivered-but-pending; later cycles commit the original message_id",
+      "D_delivered_no_durable_write_at_all": "explicit durability failure; reservation retained; process-local guard blocks a duplicate send until storage recovers"
+    },
+    "local_guard": "process-local, non-authoritative memory used only to block duplicate sends while storage is unavailable; promoted into the durable registry as soon as storage recovers and then dropped",
+    "unconfirmed_deliveries": "durable reconciliation evidence keyed by incident_id + notification kind, carrying the original Telegram message_id"
   },
   "classification_precedence": [
     "explicit RATE_LIMIT",

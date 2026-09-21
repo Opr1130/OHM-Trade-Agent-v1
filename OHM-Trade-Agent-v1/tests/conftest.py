@@ -27,6 +27,10 @@ def isolate_system_incident_registry(tmp_path, monkeypatch):
         "STATE_FILE",
         tmp_path / "system_incidents.json",
     )
+    # The process-local already-delivered guard is intentionally process-global
+    # (it exists to block duplicate sends while storage is down), so it must not
+    # leak between tests.
+    system_incidents.reset_local_unconfirmed_deliveries_for_tests()
 
 
 @pytest.fixture(autouse=True)

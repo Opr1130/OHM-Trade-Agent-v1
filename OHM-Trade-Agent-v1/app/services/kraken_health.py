@@ -345,14 +345,17 @@ class KrakenScopeProbe:
         )
 
 
-def public_connectivity_probe(
+def _fresh_public_request_probe(
     transport: KrakenPublicTransport | None = None,
 ) -> Callable[[], dict[str, Any]]:
-    """Fresh, cache-bypassing public market-data reachability probe.
+    """Fresh, cache-bypassing public market-data request.
 
     ``Time`` is cheap, requires no parameters and is never served from the TTL
     cache. ``bypass_cache=True`` makes that explicit so a future TTL for
     ``Time`` cannot silently turn this into a cache-hit proof.
+
+    A cache hit, a stale response or a local registry value can never satisfy
+    this probe: only a real provider round-trip does.
     """
 
     def probe() -> dict[str, Any]:
@@ -370,6 +373,33 @@ def public_connectivity_probe(
         return result
 
     return probe
+
+
+def public_connectivity_probe(
+    transport: KrakenPublicTransport | None = None,
+) -> Callable[[], dict[str, Any]]:
+    """Fresh public request used as *connectivity* reachability evidence."""
+
+    return _fresh_public_request_probe(transport)
+
+
+def rate_limit_cleared_probe(
+    transport: KrakenPublicTransport | None = None,
+) -> Callable[[], dict[str, Any]]:
+    """Fresh public request used as *rate-limit cleared* evidence.
+
+    Throttling is not a reachability failure, so it must be proven cleared by the
+    same authoritative path that observed it: a real provider round-trip on the
+    throttled scope that does **not** come back as 429 / rate limited.
+
+    The caller must interpret the failure class. A probe that fails as
+    ``RATE_LIMITED`` proves throttling is still active; a probe that fails as
+    ``CONNECTIVITY`` is *not* rate-limit evidence and must not be used to close a
+    rate-limit incident. Neither outcome may increment a connectivity
+    recovery-cycle counter.
+    """
+
+    return _fresh_public_request_probe(transport)
 
 
 def read_only_connectivity_probe(

@@ -1065,8 +1065,73 @@ def test_runner_coverage_cannot_close_operator_state_incident(tmp_path, monkeypa
     assert closed.action == incidents.ACTION_NOTIFY_RECOVERY
 
 
+def test_reconcile_routes_rate_limit_to_its_own_probe_not_coverage(
+    tmp_path, monkeypatch
+):
+    """Coverage cannot close a rate-limit incident; its own probe is used instead."""
+
+    incident_state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=len(sent)),
+    )
+
+    # Open a rate-limit incident (notifies immediately: no 7-cycle rule).
+    opened = incidents.observe_degradation(
+        incident_class=incidents.SystemIncidentClass.KRAKEN_RATE_LIMITED,
+        scope=incidents.SystemIncidentScope.KRAKEN_RATE_LIMIT,
+        reason="Kraken public HTTP 429 for Ticker",
+        state_file=incident_state,
+    )
+    assert opened.action == incidents.ACTION_NOTIFY_OPEN
+    assert runner._deliver_system_incident_decision(
+        settings=_settings(), decision=opened
+    ) is True
+    assert len(sent) == 1
+
+    rate_limit_probes: list[str] = []
+
+    def failing_rate_limit_probe():
+        def probe():
+            rate_limit_probes.append("rate-limit")
+            raise RuntimeError("Kraken public HTTP 429 for Time")
+
+        return probe
+
+    monkeypatch.setattr(
+        runner, "rate_limit_cleared_probe", failing_rate_limit_probe
+    )
+    _fast_probe(monkeypatch)
+    # If coverage were (wrongly) used, this scope would close on the first sweep.
+    for _ in range(3):
+        failures: list[str] = []
+        runner._reconcile_system_incident_recovery(
+            settings=_settings(),
+            coverage_complete=True,
+            degraded_scopes=set(),
+            failures=failures,
+        )
+
+    row = json.loads(incident_state.read_text(encoding="utf-8"))["incidents"][
+        "SYSTEM_HEALTH:KRAKEN:RATE_LIMIT"
+    ]
+    assert row["state"] == incidents.STATE_OPEN
+    assert row["recovered_at"] is None
+    assert row["consecutive_recovery_failures"] == 0
+    # The dedicated probe is what ran: 3 sweeps x up to KRAKEN_RECOVERY_MAX_ATTEMPTS
+    # attempts inside each single recovery cycle.
+    assert len(rate_limit_probes) == 3 * health.KRAKEN_RECOVERY_MAX_ATTEMPTS
+    # No spurious SYSTEM RECOVERED was emitted.
+    assert len(sent) == 1
+
+
 def test_runner_does_not_probe_producer_owned_scopes(tmp_path, monkeypatch):
-    """The monitor never probes scopes it does not own."""
 
     incident_state = tmp_path / "incidents.json"
     monkeypatch.setattr(incidents, "STATE_FILE", incident_state)

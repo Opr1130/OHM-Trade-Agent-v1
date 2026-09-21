@@ -70,6 +70,7 @@ reason and printed as audit evidence.
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -1439,21 +1440,131 @@ def record_unconfirmed_delivery(
         return False
 
 
+#: Process-local memory of Telegram messages that were delivered but whose durable
+#: reconciliation record could not be written. The incident registry is the
+#: durable authority; this only exists so that a storage outage cannot cause a
+#: blind duplicate human notification within the life of this process.
+#:
+#: It is deliberately *not* a second evidence store: entries are promoted into the
+#: durable registry as soon as storage recovers and are then forgotten, and they
+#: are never read as proof that a notification was committed.
+_LOCAL_UNCONFIRMED: dict[str, dict[str, Any]] = {}
+_LOCAL_UNCONFIRMED_LOCK = threading.Lock()
+
+
+def remember_unconfirmed_delivery_locally(
+    *,
+    incident_id: str,
+    incident_key: str,
+    kind: str,
+    message_id: int,
+    now: datetime | None = None,
+    confirm_attempts: int = 0,
+) -> None:
+    """Guard against a duplicate send while durable reconciliation is unavailable."""
+
+    if kind not in NOTIFICATION_KINDS or not incident_id:
+        return
+    moment = _utc(now)
+    with _LOCAL_UNCONFIRMED_LOCK:
+        _LOCAL_UNCONFIRMED[f"{incident_id}:{kind}"] = {
+            "incident_id": incident_id,
+            "incident_key": incident_key,
+            "kind": kind,
+            "message_id": int(message_id),
+            "recorded_at": moment.isoformat(),
+            "confirm_attempts": int(confirm_attempts),
+            "durable": False,
+        }
+
+
+def locally_remembered_delivery(
+    *,
+    incident_id: str,
+    kind: str,
+) -> dict[str, Any] | None:
+    """Return a process-local already-delivered record for this kind, if any."""
+
+    if kind not in NOTIFICATION_KINDS or not incident_id:
+        return None
+    with _LOCAL_UNCONFIRMED_LOCK:
+        entry = _LOCAL_UNCONFIRMED.get(f"{incident_id}:{kind}")
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def forget_local_unconfirmed_delivery(*, incident_id: str, kind: str) -> None:
+    """Drop a process-local record once durable state owns it (or it is resolved)."""
+
+    with _LOCAL_UNCONFIRMED_LOCK:
+        _LOCAL_UNCONFIRMED.pop(f"{incident_id}:{kind}", None)
+
+
+def local_unconfirmed_deliveries() -> tuple[dict[str, Any], ...]:
+    """Snapshot the process-local guard for reconciliation. Deterministic order."""
+
+    with _LOCAL_UNCONFIRMED_LOCK:
+        return tuple(dict(_LOCAL_UNCONFIRMED[key]) for key in sorted(_LOCAL_UNCONFIRMED))
+
+
+def reset_local_unconfirmed_deliveries_for_tests() -> None:
+    """Clear the process-local guard. Test-only; never called by production code."""
+
+    with _LOCAL_UNCONFIRMED_LOCK:
+        _LOCAL_UNCONFIRMED.clear()
+
+
+class UnconfirmedDeliveryDurabilityError(RuntimeError):
+    """Telegram accepted a message that could not be recorded durably anywhere.
+
+    Raised only when the durable reconciliation write *and* the durable
+    confirmation both fail. The caller must treat this as a system durability
+    failure: the message exists, so it must not be sent again, and the owning
+    reservation must be retained rather than released.
+    """
+
+    def __init__(
+        self,
+        *,
+        incident_id: str,
+        incident_key: str,
+        kind: str,
+        message_id: int | None,
+    ) -> None:
+        self.incident_id = incident_id
+        self.incident_key = incident_key
+        self.kind = kind
+        self.message_id = message_id
+        super().__init__(
+            "system-incident delivery durability failure: Telegram accepted "
+            f"message_id={message_id} for incident_id={incident_id} kind={kind} "
+            "but neither durable confirmation nor durable reconciliation could "
+            "be written"
+        )
+
+
 def unconfirmed_delivery(
     *,
     incident_id: str,
     kind: str,
     state_file: Path | None = None,
 ) -> dict[str, Any] | None:
-    """Return reconciliation evidence for an already-sent, uncommitted message."""
+    """Return reconciliation evidence for an already-sent, uncommitted message.
+
+    Durable evidence is authoritative and is checked first. If it is missing --
+    because the durable write failed while other writes succeeded, or because the
+    registry is unreadable -- the process-local guard is consulted so an
+    already-delivered message is still recognised and never sent twice.
+    """
 
     target = state_file or STATE_FILE
     try:
         payload = _load_payload(target)
     except (OSError, TimeoutError, RegistryIOError):
-        return None
+        return locally_remembered_delivery(incident_id=incident_id, kind=kind)
     entry = payload["unconfirmed_deliveries"].get(f"{incident_id}:{kind}")
-    return dict(entry) if isinstance(entry, dict) else None
+    if isinstance(entry, dict):
+        return dict(entry)
+    return locally_remembered_delivery(incident_id=incident_id, kind=kind)
 
 
 def pending_notification_decisions(

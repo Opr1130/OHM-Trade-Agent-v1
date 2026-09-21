@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from app.core.config import get_settings
 from app.services.active_trade_registry import get_active_trades
@@ -15,19 +16,30 @@ from app.services.alert_v2_format import (
 from app.services.emergency_alert_notifier import send_emergency_alert
 from app.services.emergency_move_detector import detect_emergency_move
 from app.services.kraken_health import (
+    KrakenFailureClass,
     KrakenHealthScope,
     KrakenScopeProbe,
     public_connectivity_probe,
+    rate_limit_cleared_probe,
     read_only_connectivity_probe,
     transport_connection_reset,
 )
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.system_incidents import (
+    KIND_ESCALATION,
+    KIND_OPEN,
+    KIND_RECOVERY,
+    ACTION_NOTIFY_ESCALATION,
+    ACTION_NOTIFY_OPEN,
+    ACTION_NOTIFY_RECOVERY,
+    IncidentDecision,
     RecoveryAuthority,
     SystemIncidentScope,
     classify_degradation_reason,
     confirm_incident_notification,
+    forget_local_unconfirmed_delivery,
     is_monitor_owned_scope,
+    local_unconfirmed_deliveries,
     observe_degradation,
     observe_recovery,
     pending_notification_decisions,
@@ -35,6 +47,7 @@ from app.services.system_incidents import (
     record_failed_recovery_cycle,
     record_unconfirmed_delivery,
     release_incident_notification,
+    remember_unconfirmed_delivery_locally,
     requires_owner_recovery_cycles,
     unconfirmed_delivery,
 )
@@ -82,18 +95,28 @@ def _confirm_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _deliver_system_incident_decision(*, settings, decision) -> bool:
+def _deliver_system_incident_decision(
+    *, settings, decision, failures: list[str] | None = None
+) -> bool:
     """Deliver one Alert-v2 system-incident decision, or record why it was not sent.
 
     Delivery and incident state stay distinct, and a message that already reached
-    Telegram is never sent twice:
+    Telegram is never sent twice. Four outcomes are possible:
 
-    * if a previous attempt delivered a message whose durable confirmation failed,
-      this call only reconciles that commit -- it does not send again;
-    * a successful send is committed durably, with a bounded retry of the commit;
-    * if the commit still fails, explicit reconciliation evidence is recorded
-      against ``incident_id`` + notification kind + Telegram ``message_id``;
-    * a failed send leaves the notification pending and retryable.
+    A. Telegram rejects the message -> the notification stays pending/retryable
+       and nothing is claimed.
+    B. Telegram accepts it and the durable commit succeeds -> committed once.
+    C. Telegram accepts it, the commit fails, but reconciliation evidence is
+       written durably -> delivered-but-pending; a later cycle commits the
+       original ``message_id`` instead of resending.
+    D. Telegram accepts it and *no* durable write succeeds anywhere -> a system
+       durability failure. The fact that Telegram has the message is never
+       discarded: the process-local guard and the retained reservation both block
+       a duplicate send, an explicit error is surfaced, and reconciliation is
+       retried on later cycles.
+
+    Outcome D deliberately fails closed against duplicate human notification
+    rather than pretending the delivery was safely committed.
     """
 
     now = datetime.now(timezone.utc)
@@ -110,6 +133,10 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
         if message_id is not None and confirm_incident_notification(
             decision=decision, message_id=int(message_id), now=now
         ):
+            forget_local_unconfirmed_delivery(
+                incident_id=decision.incident_id,
+                kind=decision.notification_kind,
+            )
             return True
         print(
             "O'Pip system-incident delivery already sent; durable confirmation "
@@ -161,6 +188,7 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
         generated_at=now,
     )
     if not delivery.delivered:
+        # Outcome A: a failed send leaves the notification pending/retryable.
         release_incident_notification(decision=decision, now=now)
         return False
 
@@ -170,6 +198,7 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
     if delivery.message_id is not None and confirm_incident_notification(
         decision=decision, message_id=delivery.message_id, now=now
     ):
+        # Outcome B.
         return True
 
     for _ in range(_CONFIRM_RETRY_ATTEMPTS):
@@ -177,15 +206,31 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
         if delivery.message_id is not None and confirm_incident_notification(
             decision=decision, message_id=delivery.message_id, now=now
         ):
+            # Outcome B (after bounded retry).
             return True
 
-    if delivery.message_id is not None:
-        record_unconfirmed_delivery(
-            decision=decision,
-            message_id=int(delivery.message_id),
-            now=now,
-            confirm_attempts=_CONFIRM_RETRY_ATTEMPTS + 1,
+    if delivery.message_id is None:
+        # Telegram accepted the send but returned no usable identifier. We cannot
+        # prove ownership of a message, so we must not claim a committed
+        # notification: keep the notification retryable and surface the anomaly.
+        release_incident_notification(decision=decision, now=now)
+        _record_durability_failure(
+            failures=failures,
+            detail=(
+                "Telegram accepted a system notification without a message_id; "
+                f"incident_id={decision.incident_id} kind={decision.notification_kind}"
+            ),
         )
+        return False
+
+    recorded = record_unconfirmed_delivery(
+        decision=decision,
+        message_id=int(delivery.message_id),
+        now=now,
+        confirm_attempts=_CONFIRM_RETRY_ATTEMPTS + 1,
+    )
+    if recorded:
+        # Outcome C: delivered-but-pending. Never resend; reconcile later.
         print(
             "O'Pip system-incident durable confirmation failed after delivery; "
             "recorded for reconciliation:",
@@ -193,7 +238,45 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
             f"kind={decision.notification_kind}",
             f"message_id={delivery.message_id}",
         )
+        return True
+
+    # Outcome D: system durability failure. Telegram already has this message, so
+    # fail closed against a duplicate send: keep the reservation (do not release
+    # it), remember the delivery in-process, and surface the failure explicitly.
+    remember_unconfirmed_delivery_locally(
+        incident_id=decision.incident_id,
+        incident_key=decision.incident_key,
+        kind=decision.notification_kind,
+        message_id=int(delivery.message_id),
+        now=now,
+        confirm_attempts=_CONFIRM_RETRY_ATTEMPTS + 1,
+    )
+    _record_durability_failure(
+        failures=failures,
+        detail=(
+            "system-incident delivery durability failure: Telegram accepted "
+            f"message_id={delivery.message_id} but neither durable confirmation nor "
+            "durable reconciliation could be written; reservation retained and "
+            "duplicate send blocked "
+            f"(incident_id={decision.incident_id} kind={decision.notification_kind})"
+        ),
+    )
+    print(
+        "O'Pip CRITICAL system-incident delivery durability failure; retaining "
+        "reservation and blocking duplicate send:",
+        f"incident_id={decision.incident_id}",
+        f"kind={decision.notification_kind}",
+        f"message_id={delivery.message_id}",
+    )
     return True
+
+
+def _record_durability_failure(*, failures: list[str] | None, detail: str) -> None:
+    """Surface an explicit durability failure in telemetry and the run summary."""
+
+    if failures is not None:
+        failures.append(detail)
+    print("O'Pip system-incident durability failure:", detail)
 
 
 def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_TRADE_MONITOR") -> bool:
@@ -290,14 +373,18 @@ def _attempt_connectivity_recovery(
         )
         if decision.should_notify:
             try:
-                _deliver_system_incident_decision(settings=settings, decision=decision)
+                _deliver_system_incident_decision(
+                    settings=settings, decision=decision, failures=failures
+                )
             except Exception as exc:
                 failures.append(
                     f"{scope}: failure notification failed: {type(exc).__name__}: {exc}"
                 )
         else:
             # Silent cycle, but still recorded so the failure stays auditable.
-            _deliver_system_incident_decision(settings=settings, decision=decision)
+            _deliver_system_incident_decision(
+                settings=settings, decision=decision, failures=failures
+            )
         return
 
     decision = observe_recovery(
@@ -309,7 +396,9 @@ def _attempt_connectivity_recovery(
     )
     if decision.should_notify:
         try:
-            _deliver_system_incident_decision(settings=settings, decision=decision)
+            _deliver_system_incident_decision(
+                settings=settings, decision=decision, failures=failures
+            )
         except Exception as exc:
             failures.append(
                 f"{scope}: recovery notification failed: {type(exc).__name__}: {exc}"
@@ -317,13 +406,82 @@ def _attempt_connectivity_recovery(
 
 
 #: Scope-matched recovery evidence for coverage-shaped scopes. Held-position
-#: coverage is only valid evidence for the scopes it actually proves healthy;
-#: it can never close an operator-state, rate-limit or internal-service incident.
+#: coverage is only valid evidence for the scopes it actually proves healthy.
+#:
+#: ``KRAKEN:RATE_LIMIT`` is deliberately absent: complete held-position coverage
+#: says nothing about whether Kraken is still throttling, so it must never close
+#: a rate-limit incident. Rate limiting is recovered only by
+#: :func:`_attempt_rate_limit_recovery`, on fresh provider evidence.
 _COVERAGE_EVIDENCE_BY_SCOPE: dict[str, RecoveryAuthority] = {
     SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
     SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
-    SystemIncidentScope.KRAKEN_RATE_LIMIT.value: RecoveryAuthority.RATE_LIMIT_CLEARED,
 }
+
+
+def _attempt_rate_limit_recovery(
+    *,
+    scope: str,
+    incident_class: str,
+    settings,
+    failures: list[str],
+) -> None:
+    """Prove throttling cleared using fresh provider evidence for that scope.
+
+    Rate limiting is **not** a connectivity outage, so it is not governed by the
+    seven-cycle rule and it is never closed by held-position coverage. One
+    bounded cycle performs a fresh, cache-bypassing request on the throttled
+    scope:
+
+    * success -> authoritative proof throttling cleared, close the incident;
+    * failure classified ``RATE_LIMITED`` -> still throttled, stay open;
+    * failure classified as anything else (for example connectivity) -> **not**
+      rate-limit evidence, so the incident stays open and no failure counter is
+      advanced either way.
+
+    Retry-After/backoff handling stays where it belongs: inside the transport
+    probe's bounded retry, which this cycle reuses.
+    """
+
+    try:
+        probe = KrakenScopeProbe()
+        result = probe.run(
+            rate_limit_cleared_probe(),
+            scope=KrakenHealthScope.RATE_LIMIT,
+        )
+    except Exception as exc:
+        failures.append(
+            f"{scope}: rate-limit recovery probe failed: {type(exc).__name__}: {exc}"
+        )
+        return
+
+    if not result.success:
+        if result.failure_class is not KrakenFailureClass.RATE_LIMITED:
+            # A non-rate-limit failure is not evidence that throttling cleared.
+            failures.append(
+                f"{scope}: rate-limit recovery probe did not provide rate-limit "
+                f"evidence ({result.failure_class.value}): {result.reason}"
+            )
+        return
+
+    decision = observe_recovery(
+        incident_class=incident_class,
+        scope=scope,
+        evidence_source=RecoveryAuthority.RATE_LIMIT_CLEARED,
+        evidence=(
+            "fresh cache-bypassing provider request succeeded without rate limiting"
+        ),
+        authoritative=True,
+    )
+    if decision.should_notify:
+        try:
+            _deliver_system_incident_decision(
+                settings=settings, decision=decision, failures=failures
+            )
+        except Exception as exc:
+            failures.append(
+                f"{scope}: rate-limit recovery notification failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
 
 def _reconcile_system_incident_recovery(
@@ -368,6 +526,17 @@ def _reconcile_system_incident_recovery(
             )
             continue
 
+        if scope == SystemIncidentScope.KRAKEN_RATE_LIMIT.value:
+            # Throttling needs its own fresh provider evidence; coverage proves
+            # nothing about whether Kraken is still limiting us.
+            _attempt_rate_limit_recovery(
+                scope=scope,
+                incident_class=incident_class,
+                settings=settings,
+                failures=failures,
+            )
+            continue
+
         authority = _COVERAGE_EVIDENCE_BY_SCOPE.get(scope)
         if authority is None or not coverage_complete:
             continue
@@ -384,11 +553,88 @@ def _reconcile_system_incident_recovery(
         )
         if decision.should_notify:
             try:
-                _deliver_system_incident_decision(settings=settings, decision=decision)
+                _deliver_system_incident_decision(
+                    settings=settings, decision=decision, failures=failures
+                )
             except Exception as exc:
                 failures.append(
                     f"{scope}: recovery notification failed: {type(exc).__name__}: {exc}"
                 )
+
+
+def _reconcile_local_unconfirmed_deliveries(*, failures: list[str]) -> None:
+    """Promote process-local delivery guards into durable reconciliation state.
+
+    When the incident registry was unavailable, an already-delivered message was
+    remembered in-process so it could not be resent. As soon as storage recovers
+    that record must become durable; only then is the local guard dropped.
+    """
+
+    for entry in local_unconfirmed_deliveries():
+        decision = _rebuild_decision_for_local_entry(entry)
+        if decision is None:
+            forget_local_unconfirmed_delivery(
+                incident_id=entry["incident_id"], kind=entry["kind"]
+            )
+            continue
+        promoted = record_unconfirmed_delivery(
+            decision=decision,
+            message_id=int(entry["message_id"]),
+            confirm_attempts=int(entry.get("confirm_attempts") or 0),
+        )
+        if promoted:
+            forget_local_unconfirmed_delivery(
+                incident_id=entry["incident_id"], kind=entry["kind"]
+            )
+            print(
+                "O'Pip system-incident local delivery guard promoted to durable "
+                "reconciliation:",
+                f"incident_id={entry['incident_id']}",
+                f"kind={entry['kind']}",
+                f"message_id={entry['message_id']}",
+            )
+        else:
+            failures.append(
+                "system-incident durability failure persists: delivered "
+                f"message_id={entry['message_id']} for incident_id="
+                f"{entry['incident_id']} kind={entry['kind']} still unreconciled"
+            )
+
+
+#: Which human notification each kind maps to, for rebuilding a decision during
+#: process-local reconciliation.
+_ACTION_FOR_NOTIFICATION_KIND: dict[str, str] = {
+    KIND_OPEN: ACTION_NOTIFY_OPEN,
+    KIND_ESCALATION: ACTION_NOTIFY_ESCALATION,
+    KIND_RECOVERY: ACTION_NOTIFY_RECOVERY,
+}
+
+
+def _rebuild_decision_for_local_entry(entry: dict) -> Any | None:
+    """Reconstruct a minimal decision so a local guard can be promoted durably."""
+
+    try:
+        return IncidentDecision(
+            action=_ACTION_FOR_NOTIFICATION_KIND.get(str(entry.get("kind")), ""),
+            reason="LOCAL_UNCONFIRMED_PROMOTION",
+            incident_key=str(entry.get("incident_key") or ""),
+            incident_id=str(entry.get("incident_id") or ""),
+            state="",
+            notification_state="",
+            incident_class="",
+            scope=str(entry.get("incident_key") or "").split(":", 1)[-1],
+            severity="",
+            occurrence_count=0,
+            suppressed_notification_count=0,
+            consecutive_recovery_failures=0,
+            first_seen_at=None,
+            last_seen_at=None,
+            recovered_at=None,
+            latest_reason="",
+            notification_kind=str(entry.get("kind") or ""),
+        )
+    except Exception:
+        return None
 
 
 def _retry_pending_system_notifications(*, settings, failures: list[str]) -> None:
@@ -409,7 +655,9 @@ def _retry_pending_system_notifications(*, settings, failures: list[str]) -> Non
         return
     for decision in decisions:
         try:
-            _deliver_system_incident_decision(settings=settings, decision=decision)
+            _deliver_system_incident_decision(
+                settings=settings, decision=decision, failures=failures
+            )
         except Exception as exc:
             failures.append(
                 f"{decision.scope}: pending {decision.notification_kind} delivery failed: "
@@ -440,6 +688,12 @@ def _run_recovery_sweep(
     required recovery cycle instead of returning before it can occur.
     """
 
+    try:
+        _reconcile_local_unconfirmed_deliveries(failures=failures)
+    except Exception as exc:
+        failures.append(
+            f"local delivery-guard reconciliation failed: {type(exc).__name__}: {exc}"
+        )
     try:
         _retry_pending_system_notifications(settings=settings, failures=failures)
     except Exception as exc:
