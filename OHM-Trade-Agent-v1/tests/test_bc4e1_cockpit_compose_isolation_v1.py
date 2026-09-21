@@ -884,7 +884,11 @@ def test_reads_ready_uses_each_compose_surface_for_its_own_plane(tmp_path: Path)
     assert cockpit_lines
     assert all(cockpit_surface in line for line in cockpit_lines), cockpit_lines
 
-    postgres_lines = [line for line in calls.splitlines() if "opip-postgres" in line]
+    postgres_lines = [
+        line
+        for line in calls.splitlines()
+        if "opip-postgres" in line and "--env-file" in line
+    ]
     assert postgres_lines
     assert all(analytics_surface in line for line in postgres_lines), postgres_lines
 
