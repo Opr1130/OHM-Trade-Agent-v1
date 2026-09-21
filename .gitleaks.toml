@@ -83,3 +83,34 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 commits = ["f4e7a75c3351dfa95574509975295c853720d5cc"]
 paths = ['''OHM-Trade-Agent-v1/deploy/analytics/env\.example$''']
+
+# ---------------------------------------------------------------------------
+# Probe marker constant, commit 9e1b6a1b.
+#
+# `tests/test_bc4e4_cockpit_publish_network_v1.py` serves an index.html containing a
+# marker and asserts the marker comes back over host loopback, which is what makes the
+# Docker publish probe definitive rather than a bare TCP connect. The constant was
+# first named `_PROBE_TOKEN` with a hyphenated value, and the generic-api-key rule
+# correctly fired on that shape: a credential-named identifier with entropy 3.59
+# against a run of non-words. That is a true positive against the fixture text, not a
+# scanner defect.
+#
+# The constant has been renamed to a non-credential identifier holding a plain sentence,
+# so the current tree carries no such finding. The alert persists only because
+# full-history scanning still sees the earlier blob, and the earlier commit cannot be
+# rewritten without force-pushing a branch under review for a test constant.
+#
+# Same narrow scope and same reasoning as the entries above: one rule, one commit, one
+# file, AND-combined. It cannot mask a real credential in another commit, another file,
+# or under another rule.
+#
+# `regexes` is deliberately not used: narrowing to the flagged literal would mean
+# reproducing a credential-shaped string inside the scanner's own configuration, which
+# is self-defeating and could itself be matched.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Non-credential probe marker constant at commit 9e1b6a1b (test fixture value, since renamed to a plain sentence with a non-credential identifier)."
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["9e1b6a1b9b248bbc2d66bb36774b060c64f80609"]
+paths = ['''OHM-Trade-Agent-v1/tests/test_bc4e4_cockpit_publish_network_v1\.py$''']
