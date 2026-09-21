@@ -529,15 +529,24 @@ def test_cockpit_reads_the_resolved_generation_through_its_env_file():
 def test_cockpit_secret_surface_is_materialized_before_the_build():
     """Compose loads `env_file` in order to build, so it must exist by then.
 
-    /etc/opip-cockpit.env does not exist on a host that has never started the Cockpit,
-    and the image must already exist before the generation can be resolved, so the secret
-    surface is materialized first and the verified generation is added before start.
+    /etc/opip-cockpit.env does not exist on a host that has never started the Cockpit, and
+    the image must already exist before the generation can be resolved, so the secret
+    surface is materialized first. It is only created when ABSENT: an existing file may
+    already record the generation that verified for the previous release, and dropping
+    that root before this build and verification have succeeded would leave a working
+    Cockpit unable to locate its bundle on the next recreation.
     """
     build = _extract_function(BOOTSTRAP, "cockpit_build_image")
-    assert "write_cockpit_env_file\n" in build
-    assert build.index("write_cockpit_env_file\n") < build.index(
-        "cockpit_compose build opip-cockpit"
-    )
+    code = _strip_comments(build)
+    guard = 'if [[ ! -e "$COCKPIT_ENV_FILE" ]]; then'
+    assert guard in code
+    assert code.index(guard) < code.index("cockpit_compose build opip-cockpit")
+    # The early write is inside the guard and passes no generation, so a failed run cannot
+    # claim one and an already-verified root is never dropped before this run succeeds.
+    guard_body = code[code.index(guard) :]
+    guard_body = guard_body[: guard_body.index("\n  fi\n")]
+    assert re.search(r"^\s+write_cockpit_env_file\s*$", guard_body, flags=re.M)
+    assert "COCKPIT_REPLICA_CONTAINER_ROOT" not in guard_body
 
 
 def test_replica_probe_container_is_offline_read_only_and_target_pinned():

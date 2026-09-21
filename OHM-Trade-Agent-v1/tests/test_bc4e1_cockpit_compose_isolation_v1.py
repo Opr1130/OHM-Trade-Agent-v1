@@ -227,10 +227,17 @@ def _bind_mounts(service: dict) -> list[tuple[str, str, bool]]:
 def _docker_compose_config(
     compose_path: Path, env_file: Path
 ) -> subprocess.CompletedProcess[str]:
-    """Run `docker compose config` with the analytics-plane variables provably absent."""
+    """Run `docker compose config` with the analytics-plane variables provably absent.
+
+    The Cockpit variables are removed too. Otherwise a value exported by the CI or
+    developer environment would override the interpolation env file, and the
+    "every variable unset" cases below would silently validate a host-provided value
+    instead of the Compose defaults they exist to prove.
+    """
     environment = dict(os.environ)
-    for name in ANALYTICS_PLANE_VARS + ANALYTICS_PLANE_EXTRAS:
+    for name in ANALYTICS_PLANE_VARS + ANALYTICS_PLANE_EXTRAS + tuple(COCKPIT_VARS):
         environment.pop(name, None)
+    environment.pop("OPIP_DEPLOYED_SHA", None)
 
     return subprocess.run(
         [
@@ -489,7 +496,9 @@ def test_historical_stages_keep_using_the_shared_analytics_surface():
     ):
         assert fragment in plane, fragment
     assert "COCKPIT_COMPOSE" not in plane
-    assert "cockpit_compose" not in plane
+    # The only Cockpit-surface use in this plane is the status report for the Cockpit that
+    # `reads-ready` starts; no PostgreSQL operation may go through it.
+    assert re.findall(r"cockpit_compose \S+", plane) == ["cockpit_compose ps"]
 
 
 def test_cockpit_service_is_not_declared_in_the_shared_analytics_file():
@@ -630,6 +639,14 @@ def test_cockpit_ready_still_dispatches_before_the_postgresql_plane():
         assert effect not in dispatch, effect
 
 
+def test_reads_ready_reports_the_cockpit_from_its_own_surface():
+    """The shared-surface `compose ps` cannot show a service it does not own."""
+    reads_ready = BOOTSTRAP[BOOTSTRAP.index('elif [[ "$STAGE" == "reads-ready" ]]') :]
+    assert "cockpit_compose ps" in reads_ready
+    # The status is reported after the Cockpit has been started.
+    assert reads_ready.index("cockpit_start ") < reads_ready.index("cockpit_compose ps")
+
+
 def test_readme_documents_the_cockpit_compose_surface():
     """The split must be discoverable, including for manual operator use."""
     assert "docker-compose.cockpit.yml" in README
@@ -742,7 +759,7 @@ class _Harness:
         self.tmp_path = tmp_path
         self.stage = stage
         self.state_root = tmp_path / "state"
-        (self.state_root / "config").mkdir(parents=True)
+        (self.state_root / "config").mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_root / "rollout.env"
         self.cockpit_state_file = self.state_root / "cockpit-ready.env"
         self.cockpit_env_file = tmp_path / "opip-cockpit.env"
@@ -803,23 +820,32 @@ class _Harness:
         assert "git -C" not in region
         return script + "\n" + _STUB_PREAMBLE + "\n" + region
 
+    def child_environment(self) -> dict[str, str]:
+        """The child environment: both planes' variables removed.
+
+        Removing the Cockpit variables as well as the analytics ones means the sealed env
+        file is their only source, so the harness cannot pass because a value happened to
+        be exported by CI or the developer shell.
+        """
+        environment = dict(os.environ)
+        for name in ANALYTICS_PLANE_VARS + ANALYTICS_PLANE_EXTRAS + tuple(COCKPIT_VARS):
+            environment.pop(name, None)
+        environment.pop("OPIP_DEPLOYED_SHA", None)
+        environment["OPIP_TEST_LOG"] = str(self.log)
+        environment["OPIP_TEST_GENERATION"] = GENERATION_ID
+        return environment
+
     def run(self) -> subprocess.CompletedProcess[str]:
         harness = self.tmp_path / "harness.sh"
         harness.write_text(self.build_script(), encoding="utf-8")
 
-        environment = dict(os.environ)
-        # Prove the behavioural path needs nothing from the analytics plane.
-        for name in ANALYTICS_PLANE_VARS + ANALYTICS_PLANE_EXTRAS:
-            environment.pop(name, None)
-        environment["OPIP_TEST_LOG"] = str(self.log)
-        environment["OPIP_TEST_GENERATION"] = GENERATION_ID
         return subprocess.run(
             ["bash", str(harness)],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=environment,
+            env=self.child_environment(),
             check=False,
         )
 
@@ -960,6 +986,20 @@ def test_harness_defines_every_variable_its_code_paths_reference(tmp_path: Path)
             if name not in assigned and name not in allowed:
                 missing.append(name)
         assert not missing, f"undefined variables for {stage}: {sorted(set(missing))}"
+
+
+def test_harness_env_does_not_inherit_cockpit_variables(tmp_path: Path):
+    """The harness child environment must exclude both planes' variables.
+
+    Tested through the builder `run()` uses, so the claim is about the environment the
+    control flow actually sees rather than about the source text.
+    """
+    harness = _Harness(tmp_path, "cockpit-ready")
+    child = harness.child_environment()
+    for name in ANALYTICS_PLANE_VARS + tuple(COCKPIT_VARS) + ("OPIP_DEPLOYED_SHA",):
+        assert name not in child, name
+    # Only the harness's own bookkeeping is added.
+    assert child["OPIP_TEST_LOG"] == str(harness.log)
 
 
 def test_harness_embeds_the_real_control_flow(tmp_path: Path):

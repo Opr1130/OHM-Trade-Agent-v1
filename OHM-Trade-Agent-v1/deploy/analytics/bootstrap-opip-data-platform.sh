@@ -364,11 +364,18 @@ cockpit_build_image() {
   #
   # Compose loads this service definition - including its `env_file` - in order to build,
   # and /etc/opip-cockpit.env does not exist yet on a host that has never started the
-  # Cockpit. Materialize the secret surface first, without the replica generation, which
-  # cannot be resolved until this image exists. `cockpit_start` records the verified
-  # generation immediately before the container is started.
+  # Cockpit. Materialize the secret surface first so the file is loadable.
+  #
+  # Only when absent. An existing file may already record the generation that verified
+  # for the previous release, and this build has not proven itself yet: overwriting it
+  # here would drop that root, so a failed build or a failed replica verification would
+  # leave a working Cockpit unable to locate its bundle on the next recreation.
+  # `cockpit_start` rewrites the file with the newly verified generation immediately
+  # before the container starts, so a successful run always ends up authoritative.
   export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-  write_cockpit_env_file
+  if [[ ! -e "$COCKPIT_ENV_FILE" ]]; then
+    write_cockpit_env_file
+  fi
   cockpit_compose build opip-cockpit
 }
 
@@ -907,6 +914,10 @@ elif [[ "$STAGE" == "reads-ready" ]]; then
   # the parent mount and reports replica unavailability through its own API.
   cockpit_build_image
   cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")" unverified
+  # The Cockpit is owned by its own Compose surface, so the shared-surface `compose ps`
+  # below cannot show it. Report its status here, or a successful historical-read
+  # deployment would describe only the PostgreSQL/Grafana plane to the operator.
+  cockpit_compose ps
   # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
   # here, only after every historical gate above has passed. `cockpit-ready` never
   # writes these.
