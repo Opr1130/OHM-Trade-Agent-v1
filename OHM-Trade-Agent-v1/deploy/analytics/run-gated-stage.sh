@@ -51,6 +51,101 @@ start_learning_unit() {
   return 1
 }
 
+require_sealed_env_upload() {
+  if [[ -z "$ENV_UPLOAD" ]]; then
+    echo "sealed analytics environment is required for stage $STAGE" >&2
+    exit 66
+  fi
+  if [[ ! "$ENV_UPLOAD" =~ ^/tmp/opip-analytics-env-[0-9]+$ ]]; then
+    echo "invalid sealed analytics environment path" >&2
+    exit 64
+  fi
+  [[ -r "$ENV_UPLOAD" ]] || {
+    echo "sealed analytics environment upload is unreadable" >&2
+    exit 66
+  }
+}
+
+sync_cockpit_settings() {
+  # cockpit-ready needs four read-only Cockpit settings, but refreshing the whole
+  # analytics environment here would also rotate PostgreSQL/Grafana credentials.
+  # Merge only the Cockpit allowlist into the existing host file, atomically.
+  require_sealed_env_upload
+  [[ -r "$ENV_FILE" ]] || {
+    echo "existing sealed analytics environment is required before cockpit-ready" >&2
+    exit 78
+  }
+
+  local key count temporary
+  local -a keys=(
+    OPIP_COCKPIT_SECRET
+    OPIP_COCKPIT_BIND_ADDRESS
+    OPIP_COCKPIT_HOST_PORT
+    OPIP_COCKPIT_HTTP_PORT
+  )
+
+  # Never allow a Cockpit provisioning upload to smuggle trading authority onto the
+  # analytics host. The full bootstrap repeats this boundary check after the merge.
+  for key in WEBHOOK_SECRET KRAKEN_API_KEY KRAKEN_API_SECRET TELEGRAM_BOT_TOKEN; do
+    if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_UPLOAD"; then
+      echo "$key must not be present in the sealed analytics environment" >&2
+      exit 78
+    fi
+  done
+
+  local canonical_count
+  for key in "${keys[@]}"; do
+    count="$(grep -Ec "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$ENV_UPLOAD" || true)"
+    canonical_count="$(grep -Ec "^${key}=" "$ENV_UPLOAD" || true)"
+    if [[ "$count" != "1" || "$canonical_count" != "1" ]]; then
+      echo "sealed analytics environment must contain exactly one canonical $key setting" >&2
+      exit 78
+    fi
+  done
+
+  local cockpit_secret_line cockpit_secret_value bind_line bind_value host_port_line host_port_value http_port_line http_port_value
+  cockpit_secret_line="$(grep -E '^OPIP_COCKPIT_SECRET=' "$ENV_UPLOAD")"
+  cockpit_secret_value="${cockpit_secret_line#OPIP_COCKPIT_SECRET=}"
+  bind_line="$(grep -E '^OPIP_COCKPIT_BIND_ADDRESS=' "$ENV_UPLOAD")"
+  bind_value="${bind_line#OPIP_COCKPIT_BIND_ADDRESS=}"
+  host_port_line="$(grep -E '^OPIP_COCKPIT_HOST_PORT=' "$ENV_UPLOAD")"
+  host_port_value="${host_port_line#OPIP_COCKPIT_HOST_PORT=}"
+  http_port_line="$(grep -E '^OPIP_COCKPIT_HTTP_PORT=' "$ENV_UPLOAD")"
+  http_port_value="${http_port_line#OPIP_COCKPIT_HTTP_PORT=}"
+
+  if [[ "$cockpit_secret_value" == "set-cockpit-secret" || ! "$cockpit_secret_value" =~ ^[A-Za-z0-9._~-]{24,}$ ]]; then
+    echo "OPIP_COCKPIT_SECRET must be a non-placeholder URL-safe secret of at least 24 characters" >&2
+    exit 78
+  fi
+  [[ "$bind_value" == "127.0.0.1" ]] || {
+    echo "OPIP_COCKPIT_BIND_ADDRESS must be exactly 127.0.0.1" >&2
+    exit 78
+  }
+  for key in "$host_port_value" "$http_port_value"; do
+    if [[ ! "$key" =~ ^[0-9]{1,5}$ ]] || (( 10#$key < 1 || 10#$key > 65535 )); then
+      echo "Cockpit ports must be decimal values from 1 through 65535" >&2
+      exit 78
+    fi
+  done
+
+  temporary="$(mktemp /etc/opip-data-platform.env.XXXXXX)"
+  awk -F= '
+    $1 != "OPIP_COCKPIT_SECRET" &&
+    $1 != "OPIP_COCKPIT_BIND_ADDRESS" &&
+    $1 != "OPIP_COCKPIT_HOST_PORT" &&
+    $1 != "OPIP_COCKPIT_HTTP_PORT" { print }
+  ' "$ENV_FILE" > "$temporary"
+  {
+    printf 'OPIP_COCKPIT_SECRET=%s\\n' "$cockpit_secret_value"
+    printf 'OPIP_COCKPIT_BIND_ADDRESS=%s\\n' "$bind_value"
+    printf 'OPIP_COCKPIT_HOST_PORT=%s\\n' "$host_port_value"
+    printf 'OPIP_COCKPIT_HTTP_PORT=%s\\n' "$http_port_value"
+  } >> "$temporary"
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$ENV_FILE"
+}
+
 case "$STAGE" in
   prepare)
     for unit in \
@@ -88,14 +183,7 @@ case "$STAGE" in
       opip-learning-outcomes.timer
     ;;
   empty)
-    if [[ -z "$ENV_UPLOAD" ]]; then
-      echo "sealed analytics environment is required for empty stage" >&2
-      exit 66
-    fi
-    if [[ ! "$ENV_UPLOAD" =~ ^/tmp/opip-analytics-env-[0-9]+$ ]]; then
-      echo "invalid sealed analytics environment path" >&2
-      exit 64
-    fi
+    require_sealed_env_upload
     install -o root -g root -m 0600 "$ENV_UPLOAD" "$ENV_FILE"
     normalized="$(mktemp /etc/opip-data-platform.env.XXXXXX)"
     awk -F= -v sha="$TARGET_SHA" '
@@ -179,9 +267,14 @@ case "$STAGE" in
     mv -f -- "$temporary" "$STATE_ROOT/empty-rollback.env"
     echo "empty-stage rollback evidence recorded"
     ;;
-  # `cockpit-ready` is forwarded like the other bootstrap stages, but the bootstrap
-  # itself routes it to the Cockpit-only path, which performs no PostgreSQL work.
-  backfill|shipper|reads-ready|cockpit-ready)
+  cockpit-ready)
+    # Provision only the Cockpit-specific settings from the sealed GitHub environment.
+    # This does not run the empty/PostgreSQL stage and cannot rotate unrelated analytics
+    # credentials. Missing or malformed Cockpit settings fail before the host env changes.
+    sync_cockpit_settings
+    bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" "$STAGE"
+    ;;
+  backfill|shipper|reads-ready)
     bash "$APP_ROOT/deploy/analytics/bootstrap-opip-data-platform.sh" "$TARGET_SHA" "$STAGE"
     ;;
 esac

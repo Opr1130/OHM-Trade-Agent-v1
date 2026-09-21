@@ -169,9 +169,12 @@ single rename, so an interruption can never leave a new timestamp paired with an
 release. Readiness is recorded only after every step succeeds, and a failed attempt
 leaves no marker.
 
-The sealed analytics environment file must already be installed (by the `empty` stage)
-because `cockpit-ready` needs `OPIP_COCKPIT_SECRET`. That is a secret-provisioning
-requirement, not a PostgreSQL readiness gate: no PostgreSQL container is started, and
+For `cockpit-ready`, the owner-gated workflow uploads the existing sealed analytics
+environment and the remote runner atomically merges only the four `OPIP_COCKPIT_*`
+settings into the installed host environment before bootstrap. It refuses an upload
+missing any Cockpit setting and rejects trading/order credentials. This provisions
+`OPIP_COCKPIT_SECRET` without rerunning the PostgreSQL `empty` stage or rotating
+unrelated PostgreSQL/Grafana credentials. No PostgreSQL container is started, and
 `cockpit-ready` does not read, satisfy, advance or imply the soak or `reads-ready`.
 
 ### What `cockpit-ready` verifies before starting the Cockpit
