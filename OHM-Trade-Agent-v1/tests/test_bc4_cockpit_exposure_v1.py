@@ -674,20 +674,27 @@ def test_g_plane_guard_awk_matches_only_real_assignments():
         return
 
     for text, expected in cases:
-        with tempfile.NamedTemporaryFile(
+        # delete=False is required so the file survives to be read by the child
+        # process on Windows, so cleanup is explicit and runs even if the assertion
+        # fails. Otherwise every run would leave ten .env files in the temp directory.
+        handle = tempfile.NamedTemporaryFile(
             "w", suffix=".env", delete=False, encoding="utf-8"
-        ) as handle:
+        )
+        try:
             handle.write(text)
-            path = handle.name
-        result = subprocess.run(
-            [awk, "-v", "key=WEBHOOK_SECRET", program, path],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert (result.returncode == 0) is expected, (
-            f"guard mismatch for {text!r}: exit {result.returncode}"
-        )
+            handle.close()
+            result = subprocess.run(
+                [awk, "-v", "key=WEBHOOK_SECRET", program, handle.name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert (result.returncode == 0) is expected, (
+                f"guard mismatch for {text!r}: exit {result.returncode}"
+            )
+        finally:
+            handle.close()
+            pathlib.Path(handle.name).unlink(missing_ok=True)
 
 
 def test_g_plane_guard_normalization_semantics():
