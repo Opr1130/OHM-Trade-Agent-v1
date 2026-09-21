@@ -170,18 +170,48 @@ The `reads-ready` stage runs a separate host-side preflight that fails closed:
 4. The port **must not** be bound on any public interface: `ss -ltn` must show no
    `0.0.0.0` / `[::]` / `*` listener on that port. This enforces the exposure rule at
    runtime, not only in the compose file.
+5. The listener **must belong to `opip-cockpit`**: `docker port opip-cockpit` must
+   report the loopback mapping. A stale or unrelated process holding the port would
+   not produce that mapping, so a green listener alone can never stand in for the
+   intended service.
+
+Where each app-level claim is proven:
+
+| Claim | Proven by |
+| --- | --- |
+| The page serves 200 on `/cockpit` | the container healthcheck, which issues a real GET inside the container |
+| The API returns 401 without the operator secret, 200 with it | the test suite, driving the real ASGI app |
+| Non-GET methods are rejected | the test suite |
+| The service is published on host loopback and only there | the preflight (steps 3-5) |
 
 The reachability proof is deliberately taken at the **socket layer** rather than by
-issuing an application request. What the reverse proxy needs is a TCP endpoint on host
-loopback, so proving that endpoint exists - and that no public endpoint exists - is a
-direct proof of precisely the contract that broke. Application behaviour (that the page
-serves, that the API is gated with 401, that non-GET is rejected) is proven by the
-automated test suite, which drives the real ASGI app end to end; the preflight prints
-`cockpit_app_behaviour=verified_by_test_suite` to make that split explicit.
+issuing an application request from the shell. What the reverse proxy needs is a TCP
+endpoint on host loopback that belongs to this container, so proving exactly that - and
+that no public endpoint exists - is a direct proof of the contract that broke.
+Application behaviour is proven where it actually lives (healthcheck and suite), and the
+preflight prints `cockpit_app_behaviour=verified_by_healthcheck_and_test_suite` so the
+split is explicit to an operator.
 
-`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all four
+`COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all five
 conditions hold, so a passing container healthcheck alone can never mark the Cockpit
 ready.
+
+### Secret surface
+
+The Cockpit is reachable through the reverse proxy, so it must not receive credentials
+it has no use for. `/etc/opip-cockpit.env` is derived by bootstrap from the sealed
+analytics env file with a strict allowlist:
+
+```
+WEBHOOK_SECRET               (gates every /api/cockpit/* read)
+OPIP_COCKPIT_BIND_ADDRESS
+OPIP_COCKPIT_HOST_PORT
+OPIP_COCKPIT_HTTP_PORT
+```
+
+The sealed file also holds the PostgreSQL admin, shipper, learning and dashboard
+credentials and the privileged database URLs; none of those reach the Cockpit. This
+follows the existing filtered-env pattern already used for Grafana.
 
 ## Intelligence Cockpit provisioning
 

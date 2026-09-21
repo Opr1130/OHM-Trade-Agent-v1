@@ -9,6 +9,7 @@ APP_ROOT="$REPO_ROOT/OHM-Trade-Agent-v1"
 COMPOSE="$APP_ROOT/deploy/analytics/docker-compose.yml"
 ENV_FILE="/etc/opip-data-platform.env"
 GRAFANA_ENV_FILE="/etc/opip-grafana.env"
+COCKPIT_ENV_FILE="/etc/opip-cockpit.env"
 STATE_ROOT="/var/lib/opip-data-platform"
 STATE_FILE="$STATE_ROOT/rollout.env"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
@@ -105,6 +106,42 @@ write_grafana_env_file() {
 }
 write_grafana_env_file
 
+write_cockpit_env_file() {
+  # The Cockpit is externally reachable through the reverse proxy, so it must not
+  # load credentials it has no use for. The sealed analytics env file also holds the
+  # PostgreSQL admin, shipper, learning and dashboard credentials and privileged
+  # database URLs; handing those to an internet-facing read-only service would put
+  # unrelated secrets on an unnecessary surface.
+  #
+  # This mirrors the Grafana pattern: derive a dedicated env file from the sealed
+  # source using a strict allowlist, so the Cockpit receives the minimum it needs -
+  # its own authentication secret and its own bound/port configuration. Everything
+  # else the process requires (the replica root, the container port) is static and set
+  # in compose.
+  local temporary key
+  local -a keys=(
+    WEBHOOK_SECRET
+    OPIP_COCKPIT_BIND_ADDRESS
+    OPIP_COCKPIT_HOST_PORT
+    OPIP_COCKPIT_HTTP_PORT
+  )
+
+  temporary="$(mktemp /etc/opip-cockpit.env.XXXXXX)"
+  : > "$temporary"
+  for key in "${keys[@]}"; do
+    if ! awk -F= -v key="$key" '$1 == key {print; found=1; exit} END {if (!found) exit 1}' \
+      "$ENV_FILE" >> "$temporary"; then
+      rm -f -- "$temporary"
+      echo "missing required Cockpit setting in $ENV_FILE: $key" >&2
+      exit 78
+    fi
+  done
+  chown root:root "$temporary"
+  chmod 0600 "$temporary"
+  mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
+}
+write_cockpit_env_file
+
 compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
 }
@@ -180,10 +217,27 @@ cockpit_preflight() {
     exit 78
   fi
 
-  echo "cockpit host-loopback preflight OK: ${bind}:${port} is published and not public"
+  # The listener must be this container's publish, not a stale or foreign process
+  # that happens to hold the port. `docker port` reports the mapping the Cockpit
+  # container itself declares, so it identifies the owner: a stale listener would not
+  # produce this mapping, and before the exposure fix the mapping was empty.
+  local published
+  published="$(docker port opip-cockpit 2>/dev/null || true)"
+  if [[ -z "$published" ]]; then
+    echo "opip-cockpit publishes no host port; it is unreachable from the reverse proxy" >&2
+    exit 69
+  fi
+  if ! grep -Eq -- "-> ${loopback_pattern}:${port}$" <<<"$published"; then
+    echo "opip-cockpit is not published on host loopback ${bind}:${port}" >&2
+    echo "published mappings: ${published//$'\n'/, }" >&2
+    exit 69
+  fi
+
+  echo "cockpit host-loopback preflight OK: ${bind}:${port} is published by opip-cockpit and not public"
   echo "cockpit_exposure=host-loopback"
   echo "cockpit_requires_tls_reverse_proxy=true"
-  echo "cockpit_app_behaviour=verified_by_test_suite"
+  echo "cockpit_publish_owner=opip-cockpit"
+  echo "cockpit_app_behaviour=verified_by_healthcheck_and_test_suite"
 }
 
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.

@@ -461,11 +461,16 @@ Deployment wiring (implemented):
 - **A passing container healthcheck is not operator reachability.** The healthcheck is
   container-local liveness. The `reads-ready` stage therefore runs a separate
   host-side preflight that fails closed: the bind address must be loopback, the
-  container must be `healthy` (necessary, not sufficient), `curl` must fetch
-  `/cockpit` from **host loopback** with HTTP 200 (which exercises the host publish),
-  and an unauthenticated `GET /api/cockpit/overview` must return **401** (proving the
-  route exists and is gated). `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written
-  only after all four hold.
+  container must be `healthy` (necessary, not sufficient), `ss -ltn` must show a
+  listener on host loopback (which is what catches the original unpublished-port
+  defect), no public interface may bind that port, and `docker port opip-cockpit` must
+  confirm the listener belongs to this container rather than a stale process.
+  `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all of those hold.
+- **The Cockpit receives a filtered environment, not the sealed analytics file.** It is
+  externally reachable, so bootstrap derives `/etc/opip-cockpit.env` with a strict
+  allowlist containing only `WEBHOOK_SECRET` and the Cockpit's own bind/port settings.
+  The PostgreSQL, shipper, learning, dashboard and Grafana credentials never reach it.
+  This follows the existing filtered-env pattern already used for Grafana.
 - **The trading host no longer advertises cockpit routes.** The dashboard sidecar's
   exact-match allowlist is unchanged from before this PR. Proxying `/api/cockpit/*`
   there would return `CANONICAL_REPLICA_UNAVAILABLE` for every request, because the

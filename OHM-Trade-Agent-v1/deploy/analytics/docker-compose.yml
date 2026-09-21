@@ -197,7 +197,7 @@ services:
     container_name: opip-cockpit
     restart: unless-stopped
     env_file:
-      - /etc/opip-data-platform.env
+      - /etc/opip-cockpit.env
     environment:
       OPIP_CANONICAL_REPLICA_ROOT: /app/canonical-replica
       OPIP_COCKPIT_HTTP_PORT: ${OPIP_COCKPIT_HTTP_PORT:-8000}

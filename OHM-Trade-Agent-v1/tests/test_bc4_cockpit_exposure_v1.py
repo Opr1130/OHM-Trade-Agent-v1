@@ -343,10 +343,21 @@ def test_i_reachability_proof_uses_no_clear_text_protocol_literal():
     assert "NOSONAR" not in BOOTSTRAP_TEXT
 
 
-def test_i_app_behaviour_is_proven_by_the_test_suite():
-    """The split must be explicit: the preflight states it does not test the app."""
-    assert "cockpit_app_behaviour=verified_by_test_suite" in BOOTSTRAP_TEXT
-    # And the suite really does drive the app over the read-only surface.
+def test_i_app_behaviour_is_proven_by_the_healthcheck_and_suite():
+    """The split must be explicit: the preflight states where app proof comes from.
+
+    The page-serving 200 is proven by the container healthcheck, which issues a real
+    GET on /cockpit inside the container; route existence, 401 enforcement and
+    non-GET rejection are proven by the test suite driving the real ASGI app.
+    """
+    assert "cockpit_app_behaviour=verified_by_healthcheck_and_test_suite" in (
+        BOOTSTRAP_TEXT
+    )
+    # The healthcheck really does serve the page over HTTP inside the container.
+    healthcheck = _service()["healthcheck"]["test"][1]
+    assert "/cockpit" in healthcheck
+    assert "status==200" in healthcheck
+    # And the suite really does exercise auth over the read-only surface.
     suite = pathlib.Path(__file__).read_text(encoding="utf-8")
     assert 'client.get("/api/cockpit/overview")' in suite
 
@@ -474,12 +485,71 @@ def test_j_container_remains_hardened():
     assert service["cap_drop"] == ["ALL"]
     assert "no-new-privileges:true" in service["security_opt"]
     assert service["mem_limit"] and service["pids_limit"] == 128
-    # No credentials are injected beyond the sealed analytics env file.
-    assert set(service["environment"]) == {
-        "OPIP_CANONICAL_REPLICA_ROOT",
+
+
+def test_f_cockpit_receives_only_a_filtered_environment():
+    """The externally reachable Cockpit must not load unrelated credentials.
+
+    Review finding (valid): the service loaded the whole sealed analytics env file,
+    which also holds the PostgreSQL admin, shipper, learning and dashboard credentials
+    and privileged database URLs. Handing those to an internet-facing read-only service
+    puts unrelated secrets on an unnecessary surface.
+    """
+    service = _service()
+    env_files = service["env_file"]
+    assert env_files == ["/etc/opip-cockpit.env"], env_files
+
+    # Bootstrap must derive that file with a strict allowlist, like Grafana's.
+    assert "write_cockpit_env_file" in BOOTSTRAP_TEXT
+    assert 'COCKPIT_ENV_FILE="/etc/opip-cockpit.env"' in BOOTSTRAP_TEXT
+
+    allowlist = BOOTSTRAP_TEXT[
+        BOOTSTRAP_TEXT.index("write_cockpit_env_file()") :
+        BOOTSTRAP_TEXT.index("write_cockpit_env_file\n")
+    ]
+    keys = set(re.findall(r"^\s{4}([A-Z_]+)$", allowlist, flags=re.MULTILINE))
+    assert keys == {
+        "WEBHOOK_SECRET",
+        "OPIP_COCKPIT_BIND_ADDRESS",
+        "OPIP_COCKPIT_HOST_PORT",
         "OPIP_COCKPIT_HTTP_PORT",
-        "PYTHONDONTWRITEBYTECODE",
-    }
+    }, keys
+
+    # None of the unrelated credentials may be in the Cockpit's allowlist.
+    for forbidden in (
+        "OPIP_POSTGRES_ADMIN_PASSWORD",
+        "OPIP_SHIPPER_PASSWORD",
+        "OPIP_LEARNING_DATABASE_PASSWORD",
+        "OPIP_DASHBOARD_PASSWORD",
+        "OPIP_GRAFANA_ADMIN_PASSWORD",
+        "OPIP_GRAFANA_DB_PASSWORD",
+        "OPIP_ANALYTICS_ADMIN_DATABASE_URL",
+        "OPIP_ANALYTICS_DATABASE_URL",
+    ):
+        assert forbidden not in keys, f"cockpit env allowlist leaks {forbidden}"
+
+
+def test_g_cockpit_authentication_secret_is_declared_for_the_analytics_plane():
+    """The API requires the operator secret, so the analytics plane must carry it.
+
+    Without it the service cannot read its own settings at all, so authentication would
+    fail closed with a server error rather than a clean 401.
+    """
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert "WEBHOOK_SECRET=" in text
+    # And it must be fed to the Cockpit through the filtered file.
+    assert "WEBHOOK_SECRET" in BOOTSTRAP_TEXT
+
+
+def test_i_preflight_proves_the_listener_belongs_to_the_cockpit():
+    """A stale or foreign process holding the port must not satisfy the preflight.
+
+    Review finding (valid): checking a generic listener on the configured port could
+    pass while the Cockpit's own publish or routes were broken.
+    """
+    assert "docker port opip-cockpit" in BOOTSTRAP_TEXT
+    assert "cockpit_publish_owner=opip-cockpit" in BOOTSTRAP_TEXT
+    assert "publishes no host port" in BOOTSTRAP_TEXT
 
 
 def test_j_readme_documents_the_required_proxy_routes_without_inventing_a_proxy():
