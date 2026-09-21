@@ -756,6 +756,7 @@ _STUB_PREAMBLE = textwrap.dedent(
       return 0
     }
     compose() { _log "compose $*"; return 0; }
+    cockpit_compose() { _log "cockpit_compose $*"; return 0; }
     ss() {
       printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\\n'
       printf 'LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:*\\n'

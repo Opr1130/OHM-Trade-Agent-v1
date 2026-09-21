@@ -751,8 +751,10 @@ class _Harness:
         self.cockpit_compose_file = tmp_path / "docker-compose.cockpit.yml"
         self.cockpit_compose_file.write_text("services: {}\n", encoding="utf-8")
         self.session_env_file = tmp_path / "interpolation.env"
-        # Only non-secret Cockpit settings: no analytics-plane variable exists here.
+        # The sealed analytics env file is the source of the Cockpit's own settings, so it
+        # must carry the secret as well as the three non-secret Cockpit values.
         self.session_env_file.write_text(
+            "OPIP_COCKPIT_SECRET=test-secret\n"
             "OPIP_COCKPIT_BIND_ADDRESS=127.0.0.1\n"
             "OPIP_COCKPIT_HOST_PORT=8000\n"
             "OPIP_COCKPIT_HTTP_PORT=8000\n",
@@ -890,6 +892,70 @@ def test_reads_ready_uses_each_compose_surface_for_its_own_plane(tmp_path: Path)
     # verified on this path).
     assert "READS_READY_SHA" in harness.state_file.read_text(encoding="utf-8")
     assert not harness.cockpit_state_file.exists()
+
+
+def test_harness_sealed_env_file_carries_every_cockpit_setting(tmp_path: Path):
+    """The harness's sealed env file must satisfy bootstrap's Cockpit allowlist.
+
+    `write_cockpit_env_file` fails closed (exit 78) on a missing key, so a harness whose
+    env file omits any Cockpit setting aborts before the behaviour under test. Deriving
+    the keys from bootstrap keeps this honest as the allowlist evolves.
+    """
+    writer = _extract_function(BOOTSTRAP, "write_cockpit_env_file")
+    keys_start = writer.index("local -a keys=(") + len("local -a keys=(")
+    allowlist_body = writer[keys_start : writer.index(")", keys_start)]
+    required = set(re.findall(r"^\s*(OPIP_[A-Z_]+)\s*$", allowlist_body, flags=re.M))
+    assert required == COCKPIT_VARS, required
+
+    seeded = _Harness(tmp_path, "cockpit-ready").session_env_file.read_text(
+        encoding="utf-8"
+    )
+    seeded_keys = {
+        line.split("=", 1)[0] for line in seeded.splitlines() if "=" in line
+    }
+    assert required <= seeded_keys, required - seeded_keys
+
+
+def test_harness_defines_every_variable_its_code_paths_reference(tmp_path: Path):
+    """The assembled harness must not reference a variable it never defines.
+
+    Under `set -u` a missing constant aborts the harness at run time, and the harness is
+    only executed where bash exists, so this static check runs everywhere and keeps that
+    class of defect out of CI.
+    """
+    for stage in ("cockpit-ready", "reads-ready"):
+        script = _Harness(tmp_path / stage, stage).build_script()
+        assigned = set(re.findall(r"^[ \t]*([A-Z_][A-Z0-9_]*)=", script, flags=re.M))
+        allowed = {
+            "OPIP_TEST_LOG",
+            "OPIP_TEST_GENERATION",
+            "OPIP_TEST_RESOLVE_RC",
+            "OPIP_TEST_VERIFY_RC",
+            "OPIP_TEST_HEALTH",
+            # Read from the state file at run time.
+            "EMPTY_STARTED_AT_UTC",
+            "EMPTY_DEPLOY_COUNT",
+            "EMPTY_LAST_SHA",
+            "SHIPPER_STARTED_AT_UTC",
+            "SHIPPER_SHA",
+            "DEPLOYED_SHA",
+            # Evidence paths referenced by PostgreSQL stage branches that this harness
+            # embeds but never executes.
+            "OFFHOST_EVIDENCE",
+            "RESTORE_EVIDENCE",
+            "ROLLBACK_EVIDENCE",
+            "POSTGRES_TLS_CA",
+            "POSTGRES_TLS_CERT",
+            "POSTGRES_TLS_KEY",
+        }
+        missing = []
+        for match in re.finditer(r"\$\{?([A-Z_][A-Z0-9_]*)", script):
+            if script[match.end() : match.end() + 1] == ":":
+                continue
+            name = match.group(1)
+            if name not in assigned and name not in allowed:
+                missing.append(name)
+        assert not missing, f"undefined variables for {stage}: {sorted(set(missing))}"
 
 
 def test_harness_embeds_the_real_control_flow(tmp_path: Path):
