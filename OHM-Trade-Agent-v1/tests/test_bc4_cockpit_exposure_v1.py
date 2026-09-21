@@ -541,6 +541,34 @@ def test_g_cockpit_authentication_secret_is_declared_for_the_analytics_plane():
     assert "WEBHOOK_SECRET" in BOOTSTRAP_TEXT
 
 
+def test_g_gitleaks_allowlists_stay_narrowly_scoped():
+    """Every allowlist entry must be rule- and commit-scoped, per the config's rules.
+
+    The config forbids path-only or repo-wide exclusions and forbids disabling a rule.
+    A new entry was needed because gitleaks scans full history: the placeholder fix
+    cleaned the current tree, but the earlier commit's blob still trips the rule. This
+    asserts the discipline is preserved so an allowlist can never quietly become a
+    blanket exclusion.
+    """
+    import tomllib
+
+    config = tomllib.loads(
+        (REPO.parent / ".gitleaks.toml").read_text(encoding="utf-8")
+    )
+    entries = config.get("allowlists", [])
+    assert entries, "expected the existing fixture allowlist to be present"
+
+    for entry in entries:
+        assert "description" in entry, entry
+        assert entry.get("targetRules") == ["generic-api-key"], entry
+        assert entry.get("condition") == "AND", entry
+        assert entry.get("commits"), f"allowlist is not commit-scoped: {entry}"
+        assert entry.get("paths"), f"allowlist is not path-scoped: {entry}"
+        # A repo-wide or rule-global escape hatch would break the config's contract.
+        for forbidden in ("regexTarget", "stopwords"):
+            assert forbidden not in entry, f"allowlist uses {forbidden}: {entry}"
+
+
 def test_g_cockpit_secret_placeholder_is_not_credential_shaped():
     """The placeholder must not trip the generic-api-key secret scan.
 

@@ -53,3 +53,33 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 commits = ["16c493fa109c26979df0817f9676a2f028643b91"]
 paths = ['''OHM-Trade-Agent-v1/tests/test_opip_export_diagnostics_readonly_v1\.py$''']
+
+# ---------------------------------------------------------------------------
+# Placeholder for the B/C-4 Cockpit operator-secret setting, commit f4e7a75c.
+#
+# `deploy/analytics/env.example` documents every setting an operator must supply,
+# using `replace-with-...` markers. The Cockpit entry briefly used the marker
+# `replace-with-the-existing-operator-secret-min-12-chars`, whose entropy (3.905)
+# exceeded the generic-api-key threshold, so the rule correctly fired on a string
+# that is not a credential. That is a true positive against the fixture text, not a
+# scanner defect.
+#
+# The marker has been replaced with an obviously synthetic value (entropy 3.011), so
+# the current tree carries no such finding, and a test asserts the placeholder stays
+# below the threshold. The alert persists only because full-history scanning still
+# sees the earlier blob.
+#
+# Same narrow scope and same reasoning as the entry above, for the same reasons:
+# one rule, one commit, one file, AND-combined. It cannot mask a real credential in
+# another commit, another file, or under another rule.
+#
+# `regexes` is deliberately not used: narrowing to the flagged literal would mean
+# reproducing a credential-shaped string inside the scanner's own configuration,
+# which is self-defeating and could itself be matched.
+# ---------------------------------------------------------------------------
+[[allowlists]]
+description = "Non-credential placeholder marker for the Cockpit operator secret at commit f4e7a75c (env.example documentation value, since replaced with an obviously synthetic marker)."
+targetRules = ["generic-api-key"]
+condition = "AND"
+commits = ["f4e7a75c3351dfa95574509975295c853720d5cc"]
+paths = ['''OHM-Trade-Agent-v1/deploy/analytics/env\.example$''']
