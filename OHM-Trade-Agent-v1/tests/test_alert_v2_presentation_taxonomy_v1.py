@@ -25,6 +25,7 @@ from app.services import (
     active_trade_monitor_runner as runner,
     alert_taxonomy as taxonomy,
     alert_v2_format as fmt,
+    kraken_health as health,
     notification_policy,
     system_incidents as incidents,
 )
@@ -44,6 +45,15 @@ CONNECTIVITY_REASON = (
 PRICING_KEY = "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING"
 PUBLIC_KEY = "SYSTEM_HEALTH:KRAKEN:PUBLIC_CONNECTIVITY"
 
+CONNECTIVITY_CLASS = incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE
+PRICING_CLASS = incidents.SystemIncidentClass.HELD_ASSET_PRICING_DEGRADED
+OPERATOR_CLASS = incidents.SystemIncidentClass.UNIFIED_CYCLE_OPERATOR_STATE
+PUBLIC_SCOPE = incidents.SystemIncidentScope.KRAKEN_PUBLIC
+PRICING_SCOPE = incidents.SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING
+OPERATOR_SCOPE = incidents.SystemIncidentScope.UNIFIED_CYCLE
+AUTH_PRICING = incidents.RecoveryAuthority.PRICING_COVERAGE
+AUTH_PUBLIC = incidents.RecoveryAuthority.PUBLIC_PROBE
+
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
 SIGNAL_FAMILIES = (
@@ -58,6 +68,31 @@ SIGNAL_FAMILIES = (
 
 def _settings():
     return SimpleNamespace(telegram_bot_token="token", telegram_chat_id="chat")
+
+
+def _fail_public_probe(monkeypatch) -> None:
+    """Make the public connectivity recovery probe fail deterministically."""
+
+    def failing_probe():
+        def probe():
+            raise RuntimeError("ConnectError: connection refused")
+
+        return probe
+
+    monkeypatch.setattr(runner, "public_connectivity_probe", failing_probe)
+
+
+def _fast_probe(monkeypatch) -> None:
+    """Inject a no-op sleeper so recovery cycles are instant and deterministic."""
+
+    import functools
+
+    real = runner.KrakenScopeProbe
+    monkeypatch.setattr(
+        runner,
+        "KrakenScopeProbe",
+        functools.partial(real, sleeper=lambda _: None),
+    )
 
 
 def _resolution(*, coverage_complete: bool, reason: str = ""):
@@ -84,6 +119,37 @@ def _deliver(state, decision, message_id=1):
     return incidents.confirm_incident_notification(
         decision=decision, message_id=message_id, state_file=state
     )
+
+
+def _observe(state, klass, scope, reason, **kwargs):
+    return incidents.observe_degradation(
+        incident_class=klass, scope=scope, reason=reason, state_file=state, **kwargs
+    )
+
+
+def _failed_cycle(state, klass, scope, reason, **kwargs):
+    return incidents.record_failed_recovery_cycle(
+        incident_class=klass, scope=scope, reason=reason, state_file=state, **kwargs
+    )
+
+
+def _open_connectivity_incident(state, *, cycles=7, when=NOW):
+    """Drive a public connectivity incident to exactly one OPEN notification.
+
+    Mirrors the real monitor: each cycle records the observation *and* the failed
+    recovery probe, so occurrence count and failure count both advance.
+    """
+
+    decision = None
+    for _ in range(cycles):
+        _observe(state, CONNECTIVITY_CLASS, PUBLIC_SCOPE, CONNECTIVITY_REASON, now=when)
+        decision = _failed_cycle(
+            state, CONNECTIVITY_CLASS, PUBLIC_SCOPE, CONNECTIVITY_REASON, now=when
+        )
+    assert decision is not None
+    assert decision.action == incidents.ACTION_NOTIFY_OPEN
+    _deliver(state, decision)
+    return decision
 
 
 def _row(state: Path, key: str) -> dict | None:
@@ -395,19 +461,7 @@ def test_decision_and_action_appear_near_top_of_alert(tmp_path):
     """64. decision/action is near top of alert."""
 
     state = tmp_path / "incidents.json"
-    for _ in range(6):
-        incidents.observe_degradation(
-            incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-            scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-            reason=CONNECTIVITY_REASON,
-            state_file=state,
-        )
-    decision = incidents.observe_degradation(
-        incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-        scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-        reason=CONNECTIVITY_REASON,
-        state_file=state,
-    )
+    decision = _open_connectivity_incident(state)
     message = fmt.format_system_incident_message(decision)
     lines = message.splitlines()
 
@@ -440,24 +494,26 @@ def test_pricing_alert_does_not_claim_connectivity_failure(tmp_path):
 def test_system_incident_is_never_rendered_as_signal_or_trade_alert(tmp_path):
     """5 (acceptance). system incidents are not signal/trade alerts."""
 
-    cases = (
-        ("pricing", PRICING_REASON, 1),
-        ("connectivity", CONNECTIVITY_REASON, 7),
-        ("read-only", CONNECTIVITY_REASON, 7),
+    pricing_state = tmp_path / "pricing.json"
+    pricing_decision = _pricing(pricing_state)
+
+    connectivity_state = tmp_path / "connectivity.json"
+    connectivity_decision = _open_connectivity_incident(connectivity_state)
+
+    read_only_state = tmp_path / "read-only.json"
+    read_only_reason = (
+        "Kraken account state unavailable: ConnectError: connection refused"
     )
-    for name, reason, cycles in cases:
-        state = tmp_path / f"{name}.json"
-        klass, scope = incidents.classify_degradation_reason(reason)
-        decision = None
-        for _ in range(cycles):
-            decision = incidents.observe_degradation(
-                incident_class=klass,
-                scope=scope,
-                reason=reason,
-                state_file=state,
-            )
-        assert decision is not None
-        assert decision.should_notify is True, name
+    for _ in range(7):
+        read_only_decision = _failed_cycle(
+            read_only_state,
+            incidents.SystemIncidentClass.KRAKEN_READ_ONLY_CONNECTIVITY,
+            incidents.SystemIncidentScope.KRAKEN_READ_ONLY,
+            read_only_reason,
+        )
+
+    for decision in (pricing_decision, connectivity_decision, read_only_decision):
+        assert decision.should_notify is True
         message = fmt.format_system_incident_message(decision).lower()
         for forbidden in (
             "movement watch",
@@ -468,31 +524,17 @@ def test_system_incident_is_never_rendered_as_signal_or_trade_alert(tmp_path):
             "enter now",
             "place limit",
         ):
-            assert forbidden not in message, (reason, forbidden)
+            assert forbidden not in message, forbidden
 
 
 def test_recovery_alert_reports_outage_and_failed_cycles(tmp_path):
     state = tmp_path / "incidents.json"
-    for _ in range(6):
-        incidents.observe_degradation(
-            incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-            scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-            reason=CONNECTIVITY_REASON,
-            now=NOW,
-            state_file=state,
-        )
-    opened = incidents.observe_degradation(
-        incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-        scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-        reason=CONNECTIVITY_REASON,
-        now=NOW,
-        state_file=state,
-    )
-    _deliver(state, opened)
+    _open_connectivity_incident(state)
 
     recovered = incidents.observe_recovery(
-        incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-        scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
+        incident_class=CONNECTIVITY_CLASS,
+        scope=PUBLIC_SCOPE,
+        evidence_source=AUTH_PUBLIC,
         now=NOW.replace(hour=13, minute=4),
         state_file=state,
     )
@@ -825,7 +867,8 @@ def test_runner_system_failure_is_not_a_signal_alert(tmp_path, monkeypatch):
         "KrakenExposureResolver",
         lambda **kwargs: SimpleNamespace(resolve=lambda: resolution),
     )
-    monkeypatch.setattr(runner, "read_incidents", lambda **kwargs: [])
+    _fail_public_probe(monkeypatch)
+    _fast_probe(monkeypatch)
 
     for _ in range(7):
         runner.run_active_trade_monitor()
@@ -852,7 +895,8 @@ def test_runner_connectivity_notifies_on_cycle_seven_only(tmp_path, monkeypatch)
         lambda **kwargs: sent.append(kwargs["message"])
         or SimpleNamespace(delivered=True, message_id=len(sent)),
     )
-    monkeypatch.setattr(runner, "read_incidents", lambda **kwargs: [])
+    _fail_public_probe(monkeypatch)
+    _fast_probe(monkeypatch)
 
     resolution = _resolution(coverage_complete=False, reason=CONNECTIVITY_REASON)
     monkeypatch.setattr(
@@ -872,6 +916,195 @@ def test_runner_connectivity_notifies_on_cycle_seven_only(tmp_path, monkeypatch)
     for _ in range(6):
         runner.run_active_trade_monitor()
     assert len(sent) == 1
+
+    row = incident_state.read_text(encoding="utf-8")
+    assert '"consecutive_recovery_failures": 13' in row
+
+
+def test_runner_runs_probe_while_scope_is_actively_degraded(tmp_path, monkeypatch):
+    """2. active degraded connectivity DOES run the matching recovery probe."""
+
+    incident_state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
+    )
+
+    probe_calls: list[str] = []
+
+    def counting_probe():
+        def probe():
+            probe_calls.append("public")
+            raise RuntimeError("ConnectError: connection refused")
+
+        return probe
+
+    monkeypatch.setattr(runner, "public_connectivity_probe", counting_probe)
+    _fast_probe(monkeypatch)
+
+    resolution = _resolution(coverage_complete=False, reason=CONNECTIVITY_REASON)
+    monkeypatch.setattr(
+        runner,
+        "KrakenExposureResolver",
+        lambda **kwargs: SimpleNamespace(resolve=lambda: resolution),
+    )
+
+    for _ in range(9):
+        runner.run_active_trade_monitor()
+
+    # The probe ran on every cycle, including while the outage was still active.
+    # Each recovery *cycle* makes up to KRAKEN_RECOVERY_MAX_ATTEMPTS attempts, so
+    # the attempt count is a multiple of the cycle count.
+    assert probe_calls
+    assert len(probe_calls) == 9 * health.KRAKEN_RECOVERY_MAX_ATTEMPTS
+    payload = json.loads(incident_state.read_text(encoding="utf-8"))
+    row = payload["incidents"]["SYSTEM_HEALTH:KRAKEN:PUBLIC_CONNECTIVITY"]
+    assert row["consecutive_recovery_failures"] == 9
+    assert row["recovery_cycles_attempted"] == 9
+    assert row["occurrence_count"] == 9
+
+
+def test_runner_resolver_exception_path_still_runs_one_recovery_cycle(
+    tmp_path, monkeypatch
+):
+    """8. resolver-exception path still performs one bounded matching recovery cycle."""
+
+    incident_state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
+    )
+
+    probe_calls: list[str] = []
+
+    def counting_probe():
+        def probe():
+            probe_calls.append("public")
+            raise RuntimeError("ConnectError: connection refused")
+
+        return probe
+
+    monkeypatch.setattr(runner, "public_connectivity_probe", counting_probe)
+    _fast_probe(monkeypatch)
+
+    def exploding_resolver(**kwargs):
+        raise RuntimeError(
+            "ConnectError: connection refused while resolving exposure"
+        )
+
+    monkeypatch.setattr(runner, "KrakenExposureResolver", exploding_resolver)
+
+    summary = runner.run_active_trade_monitor()
+
+    # The early-return path must not skip the required recovery cycle: one cycle
+    # ran (with its bounded internal attempts), not zero.
+    assert probe_calls
+    assert summary.checked == 0
+
+    payload = json.loads(incident_state.read_text(encoding="utf-8"))
+    row = payload["incidents"]["SYSTEM_HEALTH:KRAKEN:PUBLIC_CONNECTIVITY"]
+    assert row["consecutive_recovery_failures"] == 1
+    assert row["recovery_cycles_attempted"] == 1
+
+
+def test_runner_coverage_cannot_close_operator_state_incident(tmp_path, monkeypatch):
+    """10-12 (integration). coverage cannot close an unowned scope."""
+
+    incident_state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+
+    sent: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: sent.append(kwargs["message"])
+        or SimpleNamespace(delivered=True, message_id=1),
+    )
+
+    # run_cycle-style operator-state failure, then a fully healthy coverage cycle.
+    opened = _observe(
+        incident_state,
+        OPERATOR_CLASS,
+        OPERATOR_SCOPE,
+        "operator/capacity state unavailable: RuntimeError: corrupt registry",
+    )
+    assert opened.should_notify is True
+    assert _deliver(incident_state, opened) is True
+
+    resolution = _resolution(coverage_complete=True)
+    monkeypatch.setattr(
+        runner,
+        "KrakenExposureResolver",
+        lambda **kwargs: SimpleNamespace(resolve=lambda: resolution),
+    )
+
+    for _ in range(3):
+        runner.run_active_trade_monitor()
+
+    # No false RECOVERED for a scope this monitor cannot prove healthy.
+    assert sent == []
+    payload = json.loads(incident_state.read_text(encoding="utf-8"))
+    row = payload["incidents"]["SYSTEM_HEALTH:UNIFIED_CYCLE:OPERATOR_STATE"]
+    assert row["state"] == incidents.STATE_OPEN
+    assert row["recovered_at"] is None
+
+    # The owning producer can close it.
+    closed = incidents.observe_recovery(
+        incident_class=OPERATOR_CLASS,
+        scope=OPERATOR_SCOPE,
+        evidence_source=incidents.RecoveryAuthority.OPERATOR_STATE,
+        state_file=incident_state,
+    )
+    assert closed.action == incidents.ACTION_NOTIFY_RECOVERY
+
+
+def test_runner_does_not_probe_producer_owned_scopes(tmp_path, monkeypatch):
+    """The monitor never probes scopes it does not own."""
+
+    incident_state = tmp_path / "incidents.json"
+    monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
+    monkeypatch.setattr(runner, "get_settings", _settings)
+
+    _observe(
+        incident_state,
+        OPERATOR_CLASS,
+        OPERATOR_SCOPE,
+        "operator/capacity state unavailable: RuntimeError: corrupt registry",
+    )
+    _observe(
+        incident_state,
+        incidents.SystemIncidentClass.KRAKEN_READ_ONLY_AUTH_FAILURE,
+        incidents.SystemIncidentScope.KRAKEN_READ_ONLY_AUTH,
+        "Kraken private credentials are not configured",
+    )
+
+    probes: list[str] = []
+    monkeypatch.setattr(
+        runner, "public_connectivity_probe", lambda: (lambda: probes.append("public"))
+    )
+    monkeypatch.setattr(
+        runner,
+        "read_only_connectivity_probe",
+        lambda: (lambda: probes.append("read_only")),
+    )
+
+    failures: list[str] = []
+    runner._reconcile_system_incident_recovery(
+        settings=_settings(),
+        coverage_complete=True,
+        degraded_scopes=set(),
+        failures=failures,
+    )
+
+    assert probes == []
+    assert failures == []
 
 
 def test_runner_notification_failure_does_not_mark_incident_notified(
@@ -945,33 +1178,28 @@ def test_runner_recovery_uses_matching_scope_probe(tmp_path, monkeypatch):
 
     incident_state = tmp_path / "incidents.json"
     monkeypatch.setattr(incidents, "STATE_FILE", incident_state)
-
-    for _ in range(6):
-        incidents.observe_degradation(
-            incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-            scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-            reason=CONNECTIVITY_REASON,
-            state_file=incident_state,
-        )
-    opened = incidents.observe_degradation(
-        incident_class=incidents.SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-        scope=incidents.SystemIncidentScope.KRAKEN_PUBLIC,
-        reason=CONNECTIVITY_REASON,
-        state_file=incident_state,
+    monkeypatch.setattr(runner, "get_settings", _settings)
+    monkeypatch.setattr(
+        runner,
+        "send_tracked_telegram",
+        lambda **kwargs: SimpleNamespace(delivered=True, message_id=1),
     )
-    _deliver(incident_state, opened)
+    _open_connectivity_incident(incident_state)
 
     probes: list[str] = []
+
+    def failing(name):
+        def probe():
+            probes.append(name)
+            raise RuntimeError("ConnectError: connection refused")
+
+        return probe
+
+    monkeypatch.setattr(runner, "public_connectivity_probe", lambda: failing("public"))
     monkeypatch.setattr(
-        runner,
-        "public_connectivity_probe",
-        lambda: (lambda: probes.append("public")),
+        runner, "read_only_connectivity_probe", lambda: failing("read_only")
     )
-    monkeypatch.setattr(
-        runner,
-        "read_only_connectivity_probe",
-        lambda: (lambda: probes.append("read_only")),
-    )
+    _fast_probe(monkeypatch)
 
     failures: list[str] = []
     runner._reconcile_system_incident_recovery(
@@ -981,7 +1209,9 @@ def test_runner_recovery_uses_matching_scope_probe(tmp_path, monkeypatch):
         failures=failures,
     )
 
-    assert probes == ["public"]
+    # Only the public scope was probed, once per recovery cycle.
+    assert probes
+    assert set(probes) == {"public"}
     assert failures == []
 
 

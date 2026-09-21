@@ -23,14 +23,20 @@ from app.services.kraken_health import (
 )
 from app.services.notification_policy import record_emitted, should_emit
 from app.services.system_incidents import (
+    RecoveryAuthority,
     SystemIncidentScope,
     classify_degradation_reason,
     confirm_incident_notification,
+    is_monitor_owned_scope,
     observe_degradation,
     observe_recovery,
+    pending_notification_decisions,
     read_incidents,
+    record_failed_recovery_cycle,
+    record_unconfirmed_delivery,
     release_incident_notification,
     requires_owner_recovery_cycles,
+    unconfirmed_delivery,
 )
 from app.services.telegram_delivery import (
     record_telegram_not_eligible,
@@ -62,16 +68,57 @@ def _telegram_configured(settings) -> bool:
     )
 
 
+#: Bounded retry for committing an already-delivered message to durable incident
+#: state. Kept small so a wedged registry cannot stall the monitor cadence.
+_CONFIRM_RETRY_ATTEMPTS = 2
+_CONFIRM_RETRY_DELAY_SECONDS = 0.2
+
+
+def _confirm_sleep(seconds: float) -> None:
+    """Indirection so tests can assert retry behaviour without real waiting."""
+
+    import time
+
+    time.sleep(seconds)
+
+
 def _deliver_system_incident_decision(*, settings, decision) -> bool:
     """Deliver one Alert-v2 system-incident decision, or record why it was not sent.
 
-    Delivery and incident state stay distinct: only a delivered message may mark
-    the incident as notified. A failed send releases the reservation so a later
-    cycle can retry without creating a second incident.
+    Delivery and incident state stay distinct, and a message that already reached
+    Telegram is never sent twice:
+
+    * if a previous attempt delivered a message whose durable confirmation failed,
+      this call only reconciles that commit -- it does not send again;
+    * a successful send is committed durably, with a bounded retry of the commit;
+    * if the commit still fails, explicit reconciliation evidence is recorded
+      against ``incident_id`` + notification kind + Telegram ``message_id``;
+    * a failed send leaves the notification pending and retryable.
     """
 
     now = datetime.now(timezone.utc)
     policy_identity = f"{SYSTEM_HEALTH_FAMILY}:{decision.scope}"
+
+    # An earlier cycle may already have delivered this exact notification. Never
+    # resend; only reconcile the durable commit.
+    already_sent = unconfirmed_delivery(
+        incident_id=decision.incident_id,
+        kind=decision.notification_kind,
+    )
+    if already_sent is not None:
+        message_id = already_sent.get("message_id")
+        if message_id is not None and confirm_incident_notification(
+            decision=decision, message_id=int(message_id), now=now
+        ):
+            return True
+        print(
+            "O'Pip system-incident delivery already sent; durable confirmation "
+            "still pending:",
+            f"incident_id={decision.incident_id}",
+            f"kind={decision.notification_kind}",
+            f"message_id={message_id}",
+        )
+        return True
 
     if not decision.should_notify:
         record_telegram_suppression(
@@ -113,24 +160,49 @@ def _deliver_system_incident_decision(*, settings, decision) -> bool:
         fingerprint=decision.incident_key,
         generated_at=now,
     )
-    if delivery.delivered:
-        confirm_incident_notification(
-            decision=decision,
-            message_id=delivery.message_id,
-            now=now,
-        )
-    else:
+    if not delivery.delivered:
         release_incident_notification(decision=decision, now=now)
-    return delivery.delivered
+        return False
+
+    # Telegram accepted the message. The durable commit must not be assumed:
+    # retry it boundedly, and if it still fails, record reconciliation evidence
+    # so a later cycle commits this message instead of sending another copy.
+    if delivery.message_id is not None and confirm_incident_notification(
+        decision=decision, message_id=delivery.message_id, now=now
+    ):
+        return True
+
+    for _ in range(_CONFIRM_RETRY_ATTEMPTS):
+        _confirm_sleep(_CONFIRM_RETRY_DELAY_SECONDS)
+        if delivery.message_id is not None and confirm_incident_notification(
+            decision=decision, message_id=delivery.message_id, now=now
+        ):
+            return True
+
+    if delivery.message_id is not None:
+        record_unconfirmed_delivery(
+            decision=decision,
+            message_id=int(delivery.message_id),
+            now=now,
+            confirm_attempts=_CONFIRM_RETRY_ATTEMPTS + 1,
+        )
+        print(
+            "O'Pip system-incident durable confirmation failed after delivery; "
+            "recorded for reconciliation:",
+            f"incident_id={decision.incident_id}",
+            f"kind={decision.notification_kind}",
+            f"message_id={delivery.message_id}",
+        )
+    return True
 
 
 def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_TRADE_MONITOR") -> bool:
-    """Alert-v2 system-incident governance for one degradation occurrence.
+    """Record one degradation occurrence and deliver any notification it earned.
 
-    Every occurrence is recorded durably. The owner is interrupted only when
-    incident governance says a human genuinely needs to act -- a new incident, a
-    material escalation, or a recovery. Repeated occurrences of one continuing
-    condition update counters instead of producing another message.
+    The occurrence itself is evidence. For connectivity classes the owner
+    notification is *not* produced here -- it is produced by the recovery cycle
+    in :func:`_attempt_connectivity_recovery`, so the "more than six failed
+    recovery cycles" rule counts real probe failures.
     """
 
     incident_class, scope = classify_degradation_reason(reason)
@@ -139,6 +211,8 @@ def _notify_monitor_degraded(*, settings, reason: str, identity: str = "ACTIVE_T
         scope=scope,
         reason=reason,
     )
+    # Always route through delivery: a non-notifying occurrence still records a
+    # durable suppression row, so every occurrence stays observable/auditable.
     return _deliver_system_incident_decision(settings=settings, decision=decision)
 
 
@@ -170,20 +244,24 @@ def _attempt_connectivity_recovery(
     settings,
     failures: list[str],
 ) -> None:
-    """Run exactly one bounded recovery cycle for one connectivity scope.
+    """Run exactly ONE bounded recovery cycle for one connectivity scope.
 
-    Recovery is proven on the same semantic scope that failed. A successful
-    public call cannot close a read-only incident and vice versa.
+    Recovery is proven on the same semantic scope that failed: a public probe
+    cannot close a read-only incident and vice versa. A failed probe advances the
+    consecutive-failure counter exactly once; a successful probe closes only this
+    scope. Automatic recovery keeps running after the incident has been reported.
     """
 
     if scope == SystemIncidentScope.KRAKEN_PUBLIC.value:
         health_scope = KrakenHealthScope.PUBLIC_CONNECTIVITY
         probe_callable = public_connectivity_probe()
         reset = transport_connection_reset()
+        authority = RecoveryAuthority.PUBLIC_PROBE
     elif scope == SystemIncidentScope.KRAKEN_READ_ONLY.value:
         health_scope = KrakenHealthScope.READ_ONLY_CONNECTIVITY
         probe_callable = read_only_connectivity_probe()
         reset = None
+        authority = RecoveryAuthority.READ_ONLY_PROBE
     else:
         return
 
@@ -197,13 +275,35 @@ def _attempt_connectivity_recovery(
         return
 
     if not result.success:
-        # Keep recovering. The incident stays open and the next cycle's
-        # degradation observation advances the consecutive-failure counter.
+        # One failed higher-level cycle == exactly one increment. The incident
+        # stays open and recovery continues on the next cycle.
+        decision = record_failed_recovery_cycle(
+            incident_class=incident_class,
+            scope=scope,
+            reason=result.reason,
+            metadata={
+                "recovery_attempts": result.attempts,
+                "failure_class": result.failure_class.value,
+                "connection_reset": result.connection_reset,
+                "budget_exhausted": result.budget_exhausted,
+            },
+        )
+        if decision.should_notify:
+            try:
+                _deliver_system_incident_decision(settings=settings, decision=decision)
+            except Exception as exc:
+                failures.append(
+                    f"{scope}: failure notification failed: {type(exc).__name__}: {exc}"
+                )
+        else:
+            # Silent cycle, but still recorded so the failure stays auditable.
+            _deliver_system_incident_decision(settings=settings, decision=decision)
         return
 
     decision = observe_recovery(
         incident_class=incident_class,
         scope=scope,
+        evidence_source=authority,
         evidence=f"authoritative {health_scope.value} probe succeeded",
         authoritative=True,
     )
@@ -216,6 +316,16 @@ def _attempt_connectivity_recovery(
             )
 
 
+#: Scope-matched recovery evidence for coverage-shaped scopes. Held-position
+#: coverage is only valid evidence for the scopes it actually proves healthy;
+#: it can never close an operator-state, rate-limit or internal-service incident.
+_COVERAGE_EVIDENCE_BY_SCOPE: dict[str, RecoveryAuthority] = {
+    SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
+    SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
+    SystemIncidentScope.KRAKEN_RATE_LIMIT.value: RecoveryAuthority.RATE_LIMIT_CLEARED,
+}
+
+
 def _reconcile_system_incident_recovery(
     *,
     settings,
@@ -223,28 +333,33 @@ def _reconcile_system_incident_recovery(
     degraded_scopes: set[str],
     failures: list[str],
 ) -> None:
-    """Close incidents whose failed scope is now provably healthy again.
+    """Advance incident recovery for the scopes the active monitor owns.
 
-    Connectivity scopes need a fresh authoritative probe. Coverage-shaped scopes
-    (pricing, position verification, auth, internal state) need complete coverage
-    evidence. Nothing else may close an incident: a cache hit, a stale response
-    or a local registry value is not proof that the failed scope recovered.
+    Connectivity scopes always get their bounded probe, *including* while the
+    outage is still active -- skipping the probe during an outage is precisely
+    what would let an observation-driven counter claim failures that never
+    happened. The same-cycle guard only prevents unrelated evidence from closing
+    a scope; it never prevents the probe itself.
+
+    Producer-owned scopes (operator state, internal service, credential
+    configuration) are deliberately left alone: this monitor cannot prove them
+    healthy, so their owning component closes them.
     """
 
     try:
         open_incidents = read_incidents(include_recovered=False)
     except Exception as exc:
-        failures.append(
-            f"system-incident read failed: {type(exc).__name__}: {exc}"
-        )
+        failures.append(f"system-incident read failed: {type(exc).__name__}: {exc}")
         return
 
     for row in open_incidents:
         scope = str(row.get("scope") or "")
         incident_class = str(row.get("incident_class") or "")
-        if not scope or scope in degraded_scopes:
+        if not scope or not is_monitor_owned_scope(scope):
             continue
+
         if requires_owner_recovery_cycles(incident_class):
+            # Always probe the failed scope, even while it is still degraded.
             _attempt_connectivity_recovery(
                 scope=scope,
                 incident_class=incident_class,
@@ -252,12 +367,19 @@ def _reconcile_system_incident_recovery(
                 failures=failures,
             )
             continue
-        if not coverage_complete:
+
+        authority = _COVERAGE_EVIDENCE_BY_SCOPE.get(scope)
+        if authority is None or not coverage_complete:
+            continue
+        if scope in degraded_scopes:
+            # The scope failed again in this very cycle, so this cycle's coverage
+            # is not evidence that it recovered.
             continue
         decision = observe_recovery(
             incident_class=incident_class,
             scope=scope,
-            evidence="coverage complete for all verified holdings",
+            evidence_source=authority,
+            evidence="scope-matched coverage evidence complete for all verified holdings",
             authoritative=True,
         )
         if decision.should_notify:
@@ -267,6 +389,69 @@ def _reconcile_system_incident_recovery(
                 failures.append(
                     f"{scope}: recovery notification failed: {type(exc).__name__}: {exc}"
                 )
+
+
+def _retry_pending_system_notifications(*, settings, failures: list[str]) -> None:
+    """Deliver notifications the owner is still owed, including after recovery.
+
+    A recovery is recorded as a fact the moment it is proven, but its *message*
+    may still be undelivered. This selects those pending obligations -- including
+    rows whose lifecycle state is already ``RECOVERED`` -- so a transient Telegram
+    failure cannot permanently lose an escalation or recovery alert.
+    """
+
+    try:
+        decisions = pending_notification_decisions()
+    except Exception as exc:
+        failures.append(
+            f"pending system-notification read failed: {type(exc).__name__}: {exc}"
+        )
+        return
+    for decision in decisions:
+        try:
+            _deliver_system_incident_decision(settings=settings, decision=decision)
+        except Exception as exc:
+            failures.append(
+                f"{decision.scope}: pending {decision.notification_kind} delivery failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+
+def _scopes_for_reason(reason: str) -> set[str]:
+    """Return the semantic scopes a degradation reason implicates."""
+
+    try:
+        _, scope = classify_degradation_reason(reason)
+    except Exception:
+        return set()
+    return {scope.value}
+
+
+def _run_recovery_sweep(
+    *,
+    settings,
+    coverage_complete: bool,
+    degraded_scopes: set[str],
+    failures: list[str],
+) -> None:
+    """Single entry point for recovery work, used on every cycle path.
+
+    Kept separate so the resolver-exception early-return path performs the
+    required recovery cycle instead of returning before it can occur.
+    """
+
+    try:
+        _retry_pending_system_notifications(settings=settings, failures=failures)
+    except Exception as exc:
+        failures.append(
+            f"pending system-notification retry failed: {type(exc).__name__}: {exc}"
+        )
+    _reconcile_system_incident_recovery(
+        settings=settings,
+        coverage_complete=coverage_complete,
+        degraded_scopes=degraded_scopes,
+        failures=failures,
+    )
 
 
 def _notify_unmanaged_holding(*, settings, exposure: ResolvedExposure) -> bool:
@@ -347,6 +532,14 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             reason=reason,
             failures=failures,
         )
+        # This path must still perform the required recovery cycle rather than
+        # returning before automatic recovery can run.
+        _run_recovery_sweep(
+            settings=settings,
+            coverage_complete=False,
+            degraded_scopes=_scopes_for_reason(reason),
+            failures=failures,
+        )
         return MonitorRunSummary(
             active_trades=0,
             checked=0,
@@ -369,15 +562,13 @@ def run_active_trade_monitor() -> MonitorRunSummary:
     positions_unmanaged = 0
     degraded_symbols: list[str] = []
     #: Scopes implicated as degraded during *this* cycle. A scope in this set
-    #: must not be closed as recovered in the same cycle that observed it failing.
+    #: must not be closed as recovered by coverage evidence in the same cycle
+    #: that observed it failing. Connectivity scopes are exempt from the guard:
+    #: their probe still runs while the outage is active.
     degraded_scopes: set[str] = set()
 
     def _record_degraded_scope(reason: str) -> None:
-        try:
-            _, scope = classify_degradation_reason(reason)
-        except Exception:
-            return
-        degraded_scopes.add(scope.value)
+        degraded_scopes.update(_scopes_for_reason(reason))
 
     if not resolution.coverage_complete:
         reason = resolution.reason or "Kraken exposure coverage is incomplete"
@@ -500,10 +691,10 @@ def run_active_trade_monitor() -> MonitorRunSummary:
             failures=failures,
         )
 
-    # Close incidents whose failed scope is provably healthy again. This runs
-    # after protection work so recovery can never delay a protection decision.
+    # Advance recovery for monitor-owned scopes. This runs after protection work
+    # so recovery can never delay a protection decision.
     try:
-        _reconcile_system_incident_recovery(
+        _run_recovery_sweep(
             settings=settings,
             coverage_complete=bool(resolution.coverage_complete),
             degraded_scopes=degraded_scopes,

@@ -8,7 +8,10 @@ from app.jobs.monitor_active_trades import main as monitor_active_main
 from app.jobs.monitor_pending_setups import main as monitor_pending_main
 from app.jobs.scan_movers import main as scan_movers_main
 from app.jobs.scan_opportunities import main as scan_main
-from app.services.active_trade_monitor_runner import _notify_monitor_degraded
+from app.services.active_trade_monitor_runner import (
+    _deliver_system_incident_decision,
+    _notify_monitor_degraded,
+)
 from app.services.external_order_review import ExternalOrderReviewSummary, review_external_open_orders
 from app.services.kraken_reconciliation import ReconciliationSummary, reconcile_kraken_account
 from app.services.learning_scheduler import run_learning_cycle
@@ -21,11 +24,52 @@ from app.services.operator_control import (
     search_due,
 )
 from app.services.registry_io import load_json, registry_lock, save_json_atomic
+from app.services.system_incidents import (
+    RecoveryAuthority,
+    SystemIncidentClass,
+    SystemIncidentScope,
+    observe_recovery,
+)
 
 
 CYCLE_LOCK_FILE = Path("/app/data/.unified_cycle.lock")
 EARLY_WATCH_STATE_FILE = Path("/app/data/early_watch_scheduler_state.json")
 EARLY_WATCH_LOCK_FILE = EARLY_WATCH_STATE_FILE.parent / ".early_watch_scheduler.lock"
+
+
+def _close_operator_state_incident_if_open() -> bool:
+    """Producer-owned recovery for the operator/capacity state scope.
+
+    Only this module can prove the operator state readable, so only this module
+    closes that incident. Failure here is reported and never blocks the cycle.
+    """
+
+    try:
+        decision = observe_recovery(
+            incident_class=SystemIncidentClass.UNIFIED_CYCLE_OPERATOR_STATE,
+            scope=SystemIncidentScope.UNIFIED_CYCLE,
+            evidence_source=RecoveryAuthority.OPERATOR_STATE,
+            evidence="operator/capacity state read succeeded",
+            authoritative=True,
+        )
+    except Exception as exc:
+        print(
+            "OHM operator-state incident recovery failed:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+    if not decision.should_notify:
+        return False
+    try:
+        _deliver_system_incident_decision(settings=get_settings(), decision=decision)
+    except Exception as exc:
+        print(
+            "OHM operator-state recovery alert failed:",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return False
+    return True
 
 
 def _parse_scheduler_time(value: str | None) -> datetime | None:
@@ -394,6 +438,11 @@ def _run_cycle_once() -> None:
         monitor_active_main()
         print("Discovery/pending workflows skipped until operator state is readable.")
         return
+
+    # Producer-owned recovery: this module is the component that can prove the
+    # operator/capacity state readable, so it -- and not the active-trade monitor
+    # -- closes that incident. Exposure coverage is not valid evidence here.
+    _close_operator_state_incident_if_open()
 
     print("OHM Unified Cycle")
     print("Override mode:", decision.override_mode)

@@ -15,11 +15,33 @@ One semantic incident produces **at most**:
 * one RECOVERED notification,
 
 while every occurrence stays durably auditable (occurrence count, first/last
-seen, latest reason, structured metadata, suppressed-notification count).
+seen, latest reason, structured metadata, suppressed-notification count), and
+every *completed* incident instance stays readable after a later outage reopens
+the same scope.
 
 Incident identity is *semantic*: ``SYSTEM_HEALTH:<scope>``. It is deliberately
 not derived from the current hour, raw exception text, a changing sentence, a
 changing asset list, a stack trace, a price or a timestamp.
+
+Three separations this module exists to enforce
+-----------------------------------------------
+
+1. **Occurrence vs recovery cycle.** For connectivity classes the owner's rule
+   counts *failed recovery cycles*, not degraded monitor observations. A monitor
+   observation is recorded here by :func:`observe_degradation`; exactly one
+   higher-level probe cycle is recorded by :func:`record_failed_recovery_cycle`.
+   Only the latter advances ``consecutive_recovery_failures``. This is what makes
+   "notify after more than six failed recovery cycles" true rather than a claim.
+
+2. **Incident fact state vs human notification state.** Recovery may truthfully
+   be recorded as ``RECOVERED`` before Telegram accepts the message; the
+   *notification* then stays pending and retryable until a delivery is confirmed.
+   Lifecycle state never implies that the owner was notified.
+
+3. **Recovery authority.** A scope may only be closed by evidence that actually
+   proves *that* scope healthy (:data:`RecoveryAuthority`). Held-position coverage
+   cannot close an operator-state incident, a public probe cannot close a
+   read-only incident, and so on.
 
 Layering
 --------
@@ -66,7 +88,11 @@ from app.services.registry_io import (
 
 
 STATE_FILE = Path("/app/data/system_incidents.json")
-SCHEMA_VERSION = 1
+
+#: Schema 2 restructures storage into active incidents + a completed-incident
+#: archive, and adds per-notification delivery state. Readers of schema 1 files
+#: simply see an empty archive.
+SCHEMA_VERSION = 2
 
 #: Owner rule: notify only after connectivity has failed to recover **more than
 #: six** consecutive recovery cycles, so the first notification is cycle #7.
@@ -78,6 +104,12 @@ CONNECTIVITY_RECOVERY_FAILURES_BEFORE_NOTIFY = 7
 IMMEDIATE_NOTIFY_FAILURES = 1
 
 RESERVATION_LEASE_SECONDS = 300
+
+#: Bounded retry budget for a pending human notification. After this many failed
+#: delivery attempts the pending record is retained as evidence but stops being
+#: selected, so a broken transport cannot produce unlimited retry attempts.
+MAX_NOTIFICATION_ATTEMPTS = 5
+
 MAX_REASON_CHARS = 240
 MAX_METADATA_CHARS = 400
 MAX_METADATA_ITEMS = 24
@@ -90,14 +122,42 @@ STATE_RECOVERED = "RECOVERED"
 INCIDENT_STATES = (STATE_OPEN, STATE_CHANGED, STATE_ESCALATED, STATE_RECOVERED)
 
 # Notification sub-state. Kept separate from the lifecycle state above so the
-# frozen OPEN/CHANGED/ESCALATED/RECOVERED vocabulary is preserved while the
-# recovery-threshold progression stays explicit and observable.
+# frozen OPEN/CHANGED/ESCALATED/RECOVERED vocabulary is preserved while delivery
+# progress stays explicit and observable.
 NOTIFICATION_NONE = "NONE"
 NOTIFICATION_BELOW_THRESHOLD = "BELOW_THRESHOLD"
+NOTIFICATION_OPEN_PENDING = "OPEN_PENDING"
 NOTIFICATION_OPEN_NOTIFIED = "OPEN_NOTIFIED"
+NOTIFICATION_ESCALATION_PENDING = "ESCALATION_PENDING"
 NOTIFICATION_ESCALATED_NOTIFIED = "ESCALATED_NOTIFIED"
 NOTIFICATION_RECOVERED_PENDING = "RECOVERED_PENDING"
 NOTIFICATION_RECOVERED_NOTIFIED = "RECOVERED_NOTIFIED"
+#: A pending notification that was superseded because the scope reopened before
+#: the owner could be told. Recorded explicitly, never silently dropped.
+NOTIFICATION_SUPERSEDED = "SUPERSEDED"
+
+# Notification kinds.
+KIND_OPEN = "OPEN"
+KIND_ESCALATION = "ESCALATION"
+KIND_RECOVERY = "RECOVERY"
+NOTIFICATION_KINDS = (KIND_OPEN, KIND_ESCALATION, KIND_RECOVERY)
+
+#: Durable field pair per notification kind: (delivered-at, message-id).
+_KIND_FIELDS: dict[str, tuple[str, str]] = {
+    KIND_OPEN: ("opened_notification_at", "open_message_id"),
+    KIND_ESCALATION: ("escalation_notification_at", "escalation_message_id"),
+    KIND_RECOVERY: ("recovered_notification_at", "recovered_message_id"),
+}
+_KIND_PENDING_STATE: dict[str, str] = {
+    KIND_OPEN: NOTIFICATION_OPEN_PENDING,
+    KIND_ESCALATION: NOTIFICATION_ESCALATION_PENDING,
+    KIND_RECOVERY: NOTIFICATION_RECOVERED_PENDING,
+}
+_KIND_NOTIFIED_STATE: dict[str, str] = {
+    KIND_OPEN: NOTIFICATION_OPEN_NOTIFIED,
+    KIND_ESCALATION: NOTIFICATION_ESCALATED_NOTIFIED,
+    KIND_RECOVERY: NOTIFICATION_RECOVERED_NOTIFIED,
+}
 
 ACTION_NOTIFY_OPEN = "NOTIFY_OPEN"
 ACTION_NOTIFY_ESCALATION = "NOTIFY_ESCALATION"
@@ -142,6 +202,7 @@ class SystemIncidentClass(str, Enum):
     POSITION_VERIFICATION_UNAVAILABLE = "POSITION_VERIFICATION_UNAVAILABLE"
     PROVIDER_RATE_LIMITED = "PROVIDER_RATE_LIMITED"
     DATA_PIPELINE_STALE = "DATA_PIPELINE_STALE"
+    UNIFIED_CYCLE_OPERATOR_STATE = "UNIFIED_CYCLE_OPERATOR_STATE"
     INTERNAL_SERVICE_FAILURE = "INTERNAL_SERVICE_FAILURE"
 
 
@@ -162,6 +223,25 @@ class IncidentSeverity(str, Enum):
     DEGRADED = "DEGRADED"
     FAILURE = "FAILURE"
     CRITICAL = "CRITICAL"
+
+
+class RecoveryAuthority(str, Enum):
+    """Which evidence source is allowed to close a scope.
+
+    A scope may only be closed by the authority that can actually prove *that*
+    scope healthy. This is what stops unrelated success (for example, complete
+    held-position coverage) from closing an operator-state or rate-limit
+    incident.
+    """
+
+    PUBLIC_PROBE = "PUBLIC_PROBE"
+    READ_ONLY_PROBE = "READ_ONLY_PROBE"
+    PRICING_COVERAGE = "PRICING_COVERAGE"
+    POSITION_COVERAGE = "POSITION_COVERAGE"
+    OPERATOR_STATE = "OPERATOR_STATE"
+    RATE_LIMIT_CLEARED = "RATE_LIMIT_CLEARED"
+    AUTH_CONFIG = "AUTH_CONFIG"
+    OWNING_SUBSYSTEM = "OWNING_SUBSYSTEM"
 
 
 _SEVERITY_RANK = {
@@ -207,6 +287,9 @@ _POLICY: dict[str, IncidentPolicy] = {
     SystemIncidentClass.DATA_PIPELINE_STALE.value: IncidentPolicy(
         IMMEDIATE_NOTIFY_FAILURES, False, IncidentSeverity.DEGRADED.value
     ),
+    SystemIncidentClass.UNIFIED_CYCLE_OPERATOR_STATE.value: IncidentPolicy(
+        IMMEDIATE_NOTIFY_FAILURES, False, IncidentSeverity.FAILURE.value
+    ),
     SystemIncidentClass.INTERNAL_SERVICE_FAILURE.value: IncidentPolicy(
         IMMEDIATE_NOTIFY_FAILURES, False, IncidentSeverity.FAILURE.value
     ),
@@ -224,13 +307,39 @@ _SCOPE_BY_CLASS: dict[str, str] = {
     SystemIncidentClass.KRAKEN_RATE_LIMITED.value: SystemIncidentScope.KRAKEN_RATE_LIMIT.value,
     SystemIncidentClass.HELD_ASSET_PRICING_DEGRADED.value: SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value,
     SystemIncidentClass.POSITION_VERIFICATION_UNAVAILABLE.value: SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value,
+    SystemIncidentClass.UNIFIED_CYCLE_OPERATOR_STATE.value: SystemIncidentScope.UNIFIED_CYCLE.value,
     SystemIncidentClass.INTERNAL_SERVICE_FAILURE.value: SystemIncidentScope.INTERNAL.value,
 }
+
+#: Recovery authority per scope. Only this evidence may close the scope.
+_SCOPE_RECOVERY_AUTHORITY: dict[str, RecoveryAuthority] = {
+    SystemIncidentScope.KRAKEN_PUBLIC.value: RecoveryAuthority.PUBLIC_PROBE,
+    SystemIncidentScope.KRAKEN_READ_ONLY.value: RecoveryAuthority.READ_ONLY_PROBE,
+    SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value: RecoveryAuthority.PRICING_COVERAGE,
+    SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value: RecoveryAuthority.POSITION_COVERAGE,
+    SystemIncidentScope.UNIFIED_CYCLE.value: RecoveryAuthority.OPERATOR_STATE,
+    SystemIncidentScope.KRAKEN_RATE_LIMIT.value: RecoveryAuthority.RATE_LIMIT_CLEARED,
+    SystemIncidentScope.KRAKEN_READ_ONLY_AUTH.value: RecoveryAuthority.AUTH_CONFIG,
+    SystemIncidentScope.INTERNAL.value: RecoveryAuthority.OWNING_SUBSYSTEM,
+}
+
+#: Scopes whose recovery the active-trade monitor is allowed to decide. Every
+#: other scope is producer-owned: only the component that can prove the failed
+#: condition healthy may close it.
+MONITOR_OWNED_SCOPES: frozenset[str] = frozenset(
+    {
+        SystemIncidentScope.KRAKEN_PUBLIC.value,
+        SystemIncidentScope.KRAKEN_READ_ONLY.value,
+        SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING.value,
+        SystemIncidentScope.KRAKEN_POSITION_VERIFICATION.value,
+        SystemIncidentScope.KRAKEN_RATE_LIMIT.value,
+    }
+)
 
 
 @dataclass(frozen=True)
 class IncidentDecision:
-    """What the caller should do about one observation."""
+    """What the caller should do about one observation or recovery cycle."""
 
     action: str
     reason: str
@@ -254,6 +363,11 @@ class IncidentDecision:
     #: recovered. ``consecutive_recovery_failures`` is reset to zero on
     #: recovery, so the outage's failure history is carried separately.
     recovered_after_recovery_failures: int = 0
+    #: Which human notification this decision refers to (``OPEN``,
+    #: ``ESCALATION`` or ``RECOVERY``); empty for non-notification decisions.
+    notification_kind: str = ""
+    #: Bounded retry attempt count already recorded for the pending notification.
+    notification_attempts: int = 0
 
     @property
     def should_notify(self) -> bool:
@@ -362,14 +476,29 @@ def incident_identity(
     return klass.value, resolved_scope.value, incident_key(resolved_scope)
 
 
+def recovery_authority_for_scope(
+    scope: SystemIncidentScope | str,
+) -> RecoveryAuthority:
+    """Return the only evidence source allowed to close ``scope``."""
+
+    value = str(getattr(scope, "value", scope))
+    return _SCOPE_RECOVERY_AUTHORITY.get(value, RecoveryAuthority.OWNING_SUBSYSTEM)
+
+
+def is_monitor_owned_scope(scope: SystemIncidentScope | str) -> bool:
+    return str(getattr(scope, "value", scope)) in MONITOR_OWNED_SCOPES
+
+
 # ---------------------------------------------------------------------------
 # Degradation classification
 # ---------------------------------------------------------------------------
 
-_PRICING_REASON_MARKERS = (
-    "usd/stable-quote pricing unavailable",
-    "stable-quote pricing unavailable",
-    "no usd/stable-quote pair",
+_RATE_LIMIT_REASON_MARKERS = (
+    "429",
+    "too many requests",
+    "rate limit",
+    "retry-after",
+    "retry after",
 )
 _CREDENTIAL_REASON_MARKERS = (
     "credentials are not configured",
@@ -382,11 +511,15 @@ _CREDENTIAL_REASON_MARKERS = (
     "insufficient permission",
     "permission denied",
 )
-_RATE_LIMIT_REASON_MARKERS = ("429", "too many requests", "rate limit", "retry-after", "retry after")
 _PRIVATE_STATE_REASON_MARKERS = (
     "account state unavailable",
     "direct snapshot unavailable",
     "private snapshot",
+)
+_PRICING_REASON_MARKERS = (
+    "usd/stable-quote pricing unavailable",
+    "stable-quote pricing unavailable",
+    "no usd/stable-quote pair",
 )
 _POSITION_REASON_MARKERS = (
     "not fully protected",
@@ -397,13 +530,32 @@ _POSITION_REASON_MARKERS = (
     "coverage incomplete",
     "position verification",
 )
-_OPERATOR_REASON_MARKERS = ("operator/capacity state unavailable", "operator state unavailable")
+_OPERATOR_REASON_MARKERS = (
+    "operator/capacity state unavailable",
+    "operator state unavailable",
+)
 
 
 def classify_degradation_reason(
     reason: str | None,
 ) -> tuple[SystemIncidentClass, SystemIncidentScope]:
     """Map an operational degradation reason to its semantic incident.
+
+    Precedence is deliberate and load-bearing:
+
+    1. explicit rate limiting (so a 429 is never a fabricated outage),
+    2. explicit auth/configuration failure (never a network recovery loop),
+    3. explicit genuine connectivity -- including private/read-only reachability,
+    4. derived pricing coverage gaps,
+    5. derived position/verification gaps,
+    6. operator/state read failures,
+    7. anything else.
+
+    A resolver returns a *combined* reason. When provider reachability failed and
+    pricing gaps are merely a consequence of that outage, the connectivity class
+    must win: otherwise an immediate pricing incident would bypass the owner's
+    seven-cycle connectivity recovery policy. A pure pricing gap with healthy
+    connectivity still classifies as pricing.
 
     The asset list, wording and ordering inside ``reason`` are metadata, never
     identity: ``USD/stable-quote pricing unavailable for held assets: A,B`` and
@@ -414,47 +566,49 @@ def classify_degradation_reason(
     lowered = text.lower()
     if not lowered:
         return SystemIncidentClass.INTERNAL_SERVICE_FAILURE, SystemIncidentScope.INTERNAL
-    if any(marker in lowered for marker in _PRICING_REASON_MARKERS):
+
+    if any(marker in lowered for marker in _RATE_LIMIT_REASON_MARKERS):
         return (
-            SystemIncidentClass.HELD_ASSET_PRICING_DEGRADED,
-            SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING,
+            SystemIncidentClass.KRAKEN_RATE_LIMITED,
+            SystemIncidentScope.KRAKEN_RATE_LIMIT,
         )
     if any(marker in lowered for marker in _CREDENTIAL_REASON_MARKERS):
         return (
             SystemIncidentClass.KRAKEN_READ_ONLY_AUTH_FAILURE,
             SystemIncidentScope.KRAKEN_READ_ONLY_AUTH,
         )
-    if any(marker in lowered for marker in _RATE_LIMIT_REASON_MARKERS):
-        return (
-            SystemIncidentClass.KRAKEN_RATE_LIMITED,
-            SystemIncidentScope.KRAKEN_RATE_LIMIT,
-        )
-    if any(marker in lowered for marker in _PRIVATE_STATE_REASON_MARKERS):
-        # Incomplete private account state is only a connectivity incident when
-        # the low-level evidence actually proves reachability failed.
-        if classify_failure_text(text) is KrakenFailureClass.CONNECTIVITY:
+
+    connectivity_proven = (
+        classify_failure_text(text) is KrakenFailureClass.CONNECTIVITY
+    )
+    private_state = any(marker in lowered for marker in _PRIVATE_STATE_REASON_MARKERS)
+    if connectivity_proven:
+        # Private/account reachability is a distinct scope from public
+        # market-data reachability, even though both are connectivity failures.
+        if private_state:
             return (
                 SystemIncidentClass.KRAKEN_READ_ONLY_CONNECTIVITY,
                 SystemIncidentScope.KRAKEN_READ_ONLY,
             )
         return (
-            SystemIncidentClass.POSITION_VERIFICATION_UNAVAILABLE,
-            SystemIncidentScope.KRAKEN_POSITION_VERIFICATION,
+            SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
+            SystemIncidentScope.KRAKEN_PUBLIC,
         )
-    if any(marker in lowered for marker in _POSITION_REASON_MARKERS):
+
+    if any(marker in lowered for marker in _PRICING_REASON_MARKERS):
+        return (
+            SystemIncidentClass.HELD_ASSET_PRICING_DEGRADED,
+            SystemIncidentScope.KRAKEN_HELD_ASSET_PRICING,
+        )
+    if private_state or any(marker in lowered for marker in _POSITION_REASON_MARKERS):
         return (
             SystemIncidentClass.POSITION_VERIFICATION_UNAVAILABLE,
             SystemIncidentScope.KRAKEN_POSITION_VERIFICATION,
         )
     if any(marker in lowered for marker in _OPERATOR_REASON_MARKERS):
         return (
-            SystemIncidentClass.INTERNAL_SERVICE_FAILURE,
+            SystemIncidentClass.UNIFIED_CYCLE_OPERATOR_STATE,
             SystemIncidentScope.UNIFIED_CYCLE,
-        )
-    if classify_failure_text(text) is KrakenFailureClass.CONNECTIVITY:
-        return (
-            SystemIncidentClass.KRAKEN_CONNECTIVITY_UNAVAILABLE,
-            SystemIncidentScope.KRAKEN_PUBLIC,
         )
     return SystemIncidentClass.INTERNAL_SERVICE_FAILURE, SystemIncidentScope.INTERNAL
 
@@ -473,17 +627,6 @@ def requires_owner_recovery_cycles(incident_class: SystemIncidentClass | str) ->
     return policy_for(incident_class).requires_recovery_cycles
 
 
-def is_notification_eligible_occurrence(
-    *,
-    incident_class: SystemIncidentClass | str,
-    consecutive_recovery_failures: int,
-) -> bool:
-    """Whether *this* occurrence is allowed to interrupt the owner."""
-
-    policy = policy_for(incident_class)
-    return int(consecutive_recovery_failures) >= policy.notify_after_failures
-
-
 # ---------------------------------------------------------------------------
 # Durable store
 # ---------------------------------------------------------------------------
@@ -493,9 +636,9 @@ def _load_payload(target: Path) -> dict[str, Any]:
     payload = load_json(target)
     if not isinstance(payload, dict):
         payload = {}
-    incidents = payload.get("incidents")
-    if not isinstance(incidents, dict):
-        payload["incidents"] = {}
+    for name in ("incidents", "archive", "reservations", "unconfirmed_deliveries"):
+        if not isinstance(payload.get(name), dict):
+            payload[name] = {}
     payload["schema_version"] = SCHEMA_VERSION
     return payload
 
@@ -516,10 +659,17 @@ def _active_reservations(payload: dict[str, Any], *, now: datetime) -> dict[str,
     return active
 
 
-def _reservation_for(reservations: dict[str, dict], key: str) -> str | None:
+def _reservation_for(
+    reservations: dict[str, dict],
+    key: str,
+    kind: str | None = None,
+) -> str | None:
     for token, row in reservations.items():
-        if str(row.get("incident_key") or "") == key:
-            return token
+        if str(row.get("incident_key") or "") != key:
+            continue
+        if kind is not None and str(row.get("kind") or "") != kind:
+            continue
+        return token
     return None
 
 
@@ -532,7 +682,9 @@ def _new_row(
     now: datetime,
 ) -> dict[str, Any]:
     return {
-        "incident_id": f"INC:{key}:{now.strftime('%Y%m%dT%H%M%SZ')}",
+        # Timestamp plus a short random suffix keeps reopens of the same scope
+        # distinct without any fuzzy reconstruction.
+        "incident_id": f"INC:{key}:{now.strftime('%Y%m%dT%H%M%SZ')}:{uuid4().hex[:8]}",
         "incident_key": key,
         "alert_family": SYSTEM_HEALTH_FAMILY,
         "incident_class": incident_class.value,
@@ -543,10 +695,12 @@ def _new_row(
         "last_seen_at": now.isoformat(),
         "occurrence_count": 0,
         "consecutive_recovery_failures": 0,
+        "recovery_cycles_attempted": 0,
         "suppressed_notification_count": 0,
         "latest_reason": "",
         "metadata": {},
         "notification_state": NOTIFICATION_NONE,
+        "pending_notifications": {},
         "opened_notification_at": None,
         "open_message_id": None,
         "last_escalation_at": None,
@@ -565,7 +719,14 @@ def _decision_from_row(
     action: str,
     reason: str,
     reservation_token: str | None = None,
+    notification_kind: str = "",
 ) -> IncidentDecision:
+    pending = row.get("pending_notifications")
+    attempts = 0
+    if notification_kind and isinstance(pending, dict):
+        entry = pending.get(notification_kind)
+        if isinstance(entry, dict):
+            attempts = int(entry.get("attempts") or 0)
     return IncidentDecision(
         action=action,
         reason=reason,
@@ -588,6 +749,8 @@ def _decision_from_row(
         recovered_after_recovery_failures=int(
             row.get("recovery_failures_before_reset") or 0
         ),
+        notification_kind=notification_kind,
+        notification_attempts=attempts,
     )
 
 
@@ -617,7 +780,110 @@ def _fail_open_decision(
         recovered_at=None,
         latest_reason=_safe_text(reason, MAX_REASON_CHARS),
         metadata={"storage_failure": _safe_text(detail, 160)},
+        notification_kind=KIND_OPEN,
     )
+
+
+def _reserve(
+    reservations: dict[str, dict],
+    *,
+    key: str,
+    kind: str,
+    moment: datetime,
+) -> str | None:
+    """Reserve one notification attempt, or return None if one is in flight."""
+
+    if _reservation_for(reservations, key, kind) is not None:
+        return None
+    token = uuid4().hex
+    reservations[token] = {
+        "incident_key": key,
+        "kind": kind,
+        "reserved_at": moment.isoformat(),
+    }
+    return token
+
+
+def _active_row(
+    payload: dict[str, Any],
+    *,
+    key: str,
+    incident_class: SystemIncidentClass,
+    scope: SystemIncidentScope,
+    policy: IncidentPolicy,
+    moment: datetime,
+    initial_severity: str | None = None,
+) -> dict[str, Any]:
+    """Return the row for ``key``, archiving (never overwriting) a finished one.
+
+    A recovered incident is moved to the archive under its own ``incident_id``
+    before a fresh row is created, so a later outage on the same scope can never
+    destroy the previous lifecycle's counts, reasons, timestamps, message ids or
+    recovery evidence.
+    """
+
+    incidents = payload["incidents"]
+    row = incidents.get(key)
+    if isinstance(row, dict) and str(row.get("state")) != STATE_RECOVERED:
+        if str(row.get("incident_class")) == incident_class.value:
+            return row
+        # Same scope, genuinely different class: archive the old lifecycle too.
+    if isinstance(row, dict):
+        _archive_row(payload, row, moment)
+    created = _new_row(
+        key=key,
+        incident_class=incident_class,
+        scope=scope,
+        policy=policy,
+        now=moment,
+    )
+    if initial_severity and severity_rank(initial_severity) > severity_rank(
+        str(created.get("severity"))
+    ):
+        # A first observation may already be more severe than the class default.
+        created["severity"] = str(initial_severity).upper()
+    return created
+
+
+def _archive_row(payload: dict[str, Any], row: dict[str, Any], moment: datetime) -> None:
+    """Move a finished (or superseded) incident row into the durable archive."""
+
+    incident_id = str(row.get("incident_id") or "")
+    if not incident_id:
+        return
+    archived = dict(row)
+    archived["archived_at"] = moment.isoformat()
+    # A pending notification that can no longer be delivered because the scope
+    # already failed again is recorded as explicitly superseded, never dropped
+    # silently.
+    pending = archived.get("pending_notifications")
+    if isinstance(pending, dict) and pending:
+        archived["superseded_notifications"] = sorted(pending)
+        archived["pending_notifications"] = {}
+        archived["notification_state"] = NOTIFICATION_SUPERSEDED
+    payload["archive"][incident_id] = archived
+    payload["incidents"].pop(str(row.get("incident_key") or ""), None)
+
+
+def _bump_suppressed(row: dict[str, Any]) -> None:
+    row["suppressed_notification_count"] = (
+        int(row.get("suppressed_notification_count") or 0) + 1
+    )
+
+
+def _escalate_if_material(
+    row: dict[str, Any],
+    *,
+    observed_severity: str,
+    moment: datetime,
+) -> bool:
+    """Advance severity on a material increase and report a one-time escalation."""
+
+    if severity_rank(observed_severity) <= severity_rank(str(row.get("severity"))):
+        return False
+    row["severity"] = observed_severity
+    row["last_escalation_at"] = moment.isoformat()
+    return True
 
 
 def observe_degradation(
@@ -630,12 +896,14 @@ def observe_degradation(
     now: datetime | None = None,
     state_file: Path | None = None,
 ) -> IncidentDecision:
-    """Record one degradation occurrence and decide whether to interrupt the owner.
+    """Record one degradation occurrence.
 
-    Notification-eligible only when the incident has no OPEN notification yet and
-    the class policy threshold has been reached, or when severity materially
-    escalated. Every other occurrence updates durable evidence and increments the
-    suppressed-notification counter.
+    This records *evidence*: occurrence count, last-seen, latest reason and
+    structured metadata. For connectivity classes it deliberately does **not**
+    notify and does **not** advance ``consecutive_recovery_failures`` -- those are
+    driven exclusively by :func:`record_failed_recovery_cycle`, so the owner's
+    "more than six failed recovery cycles" rule cannot be satisfied by mere
+    observations.
     """
 
     klass, scope_value, key = incident_identity(incident_class, scope)
@@ -652,107 +920,75 @@ def observe_degradation(
     try:
         with registry_lock(lock):
             payload = _load_payload(target)
-            incidents = payload["incidents"]
             reservations = _active_reservations(payload, now=moment)
-            row = incidents.get(key)
-            if not isinstance(row, dict) or str(row.get("state")) == STATE_RECOVERED:
-                row = _new_row(
-                    key=key,
-                    incident_class=resolved_class,
-                    scope=resolved_scope,
-                    policy=policy,
-                    now=moment,
-                )
-                if severity_rank(observed_severity) > severity_rank(str(row.get("severity"))):
-                    row["severity"] = observed_severity
-            elif str(row.get("incident_class")) != resolved_class.value:
-                # Same scope, genuinely different class: close the old incident
-                # and open the new one rather than silently rewriting history.
-                row = _new_row(
-                    key=key,
-                    incident_class=resolved_class,
-                    scope=resolved_scope,
-                    policy=policy,
-                    now=moment,
-                )
-
+            row = _active_row(
+                payload,
+                key=key,
+                incident_class=resolved_class,
+                scope=resolved_scope,
+                policy=policy,
+                moment=moment,
+                initial_severity=observed_severity,
+            )
             row["occurrence_count"] = int(row.get("occurrence_count") or 0) + 1
             row["last_seen_at"] = moment.isoformat()
             row["latest_reason"] = _safe_text(reason, MAX_REASON_CHARS)
             if metadata:
                 row["metadata"] = _safe_metadata(metadata)
-            if policy.requires_recovery_cycles:
-                row["consecutive_recovery_failures"] = (
-                    int(row.get("consecutive_recovery_failures") or 0) + 1
-                )
-            failures = int(row.get("consecutive_recovery_failures") or 0)
-            opened = bool(row.get("opened_notification_at"))
 
-            # Classes that are not governed by the recovery-cycle rule are
-            # measured in occurrences instead. For connectivity, the counter is
-            # what implements the owner's "more than six failed cycles" rule.
-            effective_failures = (
-                failures
-                if policy.requires_recovery_cycles
-                else int(row.get("occurrence_count") or 0)
+            opened = bool(row.get("opened_notification_at"))
+            escalated = opened and _escalate_if_material(
+                row, observed_severity=observed_severity, moment=moment
             )
 
-            reservation_token: str | None = None
-            in_flight = _reservation_for(reservations, key)
-
-            if not opened:
-                if effective_failures >= policy.notify_after_failures:
-                    if in_flight is not None:
-                        row["suppressed_notification_count"] = (
-                            int(row.get("suppressed_notification_count") or 0) + 1
-                        )
-                        action, reason_code = ACTION_SUPPRESS_ONGOING, "NOTIFICATION_IN_FLIGHT"
-                    else:
-                        reservation_token = uuid4().hex
-                        reservations[reservation_token] = {
-                            "incident_key": key,
-                            "action": ACTION_NOTIFY_OPEN,
-                            "reserved_at": moment.isoformat(),
-                        }
-                        # The incident is OPEN, but it is only *notified* once a
-                        # delivered message is confirmed. A failed send must not
-                        # leave durable state claiming the owner was told.
+            token: str | None = None
+            kind = ""
+            if not opened and not policy.requires_recovery_cycles:
+                # Occurrence-driven classes notify immediately.
+                if int(row.get("occurrence_count") or 0) >= policy.notify_after_failures:
+                    token = _reserve(reservations, key=key, kind=KIND_OPEN, moment=moment)
+                    if token is not None:
                         row["state"] = STATE_OPEN
-                        action, reason_code = ACTION_NOTIFY_OPEN, "INCIDENT_OPEN"
+                        kind = KIND_OPEN
+                        action, code = ACTION_NOTIFY_OPEN, "INCIDENT_OPEN"
+                    else:
+                        _bump_suppressed(row)
+                        action, code = ACTION_SUPPRESS_ONGOING, "NOTIFICATION_IN_FLIGHT"
                 else:
                     row["notification_state"] = NOTIFICATION_BELOW_THRESHOLD
                     row["state"] = STATE_OPEN
-                    action, reason_code = ACTION_SILENT, "BELOW_RECOVERY_THRESHOLD"
-            else:
-                if severity_rank(observed_severity) > severity_rank(str(row.get("severity"))):
-                    if in_flight is not None:
-                        row["suppressed_notification_count"] = (
-                            int(row.get("suppressed_notification_count") or 0) + 1
-                        )
-                        action, reason_code = ACTION_SUPPRESS_ONGOING, "NOTIFICATION_IN_FLIGHT"
-                    else:
-                        reservation_token = uuid4().hex
-                        reservations[reservation_token] = {
-                            "incident_key": key,
-                            "action": ACTION_NOTIFY_ESCALATION,
-                            "reserved_at": moment.isoformat(),
-                        }
-                        # A material escalation is a fact about the incident, so
-                        # severity and the escalation timestamp advance now; the
-                        # *notification* claim waits for delivery confirmation.
-                        row["severity"] = observed_severity
-                        row["state"] = STATE_ESCALATED
-                        row["last_escalation_at"] = moment.isoformat()
-                        action, reason_code = ACTION_NOTIFY_ESCALATION, "MATERIAL_ESCALATION"
+                    _bump_suppressed(row)
+                    action, code = ACTION_SILENT, "BELOW_RECOVERY_THRESHOLD"
+            elif policy.requires_recovery_cycles:
+                # Connectivity notification is owned by the recovery cycle.
+                row["state"] = STATE_ESCALATED if escalated else (
+                    STATE_CHANGED if opened else STATE_OPEN
+                )
+                if escalated:
+                    _bump_suppressed(row)
+                    action, code = ACTION_SUPPRESS_ONGOING, "ESCALATION_ALREADY_NOTIFIED"
                 else:
-                    row["suppressed_notification_count"] = (
-                        int(row.get("suppressed_notification_count") or 0) + 1
-                    )
-                    row["state"] = STATE_CHANGED
-                    action, reason_code = ACTION_SUPPRESS_ONGOING, "INCIDENT_ONGOING"
+                    action, code = ACTION_SILENT, "GOVERNED_BY_RECOVERY_CYCLE"
+            elif escalated:
+                token = _reserve(
+                    reservations, key=key, kind=KIND_ESCALATION, moment=moment
+                )
+                if token is not None:
+                    row["state"] = STATE_ESCALATED
+                    kind = KIND_ESCALATION
+                    action, code = ACTION_NOTIFY_ESCALATION, "MATERIAL_ESCALATION"
+                else:
+                    _bump_suppressed(row)
+                    action, code = ACTION_SUPPRESS_ONGOING, "NOTIFICATION_IN_FLIGHT"
+            else:
+                row["state"] = STATE_CHANGED
+                _bump_suppressed(row)
+                action, code = ACTION_SUPPRESS_ONGOING, "INCIDENT_ONGOING"
 
-            incidents[key] = row
-            payload["incidents"] = incidents
+            if kind:
+                row["notification_state"] = _KIND_PENDING_STATE[kind]
+
+            payload["incidents"][key] = row
             payload["reservations"] = reservations
             payload["updated_at_utc"] = moment.isoformat()
             save_json_atomic(target, payload)
@@ -771,23 +1007,136 @@ def observe_degradation(
             detail=f"{type(exc).__name__}: {exc}",
         )
 
-    return _decision_from_row(row, action=action, reason=reason_code, reservation_token=reservation_token)
+    return _decision_from_row(
+        row,
+        action=action,
+        reason=code,
+        reservation_token=token,
+        notification_kind=kind,
+    )
+
+
+def record_failed_recovery_cycle(
+    *,
+    incident_class: SystemIncidentClass | str,
+    scope: SystemIncidentScope | str,
+    reason: str = "",
+    metadata: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    state_file: Path | None = None,
+) -> IncidentDecision:
+    """Record exactly ONE failed higher-level recovery cycle for a scope.
+
+    This is the only path that advances ``consecutive_recovery_failures``, so the
+    count is a count of *actual failed probes* rather than of monitor
+    observations. Internal transport retries live inside a single probe cycle and
+    are not counted here.
+    """
+
+    klass, scope_value, key = incident_identity(incident_class, scope)
+    resolved_class = SystemIncidentClass(klass)
+    resolved_scope = SystemIncidentScope(scope_value)
+    policy = policy_for(resolved_class)
+    moment = _utc(now)
+    target = state_file or STATE_FILE
+    lock = target.parent / f".{target.name}.lock"
+
+    try:
+        with registry_lock(lock):
+            payload = _load_payload(target)
+            reservations = _active_reservations(payload, now=moment)
+            row = _active_row(
+                payload,
+                key=key,
+                incident_class=resolved_class,
+                scope=resolved_scope,
+                policy=policy,
+                moment=moment,
+            )
+
+            row["consecutive_recovery_failures"] = (
+                int(row.get("consecutive_recovery_failures") or 0) + 1
+            )
+            row["recovery_cycles_attempted"] = (
+                int(row.get("recovery_cycles_attempted") or 0) + 1
+            )
+            row["last_recovery_attempt_at"] = moment.isoformat()
+            row["last_seen_at"] = moment.isoformat()
+            if reason:
+                row["latest_reason"] = _safe_text(reason, MAX_REASON_CHARS)
+            if metadata:
+                row["metadata"] = _safe_metadata(metadata)
+
+            failures = int(row["consecutive_recovery_failures"])
+            opened = bool(row.get("opened_notification_at"))
+
+            token: str | None = None
+            kind = ""
+            if not opened:
+                if failures >= policy.notify_after_failures:
+                    token = _reserve(reservations, key=key, kind=KIND_OPEN, moment=moment)
+                    if token is not None:
+                        row["state"] = STATE_OPEN
+                        kind = KIND_OPEN
+                        action, code = ACTION_NOTIFY_OPEN, "INCIDENT_OPEN"
+                    else:
+                        _bump_suppressed(row)
+                        action, code = ACTION_SUPPRESS_ONGOING, "NOTIFICATION_IN_FLIGHT"
+                else:
+                    row["notification_state"] = NOTIFICATION_BELOW_THRESHOLD
+                    row["state"] = STATE_OPEN
+                    _bump_suppressed(row)
+                    action, code = ACTION_SILENT, "BELOW_RECOVERY_THRESHOLD"
+            else:
+                row["state"] = STATE_CHANGED
+                _bump_suppressed(row)
+                action, code = ACTION_SUPPRESS_ONGOING, "INCIDENT_ONGOING"
+
+            if kind:
+                row["notification_state"] = _KIND_PENDING_STATE[kind]
+
+            payload["incidents"][key] = row
+            payload["reservations"] = reservations
+            payload["updated_at_utc"] = moment.isoformat()
+            save_json_atomic(target, payload)
+    except (OSError, TimeoutError, RegistryIOError) as exc:
+        print(
+            "O'Pip system-incident state unavailable during recovery cycle:",
+            f"incident_key={key}",
+            f"{type(exc).__name__}: {exc}",
+        )
+        return _fail_open_decision(
+            incident_class=resolved_class,
+            scope=resolved_scope,
+            reason=reason or "recovery cycle failed",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    return _decision_from_row(
+        row,
+        action=action,
+        reason=code,
+        reservation_token=token,
+        notification_kind=kind,
+    )
 
 
 def observe_recovery(
     *,
     incident_class: SystemIncidentClass | str,
     scope: SystemIncidentScope | str,
+    evidence_source: RecoveryAuthority | str,
     evidence: str = "authoritative probe succeeded",
     authoritative: bool = True,
     now: datetime | None = None,
     state_file: Path | None = None,
 ) -> IncidentDecision:
-    """Close an open incident and decide whether to emit one RECOVERED message.
+    """Close an open incident, but only on scope-matched authoritative evidence.
 
-    ``authoritative=False`` models a cache hit or stale local data: it can never
-    close an incident, because a TTL cache hit is not proof that connectivity
-    recovered.
+    ``evidence_source`` must equal the scope's :data:`RecoveryAuthority`. A cache
+    hit, stale response or unrelated subsystem's success is refused, so complete
+    held-position coverage can never close an operator-state, rate-limit or
+    internal-service incident.
     """
 
     klass, scope_value, key = incident_identity(incident_class, scope)
@@ -797,12 +1146,56 @@ def observe_recovery(
     target = state_file or STATE_FILE
     lock = target.parent / f".{target.name}.lock"
 
+    expected = recovery_authority_for_scope(resolved_scope)
+    supplied = str(getattr(evidence_source, "value", evidence_source) or "").upper()
+    if supplied != expected.value:
+        return IncidentDecision(
+            action=ACTION_SILENT,
+            reason="EVIDENCE_SOURCE_MISMATCH",
+            incident_key=key,
+            incident_id="",
+            state=STATE_OPEN,
+            notification_state=NOTIFICATION_NONE,
+            incident_class=resolved_class.value,
+            scope=resolved_scope.value,
+            severity=policy_for(resolved_class).severity,
+            occurrence_count=0,
+            suppressed_notification_count=0,
+            consecutive_recovery_failures=0,
+            first_seen_at=None,
+            last_seen_at=None,
+            recovered_at=None,
+            latest_reason=_safe_text(evidence, MAX_REASON_CHARS),
+            metadata={"expected_authority": expected.value, "supplied": supplied},
+        )
+
+    if not authoritative:
+        # A TTL cache hit, stale response or local registry value is not proof
+        # that the failed scope recovered.
+        return IncidentDecision(
+            action=ACTION_SILENT,
+            reason="EVIDENCE_NOT_AUTHORITATIVE",
+            incident_key=key,
+            incident_id="",
+            state=STATE_OPEN,
+            notification_state=NOTIFICATION_NONE,
+            incident_class=resolved_class.value,
+            scope=resolved_scope.value,
+            severity=policy_for(resolved_class).severity,
+            occurrence_count=0,
+            suppressed_notification_count=0,
+            consecutive_recovery_failures=0,
+            first_seen_at=None,
+            last_seen_at=None,
+            recovered_at=None,
+            latest_reason=_safe_text(evidence, MAX_REASON_CHARS),
+        )
+
     try:
         with registry_lock(lock):
             payload = _load_payload(target)
-            incidents = payload["incidents"]
             reservations = _active_reservations(payload, now=moment)
-            row = incidents.get(key)
+            row = payload["incidents"].get(key)
 
             if not isinstance(row, dict):
                 synthetic = _new_row(
@@ -818,77 +1211,46 @@ def observe_recovery(
                     synthetic, action=ACTION_SILENT, reason="NO_OPEN_INCIDENT"
                 )
 
-            if not authoritative:
-                # A TTL cache hit, stale response or local registry value is not
-                # proof that the failed scope recovered.
-                return _decision_from_row(
-                    row,
-                    action=ACTION_SILENT,
-                    reason="EVIDENCE_NOT_AUTHORITATIVE",
-                )
-
-            opened = bool(row.get("opened_notification_at"))
-            recovery_owed = bool(row.get("recovered_notification_at")) is False and opened
-
             if str(row.get("state")) == STATE_RECOVERED:
-                if recovery_owed:
-                    reservation_token = _reservation_for(reservations, key)
-                    if reservation_token is None:
-                        reservation_token = uuid4().hex
-                        reservations[reservation_token] = {
-                            "incident_key": key,
-                            "action": ACTION_NOTIFY_RECOVERY,
-                            "reserved_at": moment.isoformat(),
-                        }
-                        incidents[key] = row
-                        payload["incidents"] = incidents
-                        payload["reservations"] = reservations
-                        save_json_atomic(target, payload)
-                        return _decision_from_row(
-                            row,
-                            action=ACTION_NOTIFY_RECOVERY,
-                            reason="RECOVERY_NOTIFICATION_RETRY",
-                            reservation_token=reservation_token,
-                        )
-                    return _decision_from_row(
-                        row, action=ACTION_SILENT, reason="RECOVERY_NOTIFICATION_IN_FLIGHT"
-                    )
-                # The incident was already closed and already reported (or was
-                # never worth reporting). Repeated healthy cycles emit nothing.
+                # Recovery is already a fact. Only the human notification may
+                # still be owed, and it is retried through the pending path --
+                # never by resending inside observe_recovery.
                 return _decision_from_row(
                     row, action=ACTION_SILENT, reason="ALREADY_RECOVERED"
                 )
 
-            reservation_token: str | None = None
-            in_flight = _reservation_for(reservations, key)
-
+            opened = bool(row.get("opened_notification_at"))
             failures_before_reset = int(row.get("consecutive_recovery_failures") or 0)
+
             row["state"] = STATE_RECOVERED
             row["recovered_at"] = moment.isoformat()
             row["last_success_at"] = moment.isoformat()
             row["consecutive_recovery_failures"] = 0
             row["recovery_failures_before_reset"] = failures_before_reset
             row["recovery_evidence"] = _safe_text(evidence, MAX_METADATA_CHARS)
+            row["recovery_authority"] = expected.value
 
-            if opened and in_flight is None:
-                reservation_token = uuid4().hex
-                reservations[reservation_token] = {
-                    "incident_key": key,
-                    "action": ACTION_NOTIFY_RECOVERY,
-                    "reserved_at": moment.isoformat(),
-                }
-                row["notification_state"] = NOTIFICATION_RECOVERED_PENDING
-                action, reason_code = ACTION_NOTIFY_RECOVERY, "INCIDENT_RECOVERED"
-            elif opened:
-                action, reason_code = ACTION_SILENT, "RECOVERY_NOTIFICATION_IN_FLIGHT"
+            token: str | None = None
+            kind = ""
+            if opened:
+                token = _reserve(reservations, key=key, kind=KIND_RECOVERY, moment=moment)
+                if token is not None:
+                    kind = KIND_RECOVERY
+                    row["notification_state"] = NOTIFICATION_RECOVERED_PENDING
+                    action, code = ACTION_NOTIFY_RECOVERY, "INCIDENT_RECOVERED"
+                else:
+                    # Another worker already owes this recovery message.
+                    row["pending_notifications"][KIND_RECOVERY] = (
+                        row["pending_notifications"].get(KIND_RECOVERY) or {}
+                    )
+                    action, code = ACTION_SILENT, "RECOVERY_NOTIFICATION_IN_FLIGHT"
             else:
                 # The owner was never interrupted below the threshold, so the
                 # restoration is silent: no outage alert, no recovery alert.
                 row["notification_state"] = NOTIFICATION_NONE
-                action, reason_code = ACTION_SILENT, "SILENT_HEALTHY_RESTORATION"
+                action, code = ACTION_SILENT, "SILENT_HEALTHY_RESTORATION"
 
-            incidents[key] = row
-            payload["incidents"] = incidents
+            payload["incidents"][key] = row
             payload["reservations"] = reservations
             payload["updated_at_utc"] = moment.isoformat()
             save_json_atomic(target, payload)
@@ -899,20 +1261,47 @@ def observe_recovery(
             f"incident_key={key}",
             f"{type(exc).__name__}: {exc}",
         )
-        synthetic = _new_row(
-            key=key,
-            incident_class=resolved_class,
-            scope=resolved_scope,
-            policy=policy_for(resolved_class),
-            now=moment,
-        )
-        return _decision_from_row(
-            synthetic,
+        return IncidentDecision(
             action=ACTION_SILENT,
             reason="STATE_UNAVAILABLE_RECOVERY_UNVERIFIED",
+            incident_key=key,
+            incident_id="",
+            state=STATE_OPEN,
+            notification_state=NOTIFICATION_NONE,
+            incident_class=resolved_class.value,
+            scope=resolved_scope.value,
+            severity=policy_for(resolved_class).severity,
+            occurrence_count=0,
+            suppressed_notification_count=0,
+            consecutive_recovery_failures=0,
+            first_seen_at=None,
+            last_seen_at=None,
+            recovered_at=None,
+            latest_reason=_safe_text(evidence, MAX_REASON_CHARS),
         )
 
-    return _decision_from_row(row, action=action, reason=reason_code, reservation_token=reservation_token)
+    return _decision_from_row(
+        row,
+        action=action,
+        reason=code,
+        reservation_token=token,
+        notification_kind=kind,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notification delivery state (separate from incident fact state)
+# ---------------------------------------------------------------------------
+
+
+def _mark_pending(row: dict[str, Any], kind: str, moment: datetime) -> None:
+    pending = row.setdefault("pending_notifications", {})
+    entry = pending.get(kind)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    entry["last_failed_at"] = moment.isoformat()
+    pending[kind] = entry
+    row["notification_state"] = _KIND_PENDING_STATE[kind]
 
 
 def confirm_incident_notification(
@@ -922,46 +1311,39 @@ def confirm_incident_notification(
     now: datetime | None = None,
     state_file: Path | None = None,
 ) -> bool:
-    """Commit a delivered notification against its reservation.
+    """Commit a *delivered* notification against its reservation.
 
-    Only a *delivered* message may reach this path. A failed delivery must call
-    :func:`release_incident_notification` so the incident stays OPEN and keeps
-    its unfilled-notification state.
+    Called only after Telegram accepted the message. Clears any pending-retry
+    record and any unconfirmed-delivery evidence for this kind.
     """
 
-    if not decision.reservation_token:
+    kind = decision.notification_kind
+    if kind not in NOTIFICATION_KINDS:
         return False
     moment = _utc(now)
     target = state_file or STATE_FILE
     lock = target.parent / f".{target.name}.lock"
+    at_field, id_field = _KIND_FIELDS[kind]
     try:
         with registry_lock(lock):
             payload = _load_payload(target)
-            incidents = payload["incidents"]
             reservations = _active_reservations(payload, now=moment)
-            row = incidents.get(decision.incident_key)
+            row = payload["incidents"].get(decision.incident_key)
             if not isinstance(row, dict):
                 return False
-            reservations.pop(str(decision.reservation_token), None)
-            if decision.action == ACTION_NOTIFY_OPEN:
-                row["opened_notification_at"] = moment.isoformat()
-                row["notification_state"] = NOTIFICATION_OPEN_NOTIFIED
-                if message_id is not None:
-                    row["open_message_id"] = int(message_id)
-            elif decision.action == ACTION_NOTIFY_ESCALATION:
-                row["escalation_notification_at"] = moment.isoformat()
-                row["notification_state"] = NOTIFICATION_ESCALATED_NOTIFIED
-                if message_id is not None:
-                    row["escalation_message_id"] = int(message_id)
-            elif decision.action == ACTION_NOTIFY_RECOVERY:
-                row["recovered_notification_at"] = moment.isoformat()
-                row["notification_state"] = NOTIFICATION_RECOVERED_NOTIFIED
-                if message_id is not None:
-                    row["recovered_message_id"] = int(message_id)
-            else:
-                return False
-            incidents[decision.incident_key] = row
-            payload["incidents"] = incidents
+            if decision.reservation_token:
+                reservations.pop(str(decision.reservation_token), None)
+            row[at_field] = moment.isoformat()
+            if message_id is not None:
+                row[id_field] = int(message_id)
+            pending = row.get("pending_notifications")
+            if isinstance(pending, dict):
+                pending.pop(kind, None)
+            unconfirmed = payload.get("unconfirmed_deliveries")
+            if isinstance(unconfirmed, dict):
+                unconfirmed.pop(f"{decision.incident_id}:{kind}", None)
+            row["notification_state"] = _KIND_NOTIFIED_STATE[kind]
+            payload["incidents"][decision.incident_key] = row
             payload["reservations"] = reservations
             save_json_atomic(target, payload)
         return True
@@ -975,9 +1357,15 @@ def release_incident_notification(
     now: datetime | None = None,
     state_file: Path | None = None,
 ) -> bool:
-    """Release an unused reservation after a failed delivery attempt."""
+    """Record a failed delivery attempt, keeping the notification retryable.
 
-    if not decision.reservation_token:
+    The incident's *fact* state is never rewound (a recovery really did happen).
+    Only the delivery obligation stays pending, recorded with a bounded attempt
+    count so it remains selected for reconciliation.
+    """
+
+    kind = decision.notification_kind
+    if kind not in NOTIFICATION_KINDS:
         return False
     moment = _utc(now)
     target = state_file or STATE_FILE
@@ -986,7 +1374,13 @@ def release_incident_notification(
         with registry_lock(lock):
             payload = _load_payload(target)
             reservations = _active_reservations(payload, now=moment)
-            reservations.pop(str(decision.reservation_token), None)
+            if decision.reservation_token:
+                reservations.pop(str(decision.reservation_token), None)
+            row = payload["incidents"].get(decision.incident_key)
+            if not isinstance(row, dict):
+                return False
+            _mark_pending(row, kind, moment)
+            payload["incidents"][decision.incident_key] = row
             payload["reservations"] = reservations
             save_json_atomic(target, payload)
         return True
@@ -994,17 +1388,187 @@ def release_incident_notification(
         return False
 
 
+def record_unconfirmed_delivery(
+    *,
+    decision: IncidentDecision,
+    message_id: int,
+    now: datetime | None = None,
+    state_file: Path | None = None,
+    confirm_attempts: int = 0,
+) -> bool:
+    """Durably record a Telegram message that could not be committed to state.
+
+    This is reconciliation evidence tied to ``incident_id`` + notification kind +
+    Telegram ``message_id``, so a later cycle can commit the message that was
+    already sent instead of sending a duplicate.
+    """
+
+    kind = decision.notification_kind
+    if kind not in NOTIFICATION_KINDS:
+        return False
+    moment = _utc(now)
+    target = state_file or STATE_FILE
+    lock = target.parent / f".{target.name}.lock"
+    try:
+        with registry_lock(lock):
+            payload = _load_payload(target)
+            reservations = _active_reservations(payload, now=moment)
+            # The send already completed, so no worker should still hold a lease
+            # for this notification. Clearing it lets the very next cycle
+            # reconcile the commit instead of waiting out the lease TTL.
+            for token, row in list(reservations.items()):
+                if (
+                    str(row.get("incident_key") or "") == decision.incident_key
+                    and str(row.get("kind") or "") == kind
+                ):
+                    reservations.pop(token, None)
+            payload["reservations"] = reservations
+            unconfirmed = payload["unconfirmed_deliveries"]
+            unconfirmed[f"{decision.incident_id}:{kind}"] = {
+                "incident_id": decision.incident_id,
+                "incident_key": decision.incident_key,
+                "kind": kind,
+                "message_id": int(message_id),
+                "recorded_at": moment.isoformat(),
+                "confirm_attempts": int(confirm_attempts),
+            }
+            payload["unconfirmed_deliveries"] = unconfirmed
+            save_json_atomic(target, payload)
+        return True
+    except (OSError, TimeoutError, RegistryIOError):
+        return False
+
+
+def unconfirmed_delivery(
+    *,
+    incident_id: str,
+    kind: str,
+    state_file: Path | None = None,
+) -> dict[str, Any] | None:
+    """Return reconciliation evidence for an already-sent, uncommitted message."""
+
+    target = state_file or STATE_FILE
+    try:
+        payload = _load_payload(target)
+    except (OSError, TimeoutError, RegistryIOError):
+        return None
+    entry = payload["unconfirmed_deliveries"].get(f"{incident_id}:{kind}")
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def pending_notification_decisions(
+    *,
+    now: datetime | None = None,
+    state_file: Path | None = None,
+    max_attempts: int = MAX_NOTIFICATION_ATTEMPTS,
+) -> list[IncidentDecision]:
+    """Return decisions for notifications still owed to the owner.
+
+    Includes rows whose lifecycle state is already ``RECOVERED``, because the
+    recovery *message* may still be undelivered. Selection is deterministic and
+    bounded; exhausted records stay durably visible as evidence.
+    """
+
+    moment = _utc(now)
+    target = state_file or STATE_FILE
+    lock = target.parent / f".{target.name}.lock"
+    decisions: list[IncidentDecision] = []
+    try:
+        with registry_lock(lock):
+            payload = _load_payload(target)
+            reservations = _active_reservations(payload, now=moment)
+            for key in sorted(payload["incidents"]):
+                row = payload["incidents"][key]
+                if not isinstance(row, dict):
+                    continue
+                pending = row.get("pending_notifications")
+                if not isinstance(pending, dict) or not pending:
+                    continue
+                for kind in NOTIFICATION_KINDS:
+                    entry = pending.get(kind)
+                    if not isinstance(entry, dict):
+                        continue
+                    if int(entry.get("attempts") or 0) >= max_attempts:
+                        continue
+                    # An active (non-expired) lease means another worker is
+                    # already delivering this kind; skip rather than double-send.
+                    if _reservation_for(reservations, key, kind) is not None:
+                        continue
+                    token = _reserve(reservations, key=key, kind=kind, moment=moment)
+                    if token is None:
+                        continue
+                    decisions.append(
+                        _decision_from_row(
+                            row,
+                            action=_ACTION_FOR_KIND[kind],
+                            reason="PENDING_NOTIFICATION_RETRY",
+                            reservation_token=token,
+                            notification_kind=kind,
+                        )
+                    )
+            if decisions:
+                payload["reservations"] = reservations
+                save_json_atomic(target, payload)
+    except (OSError, TimeoutError, RegistryIOError):
+        return []
+    return decisions
+
+
+#: Which human notification a pending kind maps to.
+_ACTION_FOR_KIND = {
+    KIND_OPEN: ACTION_NOTIFY_OPEN,
+    KIND_ESCALATION: ACTION_NOTIFY_ESCALATION,
+    KIND_RECOVERY: ACTION_NOTIFY_RECOVERY,
+}
+
+
 # ---------------------------------------------------------------------------
 # Read-only projection (future Cockpit / Operations view)
 # ---------------------------------------------------------------------------
+
+
+def _project_row(row: dict[str, Any]) -> dict[str, Any]:
+    pending = row.get("pending_notifications")
+    pending_kinds = sorted(pending) if isinstance(pending, dict) else []
+    return {
+        "incident_id": row.get("incident_id"),
+        "incident_key": row.get("incident_key"),
+        "alert_family": row.get("alert_family") or SYSTEM_HEALTH_FAMILY,
+        "incident_class": row.get("incident_class"),
+        "scope": row.get("scope"),
+        "severity": row.get("severity"),
+        "state": row.get("state"),
+        "notification_state": row.get("notification_state"),
+        "first_seen_at": row.get("first_seen_at"),
+        "last_seen_at": row.get("last_seen_at"),
+        "occurrence_count": int(row.get("occurrence_count") or 0),
+        "consecutive_recovery_failures": int(
+            row.get("consecutive_recovery_failures") or 0
+        ),
+        "recovery_cycles_attempted": int(row.get("recovery_cycles_attempted") or 0),
+        "suppressed_notification_count": int(
+            row.get("suppressed_notification_count") or 0
+        ),
+        "notification_delivered": bool(row.get("opened_notification_at")),
+        "notification_pending": pending_kinds,
+        "recovered_at": row.get("recovered_at"),
+        "outage_seconds": _outage_seconds(row),
+        "latest_reason": row.get("latest_reason"),
+        "metadata": dict(row.get("metadata") or {}),
+    }
 
 
 def read_incidents(
     *,
     state_file: Path | None = None,
     include_recovered: bool = True,
+    include_archived: bool = True,
 ) -> list[dict[str, Any]]:
     """Return a deterministic, secret-free projection of durable incidents.
+
+    Active incidents and every completed (archived) incident instance are
+    returned, ordered by ``first_seen_at`` then ``incident_id``, so a later
+    outage on a scope never hides the previous lifecycle.
 
     This is a read-only projection for a future Operations/Incidents view. It
     deliberately does not import or influence any notification authority.
@@ -1015,39 +1579,20 @@ def read_incidents(
         payload = _load_payload(target)
     except (OSError, TimeoutError, RegistryIOError):
         return []
+
     rows: list[dict[str, Any]] = []
-    for key in sorted(payload.get("incidents") or {}):
-        row = payload["incidents"][key]
+    for row in payload["incidents"].values():
         if not isinstance(row, dict):
             continue
         if not include_recovered and str(row.get("state")) == STATE_RECOVERED:
             continue
-        rows.append(
-            {
-                "incident_id": row.get("incident_id"),
-                "incident_key": row.get("incident_key") or key,
-                "alert_family": row.get("alert_family") or SYSTEM_HEALTH_FAMILY,
-                "incident_class": row.get("incident_class"),
-                "scope": row.get("scope"),
-                "severity": row.get("severity"),
-                "state": row.get("state"),
-                "notification_state": row.get("notification_state"),
-                "first_seen_at": row.get("first_seen_at"),
-                "last_seen_at": row.get("last_seen_at"),
-                "occurrence_count": int(row.get("occurrence_count") or 0),
-                "consecutive_recovery_failures": int(
-                    row.get("consecutive_recovery_failures") or 0
-                ),
-                "suppressed_notification_count": int(
-                    row.get("suppressed_notification_count") or 0
-                ),
-                "notification_delivered": bool(row.get("opened_notification_at")),
-                "recovered_at": row.get("recovered_at"),
-                "outage_seconds": _outage_seconds(row),
-                "latest_reason": row.get("latest_reason"),
-                "metadata": dict(row.get("metadata") or {}),
-            }
-        )
+        rows.append(_project_row(row))
+    if include_archived:
+        for row in payload["archive"].values():
+            if isinstance(row, dict):
+                rows.append(_project_row(row))
+
+    rows.sort(key=lambda item: (str(item.get("first_seen_at") or ""), str(item.get("incident_id") or "")))
     return rows
 
 

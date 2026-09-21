@@ -1,9 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "contract": "O'Pip Alert v2 system-incident governance",
   "lifecycle": ["OPEN", "CHANGED", "ESCALATED", "RECOVERED"],
   "state_file": "/app/data/system_incidents.json",
   "schema_constant": "app.services.system_incidents.SCHEMA_VERSION",
+  "storage": {
+    "incidents": "active incident indexed by semantic scope key",
+    "archive": "completed incident instances indexed by incident_id (never overwritten)",
+    "reservations": "one in-flight notification attempt per scope+kind",
+    "unconfirmed_deliveries": "delivered Telegram messages whose durable commit failed, for reconciliation"
+  },
   "identity": {
     "alert_family": "SYSTEM_HEALTH",
     "rule": "SYSTEM_HEALTH:<semantic_scope>",
@@ -31,15 +37,18 @@
     "open": 1,
     "escalation": 1,
     "recovered": 1,
-    "rule": "one semantic incident produces at most one OPEN, one material escalation and one RECOVERED human notification; every additional occurrence increments occurrence_count and suppressed_notification_count"
+    "rule": "one semantic incident produces at most one OPEN, one material escalation and one RECOVERED human notification; every additional occurrence increments occurrence_count and suppressed_notification_count",
+    "fact_state_vs_delivery_state": "lifecycle state records what happened; a notification stays pending and retryable until Telegram delivery is confirmed, so lifecycle state never implies the owner was told"
   },
   "connectivity_recovery_rule": {
     "owner_rule": "notify only after connectivity has failed to recover MORE THAN six consecutive recovery cycles",
     "notify_after_consecutive_failures": 7,
     "first_notification_cycle": 7,
+    "counter_measures": "FAILED RECOVERY CYCLES (KrakenScopeProbe.run() results), never degraded monitor observations",
     "cycles_1_to_6": "SILENT (durable telemetry only)",
     "cycles_after_7": "keep recovering; no repeated failure notification",
     "recovery_cycle_definition": "one higher-level health probe; internal KrakenPublicTransport retries do not increment the recovery-cycle counter",
+    "recorded_by": "app.services.system_incidents.record_failed_recovery_cycle",
     "not_applicable_classes": [
       "KRAKEN_READ_ONLY_AUTH_FAILURE",
       "KRAKEN_RATE_LIMITED",
@@ -47,9 +56,40 @@
       "POSITION_VERIFICATION_UNAVAILABLE",
       "PROVIDER_RATE_LIMITED",
       "DATA_PIPELINE_STALE",
+      "UNIFIED_CYCLE_OPERATOR_STATE",
       "INTERNAL_SERVICE_FAILURE"
     ]
   },
+  "recovery_authority": {
+    "rule": "a scope may only be closed by evidence that proves THAT scope healthy; unrelated success is refused",
+    "by_scope": {
+      "KRAKEN:PUBLIC_CONNECTIVITY": "PUBLIC_PROBE",
+      "KRAKEN:READ_ONLY_CONNECTIVITY": "READ_ONLY_PROBE",
+      "KRAKEN:HELD_ASSET_PRICING": "PRICING_COVERAGE",
+      "KRAKEN:POSITION_VERIFICATION": "POSITION_COVERAGE",
+      "KRAKEN:RATE_LIMIT": "RATE_LIMIT_CLEARED",
+      "KRAKEN:READ_ONLY_AUTH": "AUTH_CONFIG",
+      "UNIFIED_CYCLE:OPERATOR_STATE": "OPERATOR_STATE",
+      "INTERNAL:SERVICE": "OWNING_SUBSYSTEM"
+    },
+    "monitor_owned_scopes": [
+      "KRAKEN:PUBLIC_CONNECTIVITY",
+      "KRAKEN:READ_ONLY_CONNECTIVITY",
+      "KRAKEN:HELD_ASSET_PRICING",
+      "KRAKEN:POSITION_VERIFICATION",
+      "KRAKEN:RATE_LIMIT"
+    ],
+    "producer_owned_recovery": "UNIFIED_CYCLE:OPERATOR_STATE is closed by app/jobs/run_cycle.py, the component that can prove operator state readable"
+  },
+  "classification_precedence": [
+    "explicit RATE_LIMIT",
+    "explicit AUTH/CONFIG",
+    "explicit genuine CONNECTIVITY (public or private/read-only)",
+    "derived PRICING symptoms",
+    "derived POSITION/verification symptoms",
+    "operator/state read failure",
+    "OTHER"
+  ],
   "persisted_row_fields": [
     "incident_id",
     "incident_key",
@@ -62,10 +102,12 @@
     "last_seen_at",
     "occurrence_count",
     "consecutive_recovery_failures",
+    "recovery_cycles_attempted",
     "suppressed_notification_count",
     "latest_reason",
     "metadata",
     "notification_state",
+    "pending_notifications",
     "opened_notification_at",
     "open_message_id",
     "last_escalation_at",
@@ -85,12 +127,13 @@
     "any credential value"
   ],
   "example": {
-    "incident_key": "SYSTEM_HEALTH:KRAKEN:HELD_ASSET_PRICING",
+    "incident_key": "SYSTEM_HEALTH:KRAKEN:PUBLIC_CONNECTIVITY",
     "states": [
-      {"cycle": 1, "state": "OPEN", "action": "NOTIFY_OPEN", "occurrence_count": 1},
-      {"cycle": 2, "state": "CHANGED", "action": "SUPPRESS_ONGOING", "occurrence_count": 2},
-      {"cycle": 60, "state": "CHANGED", "action": "SUPPRESS_ONGOING", "occurrence_count": 60, "suppressed_notification_count": 59},
-      {"cycle": 61, "state": "RECOVERED", "action": "NOTIFY_RECOVERY", "occurrence_count": 60}
+      {"failed_recovery_cycle": 1, "state": "OPEN", "action": "SILENT", "consecutive_recovery_failures": 1},
+      {"failed_recovery_cycle": 6, "state": "OPEN", "action": "SILENT", "consecutive_recovery_failures": 6},
+      {"failed_recovery_cycle": 7, "state": "OPEN", "action": "NOTIFY_OPEN", "consecutive_recovery_failures": 7},
+      {"failed_recovery_cycle": 8, "state": "CHANGED", "action": "SUPPRESS_ONGOING", "consecutive_recovery_failures": 8},
+      {"probe_succeeded": true, "state": "RECOVERED", "action": "NOTIFY_RECOVERY", "notification_state": "RECOVERED_PENDING"}
     ]
   },
   "authority": {

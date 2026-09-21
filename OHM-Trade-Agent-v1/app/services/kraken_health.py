@@ -45,7 +45,14 @@ KRAKEN_RECOVERY_MAX_ATTEMPTS = 3
 KRAKEN_RECOVERY_BASE_DELAY_SECONDS = 0.5
 KRAKEN_RECOVERY_MAX_DELAY_SECONDS = 8.0
 KRAKEN_RECOVERY_JITTER_RATIO = 0.15
+#: Timeout applied to a single recovery request. The read-only probe bounds its
+#: client with this value so one request cannot occupy an entire monitor cycle.
 KRAKEN_RECOVERY_TIMEOUT_SECONDS = 5.0
+#: Wall-clock budget for one *complete* higher-level recovery cycle, across all
+#: attempts and backoff sleeps. This is what keeps a recovery cycle from
+#: overrunning the once-per-minute monitor cadence; without it, each nested
+#: request could independently consume the full timeout.
+KRAKEN_RECOVERY_CYCLE_BUDGET_SECONDS = 10.0
 
 
 class KrakenHealthScope(str, Enum):
@@ -171,13 +178,17 @@ def classify_failure_text(text: str | None) -> KrakenFailureClass:
         return KrakenFailureClass.RATE_LIMITED
     if any(marker in haystack for marker in _AUTH_MARKERS):
         return KrakenFailureClass.AUTH_CONFIG
-    if any(marker in haystack for marker in _PRICING_MARKERS):
-        return KrakenFailureClass.PRICING
-    # Connectivity is evaluated before position/account markers: "account state
-    # unavailable: ConnectError" IS a reachability failure, and treating it as
-    # mere incomplete state would under-report a real outage.
+    # Connectivity is evaluated before pricing coverage and before position/account
+    # markers. Explicit provider reachability failure must outrank *derived*
+    # symptoms: a resolver reason that reports both "pair discovery unavailable:
+    # connection refused" and "pricing unavailable" is a connectivity outage, and
+    # treating it as a pricing gap would bypass the owner's seven-cycle recovery
+    # policy. It also means "account state unavailable: ConnectError" is correctly
+    # read as unreachable rather than merely incomplete.
     if any(marker in haystack for marker in _CONNECTIVITY_MARKERS):
         return KrakenFailureClass.CONNECTIVITY
+    if any(marker in haystack for marker in _PRICING_MARKERS):
+        return KrakenFailureClass.PRICING
     if any(marker in haystack for marker in _POSITION_MARKERS):
         return KrakenFailureClass.POSITION_VERIFICATION
     return KrakenFailureClass.OTHER
@@ -197,6 +208,8 @@ class RecoveryProbeResult:
     attempts: int
     reason: str
     connection_reset: bool = False
+    #: True when the cycle stopped early because its wall-clock budget ran out.
+    budget_exhausted: bool = False
 
     @property
     def attempts_used(self) -> int:
@@ -221,14 +234,18 @@ class KrakenScopeProbe:
         sleeper: Callable[[float], None] | None = None,
         random_source: Callable[[float, float], float] | None = None,
         connection_reset: Callable[[], Any] | None = None,
+        clock: Callable[[], float] | None = None,
+        cycle_budget_seconds: float = KRAKEN_RECOVERY_CYCLE_BUDGET_SECONDS,
     ) -> None:
         self.max_attempts = max(1, int(max_attempts))
         self.base_delay_seconds = max(0.0, float(base_delay_seconds))
         self.max_delay_seconds = max(0.0, float(max_delay_seconds))
         self.jitter_ratio = max(0.0, float(jitter_ratio))
+        self.cycle_budget_seconds = max(0.0, float(cycle_budget_seconds))
         self._sleep = sleeper or time.sleep
         self._random = random_source or random.uniform
         self._reset = connection_reset
+        self._clock = clock or time.monotonic
 
     def _delay_for(self, attempt: int) -> float:
         """Backoff for the retry *after* ``attempt`` failed, plus jitter.
@@ -258,19 +275,35 @@ class KrakenScopeProbe:
     ) -> RecoveryProbeResult:
         """Run one recovery cycle.
 
-        Exactly one call == exactly one owner-visible recovery cycle.
+        Exactly one call == exactly one owner-visible recovery cycle. The whole
+        cycle is bounded by ``cycle_budget_seconds`` in addition to
+        ``max_attempts``, so a hung request cannot occupy the monitor cadence and
+        the number of attempts stays deterministic.
         """
 
+        started = self._clock()
         attempts = 0
         last_class = KrakenFailureClass.OTHER
         last_reason = "no probe attempt was made"
         connection_reset = False
+        budget_exhausted = False
 
         for attempt in range(1, self.max_attempts + 1):
+            if attempts and self.cycle_budget_seconds > 0:
+                if (self._clock() - started) >= self.cycle_budget_seconds:
+                    budget_exhausted = True
+                    break
             attempts = attempt
             if attempt > 1:
                 delay = self._delay_for(attempt - 1)
                 if delay > 0:
+                    # Never sleep past the cycle budget: a recovery cycle must
+                    # finish inside it rather than overrun the monitor cadence.
+                    if self.cycle_budget_seconds > 0 and (
+                        (self._clock() - started) + delay > self.cycle_budget_seconds
+                    ):
+                        budget_exhausted = True
+                        break
                     self._sleep(delay)
             try:
                 probe()
@@ -283,12 +316,13 @@ class KrakenScopeProbe:
                     and not connection_reset
                 ):
                     # A demonstrably broken pooled connection may be replaced,
-                    # but only for a genuine reachability failure.
+                    # but only for a genuine reachability failure. A reset that
+                    # returns False or raises did not happen, and must not be
+                    # reported as if it did.
                     try:
-                        self._reset()
-                        connection_reset = True
+                        connection_reset = bool(self._reset())
                     except Exception:
-                        pass
+                        connection_reset = False
                 continue
             return RecoveryProbeResult(
                 scope=scope,
@@ -297,6 +331,7 @@ class KrakenScopeProbe:
                 attempts=attempts,
                 reason="probe succeeded",
                 connection_reset=connection_reset,
+                budget_exhausted=budget_exhausted,
             )
 
         return RecoveryProbeResult(
@@ -306,6 +341,7 @@ class KrakenScopeProbe:
             attempts=attempts,
             reason=last_reason,
             connection_reset=connection_reset,
+            budget_exhausted=budget_exhausted,
         )
 
 
@@ -338,12 +374,15 @@ def public_connectivity_probe(
 
 def read_only_connectivity_probe(
     client: Any | None = None,
+    *,
+    timeout_seconds: float = KRAKEN_RECOVERY_TIMEOUT_SECONDS,
 ) -> Callable[[], Any]:
     """Fresh private ***read-only*** account-reachability probe.
 
-    The probe imports the read-only client lazily and asserts read-only
-    permissions before any call, so the recovery path can never reach an order
-    endpoint even if a future client gains one.
+    The probe imports the read-only client lazily, asserts read-only permissions
+    before any call, and bounds the client with the recovery timeout so a single
+    request cannot occupy an entire monitor cycle. The probe can never reach an
+    order endpoint even if a future client gains one.
     """
 
     def probe() -> Any:
@@ -351,7 +390,9 @@ def read_only_connectivity_probe(
         if active is None:
             from app.exchanges.kraken_private import KrakenPrivateClient
 
-            active = KrakenPrivateClient()
+            # Bounded timeout: the default is 15s, which would let one request
+            # consume a large part of a once-per-minute monitor cycle.
+            active = KrakenPrivateClient(timeout_seconds=timeout_seconds)
         if not getattr(active, "enabled", False):
             from app.exchanges.kraken_private import KrakenPrivateAPIError
 
