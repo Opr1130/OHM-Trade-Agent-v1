@@ -184,6 +184,12 @@ services:
   # droplet, database, scheduler or credentials. It runs the cockpit-only ASGI app
   # rather than the trading entry point, so this container cannot start trading
   # subsystems, and it holds no exchange or Telegram authority.
+  #
+  # Exposure mirrors the existing Grafana model: the service listens on the
+  # container interface and is published ONLY to host loopback, where the host's TLS
+  # reverse proxy terminates and forwards. The analytics network is internal, so
+  # binding to loopback *inside* the container would be unreachable from the host and
+  # from the proxy. Port 8000 is never published to a public interface.
   opip-cockpit:
     build:
       context: ../..
@@ -194,14 +200,19 @@ services:
       - /etc/opip-data-platform.env
     environment:
       OPIP_CANONICAL_REPLICA_ROOT: /app/canonical-replica
+      OPIP_COCKPIT_HTTP_PORT: ${OPIP_COCKPIT_HTTP_PORT:-8000}
       PYTHONDONTWRITEBYTECODE: "1"
     command:
       - uvicorn
       - app.api.cockpit_service:app
       - --host
-      - 127.0.0.1
+      - 0.0.0.0
       - --port
-      - "8000"
+      - ${OPIP_COCKPIT_HTTP_PORT:-8000}
+    ports:
+      # Host-loopback only. The bind address is explicitly defaulted to 127.0.0.1 so
+      # an unset variable can never widen exposure to a public interface.
+      - "${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}:${OPIP_COCKPIT_HOST_PORT:-8000}:${OPIP_COCKPIT_HTTP_PORT:-8000}"
     volumes:
       # The verified canonical replica, read-only, at the path the replica module
       # already expects. Same host root the learning-plane jobs mount.
@@ -220,9 +231,14 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
+      # Container-local liveness only. This proves the process answers inside the
+      # container; it does NOT prove operator reachability, which depends on the host
+      # publish and the host reverse proxy. The bootstrap preflight proves that
+      # separately, because a passing healthcheck here is not evidence of an
+      # operator-reachable endpoint.
       test:
         - CMD-SHELL
-        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/cockpit', timeout=5).status==200 else 1)"
+        - python -c "import os,urllib.request,sys; port=os.environ.get('OPIP_COCKPIT_HTTP_PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/cockpit', timeout=5).status==200 else 1)"
       interval: 30s
       timeout: 10s
       retries: 5

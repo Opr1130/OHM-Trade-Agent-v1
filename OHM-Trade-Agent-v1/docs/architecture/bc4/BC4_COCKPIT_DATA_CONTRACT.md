@@ -449,6 +449,23 @@ Deployment wiring (implemented):
 - It runs `app.api.cockpit_service:app`, a cockpit-only ASGI app rather than the
   trading entry point, so the analytics-plane container physically cannot start
   trading subsystems, and it holds no exchange, Telegram or order authority.
+- **Operator reachability follows the existing Grafana model.** The service listens on
+  the container interface (`--host 0.0.0.0`) and is published **only to host
+  loopback** (`127.0.0.1:${OPIP_COCKPIT_HOST_PORT}:${OPIP_COCKPIT_HTTP_PORT}`, bind
+  defaulted to loopback). The analytics network is `internal: true`, so a
+  container-loopback bind would be unreachable from the host; port 8000 is never
+  published to a public or VPC interface. The host's TLS reverse proxy terminates TLS
+  and forwards `/cockpit`, `/api/cockpit/overview`, `/api/cockpit/trades` and
+  `/api/cockpit/trades/*` to that loopback port. The exact required routes are
+  documented in `deploy/analytics/README.md`; no second proxy platform is introduced.
+- **A passing container healthcheck is not operator reachability.** The healthcheck is
+  container-local liveness. The `reads-ready` stage therefore runs a separate
+  host-side preflight that fails closed: the bind address must be loopback, the
+  container must be `healthy` (necessary, not sufficient), `curl` must fetch
+  `/cockpit` from **host loopback** with HTTP 200 (which exercises the host publish),
+  and an unauthenticated `GET /api/cockpit/overview` must return **401** (proving the
+  route exists and is gated). `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written
+  only after all four hold.
 - **The trading host no longer advertises cockpit routes.** The dashboard sidecar's
   exact-match allowlist is unchanged from before this PR. Proxying `/api/cockpit/*`
   there would return `CANONICAL_REPLICA_UNAVAILABLE` for every request, because the

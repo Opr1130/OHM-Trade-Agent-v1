@@ -109,6 +109,69 @@ compose() {
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE" "$@"
 }
 
+cockpit_preflight() {
+  # Prove the Cockpit is reachable to an OPERATOR, which is a different claim from
+  # the container being healthy.
+  #
+  # The container healthcheck runs inside the container and would pass even when
+  # nothing on the host can reach the service: the analytics network is internal, so
+  # a container-loopback bind is unreachable from the host, and an unpublished port is
+  # unreachable from the host reverse proxy. A green healthcheck is therefore never
+  # accepted as evidence of operator reachability here.
+  local bind="${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}"
+  local port="${OPIP_COCKPIT_HOST_PORT:-8000}"
+  local endpoint="http://${bind}:${port}"
+
+  # Fail closed on any non-loopback bind. The raw Cockpit HTTP service must remain
+  # host-loopback only; the TLS reverse proxy is the sole supported external entry
+  # point, so a public bind is refused rather than silently accepted.
+  case "$bind" in
+    127.*|localhost) ;;
+    *)
+      echo "OPIP_COCKPIT_BIND_ADDRESS must be host loopback, not '$bind'" >&2
+      echo "the cockpit must be reached through the host TLS reverse proxy" >&2
+      exit 78
+      ;;
+  esac
+
+  local health
+  health="$(docker inspect \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    opip-cockpit 2>/dev/null || true)"
+  if [[ "$health" != "healthy" ]]; then
+    echo "cockpit container health is '$health', not 'healthy'" >&2
+    echo "note: container health alone would not prove operator reachability" >&2
+    exit 69
+  fi
+
+  command -v curl >/dev/null 2>&1 || {
+    echo "curl is required to prove cockpit loopback reachability" >&2
+    exit 69
+  }
+
+  if ! curl --fail --silent --show-error --max-time 5 "${endpoint}/cockpit" >/dev/null 2>&1; then
+    echo "cockpit container is healthy but NOT reachable on host loopback ${endpoint}" >&2
+    echo "container health does not imply operator reachability; check the host publish and the reverse proxy" >&2
+    exit 69
+  fi
+
+  # Prove the read-only API route exists from the host AND still enforces
+  # authentication. A 401 means the endpoint is served and gated; a 404 would mean the
+  # route is missing and the deployment is incomplete. A 200 would mean
+  # authentication is not being enforced.
+  local api_code
+  api_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --max-time 5 "${endpoint}/api/cockpit/overview" 2>/dev/null || true)"
+  if [[ "$api_code" != "401" ]]; then
+    echo "cockpit API did not gate an unauthenticated request from the host (http ${api_code:-none}); expected 401" >&2
+    exit 69
+  fi
+
+  echo "cockpit host-loopback preflight OK: ${endpoint} serves the page and gates the API"
+  echo "cockpit_exposure=host-loopback"
+  echo "cockpit_requires_tls_reverse_proxy=true"
+}
+
 # Serialize with sync/capture/outcomes on the shared learning/analytics host.
 # Timers use this same lock and will skip rather than compete for RAM or files.
 exec 8>/var/lock/opip-learning-plane.lock
@@ -401,6 +464,12 @@ else
   admin_run python -m app.opip.data_platform.migrations sync-required-streams
   admin_run python -m app.opip.data_platform.reconcile
   admin_run python -m app.opip.data_platform.health --require-ready
+  # Start the read-only Cockpit and prove operator reachability on host loopback.
+  # The Cockpit reads only the verified replica, so it belongs to the reads phase.
+  compose up -d opip-cockpit
+  cockpit_preflight
+  write_state COCKPIT_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_state COCKPIT_READY_SHA "$TARGET_SHA"
   write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_state READS_READY_SHA "$TARGET_SHA"
 fi

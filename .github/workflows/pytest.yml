@@ -59,6 +59,11 @@ jobs:
           bash -n deploy/remote/opip-learning-read-export.sh
           bash -n deploy/learning/opip-learning-sync.sh
           bash -n deploy/learning/opip-learning-job.sh
+          bash -n deploy/analytics/bootstrap-opip-data-platform.sh
+          bash -n deploy/analytics/run-gated-stage.sh
+          bash -n deploy/analytics/opip-data-platform-maintenance.sh
+          bash -n deploy/analytics/opip-postgres-backup.sh
+          bash -n deploy/analytics/opip-postgres-restore-drill.sh
       # The canonical learning-replica transfer E2E executes the real exporter,
       # forced reader and sync, and the exporter is intentionally root-only. The
       # ordinary pytest run above collects it but skips it (not root), so it is

@@ -66,6 +66,9 @@ PostgreSQL is started with `ssl=on` and Grafana trusts only the mounted
 8. Start Grafana with
    `docker compose --env-file /etc/opip-data-platform.env -f deploy/analytics/docker-compose.yml up -d opip-grafana`,
    then configure TLS reverse proxy routing to the private bind endpoint.
+9. The `reads-ready` stage starts `opip-cockpit` (the read-only B/C-4 Cockpit) and
+   proves host-loopback reachability. Configure the reverse proxy for the Cockpit
+   paths below before treating the Cockpit as operator-available.
 
 The stages are deliberately non-collapsible. `empty` installs PostgreSQL and
 the additive schema; `offhost-verified` records an owner attestation only
@@ -109,6 +112,68 @@ been verified. After the first dump and after every material schema change, run
 `opip-postgres-restore-drill`; it restores
 into a temporary database, validates `ops.schema_version`, records evidence,
 and drops only that temporary database.
+
+## Read-only Cockpit exposure
+
+The B/C-4 Cockpit (`opip-cockpit`) answers Paper-v2 analytical questions from the
+verified canonical replica. It is exposed using the **same model as Grafana**: a
+loopback-published service behind the host's TLS reverse proxy. No new proxy platform
+is introduced, and this repository does not version-control the host proxy
+configuration.
+
+### Required reverse-proxy routes
+
+The external endpoint must terminate TLS and forward these four paths to the
+host-loopback Cockpit port. All four are GET-only and must not be cached.
+
+| External path | Proxied to |
+| --- | --- |
+| `/cockpit` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/cockpit` |
+| `/api/cockpit/overview` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/overview` |
+| `/api/cockpit/trades` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/trades` |
+| `/api/cockpit/trades/*` | `http://127.0.0.1:${OPIP_COCKPIT_HOST_PORT}/api/cockpit/trades/*` (path parameter) |
+
+Requirements:
+
+- Terminate TLS at the proxy; do **not** expose `OPIP_COCKPIT_HOST_PORT` to the
+  Internet, and do not publish it on a public or VPC interface.
+- Restrict the proxied methods to GET. The API is read-only, and the edge should say
+  so rather than relying on the application alone.
+- Do not cache. Analytical responses are point-in-time and carry an `as_of`.
+- The four paths are the whole surface. `/api/cockpit/trades/*` is a prefix match for
+  the Trade Detail path parameter and exposes nothing beyond that route.
+
+### Authentication
+
+`/cockpit` is a public static shell; every `/api/cockpit/*` read requires the
+existing operator secret in the `x-webhook-secret` header. The proxy must forward
+that header and must not inject or store the secret. A request without it returns
+401, which is also what the bootstrap preflight asserts to prove the API is served
+*and* gated.
+
+### Reachability proof (and what it is not)
+
+The container healthcheck is **container-local liveness only**. It runs inside the
+container, so it would pass even when the analytics network being internal (and the
+port being unpublished) leaves the service unreachable from the host. A green
+healthcheck is therefore **not** evidence that an operator can reach the Cockpit.
+
+The `reads-ready` stage therefore runs a separate host-side preflight that fails
+closed, in this order:
+
+1. `OPIP_COCKPIT_BIND_ADDRESS` must be host loopback; any other value is refused,
+   because the raw HTTP service must never be exposed beyond the host.
+2. The container must report `healthy` (necessary, not sufficient).
+3. `curl` must fetch **`/cockpit` from host loopback** and receive HTTP 200. This is
+   the operator reachability claim: it exercises the host publish and therefore
+   catches an unpublished port or a container-loopback bind.
+4. An unauthenticated `GET /api/cockpit/overview` from host loopback must return
+   **401**. A 404 would mean the route is absent; a 200 would mean authentication is
+   not enforced.
+
+The preflight records `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` only after all
+four conditions hold, so a passing container healthcheck alone can never mark the
+Cockpit ready.
 
 ## Intelligence Cockpit provisioning
 
