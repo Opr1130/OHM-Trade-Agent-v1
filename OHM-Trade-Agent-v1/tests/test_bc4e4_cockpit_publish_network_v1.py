@@ -216,6 +216,56 @@ def test_7c_egress_claims_are_precise_and_not_overclaimed():
     assert "Residual capability, deliberately accepted" in COCKPIT_TEXT
 
 
+def _flattened(text: str) -> str:
+    """Whitespace-normalised, lower-cased prose with comment/markdown markers removed.
+
+    Comment markers must go first: a phrase that wraps across Compose comment lines would
+    otherwise read as "... application # state" and defeat the assertion.
+    """
+    without_markers = text.replace("#", " ")
+    return " ".join(without_markers.split()).lower()
+
+
+def test_7e_no_egress_overclaim_is_absolute():
+    """No surface may claim Internet egress is categorically impossible.
+
+    Review finding (valid): saying a packet retains its bridge source address "which no
+    upstream can return to" was too absolute. An upstream or host with an explicit route to
+    the Docker bridge subnet can return traffic, so both surfaces must say so.
+    """
+    for surface, text in (("README", README), ("compose", COCKPIT_TEXT)):
+        assert "no upstream can return" not in text, surface
+        # The positive statement must be present: direct routing can still work.
+        flattened = _flattened(text)
+        assert "direct routing remains possible" in flattened, surface
+        assert "not categorically impossible" in flattened, surface
+        assert "explicitly routes" in flattened, surface
+
+    # And the removal is described as Docker's automatic NAT, not as unreturnable traffic.
+    assert "automatic source-nat" in _flattened(README)
+
+
+def test_7f_the_writable_state_claim_matches_the_tmpfs():
+    """The container is NOT without writable state: /tmp is a writable tmpfs.
+
+    Review finding (valid): "read-only rootfs with no writable state" contradicted the
+    service's own `tmpfs: /tmp:rw,noexec,nosuid,size=32m`.
+    """
+    for surface, text in (("README", README), ("compose", COCKPIT_TEXT)):
+        assert "no writable state" not in text, surface
+        flattened = _flattened(text)
+        # Precisely scoped: no *persistent* writable application state...
+        assert "no persistent writable application state" in flattened, surface
+        # ...and the bounded tmpfs is named as the thing that is writable.
+        assert "/tmp" in text, surface
+        assert "32m" in text, surface
+
+    # The claim is checked against the artifact it describes.
+    service = _cockpit()
+    assert service["read_only"] is True
+    assert service["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=32m"], service["tmpfs"]
+
+
 def test_7d_credential_claims_name_the_one_secret_that_is_present():
     """The Cockpit does hold OPIP_COCKPIT_SECRET, so "no credentials" was wrong.
 

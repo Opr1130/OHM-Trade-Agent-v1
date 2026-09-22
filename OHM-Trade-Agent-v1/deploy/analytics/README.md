@@ -275,10 +275,14 @@ Precisely what that option does and does not do:
 
 | | Effect |
 | --- | --- |
-| NAT-based Internet egress | **Removed.** A container packet leaves with its own bridge source address, which no upstream can return to. |
+| NAT-based Internet egress | **Removed.** Docker's automatic source-NAT for traffic leaving this bridge is gone, so packets retain their bridge source address. Ordinary Internet connectivity will generally fail without a return route, but direct routing remains possible where the host or upstream network explicitly routes this subnet. |
 | Gateway / default route | **Still present.** This network is deliberately not `internal`, so Docker installs a gateway and a default route. |
 | Host / direct-routing reachability | **Not firewall-denied.** Traffic destined for the host's own addresses is delivered locally rather than forwarded, so it never reaches a NAT or filter decision this option could influence. |
 | Hard egress denial | **Not implemented.** See below. |
+
+Internet egress is therefore **not categorically impossible**: an upstream or host network
+that explicitly routes this bridge's subnet can still return traffic. What is removed is
+Docker's automatic NAT, not the possibility of a return path.
 
 **No firewall enforcement is installed, by design.** Hard egress denial would mean a
 `DOCKER-USER` (or nftables-backend) rule keyed to this bridge's interface. The repository
@@ -296,7 +300,9 @@ always creates a gateway/default route. That residual capability is deliberately
 and is documented here rather than described as if it had been eliminated. What bounds a
 compromise is the rest of the container's posture:
 
-- `cap_drop: ALL`, `no-new-privileges`, a read-only rootfs with no writable state
+- `cap_drop: ALL`, `no-new-privileges`, a read-only rootfs with no persistent writable
+  application state — only the bounded `/tmp` tmpfs is writable
+  (`rw,noexec,nosuid,size=32m`)
 - **no Kraken credentials**
 - **no Telegram authority**
 - **no trading `WEBHOOK_SECRET`**

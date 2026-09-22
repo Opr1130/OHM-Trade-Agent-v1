@@ -159,8 +159,12 @@ networks:
       # Removes source-NAT for container-originated traffic leaving this bridge. That is a
       # real reduction, and it is all this option does:
       #
-      #   * NAT-based Internet egress is removed. Without masquerade a container packet
-      #     leaves with its own bridge source address, which no upstream can return to.
+      #   * NAT-based Internet egress is removed. Disabling Docker bridge masquerading
+      #     removes Docker's automatic source-NAT for traffic leaving this bridge, so
+      #     packets retain their bridge source address. Ordinary Internet connectivity will
+      #     generally fail unless the surrounding network has a return route, but direct
+      #     routing remains possible where the host or upstream network explicitly routes
+      #     this subnet. Internet egress is therefore not categorically impossible.
       #   * It is NOT an egress firewall. This network is deliberately NOT `internal`, so
       #     Docker still installs a gateway and a default route, and packets can still
       #     leave where host or upstream routing permits. Container-originated access to
@@ -187,8 +191,9 @@ networks:
       # gateway/default route, and host/direct-routing reachability is not firewall-denied.
       # That is inherent to any topology that can be published at all. The container's
       # other controls bound what a compromise could do with it: `cap_drop: ALL`,
-      # `no-new-privileges`, a read-only rootfs with no writable state, no Kraken
-      # credentials, no Telegram authority, no trading WEBHOOK_SECRET, and only the
+      # `no-new-privileges`, a read-only rootfs with no persistent writable application
+      # state (only the bounded `/tmp` tmpfs is writable: rw,noexec,nosuid,size=32m), no
+      # Kraken credentials, no Telegram authority, no trading WEBHOOK_SECRET, and only the
       # dedicated read-only OPIP_COCKPIT_SECRET - which is present and is not a trading
       # credential.
       com.docker.network.bridge.enable_ip_masquerade: "false"
