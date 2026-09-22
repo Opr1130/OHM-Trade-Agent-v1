@@ -1685,3 +1685,45 @@ def test_a_reported_cost_above_the_reservation_is_charged_to_the_case():
     # the second seat cannot invoke.
     assert result.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
     assert second.calls == []
+
+
+def test_each_attempt_is_charged_so_a_retry_overage_reaches_the_case_ledger():
+    """A retried seat's cumulative spend must bound the next seat."""
+    # First attempt times out (reserving 40, reporting nothing); the retry
+    # succeeds reporting 1,000 against a 40 estimate. The conservative charge is
+    # 40 + 1,000 = 1,040, so a following 20-unit seat must not run under a
+    # 1,020-unit ceiling.
+    first = _provider(
+        ProviderFamily.OPENAI,
+        answers=(
+            ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),
+            ScriptedAnswer(text=opinion_json()),
+        ),
+    )
+    first._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    first._cost_override = 1_000  # noqa: SLF001 - test double
+    second = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    second._estimated_cost_microunits = 20  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first, ProviderFamily.ANTHROPIC: second},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+                max_attempts=3,
+                cost_ceiling=1_020,
+            )
+        )
+    )
+    assert result.seats[0].outcome.status is ObservationStatus.COMPLETED
+    assert len(first.calls) == 2
+    assert result.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []

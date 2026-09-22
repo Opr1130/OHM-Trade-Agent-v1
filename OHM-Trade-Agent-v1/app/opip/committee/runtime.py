@@ -367,8 +367,7 @@ class CommitteeRunner:
                 0,
             )
 
-        outcome, reserved, already_recorded = self._invoke_within_budget(
-            case=case,
+        outcome, reserved, already_recorded = self._invoke_within_budget(            case=case,
             family=family,
             provider=provider,
             wire=wire,
@@ -413,15 +412,10 @@ class CommitteeRunner:
             # failure; recording it again would double-count the attempt and
             # append duplicate raw evidence.
             self._ledger.record(outcome)
-        # Charge the greater of what was reserved and what the provider actually
-        # reported. Nothing requires the pre-flight estimate to be an upper
-        # bound, so carrying only the reservation would let an under-estimated
-        # seat leave room for the next seat to spend past the ceiling. A failure
-        # with unknown cost still charges its reservation.
-        reported = outcome.estimated_cost_microunits or 0
-        return CommitteeSeatResult(family, logical_id, outcome), max(
-            reserved, reported
-        )
+        # The seat is charged the cumulative per-attempt cost computed while
+        # invoking, so a retried or under-estimated seat cannot leave room for the
+        # next seat to spend past the case ceiling.
+        return CommitteeSeatResult(family, logical_id, outcome), reserved
 
     def _duplicate_acknowledgement(
         self,
@@ -489,6 +483,7 @@ class CommitteeRunner:
         """
         estimate = provider.estimate_cost_microunits(wire)
         seat_reserved = 0
+        seat_charge = 0
         outcome: ProviderCallOutcome | None = None
         while True:
             skip_reason = self._attempt_budget_reason(
@@ -500,7 +495,7 @@ class CommitteeRunner:
             if skip_reason is not None:
                 # A previous attempt already happened, was persisted below, and
                 # is retained as the seat's disposition.
-                return outcome, seat_reserved, outcome is not None
+                return outcome, seat_charge, outcome is not None
             outcome = self._attempt_seat(
                 case=case,
                 family=family,
@@ -511,13 +506,19 @@ class CommitteeRunner:
             )
             if estimate is not None:
                 seat_reserved += estimate
+            # Charge each attempt the greater of its own reservation and its
+            # reported cost. An attempt's actual spend can exceed its estimate,
+            # and summing per attempt (rather than comparing a total reservation
+            # with only the final report) keeps a retried seat's overage on the
+            # case ledger so the next seat cannot spend past the ceiling.
+            seat_charge += max(estimate or 0, outcome.estimated_cost_microunits or 0)
             if not (
                 outcome.status is ObservationStatus.FAILED
                 and outcome.failure_class in RETRYABLE_FAILURE_CLASSES
                 and attempt < case.policy.max_attempts_per_seat
                 and attempt < MAX_RECORDED_ATTEMPTS
             ):
-                return outcome, seat_reserved, False
+                return outcome, seat_charge, False
             # Persist the failed attempt before retrying, so the audit trail
             # keeps every try rather than only the last one. A failed attempt is
             # not a committed observation, so this cannot create a second
@@ -526,7 +527,7 @@ class CommitteeRunner:
             if attempt + 1 > case.policy.max_attempts_per_seat:
                 # The retry would exceed the declared per-seat policy, so stop
                 # with the recorded failure rather than spending again.
-                return outcome, seat_reserved, True
+                return outcome, seat_charge, True
             attempt += 1
 
     def _attempt_seat(

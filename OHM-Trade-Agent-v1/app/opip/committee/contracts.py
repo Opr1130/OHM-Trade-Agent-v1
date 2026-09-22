@@ -245,6 +245,18 @@ def _require_non_empty_str(value: object, *, field_name: str) -> str:
     return text
 
 
+def _require_optional_opaque_ref(value: object, *, field_name: str) -> str | None:
+    """Accept a non-empty opaque id, or ``None``. Empty/whitespace fails closed."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or null")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field_name} must be non-empty when provided")
+    return text
+
+
 def _require_str_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"{field_name} must be a sequence of strings")
@@ -567,6 +579,48 @@ class EvidenceSnapshot:
 
 
 @dataclass(frozen=True)
+class CanonicalDecisionBinding:
+    """Opaque by-reference link from a committee case to a canonical decision.
+
+    MEASUREMENT ONLY - NO PRODUCTION DECISION AUTHORITY.
+
+    This closes the learning-loop edge *recommendation → canonical decision*
+    without writing to Decision Intelligence streams and without inventing a
+    second decision authority. Both fields are opaque string references only;
+    at least one must be set. Empty or whitespace-only refs fail closed.
+
+    Presence of a binding never grants admission, ranking, sizing, execution,
+    or promotion authority. A governed DI/canonical writer bridge remains a
+    separate, future, human-approved change.
+    """
+
+    decision_id: str | None = None
+    episode_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "decision_id",
+            _require_optional_opaque_ref(self.decision_id, field_name="decision_id"),
+        )
+        object.__setattr__(
+            self,
+            "episode_id",
+            _require_optional_opaque_ref(self.episode_id, field_name="episode_id"),
+        )
+        if self.decision_id is None and self.episode_id is None:
+            raise ValueError(
+                "canonical binding requires decision_id and/or episode_id"
+            )
+
+    def identity_payload(self) -> dict[str, str | None]:
+        return {
+            "decision_id": self.decision_id,
+            "episode_id": self.episode_id,
+        }
+
+
+@dataclass(frozen=True)
 class CommitteePolicy:
     """Versioned committee configuration. No trading meaning is attached."""
 
@@ -632,6 +686,11 @@ class CommitteeCase:
 
     The case binds a sealed evidence snapshot to a committee policy. It carries
     no admission, ranking, sizing, or execution meaning.
+
+    An optional :class:`CanonicalDecisionBinding` may reference an existing
+    opaque canonical decision and/or episode identity by string only. The
+    binding is advisory linkage for learning attribution; it is not a second
+    decision authority and never writes to Decision Intelligence streams.
     """
 
     case_id: str
@@ -642,6 +701,7 @@ class CommitteeCase:
     provenance: Provenance
     instrument_id: str | None = None
     strategy_context_id: str | None = None
+    canonical_binding: CanonicalDecisionBinding | None = None
     schema_version: int = COMMITTEE_CASE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -672,6 +732,12 @@ class CommitteeCase:
             raise ValueError("snapshot instrument_id must match the committee case")
         if self.snapshot.strategy_context_id != self.strategy_context_id:
             raise ValueError("snapshot strategy_context_id must match the committee case")
+        if self.canonical_binding is not None and not isinstance(
+            self.canonical_binding, CanonicalDecisionBinding
+        ):
+            raise ValueError(
+                "canonical_binding must be a CanonicalDecisionBinding or null"
+            )
         object.__setattr__(
             self,
             "created_at",
@@ -679,6 +745,28 @@ class CommitteeCase:
         )
         if self.created_at < self.snapshot.assembled_at:
             raise ValueError("case created_at must be >= snapshot assembled_at")
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "case_id": self.case_id,
+            "case_type": self.case_type,
+            "snapshot_hash": self.snapshot.snapshot_hash,
+            "policy_hash": self.policy.policy_hash,
+            "created_at": self.created_at,
+            "instrument_id": self.instrument_id,
+            "strategy_context_id": self.strategy_context_id,
+            "canonical_binding": (
+                None
+                if self.canonical_binding is None
+                else self.canonical_binding.identity_payload()
+            ),
+        }
+
+    @property
+    def case_hash(self) -> str:
+        """Content-derived identity of this committee case."""
+        return stable_hash(COMMITTEE_CASE_IDENTITY_DOMAIN, self.identity_payload())
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1150,7 @@ __all__ = [
     "LOGICAL_OBSERVATION_IDENTITY_DOMAIN",
     "MODEL_BOUND_ITEM_FIELDS",
     "CaseType",
+    "CanonicalDecisionBinding",
     "CommitteeCase",
     "CommitteeCaseOutcome",
     "CommitteePolicy",
