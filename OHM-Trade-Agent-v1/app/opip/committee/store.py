@@ -29,6 +29,8 @@ from app.opip.committee.serialization import (
     call_outcome_to_dict,
     case_outcome_from_dict,
     case_outcome_to_dict,
+    evaluation_report_from_dict,
+    evaluation_report_to_dict,
 )
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
@@ -44,6 +46,8 @@ CALL_OUTCOMES_MAX_BYTES = 8 * 1024 * 1024
 CALL_OUTCOMES_KEEP_LINES = 50_000
 CASE_OUTCOMES_MAX_BYTES = 8 * 1024 * 1024
 CASE_OUTCOMES_KEEP_LINES = 20_000
+EVALUATIONS_MAX_BYTES = 8 * 1024 * 1024
+EVALUATIONS_KEEP_LINES = 5_000
 
 #: Reasons an append is acknowledged without writing a new row.
 REASON_STORED = "STORED"
@@ -76,6 +80,10 @@ def _parse_case_line(line: bytes) -> CommitteeCaseOutcome:
     return case_outcome_from_dict(parse_json_object_line(line))
 
 
+def _parse_evaluation_line(line: bytes):
+    return evaluation_report_from_dict(parse_json_object_line(line))
+
+
 class CommitteeEvidenceStore:
     """Append-only durable store for committee observations and case outcomes."""
 
@@ -87,12 +95,16 @@ class CommitteeEvidenceStore:
         call_keep_lines: int = CALL_OUTCOMES_KEEP_LINES,
         case_max_bytes: int = CASE_OUTCOMES_MAX_BYTES,
         case_keep_lines: int = CASE_OUTCOMES_KEEP_LINES,
+        evaluations_max_bytes: int = EVALUATIONS_MAX_BYTES,
+        evaluations_keep_lines: int = EVALUATIONS_KEEP_LINES,
     ) -> None:
         self.root = Path(root)
         self.call_lock_file = self.root / ".call_outcomes.lock"
         self.case_lock_file = self.root / ".case_outcomes.lock"
+        self.evaluation_lock_file = self.root / ".evaluations.lock"
         self.calls_index_file = self.root / "call_outcome_index.json"
         self.cases_index_file = self.root / "case_outcome_index.json"
+        self.evaluations_index_file = self.root / "evaluation_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -110,6 +122,15 @@ class CommitteeEvidenceStore:
             archive_prefix="cases",
             parse_line=_parse_case_line,
             visible_at=lambda row: row.started_at,
+        )
+        self._evaluations = BoundedJsonlArchive(
+            data_file=self.root / "evaluations.jsonl",
+            archive_dir=self.root / "archive_evaluations",
+            max_bytes=evaluations_max_bytes,
+            keep_lines=evaluations_keep_lines,
+            archive_prefix="evaluations",
+            parse_line=_parse_evaluation_line,
+            visible_at=lambda row: row.generated_at,
         )
 
     # ---------------------------------------------------------------- calls
@@ -189,6 +210,53 @@ class CommitteeEvidenceStore:
             seen.add(row.case_outcome_id)
             yield row
 
+    # ----------------------------------------------------------- evaluations
+
+    def append_evaluation_report(self, report) -> StoreAppendResult:
+        """Append a bake-off report, or acknowledge a duplicate without writing."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.evaluation_lock_file):
+            self._evaluations.repair_tail()
+            known = self._load_evaluation_ids()
+            if report.report_id in known:
+                return StoreAppendResult(False, report.report_id, REASON_DUPLICATE)
+            self._evaluations.append_encoded_locked(
+                encode_row(evaluation_report_to_dict(report))
+            )
+            known.add(report.report_id)
+            self._save_evaluation_ids(known)
+            self._compact(self._evaluations, "evaluation report")
+            return StoreAppendResult(True, report.report_id, REASON_STORED)
+
+    def iter_evaluation_reports(self, *, include_archive: bool = True):
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._evaluations.iter_archive_rows():
+                if row.report_id in seen:
+                    continue
+                seen.add(row.report_id)
+                yield row
+        for row in self._evaluations.iter_hot_rows():
+            if row.report_id in seen:
+                continue
+            seen.add(row.report_id)
+            yield row
+
+    def _load_evaluation_ids(self) -> set[str]:
+        raw = self._load_index_payload(self.evaluations_index_file)
+        entries = raw.get("entries")
+        if not isinstance(entries, Mapping):
+            return set()
+        return {key for key in entries if isinstance(key, str)}
+
+    def _save_evaluation_ids(self, ids: set[str]) -> None:
+        payload = {
+            "schema_version": 1,
+            "kind": "EVALUATION",
+            "entries": {key: key for key in sorted(ids)},
+        }
+        self._write_index(self.evaluations_index_file, payload, label="evaluation")
+
     # --------------------------------------------------------------- helpers
 
     def _load_call_index(self) -> dict[str, _CommittedIndexEntry]:
@@ -238,6 +306,9 @@ class CommitteeEvidenceStore:
         self._write_index(self.cases_index_file, payload, label="case outcome")
 
     def _load_index_payload(self, path: Path) -> Mapping[str, Any]:
+        if not path.exists():
+            # A first run has no index yet; the durable log is the authority.
+            return {}
         try:
             raw = load_json(path)
         except Exception:
@@ -246,9 +317,7 @@ class CommitteeEvidenceStore:
                 path,
             )
             return {}
-        if not isinstance(raw, Mapping):
-            return {}
-        if raw.get("schema_version") != 1:
+        if not isinstance(raw, Mapping) or raw.get("schema_version") != 1:
             logger.warning(
                 "O'Pip committee index schema mismatch at %s; rebuilding from durable log",
                 path,
@@ -330,6 +399,8 @@ __all__ = [
     "CASE_OUTCOMES_KEEP_LINES",
     "CASE_OUTCOMES_MAX_BYTES",
     "COMMITTEE_DIR",
+    "EVALUATIONS_KEEP_LINES",
+    "EVALUATIONS_MAX_BYTES",
     "REASON_DIVERGENCE",
     "REASON_DUPLICATE",
     "REASON_STORED",

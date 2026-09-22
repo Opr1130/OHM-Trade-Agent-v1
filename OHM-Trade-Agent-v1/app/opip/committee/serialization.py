@@ -412,6 +412,362 @@ def case_outcome_from_dict(row: Mapping[str, Any]) -> CommitteeCaseOutcome:
     return case_outcome
 
 
+def _encode_metric(metric) -> dict[str, Any]:
+    return {
+        "name": metric.name,
+        "value": metric.value,
+        "applicable": metric.applicable,
+        "sample_size": metric.sample_size,
+        "reason": metric.not_applicable_reason,
+    }
+
+
+def _decode_metric(row: Mapping[str, Any]):
+    from app.opip.committee.metrics import EvaluationMetric
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("metric must be an object")
+    return EvaluationMetric(
+        name=row.get("name"),
+        value=_parse_optional_str(row.get("value"), field="metric.value"),
+        applicable=bool(row.get("applicable")),
+        sample_size=row.get("sample_size"),
+        not_applicable_reason=_parse_optional_str(
+            row.get("reason"), field="metric.reason"
+        ),
+    )
+
+
+def _encode_bin(item) -> dict[str, Any]:
+    return {
+        "lower": item.lower,
+        "upper": item.upper,
+        "count": item.count,
+        "mean_predicted": item.mean_predicted,
+        "observed_rate": item.observed_rate,
+    }
+
+
+def _decode_bin(row: Mapping[str, Any]):
+    from app.opip.committee.metrics import CalibrationBin
+
+    return CalibrationBin(
+        lower=row.get("lower"),
+        upper=row.get("upper"),
+        count=row.get("count"),
+        mean_predicted=row.get("mean_predicted"),
+        observed_rate=row.get("observed_rate"),
+    )
+
+
+def _encode_confusion(matrix) -> dict[str, Any] | None:
+    if matrix is None:
+        return None
+    return {
+        "true_positive": matrix.true_positive,
+        "false_positive": matrix.false_positive,
+        "true_negative": matrix.true_negative,
+        "false_negative": matrix.false_negative,
+    }
+
+
+def _decode_confusion(row: Mapping[str, Any] | None):
+    from app.opip.committee.metrics import ConfusionMatrix
+
+    if row is None:
+        return None
+    return ConfusionMatrix(
+        true_positive=row.get("true_positive"),
+        false_positive=row.get("false_positive"),
+        true_negative=row.get("true_negative"),
+        false_negative=row.get("false_negative"),
+    )
+
+
+def _encode_latency(latency) -> dict[str, Any]:
+    return {
+        "sample_size": latency.sample_size,
+        "p50_micros": latency.p50_micros,
+        "p90_micros": latency.p90_micros,
+        "maximum_micros": latency.maximum_micros,
+    }
+
+
+def _decode_latency(row: Mapping[str, Any]):
+    from app.opip.committee.metrics import LatencyDistribution
+
+    return LatencyDistribution(
+        sample_size=row.get("sample_size"),
+        p50_micros=_parse_optional_int(row.get("p50_micros"), field="p50_micros"),
+        p90_micros=_parse_optional_int(row.get("p90_micros"), field="p90_micros"),
+        maximum_micros=_parse_optional_int(
+            row.get("maximum_micros"), field="maximum_micros"
+        ),
+    )
+
+
+def _encode_cost(cost) -> dict[str, Any]:
+    return {
+        "sample_size": cost.sample_size,
+        "known_cost_microunits": cost.known_cost_microunits,
+        "unknown_cost_samples": cost.unknown_cost_samples,
+    }
+
+
+def _decode_cost(row: Mapping[str, Any]):
+    from app.opip.committee.metrics import CostAggregate
+
+    return CostAggregate(
+        sample_size=row.get("sample_size"),
+        known_cost_microunits=_parse_optional_int(
+            row.get("known_cost_microunits"), field="known_cost_microunits"
+        ),
+        unknown_cost_samples=row.get("unknown_cost_samples"),
+    )
+
+
+def _encode_arm(arm) -> dict[str, Any]:
+    return {
+        "arm_id": arm.arm_id,
+        "kind": arm.kind.value,
+        "label": arm.label,
+        "provider_family": (
+            None if arm.provider_family is None else arm.provider_family.value
+        ),
+        "model": arm.model,
+        "cases": arm.cases,
+        "answered": arm.answered,
+        "abstentions": arm.abstentions,
+        "schema_valid": arm.schema_valid,
+        "failures": arm.failures,
+        "unavailable": arm.unavailable,
+        "skipped_budget": arm.skipped_budget,
+        "input_tokens": arm.input_tokens,
+        "output_tokens": arm.output_tokens,
+        "adequacy": arm.adequacy,
+        # Keyed by contract field rather than by metric label: a metric's own
+        # name (for example "repeatability" for the consistency field) must not
+        # decide where it is read back from.
+        "metrics": {
+            field_name: _encode_metric(getattr(arm, field_name))
+            for field_name, _ in _ARM_METRIC_FIELDS
+        },
+        "calibration_bins": [_encode_bin(item) for item in arm.calibration_bins],
+        "confusion": _encode_confusion(arm.confusion),
+        "latency": _encode_latency(arm.latency),
+        "cost": _encode_cost(arm.cost),
+    }
+
+
+#: Contract fields that carry an EvaluationMetric, in report order.
+_ARM_METRIC_FIELDS = (
+    ("coverage", "coverage"),
+    ("response_validity", "response_validity"),
+    ("abstention_rate", "abstention_rate"),
+    ("failure_rate", "failure_rate"),
+    ("schema_compliance", "schema_compliance"),
+    ("consistency", "consistency"),
+    ("precision", "precision"),
+    ("recall", "recall"),
+    ("f1", "f1"),
+    ("accuracy", "accuracy"),
+    ("brier_score", "brier_score"),
+    ("log_loss", "log_loss"),
+    ("expected_calibration_error", "expected_calibration_error"),
+)
+
+
+def _decode_arm(row: Mapping[str, Any]):
+    from app.opip.committee.evaluation import ArmEvaluation, ArmKind
+
+    raw_metrics = row.get("metrics")
+    if not isinstance(raw_metrics, Mapping):
+        raise CommitteeSerializationError("arm metrics must be an object")
+    metrics_by_field = {
+        field_name: _decode_metric(raw_metrics[field_name])
+        for field_name, _ in _ARM_METRIC_FIELDS
+        if field_name in raw_metrics
+    }
+    missing = [
+        field_name
+        for field_name, _ in _ARM_METRIC_FIELDS
+        if field_name not in metrics_by_field
+    ]
+    if missing:
+        raise CommitteeSerializationError(f"arm is missing metrics: {missing}")
+    return ArmEvaluation(
+        arm_id=row.get("arm_id"),
+        kind=_parse_enum(row.get("kind"), ArmKind, field="kind"),
+        label=row.get("label"),
+        provider_family=_parse_optional_enum(
+            row.get("provider_family"), ProviderFamily, field="provider_family"
+        ),
+        model=_parse_optional_str(row.get("model"), field="model"),
+        cases=row.get("cases"),
+        answered=row.get("answered"),
+        abstentions=row.get("abstentions"),
+        schema_valid=row.get("schema_valid"),
+        failures=row.get("failures"),
+        unavailable=row.get("unavailable"),
+        skipped_budget=row.get("skipped_budget"),
+        input_tokens=_parse_optional_int(row.get("input_tokens"), field="input_tokens"),
+        output_tokens=_parse_optional_int(
+            row.get("output_tokens"), field="output_tokens"
+        ),
+        adequacy=row.get("adequacy"),
+        coverage=metrics_by_field["coverage"],
+        response_validity=metrics_by_field["response_validity"],
+        abstention_rate=metrics_by_field["abstention_rate"],
+        failure_rate=metrics_by_field["failure_rate"],
+        schema_compliance=metrics_by_field["schema_compliance"],
+        consistency=metrics_by_field["consistency"],
+        precision=metrics_by_field["precision"],
+        recall=metrics_by_field["recall"],
+        f1=metrics_by_field["f1"],
+        accuracy=metrics_by_field["accuracy"],
+        brier_score=metrics_by_field["brier_score"],
+        log_loss=metrics_by_field["log_loss"],
+        expected_calibration_error=metrics_by_field["expected_calibration_error"],
+        calibration_bins=tuple(
+            _decode_bin(item) for item in row.get("calibration_bins", [])
+        ),
+        confusion=_decode_confusion(row.get("confusion")),
+        latency=_decode_latency(row.get("latency", {})),
+        cost=_decode_cost(row.get("cost", {})),
+    )
+
+
+_ARM_FIELDS = frozenset(
+    {
+        "arm_id",
+        "kind",
+        "label",
+        "provider_family",
+        "model",
+        "cases",
+        "answered",
+        "abstentions",
+        "schema_valid",
+        "failures",
+        "unavailable",
+        "skipped_budget",
+        "input_tokens",
+        "output_tokens",
+        "adequacy",
+        "metrics",
+        "calibration_bins",
+        "confusion",
+        "latency",
+        "cost",
+    }
+)
+
+_REPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "report_id",
+        "experiment_id",
+        "phase",
+        "case_type",
+        "generated_at",
+        "case_count",
+        "minimum_samples",
+        "arms",
+        "provenance",
+        "metric_definitions_version",
+        "committee_signal_rule_version",
+        "measurement_only",
+        "automatic_promotion",
+        "trade_authority_changed",
+    }
+)
+
+
+def evaluation_report_to_dict(report) -> dict[str, Any]:
+    provenance = report.provenance
+    return {
+        "schema_version": report.schema_version,
+        "report_id": report.report_id,
+        "experiment_id": report.experiment_id,
+        "phase": report.phase.value,
+        "case_type": report.case_type.value,
+        "generated_at": _iso(report.generated_at),
+        "case_count": report.case_count,
+        "minimum_samples": report.minimum_samples,
+        "arms": [_encode_arm(arm) for arm in report.arms],
+        "provenance": {
+            "schema_version": provenance.schema_version,
+            "producing_component": provenance.producing_component,
+            "artifact_or_build_id": provenance.artifact_or_build_id,
+            "process_instance_id": provenance.process_instance_id,
+            "emitted_at": _iso(provenance.emitted_at),
+            "source_record_refs": list(provenance.source_record_refs),
+        },
+        "metric_definitions_version": report.metric_definitions_version,
+        "committee_signal_rule_version": report.committee_signal_rule_version,
+        "measurement_only": report.measurement_only,
+        "automatic_promotion": report.automatic_promotion,
+        "trade_authority_changed": report.trade_authority_changed,
+    }
+
+
+def evaluation_report_from_dict(row: Mapping[str, Any]):
+    """Rebuild a bake-off report, verifying its content identity on read."""
+    from app.opip.committee.evaluation import EvaluationReport
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("evaluation report must be an object")
+    _reject_unknown(row, _REPORT_FIELDS, kind="evaluation report")
+    provenance_row = row.get("provenance")
+    if not isinstance(provenance_row, Mapping):
+        raise CommitteeSerializationError("provenance must be an object")
+    _reject_unknown(provenance_row, _PROVENANCE_FIELDS, kind="provenance")
+    raw_arms = row.get("arms")
+    if not isinstance(raw_arms, list):
+        raise CommitteeSerializationError("arms must be a list")
+    arms = []
+    for arm_row in raw_arms:
+        if not isinstance(arm_row, Mapping):
+            raise CommitteeSerializationError("arm must be an object")
+        _reject_unknown(arm_row, _ARM_FIELDS, kind="arm")
+        arms.append(_decode_arm(arm_row))
+
+    from app.opip.committee.contracts import CaseType, EvaluationPhase
+    from app.opip.decision_intelligence.identity import Provenance
+
+    report = EvaluationReport(
+        schema_version=row.get("schema_version"),
+        experiment_id=row.get("experiment_id"),
+        phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
+        case_type=_parse_enum(row.get("case_type"), CaseType, field="case_type"),
+        generated_at=_parse_dt(row.get("generated_at"), field="generated_at"),
+        case_count=row.get("case_count"),
+        minimum_samples=row.get("minimum_samples"),
+        arms=tuple(arms),
+        provenance=Provenance(
+            schema_version=provenance_row.get("schema_version"),
+            producing_component=provenance_row.get("producing_component"),
+            artifact_or_build_id=provenance_row.get("artifact_or_build_id"),
+            process_instance_id=provenance_row.get("process_instance_id"),
+            emitted_at=_parse_dt(provenance_row.get("emitted_at"), field="emitted_at"),
+            source_record_refs=_parse_str_tuple(
+                provenance_row.get("source_record_refs"), field="source_record_refs"
+            ),
+        ),
+        metric_definitions_version=row.get("metric_definitions_version"),
+        committee_signal_rule_version=row.get("committee_signal_rule_version"),
+        measurement_only=bool(row.get("measurement_only")),
+        automatic_promotion=bool(row.get("automatic_promotion")),
+        trade_authority_changed=bool(row.get("trade_authority_changed")),
+    )
+    declared_id = row.get("report_id")
+    if declared_id is not None and declared_id != report.report_id:
+        raise CommitteeSerializationError(
+            "persisted report_id does not match its content identity"
+        )
+    return report
+
+
 __all__ = [
     "COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION",
     "PROVIDER_CALL_OUTCOME_SCHEMA_VERSION",
@@ -420,6 +776,8 @@ __all__ = [
     "call_outcome_to_dict",
     "case_outcome_from_dict",
     "case_outcome_to_dict",
+    "evaluation_report_from_dict",
+    "evaluation_report_to_dict",
     "opinion_from_dict",
     "opinion_to_dict",
 ]

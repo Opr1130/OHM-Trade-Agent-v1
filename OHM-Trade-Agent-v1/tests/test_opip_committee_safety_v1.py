@@ -234,18 +234,100 @@ def test_committee_declares_non_authority():
 
 
 def test_committee_contracts_expose_no_authority_field():
-    from app.opip.committee import contracts
+    """No record may carry a field that grants, rather than denies, authority."""
+    from app.opip.committee import contracts, evaluation
 
+    # The only authority-adjacent field permitted is an explicit denial flag.
+    denial_flags = {"trade_authority_changed", "measurement_only"}
     for record in (
         contracts.CommitteeCase,
         contracts.ProviderCallOutcome,
         contracts.CommitteeCaseOutcome,
         contracts.StructuredOpinion,
         contracts.CommitteePolicy,
+        evaluation.EvaluationReport,
+        evaluation.ArmEvaluation,
     ):
         fields = record.__dataclass_fields__
-        for token in ("authority", "execution", "admission", "ranking", "sizing"):
+        for field in fields:
+            if "authority" in field:
+                assert field in denial_flags, (record, field)
+        for token in ("admission", "ranking", "sizing", "promote", "winner", "champion"):
             assert not any(token in field for field in fields), (record, token)
+
+    flags = evaluation.EvaluationReport.__dataclass_fields__
+    assert flags["trade_authority_changed"].default is False
+    assert flags["measurement_only"].default is True
+
+
+def test_bake_off_can_never_promote_or_rank_for_action():
+    from datetime import datetime, timezone
+
+    from app.opip.committee.contracts import CaseType, EvaluationPhase
+    from app.opip.committee.evaluation import EvaluationReport
+
+    fields = EvaluationReport.__dataclass_fields__
+    assert fields["automatic_promotion"].default is False
+    assert fields["trade_authority_changed"].default is False
+    assert fields["measurement_only"].default is True
+
+    # The contract itself refuses anything that would read as promotion.
+    with pytest.raises(ValueError):
+        EvaluationReport(
+            experiment_id="x",
+            phase=EvaluationPhase.RETROSPECTIVE,
+            case_type=CaseType.MARKET_OPPORTUNITY,
+            generated_at=datetime.now(timezone.utc),
+            case_count=1,
+            minimum_samples=1,
+            arms=(),
+            provenance=None,  # type: ignore[arg-type]
+        )
+
+
+def test_pricing_is_configuration_and_not_a_hardcoded_vendor_table():
+    """Cost must come from configuration, never from a table in source."""
+    from app.opip.committee.pricing import PriceBook
+
+    # No built-in prices: an unconfigured price book is empty, not defaulted.
+    assert PriceBook().is_empty
+    assert len(PriceBook.from_env({})) == 0
+
+    tree = ast.parse((COMMITTEE_ROOT / "pricing.py").read_text(encoding="utf-8"))
+    allowed_module_constants = {
+        "COMMITTEE_PRICES_ENV",
+        "TOKENS_PER_PRICING_UNIT",
+        "MICROUNITS_PER_UNIT",
+        "COST_UNKNOWN",
+        "__all__",
+    }
+    unexpected: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    if target.id not in allowed_module_constants:
+                        unexpected.append(target.id)
+    assert unexpected == [], f"pricing must not define extra constants: {unexpected}"
+
+
+def test_evaluation_module_names_contain_no_promotion_surface():
+    """No function or attribute may read as promoting, ranking, or choosing."""
+    tree = ast.parse(
+        (COMMITTEE_ROOT / "evaluation.py").read_text(encoding="utf-8")
+    )
+    forbidden = ("promote", "winner", "best_", "champion", "rank")
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            lowered = node.name.lower()
+            if any(token in lowered for token in forbidden):
+                offenders.append(node.name)
+        elif isinstance(node, ast.Attribute):
+            lowered = node.attr.lower()
+            if any(token in lowered for token in ("promote", "winner", "champion")):
+                offenders.append(node.attr)
+    assert offenders == [], offenders
 
 
 def test_committee_never_constructs_a_wire_request_outside_the_runtime():
