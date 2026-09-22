@@ -99,6 +99,7 @@ _CASE_OUTCOME_FIELDS = frozenset(
         "started_at",
         "completed_at",
         "outcomes",
+        "canonical_binding",
         "provenance",
     }
 )
@@ -361,6 +362,14 @@ def case_outcome_to_dict(outcome: CommitteeCaseOutcome) -> dict[str, Any]:
         "started_at": _iso(outcome.started_at),
         "completed_at": _iso(outcome.completed_at),
         "outcomes": [call_outcome_to_dict(item) for item in outcome.outcomes],
+        "canonical_binding": (
+            None
+            if outcome.canonical_binding is None
+            else {
+                "decision_id": outcome.canonical_binding.decision_id,
+                "episode_id": outcome.canonical_binding.episode_id,
+            }
+        ),
         "provenance": {
             "schema_version": provenance.schema_version,
             "producing_component": provenance.producing_component,
@@ -385,6 +394,11 @@ def case_outcome_from_dict(row: Mapping[str, Any]) -> CommitteeCaseOutcome:
     raw_outcomes = row.get("outcomes")
     if not isinstance(raw_outcomes, list):
         raise CommitteeSerializationError("outcomes must be a list")
+    raw_binding = row.get("canonical_binding")
+    if raw_binding is not None and not isinstance(raw_binding, Mapping):
+        raise CommitteeSerializationError("canonical_binding must be an object or null")
+    from app.opip.committee.contracts import CanonicalDecisionBinding
+
     case_outcome = CommitteeCaseOutcome(
         schema_version=row.get("schema_version"),
         case_id=row.get("case_id"),
@@ -396,6 +410,14 @@ def case_outcome_from_dict(row: Mapping[str, Any]) -> CommitteeCaseOutcome:
         outcomes=tuple(
             call_outcome_from_dict(item, expect_schema_version=None)
             for item in raw_outcomes
+        ),
+        canonical_binding=(
+            None
+            if raw_binding is None
+            else CanonicalDecisionBinding(
+                decision_id=raw_binding.get("decision_id"),
+                episode_id=raw_binding.get("episode_id"),
+            )
         ),
         provenance=Provenance(
             schema_version=provenance_row.get("schema_version"),

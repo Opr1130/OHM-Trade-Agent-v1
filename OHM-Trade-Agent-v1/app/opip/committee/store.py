@@ -692,6 +692,7 @@ class DurableObservationLedger:
         self._store = store
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
+        self._case_spend: dict[str, int] = {}
         self._loaded_signature: tuple[int, int] | None = None
         self._loaded = False
 
@@ -701,15 +702,24 @@ class DurableObservationLedger:
             return
         committed: dict[str, ProviderCallOutcome] = {}
         attempts: dict[str, int] = {}
+        case_spend: dict[str, int] = {}
         for row in self._store.iter_call_outcomes():
             key = row.logical_observation_id
             attempts[key] = attempts.get(key, 0) + 1
+            case_spend[row.case_id] = case_spend.get(row.case_id, 0) + (
+                row.estimated_cost_microunits or 0
+            )
             if row.status in COMMITTED_STATUSES:
                 committed.setdefault(key, row)
         self._committed = committed
         self._attempts = attempts
+        self._case_spend = case_spend
         self._loaded_signature = signature
         self._loaded = True
+
+    def case_spend_microunits(self, case_id: str) -> int:
+        self._ensure_loaded()
+        return self._case_spend.get(case_id, 0)
 
     def committed_opinion(self, logical_observation_id: str) -> ProviderCallOutcome | None:
         self._ensure_loaded()

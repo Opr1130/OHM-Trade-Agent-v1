@@ -1727,3 +1727,137 @@ def test_each_attempt_is_charged_so_a_retry_overage_reaches_the_case_ledger():
     assert len(first.calls) == 2
     assert result.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
     assert second.calls == []
+
+
+def test_a_redelivered_case_cannot_spend_its_ceiling_again():
+    """Prior spend is reconstructed so a redelivery stays within the budget."""
+    first = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+    )
+    first._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    first._cost_override = 1_000  # noqa: SLF001 - test double
+    second = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    second._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    ledger = InMemoryObservationLedger()
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first, ProviderFamily.ANTHROPIC: second},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(
+        families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+        cost_ceiling=1_020,
+    )
+    first_run = runner.run_case(_case(policy=policy))
+    assert first_run.seats[0].outcome.estimated_cost_microunits == 1_000
+    assert first_run.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []
+
+    # Redelivery: the first seat is acknowledged for no new charge, but the
+    # recorded 1,000 must still block the second seat.
+    second_run = runner.run_case(_case(policy=policy))
+    assert second_run.seats[0].outcome.status is ObservationStatus.DUPLICATE_OK
+    assert second_run.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []
+    assert ledger.case_spend_microunits("case-1") == 1_000
+
+
+def test_an_unavailable_seat_is_not_charged_for_a_call_it_never_made():
+    """A seat that was never invoked must not consume the case budget."""
+    unavailable = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        availability=ProviderAvailability.UNAVAILABLE,
+    )
+    # A nonzero estimator is the finding's scenario: it must not be charged when
+    # the adapter reports itself unavailable and invoke() is never called.
+    unavailable._estimated_cost_microunits = 80  # noqa: SLF001 - test double
+    healthy = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    healthy._estimated_cost_microunits = 30  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={
+            ProviderFamily.OPENAI: unavailable,
+            ProviderFamily.ANTHROPIC: healthy,
+        },
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+                cost_ceiling=100,
+            )
+        )
+    )
+    assert result.seats[0].outcome.status is ObservationStatus.UNAVAILABLE
+    assert unavailable.calls == []
+    # The 80-unit estimate fits the ceiling, so the seat is reached and reported
+    # unavailable without invoking. Because no spend occurred, the healthy
+    # 30-unit seat still runs under the same 100-unit ceiling; charging the
+    # estimate would have blocked it at 80 + 30 > 100.
+    assert result.seats[1].outcome.status is ObservationStatus.COMPLETED
+    assert len(healthy.calls) == 1
+
+
+def test_the_canonical_binding_survives_into_the_case_evidence(tmp_path):
+    """The recommendation-to-decision linkage must be durable, not in-memory."""
+    from app.opip.committee.contracts import CanonicalDecisionBinding
+
+    store = CommitteeEvidenceStore(root=tmp_path)
+    binding = CanonicalDecisionBinding(decision_id="DEC-1", episode_id="EP-7")
+    case = CommitteeCase(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=_snapshot(),
+        policy=_policy(families=(ProviderFamily.OPENAI,)),
+        created_at=NOW,
+        provenance=_provenance(),
+        instrument_id="INSTR:kraken:SOL:USD:1",
+        canonical_binding=binding,
+    )
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    case_outcome = runner.run_case(case).case_outcome
+    assert case_outcome.canonical_binding == binding
+    assert store.append_case_outcome(case_outcome).stored is True
+
+    reloaded = list(store.iter_case_outcomes())[0]
+    assert reloaded.canonical_binding is not None
+    assert reloaded.canonical_binding.decision_id == "DEC-1"
+    assert reloaded.canonical_binding.episode_id == "EP-7"
+    assert reloaded.case_outcome_id == case_outcome.case_outcome_id
+
+
+def test_the_binding_participates_in_the_case_outcome_identity():
+    from dataclasses import replace
+
+    from app.opip.committee.contracts import CanonicalDecisionBinding
+
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    plain = runner.run_case(_case(policy=policy)).case_outcome
+    bound = replace(
+        plain, canonical_binding=CanonicalDecisionBinding(decision_id="DEC-1")
+    )
+    assert bound.case_outcome_id != plain.case_outcome_id

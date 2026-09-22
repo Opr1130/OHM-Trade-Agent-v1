@@ -218,7 +218,11 @@ class CommitteeRunner:
 
         started_at = self._now()
         seats: list[CommitteeSeatResult] = []
-        spent_microunits = 0
+        # Seed the case budget with spend already recorded for this case, so a
+        # redelivery cannot spend the whole ceiling again: duplicate
+        # acknowledgements contribute nothing, so without this the case could
+        # exceed its declared budget across runs.
+        spent_microunits = self._ledger.case_spend_microunits(case.case_id)
         for family in case.policy.seated_providers:
             seat, reserved = self._run_seat(
                 case=case,
@@ -250,6 +254,7 @@ class CommitteeRunner:
             started_at=started_at,
             completed_at=completed_at,
             outcomes=tuple(seat.outcome for seat in seats),
+            canonical_binding=case.canonical_binding,
             provenance=Provenance(
                 producing_component="app.opip.committee.runtime",
                 artifact_or_build_id=case.policy.policy_version,
@@ -510,8 +515,13 @@ class CommitteeRunner:
             # reported cost. An attempt's actual spend can exceed its estimate,
             # and summing per attempt (rather than comparing a total reservation
             # with only the final report) keeps a retried seat's overage on the
-            # case ledger so the next seat cannot spend past the ceiling.
-            seat_charge += max(estimate or 0, outcome.estimated_cost_microunits or 0)
+            # case ledger so the next seat cannot spend past the ceiling. A seat
+            # that was never invoked (an unavailable adapter) incurs no spend, so
+            # its estimate is not charged.
+            if outcome.status is not ObservationStatus.UNAVAILABLE:
+                seat_charge += max(
+                    estimate or 0, outcome.estimated_cost_microunits or 0
+                )
             if not (
                 outcome.status is ObservationStatus.FAILED
                 and outcome.failure_class in RETRYABLE_FAILURE_CLASSES

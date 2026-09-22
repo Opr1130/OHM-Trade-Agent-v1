@@ -990,6 +990,11 @@ class CommitteeCaseOutcome:
     completed_at: datetime
     outcomes: tuple[ProviderCallOutcome, ...]
     provenance: Provenance
+    #: The opaque canonical linkage the case was run with, if any. Persisting it
+    #: here is what makes the recommendation-to-decision edge traceable after the
+    #: in-memory result is gone; without it the durable case artifact retains only
+    #: case_id and the linkage is silently lost.
+    canonical_binding: CanonicalDecisionBinding | None = None
     schema_version: int = COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -1020,6 +1025,10 @@ class CommitteeCaseOutcome:
             if outcome.provider_family in seen:
                 raise ValueError("one sealed opinion per provider family")
             seen.add(outcome.provider_family)
+        if self.canonical_binding is not None and not isinstance(
+            self.canonical_binding, CanonicalDecisionBinding
+        ):
+            raise ValueError("invalid canonical_binding")
         object.__setattr__(
             self,
             "started_at",
@@ -1084,6 +1093,14 @@ class CommitteeCaseOutcome:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "outcomes": tuple(outcome.outcome_id for outcome in self.outcomes),
+            "canonical_binding": (
+                None
+                if self.canonical_binding is None
+                else (
+                    self.canonical_binding.decision_id,
+                    self.canonical_binding.episode_id,
+                )
+            ),
         }
 
     @property
