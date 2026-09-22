@@ -898,3 +898,81 @@ def test_case_outcome_serialization_round_trip():
     ).case_outcome
     restored = case_outcome_from_dict(case_outcome_to_dict(outcome))
     assert restored.case_outcome_id == outcome.case_outcome_id
+
+
+# ------------------------------------------- review findings (fail-closed)
+
+
+def test_declared_cost_ceiling_skips_a_seat_whose_cost_cannot_be_bounded():
+    """A declared ceiling must not be bypassable by an unknown cost estimate."""
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = None  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+    )
+    result = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,), cost_ceiling=1_000))
+    )
+    outcome = result.seats[0].outcome
+    assert outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert provider.calls == []
+    assert "cannot be bounded" in outcome.detail
+
+
+def test_no_declared_ceiling_still_allows_an_unknown_cost():
+    """Without a ceiling there is nothing to enforce, so the seat runs."""
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = None  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+    )
+    result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
+    assert result.seats[0].outcome.status is ObservationStatus.COMPLETED
+
+
+def test_every_retry_attempt_is_recorded_not_only_the_last():
+    """The audit trail keeps each attempt, so attempt_count reflects reality."""
+    provider = _provider(
+        ProviderFamily.OPENAI,
+        answers=(
+            ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),
+            ScriptedAnswer(text=opinion_json()),
+        ),
+    )
+    ledger = InMemoryObservationLedger()
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider}, ledger=ledger, now=lambda: NOW
+    )
+    result = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,), max_attempts=2))
+    )
+    logical_id = result.seats[0].logical_observation_id
+    # The failed first attempt is durably recorded, so two attempts are visible.
+    assert ledger.attempt_count(logical_id) == 2
+    assert result.seats[0].outcome.attempt == 2
+
+
+def test_a_lost_index_is_rebuilt_so_a_redelivery_is_still_a_duplicate(tmp_path):
+    """Losing the index must not let the same opinion be appended twice."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    ledger = DurableObservationLedger(store=store)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=ledger,
+        now=lambda: NOW,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+    assert len(list(store.iter_call_outcomes())) == 1
+
+    # Simulate an index lost after a failed update.
+    store.calls_index_file.unlink()
+
+    result = store.append_call_outcome(committed)
+    assert result.stored is False
+    assert result.reason == REASON_DUPLICATE
+    assert len(list(store.iter_call_outcomes())) == 1

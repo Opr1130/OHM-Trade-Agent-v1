@@ -666,3 +666,43 @@ def test_outcome_eligibility_is_derived_from_the_cutoff_and_horizon():
     )
     with pytest.raises(ProspectivePolicyError):
         prediction.outcome_eligible_at(0)
+
+
+# ------------------------------------------- review findings (fail-closed)
+
+
+def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
+    """Sealing must refuse a retrospective committee run outright."""
+    retrospective = CommitteeCaseOutcome(
+        case_id=CASE_ID,
+        evidence_snapshot_hash="COMMITTEE-EVIDENCE:abc123",
+        committee_policy_version="committee-policy-v1",
+        phase=EvaluationPhase.RETROSPECTIVE,
+        started_at=CUTOFF - timedelta(minutes=5),
+        completed_at=SEALED_AT,
+        outcomes=(_seat(),),
+        provenance=_provenance(),
+    )
+    with pytest.raises(ProspectivePolicyError):
+        seal_prediction(
+            case_outcome=retrospective,
+            evidence_cutoff_at=CUTOFF,
+            sealed_at=SEALED_AT,
+            experiment_id=EXPERIMENT_ID,
+            provenance=_provenance(),
+            case_type=CaseType.MARKET_OPPORTUNITY,
+        )
+
+
+def test_outcome_identity_covers_every_field_that_changes_its_meaning():
+    """Two materially different outcomes must not share one identity."""
+    base = _observation()
+    differing_return = _observation(realised_return_microunits=99_999)
+    provisional = _observation(
+        finality=OutcomeFinality.PROVISIONAL,
+        incomplete_reason="window still open",
+    )
+    assert differing_return.observation_id != base.observation_id
+    assert provisional.observation_id != base.observation_id
+    # Identical content still collapses to one identity.
+    assert _observation().observation_id == base.observation_id

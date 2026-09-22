@@ -150,7 +150,7 @@ protocol forbids.
 | Variable | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `OPIP_COMMITTEE_MODE` | `off`, `shadow` | `off` | `off` disables the plane; `shadow` is the only value that permits committee work. Any other value fails Settings parsing. |
-| `OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS` | integer ≥ 0 | `0` | Optional per-case cost ceiling. `0` means no declared ceiling. A seat is skipped once the ceiling would be exceeded. |
+| `OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS` | integer ≥ 0 | `0` | Optional per-case cost ceiling. `0` means no declared ceiling. A seat is skipped once the ceiling would be exceeded, **and also when its cost cannot be bounded at all** — a declared ceiling that cannot be enforced would permit exactly the spend it exists to prevent. |
 | `OPIP_COMMITTEE_PRICES` | `provider:model=in/out;...` | unset | Prices in microunits per million tokens. Absent or unmatched prices yield `UNKNOWN` cost. |
 
 **No credential is read, constructed, or stored by this plane.** Provider
@@ -178,7 +178,11 @@ archive, inheriting its durability semantics: an fsynced HOT append, verified
 gzip archives before compaction, and a quarantined truncated tail rather than a
 silently dropped row. Nothing is overwritten: a committed observation is
 immutable, a logical re-execution is acknowledged as a duplicate, and a
-divergent replay is reported rather than applied.
+divergent replay is reported rather than applied. Every retry attempt is recorded
+before the next attempt starts, so the audit trail keeps each try rather than
+only the last one. If a record-id index is lost, it is rebuilt from the durable
+log rather than treated as empty, so a re-delivered observation is still
+acknowledged as a duplicate instead of being appended a second time.
 
 Streams live under `/app/data/opip/committee/`:
 

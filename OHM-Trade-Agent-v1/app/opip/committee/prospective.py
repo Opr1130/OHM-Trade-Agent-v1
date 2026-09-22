@@ -274,6 +274,11 @@ class OutcomeObservation:
             "horizon_seconds": self.horizon_seconds,
             "finality": self.finality,
             "positive": self.positive,
+            # Every persisted field that changes the meaning of the outcome must
+            # be part of its identity, otherwise two materially different
+            # observations could share one id and one could be deduped away.
+            "realised_return_microunits": self.realised_return_microunits,
+            "incomplete_reason": self.incomplete_reason,
         }
 
     @property
@@ -465,11 +470,16 @@ def seal_prediction(
     """Seal the T0 opinions for a case so no later evidence can alter them."""
     cutoff = require_utc(evidence_cutoff_at, field_name="evidence_cutoff_at")
     sealed = require_utc(sealed_at, field_name="sealed_at")
+    hashes = _sealed_opinion_hashes(case_outcome)
+    if case_outcome.phase is not EvaluationPhase.PROSPECTIVE:
+        raise ProspectivePolicyError(
+            "a retrospective committee run cannot be sealed as a prospective "
+            "prediction; retrospective evidence belongs to the bake-off path"
+        )
     if sealed < case_outcome.completed_at:
         raise ProspectivePolicyError(
             "a prediction cannot be sealed before its committee run completed"
         )
-    hashes = _sealed_opinion_hashes(case_outcome)
     return SealedPrediction(
         case_id=case_outcome.case_id,
         case_type=case_type,

@@ -314,7 +314,10 @@ class CommitteeRunner:
             )
             return CommitteeSeatResult(family, logical_id, outcome)
 
-        if self._budget_exhausted(case=case, provider=provider, wire=wire, spent=spent_microunits):
+        skip_reason = self._budget_skip_reason(
+            case=case, provider=provider, wire=wire, spent=spent_microunits
+        )
+        if skip_reason is not None:
             outcome = ProviderCallOutcome(
                 logical_observation_id=logical_id,
                 case_id=case.case_id,
@@ -327,7 +330,7 @@ class CommitteeRunner:
                 input_hash=input_hash,
                 reported_provider=provider.model_identifier(),
                 reported_model=None,
-                detail="committee cost ceiling would be exceeded",
+                detail=skip_reason,
                 cost_completeness=CostCompleteness.UNKNOWN,
             )
             return CommitteeSeatResult(family, logical_id, outcome)
@@ -348,6 +351,11 @@ class CommitteeRunner:
                 and attempt < case.policy.max_attempts_per_seat
             ):
                 break
+            # Persist the failed attempt before retrying, so the audit trail
+            # keeps every try rather than only the last one. A failed attempt is
+            # not a committed observation, so this cannot create a second
+            # opinion.
+            self._ledger.record(outcome)
             attempt += 1
 
         if replay_existing and committed is not None and outcome.opinion is not None:
@@ -520,23 +528,33 @@ class CommitteeRunner:
             )
         return None
 
-    def _budget_exhausted(
+    def _budget_skip_reason(
         self,
         *,
         case: CommitteeCase,
         provider: CommitteeProvider,
         wire: ProviderWireRequest,
         spent: int,
-    ) -> bool:
+    ) -> str | None:
+        """Why this seat must be skipped, or ``None`` to proceed.
+
+        A declared ceiling is only meaningful if it can actually be enforced. An
+        unbounded cost therefore skips the seat rather than permitting spend the
+        ceiling was meant to prevent; an operator who wants the seat to run
+        without a ceiling simply does not declare one.
+        """
         ceiling = case.policy.max_estimated_cost_microunits
         if ceiling is None:
-            return False
+            return None
         estimate = provider.estimate_cost_microunits(wire)
         if estimate is None:
-            # An unknown estimate is never treated as zero-cost permission to
-            # spend against a declared ceiling.
-            return False
-        return spent + estimate > ceiling
+            return (
+                "committee cost ceiling is declared but this seat's cost cannot "
+                "be bounded within it"
+            )
+        if spent + estimate > ceiling:
+            return "committee cost ceiling would be exceeded"
+        return None
 
     def _failure_outcome(
         self,

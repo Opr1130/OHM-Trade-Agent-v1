@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from app.opip.committee.contracts import (
     CommitteeCaseOutcome,
@@ -286,12 +286,71 @@ class CommitteeEvidenceStore:
             seen.add(row.report_id)
             yield row
 
-    def _load_id_set(self, path: Path) -> set[str]:
+    def _load_id_set(self, path: Path, *, rebuild: Callable[[], set[str]]) -> set[str]:
+        """Load a record-id set, rebuilding it from the durable log if lost."""
         raw = self._load_index_payload(path)
         entries = raw.get("entries")
-        if not isinstance(entries, Mapping):
-            return set()
-        return {key for key in entries if isinstance(key, str)}
+        if isinstance(entries, Mapping):
+            known = {key for key in entries if isinstance(key, str)}
+            if known:
+                return known
+        return rebuild()
+
+    def _rebuild_case_ids(self) -> set[str]:
+        ids = {row.case_outcome_id for row in self.iter_case_outcomes()}
+        if ids:
+            logger.warning(
+                "O'Pip committee case index rebuilt from the durable log (%d entries)",
+                len(ids),
+            )
+            self._save_case_ids(ids)
+        return ids
+
+    def _rebuild_evaluation_ids(self) -> set[str]:
+        ids = {row.report_id for row in self.iter_evaluation_reports()}
+        if ids:
+            logger.warning(
+                "O'Pip committee evaluation index rebuilt from the durable log "
+                "(%d entries)",
+                len(ids),
+            )
+            self._save_evaluation_ids(ids)
+        return ids
+
+    def _rebuild_prospective_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for row in self.iter_prospective_records():
+            record_id = (
+                getattr(row, "prediction_id", None)
+                or getattr(row, "observation_id", None)
+                or getattr(row, "evaluation_id", None)
+            )
+            if isinstance(record_id, str):
+                ids.add(record_id)
+        if ids:
+            logger.warning(
+                "O'Pip committee prospective index rebuilt from the durable log "
+                "(%d entries)",
+                len(ids),
+            )
+            self._save_prospective_ids(ids)
+        return ids
+
+    def _rebuild_attribution_ids(self) -> set[str]:
+        ids = {row.attribution_id for row in self.iter_attribution_reports()}
+        if ids:
+            logger.warning(
+                "O'Pip committee attribution index rebuilt from the durable log "
+                "(%d entries)",
+                len(ids),
+            )
+            self._save_id_set(
+                self.attribution_index_file,
+                kind="ATTRIBUTION",
+                ids=ids,
+                label="attribution",
+            )
+        return ids
 
     def _save_id_set(
         self, path: Path, *, kind: str, ids: set[str], label: str
@@ -304,7 +363,9 @@ class CommitteeEvidenceStore:
         self._write_index(path, payload, label=label)
 
     def _load_evaluation_ids(self) -> set[str]:
-        return self._load_id_set(self.evaluations_index_file)
+        return self._load_id_set(
+            self.evaluations_index_file, rebuild=self._rebuild_evaluation_ids
+        )
 
     def _save_evaluation_ids(self, ids: set[str]) -> None:
         self._save_id_set(
@@ -391,7 +452,9 @@ class CommitteeEvidenceStore:
                 yield row
 
     def _load_prospective_ids(self) -> set[str]:
-        return self._load_id_set(self.prospective_index_file)
+        return self._load_id_set(
+            self.prospective_index_file, rebuild=self._rebuild_prospective_ids
+        )
 
     def _save_prospective_ids(self, ids: set[str]) -> None:
         self._save_id_set(
@@ -405,7 +468,9 @@ class CommitteeEvidenceStore:
         self.root.mkdir(parents=True, exist_ok=True)
         with registry_lock(self.attribution_lock_file):
             self._attributions.repair_tail()
-            known = self._load_id_set(self.attribution_index_file)
+            known = self._load_id_set(
+                self.attribution_index_file, rebuild=self._rebuild_attribution_ids
+            )
             if report.attribution_id in known:
                 return StoreAppendResult(False, report.attribution_id, REASON_DUPLICATE)
             self._attributions.append_encoded_locked(
@@ -441,7 +506,7 @@ class CommitteeEvidenceStore:
         raw = self._load_index_payload(self.calls_index_file)
         entries = raw.get("entries")
         if not isinstance(entries, Mapping):
-            return {}
+            return self._rebuild_call_index()
         parsed: dict[str, _CommittedIndexEntry] = {}
         for key, value in entries.items():
             if not isinstance(key, str) or not isinstance(value, Mapping):
@@ -452,7 +517,34 @@ class CommitteeEvidenceStore:
                 parsed[key] = _CommittedIndexEntry(
                     outcome_id=outcome_id, opinion_hash=opinion_hash
                 )
-        return parsed
+        if parsed:
+            return parsed
+        # An empty index beside a non-empty durable log means the index was lost.
+        # Rebuilding from the log is what keeps a re-delivered observation from
+        # being appended a second time as a fresh opinion.
+        return self._rebuild_call_index()
+
+    def _rebuild_call_index(self) -> dict[str, _CommittedIndexEntry]:
+        rebuilt: dict[str, _CommittedIndexEntry] = {}
+        for outcome in self.iter_call_outcomes():
+            if (
+                outcome.status in COMMITTED_STATUSES
+                and outcome.opinion is not None
+            ):
+                rebuilt.setdefault(
+                    outcome.logical_observation_id,
+                    _CommittedIndexEntry(
+                        outcome_id=outcome.outcome_id,
+                        opinion_hash=outcome.opinion.opinion_hash,
+                    ),
+                )
+        if rebuilt:
+            logger.warning(
+                "O'Pip committee call index rebuilt from the durable log (%d entries)",
+                len(rebuilt),
+            )
+            self._save_call_index(rebuilt)
+        return rebuilt
 
     def _save_call_index(self, index: Mapping[str, _CommittedIndexEntry]) -> None:
         payload = {
@@ -469,7 +561,9 @@ class CommitteeEvidenceStore:
         self._write_index(self.calls_index_file, payload, label="call outcome")
 
     def _load_case_ids(self) -> set[str]:
-        return self._load_id_set(self.cases_index_file)
+        return self._load_id_set(
+            self.cases_index_file, rebuild=self._rebuild_case_ids
+        )
 
     def _save_case_ids(self, ids: set[str]) -> None:
         self._save_id_set(
