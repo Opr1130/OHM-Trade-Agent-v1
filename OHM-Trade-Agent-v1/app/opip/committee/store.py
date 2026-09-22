@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -26,6 +27,7 @@ from app.opip.committee.contracts import (
 from app.opip.committee.ledger import COMMITTED_STATUSES
 from app.opip.committee.runtime import CommitteeReplayDivergenceError
 from app.opip.committee.serialization import (
+    CommitteeSerializationError,
     attribution_report_from_dict,
     attribution_report_to_dict,
     call_outcome_from_dict,
@@ -101,6 +103,33 @@ def _parse_prospective_line(line: bytes):
 
 def _parse_attribution_line(line: bytes):
     return attribution_report_from_dict(parse_json_object_line(line))
+
+
+def _prospective_visible_at(row: Any) -> datetime:
+    """The authoritative visibility timestamp for one prospective record.
+
+    Dispatched by record type: a sealed prediction is visible when it was sealed,
+    an outcome observation when it was observed, and a prospective evaluation when
+    it was evaluated. An unknown record type raises rather than guessing at a
+    temporal field, because a wrong timestamp would silently misplace the record
+    in archive windows and hide it from verification.
+    """
+    from app.opip.committee.prospective import (
+        OutcomeObservation,
+        ProspectiveEvaluation,
+        SealedPrediction,
+    )
+
+    if isinstance(row, SealedPrediction):
+        return row.sealed_at
+    if isinstance(row, OutcomeObservation):
+        return row.observed_at
+    if isinstance(row, ProspectiveEvaluation):
+        return row.evaluated_at
+    raise CommitteeSerializationError(
+        "no prospective visibility timestamp is defined for "
+        f"{type(row).__name__}"
+    )
 
 
 def _prospective_record_id(row: Any) -> str | None:
@@ -189,7 +218,9 @@ class CommitteeEvidenceStore:
             keep_lines=prospective_keep_lines,
             archive_prefix="prospective",
             parse_line=_parse_prospective_line,
-            visible_at=lambda row: row.observed_at,
+            # The stream holds several record types with different temporal
+            # fields, so the visibility timestamp is dispatched by record type.
+            visible_at=_prospective_visible_at,
         )
         self._attributions = BoundedJsonlArchive(
             data_file=self.root / "attributions.jsonl",
@@ -310,39 +341,53 @@ class CommitteeEvidenceStore:
             seen.add(row.report_id)
             yield row
 
-    def _load_id_set(self, path: Path, *, rebuild: Callable[[], set[str]]) -> set[str]:
-        """Load a record-id set, rebuilding it from the durable log if lost."""
+    def _load_id_set(
+        self,
+        path: Path,
+        *,
+        rebuild: Callable[[], set[str]],
+        persist: Callable[[set[str]], None],
+    ) -> set[str]:
+        """Return a record-id set, reconciled against the authoritative log.
+
+        The sidecar is a cache, never the authority. A missing, empty, stale, or
+        partially written sidecar must not make an existing record look new,
+        because a redelivery would then be appended a second time. The durable
+        stream is therefore scanned and the sidecar reconciled to it on every
+        load, exactly as the call index is.
+        """
+        stored = self._parse_id_set(path)
+        rebuilt = rebuild()
+        if rebuilt != stored:
+            persist(rebuilt)
+            if stored:
+                logger.warning(
+                    "O'Pip committee sidecar reconciled from the durable log at "
+                    "%s (stored=%d, durable=%d); durable evidence is authoritative",
+                    path.name,
+                    len(stored),
+                    len(rebuilt),
+                )
+        return rebuilt
+
+    def _parse_id_set(self, path: Path) -> set[str]:
         raw = self._load_index_payload(path)
         entries = raw.get("entries")
-        if isinstance(entries, Mapping):
-            known = {key for key in entries if isinstance(key, str)}
-            if known:
-                return known
-        return rebuild()
+        if not isinstance(entries, Mapping):
+            return set()
+        return {key for key in entries if isinstance(key, str)}
 
     def _rebuild_case_ids(self) -> set[str]:
-        ids = {row.case_outcome_id for row in self.iter_case_outcomes()}
-        if ids:
-            logger.warning(
-                "O'Pip committee case index rebuilt from the durable log (%d entries)",
-                len(ids),
-            )
-            self._save_case_ids(ids)
-        return ids
+        """Derive the case-outcome id set from the authoritative durable log."""
+        return {row.case_outcome_id for row in self.iter_case_outcomes()}
 
     def _rebuild_evaluation_ids(self) -> set[str]:
-        ids = {row.report_id for row in self.iter_evaluation_reports()}
-        if ids:
-            logger.warning(
-                "O'Pip committee evaluation index rebuilt from the durable log "
-                "(%d entries)",
-                len(ids),
-            )
-            self._save_evaluation_ids(ids)
-        return ids
+        """Derive the evaluation-report id set from the durable log."""
+        return {row.report_id for row in self.iter_evaluation_reports()}
 
     def _rebuild_prospective_ids(self) -> set[str]:
-        ids = {
+        """Derive the prospective id set from the durable log."""
+        return {
             record_id
             for record_id in (
                 _prospective_record_id(row)
@@ -350,30 +395,10 @@ class CommitteeEvidenceStore:
             )
             if record_id is not None
         }
-        if ids:
-            logger.warning(
-                "O'Pip committee prospective index rebuilt from the durable log "
-                "(%d entries)",
-                len(ids),
-            )
-            self._save_prospective_ids(ids)
-        return ids
 
     def _rebuild_attribution_ids(self) -> set[str]:
-        ids = {row.attribution_id for row in self.iter_attribution_reports()}
-        if ids:
-            logger.warning(
-                "O'Pip committee attribution index rebuilt from the durable log "
-                "(%d entries)",
-                len(ids),
-            )
-            self._save_id_set(
-                self.attribution_index_file,
-                kind="ATTRIBUTION",
-                ids=ids,
-                label="attribution",
-            )
-        return ids
+        """Derive the attribution-report id set from the durable log."""
+        return {row.attribution_id for row in self.iter_attribution_reports()}
 
     def _save_id_set(
         self, path: Path, *, kind: str, ids: set[str], label: str
@@ -387,7 +412,9 @@ class CommitteeEvidenceStore:
 
     def _load_evaluation_ids(self) -> set[str]:
         return self._load_id_set(
-            self.evaluations_index_file, rebuild=self._rebuild_evaluation_ids
+            self.evaluations_index_file,
+            rebuild=self._rebuild_evaluation_ids,
+            persist=self._save_evaluation_ids,
         )
 
     def _save_evaluation_ids(self, ids: set[str]) -> None:
@@ -473,7 +500,9 @@ class CommitteeEvidenceStore:
 
     def _load_prospective_ids(self) -> set[str]:
         return self._load_id_set(
-            self.prospective_index_file, rebuild=self._rebuild_prospective_ids
+            self.prospective_index_file,
+            rebuild=self._rebuild_prospective_ids,
+            persist=self._save_prospective_ids,
         )
 
     def _save_prospective_ids(self, ids: set[str]) -> None:
@@ -489,7 +518,14 @@ class CommitteeEvidenceStore:
         with registry_lock(self.attribution_lock_file):
             self._attributions.repair_tail()
             known = self._load_id_set(
-                self.attribution_index_file, rebuild=self._rebuild_attribution_ids
+                self.attribution_index_file,
+                rebuild=self._rebuild_attribution_ids,
+                persist=lambda ids: self._save_id_set(
+                    self.attribution_index_file,
+                    kind="ATTRIBUTION",
+                    ids=ids,
+                    label="attribution",
+                ),
             )
             if report.attribution_id in known:
                 return StoreAppendResult(False, report.attribution_id, REASON_DUPLICATE)
@@ -592,7 +628,9 @@ class CommitteeEvidenceStore:
 
     def _load_case_ids(self) -> set[str]:
         return self._load_id_set(
-            self.cases_index_file, rebuild=self._rebuild_case_ids
+            self.cases_index_file,
+            rebuild=self._rebuild_case_ids,
+            persist=self._save_case_ids,
         )
 
     def _save_case_ids(self, ids: set[str]) -> None:

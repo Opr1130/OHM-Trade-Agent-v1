@@ -819,3 +819,218 @@ def test_evaluation_report_is_stored_and_reloaded(tmp_path):
         == report.arm("model:openai:model-a").precision.value
     )
     assert reloaded[0].automatic_promotion is False
+
+
+# ==================== review findings: bake-off input and metric integrity
+
+
+def test_duplicate_case_observations_are_rejected():
+    """A repeated case id cannot inflate samples or overwrite a seat result."""
+    cases = _cases(3)
+    duplicated = cases + cases[:1]
+    provenance = _provenance()
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            duplicated,
+            experiment_id="dup-1",
+            provenance=provenance,
+            generated_at=LATER,
+        )
+
+
+def test_duplicate_resolved_outcomes_are_rejected():
+    cases = _cases(2)
+    provenance = _provenance()
+    labels = [
+        ResolvedOutcome(
+            case_id="case-000", positive=True, observed_at=LATER, source_ref="o1"
+        ),
+        ResolvedOutcome(
+            case_id="case-000", positive=False, observed_at=LATER, source_ref="o2"
+        ),
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="dup-2",
+            provenance=provenance,
+            generated_at=LATER,
+            resolved_outcomes=labels,
+        )
+
+
+def test_duplicate_baseline_calls_are_rejected():
+    cases = _cases(2)
+    provenance = _provenance()
+    baseline = [
+        BaselineCall(case_id="case-000", positive=True),
+        BaselineCall(case_id="case-000", positive=False),
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="dup-3",
+            provenance=provenance,
+            generated_at=LATER,
+            deterministic_baseline=baseline,
+        )
+
+
+def test_duplicate_forecasts_for_one_case_and_arm_are_rejected():
+    cases = _cases(2)
+    provenance = _provenance()
+    forecasts = [
+        ProbabilityForecast(
+            case_id="case-000", arm_id="model:openai:model-a", probability=Decimal("0.6")
+        ),
+        ProbabilityForecast(
+            case_id="case-000", arm_id="model:openai:model-a", probability=Decimal("0.7")
+        ),
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="dup-4",
+            provenance=provenance,
+            generated_at=LATER,
+            probability_forecasts=forecasts,
+        )
+
+
+def test_forecasts_are_rejected_for_a_non_probabilistic_case_type():
+    """Only a case type that defines a probability may carry one."""
+    case = CaseObservation(
+        case_id="evt-1",
+        case_type=CaseType.EVENT_INTERPRETATION,
+        seats=(_seat("evt-1"),),
+    )
+    provenance = _provenance()
+    forecasts = [
+        ProbabilityForecast(
+            case_id="evt-1", arm_id="model:openai:model-a", probability=Decimal("0.6")
+        )
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            (case,),
+            experiment_id="fc-1",
+            provenance=provenance,
+            generated_at=LATER,
+            probability_forecasts=forecasts,
+        )
+
+
+def test_zero_token_usage_is_a_known_value_not_missing():
+    """A recorded zero must not be treated as unknown usage."""
+    from app.opip.committee.evaluation import _sum_tokens
+
+    all_known = [_seat("case-000", input_tokens=0), _seat("case-001", input_tokens=0)]
+    assert _sum_tokens(all_known, "input_tokens") == 0
+
+    one_unknown = [_seat("case-000", input_tokens=0), _seat("case-001", input_tokens=None)]
+    assert _sum_tokens(one_unknown, "input_tokens") is None
+
+    every_unknown = [
+        _seat("case-000", input_tokens=None),
+        _seat("case-001", input_tokens=None),
+    ]
+    assert _sum_tokens(every_unknown, "input_tokens") is None
+
+    known_sum = [_seat("case-000", input_tokens=10), _seat("case-001", input_tokens=32)]
+    assert _sum_tokens(known_sum, "input_tokens") == 42
+
+
+def test_committee_signal_token_aggregate_is_unknown_if_any_seat_is_unknown():
+    """A partial token total must not be presented as a complete one."""
+    case_id = "case-000"
+    case = CaseObservation(
+        case_id=case_id,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(
+            _seat(case_id, input_tokens=10, output_tokens=5),
+            _seat(
+                case_id,
+                family=ProviderFamily.ANTHROPIC,
+                model="model-b",
+                input_tokens=None,
+                output_tokens=None,
+            ),
+        ),
+    )
+    report = evaluate_model_bake_off(
+        (case,), experiment_id="tok-1", provenance=_provenance(), generated_at=LATER
+    )
+    signal = report.arm("committee:research-signal")
+    assert signal.input_tokens is None
+    assert signal.output_tokens is None
+
+
+def test_every_metric_keeps_its_own_name_when_nothing_is_applicable():
+    """Persisted names stay correct and public lookup works on an empty arm."""
+    from app.opip.committee.metrics import classification_report
+
+    report = classification_report([])
+    assert report.precision.name == "precision"
+    assert report.recall.name == "recall"
+    assert report.f1.name == "f1"
+    assert report.accuracy.name == "accuracy"
+    for metric in (report.precision, report.recall, report.f1, report.accuracy):
+        assert metric.applicable is False
+        assert metric.value is None
+        assert metric.sample_size == 0
+
+
+def test_an_unevaluated_arm_still_resolves_every_metric_by_name():
+    """`metric("accuracy")` must not raise precisely for an unevaluated arm."""
+    case_id = "case-000"
+    case = CaseObservation(
+        case_id=case_id,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(_seat(case_id),),
+    )
+    report = evaluate_model_bake_off(
+        (case,), experiment_id="names-1", provenance=_provenance(), generated_at=LATER
+    )
+    arm = report.arm("model:openai:model-a")
+    assert arm.confusion is None
+    for name in ("precision", "recall", "f1", "accuracy"):
+        metric = arm.metric(name)
+        assert metric.name == name
+        assert metric.applicable is False
+
+
+def test_report_identity_covers_failures_skips_cost_and_latency():
+    """A report differing only in persisted arm evidence gets a new id."""
+    case_id = "case-000"
+    base_case = CaseObservation(
+        case_id=case_id,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(_seat(case_id, cost=100, latency=1_000),),
+    )
+    other_case = CaseObservation(
+        case_id=case_id,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(_seat(case_id, cost=999, latency=1_000),),
+    )
+    first = evaluate_model_bake_off(
+        (base_case,), experiment_id="ident-1", provenance=_provenance(), generated_at=LATER
+    )
+    second = evaluate_model_bake_off(
+        (other_case,), experiment_id="ident-1", provenance=_provenance(), generated_at=LATER
+    )
+    assert first.report_id != second.report_id
+
+    failed_seat = _seat(
+        case_id,
+        status=ObservationStatus.FAILED,
+        failure_class=ProviderFailureClass.TIMEOUT,
+    )
+    failed_case = CaseObservation(
+        case_id=case_id,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(failed_seat,),
+    )
+    third = evaluate_model_bake_off(
+        (failed_case,), experiment_id="ident-1", provenance=_provenance(), generated_at=LATER
+    )
+    assert third.report_id != first.report_id

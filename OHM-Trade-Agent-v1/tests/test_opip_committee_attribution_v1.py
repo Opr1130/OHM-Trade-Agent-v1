@@ -752,3 +752,136 @@ def test_paired_support_is_required_for_added_information():
     assert increment.paired_scored == MIN_ATTRIBUTION_SAMPLES
     assert increment.incremental_accuracy.sample_size == MIN_ATTRIBUTION_SAMPLES
     assert increment.added_information is True
+
+# ==================== review findings: attribution integrity
+
+
+def test_a_failed_seat_is_not_counted_as_an_unavailable_seat():
+    """Failure, invalidity, and unavailability stay distinct dispositions."""
+    matrix = build_disagreement_matrix(
+        _case(
+            seats=(
+                _seat("case-1", assessment="SUPPORTIVE"),
+                _seat(
+                    "case-1",
+                    family=ProviderFamily.ANTHROPIC,
+                    model="model-b",
+                    status=ObservationStatus.FAILED,
+                    failure_class=ProviderFailureClass.TIMEOUT,
+                ),
+            )
+        )
+    )
+    assert matrix.failed_seats == 1
+    # A timeout is not an unavailable seat even though both yield no opinion.
+    assert matrix.unavailable_seats == 0
+    assert DisagreementKind.SEAT_UNAVAILABLE_PRESENT not in matrix.conditions
+    assert DisagreementKind.PROVIDER_FAILURE_PRESENT in matrix.conditions
+
+
+def test_a_budget_skip_is_not_counted_as_an_unavailable_seat():
+    from app.opip.committee.contracts import CostCompleteness
+    from app.opip.committee.contracts import ProviderCallOutcome, ReproducibilityClass
+
+    skipped = ProviderCallOutcome(
+        logical_observation_id="COMMITTEE-LOGICAL:case-1:openai:model-a",
+        case_id="case-1",
+        provider_family=ProviderFamily.OPENAI,
+        requested_model="model-a",
+        status=ObservationStatus.SKIPPED_BUDGET,
+        attempt=1,
+        reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
+        request_at=START,
+        input_hash="COMMITTEE-WIRE:case-1:openai",
+        cost_completeness=CostCompleteness.UNKNOWN,
+    )
+    matrix = build_disagreement_matrix(_case(seats=(skipped,)))
+    assert matrix.unavailable_seats == 0
+    assert matrix.failed_seats == 0
+
+
+def test_a_genuinely_unavailable_seat_is_counted_as_unavailable():
+    from app.opip.committee.contracts import ProviderFailureClass
+    from app.opip.committee.contracts import ProviderCallOutcome, ReproducibilityClass
+
+    unavailable = ProviderCallOutcome(
+        logical_observation_id="COMMITTEE-LOGICAL:case-1:openai:model-a",
+        case_id="case-1",
+        provider_family=ProviderFamily.OPENAI,
+        requested_model="model-a",
+        status=ObservationStatus.UNAVAILABLE,
+        attempt=1,
+        reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
+        request_at=START,
+        input_hash="COMMITTEE-WIRE:case-1:openai",
+        failure_class=ProviderFailureClass.PROVIDER_UNAVAILABLE,
+        cost_completeness=CostCompleteness.UNKNOWN,
+    )
+    matrix = build_disagreement_matrix(_case(seats=(unavailable,)))
+    assert matrix.unavailable_seats == 1
+    assert DisagreementKind.SEAT_UNAVAILABLE_PRESENT in matrix.conditions
+
+
+def test_duplicate_case_ids_are_rejected_before_attribution():
+    """A repeated case id cannot undercount disagreement or misjudge a provider."""
+    case = _uniform_cases(1, committee_right=True, baseline_right=False)[0]
+    with pytest.raises(ValueError):
+        _report((case, case))
+
+
+def test_attribution_identity_covers_the_paired_increment_and_metrics():
+    """Changing baseline_scored must change the artifact identity."""
+    from dataclasses import replace
+
+    report = _report(
+        _uniform_cases(
+            MIN_ATTRIBUTION_SAMPLES, committee_right=True, baseline_right=False
+        )
+    )
+    payload = report.identity_payload()
+    increment = payload["committee_increment"]
+    assert increment[0] == MIN_ATTRIBUTION_SAMPLES  # baseline_scored
+    assert increment[1] == 0  # baseline_correct
+    assert len(payload["chronological_stability"][0]) == 5
+
+    # Rebinding the paired population must not preserve the identity, because it
+    # can flip added_information from unsupported to supported.
+    altered = replace(
+        report,
+        committee_increment=replace(
+            report.committee_increment, baseline_scored=0, baseline_correct=0
+        ),
+    )
+    assert altered.attribution_id != report.attribution_id
+
+
+def test_added_information_honors_the_reports_declared_threshold():
+    """A stricter declared sample requirement must not be silently relaxed."""
+    cases = _uniform_cases(
+        MIN_ATTRIBUTION_SAMPLES, committee_right=True, baseline_right=False
+    )
+    default_report = _report(cases)
+    assert default_report.added_information is True
+
+    strict_report = _report(cases, minimum_samples=MIN_ATTRIBUTION_SAMPLES * 4)
+    assert strict_report.added_information is None
+    assert strict_report.providers[0].adequacy_note.startswith("INSUFFICIENT_SAMPLE")
+    assert str(MIN_ATTRIBUTION_SAMPLES * 4) in strict_report.providers[0].adequacy_note
+
+    exploratory = _report(cases, minimum_samples=1)
+    assert exploratory.added_information is True
+
+
+def test_attribution_round_trip_preserves_the_declared_threshold(tmp_path):
+    store = CommitteeEvidenceStore(root=tmp_path)
+    report = _report(
+        _uniform_cases(
+            MIN_ATTRIBUTION_SAMPLES, committee_right=True, baseline_right=False
+        ),
+        minimum_samples=MIN_ATTRIBUTION_SAMPLES * 3,
+    )
+    assert store.append_attribution_report(report).reason == REASON_STORED
+    reloaded = list(store.iter_attribution_reports())[0]
+    assert reloaded.minimum_samples == MIN_ATTRIBUTION_SAMPLES * 3
+    assert reloaded.providers[0].minimum_samples == MIN_ATTRIBUTION_SAMPLES * 3
+    assert reloaded.added_information is None

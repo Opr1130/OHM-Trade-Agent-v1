@@ -322,15 +322,24 @@ def classification_report(pairs: Sequence[tuple[bool, bool]]) -> ClassificationR
     """Classification metrics. No labeled pair means no metric, not a zero."""
     matrix = confusion_matrix(pairs)
     if matrix.total == 0:
-        empty = EvaluationMetric(
-            name="classification",
-            value=None,
-            applicable=False,
-            sample_size=0,
-            not_applicable_reason=REASON_NO_CLASSIFICATION_TARGET,
-        )
+        # Each metric keeps its own name even when nothing is applicable, so a
+        # persisted report cannot mislabel four measurements as one and a public
+        # ``metric("accuracy")`` lookup still resolves for an unevaluated arm.
+        def _inapplicable(name: str) -> EvaluationMetric:
+            return EvaluationMetric(
+                name=name,
+                value=None,
+                applicable=False,
+                sample_size=0,
+                not_applicable_reason=REASON_NO_CLASSIFICATION_TARGET,
+            )
+
         return ClassificationReport(
-            matrix=matrix, precision=empty, recall=empty, f1=empty, accuracy=empty
+            matrix=matrix,
+            precision=_inapplicable("precision"),
+            recall=_inapplicable("recall"),
+            f1=_inapplicable("f1"),
+            accuracy=_inapplicable("accuracy"),
         )
     precision = rate_metric(
         "precision",

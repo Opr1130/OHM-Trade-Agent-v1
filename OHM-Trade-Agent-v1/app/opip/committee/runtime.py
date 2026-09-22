@@ -52,6 +52,7 @@ from app.opip.committee.providers import (
     RETRYABLE_FAILURE_CLASSES,
     resolve_seated_providers,
 )
+from app.opip.committee.settings import committee_shadow_enabled
 from app.opip.decision_intelligence.serialization import stable_hash
 
 #: The provider-agnostic instruction. One prompt for every seat is what makes
@@ -80,6 +81,10 @@ COMMITTEE_SYSTEM_PROMPT = (
 
 DEFAULT_MAX_OUTPUT_TOKENS = 1_200
 DEFAULT_TIMEOUT_SECONDS = 60
+
+#: The largest attempt number ``ProviderCallOutcome`` accepts. Reaching it means
+#: the seat may not be invoked again, because no legal outcome could be recorded.
+MAX_RECORDED_ATTEMPTS = 5
 
 PROMPT_HASH_DOMAIN = "COMMITTEE-PROMPT"
 WIRE_HASH_DOMAIN = "COMMITTEE-WIRE"
@@ -158,6 +163,7 @@ class CommitteeRunner:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         now: Callable[[], datetime] | None = None,
+        settings: object | None = None,
     ) -> None:
         self._providers: Mapping[ProviderFamily, CommitteeProvider] = dict(providers)
         self._ledger = ledger
@@ -166,6 +172,9 @@ class CommitteeRunner:
         self._now: Callable[[], datetime] = now or (
             lambda: datetime.now(timezone.utc)
         )
+        # Injected so callers and tests can state the enablement gate explicitly
+        # rather than depending on ambient process settings.
+        self._settings = settings
 
     def run_case(
         self,
@@ -184,6 +193,15 @@ class CommitteeRunner:
             raise CommitteePolicyViolation("run_case requires a CommitteeCase")
         if not isinstance(phase, EvaluationPhase):
             raise CommitteePolicyViolation("invalid evaluation phase")
+        # The enablement gate is enforced here, at the execution API, so the
+        # advertised off/shadow switch actually governs model egress and spend.
+        # An operator who has not enabled the committee cannot reach a provider
+        # by constructing a runner directly.
+        if not committee_shadow_enabled(self._settings):
+            raise CommitteePolicyViolation(
+                "the Intelligence Committee is disabled; set OPIP_COMMITTEE_MODE="
+                "shadow to permit committee work"
+            )
 
         # Screened once, shared by every seat: this is what makes the evidence
         # logically equivalent across members and prevents cross-contamination.
@@ -290,6 +308,11 @@ class CommitteeRunner:
             # A committed logical observation is never asked again. This is the
             # ACK-loss case: the caller may not know the write landed, but a
             # second independent opinion must not be manufactured.
+            #
+            # The acknowledgement reuses the original call's timings rather than
+            # stamping a fresh request time. A replay can legitimately arrive
+            # later than the original response, and a synthetic request time
+            # after it would be a contract-violating, falsified provider timing.
             outcome = ProviderCallOutcome(
                 logical_observation_id=logical_id,
                 case_id=case.case_id,
@@ -298,7 +321,7 @@ class CommitteeRunner:
                 status=ObservationStatus.DUPLICATE_OK,
                 attempt=committed.attempt,
                 reproducibility=committed.reproducibility,
-                request_at=self._now(),
+                request_at=committed.request_at,
                 input_hash=input_hash,
                 reported_provider=committed.reported_provider,
                 reported_model=committed.reported_model,
@@ -310,33 +333,64 @@ class CommitteeRunner:
                 output_tokens=committed.output_tokens,
                 estimated_cost_microunits=None,
                 cost_completeness=CostCompleteness.UNKNOWN,
-                detail="logical observation already committed; not re-queried",
-            )
-            return CommitteeSeatResult(family, logical_id, outcome)
-
-        skip_reason = self._budget_skip_reason(
-            case=case, provider=provider, wire=wire, spent=spent_microunits
-        )
-        if skip_reason is not None:
-            outcome = ProviderCallOutcome(
-                logical_observation_id=logical_id,
-                case_id=case.case_id,
-                provider_family=family,
-                requested_model=requested_model,
-                status=ObservationStatus.SKIPPED_BUDGET,
-                attempt=1,
-                reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
-                request_at=self._now(),
-                input_hash=input_hash,
-                reported_provider=provider.model_identifier(),
-                reported_model=None,
-                detail=skip_reason,
-                cost_completeness=CostCompleteness.UNKNOWN,
+                detail=(
+                    "logical observation already committed; not re-queried; "
+                    "timings are the original call's"
+                ),
             )
             return CommitteeSeatResult(family, logical_id, outcome)
 
         attempt = self._ledger.attempt_count(logical_id) + 1
+        if attempt > MAX_RECORDED_ATTEMPTS:
+            # The attempt counter is bounded by the outcome contract, and the
+            # provider must not be called again just to construct an outcome the
+            # contract would reject. Return a governed disposition instead of
+            # turning a typed, nonfatal state into an exception after another
+            # external call.
+            return CommitteeSeatResult(
+                family,
+                logical_id,
+                self._exhausted_attempt_outcome(
+                    case=case,
+                    family=family,
+                    requested_model=requested_model,
+                    logical_id=logical_id,
+                    input_hash=input_hash,
+                    provider=provider,
+                ),
+            )
+
+        # The estimate is reserved per provider invocation, not once per seat, so
+        # a permitted retry cannot push cumulative spend past the declared case
+        # ceiling.
+        estimate = provider.estimate_cost_microunits(wire)
+        seat_reserved = 0
+        outcome: ProviderCallOutcome | None = None
         while True:
+            skip_reason = self._attempt_budget_reason(
+                case=case,
+                estimate=estimate,
+                committed_spend=spent_microunits,
+                seat_reserved=seat_reserved,
+            )
+            if skip_reason is not None:
+                if outcome is None:
+                    return CommitteeSeatResult(
+                        family,
+                        logical_id,
+                        self._budget_skipped_outcome(
+                            case=case,
+                            family=family,
+                            requested_model=requested_model,
+                            logical_id=logical_id,
+                            input_hash=input_hash,
+                            provider=provider,
+                            attempt=attempt,
+                            reason=skip_reason,
+                        ),
+                    )
+                # A previous attempt already happened and is retained below.
+                break
             outcome = self._attempt_seat(
                 case=case,
                 family=family,
@@ -345,10 +399,13 @@ class CommitteeRunner:
                 input_hash=input_hash,
                 attempt=attempt,
             )
+            if estimate is not None:
+                seat_reserved += estimate
             if not (
                 outcome.status is ObservationStatus.FAILED
                 and outcome.failure_class in RETRYABLE_FAILURE_CLASSES
                 and attempt < case.policy.max_attempts_per_seat
+                and attempt < MAX_RECORDED_ATTEMPTS
             ):
                 break
             # Persist the failed attempt before retrying, so the audit trail
@@ -526,33 +583,99 @@ class CommitteeRunner:
             )
         return None
 
-    def _budget_skip_reason(
+    def _attempt_budget_reason(
         self,
         *,
         case: CommitteeCase,
-        provider: CommitteeProvider,
-        wire: ProviderWireRequest,
-        spent: int,
+        estimate: int | None,
+        committed_spend: int,
+        seat_reserved: int,
     ) -> str | None:
-        """Why this seat must be skipped, or ``None`` to proceed.
+        """Why this provider invocation must not happen, or ``None`` to proceed.
 
-        A declared ceiling is only meaningful if it can actually be enforced. An
-        unbounded cost therefore skips the seat rather than permitting spend the
-        ceiling was meant to prevent; an operator who wants the seat to run
-        without a ceiling simply does not declare one.
+        A declared ceiling is only meaningful if it can actually be enforced, so
+        the reservation is rechecked for every invocation rather than once per
+        seat: a permitted retry cannot push cumulative spend past the ceiling. An
+        unbounded cost also skips, because it cannot be shown to fit; an operator
+        who wants the seat to run without a ceiling simply does not declare one.
         """
         ceiling = case.policy.max_estimated_cost_microunits
         if ceiling is None:
             return None
-        estimate = provider.estimate_cost_microunits(wire)
         if estimate is None:
             return (
                 "committee cost ceiling is declared but this seat's cost cannot "
                 "be bounded within it"
             )
-        if spent + estimate > ceiling:
+        if committed_spend + seat_reserved + estimate > ceiling:
             return "committee cost ceiling would be exceeded"
         return None
+
+    def _budget_skipped_outcome(
+        self,
+        *,
+        case: CommitteeCase,
+        family: ProviderFamily,
+        requested_model: str,
+        logical_id: str,
+        input_hash: str,
+        provider: CommitteeProvider,
+        attempt: int,
+        reason: str,
+    ) -> ProviderCallOutcome:
+        return ProviderCallOutcome(
+            logical_observation_id=logical_id,
+            case_id=case.case_id,
+            provider_family=family,
+            requested_model=requested_model,
+            status=ObservationStatus.SKIPPED_BUDGET,
+            attempt=attempt,
+            reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
+            request_at=self._now(),
+            input_hash=input_hash,
+            reported_provider=provider.model_identifier(),
+            reported_model=None,
+            detail=reason,
+            cost_completeness=CostCompleteness.UNKNOWN,
+        )
+
+    def _exhausted_attempt_outcome(
+        self,
+        *,
+        case: CommitteeCase,
+        family: ProviderFamily,
+        requested_model: str,
+        logical_id: str,
+        input_hash: str,
+        provider: CommitteeProvider,
+    ) -> ProviderCallOutcome:
+        """A governed disposition for a seat that has used every legal attempt.
+
+        The provider is not called: the recorded-attempt budget is exhausted, so
+        the committee cannot obtain an opinion from this seat. Reported as an
+        unavailable seat with a precise reason rather than raising, so a
+        persistently failing seat cannot convert a typed, nonfatal disposition
+        into an exception after one more external call.
+        """
+        return ProviderCallOutcome(
+            logical_observation_id=logical_id,
+            case_id=case.case_id,
+            provider_family=family,
+            requested_model=requested_model,
+            status=ObservationStatus.UNAVAILABLE,
+            attempt=MAX_RECORDED_ATTEMPTS,
+            reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
+            request_at=self._now(),
+            input_hash=input_hash,
+            reported_provider=provider.model_identifier(),
+            reported_model=None,
+            failure_class=ProviderFailureClass.PROVIDER_UNAVAILABLE,
+            detail=(
+                "attempt budget exhausted for this logical seat; no further "
+                "provider call was attempted"
+            ),
+            cost_completeness=CostCompleteness.UNKNOWN,
+        )
 
     def _failure_outcome(
         self,

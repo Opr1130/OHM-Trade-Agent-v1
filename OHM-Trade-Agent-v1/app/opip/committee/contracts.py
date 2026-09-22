@@ -43,6 +43,13 @@ PROVIDER_CALL_OUTCOME_IDENTITY_DOMAIN = "COMMITTEE-CALL"
 COMMITTEE_CASE_OUTCOME_IDENTITY_DOMAIN = "COMMITTEE-OUTCOME"
 LOGICAL_OBSERVATION_IDENTITY_DOMAIN = "COMMITTEE-LOGICAL"
 
+#: Evidence metadata that the snapshot owns. A payload may not supply these, so
+#: the model can never be shown an identity, source, or timestamp that is not the
+#: authenticated one the snapshot will validate citations against.
+RESERVED_EVIDENCE_FIELDS = frozenset(
+    {"evidence_id", "source_id", "available_at"}
+)
+
 #: The complete, closed set of fields a model-bound evidence item may carry.
 #: Anything outside this set is rejected before an external call is built.
 MODEL_BOUND_ITEM_FIELDS = frozenset(
@@ -527,7 +534,14 @@ class EvidenceSnapshot:
         return stable_hash(EVIDENCE_SNAPSHOT_ID_DOMAIN, self.identity_payload())
 
     def model_bound_view(self) -> dict[str, Any]:
-        """The only representation permitted to leave the process boundary."""
+        """The only representation permitted to leave the process boundary.
+
+        Authenticated metadata is written last and cannot be overridden by an
+        evidence payload. Otherwise a payload carrying an allowlisted key such as
+        ``evidence_id`` would show the model a value that is absent from the
+        snapshot's citable reference set - so a correct citation of the visible id
+        would be rejected - and could spoof source or timing metadata.
+        """
         return {
             "case_id": self.case_id,
             "case_type": self.case_type.value,
@@ -537,14 +551,15 @@ class EvidenceSnapshot:
             "prompt_version": self.prompt_version,
             "evidence": tuple(
                 {
-                    "evidence_id": item.evidence_id,
-                    "source_id": item.source_id,
-                    "available_at": item.available_at.isoformat(),
                     **{
                         key: item.payload[key]
                         for key in sorted(item.payload)
                         if key in MODEL_BOUND_ITEM_FIELDS
+                        and key not in RESERVED_EVIDENCE_FIELDS
                     },
+                    "evidence_id": item.evidence_id,
+                    "source_id": item.source_id,
+                    "available_at": item.available_at.isoformat(),
                 }
                 for item in self.items
             ),
@@ -846,6 +861,21 @@ class ProviderCallOutcome:
             ),
             "request_at": self.request_at,
             "replay_divergence_detected": self.replay_divergence_detected,
+            # The served identity and the recorded call telemetry are persisted
+            # evidence, so they participate in the identity too. Otherwise a row
+            # differing only in latency, tokens, cost, or completeness would keep
+            # its outcome_id, and the bake-off's cost and latency evidence could
+            # change without the durable artifact identity detecting it.
+            "reported_provider": self.reported_provider,
+            "reported_model": self.reported_model,
+            "response_at": self.response_at,
+            "raw_response_ref": self.raw_response_ref,
+            "latency_micros": self.latency_micros,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_cost_microunits": self.estimated_cost_microunits,
+            "cost_completeness": self.cost_completeness,
+            "detail": self.detail,
         }
 
     @property

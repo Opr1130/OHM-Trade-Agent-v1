@@ -10,11 +10,25 @@ enable a trading path, and an unreadable or malformed configuration resolves to
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 COMMITTEE_MODE_OFF = "off"
 COMMITTEE_MODE_SHADOW = "shadow"
 COMMITTEE_MODES = frozenset({COMMITTEE_MODE_OFF, COMMITTEE_MODE_SHADOW})
+
+
+@dataclass(frozen=True)
+class CommitteeShadowSettings:
+    """Explicit, injected enablement for callers and tests.
+
+    The execution API refuses to run unless the committee is enabled, so a caller
+    that intends committee work states that intent here rather than depending on
+    ambient process settings. Mirrors the Feature Bus shadow-settings helper.
+    """
+
+    opip_committee_mode: str = COMMITTEE_MODE_SHADOW
+    opip_committee_max_estimated_cost_microunits: int = 0
 
 
 def resolve_committee_mode(settings: Any | None = None) -> str:
@@ -60,6 +74,7 @@ __all__ = [
     "COMMITTEE_MODE_OFF",
     "COMMITTEE_MODE_SHADOW",
     "COMMITTEE_MODES",
+    "CommitteeShadowSettings",
     "committee_shadow_enabled",
     "resolve_committee_cost_ceiling",
     "resolve_committee_mode",

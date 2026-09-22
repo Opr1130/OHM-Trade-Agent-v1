@@ -110,7 +110,16 @@ def _require_string(
 
 
 def _require_string_list(payload: Mapping[str, Any], field: str) -> tuple[str, ...]:
-    raw = payload.get(field, [])
+    """Require a declared list field to be present as a list of strings.
+
+    An absent key is a schema failure rather than an empty list. The prompt and
+    the parser both require the exact field set, and silently defaulting a missing
+    field would record an incomplete response as schema-valid. An explicitly
+    present empty list remains valid, because that is the model asserting "none".
+    """
+    if field not in payload:
+        raise _schema(f"{field} is required and must be present")
+    raw = payload[field]
     if not isinstance(raw, list):
         raise _schema(f"{field} must be a list of strings")
     if len(raw) > MAX_LIST_ITEMS:

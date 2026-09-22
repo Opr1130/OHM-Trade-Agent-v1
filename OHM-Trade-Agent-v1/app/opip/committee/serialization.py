@@ -1159,6 +1159,7 @@ _PROVIDER_ATTRIBUTION_FIELDS = frozenset(
         "accuracy_by_case_type",
         "known_cost_microunits",
         "unknown_cost_samples",
+        "minimum_samples",
     }
 )
 
@@ -1240,6 +1241,7 @@ def attribution_report_to_dict(report) -> dict[str, Any]:
                 ],
                 "known_cost_microunits": provider.known_cost_microunits,
                 "unknown_cost_samples": provider.unknown_cost_samples,
+                "minimum_samples": provider.minimum_samples,
             }
             for provider in report.providers
         ],
@@ -1293,9 +1295,14 @@ def attribution_report_to_dict(report) -> dict[str, Any]:
 
 
 def _decode_provider_attribution(row: Mapping[str, Any]):
-    from app.opip.committee.attribution import CaseTypeAccuracy, ProviderAttribution
+    from app.opip.committee.attribution import (
+        MIN_ATTRIBUTION_SAMPLES,
+        CaseTypeAccuracy,
+        ProviderAttribution,
+    )
 
     _reject_unknown(row, _PROVIDER_ATTRIBUTION_FIELDS, kind="provider attribution")
+
     raw_types = row.get("accuracy_by_case_type", [])
     if not isinstance(raw_types, list):
         raise CommitteeSerializationError("accuracy_by_case_type must be a list")
@@ -1339,6 +1346,7 @@ def _decode_provider_attribution(row: Mapping[str, Any]):
             row.get("known_cost_microunits"), field="known_cost_microunits"
         ),
         unknown_cost_samples=row.get("unknown_cost_samples"),
+        minimum_samples=row.get("minimum_samples", MIN_ATTRIBUTION_SAMPLES),
     )
 
 

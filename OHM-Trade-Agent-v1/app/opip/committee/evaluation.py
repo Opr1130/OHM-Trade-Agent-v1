@@ -73,6 +73,12 @@ COMMITTEE_SIGNAL_SUPPORTIVE_SHARE_BASIS_POINTS = 6_000
 #: A research signal needs at least this many directional seats to be defined.
 COMMITTEE_SIGNAL_MIN_ANSWERED_SEATS = 2
 
+#: Case types that define a genuine probabilistic forecast, and are therefore
+#: the only ones for which proper scoring rules and calibration may apply. Every
+#: other declared case type reports those metrics as not applicable rather than
+#: accepting an arbitrary probability as valid evidence.
+PROBABILISTIC_CASE_TYPES = frozenset({CaseType.MARKET_OPPORTUNITY})
+
 ADEQUACY_ADEQUATE = "ADEQUATE"
 ADEQUACY_INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE"
 
@@ -326,19 +332,12 @@ class EvaluationReport:
             "minimum_samples": self.minimum_samples,
             "metric_definitions_version": self.metric_definitions_version,
             "committee_signal_rule_version": self.committee_signal_rule_version,
-            "arms": tuple(
-                {
-                    "arm_id": arm.arm_id,
-                    "kind": arm.kind,
-                    "cases": arm.cases,
-                    "answered": arm.answered,
-                    "adequacy": arm.adequacy,
-                    "metrics": tuple(
-                        (metric.name, metric.value) for metric in arm.metrics()
-                    ),
-                }
-                for arm in self.arms
-            ),
+            # Every persisted result field participates in the identity, not just
+            # the headline metric values. Otherwise two reports differing in
+            # failures, budget skips, token/cost/latency aggregates, confusion
+            # data, calibration bins, or metric applicability would share a
+            # report_id and one could be discarded as a duplicate of the other.
+            "arms": tuple(_arm_identity(arm) for arm in self.arms),
         }
 
     @property
@@ -354,6 +353,68 @@ class EvaluationReport:
             if arm.arm_id == arm_id:
                 return arm
         raise KeyError(arm_id)
+
+
+def _arm_identity(arm: "ArmEvaluation") -> dict[str, object]:
+    """The full semantic content of one arm, for the report identity."""
+    return {
+        "arm_id": arm.arm_id,
+        "kind": arm.kind,
+        "label": arm.label,
+        "provider_family": arm.provider_family,
+        "model": arm.model,
+        "cases": arm.cases,
+        "answered": arm.answered,
+        "abstentions": arm.abstentions,
+        "schema_valid": arm.schema_valid,
+        "failures": arm.failures,
+        "unavailable": arm.unavailable,
+        "skipped_budget": arm.skipped_budget,
+        "input_tokens": arm.input_tokens,
+        "output_tokens": arm.output_tokens,
+        "adequacy": arm.adequacy,
+        "metrics": tuple(
+            (
+                metric.name,
+                metric.value,
+                metric.applicable,
+                metric.sample_size,
+                metric.not_applicable_reason,
+            )
+            for metric in arm.metrics()
+        ),
+        "calibration_bins": tuple(
+            (
+                item.lower,
+                item.upper,
+                item.count,
+                item.mean_predicted,
+                item.observed_rate,
+            )
+            for item in arm.calibration_bins
+        ),
+        "confusion": (
+            None
+            if arm.confusion is None
+            else (
+                arm.confusion.true_positive,
+                arm.confusion.false_positive,
+                arm.confusion.true_negative,
+                arm.confusion.false_negative,
+            )
+        ),
+        "latency": (
+            arm.latency.sample_size,
+            arm.latency.p50_micros,
+            arm.latency.p90_micros,
+            arm.latency.maximum_micros,
+        ),
+        "cost": (
+            arm.cost.sample_size,
+            arm.cost.known_cost_microunits,
+            arm.cost.unknown_cost_samples,
+        ),
+    }
 
 
 def directional_call(outcome: ProviderCallOutcome) -> DirectionalCall:
@@ -620,7 +681,13 @@ def _validate_bake_off_inputs(
             "a bake-off compares arms over a single case type; "
             "mixed case types must be evaluated separately"
         )
-    known_cases = {observation.case_id for observation in observations}
+    case_type = next(iter(case_types))
+    known_cases = _require_unique_case_ids(observations)
+    _require_unique_related_records(
+        resolved_outcomes=resolved_outcomes,
+        deterministic_baseline=deterministic_baseline,
+        probability_forecasts=probability_forecasts,
+    )
     for label, case_id in (
         *(
             ("resolved outcome", item.case_id)
@@ -637,7 +704,87 @@ def _validate_bake_off_inputs(
     ):
         if case_id not in known_cases:
             raise ValueError(f"{label} for unknown case: {case_id}")
-    return next(iter(case_types))
+    _require_forecast_support(case_type, probability_forecasts)
+    return case_type
+
+
+def _require_unique_case_ids(
+    observations: Sequence[CaseObservation],
+) -> set[str]:
+    """Reject duplicate case observations before any aggregation happens.
+
+    A repeated case id would otherwise be collapsed by the known-case set while
+    the accumulation loop and ``case_count`` still counted both occurrences, and
+    each arm's per-case dictionary would keep only the later call - producing
+    mismatched coverage, inflated sample sizes, and silently replaced seat
+    results. Failing closed keeps the report a faithful description of its input.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for observation in observations:
+        if observation.case_id in seen:
+            duplicates.append(observation.case_id)
+        seen.add(observation.case_id)
+    if duplicates:
+        raise ValueError(
+            "duplicate case observations are not allowed in a bake-off: "
+            f"{sorted(set(duplicates))}"
+        )
+    return seen
+
+
+def _require_unique_related_records(
+    *,
+    resolved_outcomes: Sequence[ResolvedOutcome],
+    deterministic_baseline: Sequence[BaselineCall],
+    probability_forecasts: Sequence[ProbabilityForecast],
+) -> None:
+    """One record per case for the joined inputs, as those contracts require."""
+    for label, case_ids in (
+        ("resolved outcome", [item.case_id for item in resolved_outcomes]),
+        ("baseline call", [item.case_id for item in deterministic_baseline]),
+    ):
+        duplicates = sorted(
+            {case_id for case_id in case_ids if case_ids.count(case_id) > 1}
+        )
+        if duplicates:
+            raise ValueError(
+                f"multiple {label} entries for the same case: {duplicates}"
+            )
+    forecast_keys = [
+        (item.case_id, item.arm_id) for item in probability_forecasts
+    ]
+    duplicate_forecasts = sorted(
+        {
+            key
+            for key in forecast_keys
+            if forecast_keys.count(key) > 1
+        }
+    )
+    if duplicate_forecasts:
+        raise ValueError(
+            "multiple forecasts for the same case and arm: "
+            f"{duplicate_forecasts}"
+        )
+
+
+def _require_forecast_support(
+    case_type: CaseType,
+    probability_forecasts: Sequence[ProbabilityForecast],
+) -> None:
+    """Probabilistic metrics exist only for case types that define a probability.
+
+    Accepting a forecast for another case type would publish an arbitrary
+    probability as valid experimental evidence and yield an applicable Brier
+    score the case type cannot support.
+    """
+    if not probability_forecasts:
+        return
+    if case_type not in PROBABILISTIC_CASE_TYPES:
+        raise ValueError(
+            f"case type {case_type.value} does not define a probabilistic "
+            "forecast, so no probability samples may be supplied for it"
+        )
 
 
 def _accumulate_independent_seats(
@@ -786,9 +933,17 @@ def evaluate_model_bake_off(
 
 
 def _sum_tokens(seats: Sequence[ProviderCallOutcome], attribute: str) -> int | None:
+    """Aggregate one token field, preserving unknown completeness.
+
+    Matching the cost rule: if any contributing seat's usage is unknown, the
+    aggregate is unknown. Summing only the known values would present a partial
+    total as a complete one and undercount usage in cost-efficiency comparisons.
+    A recorded zero is a legitimate known value and is not treated as missing.
+    """
     values = [getattr(seat, attribute) for seat in seats]
-    known = [value for value in values if value is not None]
-    return sum(known) if known else None
+    if any(value is None for value in values):
+        return None
+    return sum(values)
 
 
 def _sum_costs(seats: Sequence[ProviderCallOutcome]) -> int | None:

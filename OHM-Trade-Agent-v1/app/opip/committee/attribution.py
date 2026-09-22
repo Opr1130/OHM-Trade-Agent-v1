@@ -218,14 +218,21 @@ class ProviderAttribution:
     accuracy_by_case_type: tuple[CaseTypeAccuracy, ...]
     known_cost_microunits: int | None
     unknown_cost_samples: int
+    #: The sample threshold this arm was assessed against. Carried on the arm so
+    #: its adequacy statement matches the report that declared the threshold
+    #: rather than the module default.
+    minimum_samples: int = MIN_ATTRIBUTION_SAMPLES
 
     @property
     def adequacy_note(self) -> str:
         """An explicit statement when the sample cannot support a claim."""
         return (
             "adequate"
-            if self.scored_cases >= MIN_ATTRIBUTION_SAMPLES
-            else f"INSUFFICIENT_SAMPLE ({self.scored_cases} of {MIN_ATTRIBUTION_SAMPLES})"
+            if self.scored_cases >= self.minimum_samples
+            else (
+                f"INSUFFICIENT_SAMPLE ({self.scored_cases} of "
+                f"{self.minimum_samples})"
+            )
         )
 
 
@@ -255,14 +262,25 @@ class CommitteeIncrement:
         """
         return self.baseline_scored
 
-    @property
-    def added_information(self) -> bool | None:
-        """Whether the committee beat the baseline, or ``None`` if unsupported."""
-        if self.paired_scored < MIN_ATTRIBUTION_SAMPLES:
+    def added_information_at(self, minimum_samples: int) -> bool | None:
+        """Whether the committee beat the baseline under a declared threshold.
+
+        The threshold is supplied by the owning report so a caller-selected
+        sample requirement is honored rather than silently replaced by the module
+        default.
+        """
+        if type(minimum_samples) is not int or minimum_samples < 1:
+            raise ValueError("minimum_samples must be a positive integer")
+        if self.paired_scored < minimum_samples:
             return None
         if not self.incremental_accuracy.applicable:
             return None
         return (self.incremental_accuracy.decimal_value or 0) > 0
+
+    @property
+    def added_information(self) -> bool | None:
+        """Whether the committee beat the baseline at the module default threshold."""
+        return self.added_information_at(MIN_ATTRIBUTION_SAMPLES)
 
 
 @dataclass(frozen=True)
@@ -339,25 +357,47 @@ class AttributionReport:
             "minimum_samples": self.minimum_samples,
             "attribution_method_version": self.attribution_method_version,
             "providers": tuple(
-                (
-                    provider.provider_family,
-                    provider.model,
-                    provider.scored_cases,
-                    provider.correct_cases,
-                    provider.baseline_agreements,
-                    provider.baseline_disagreements,
-                    provider.independent_incremental_correct,
-                )
-                for provider in self.providers
+                _provider_identity(provider) for provider in self.providers
             ),
             "disagreements": tuple(
-                (item.kind, item.cases) for item in self.disagreements
+                (item.kind, item.cases, _metric_identity(item.share))
+                for item in self.disagreements
             ),
+            # The full increment participates in the identity: changing
+            # baseline_scored can flip added_information from unsupported to
+            # supported, so an identity that omitted it could keep the same
+            # attribution_id while the evidence meaningfully changed.
             "committee_increment": (
+                self.committee_increment.baseline_scored,
+                self.committee_increment.baseline_correct,
+                self.committee_increment.committee_scored,
+                self.committee_increment.committee_correct,
+                self.committee_increment.both_correct,
+                self.committee_increment.both_wrong,
                 self.committee_increment.only_committee_correct,
                 self.committee_increment.only_baseline_correct,
-                self.committee_increment.committee_scored,
+                _metric_identity(self.committee_increment.committee_accuracy),
+                _metric_identity(self.committee_increment.baseline_accuracy),
+                _metric_identity(self.committee_increment.incremental_accuracy),
             ),
+            "contested_case_accuracy": _metric_identity(
+                self.contested_case_accuracy
+            ),
+            "unanimous_case_accuracy": _metric_identity(
+                self.unanimous_case_accuracy
+            ),
+            "chronological_stability": tuple(
+                (
+                    item.label,
+                    item.cases,
+                    item.scored,
+                    item.correct,
+                    _metric_identity(item.accuracy),
+                )
+                for item in self.chronological_stability
+            ),
+            "incremental_cost_microunits": self.incremental_cost_microunits,
+            "calibration": _metric_identity(self.calibration),
         }
 
     @property
@@ -365,6 +405,60 @@ class AttributionReport:
         return stable_hash(
             ATTRIBUTION_REPORT_IDENTITY_DOMAIN, self.identity_payload()
         )
+
+    @property
+    def added_information(self) -> bool | None:
+        """Whether the committee beat the baseline at this report's threshold.
+
+        Delegates to the increment using the threshold the report declared, so a
+        report generated with ``minimum_samples=100`` cannot claim added
+        information after only the module default of 30 paired cases.
+        """
+        return self.committee_increment.added_information_at(self.minimum_samples)
+
+
+def _metric_identity(metric: EvaluationMetric) -> tuple[object, ...]:
+    """The semantic content of one metric, for use in a content identity."""
+    return (
+        metric.name,
+        metric.value,
+        metric.applicable,
+        metric.sample_size,
+        metric.not_applicable_reason,
+    )
+
+
+def _provider_identity(provider: "ProviderAttribution") -> dict[str, object]:
+    """The full semantic content of one provider's attribution."""
+    return {
+        "provider_family": provider.provider_family,
+        "model": provider.model,
+        "scored_cases": provider.scored_cases,
+        "correct_cases": provider.correct_cases,
+        "abstained_cases": provider.abstained_cases,
+        "failed_cases": provider.failed_cases,
+        "accuracy": _metric_identity(provider.accuracy),
+        "baseline_agreements": provider.baseline_agreements,
+        "baseline_disagreements": provider.baseline_disagreements,
+        "accuracy_when_agreeing_with_baseline": _metric_identity(
+            provider.accuracy_when_agreeing_with_baseline
+        ),
+        "accuracy_when_disagreeing_with_baseline": _metric_identity(
+            provider.accuracy_when_disagreeing_with_baseline
+        ),
+        "independent_incremental_correct": (
+            provider.independent_incremental_correct
+        ),
+        "accuracy_when_contested": _metric_identity(
+            provider.accuracy_when_contested
+        ),
+        "accuracy_by_case_type": tuple(
+            (item.case_type, item.scored, item.correct, _metric_identity(item.accuracy))
+            for item in provider.accuracy_by_case_type
+        ),
+        "known_cost_microunits": provider.known_cost_microunits,
+        "unknown_cost_samples": provider.unknown_cost_samples,
+    }
 
 
 def _seat_verdict(
@@ -395,15 +489,25 @@ def _seat_verdict(
     )
 
 
-def _call_counts(verdicts: tuple[SeatVerdict, ...]) -> tuple[int, int, int, int]:
+def _call_counts(
+    verdicts: tuple[SeatVerdict, ...], seats: tuple[ProviderCallOutcome, ...]
+) -> tuple[int, int, int, int]:
     def _count(call: DirectionalCall) -> int:
         return sum(1 for item in verdicts if item.call is call)
 
+    # Unavailability is counted from the concrete observation status, not from
+    # the collapsed directional call. ``directional_call()`` maps FAILED, INVALID,
+    # and SKIPPED_BUDGET to UNAVAILABLE as a research reading, so deriving this
+    # count from it would label a timeout or a schema-invalid response as an
+    # unavailable seat and lose the distinction the matrix exists to preserve.
+    unavailable = sum(
+        1 for seat in seats if seat.status is ObservationStatus.UNAVAILABLE
+    )
     return (
         _count(DirectionalCall.POSITIVE),
         _count(DirectionalCall.NEGATIVE),
         _count(DirectionalCall.ABSTAIN),
-        _count(DirectionalCall.UNAVAILABLE),
+        unavailable,
     )
 
 
@@ -481,7 +585,9 @@ def build_disagreement_matrix(case: AttributionCase) -> DisagreementMatrix:
         _seat_verdict(seat, observed_positive=case.observed_positive)
         for seat in case.seats
     )
-    supportive, opposing, abstained, unavailable = _call_counts(verdicts)
+    supportive, opposing, abstained, unavailable = _call_counts(
+        verdicts, case.seats
+    )
     failed = sum(
         1
         for seat in case.seats
@@ -542,6 +648,29 @@ def _accuracy(scored: int, correct: int, *, name: str) -> EvaluationMetric:
     return rate_metric(name, numerator=correct, denominator=scored)
 
 
+def _require_unique_attribution_case_ids(
+    ordered: Sequence[AttributionCase],
+) -> None:
+    """Reject duplicate case ids before any matrix is built.
+
+    The matrix map keeps only the last matrix for a repeated case id while
+    ``ordered``, ``case_count``, and the rate denominators still count both
+    entries - so disagreement shares would be undercounted and a provider's
+    earlier case would be judged using the later case's disagreement state.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for case in ordered:
+        if case.case_id in seen:
+            duplicates.append(case.case_id)
+        seen.add(case.case_id)
+    if duplicates:
+        raise ValueError(
+            "duplicate case ids are not allowed in an attribution report: "
+            f"{sorted(set(duplicates))}"
+        )
+
+
 def build_attribution_report(
     cases: Sequence[AttributionCase],
     *,
@@ -560,6 +689,7 @@ def build_attribution_report(
             "attribution compares a single case type; evaluate mixed types separately"
         )
     ordered = sorted(cases, key=lambda item: (item.decided_at, item.case_id))
+    _require_unique_attribution_case_ids(ordered)
     matrices = {case.case_id: build_disagreement_matrix(case) for case in ordered}
 
     disagreement_counts: dict[DisagreementKind, int] = {}
@@ -593,6 +723,7 @@ def build_attribution_report(
                 matrices,
                 family=family,
                 model=model,
+                minimum_samples=minimum_samples,
             )
         )
 
@@ -730,6 +861,7 @@ def _provider_attribution(
     *,
     family: ProviderFamily,
     model: str,
+    minimum_samples: int,
 ) -> ProviderAttribution:
     tally = _ProviderAccumulator()
     for case in cases:
@@ -787,6 +919,7 @@ def _provider_attribution(
         ),
         known_cost_microunits=tally.known_cost_microunits,
         unknown_cost_samples=tally.unknown_cost_samples,
+        minimum_samples=minimum_samples,
     )
 
 

@@ -19,7 +19,9 @@ import pytest
 from app.opip.committee.contracts import (
     CaseType,
     CommitteeCase,
+    CommitteeCaseOutcome,
     CommitteePolicy,
+    CostCompleteness,
     DirectionalAssessment,
     EvidenceSufficiency,
     EvaluationPhase,
@@ -54,6 +56,7 @@ from app.opip.committee.providers import (
     resolve_seated_providers,
 )
 from app.opip.committee.runtime import (
+    CommitteePolicyViolation,
     CommitteeReplayDivergenceError,
     CommitteeRunner,
 )
@@ -71,7 +74,12 @@ from app.opip.committee.store import (
     CommitteeEvidenceStore,
     DurableObservationLedger,
 )
+from app.opip.committee.settings import CommitteeShadowSettings
 from app.opip.decision_intelligence.identity import Provenance
+
+#: The committee ships dark, so this file states enablement explicitly rather
+#: than depending on ambient process settings.
+SHADOW_SETTINGS = CommitteeShadowSettings()
 
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 CUTOFF = NOW - timedelta(minutes=5)
@@ -439,6 +447,7 @@ def test_seats_receive_identical_evidence_and_never_each_other_answers():
         },
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case())
 
@@ -462,6 +471,7 @@ def test_complete_committee_seals_one_opinion_per_seat():
         },
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case())
 
@@ -479,6 +489,7 @@ def test_repeating_a_case_does_not_create_a_second_opinion():
         providers={ProviderFamily.OPENAI: openai},
         ledger=ledger,
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     policy = _policy(families=(ProviderFamily.OPENAI,))
     first = runner.run_case(_case(policy=policy))
@@ -501,6 +512,7 @@ def test_replay_divergence_fails_explicitly_and_preserves_history():
         providers={ProviderFamily.OPENAI: first},
         ledger=ledger,
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     runner.run_case(_case(policy=policy))
 
@@ -509,6 +521,7 @@ def test_replay_divergence_fails_explicitly_and_preserves_history():
         providers={ProviderFamily.OPENAI: diverging},
         ledger=ledger,
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     replay_case = _case(policy=policy)
     with pytest.raises(CommitteeReplayDivergenceError):
@@ -540,6 +553,7 @@ def test_retryable_failure_is_retried_within_bounds():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(
         families=(ProviderFamily.OPENAI,), max_attempts=2
@@ -564,6 +578,7 @@ def test_non_retryable_failure_is_not_retried():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(
         families=(ProviderFamily.OPENAI,), max_attempts=3
@@ -585,6 +600,7 @@ def test_retries_never_exceed_the_policy_bound():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     runner.run_case(_case(policy=_policy(
         families=(ProviderFamily.OPENAI,), max_attempts=2
@@ -605,6 +621,7 @@ def test_response_from_the_wrong_provider_is_rejected_not_attributed():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
 
@@ -623,6 +640,7 @@ def test_response_from_the_wrong_model_is_rejected_not_attributed():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     assert result.seats[0].outcome.status is ObservationStatus.INVALID
@@ -637,6 +655,7 @@ def test_spoofed_model_identity_is_recorded_verbatim():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
@@ -660,6 +679,7 @@ def test_partial_committee_preserves_failure_as_a_failure_not_a_vote():
         },
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(policy=_policy(families=(ProviderFamily.OPENAI, ProviderFamily.GOOGLE_GEMINI)))
@@ -677,6 +697,7 @@ def test_seat_with_no_supported_integration_is_unavailable():
         providers={ProviderFamily.OPENAI: _ok()},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(
@@ -703,6 +724,7 @@ def test_budget_ceiling_skips_a_seat_instead_of_spending():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(
@@ -729,6 +751,7 @@ def test_seat_failure_does_not_raise_out_of_the_runner():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     outcome = result.seats[0].outcome
@@ -750,6 +773,7 @@ def test_received_but_unusable_body_is_invalid_not_a_silent_success():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     outcome = result.seats[0].outcome
@@ -763,6 +787,7 @@ def test_reproducibility_is_declared_honestly():
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     assert result.seats[0].outcome.reproducibility is (
@@ -806,6 +831,7 @@ def test_store_round_trips_case_and_call_evidence(tmp_path):
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     assert store.append_case_outcome(result.case_outcome).reason == REASON_STORED
@@ -824,7 +850,10 @@ def test_store_acknowledges_an_identical_logical_observation(tmp_path):
     provider = _ok(ProviderFamily.OPENAI)
     policy = _policy(families=(ProviderFamily.OPENAI,))
     CommitteeRunner(
-        providers={ProviderFamily.OPENAI: provider}, ledger=ledger, now=lambda: NOW
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
     outcome = list(store.iter_call_outcomes())[0]
 
@@ -840,6 +869,7 @@ def test_store_refuses_to_overwrite_a_committed_opinion_with_different_content(t
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="original")},
         ledger=ledger,
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
     committed = list(store.iter_call_outcomes())[0]
 
@@ -886,6 +916,7 @@ def test_durable_ledger_survives_a_new_ledger_instance(tmp_path):
         providers={ProviderFamily.OPENAI: provider},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
 
     # A fresh process would build a fresh ledger over the same durable store.
@@ -893,6 +924,7 @@ def test_durable_ledger_survives_a_new_ledger_instance(tmp_path):
         providers={ProviderFamily.OPENAI: provider},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = second.run_case(_case(policy=policy))
     assert len(provider.calls) == 1
@@ -905,6 +937,7 @@ def test_persisted_identity_mismatch_is_rejected_on_read(tmp_path):
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     committed = list(store.iter_call_outcomes())[0]
@@ -920,6 +953,7 @@ def test_case_outcome_serialization_round_trip():
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     outcome = runner.run_case(
         _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
@@ -939,6 +973,7 @@ def test_declared_cost_ceiling_skips_a_seat_whose_cost_cannot_be_bounded():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(policy=_policy(families=(ProviderFamily.OPENAI,), cost_ceiling=1_000))
@@ -957,6 +992,7 @@ def test_no_declared_ceiling_still_allows_an_unknown_cost():
         providers={ProviderFamily.OPENAI: provider},
         ledger=InMemoryObservationLedger(),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(_case(policy=_policy(families=(ProviderFamily.OPENAI,))))
     assert result.seats[0].outcome.status is ObservationStatus.COMPLETED
@@ -973,7 +1009,10 @@ def test_every_retry_attempt_is_recorded_not_only_the_last():
     )
     ledger = InMemoryObservationLedger()
     runner = CommitteeRunner(
-        providers={ProviderFamily.OPENAI: provider}, ledger=ledger, now=lambda: NOW
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     )
     result = runner.run_case(
         _case(policy=_policy(families=(ProviderFamily.OPENAI,), max_attempts=2))
@@ -993,6 +1032,7 @@ def test_a_lost_index_is_rebuilt_so_a_redelivery_is_still_a_duplicate(tmp_path):
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
         ledger=ledger,
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
     committed = list(store.iter_call_outcomes())[0]
     assert len(list(store.iter_call_outcomes())) == 1
@@ -1017,6 +1057,7 @@ def test_a_rejected_divergent_ledger_append_is_propagated_not_swallowed(tmp_path
         providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="sealed")},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
     committed = list(store.iter_call_outcomes())[0]
 
@@ -1066,6 +1107,7 @@ def test_a_partially_stale_call_index_is_reconciled_from_the_log(tmp_path):
         providers={ProviderFamily.OPENAI: first},
         ledger=DurableObservationLedger(store=store),
         now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
     ).run_case(_case(policy=policy))
     committed = list(store.iter_call_outcomes())[0]
 
@@ -1081,3 +1123,419 @@ def test_a_partially_stale_call_index_is_reconciled_from_the_log(tmp_path):
     assert result.stored is False
     assert result.reason == REASON_DUPLICATE
     assert len(list(store.iter_call_outcomes())) == 1
+
+# ==================== review findings: archive + runtime integrity
+
+
+def _authenticated_snapshot():
+    from app.opip.committee.evidence import build_evidence_item, build_evidence_snapshot
+
+    return build_evidence_snapshot(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=CUTOFF,
+        assembled_at=NOW,
+        items=(
+            build_evidence_item(
+                evidence_id="E1",
+                source_id="market-observation",
+                available_at=CUTOFF - timedelta(minutes=10),
+                payload={"metric_name": "close", "metric_value": "100"},
+                evidence_cutoff_at=CUTOFF,
+            ),
+        ),
+        source_refs=("snapshot-ref-1",),
+        committee_policy_version=POLICY_VERSION,
+        prompt_template_id="committee.opinion.v1",
+        prompt_version="3",
+        instrument_id="INSTR:kraken:SOL:USD:1",
+    )
+
+
+def _prospective_case_outcome(snapshot):
+    return CommitteeCaseOutcome(
+        case_id="case-1",
+        evidence_snapshot_hash=snapshot.snapshot_hash,
+        committee_policy_version=POLICY_VERSION,
+        phase=EvaluationPhase.PROSPECTIVE,
+        started_at=CUTOFF - timedelta(minutes=5),
+        completed_at=NOW,
+        outcomes=(_call_outcome(),),
+        provenance=_provenance(),
+    )
+
+
+def _call_outcome(
+    *,
+    family: ProviderFamily = ProviderFamily.OPENAI,
+    model: str = "model-a",
+) -> ProviderCallOutcome:
+    """A committed call outcome, for identity and telemetry assertions."""
+    return ProviderCallOutcome(
+        logical_observation_id=f"COMMITTEE-LOGICAL:case-1:{family.value}:{model}",
+        case_id="case-1",
+        provider_family=family,
+        requested_model=model,
+        status=ObservationStatus.COMPLETED,
+        attempt=1,
+        reproducibility=ReproducibilityClass.NONDETERMINISTIC_PROVIDER_OUTPUT,
+        request_at=NOW,
+        input_hash=f"COMMITTEE-WIRE:case-1:{family.value}",
+        reported_provider=family.value,
+        reported_model=model,
+        opinion=StructuredOpinion(
+            case_id="case-1",
+            provider=family.value,
+            model=model,
+            evidence_sufficiency=EvidenceSufficiency.SUFFICIENT,
+            assessment=DirectionalAssessment.SUPPORTIVE,
+            hypothesis="probe hypothesis",
+            recommended_research_action=ResearchAction.NO_ACTION,
+        ),
+        response_at=NOW,
+        latency_micros=500_000,
+        input_tokens=100,
+        output_tokens=40,
+        estimated_cost_microunits=1_000,
+        cost_completeness=CostCompleteness.COMPLETE,
+    )
+
+
+def _prediction_with_snapshot():
+    """A sealed prospective prediction over the authenticated snapshot."""
+    from app.opip.committee.prospective import seal_prediction
+
+    snapshot = _authenticated_snapshot()
+    return seal_prediction(
+        case_outcome=_prospective_case_outcome(snapshot),
+        evidence_snapshot=snapshot,
+        sealed_at=NOW + timedelta(seconds=30),
+        experiment_id="archive-exp-1",
+        provenance=_provenance(),
+        case_type=CaseType.MARKET_OPPORTUNITY,
+    )
+
+
+def _observation_probe():
+    from app.opip.committee.prospective import OutcomeFinality, OutcomeObservation
+
+    return OutcomeObservation(
+        case_id="case-1",
+        outcome_source="kraken_public_ohlc",
+        source_refs=("phase3c_forward_outcomes:row-1",),
+        observed_at=NOW + timedelta(hours=4),
+        horizon_seconds=4 * 3600,
+        finality=OutcomeFinality.FINAL,
+        positive=True,
+        realised_return_microunits=12_500,
+    )
+
+
+def _evaluation_probe():
+    from app.opip.committee.prospective import evaluate_prospective
+
+    snapshot = _authenticated_snapshot()
+    return evaluate_prospective(
+        prediction=_prediction_with_snapshot(),
+        case_outcome=_prospective_case_outcome(snapshot),
+        observation=_observation_probe(),
+        evaluated_at=NOW + timedelta(hours=4, minutes=5),
+        provenance=_provenance(),
+    )
+
+
+def test_prospective_visibility_timestamp_is_dispatched_by_record_type():
+    """Each prospective type has its own authoritative temporal field."""
+    from app.opip.committee.prospective import (
+        OutcomeObservation,
+        ProspectiveEvaluation,
+        SealedPrediction,
+    )
+    from app.opip.committee.store import _prospective_visible_at
+
+    sealed = _prediction_with_snapshot()
+    observation = _observation_probe()
+    evaluation = _evaluation_probe()
+
+    assert _prospective_visible_at(sealed) == sealed.sealed_at
+    assert _prospective_visible_at(observation) == observation.observed_at
+    assert _prospective_visible_at(evaluation) == evaluation.evaluated_at
+    assert isinstance(sealed, SealedPrediction)
+    assert isinstance(observation, OutcomeObservation)
+    assert isinstance(evaluation, ProspectiveEvaluation)
+
+
+def test_prospective_visibility_timestamp_fails_closed_for_unknown_type():
+    """No getattr fallback: an unknown record type raises instead of guessing."""
+    from app.opip.committee.store import _prospective_visible_at
+
+    class NotAProspectiveRecord:
+        observed_at = NOW
+
+    with pytest.raises(CommitteeSerializationError):
+        _prospective_visible_at(NotAProspectiveRecord())
+
+
+def test_prospective_compaction_succeeds_across_all_record_types(tmp_path):
+    """Rotation must not fail on a SealedPrediction, which has no observed_at."""
+    store = CommitteeEvidenceStore(
+        root=tmp_path,
+        prospective_max_bytes=1,
+        prospective_keep_lines=1,
+    )
+    prediction = _prediction_with_snapshot()
+    observation = _observation_probe()
+    evaluation = _evaluation_probe()
+    assert store.append_sealed_prediction(prediction).stored is True
+    assert store.append_outcome_observation(observation).stored is True
+    assert store.append_prospective_evaluation(evaluation).stored is True
+
+    # Rotation ran on every append; all three record types remain readable and
+    # each was verified with its own temporal field.
+    assert len(list(store.iter_sealed_predictions())) == 1
+    assert len(list(store.iter_outcome_observations())) == 1
+    assert len(list(store.iter_prospective_evaluations())) == 1
+    assert list(tmp_path.glob("archive_prospective/*.jsonl.gz")), (
+        "expected the archived prefix to exist after rotation"
+    )
+
+
+def test_a_replay_after_the_original_response_stays_contract_valid():
+    """T2 > T1 must still yield DUPLICATE_OK without falsifying timings."""
+    provider = _ok(ProviderFamily.OPENAI)
+    ledger = InMemoryObservationLedger()
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    first_clock = [NOW]
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: first_clock[0],
+        settings=SHADOW_SETTINGS,
+    )
+    original = runner.run_case(_case(policy=policy))
+    original_outcome = original.seats[0].outcome
+
+    # The replay happens well after the original response. The clock is advanced
+    # rather than frozen, because a frozen clock is what hid this defect.
+    later = NOW + timedelta(hours=6)
+    replay = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: later,
+        settings=SHADOW_SETTINGS,
+    ).run_case(_case(policy=policy))
+
+    acknowledged = replay.seats[0].outcome
+    assert acknowledged.status is ObservationStatus.DUPLICATE_OK
+    # The provider was not asked again.
+    assert len(provider.calls) == 1
+    # Timestamps remain contract-valid: the acknowledgement reuses the original
+    # call's timing evidence instead of stamping a later synthetic request.
+    assert acknowledged.response_at is not None
+    assert acknowledged.response_at >= acknowledged.request_at
+    assert acknowledged.request_at == original_outcome.request_at
+    assert acknowledged.response_at == original_outcome.response_at
+    # The original immutable observation is unchanged.
+    preserved = ledger.committed_opinion(original_outcome.logical_observation_id)
+    assert preserved is not None
+    assert preserved.outcome_id == original_outcome.outcome_id
+    assert preserved.opinion.opinion_hash == original_outcome.opinion.opinion_hash
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    [
+        "supporting_evidence_refs",
+        "contradicting_evidence_refs",
+        "major_assumptions",
+        "risk_factors",
+        "missing_evidence",
+        "alternative_explanations",
+    ],
+)
+def test_omitting_a_required_list_field_is_a_schema_failure(omitted):
+    """A missing declared field must not be defaulted to an empty list."""
+    from app.opip.committee.opinion import parse_structured_opinion
+
+    payload = opinion_json(drop=(omitted,))
+    with pytest.raises(OpinionParseError) as excinfo:
+        parse_structured_opinion(
+            raw_text=payload,
+            case_id="case-1",
+            provider="openai",
+            model="model-a",
+            allowed_evidence_refs=("E1", "E2"),
+        )
+    assert excinfo.value.failure_class is (
+        ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    )
+
+
+def test_an_explicitly_empty_list_field_is_still_valid():
+    """The model may assert "none"; that is different from omitting the field."""
+    payload = opinion_json(lists={"risk_factors": ()})
+    opinion = _parse(payload)
+    assert opinion.risk_factors == ()
+
+
+def test_the_execution_api_refuses_to_run_while_the_committee_is_disabled():
+    """The off/shadow switch must govern model egress, not just be advertised."""
+    provider = _ok(ProviderFamily.OPENAI)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings={"opip_committee_mode": "off"},
+    )
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    with pytest.raises(CommitteePolicyViolation):
+        runner.run_case(_case(policy=policy))
+    assert provider.calls == []
+
+
+def test_the_execution_api_runs_when_shadow_is_enabled():
+    provider = _ok(ProviderFamily.OPENAI)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
+    )
+    assert result.answered_count == 1
+
+
+def test_a_retry_cannot_exceed_the_declared_case_ceiling():
+    """The reservation is rechecked per invocation, not once per seat."""
+    provider = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),),
+    )
+    provider._estimated_cost_microunits = 60  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI,),
+                max_attempts=3,
+                cost_ceiling=100,
+            )
+        )
+    )
+    # 60 fits the ceiling once; a second 60 would be 120 > 100, so only one
+    # invocation may happen even though three attempts were permitted.
+    assert len(provider.calls) == 1
+    assert result.seats[0].outcome.status is ObservationStatus.FAILED
+    assert result.seats[0].outcome.failure_class is ProviderFailureClass.TIMEOUT
+
+
+def test_an_exhausted_attempt_budget_returns_a_governed_disposition():
+    """A persistently failing seat must not raise after one more external call."""
+    provider = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),),
+    )
+    ledger = InMemoryObservationLedger()
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(families=(ProviderFamily.OPENAI,), max_attempts=5)
+    # Five separate runs accumulate five recorded failures for the same seat.
+    for _ in range(5):
+        runner.run_case(_case(policy=policy))
+    calls_before = len(provider.calls)
+    assert calls_before == 5
+
+    final = runner.run_case(_case(policy=policy))
+    outcome = final.seats[0].outcome
+    # No sixth external call, and a typed disposition rather than an exception.
+    assert len(provider.calls) == calls_before
+    assert outcome.status is ObservationStatus.UNAVAILABLE
+    assert outcome.failure_class is ProviderFailureClass.PROVIDER_UNAVAILABLE
+    assert outcome.attempt == 5
+
+
+def test_a_payload_cannot_override_authenticated_evidence_metadata():
+    """Reserved metadata comes from the snapshot, never from the payload."""
+    snapshot = build_evidence_snapshot(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=CUTOFF,
+        assembled_at=NOW,
+        items=(
+            _item(
+                "E-real",
+                payload={
+                    "metric_name": "close",
+                    "evidence_id": "E-spoofed",
+                    "source_id": "spoofed-source",
+                    "available_at": CUTOFF.isoformat(),
+                },
+            ),
+        ),
+        source_refs=("ref",),
+        committee_policy_version=POLICY_VERSION,
+        prompt_template_id="committee.opinion.v1",
+        prompt_version="3",
+    )
+    view = snapshot.model_bound_view()
+    item = view["evidence"][0]
+    assert item["evidence_id"] == "E-real"
+    assert item["source_id"] == "market-observation"
+    assert item["available_at"] == (CUTOFF - timedelta(minutes=10)).isoformat()
+    assert "E-spoofed" not in json.dumps(view, sort_keys=True)
+    assert "spoofed-source" not in json.dumps(view, sort_keys=True)
+
+
+def test_call_telemetry_participates_in_the_outcome_identity():
+    """A row differing only in recorded telemetry must get a different id."""
+    from dataclasses import replace
+
+    base = _call_outcome()
+    assert replace(base, latency_micros=999).outcome_id != base.outcome_id
+    assert replace(base, input_tokens=7).outcome_id != base.outcome_id
+    assert replace(base, output_tokens=7).outcome_id != base.outcome_id
+    assert replace(base, estimated_cost_microunits=5).outcome_id != base.outcome_id
+    assert replace(base, cost_completeness=CostCompleteness.UNKNOWN).outcome_id != (
+        base.outcome_id
+    )
+    assert replace(base, reported_model="other").outcome_id != base.outcome_id
+    assert replace(base, detail="changed").outcome_id != base.outcome_id
+    # Identical content still collapses to one identity.
+    assert replace(base).outcome_id == base.outcome_id
+
+
+def test_a_stale_case_sidecar_is_reconciled_before_append(tmp_path):
+    """Every sidecar, not just the call index, is reconciled to the log."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    case_outcome = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
+    ).case_outcome
+    assert store.append_case_outcome(case_outcome).reason == REASON_STORED
+
+    # A sidecar that is present and non-empty but stale.
+    store.cases_index_file.write_text(
+        '{"schema_version":1,"kind":"CASE_OUTCOME","entries":'
+        '{"COMMITTEE-OUTCOME:other":"COMMITTEE-OUTCOME:other"}}',
+        encoding="utf-8",
+    )
+    result = store.append_case_outcome(case_outcome)
+    assert result.stored is False
+    assert result.reason == REASON_DUPLICATE
+    assert len(list(store.iter_case_outcomes())) == 1

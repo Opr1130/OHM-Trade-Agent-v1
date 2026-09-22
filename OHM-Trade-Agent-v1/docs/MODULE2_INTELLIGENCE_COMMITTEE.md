@@ -80,11 +80,20 @@ belongs in `app/opip/canonical/`, following the existing adapter pattern.
   is rejected rather than attributed.
 - A versioned structured opinion contract. Non-JSON, markdown-fenced,
   undeclared, or out-of-range output becomes an explicit invalid observation;
-  hallucinated evidence references are refused.
+  hallucinated evidence references are refused. Every declared list field must be
+  present — an omitted field is a schema failure rather than a silent empty list
+  — and authenticated evidence metadata cannot be overridden by a payload.
 - Fail-closed secret screening of everything permitted to leave the process.
 - Idempotent, bounded execution. A committed logical observation is never
   re-queried, and a divergent replay fails explicitly instead of overwriting
-  sealed evidence.
+  sealed evidence. A duplicate acknowledgement reuses the original call's timings
+  rather than stamping a synthetic request time, so an ACK-loss replay that
+  arrives after the original response stays contract-valid. A seat that has used
+  every recordable attempt (5) returns a governed unavailable disposition rather
+  than being invoked again to build an outcome the contract would reject.
+- Enablement gate at the execution API: `run_case` refuses to run while
+  `OPIP_COMMITTEE_MODE` is `off`, so the switch governs real model egress and
+  spend rather than being merely advertised.
 
 ### 2B — Model bake-off / evaluation (`metrics.py`, `pricing.py`, `evaluation.py`)
 
@@ -95,7 +104,17 @@ belongs in `app/opip/canonical/`, following the existing adapter pattern.
   reported as not applicable with a reason code, never as zero.
 - Cost accounting is configuration: prices are microunits per million tokens,
   an unconfigured price yields `UNKNOWN` (never zero), and a malformed price
-  specification raises rather than being ignored.
+  specification raises rather than being ignored. The ceiling reservation is
+  rechecked for every provider invocation, so a permitted retry cannot push
+  cumulative spend past a declared ceiling.
+- Unknown propagates: if any contributing seat's token usage is unknown, the
+  aggregate is unknown rather than a partial total presented as complete. A
+  recorded zero is a known value.
+- Input integrity: duplicate case observations, duplicate resolved outcomes,
+  duplicate baseline calls, and duplicate per-case forecasts are rejected before
+  evaluation, so a repeated case cannot inflate a sample size, overwrite an
+  earlier seat result, or distort a metric population. A probabilistic forecast
+  is accepted only for a case type that defines one.
 - An arm below the minimum scored-case count is `INSUFFICIENT_SAMPLE` and must
   not be read as a winner.
 - Proper scoring rules and calibration exist and are covered by tests, but they
