@@ -185,6 +185,17 @@ def freeze_nested(value: Any) -> Any:
     return value
 
 
+def _as_exact_int(value: object, *, field_name: str) -> int:
+    """Narrow ``value`` to a real ``int`` or fail.
+
+    ``isinstance(True, int)`` is ``True`` in Python, so only an identity check
+    keeps an integer field from silently accepting ``True``.
+    """
+    if type(value) is not int:
+        raise ValueError(f"{field_name} must be an integer")
+    return int(value)
+
+
 def _require_exact_int(
     value: object,
     *,
@@ -192,19 +203,13 @@ def _require_exact_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    """Reject bool and float masquerading as an integer.
-
-    ``isinstance(True, int)`` is ``True`` in Python, so identity checks are the
-    only way to keep an integer field from silently accepting ``True`` or
-    ``1.0``.
-    """
-    if type(value) is not int:
-        raise ValueError(f"{field_name} must be an integer")
-    if minimum is not None and value < minimum:
+    """Require an exact integer, optionally bounded."""
+    number = _as_exact_int(value, field_name=field_name)
+    if minimum is not None and number < minimum:
         raise ValueError(f"{field_name} must be >= {minimum}")
-    if maximum is not None and value > maximum:
+    if maximum is not None and number > maximum:
         raise ValueError(f"{field_name} must be <= {maximum}")
-    return value
+    return number
 
 
 def _require_optional_exact_int(
@@ -242,6 +247,144 @@ def _require_str_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
             raise ValueError(f"{field_name} entries must be non-empty strings")
         items.append(item.strip())
     return tuple(items)
+
+
+_CALL_OUTCOME_REQUIRED_FIELDS = (
+    "logical_observation_id",
+    "case_id",
+    "requested_model",
+    "input_hash",
+)
+
+_CALL_OUTCOME_OPTIONAL_INT_FIELDS = (
+    "latency_micros",
+    "input_tokens",
+    "output_tokens",
+    "estimated_cost_microunits",
+)
+
+
+def _validate_call_outcome_identity(outcome: "ProviderCallOutcome") -> None:
+    """Validate the identity, enum, and numeric surface of a call outcome."""
+    if outcome.schema_version != PROVIDER_CALL_OUTCOME_SCHEMA_VERSION or (
+        type(outcome.schema_version) is not int
+    ):
+        raise ValueError("unsupported ProviderCallOutcome schema_version")
+    for field_name in _CALL_OUTCOME_REQUIRED_FIELDS:
+        object.__setattr__(
+            outcome,
+            field_name,
+            _require_non_empty_str(getattr(outcome, field_name), field_name=field_name),
+        )
+    for field_name, expected in (
+        ("provider_family", ProviderFamily),
+        ("status", ObservationStatus),
+        ("reproducibility", ReproducibilityClass),
+        ("cost_completeness", CostCompleteness),
+    ):
+        if not isinstance(getattr(outcome, field_name), expected):
+            raise ValueError(f"invalid {field_name}")
+    _require_exact_int(
+        outcome.attempt, field_name="attempt", minimum=1, maximum=5
+    )
+    for field_name in _CALL_OUTCOME_OPTIONAL_INT_FIELDS:
+        _require_optional_exact_int(
+            getattr(outcome, field_name), field_name=field_name, minimum=0
+        )
+    object.__setattr__(
+        outcome,
+        "request_at",
+        require_utc(outcome.request_at, field_name="request_at"),
+    )
+    if outcome.response_at is None:
+        return
+    object.__setattr__(
+        outcome,
+        "response_at",
+        require_utc(outcome.response_at, field_name="response_at"),
+    )
+    if outcome.response_at < outcome.request_at:
+        raise ValueError("response_at must be >= request_at")
+
+
+def _validate_completed_outcome(outcome: "ProviderCallOutcome") -> None:
+    if outcome.opinion is None:
+        raise ValueError("a COMPLETED outcome must carry a validated opinion")
+    if outcome.failure_class is not None:
+        raise ValueError("a COMPLETED outcome cannot carry a failure class")
+    if outcome.response_at is None:
+        raise ValueError("a COMPLETED outcome requires response_at")
+    if outcome.opinion.case_id != outcome.case_id:
+        raise ValueError("opinion case_id must match the call outcome")
+    if outcome.replay_divergence_detected:
+        raise ValueError("a first committed opinion cannot be a replay divergence")
+    if not outcome.reported_provider or not outcome.reported_model:
+        raise ValueError("a committed outcome must record the served identity")
+
+
+def _validate_duplicate_outcome(outcome: "ProviderCallOutcome") -> None:
+    if outcome.opinion is None:
+        raise ValueError("a DUPLICATE_OK outcome must carry the committed opinion")
+    if outcome.failure_class is not None:
+        raise ValueError("a DUPLICATE_OK outcome cannot carry a failure class")
+    if outcome.opinion.case_id != outcome.case_id:
+        raise ValueError("opinion case_id must match the call outcome")
+    if outcome.replay_divergence_detected:
+        raise ValueError(
+            "a divergent replay is rejected, not recorded as a duplicate"
+        )
+    if not outcome.reported_provider or not outcome.reported_model:
+        raise ValueError("a duplicate outcome must record the served identity")
+
+
+def _validate_failed_outcome(outcome: "ProviderCallOutcome") -> None:
+    if outcome.failure_class is None:
+        raise ValueError(f"a {outcome.status.value} outcome requires a failure class")
+    if outcome.opinion is not None:
+        raise ValueError("a failed outcome cannot carry an opinion")
+
+
+def _validate_unavailable_outcome(outcome: "ProviderCallOutcome") -> None:
+    if outcome.failure_class is not ProviderFailureClass.PROVIDER_UNAVAILABLE:
+        raise ValueError(
+            "an UNAVAILABLE outcome must be classified PROVIDER_UNAVAILABLE"
+        )
+    if outcome.opinion is not None:
+        raise ValueError("an unavailable seat cannot carry an opinion")
+
+
+def _validate_budget_skipped_outcome(outcome: "ProviderCallOutcome") -> None:
+    if outcome.failure_class is not None:
+        raise ValueError("a budget skip is a policy outcome, not a failure")
+    if outcome.opinion is not None:
+        raise ValueError("a budget-skipped seat cannot carry an opinion")
+
+
+_CALL_OUTCOME_STATUS_VALIDATORS = {
+    ObservationStatus.COMPLETED: _validate_completed_outcome,
+    ObservationStatus.DUPLICATE_OK: _validate_duplicate_outcome,
+    ObservationStatus.FAILED: _validate_failed_outcome,
+    ObservationStatus.INVALID: _validate_failed_outcome,
+    ObservationStatus.UNAVAILABLE: _validate_unavailable_outcome,
+    ObservationStatus.SKIPPED_BUDGET: _validate_budget_skipped_outcome,
+}
+
+
+def _validate_call_outcome_status(outcome: "ProviderCallOutcome") -> None:
+    """Validate the status-specific shape of a call outcome."""
+    validator = _CALL_OUTCOME_STATUS_VALIDATORS.get(outcome.status)
+    if validator is None:
+        raise ValueError(f"undeclared observation status: {outcome.status}")
+    validator(outcome)
+    cost_fields = (
+        outcome.input_tokens,
+        outcome.output_tokens,
+        outcome.estimated_cost_microunits,
+    )
+    if any(value is None for value in cost_fields) and (
+        outcome.cost_completeness is CostCompleteness.COMPLETE
+    ):
+        raise ValueError("COMPLETE cost requires tokens and cost to be present")
 
 
 @dataclass(frozen=True)
@@ -676,106 +819,8 @@ class ProviderCallOutcome:
     schema_version: int = PROVIDER_CALL_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != PROVIDER_CALL_OUTCOME_SCHEMA_VERSION or (
-            type(self.schema_version) is not int
-        ):
-            raise ValueError("unsupported ProviderCallOutcome schema_version")
-        for field_name in (
-            "logical_observation_id",
-            "case_id",
-            "requested_model",
-            "input_hash",
-        ):
-            object.__setattr__(
-                self,
-                field_name,
-                _require_non_empty_str(getattr(self, field_name), field_name=field_name),
-            )
-        if not isinstance(self.provider_family, ProviderFamily):
-            raise ValueError("invalid provider_family")
-        if not isinstance(self.status, ObservationStatus):
-            raise ValueError("invalid observation status")
-        if not isinstance(self.reproducibility, ReproducibilityClass):
-            raise ValueError("invalid reproducibility class")
-        if not isinstance(self.cost_completeness, CostCompleteness):
-            raise ValueError("invalid cost_completeness")
-        _require_exact_int(self.attempt, field_name="attempt", minimum=1, maximum=5)
-        for field_name in (
-            "latency_micros",
-            "input_tokens",
-            "output_tokens",
-            "estimated_cost_microunits",
-        ):
-            _require_optional_exact_int(
-                getattr(self, field_name), field_name=field_name, minimum=0
-            )
-        object.__setattr__(
-            self,
-            "request_at",
-            require_utc(self.request_at, field_name="request_at"),
-        )
-        if self.response_at is not None:
-            object.__setattr__(
-                self,
-                "response_at",
-                require_utc(self.response_at, field_name="response_at"),
-            )
-            if self.response_at < self.request_at:
-                raise ValueError("response_at must be >= request_at")
-
-        if self.status is ObservationStatus.COMPLETED:
-            if self.opinion is None:
-                raise ValueError("a COMPLETED outcome must carry a validated opinion")
-            if self.failure_class is not None:
-                raise ValueError("a COMPLETED outcome cannot carry a failure class")
-            if self.response_at is None:
-                raise ValueError("a COMPLETED outcome requires response_at")
-            if self.opinion.case_id != self.case_id:
-                raise ValueError("opinion case_id must match the call outcome")
-            if self.replay_divergence_detected:
-                raise ValueError("a first committed opinion cannot be a replay divergence")
-            if not self.reported_provider or not self.reported_model:
-                raise ValueError("a committed outcome must record the served identity")
-        elif self.status is ObservationStatus.DUPLICATE_OK:
-            if self.opinion is None:
-                raise ValueError("a DUPLICATE_OK outcome must carry the committed opinion")
-            if self.failure_class is not None:
-                raise ValueError("a DUPLICATE_OK outcome cannot carry a failure class")
-            if self.opinion.case_id != self.case_id:
-                raise ValueError("opinion case_id must match the call outcome")
-            if self.replay_divergence_detected:
-                raise ValueError(
-                    "a divergent replay is rejected, not recorded as a duplicate"
-                )
-            if not self.reported_provider or not self.reported_model:
-                raise ValueError("a duplicate outcome must record the served identity")
-        elif self.status in (ObservationStatus.FAILED, ObservationStatus.INVALID):
-            if self.failure_class is None:
-                raise ValueError(f"a {self.status.value} outcome requires a failure class")
-            if self.opinion is not None:
-                raise ValueError("a failed outcome cannot carry an opinion")
-        elif self.status is ObservationStatus.UNAVAILABLE:
-            if self.failure_class is not ProviderFailureClass.PROVIDER_UNAVAILABLE:
-                raise ValueError(
-                    "an UNAVAILABLE outcome must be classified PROVIDER_UNAVAILABLE"
-                )
-            if self.opinion is not None:
-                raise ValueError("an unavailable seat cannot carry an opinion")
-        elif self.status is ObservationStatus.SKIPPED_BUDGET:
-            if self.failure_class is not None:
-                raise ValueError("a budget skip is a policy outcome, not a failure")
-            if self.opinion is not None:
-                raise ValueError("a budget-skipped seat cannot carry an opinion")
-
-        if any(
-            value is None
-            for value in (
-                self.input_tokens,
-                self.output_tokens,
-                self.estimated_cost_microunits,
-            )
-        ) and self.cost_completeness is CostCompleteness.COMPLETE:
-            raise ValueError("COMPLETE cost requires tokens and cost to be present")
+        _validate_call_outcome_identity(self)
+        _validate_call_outcome_status(self)
 
     @property
     def is_independent_opinion(self) -> bool:

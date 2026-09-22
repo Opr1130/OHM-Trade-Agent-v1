@@ -58,6 +58,114 @@ SEALED_PREDICTION_IDENTITY_DOMAIN = "COMMITTEE-SEAL"
 OUTCOME_OBSERVATION_IDENTITY_DOMAIN = "COMMITTEE-OUTCOME-OBS"
 PROSPECTIVE_EVALUATION_IDENTITY_DOMAIN = "COMMITTEE-PROSPECTIVE-EVAL"
 
+#: Shared validation message so the horizon rule cannot drift.
+_HORIZON_MESSAGE = "horizon_seconds must be a positive integer"
+
+_SEALED_PREDICTION_REQUIRED_FIELDS = (
+    "case_id",
+    "experiment_id",
+    "case_outcome_id",
+    "evidence_snapshot_hash",
+    "committee_policy_version",
+)
+
+
+def _validate_sealed_prediction(prediction: "SealedPrediction") -> None:
+    """Validate the sealed T0 record, including its prospective-only phase."""
+    if type(prediction.schema_version) is not int or prediction.schema_version != (
+        SEALED_PREDICTION_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported SealedPrediction schema_version")
+    for field_name in _SEALED_PREDICTION_REQUIRED_FIELDS:
+        value = getattr(prediction, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ProspectivePolicyError(f"{field_name} is required")
+    if not isinstance(prediction.case_type, CaseType):
+        raise ProspectivePolicyError("invalid case_type")
+    if prediction.phase is not EvaluationPhase.PROSPECTIVE:
+        raise ProspectivePolicyError(
+            "a sealed prediction is prospective evidence; retrospective "
+            "evidence belongs to the bake-off path"
+        )
+    for field_name in ("evidence_cutoff_at", "sealed_at"):
+        object.__setattr__(
+            prediction,
+            field_name,
+            require_utc(getattr(prediction, field_name), field_name=field_name),
+        )
+    if prediction.sealed_at < prediction.evidence_cutoff_at:
+        raise ProspectivePolicyError(
+            "a prediction cannot be sealed before its evidence cutoff"
+        )
+    if (
+        type(prediction.sealed_seat_count) is not int
+        or prediction.sealed_seat_count < 0
+    ):
+        raise ProspectivePolicyError(
+            "sealed_seat_count must be a non-negative integer"
+        )
+    if len(prediction.sealed_opinion_hashes) != prediction.sealed_seat_count:
+        raise ProspectivePolicyError(
+            "sealed_seat_count must match the sealed opinion hashes"
+        )
+
+
+def _validate_outcome_references(observation: "OutcomeObservation") -> None:
+    for field_name in ("case_id", "outcome_source"):
+        value = getattr(observation, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ProspectivePolicyError(f"{field_name} is required")
+    if not observation.source_refs:
+        raise ProspectivePolicyError(
+            "an outcome observation must reference canonical evidence rather "
+            "than being recomputed"
+        )
+    for ref in observation.source_refs:
+        if not isinstance(ref, str) or not ref.strip():
+            raise ProspectivePolicyError("source_refs entries are required")
+
+
+def _validate_outcome_finality(observation: "OutcomeObservation") -> None:
+    if not isinstance(observation.finality, OutcomeFinality):
+        raise ProspectivePolicyError("invalid outcome finality")
+    if (
+        observation.finality is OutcomeFinality.PROVISIONAL
+        and not observation.incomplete_reason
+    ):
+        raise ProspectivePolicyError(
+            "a provisional outcome must state why it is not final"
+        )
+    if (
+        observation.finality is OutcomeFinality.FINAL
+        and observation.incomplete_reason
+    ):
+        raise ProspectivePolicyError(
+            "a final outcome cannot carry an incompleteness reason"
+        )
+
+
+def _validate_outcome_observation(observation: "OutcomeObservation") -> None:
+    """Validate a T1 outcome record, including its finality statement."""
+    if type(observation.schema_version) is not int or (
+        observation.schema_version != OUTCOME_OBSERVATION_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported OutcomeObservation schema_version")
+    _validate_outcome_references(observation)
+    object.__setattr__(
+        observation,
+        "observed_at",
+        require_utc(observation.observed_at, field_name="observed_at"),
+    )
+    if type(observation.horizon_seconds) is not int or observation.horizon_seconds < 1:
+        raise ProspectivePolicyError(_HORIZON_MESSAGE)
+    if observation.positive is not None and type(observation.positive) is not bool:
+        raise ProspectivePolicyError("positive must be a boolean or null")
+    if observation.realised_return_microunits is not None and (
+        type(observation.realised_return_microunits) is not int
+    ):
+        raise ProspectivePolicyError("realised_return_microunits must be an integer")
+    _validate_outcome_finality(observation)
+
 
 class OutcomeFinality(str, Enum):
     """Whether outcome evidence is complete and final.
@@ -101,47 +209,7 @@ class SealedPrediction:
     schema_version: int = SEALED_PREDICTION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != (
-            SEALED_PREDICTION_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported SealedPrediction schema_version")
-        for field_name in (
-            "case_id",
-            "experiment_id",
-            "case_outcome_id",
-            "evidence_snapshot_hash",
-            "committee_policy_version",
-        ):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ProspectivePolicyError(f"{field_name} is required")
-        if not isinstance(self.case_type, CaseType):
-            raise ProspectivePolicyError("invalid case_type")
-        if self.phase is not EvaluationPhase.PROSPECTIVE:
-            raise ProspectivePolicyError(
-                "a sealed prediction is prospective evidence; retrospective "
-                "evidence belongs to the bake-off path"
-            )
-        object.__setattr__(
-            self,
-            "evidence_cutoff_at",
-            require_utc(self.evidence_cutoff_at, field_name="evidence_cutoff_at"),
-        )
-        object.__setattr__(
-            self, "sealed_at", require_utc(self.sealed_at, field_name="sealed_at")
-        )
-        if self.sealed_at < self.evidence_cutoff_at:
-            raise ProspectivePolicyError(
-                "a prediction cannot be sealed before its evidence cutoff"
-            )
-        if type(self.sealed_seat_count) is not int or self.sealed_seat_count < 0:
-            raise ProspectivePolicyError(
-                "sealed_seat_count must be a non-negative integer"
-            )
-        if len(self.sealed_opinion_hashes) != self.sealed_seat_count:
-            raise ProspectivePolicyError(
-                "sealed_seat_count must match the sealed opinion hashes"
-            )
+        _validate_sealed_prediction(self)
 
     def identity_payload(self) -> dict[str, object]:
         return {
@@ -166,7 +234,7 @@ class SealedPrediction:
     def outcome_eligible_at(self, horizon_seconds: int) -> datetime:
         """The earliest instant at which this prediction may be judged."""
         if type(horizon_seconds) is not int or horizon_seconds < 1:
-            raise ProspectivePolicyError("horizon_seconds must be a positive integer")
+            raise ProspectivePolicyError(_HORIZON_MESSAGE)
         return self.evidence_cutoff_at + timedelta(seconds=horizon_seconds)
 
 
@@ -186,45 +254,7 @@ class OutcomeObservation:
     schema_version: int = OUTCOME_OBSERVATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != (
-            OUTCOME_OBSERVATION_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported OutcomeObservation schema_version")
-        for field_name in ("case_id", "outcome_source"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ProspectivePolicyError(f"{field_name} is required")
-        if not self.source_refs:
-            raise ProspectivePolicyError(
-                "an outcome observation must reference canonical evidence rather "
-                "than being recomputed"
-            )
-        for ref in self.source_refs:
-            if not isinstance(ref, str) or not ref.strip():
-                raise ProspectivePolicyError("source_refs entries are required")
-        if not isinstance(self.finality, OutcomeFinality):
-            raise ProspectivePolicyError("invalid outcome finality")
-        object.__setattr__(
-            self,
-            "observed_at",
-            require_utc(self.observed_at, field_name="observed_at"),
-        )
-        if type(self.horizon_seconds) is not int or self.horizon_seconds < 1:
-            raise ProspectivePolicyError("horizon_seconds must be a positive integer")
-        if self.positive is not None and type(self.positive) is not bool:
-            raise ProspectivePolicyError("positive must be a boolean or null")
-        if self.realised_return_microunits is not None and (
-            type(self.realised_return_microunits) is not int
-        ):
-            raise ProspectivePolicyError("realised_return_microunits must be an integer")
-        if self.finality is OutcomeFinality.PROVISIONAL and not self.incomplete_reason:
-            raise ProspectivePolicyError(
-                "a provisional outcome must state why it is not final"
-            )
-        if self.finality is OutcomeFinality.FINAL and self.incomplete_reason:
-            raise ProspectivePolicyError(
-                "a final outcome cannot carry an incompleteness reason"
-            )
+        _validate_outcome_observation(self)
 
     @property
     def is_final(self) -> bool:
@@ -338,7 +368,7 @@ class ProspectiveEvaluation:
                 require_utc(getattr(self, field_name), field_name=field_name),
             )
         if type(self.horizon_seconds) is not int or self.horizon_seconds < 1:
-            raise ProspectivePolicyError("horizon_seconds must be a positive integer")
+            raise ProspectivePolicyError(_HORIZON_MESSAGE)
         if self.observed_at < self.sealed_at:
             raise ProspectivePolicyError(
                 "an outcome observed before sealing is not a prospective outcome"
@@ -500,7 +530,7 @@ def assert_outcome_is_prospective(
             "the outcome was observed before the prediction was sealed"
         )
     if observation.horizon_seconds < 1:
-        raise ProspectivePolicyError("horizon_seconds must be a positive integer")
+        raise ProspectivePolicyError(_HORIZON_MESSAGE)
 
 
 def _score_seats(

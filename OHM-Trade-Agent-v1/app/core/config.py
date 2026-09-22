@@ -12,6 +12,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _DEFAULT_TRADINGVIEW_VERIFICATION_VALUE = "verified-by-trusted-proxy"
 _MIN_TRADINGVIEW_BEARER_LENGTH = 43
 
+#: Mode pattern for features that may only be off or shadow. Shared so the
+#: shadow-capable switches cannot drift apart.
+_OFF_SHADOW_MODE_PATTERN = r"^(off|shadow)$"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -65,7 +69,7 @@ class Settings(BaseSettings):
     # Invalid env values must fail Settings parsing (never silently become off).
     opip_canonical_writer_mode: str = Field(
         default="off",
-        pattern=r"^(off|shadow)$",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
     )
     # PR 3 feature bus capture. Default off. "shadow" persists market
     # observations, feature snapshots and checkpoints as canonical evidence
@@ -75,7 +79,7 @@ class Settings(BaseSettings):
     # Invalid env values must fail Settings parsing (never silently become off).
     opip_feature_bus_mode: str = Field(
         default="off",
-        pattern=r"^(off|shadow)$",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
     )
     # B/C-3 Paper v2 execution. Default off, and "active" is the only value that
     # enables it: activation is an explicit operator decision, so an unknown or
@@ -94,7 +98,7 @@ class Settings(BaseSettings):
     # must fail Settings parsing rather than silently enabling model spending.
     opip_committee_mode: str = Field(
         default="off",
-        pattern=r"^(off|shadow)$",
+        pattern=_OFF_SHADOW_MODE_PATTERN,
     )
     # Optional committee cost ceiling in microunits. Zero means "no declared
     # ceiling", and a seat is skipped once the declared ceiling would be

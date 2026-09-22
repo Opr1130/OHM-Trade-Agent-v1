@@ -342,13 +342,14 @@ def classification_report(pairs: Sequence[tuple[bool, bool]]) -> ClassificationR
         numerator=matrix.true_positive,
         denominator=matrix.true_positive + matrix.false_negative,
     )
-    if precision.applicable and recall.applicable and precision.decimal_value is not None:
-        assert recall.decimal_value is not None
-        combined = precision.decimal_value + recall.decimal_value
+    precision_value = precision.decimal_value if precision.applicable else None
+    recall_value = recall.decimal_value if recall.applicable else None
+    if precision_value is not None and recall_value is not None:
+        combined = precision_value + recall_value
         f1_value = (
             Decimal(0)
             if combined == 0
-            else (Decimal(2) * precision.decimal_value * recall.decimal_value) / combined
+            else (Decimal(2) * precision_value * recall_value) / combined
         )
         f1 = EvaluationMetric(
             name="f1",

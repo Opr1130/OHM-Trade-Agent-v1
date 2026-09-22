@@ -29,7 +29,7 @@ exactly the conflation the repository's statistical protocol forbids.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Mapping, Sequence
@@ -385,18 +385,93 @@ def _seat_verdict(
     )
 
 
+def _call_counts(verdicts: tuple[SeatVerdict, ...]) -> tuple[int, int, int, int]:
+    def _count(call: DirectionalCall) -> int:
+        return sum(1 for item in verdicts if item.call is call)
+
+    return (
+        _count(DirectionalCall.POSITIVE),
+        _count(DirectionalCall.NEGATIVE),
+        _count(DirectionalCall.ABSTAIN),
+        _count(DirectionalCall.UNAVAILABLE),
+    )
+
+
+def _directional(verdicts: tuple[SeatVerdict, ...]) -> list[SeatVerdict]:
+    return [
+        item
+        for item in verdicts
+        if item.call in (DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE)
+    ]
+
+
+def _contested_refs(directional: list[SeatVerdict]) -> tuple[str, ...]:
+    supported: set[str] = set()
+    contradicted: set[str] = set()
+    for item in directional:
+        supported |= set(item.supporting_evidence_refs)
+        contradicted |= set(item.contradicting_evidence_refs)
+    return tuple(sorted(supported & contradicted))
+
+
+def _assumption_sets(directional: list[SeatVerdict]) -> set[frozenset[str]]:
+    return {
+        frozenset(item.major_assumptions)
+        for item in directional
+        if item.major_assumptions
+    }
+
+
+def _confidence_spread(directional: list[SeatVerdict]) -> int | None:
+    confidences = [
+        item.confidence for item in directional if item.confidence is not None
+    ]
+    if len(confidences) < 2:
+        return None
+    return max(confidences) - min(confidences)
+
+
+def _primary_disagreement(
+    *,
+    directional: list[SeatVerdict],
+    supportive: int,
+    opposing: int,
+    spread: int | None,
+    conditions: set[DisagreementKind],
+) -> DisagreementKind:
+    """The most specific structural reading of the case."""
+    if not directional:
+        conditions.add(DisagreementKind.INSUFFICIENT_EVIDENCE)
+        return DisagreementKind.INSUFFICIENT_EVIDENCE
+    if supportive and opposing:
+        # A single dissent needs a majority to dissent from. A one-against-one
+        # reading is a split, not one model standing alone against the rest.
+        if min(supportive, opposing) == 1 and max(supportive, opposing) >= 2:
+            primary = DisagreementKind.SINGLE_MODEL_DISSENT
+        else:
+            primary = DisagreementKind.SPLIT_DECISION
+        conditions.add(primary)
+        return primary
+    conditions.add(DisagreementKind.UNANIMOUS_AGREEMENT)
+    if spread is not None and spread > CONFIDENCE_SPREAD_THRESHOLD:
+        conditions.add(DisagreementKind.DIRECTIONAL_AGREEMENT_CONFIDENCE_DISAGREEMENT)
+        return DisagreementKind.DIRECTIONAL_AGREEMENT_CONFIDENCE_DISAGREEMENT
+    for candidate in (
+        DisagreementKind.EVIDENCE_DISAGREEMENT,
+        DisagreementKind.ASSUMPTION_DISAGREEMENT,
+    ):
+        if candidate in conditions:
+            return candidate
+    return DisagreementKind.UNANIMOUS_AGREEMENT
+
+
 def build_disagreement_matrix(case: AttributionCase) -> DisagreementMatrix:
     """Read one case's dissent without averaging it away."""
     verdicts = tuple(
         _seat_verdict(seat, observed_positive=case.observed_positive)
         for seat in case.seats
     )
-    supportive = sum(1 for item in verdicts if item.call is DirectionalCall.POSITIVE)
-    opposing = sum(1 for item in verdicts if item.call is DirectionalCall.NEGATIVE)
-    abstained = sum(1 for item in verdicts if item.call is DirectionalCall.ABSTAIN)
-    unavailable = sum(
-        1 for item in verdicts if item.call is DirectionalCall.UNAVAILABLE
-    )
+    supportive, opposing, abstained, unavailable = _call_counts(verdicts)
     failed = sum(
         1
         for seat in case.seats
@@ -406,64 +481,29 @@ def build_disagreement_matrix(case: AttributionCase) -> DisagreementMatrix:
         1 for seat in case.seats if seat.status is ObservationStatus.INVALID
     )
     conditions: set[DisagreementKind] = set()
-    if failed:
-        conditions.add(DisagreementKind.PROVIDER_FAILURE_PRESENT)
-    if invalid:
-        conditions.add(DisagreementKind.SCHEMA_INVALID_PRESENT)
-    if unavailable:
-        conditions.add(DisagreementKind.SEAT_UNAVAILABLE_PRESENT)
+    for count, kind in (
+        (failed, DisagreementKind.PROVIDER_FAILURE_PRESENT),
+        (invalid, DisagreementKind.SCHEMA_INVALID_PRESENT),
+        (unavailable, DisagreementKind.SEAT_UNAVAILABLE_PRESENT),
+    ):
+        if count:
+            conditions.add(kind)
 
-    directional = [item for item in verdicts if item.call in (
-        DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE
-    )]
-    supported: set[str] = set()
-    contradicted: set[str] = set()
-    for item in directional:
-        supported |= set(item.supporting_evidence_refs)
-        contradicted |= set(item.contradicting_evidence_refs)
-    contested = tuple(sorted(supported & contradicted))
+    directional = _directional(verdicts)
+    contested = _contested_refs(directional)
     if contested:
         conditions.add(DisagreementKind.EVIDENCE_DISAGREEMENT)
-
-    assumptions = {
-        frozenset(item.major_assumptions)
-        for item in directional
-        if item.major_assumptions
-    }
-    if len(assumptions) > 1:
+    if len(_assumption_sets(directional)) > 1:
         conditions.add(DisagreementKind.ASSUMPTION_DISAGREEMENT)
 
-    confidences = [
-        item.confidence for item in directional if item.confidence is not None
-    ]
-    spread = max(confidences) - min(confidences) if len(confidences) > 1 else None
-
-    if len(directional) < 1:
-        primary = DisagreementKind.INSUFFICIENT_EVIDENCE
-        conditions.add(DisagreementKind.INSUFFICIENT_EVIDENCE)
-    elif supportive and opposing:
-        # A single dissent needs a majority to dissent from. A one-against-one
-        # reading is a split, not one model standing alone against the rest.
-        if min(supportive, opposing) == 1 and max(supportive, opposing) >= 2:
-            primary = DisagreementKind.SINGLE_MODEL_DISSENT
-        else:
-            primary = DisagreementKind.SPLIT_DECISION
-        conditions.add(primary)
-    else:
-        conditions.add(DisagreementKind.UNANIMOUS_AGREEMENT)
-        if spread is not None and spread > CONFIDENCE_SPREAD_THRESHOLD:
-            conditions.add(
-                DisagreementKind.DIRECTIONAL_AGREEMENT_CONFIDENCE_DISAGREEMENT
-            )
-            primary = (
-                DisagreementKind.DIRECTIONAL_AGREEMENT_CONFIDENCE_DISAGREEMENT
-            )
-        elif DisagreementKind.EVIDENCE_DISAGREEMENT in conditions:
-            primary = DisagreementKind.EVIDENCE_DISAGREEMENT
-        elif DisagreementKind.ASSUMPTION_DISAGREEMENT in conditions:
-            primary = DisagreementKind.ASSUMPTION_DISAGREEMENT
-        else:
-            primary = DisagreementKind.UNANIMOUS_AGREEMENT
+    spread = _confidence_spread(directional)
+    primary = _primary_disagreement(
+        directional=directional,
+        supportive=supportive,
+        opposing=opposing,
+        spread=spread,
+        conditions=conditions,
+    )
 
     return DisagreementMatrix(
         case_id=case.case_id,
@@ -596,6 +636,84 @@ def _committee_accuracy(cases: Sequence[AttributionCase]) -> EvaluationMetric:
     return _accuracy(scored, correct, name="committee_accuracy")
 
 
+@dataclass
+class _ProviderAccumulator:
+    """Mutable tally for one provider while its cases are walked."""
+
+    scored: int = 0
+    correct: int = 0
+    abstained: int = 0
+    failed: int = 0
+    agree_cases: int = 0
+    agree_correct: int = 0
+    disagree_cases: int = 0
+    disagree_correct: int = 0
+    incremental: int = 0
+    contested_scored: int = 0
+    contested_correct: int = 0
+    known_cost_microunits: int | None = 0
+    unknown_cost_samples: int = 0
+    by_type: dict[CaseType, list[int]] = field(default_factory=dict)
+
+    def add_cost(self, cost: int | None) -> None:
+        """Track spend, staying unknown if any single sample is unknown."""
+        if cost is None:
+            self.unknown_cost_samples += 1
+            self.known_cost_microunits = None
+        elif self.known_cost_microunits is not None:
+            self.known_cost_microunits += cost
+
+    def add_call(self, verdict: SeatVerdict, seat: ProviderCallOutcome) -> None:
+        if verdict.call is DirectionalCall.ABSTAIN:
+            self.abstained += 1
+        if seat.status in (ObservationStatus.FAILED, ObservationStatus.INVALID):
+            self.failed += 1
+
+    def add_scored(self, case_type: CaseType, *, correct: bool) -> None:
+        self.scored += 1
+        counts = self.by_type.setdefault(case_type, [0, 0])
+        counts[0] += 1
+        if correct:
+            self.correct += 1
+            counts[1] += 1
+
+    def add_contested(self, *, correct: bool) -> None:
+        self.contested_scored += 1
+        if correct:
+            self.contested_correct += 1
+
+    def add_baseline_relation(self, case: AttributionCase, verdict: SeatVerdict) -> None:
+        """Compare against the deterministic baseline, or record unavailability."""
+        if case.baseline_positive is None:
+            return
+        agrees = (verdict.call is DirectionalCall.POSITIVE) == case.baseline_positive
+        if agrees:
+            self.agree_cases += 1
+            if verdict.correct:
+                self.agree_correct += 1
+            return
+        self.disagree_cases += 1
+        if verdict.correct:
+            self.disagree_correct += 1
+            # Independent and right where the baseline was wrong: the only
+            # configuration that demonstrates added information.
+            if case.baseline_positive != case.observed_positive:
+                self.incremental += 1
+
+
+def _seat_for(
+    case: AttributionCase, *, family: ProviderFamily, model: str
+) -> ProviderCallOutcome | None:
+    return next(
+        (
+            item
+            for item in case.seats
+            if item.provider_family is family and item.requested_model == model
+        ),
+        None,
+    )
+
+
 def _provider_attribution(
     cases: Sequence[AttributionCase],
     matrices: Mapping[str, DisagreementMatrix],
@@ -603,89 +721,46 @@ def _provider_attribution(
     family: ProviderFamily,
     model: str,
 ) -> ProviderAttribution:
-    scored = correct = abstained = failed = 0
-    agree_cases = agree_correct = 0
-    disagree_cases = disagree_correct = 0
-    incremental = 0
-    contested_scored = contested_correct = 0
-    by_type: dict[CaseType, list[int]] = {}
-    known_cost: int | None = 0
-    unknown_cost = 0
-
+    tally = _ProviderAccumulator()
     for case in cases:
-        seat = next(
-            (
-                item
-                for item in case.seats
-                if item.provider_family is family and item.requested_model == model
-            ),
-            None,
-        )
+        seat = _seat_for(case, family=family, model=model)
         if seat is None:
             continue
+        tally.add_cost(seat.estimated_cost_microunits)
         verdict = _seat_verdict(seat, observed_positive=case.observed_positive)
-        if seat.estimated_cost_microunits is None:
-            unknown_cost += 1
-            known_cost = None
-        elif known_cost is not None:
-            known_cost += seat.estimated_cost_microunits
-
-        if verdict.call is DirectionalCall.ABSTAIN:
-            abstained += 1
-        if seat.status is not None and seat.status.value in {"FAILED", "INVALID"}:
-            failed += 1
-
+        tally.add_call(verdict, seat)
         if verdict.correct is None:
             continue
-        scored += 1
-        by_type.setdefault(case.case_type, [0, 0])[0] += 1
-        if verdict.correct:
-            correct += 1
-            by_type[case.case_type][1] += 1
-
-        matrix = matrices[case.case_id]
-        if matrix.is_contested:
-            contested_scored += 1
-            if verdict.correct:
-                contested_correct += 1
-
-        if case.baseline_positive is None:
-            continue
-        agrees = (verdict.call is DirectionalCall.POSITIVE) == case.baseline_positive
-        if not agrees:
-            disagree_cases += 1
-            if verdict.correct:
-                disagree_correct += 1
-            # Independent and right where the baseline was wrong: this is the
-            # only configuration that demonstrates added information.
-            if verdict.correct and (case.baseline_positive != case.observed_positive):
-                incremental += 1
-        else:
-            agree_cases += 1
-            if verdict.correct:
-                agree_correct += 1
+        tally.add_scored(case.case_type, correct=verdict.correct)
+        if matrices[case.case_id].is_contested:
+            tally.add_contested(correct=verdict.correct)
+        tally.add_baseline_relation(case, verdict)
 
     return ProviderAttribution(
         provider_family=family,
         model=model,
-        scored_cases=scored,
-        correct_cases=correct,
-        abstained_cases=abstained,
-        failed_cases=failed,
-        accuracy=_accuracy(scored, correct, name="accuracy"),
-        baseline_agreements=agree_cases,
-        baseline_disagreements=disagree_cases,
+        scored_cases=tally.scored,
+        correct_cases=tally.correct,
+        abstained_cases=tally.abstained,
+        failed_cases=tally.failed,
+        accuracy=_accuracy(tally.scored, tally.correct, name="accuracy"),
+        baseline_agreements=tally.agree_cases,
+        baseline_disagreements=tally.disagree_cases,
         accuracy_when_agreeing_with_baseline=_accuracy(
-            agree_cases, agree_correct, name="accuracy_when_agreeing_with_baseline"
+            tally.agree_cases,
+            tally.agree_correct,
+            name="accuracy_when_agreeing_with_baseline",
         ),
         accuracy_when_disagreeing_with_baseline=_accuracy(
-            disagree_cases,
-            disagree_correct,
+            tally.disagree_cases,
+            tally.disagree_correct,
             name="accuracy_when_disagreeing_with_baseline",
         ),
-        independent_incremental_correct=incremental,
+        independent_incremental_correct=tally.incremental,
         accuracy_when_contested=_accuracy(
-            contested_scored, contested_correct, name="accuracy_when_contested"
+            tally.contested_scored,
+            tally.contested_correct,
+            name="accuracy_when_contested",
         ),
         accuracy_by_case_type=tuple(
             CaseTypeAccuracy(
@@ -697,63 +772,83 @@ def _provider_attribution(
                 ),
             )
             for case_type, counts in sorted(
-                by_type.items(), key=lambda item: item[0].value
+                tally.by_type.items(), key=lambda item: item[0].value
             )
         ),
-        known_cost_microunits=known_cost,
-        unknown_cost_samples=unknown_cost,
+        known_cost_microunits=tally.known_cost_microunits,
+        unknown_cost_samples=tally.unknown_cost_samples,
     )
 
 
-def _committee_increment(cases: Sequence[AttributionCase]) -> CommitteeIncrement:
-    baseline_scored = baseline_correct = 0
-    committee_scored = committee_correct = 0
-    both_correct = both_wrong = only_committee = only_baseline = 0
-    for case in cases:
-        if case.observed_positive is None:
-            continue
-        call = committee_research_call(case)
-        if call not in (DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE):
-            continue
-        committee_scored += 1
-        committee_right = (
-            call is DirectionalCall.POSITIVE
-        ) == case.observed_positive
-        if committee_right:
-            committee_correct += 1
-        if case.baseline_positive is None:
-            continue
-        baseline_scored += 1
-        baseline_right = case.baseline_positive == case.observed_positive
-        if baseline_right:
-            baseline_correct += 1
+@dataclass
+class _IncrementTally:
+    """Paired baseline/committee tallies over the shared case set."""
+
+    baseline_scored: int = 0
+    baseline_correct: int = 0
+    committee_scored: int = 0
+    committee_correct: int = 0
+    both_correct: int = 0
+    both_wrong: int = 0
+    only_committee_correct: int = 0
+    only_baseline_correct: int = 0
+
+    def add(self, *, committee_right: bool, baseline_right: bool) -> None:
         if committee_right and baseline_right:
-            both_correct += 1
-        elif not committee_right and not baseline_right:
-            both_wrong += 1
+            self.both_correct += 1
         elif committee_right:
-            only_committee += 1
+            self.only_committee_correct += 1
+        elif baseline_right:
+            self.only_baseline_correct += 1
         else:
-            only_baseline += 1
+            self.both_wrong += 1
+
+
+def _increment_case(case: AttributionCase, tally: _IncrementTally) -> None:
+    """Record one case's paired outcome, skipping anything unscoreable."""
+    if case.observed_positive is None:
+        return
+    call = committee_research_call(case)
+    if call not in (DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE):
+        return
+    tally.committee_scored += 1
+    committee_right = (call is DirectionalCall.POSITIVE) == case.observed_positive
+    if committee_right:
+        tally.committee_correct += 1
+    if case.baseline_positive is None:
+        return
+    tally.baseline_scored += 1
+    baseline_right = case.baseline_positive == case.observed_positive
+    if baseline_right:
+        tally.baseline_correct += 1
+    tally.add(committee_right=committee_right, baseline_right=baseline_right)
+
+
+def _committee_increment(cases: Sequence[AttributionCase]) -> CommitteeIncrement:
+    tally = _IncrementTally()
+    for case in cases:
+        _increment_case(case, tally)
     return CommitteeIncrement(
-        baseline_scored=baseline_scored,
-        baseline_correct=baseline_correct,
-        committee_scored=committee_scored,
-        committee_correct=committee_correct,
-        both_correct=both_correct,
-        both_wrong=both_wrong,
-        only_committee_correct=only_committee,
-        only_baseline_correct=only_baseline,
+        baseline_scored=tally.baseline_scored,
+        baseline_correct=tally.baseline_correct,
+        committee_scored=tally.committee_scored,
+        committee_correct=tally.committee_correct,
+        both_correct=tally.both_correct,
+        both_wrong=tally.both_wrong,
+        only_committee_correct=tally.only_committee_correct,
+        only_baseline_correct=tally.only_baseline_correct,
         committee_accuracy=_accuracy(
-            committee_scored, committee_correct, name="committee_accuracy"
+            tally.committee_scored, tally.committee_correct, name="committee_accuracy"
         ),
         baseline_accuracy=_accuracy(
-            baseline_scored, baseline_correct, name="baseline_accuracy"
+            tally.baseline_scored, tally.baseline_correct, name="baseline_accuracy"
         ),
         incremental_accuracy=rate_metric(
             "incremental_accuracy",
-            numerator=only_committee - only_baseline,
-            denominator=max(baseline_scored, committee_scored),
+            numerator=(
+                tally.only_committee_correct - tally.only_baseline_correct
+            ),
+            denominator=max(tally.baseline_scored, tally.committee_scored),
         ),
     )
 

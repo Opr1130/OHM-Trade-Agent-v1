@@ -34,6 +34,9 @@ from app.opip.decision_intelligence.serialization import require_utc
 _UTC_OFFSET = "+00:00"
 _UTC_Z = "Z"
 
+#: Shared validation message for persisted provenance rows.
+_PROVENANCE_MESSAGE = "provenance must be an object"
+
 _CALL_OUTCOME_FIELDS = frozenset(
     {
         "schema_version",
@@ -377,7 +380,7 @@ def case_outcome_from_dict(row: Mapping[str, Any]) -> CommitteeCaseOutcome:
     _reject_unknown(row, _CASE_OUTCOME_FIELDS, kind="case outcome")
     provenance_row = row.get("provenance")
     if not isinstance(provenance_row, Mapping):
-        raise CommitteeSerializationError("provenance must be an object")
+        raise CommitteeSerializationError(_PROVENANCE_MESSAGE)
     _reject_unknown(provenance_row, _PROVENANCE_FIELDS, kind="provenance")
     raw_outcomes = row.get("outcomes")
     if not isinstance(raw_outcomes, list):
@@ -721,7 +724,7 @@ def evaluation_report_from_dict(row: Mapping[str, Any]):
     _reject_unknown(row, _REPORT_FIELDS, kind="evaluation report")
     provenance_row = row.get("provenance")
     if not isinstance(provenance_row, Mapping):
-        raise CommitteeSerializationError("provenance must be an object")
+        raise CommitteeSerializationError(_PROVENANCE_MESSAGE)
     _reject_unknown(provenance_row, _PROVENANCE_FIELDS, kind="provenance")
     raw_arms = row.get("arms")
     if not isinstance(raw_arms, list):
@@ -861,7 +864,7 @@ def _decode_provenance(row: Mapping[str, Any]):
     from app.opip.decision_intelligence.identity import Provenance
 
     if not isinstance(row, Mapping):
-        raise CommitteeSerializationError("provenance must be an object")
+        raise CommitteeSerializationError(_PROVENANCE_MESSAGE)
     _reject_unknown(row, _PROVENANCE_FIELDS, kind="provenance")
     return Provenance(
         schema_version=row.get("schema_version"),

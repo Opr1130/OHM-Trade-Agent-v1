@@ -375,7 +375,6 @@ class CommitteeRunner:
             return self._failure_outcome(
                 case=case,
                 family=family,
-                provider=provider,
                 wire=wire,
                 input_hash=input_hash,
                 attempt=attempt,
@@ -390,7 +389,6 @@ class CommitteeRunner:
             return self._failure_outcome(
                 case=case,
                 family=family,
-                provider=provider,
                 wire=wire,
                 input_hash=input_hash,
                 attempt=attempt,
@@ -429,7 +427,6 @@ class CommitteeRunner:
             return self._failure_outcome(
                 case=case,
                 family=family,
-                provider=provider,
                 wire=wire,
                 input_hash=input_hash,
                 attempt=attempt,
@@ -453,7 +450,6 @@ class CommitteeRunner:
             return self._failure_outcome(
                 case=case,
                 family=family,
-                provider=provider,
                 wire=wire,
                 input_hash=input_hash,
                 attempt=attempt,
@@ -547,7 +543,6 @@ class CommitteeRunner:
         *,
         case: CommitteeCase,
         family: ProviderFamily,
-        provider: CommitteeProvider,
         wire: ProviderWireRequest,
         input_hash: str,
         attempt: int,

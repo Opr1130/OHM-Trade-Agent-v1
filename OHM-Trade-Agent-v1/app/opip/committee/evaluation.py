@@ -78,6 +78,9 @@ ADEQUACY_INSUFFICIENT_SAMPLE = "INSUFFICIENT_SAMPLE"
 
 REPORT_IDENTITY_DOMAIN = "COMMITTEE-EVALUATION"
 
+#: Shared validation message so the contract wording cannot drift.
+_CASE_ID_MESSAGE = "case_id is required"
+
 
 class ArmKind(str, Enum):
     """What kind of comparator an arm is.
@@ -112,7 +115,7 @@ class ResolvedOutcome:
 
     def __post_init__(self) -> None:
         if not isinstance(self.case_id, str) or not self.case_id.strip():
-            raise ValueError("case_id is required")
+            raise ValueError(_CASE_ID_MESSAGE)
         if type(self.positive) is not bool:
             raise ValueError("positive must be a boolean")
         object.__setattr__(
@@ -131,7 +134,7 @@ class BaselineCall:
 
     def __post_init__(self) -> None:
         if not isinstance(self.case_id, str) or not self.case_id.strip():
-            raise ValueError("case_id is required")
+            raise ValueError(_CASE_ID_MESSAGE)
         if type(self.positive) is not bool:
             raise ValueError("positive must be a boolean")
 
@@ -189,7 +192,7 @@ class CaseObservation:
 
     def __post_init__(self) -> None:
         if not isinstance(self.case_id, str) or not self.case_id.strip():
-            raise ValueError("case_id is required")
+            raise ValueError(_CASE_ID_MESSAGE)
         if not isinstance(self.case_type, CaseType):
             raise ValueError("invalid case_type")
         if not isinstance(self.seats, tuple):
