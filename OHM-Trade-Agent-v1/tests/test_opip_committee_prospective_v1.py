@@ -11,6 +11,7 @@ or retroactively flatter what the committee said at T0.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 
 import pytest
 
@@ -30,6 +31,7 @@ from app.opip.committee.contracts import (
     CostCompleteness,
 )
 from app.opip.committee.evaluation import DirectionalCall
+from app.opip.committee.evidence import build_evidence_item, build_evidence_snapshot
 from app.opip.committee.prospective import (
     HindsightLeakageError,
     OutcomeFinality,
@@ -37,6 +39,7 @@ from app.opip.committee.prospective import (
     ProspectivePolicyError,
     SealedPrediction,
     assert_outcome_is_prospective,
+    awaiting_evaluation,
     awaiting_outcome,
     evaluate_prospective,
     prospective_observability_counts,
@@ -67,6 +70,29 @@ OBSERVED_AT = CUTOFF + timedelta(seconds=HORIZON)
 EVALUATED_AT = OBSERVED_AT + timedelta(minutes=5)
 CASE_ID = "case-1"
 EXPERIMENT_ID = "prospective-exp-1"
+
+
+def _snapshot(*, cutoff=CUTOFF):
+    """The authenticated T0 evidence snapshot the committee actually ran on."""
+    return build_evidence_snapshot(
+        case_id=CASE_ID,
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=cutoff,
+        assembled_at=cutoff + timedelta(seconds=10),
+        items=(
+            build_evidence_item(
+                evidence_id="E1",
+                source_id="market-observation",
+                available_at=cutoff - timedelta(minutes=10),
+                payload={"metric_name": "close", "metric_value": "100"},
+                evidence_cutoff_at=cutoff,
+            ),
+        ),
+        source_refs=("snapshot-ref-1",),
+        committee_policy_version="committee-policy-v1",
+        prompt_template_id="committee.opinion.v1",
+        prompt_version="3",
+    )
 
 
 def _provenance() -> Provenance:
@@ -150,7 +176,7 @@ def _seat(
 def _case_outcome(*seats: ProviderCallOutcome, completed_at=None) -> CommitteeCaseOutcome:
     return CommitteeCaseOutcome(
         case_id=CASE_ID,
-        evidence_snapshot_hash="COMMITTEE-EVIDENCE:abc123",
+        evidence_snapshot_hash=_snapshot().snapshot_hash,
         committee_policy_version="committee-policy-v1",
         phase=EvaluationPhase.PROSPECTIVE,
         started_at=CUTOFF - timedelta(minutes=5),
@@ -164,7 +190,7 @@ def _prediction(case_outcome=None, **overrides) -> SealedPrediction:
     case_outcome = case_outcome or _case_outcome()
     values = {
         "case_outcome": case_outcome,
-        "evidence_cutoff_at": CUTOFF,
+        "evidence_snapshot": _snapshot(),
         "sealed_at": SEALED_AT,
         "experiment_id": EXPERIMENT_ID,
         "provenance": _provenance(),
@@ -415,8 +441,9 @@ def test_prospective_evaluation_cannot_carry_a_retrospective_phase():
         for field in evaluation.__dataclass_fields__
     }
     retrospective_fields["phase"] = EvaluationPhase.RETROSPECTIVE
+    evaluation_type = type(evaluation)
     with pytest.raises(ProspectivePolicyError):
-        type(evaluation)(**retrospective_fields)
+        evaluation_type(**retrospective_fields)
 
 
 def test_evaluation_time_cannot_precede_the_outcome():
@@ -511,9 +538,8 @@ def test_non_directional_outcome_yields_not_applicable_metrics_not_zero():
 
 def test_awaiting_outcome_tracks_unjoined_seals():
     prediction = _prediction()
-    assert awaiting_outcome(predictions=(prediction,), observations=()) == (
-        prediction,
-    )
+    # A seal with no recorded evaluation is unresolved.
+    assert awaiting_outcome(predictions=(prediction,)) == (prediction,)
 
     evaluation = evaluate_prospective(
         prediction=prediction,
@@ -524,9 +550,28 @@ def test_awaiting_outcome_tracks_unjoined_seals():
     )
     assert awaiting_outcome(
         predictions=(prediction,),
-        observations=(_observation(),),
         evaluations=(evaluation,),
     ) == ()
+
+
+def test_an_observed_but_unevaluated_prediction_stays_visible():
+    """A failed T2 must not silently drop the prediction from the pending set."""
+    prediction = _prediction()
+    observation = _observation()
+
+    # The outcome was observed, but evaluation never completed or was not
+    # persisted. The prediction must remain visible as pending evaluation rather
+    # than disappearing from operational counters.
+    assert awaiting_outcome(predictions=(prediction,)) == (prediction,)
+
+    counts = prospective_observability_counts(
+        predictions=(prediction,),
+        observations=(observation,),
+        evaluations=(),
+    )
+    assert counts["awaiting_outcome"] == 1
+    assert counts["awaiting_evaluation"] == 1
+    assert counts["unresolved_predictions"] == 1
 
 
 def test_observability_counts_distinguish_final_from_provisional():
@@ -569,6 +614,10 @@ def test_awaiting_outcome_ignores_an_already_evaluated_prediction():
         provenance=_provenance(),
     )
     assert awaiting_outcome(
+        predictions=(prediction,),
+        evaluations=(evaluation,),
+    ) == ()
+    assert awaiting_evaluation(
         predictions=(prediction,),
         observations=(observation,),
         evaluations=(evaluation,),
@@ -689,7 +738,7 @@ def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
     with pytest.raises(ProspectivePolicyError):
         seal_prediction(
             case_outcome=retrospective,
-            evidence_cutoff_at=CUTOFF,
+            evidence_snapshot=_snapshot(),
             sealed_at=SEALED_AT,
             experiment_id=EXPERIMENT_ID,
             provenance=retrospective_seal,
@@ -709,3 +758,123 @@ def test_outcome_identity_covers_every_field_that_changes_its_meaning():
     assert provisional.observation_id != base.observation_id
     # Identical content still collapses to one identity.
     assert _observation().observation_id == base.observation_id
+
+
+# ------------------------------- review findings (evidence integrity)
+
+
+def test_sealing_derives_the_cutoff_from_the_authenticated_snapshot():
+    """A caller cannot substitute an earlier cutoff than the snapshot used."""
+    # A snapshot built on an *earlier* cutoff has a different hash, so it cannot
+    # stand in for the one the committee actually ran on.
+    earlier = _snapshot(cutoff=CUTOFF - timedelta(hours=6))
+    case_outcome = _case_outcome()
+    provenance = _provenance()
+    with pytest.raises(ProspectivePolicyError):
+        seal_prediction(
+            case_outcome=case_outcome,
+            evidence_snapshot=earlier,
+            sealed_at=SEALED_AT,
+            experiment_id=EXPERIMENT_ID,
+            provenance=provenance,
+            case_type=CaseType.MARKET_OPPORTUNITY,
+        )
+
+
+def test_sealing_rejects_a_snapshot_for_another_case():
+    other = build_evidence_snapshot(
+        case_id="some-other-case",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        evidence_cutoff_at=CUTOFF,
+        assembled_at=CUTOFF + timedelta(seconds=10),
+        items=(
+            build_evidence_item(
+                evidence_id="E1",
+                source_id="market-observation",
+                available_at=CUTOFF - timedelta(minutes=10),
+                payload={"metric_name": "close", "metric_value": "100"},
+                evidence_cutoff_at=CUTOFF,
+            ),
+        ),
+        source_refs=("ref",),
+        committee_policy_version="committee-policy-v1",
+        prompt_template_id="committee.opinion.v1",
+        prompt_version="3",
+    )
+    provenance = _provenance()
+    with pytest.raises(ProspectivePolicyError):
+        seal_prediction(
+            case_outcome=_case_outcome(),
+            evidence_snapshot=other,
+            sealed_at=SEALED_AT,
+            experiment_id=EXPERIMENT_ID,
+            provenance=provenance,
+            case_type=CaseType.MARKET_OPPORTUNITY,
+        )
+
+
+def test_the_sealed_cutoff_equals_the_snapshot_cutoff():
+    prediction = _prediction()
+    assert prediction.evidence_cutoff_at == _snapshot().evidence_cutoff_at
+    assert prediction.evidence_cutoff_at == CUTOFF
+
+
+def test_evaluation_identity_covers_finality_metrics_and_counts():
+    """A changed result must change the identity, not reuse the original id."""
+    evaluation = evaluate_prospective(
+        prediction=_prediction(),
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+    )
+    payload = evaluation.identity_payload()
+    assert payload["seat_counts"] == (
+        evaluation.scored_seats,
+        evaluation.abstained_seats,
+        evaluation.unavailable_seats,
+        evaluation.unscored_directional_seats,
+    )
+    assert tuple(metric[0] for metric in payload["metrics"]) == (
+        "precision",
+        "recall",
+        "f1",
+        "accuracy",
+    )
+    # The per-seat final flag is part of the identity, not just the verdict.
+    assert all(score[4] is True for score in payload["seat_scores"])
+
+    # Rebinding finality must yield a different identity.
+    provisional = replace(
+        evaluation,
+        finality=OutcomeFinality.PROVISIONAL,
+        seat_scores=tuple(
+            replace(score, final=False) for score in evaluation.seat_scores
+        ),
+    )
+    assert provisional.evaluation_id != evaluation.evaluation_id
+
+
+def test_a_lost_prospective_index_is_rebuilt_with_evaluation_ids(tmp_path):
+    """Rebuilding must index evaluation ids, or a redelivery duplicates a row."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    prediction = _prediction()
+    observation = _observation()
+    evaluation = evaluate_prospective(
+        prediction=prediction,
+        case_outcome=_case_outcome(),
+        observation=observation,
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+    )
+    store.append_sealed_prediction(prediction)
+    store.append_outcome_observation(observation)
+    assert store.append_prospective_evaluation(evaluation).reason == REASON_STORED
+
+    store.prospective_index_file.unlink()
+
+    result = store.append_prospective_evaluation(evaluation)
+    assert result.stored is False
+    assert result.reason == REASON_DUPLICATE
+    assert result.record_id == evaluation.evaluation_id
+    assert len(list(store.iter_prospective_evaluations())) == 1

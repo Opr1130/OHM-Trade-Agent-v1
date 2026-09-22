@@ -24,6 +24,7 @@ from app.opip.committee.contracts import (
     ProviderCallOutcome,
 )
 from app.opip.committee.ledger import COMMITTED_STATUSES
+from app.opip.committee.runtime import CommitteeReplayDivergenceError
 from app.opip.committee.serialization import (
     attribution_report_from_dict,
     attribution_report_to_dict,
@@ -100,6 +101,29 @@ def _parse_prospective_line(line: bytes):
 
 def _parse_attribution_line(line: bytes):
     return attribution_report_from_dict(parse_json_object_line(line))
+
+
+def _prospective_record_id(row: Any) -> str | None:
+    """The durable id of one prospective record, chosen by its record type.
+
+    A ``ProspectiveEvaluation`` carries both a ``prediction_id`` and an
+    ``evaluation_id``, so an attribute-presence chain would always select the
+    prediction id and the evaluation ids would never be indexed. Selecting by
+    record type keeps every evaluation reachable for duplicate detection.
+    """
+    from app.opip.committee.prospective import (
+        OutcomeObservation,
+        ProspectiveEvaluation,
+        SealedPrediction,
+    )
+
+    if isinstance(row, SealedPrediction):
+        return row.prediction_id
+    if isinstance(row, OutcomeObservation):
+        return row.observation_id
+    if isinstance(row, ProspectiveEvaluation):
+        return row.evaluation_id
+    return None
 
 
 class CommitteeEvidenceStore:
@@ -318,15 +342,14 @@ class CommitteeEvidenceStore:
         return ids
 
     def _rebuild_prospective_ids(self) -> set[str]:
-        ids: set[str] = set()
-        for row in self.iter_prospective_records():
-            record_id = (
-                getattr(row, "prediction_id", None)
-                or getattr(row, "observation_id", None)
-                or getattr(row, "evaluation_id", None)
+        ids = {
+            record_id
+            for record_id in (
+                _prospective_record_id(row)
+                for row in self.iter_prospective_records()
             )
-            if isinstance(record_id, str):
-                ids.add(record_id)
+            if record_id is not None
+        }
         if ids:
             logger.warning(
                 "O'Pip committee prospective index rebuilt from the durable log "
@@ -412,18 +435,15 @@ class CommitteeEvidenceStore:
 
     def iter_prospective_records(self, *, include_archive: bool = True) -> Iterator[Any]:
         # Keyed by record type as well as id: a prediction and its evaluation
-        # legitimately share the prediction_id, so id alone would collapse them.
+        # legitimately share the prediction_id, and two evaluations of the same
+        # prediction are distinct records, so id alone would collapse them.
         seen: set[tuple[str, str]] = set()
         rows: list[Any] = []
         if include_archive:
             rows.extend(self._prospective.iter_archive_rows())
         rows.extend(self._prospective.iter_hot_rows())
         for row in rows:
-            record_id = (
-                getattr(row, "prediction_id", None)
-                or getattr(row, "observation_id", None)
-                or getattr(row, "evaluation_id", None)
-            )
+            record_id = _prospective_record_id(row)
             key = (type(row).__name__, str(record_id))
             if key in seen:
                 continue
@@ -503,10 +523,31 @@ class CommitteeEvidenceStore:
     # --------------------------------------------------------------- helpers
 
     def _load_call_index(self) -> dict[str, _CommittedIndexEntry]:
+        """Return the committed-call index, reconciled against the durable log.
+
+        The sidecar is a cache, never the authority. A missing, empty, stale, or
+        partially-written sidecar must not cause an existing logical observation
+        to look new, because that would append a duplicate - or admit a divergent
+        opinion - and repoint the sidecar at it. The durable log is therefore
+        scanned and the sidecar is reconciled to it on every load.
+        """
+        stored = self._parse_call_index()
+        rebuilt = self._rebuild_call_index()
+        if rebuilt != stored:
+            self._save_call_index(rebuilt)
+            logger.warning(
+                "O'Pip committee call index reconciled from the durable log "
+                "(stored=%d, durable=%d); durable evidence is authoritative",
+                len(stored),
+                len(rebuilt),
+            )
+        return rebuilt
+
+    def _parse_call_index(self) -> dict[str, _CommittedIndexEntry]:
         raw = self._load_index_payload(self.calls_index_file)
         entries = raw.get("entries")
         if not isinstance(entries, Mapping):
-            return self._rebuild_call_index()
+            return {}
         parsed: dict[str, _CommittedIndexEntry] = {}
         for key, value in entries.items():
             if not isinstance(key, str) or not isinstance(value, Mapping):
@@ -517,12 +558,7 @@ class CommitteeEvidenceStore:
                 parsed[key] = _CommittedIndexEntry(
                     outcome_id=outcome_id, opinion_hash=opinion_hash
                 )
-        if parsed:
-            return parsed
-        # An empty index beside a non-empty durable log means the index was lost.
-        # Rebuilding from the log is what keeps a re-delivered observation from
-        # being appended a second time as a fresh opinion.
-        return self._rebuild_call_index()
+        return parsed
 
     def _rebuild_call_index(self) -> dict[str, _CommittedIndexEntry]:
         rebuilt: dict[str, _CommittedIndexEntry] = {}
@@ -538,12 +574,6 @@ class CommitteeEvidenceStore:
                         opinion_hash=outcome.opinion.opinion_hash,
                     ),
                 )
-        if rebuilt:
-            logger.warning(
-                "O'Pip committee call index rebuilt from the durable log (%d entries)",
-                len(rebuilt),
-            )
-            self._save_call_index(rebuilt)
         return rebuilt
 
     def _save_call_index(self, index: Mapping[str, _CommittedIndexEntry]) -> None:
@@ -652,7 +682,20 @@ class DurableObservationLedger:
         return self._attempts.get(logical_observation_id, 0)
 
     def record(self, outcome: ProviderCallOutcome) -> None:
-        self._store.append_call_outcome(outcome)
+        """Persist one attempt, refusing to publish a rejected observation.
+
+        If the durable log already holds a different opinion for this logical
+        seat, the append is refused as a divergence. That result cannot be
+        discarded: the caller must not proceed to publish a case outcome
+        containing an opinion the evidence log explicitly rejected.
+        """
+        result = self._store.append_call_outcome(outcome)
+        if not result.stored and result.reason == REASON_DIVERGENCE:
+            raise CommitteeReplayDivergenceError(
+                "the durable call log already holds a different opinion for this "
+                f"logical observation ({outcome.logical_observation_id}); the new "
+                "opinion was refused and no case outcome may be published from it"
+            )
         # Invalidate so the next lookup re-reads durable evidence rather than
         # trusting a locally derived view.
         self._loaded = False

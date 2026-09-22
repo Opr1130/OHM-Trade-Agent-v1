@@ -28,6 +28,7 @@ from app.opip.committee.contracts import (
     ProviderFailureClass,
     ProviderFamily,
     ReproducibilityClass,
+    ResearchAction,
     StructuredOpinion,
     logical_observation_id,
 )
@@ -202,14 +203,16 @@ def test_binary_floats_are_rejected_from_evidence_identity():
 
 def test_case_requires_snapshot_policy_alignment():
     mismatched = _snapshot(policy_version="other-policy")
+    policy = _policy()
+    provenance = _provenance()
     with pytest.raises(ValueError):
         CommitteeCase(
             case_id="case-1",
             case_type=CaseType.MARKET_OPPORTUNITY,
             snapshot=mismatched,
-            policy=_policy(),
+            policy=policy,
             created_at=NOW,
-            provenance=_provenance(),
+            provenance=provenance,
             instrument_id="INSTR:kraken:SOL:USD:1",
         )
 
@@ -507,8 +510,9 @@ def test_replay_divergence_fails_explicitly_and_preserves_history():
         ledger=ledger,
         now=lambda: NOW,
     )
+    replay_case = _case(policy=policy)
     with pytest.raises(CommitteeReplayDivergenceError):
-        replayer.run_case(_case(policy=policy), replay_existing=True)
+        replayer.run_case(replay_case, replay_existing=True)
 
     preserved = ledger.committed_opinion(
         logical_observation_id(
@@ -995,6 +999,83 @@ def test_a_lost_index_is_rebuilt_so_a_redelivery_is_still_a_duplicate(tmp_path):
 
     # Simulate an index lost after a failed update.
     store.calls_index_file.unlink()
+
+    result = store.append_call_outcome(committed)
+    assert result.stored is False
+    assert result.reason == REASON_DUPLICATE
+    assert len(list(store.iter_call_outcomes())) == 1
+
+
+# ------------------------------- review findings (durable evidence integrity)
+
+
+def test_a_rejected_divergent_ledger_append_is_propagated_not_swallowed(tmp_path):
+    """A refused opinion must not be published as durable evidence."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI, hypothesis="sealed")},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+
+    # A second runner re-derives the same logical seat but produces a different
+    # opinion (a race, or a provider that changed its answer). The append is
+    # refused, and the refusal must reach the caller.
+    divergent_opinion = StructuredOpinion(
+        case_id=committed.case_id,
+        provider=committed.reported_provider,
+        model=committed.reported_model,
+        evidence_sufficiency=EvidenceSufficiency.SUFFICIENT,
+        assessment=DirectionalAssessment.OPPOSING,
+        hypothesis="a different hypothesis",
+        recommended_research_action=ResearchAction.NO_ACTION,
+    )
+    divergent = ProviderCallOutcome(
+        logical_observation_id=committed.logical_observation_id,
+        case_id=committed.case_id,
+        provider_family=committed.provider_family,
+        requested_model=committed.requested_model,
+        status=ObservationStatus.COMPLETED,
+        attempt=1,
+        reproducibility=ReproducibilityClass.NONDETERMINISTIC_PROVIDER_OUTPUT,
+        request_at=NOW,
+        input_hash=committed.input_hash,
+        reported_provider=committed.reported_provider,
+        reported_model=committed.reported_model,
+        opinion=divergent_opinion,
+        response_at=NOW,
+    )
+    ledger = DurableObservationLedger(store=store)
+    with pytest.raises(CommitteeReplayDivergenceError):
+        ledger.record(divergent)
+
+    # History is unchanged: exactly one committed observation survives.
+    survivors = list(store.iter_call_outcomes())
+    assert len(survivors) == 1
+    assert survivors[0].opinion.opinion_hash == committed.opinion.opinion_hash
+
+
+def test_a_partially_stale_call_index_is_reconciled_from_the_log(tmp_path):
+    """A non-empty but stale sidecar must not let a redelivery append again."""
+    store = CommitteeEvidenceStore(root=tmp_path)
+    first = _ok(ProviderFamily.OPENAI)
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+    CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first},
+        ledger=DurableObservationLedger(store=store),
+        now=lambda: NOW,
+    ).run_case(_case(policy=policy))
+    committed = list(store.iter_call_outcomes())[0]
+
+    # A sidecar that is present and non-empty but missing this logical id.
+    store.calls_index_file.write_text(
+        '{"schema_version":1,"kind":"CALL_OUTCOME","entries":'
+        '{"COMMITTEE-LOGICAL:other":{"outcome_id":"COMMITTEE-CALL:other",'
+        '"opinion_hash":"COMMITTEE-OPINION:other"}}}',
+        encoding="utf-8",
+    )
 
     result = store.append_call_outcome(committed)
     assert result.stored is False

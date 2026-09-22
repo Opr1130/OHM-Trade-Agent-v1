@@ -683,3 +683,72 @@ def test_serialization_round_trip_preserves_metrics():
         report.committee_increment.committee_accuracy.value
     )
     assert restored.calibration.applicable is False
+
+
+# ------------------------------- review findings (paired comparison)
+
+
+def _unpaired_cases(count: int):
+    """Cases where the committee has a view but no baseline exists."""
+    cases = []
+    for index in range(count):
+        case_id = f"unpaired-{index:03d}"
+        cases.append(
+            _case(
+                case_id,
+                seats=(
+                    _seat(case_id, assessment="SUPPORTIVE"),
+                    _seat(
+                        case_id,
+                        family=ProviderFamily.ANTHROPIC,
+                        model="model-b",
+                        assessment="SUPPORTIVE",
+                    ),
+                ),
+                baseline_positive=None,
+                observed_positive=True,
+                decided_at=START + timedelta(days=index),
+            )
+        )
+    return tuple(cases)
+
+
+def test_unpaired_cases_do_not_satisfy_the_incremental_sample_threshold():
+    """Incremental support must come from paired baseline comparisons."""
+    report = _report(_unpaired_cases(MIN_ATTRIBUTION_SAMPLES * 2))
+    increment = report.committee_increment
+
+    # The committee has plenty of directional calls...
+    assert increment.committee_scored == MIN_ATTRIBUTION_SAMPLES * 2
+    # ...but no case can be compared against the deterministic baseline.
+    assert increment.paired_scored == 0
+    assert increment.baseline_scored == 0
+    assert increment.incremental_accuracy.applicable is False
+    assert increment.added_information is None
+
+
+def test_incremental_accuracy_uses_only_the_paired_population():
+    """One paired case plus many unpaired ones cannot inflate the denominator."""
+    paired = _uniform_cases(1, committee_right=True, baseline_right=False)
+    report = _report(paired + _unpaired_cases(MIN_ATTRIBUTION_SAMPLES * 2))
+    increment = report.committee_increment
+
+    assert increment.committee_scored == 1 + MIN_ATTRIBUTION_SAMPLES * 2
+    assert increment.paired_scored == 1
+    # The effect is measured over the single comparable case, not the union.
+    assert increment.incremental_accuracy.sample_size == 1
+    assert increment.incremental_accuracy.value == "1.000000"
+    # And one paired case is far too few to claim added information.
+    assert increment.added_information is None
+
+
+def test_paired_support_is_required_for_added_information():
+    report = _report(
+        _uniform_cases(
+            MIN_ATTRIBUTION_SAMPLES, committee_right=True, baseline_right=False
+        )
+    )
+    increment = report.committee_increment
+    assert increment.paired_scored == MIN_ATTRIBUTION_SAMPLES
+    assert increment.incremental_accuracy.sample_size == MIN_ATTRIBUTION_SAMPLES
+    assert increment.added_information is True

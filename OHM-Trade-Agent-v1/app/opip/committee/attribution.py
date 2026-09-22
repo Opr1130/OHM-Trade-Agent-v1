@@ -246,9 +246,19 @@ class CommitteeIncrement:
     incremental_accuracy: EvaluationMetric
 
     @property
+    def paired_scored(self) -> int:
+        """Cases where both the committee and the deterministic baseline called.
+
+        This is the population the incremental comparison is actually valid
+        over. Using the committee-only count here would let unpaired cases
+        satisfy the sample threshold for a claim they cannot support.
+        """
+        return self.baseline_scored
+
+    @property
     def added_information(self) -> bool | None:
         """Whether the committee beat the baseline, or ``None`` if unsupported."""
-        if self.committee_scored < MIN_ATTRIBUTION_SAMPLES:
+        if self.paired_scored < MIN_ATTRIBUTION_SAMPLES:
             return None
         if not self.incremental_accuracy.applicable:
             return None
@@ -848,7 +858,11 @@ def _committee_increment(cases: Sequence[AttributionCase]) -> CommitteeIncrement
             numerator=(
                 tally.only_committee_correct - tally.only_baseline_correct
             ),
-            denominator=max(tally.baseline_scored, tally.committee_scored),
+            # Denominator is the paired population: cases with both a committee
+            # directional call and a baseline call. Dividing by the union with
+            # committee-only cases would compare accuracies over different
+            # populations and understate the effect.
+            denominator=tally.baseline_scored,
         ),
     )
 

@@ -105,9 +105,7 @@ belongs in `app/opip/canonical/`, following the existing adapter pattern.
 
 Strict three-point protocol: **T0** seal → **T1** outcome → **T2** compare.
 
-- A sealed prediction records the content hash of every sealed opinion and the
-  cutoff. Verification recomputes those hashes from the recorded T0 evidence, so
-  a later rewrite of a sealed opinion fails closed.
+- A sealed prediction records the content hash of every sealed opinion plus the cutoff. The cutoff is **derived from the authenticated evidence snapshot** the committee actually ran on, not accepted from the caller: a caller-supplied earlier cutoff could otherwise admit an outcome that overlaps evidence already present at T0. Verification recomputes the sealed hashes from the recorded T0 evidence, so a later rewrite of a sealed opinion fails closed.
 - An outcome may only be joined when its whole measurement window lies after the
   cutoff. An overlapping window, an outcome observed before the cutoff, or an
   outcome observed before sealing raise `HindsightLeakageError`.
@@ -117,6 +115,9 @@ Strict three-point protocol: **T0** seal → **T1** outcome → **T2** compare.
 - Retrospective and prospective metrics are never mixed.
 - Seat accounting is exhaustive: a seat is scored, abstaining, unavailable, or
   explicitly unscored because the outcome carried no direction.
+- Pending work is never silently dropped. A prediction whose outcome was observed
+  but whose evaluation failed or was never persisted stays visible as
+  `awaiting_evaluation` rather than disappearing from the pending counters.
 
 ### 2D — Learning & attribution (`attribution.py`)
 

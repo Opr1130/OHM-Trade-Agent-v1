@@ -37,6 +37,7 @@ from app.opip.committee.contracts import (
     CaseType,
     CommitteeCaseOutcome,
     EvaluationPhase,
+    EvidenceSnapshot,
     ObservationStatus,
     ProviderCallOutcome,
     ProviderFamily,
@@ -465,14 +466,41 @@ class ProspectiveEvaluation:
             "evaluated_at": self.evaluated_at,
             "horizon_seconds": self.horizon_seconds,
             "finality": self.finality,
+            # The identity must cover every persisted result field, including the
+            # per-seat final flag, the aggregate counts, and the metric values.
+            # Otherwise a corrected or corrupted row could change its reported
+            # accuracy or final-evidence status while keeping the same id, and
+            # the store would treat the altered record as the original artifact.
             "seat_scores": tuple(
                 (
                     score.provider_family,
                     score.model,
                     score.call,
                     score.correct,
+                    score.final,
                 )
                 for score in self.seat_scores
+            ),
+            "seat_counts": (
+                self.scored_seats,
+                self.abstained_seats,
+                self.unavailable_seats,
+                self.unscored_directional_seats,
+            ),
+            "metrics": tuple(
+                _metric_identity(metric)
+                for metric in (self.precision, self.recall, self.f1, self.accuracy)
+            ),
+            "has_confusion": self.confusion is not None,
+            "confusion": (
+                None
+                if self.confusion is None
+                else (
+                    self.confusion.true_positive,
+                    self.confusion.false_positive,
+                    self.confusion.true_negative,
+                    self.confusion.false_negative,
+                )
             ),
         }
 
@@ -481,6 +509,17 @@ class ProspectiveEvaluation:
         return stable_hash(
             PROSPECTIVE_EVALUATION_IDENTITY_DOMAIN, self.identity_payload()
         )
+
+
+def _metric_identity(metric: EvaluationMetric) -> tuple[object, ...]:
+    """The semantic content of one metric, for use in a content identity."""
+    return (
+        metric.name,
+        metric.value,
+        metric.applicable,
+        metric.sample_size,
+        metric.not_applicable_reason,
+    )
 
 
 def _sealed_opinion_hashes(case_outcome: CommitteeCaseOutcome) -> tuple[str, ...]:
@@ -497,15 +536,23 @@ def _sealed_opinion_hashes(case_outcome: CommitteeCaseOutcome) -> tuple[str, ...
 def seal_prediction(
     *,
     case_outcome: CommitteeCaseOutcome,
-    evidence_cutoff_at: datetime,
+    evidence_snapshot: EvidenceSnapshot,
     sealed_at: datetime,
     experiment_id: str,
     provenance: Provenance,
     case_type: CaseType,
 ) -> SealedPrediction:
-    """Seal the T0 opinions for a case so no later evidence can alter them."""
-    cutoff = require_utc(evidence_cutoff_at, field_name="evidence_cutoff_at")
+    """Seal the T0 opinions for a case so no later evidence can alter them.
+
+    The cutoff is read from the authenticated evidence snapshot rather than
+    accepted from the caller. A caller-supplied cutoff could be earlier than the
+    one the snapshot was actually built with, which would let
+    :func:`assert_outcome_is_prospective` admit an outcome that overlaps evidence
+    already present at T0 and quietly defeat the anti-hindsight guarantee.
+    """
     sealed = require_utc(sealed_at, field_name="sealed_at")
+    _require_snapshot_binding(case_outcome, evidence_snapshot, case_type=case_type)
+    cutoff = evidence_snapshot.evidence_cutoff_at
     hashes = _sealed_opinion_hashes(case_outcome)
     if case_outcome.phase is not EvaluationPhase.PROSPECTIVE:
         raise ProspectivePolicyError(
@@ -529,6 +576,31 @@ def seal_prediction(
         sealed_seat_count=len(hashes),
         provenance=provenance,
     )
+
+
+def _require_snapshot_binding(
+    case_outcome: CommitteeCaseOutcome,
+    evidence_snapshot: EvidenceSnapshot,
+    *,
+    case_type: CaseType,
+) -> None:
+    """Fail closed unless the snapshot is the one this run was decided on."""
+    if not isinstance(evidence_snapshot, EvidenceSnapshot):
+        raise ProspectivePolicyError(
+            "sealing requires the authenticated evidence snapshot, not a raw cutoff"
+        )
+    if evidence_snapshot.case_id != case_outcome.case_id:
+        raise ProspectivePolicyError(
+            "the evidence snapshot is for a different case than the committee run"
+        )
+    if evidence_snapshot.snapshot_hash != case_outcome.evidence_snapshot_hash:
+        raise ProspectivePolicyError(
+            "the evidence snapshot does not match the one the committee ran on"
+        )
+    if evidence_snapshot.case_type is not case_type:
+        raise ProspectivePolicyError(
+            "the evidence snapshot case type does not match the sealed prediction"
+        )
 
 
 def verify_seal(
@@ -679,21 +751,43 @@ def evaluate_prospective(
 def awaiting_outcome(
     *,
     predictions: Sequence[SealedPrediction],
+    evaluations: Sequence[ProspectiveEvaluation] = (),
+) -> tuple[SealedPrediction, ...]:
+    """Sealed predictions whose outcome is not yet known or not yet joined.
+
+    Any prediction without a recorded evaluation is unresolved. A prediction
+    whose outcome was observed but whose evaluation failed or was never
+    persisted therefore stays visible here instead of silently disappearing
+    from the pending set.
+    """
+    evaluated = {item.prediction_id for item in evaluations}
+    return tuple(
+        prediction
+        for prediction in predictions
+        if prediction.prediction_id not in evaluated
+    )
+
+
+def awaiting_evaluation(
+    *,
+    predictions: Sequence[SealedPrediction],
     observations: Sequence[OutcomeObservation],
     evaluations: Sequence[ProspectiveEvaluation] = (),
 ) -> tuple[SealedPrediction, ...]:
-    """Sealed predictions that have no evaluation yet."""
+    """Sealed predictions whose outcome is known but which lack an evaluation.
+
+    Reported separately from :func:`awaiting_outcome` so an orphaned T1/T2 pair
+    is visible as "pending evaluation" rather than being counted as merely
+    "no outcome yet".
+    """
     evaluated = {item.prediction_id for item in evaluations}
     observed = {item.case_id for item in observations}
-    pending: list[SealedPrediction] = []
-    for prediction in predictions:
-        if prediction.prediction_id in evaluated:
-            continue
-        if prediction.case_id in observed:
-            # An outcome exists but the join has not been recorded yet.
-            continue
-        pending.append(prediction)
-    return tuple(pending)
+    return tuple(
+        prediction
+        for prediction in predictions
+        if prediction.prediction_id not in evaluated
+        and prediction.case_id in observed
+    )
 
 
 def prospective_observability_counts(
@@ -703,6 +797,12 @@ def prospective_observability_counts(
     evaluations: Sequence[ProspectiveEvaluation],
 ) -> Mapping[str, int]:
     """Counters for the prospective experiment, for operational visibility."""
+    unresolved = awaiting_outcome(predictions=predictions, evaluations=evaluations)
+    pending_evaluation = awaiting_evaluation(
+        predictions=predictions,
+        observations=observations,
+        evaluations=evaluations,
+    )
     return {
         "sealed_predictions": len(predictions),
         "outcome_observations": len(observations),
@@ -716,13 +816,9 @@ def prospective_observability_counts(
         "provisional_evaluations": sum(
             1 for item in evaluations if not item.counts_as_final_evidence
         ),
-        "awaiting_outcome": len(
-            awaiting_outcome(
-                predictions=predictions,
-                observations=observations,
-                evaluations=evaluations,
-            )
-        ),
+        "awaiting_outcome": len(unresolved),
+        "awaiting_evaluation": len(pending_evaluation),
+        "unresolved_predictions": len(unresolved),
     }
 
 
@@ -738,6 +834,7 @@ __all__ = [
     "OutcomeObservation",
     "SealedPrediction",
     "assert_outcome_is_prospective",
+    "awaiting_evaluation",
     "awaiting_outcome",
     "evaluate_prospective",
     "prospective_observability_counts",
