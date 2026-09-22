@@ -95,21 +95,31 @@ def _replica_db_path() -> Path | None:
     generation is eventually pruned even though the replica plane remains healthy.
 
     A direct bundle root is still accepted for tests and explicit one-off use. The
-    production deployment supplies the repository root, so each request resolves the
-    committed generation before opening the database. No fallback to the authoritative
-    production store or writer RPC exists.
+    production deployment supplies the repository root plus OPIP_COCKPIT_RELEASE_SHA.
+    Each request resolves the committed generation and requires its manifest to name
+    that same release before opening the database. Same-release rotations therefore
+    remain seamless, while cross-release drift fails closed until Cockpit is redeployed.
+    No fallback to the authoritative production store or writer RPC exists.
     """
     try:
         from app.opip.learning.canonical_replica import (
             host_current_pointer,
+            read_replica_manifest,
             replica_db_path,
+            replica_manifest_path,
             replica_root,
             resolve_current_generation,
         )
 
         root = replica_root()
         if host_current_pointer(root).is_file():
+            expected_release = os.environ.get("OPIP_COCKPIT_RELEASE_SHA", "").strip()
+            if not expected_release:
+                return None
             root = resolve_current_generation(root)
+            manifest = read_replica_manifest(replica_manifest_path(root))
+            if str(manifest.get("source_release_sha") or "") != expected_release:
+                return None
         path = replica_db_path(root)
     except Exception:  # noqa: BLE001 - unreadable configuration is reported, not raised
         return None
