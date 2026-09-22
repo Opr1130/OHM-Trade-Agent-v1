@@ -1111,10 +1111,346 @@ def prospective_record_from_dict(row: Mapping[str, Any]):
     raise CommitteeSerializationError(f"undeclared prospective record kind: {kind!r}")
 
 
+_ATTRIBUTION_REPORT_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "attribution_id",
+        "experiment_id",
+        "phase",
+        "generated_at",
+        "case_count",
+        "minimum_samples",
+        "attribution_method_version",
+        "advisory_only",
+        "measurement_only",
+        "automatic_promotion",
+        "trade_authority_changed",
+        "providers",
+        "disagreements",
+        "committee_increment",
+        "contested_case_accuracy",
+        "unanimous_case_accuracy",
+        "chronological_stability",
+        "incremental_cost_microunits",
+        "calibration",
+        "provenance",
+    }
+)
+
+_PROVIDER_ATTRIBUTION_FIELDS = frozenset(
+    {
+        "provider_family",
+        "model",
+        "scored_cases",
+        "correct_cases",
+        "abstained_cases",
+        "failed_cases",
+        "accuracy",
+        "baseline_agreements",
+        "baseline_disagreements",
+        "accuracy_when_agreeing_with_baseline",
+        "accuracy_when_disagreeing_with_baseline",
+        "independent_incremental_correct",
+        "accuracy_when_contested",
+        "accuracy_by_case_type",
+        "known_cost_microunits",
+        "unknown_cost_samples",
+    }
+)
+
+_CASE_TYPE_ACCURACY_FIELDS = frozenset(
+    {"case_type", "scored", "correct", "accuracy"}
+)
+
+_DISAGREEMENT_SUMMARY_FIELDS = frozenset({"kind", "cases", "share"})
+
+_WINDOW_ACCURACY_FIELDS = frozenset(
+    {"label", "cases", "scored", "correct", "accuracy"}
+)
+
+_COMMITTEE_INCREMENT_FIELDS = frozenset(
+    {
+        "baseline_scored",
+        "baseline_correct",
+        "committee_scored",
+        "committee_correct",
+        "both_correct",
+        "both_wrong",
+        "only_committee_correct",
+        "only_baseline_correct",
+        "committee_accuracy",
+        "baseline_accuracy",
+        "incremental_accuracy",
+    }
+)
+
+_ATTRIBUTION_KIND = "ATTRIBUTION_REPORT"
+
+
+def attribution_report_to_dict(report) -> dict[str, Any]:
+    return {
+        "kind": _ATTRIBUTION_KIND,
+        "schema_version": report.schema_version,
+        "attribution_id": report.attribution_id,
+        "experiment_id": report.experiment_id,
+        "phase": report.phase.value,
+        "generated_at": _iso(report.generated_at),
+        "case_count": report.case_count,
+        "minimum_samples": report.minimum_samples,
+        "attribution_method_version": report.attribution_method_version,
+        "advisory_only": report.advisory_only,
+        "measurement_only": report.measurement_only,
+        "automatic_promotion": report.automatic_promotion,
+        "trade_authority_changed": report.trade_authority_changed,
+        "providers": [
+            {
+                "provider_family": provider.provider_family.value,
+                "model": provider.model,
+                "scored_cases": provider.scored_cases,
+                "correct_cases": provider.correct_cases,
+                "abstained_cases": provider.abstained_cases,
+                "failed_cases": provider.failed_cases,
+                "accuracy": _encode_metric(provider.accuracy),
+                "baseline_agreements": provider.baseline_agreements,
+                "baseline_disagreements": provider.baseline_disagreements,
+                "accuracy_when_agreeing_with_baseline": _encode_metric(
+                    provider.accuracy_when_agreeing_with_baseline
+                ),
+                "accuracy_when_disagreeing_with_baseline": _encode_metric(
+                    provider.accuracy_when_disagreeing_with_baseline
+                ),
+                "independent_incremental_correct": (
+                    provider.independent_incremental_correct
+                ),
+                "accuracy_when_contested": _encode_metric(
+                    provider.accuracy_when_contested
+                ),
+                "accuracy_by_case_type": [
+                    {
+                        "case_type": item.case_type.value,
+                        "scored": item.scored,
+                        "correct": item.correct,
+                        "accuracy": _encode_metric(item.accuracy),
+                    }
+                    for item in provider.accuracy_by_case_type
+                ],
+                "known_cost_microunits": provider.known_cost_microunits,
+                "unknown_cost_samples": provider.unknown_cost_samples,
+            }
+            for provider in report.providers
+        ],
+        "disagreements": [
+            {
+                "kind": item.kind.value,
+                "cases": item.cases,
+                "share": _encode_metric(item.share),
+            }
+            for item in report.disagreements
+        ],
+        "committee_increment": {
+            "baseline_scored": report.committee_increment.baseline_scored,
+            "baseline_correct": report.committee_increment.baseline_correct,
+            "committee_scored": report.committee_increment.committee_scored,
+            "committee_correct": report.committee_increment.committee_correct,
+            "both_correct": report.committee_increment.both_correct,
+            "both_wrong": report.committee_increment.both_wrong,
+            "only_committee_correct": (
+                report.committee_increment.only_committee_correct
+            ),
+            "only_baseline_correct": (
+                report.committee_increment.only_baseline_correct
+            ),
+            "committee_accuracy": _encode_metric(
+                report.committee_increment.committee_accuracy
+            ),
+            "baseline_accuracy": _encode_metric(
+                report.committee_increment.baseline_accuracy
+            ),
+            "incremental_accuracy": _encode_metric(
+                report.committee_increment.incremental_accuracy
+            ),
+        },
+        "contested_case_accuracy": _encode_metric(report.contested_case_accuracy),
+        "unanimous_case_accuracy": _encode_metric(report.unanimous_case_accuracy),
+        "chronological_stability": [
+            {
+                "label": item.label,
+                "cases": item.cases,
+                "scored": item.scored,
+                "correct": item.correct,
+                "accuracy": _encode_metric(item.accuracy),
+            }
+            for item in report.chronological_stability
+        ],
+        "incremental_cost_microunits": report.incremental_cost_microunits,
+        "calibration": _encode_metric(report.calibration),
+        "provenance": _encode_provenance(report.provenance),
+    }
+
+
+def _decode_provider_attribution(row: Mapping[str, Any]):
+    from app.opip.committee.attribution import CaseTypeAccuracy, ProviderAttribution
+
+    _reject_unknown(row, _PROVIDER_ATTRIBUTION_FIELDS, kind="provider attribution")
+    raw_types = row.get("accuracy_by_case_type", [])
+    if not isinstance(raw_types, list):
+        raise CommitteeSerializationError("accuracy_by_case_type must be a list")
+    by_type = []
+    for item in raw_types:
+        if not isinstance(item, Mapping):
+            raise CommitteeSerializationError("case type accuracy must be an object")
+        _reject_unknown(item, _CASE_TYPE_ACCURACY_FIELDS, kind="case type accuracy")
+        by_type.append(
+            CaseTypeAccuracy(
+                case_type=_parse_enum(
+                    item.get("case_type"), CaseType, field="case_type"
+                ),
+                scored=item.get("scored"),
+                correct=item.get("correct"),
+                accuracy=_decode_metric(item.get("accuracy")),
+            )
+        )
+    return ProviderAttribution(
+        provider_family=_parse_enum(
+            row.get("provider_family"), ProviderFamily, field="provider_family"
+        ),
+        model=row.get("model"),
+        scored_cases=row.get("scored_cases"),
+        correct_cases=row.get("correct_cases"),
+        abstained_cases=row.get("abstained_cases"),
+        failed_cases=row.get("failed_cases"),
+        accuracy=_decode_metric(row.get("accuracy")),
+        baseline_agreements=row.get("baseline_agreements"),
+        baseline_disagreements=row.get("baseline_disagreements"),
+        accuracy_when_agreeing_with_baseline=_decode_metric(
+            row.get("accuracy_when_agreeing_with_baseline")
+        ),
+        accuracy_when_disagreeing_with_baseline=_decode_metric(
+            row.get("accuracy_when_disagreeing_with_baseline")
+        ),
+        independent_incremental_correct=row.get("independent_incremental_correct"),
+        accuracy_when_contested=_decode_metric(row.get("accuracy_when_contested")),
+        accuracy_by_case_type=tuple(by_type),
+        known_cost_microunits=_parse_optional_int(
+            row.get("known_cost_microunits"), field="known_cost_microunits"
+        ),
+        unknown_cost_samples=row.get("unknown_cost_samples"),
+    )
+
+
+def attribution_report_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.attribution import (
+        AttributionReport,
+        CommitteeIncrement,
+        DisagreementKind,
+        DisagreementSummary,
+        WindowAccuracy,
+    )
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("attribution report must be an object")
+    _reject_unknown(row, _ATTRIBUTION_REPORT_FIELDS, kind="attribution report")
+    raw_providers = row.get("providers")
+    if not isinstance(raw_providers, list):
+        raise CommitteeSerializationError("providers must be a list")
+    raw_disagreements = row.get("disagreements")
+    if not isinstance(raw_disagreements, list):
+        raise CommitteeSerializationError("disagreements must be a list")
+    raw_windows = row.get("chronological_stability")
+    if not isinstance(raw_windows, list):
+        raise CommitteeSerializationError("chronological_stability must be a list")
+    increment_row = row.get("committee_increment")
+    if not isinstance(increment_row, Mapping):
+        raise CommitteeSerializationError("committee_increment must be an object")
+    _reject_unknown(
+        increment_row, _COMMITTEE_INCREMENT_FIELDS, kind="committee increment"
+    )
+
+    disagreements = []
+    for item in raw_disagreements:
+        if not isinstance(item, Mapping):
+            raise CommitteeSerializationError("disagreement must be an object")
+        _reject_unknown(item, _DISAGREEMENT_SUMMARY_FIELDS, kind="disagreement")
+        disagreements.append(
+            DisagreementSummary(
+                kind=_parse_enum(item.get("kind"), DisagreementKind, field="kind"),
+                cases=item.get("cases"),
+                share=_decode_metric(item.get("share")),
+            )
+        )
+
+    windows = []
+    for item in raw_windows:
+        if not isinstance(item, Mapping):
+            raise CommitteeSerializationError("window accuracy must be an object")
+        _reject_unknown(item, _WINDOW_ACCURACY_FIELDS, kind="window accuracy")
+        windows.append(
+            WindowAccuracy(
+                label=item.get("label"),
+                cases=item.get("cases"),
+                scored=item.get("scored"),
+                correct=item.get("correct"),
+                accuracy=_decode_metric(item.get("accuracy")),
+            )
+        )
+
+    report = AttributionReport(
+        schema_version=row.get("schema_version"),
+        experiment_id=row.get("experiment_id"),
+        phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
+        generated_at=_parse_dt(row.get("generated_at"), field="generated_at"),
+        case_count=row.get("case_count"),
+        minimum_samples=row.get("minimum_samples"),
+        providers=tuple(
+            _decode_provider_attribution(item) for item in raw_providers
+        ),
+        disagreements=tuple(disagreements),
+        committee_increment=CommitteeIncrement(
+            baseline_scored=increment_row.get("baseline_scored"),
+            baseline_correct=increment_row.get("baseline_correct"),
+            committee_scored=increment_row.get("committee_scored"),
+            committee_correct=increment_row.get("committee_correct"),
+            both_correct=increment_row.get("both_correct"),
+            both_wrong=increment_row.get("both_wrong"),
+            only_committee_correct=increment_row.get("only_committee_correct"),
+            only_baseline_correct=increment_row.get("only_baseline_correct"),
+            committee_accuracy=_decode_metric(
+                increment_row.get("committee_accuracy")
+            ),
+            baseline_accuracy=_decode_metric(increment_row.get("baseline_accuracy")),
+            incremental_accuracy=_decode_metric(
+                increment_row.get("incremental_accuracy")
+            ),
+        ),
+        contested_case_accuracy=_decode_metric(row.get("contested_case_accuracy")),
+        unanimous_case_accuracy=_decode_metric(row.get("unanimous_case_accuracy")),
+        chronological_stability=tuple(windows),
+        incremental_cost_microunits=_parse_optional_int(
+            row.get("incremental_cost_microunits"), field="incremental_cost_microunits"
+        ),
+        calibration=_decode_metric(row.get("calibration")),
+        provenance=_decode_provenance(row.get("provenance")),
+        attribution_method_version=row.get("attribution_method_version"),
+        advisory_only=bool(row.get("advisory_only")),
+        measurement_only=bool(row.get("measurement_only")),
+        automatic_promotion=bool(row.get("automatic_promotion")),
+        trade_authority_changed=bool(row.get("trade_authority_changed")),
+    )
+    declared = row.get("attribution_id")
+    if declared is not None and declared != report.attribution_id:
+        raise CommitteeSerializationError(
+            "persisted attribution_id does not match its content identity"
+        )
+    return report
+
+
 __all__ = [
     "COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION",
     "PROVIDER_CALL_OUTCOME_SCHEMA_VERSION",
     "CommitteeSerializationError",
+    "attribution_report_from_dict",
+    "attribution_report_to_dict",
     "call_outcome_from_dict",
     "call_outcome_to_dict",
     "case_outcome_from_dict",

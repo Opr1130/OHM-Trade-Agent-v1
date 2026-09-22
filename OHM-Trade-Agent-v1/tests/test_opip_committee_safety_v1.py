@@ -106,7 +106,6 @@ PURE_MODULES = (
     "contracts.py",
     "evidence.py",
     "evaluation.py",
-    "ledger.py",
     "metrics.py",
     "opinion.py",
     "outbound.py",
@@ -114,6 +113,8 @@ PURE_MODULES = (
     "prospective.py",
     "serialization.py",
     "settings.py",
+    "ledger.py",
+    "attribution.py",
 )
 
 #: The single infrastructure helper the store may use for cross-process locking.
@@ -318,20 +319,41 @@ def test_pricing_is_configuration_and_not_a_hardcoded_vendor_table():
 
 def test_evaluation_module_names_contain_no_promotion_surface():
     """No function or attribute may read as promoting, ranking, or choosing."""
-    tree = ast.parse(
-        (COMMITTEE_ROOT / "evaluation.py").read_text(encoding="utf-8")
-    )
     forbidden = ("promote", "winner", "best_", "champion", "rank")
     offenders: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            lowered = node.name.lower()
-            if any(token in lowered for token in forbidden):
-                offenders.append(node.name)
-        elif isinstance(node, ast.Attribute):
-            lowered = node.attr.lower()
-            if any(token in lowered for token in ("promote", "winner", "champion")):
-                offenders.append(node.attr)
+    for name in ("evaluation.py", "attribution.py"):
+        tree = ast.parse((COMMITTEE_ROOT / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                lowered = node.name.lower()
+                if any(token in lowered for token in forbidden):
+                    offenders.append(f"{name}:{node.name}")
+            elif isinstance(node, ast.Attribute):
+                lowered = node.attr.lower()
+                if any(token in lowered for token in ("promote", "winner", "champion")):
+                    offenders.append(f"{name}:{node.attr}")
+    assert offenders == [], offenders
+
+
+def test_attribution_carries_an_explicit_non_promotion_disposition():
+    from app.opip.committee.attribution import AttributionReport
+
+    fields = AttributionReport.__dataclass_fields__
+    assert fields["automatic_promotion"].default is False
+    assert fields["trade_authority_changed"].default is False
+    assert fields["advisory_only"].default is True
+    assert fields["measurement_only"].default is True
+
+
+def test_committee_reports_are_never_wired_to_a_production_consumer():
+    """Nothing outside the plane may read committee reports yet."""
+    offenders: list[str] = []
+    for path in APP_ROOT.rglob("*.py"):
+        if COMMITTEE_ROOT in path.parents:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "COMMITTEE-ATTRIBUTION" in text or "COMMITTEE-EVALUATION" in text:
+            offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == [], offenders
 
 

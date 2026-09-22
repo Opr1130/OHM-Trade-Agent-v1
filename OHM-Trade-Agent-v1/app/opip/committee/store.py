@@ -25,6 +25,8 @@ from app.opip.committee.contracts import (
 )
 from app.opip.committee.ledger import COMMITTED_STATUSES
 from app.opip.committee.serialization import (
+    attribution_report_from_dict,
+    attribution_report_to_dict,
     call_outcome_from_dict,
     call_outcome_to_dict,
     case_outcome_from_dict,
@@ -54,6 +56,8 @@ EVALUATIONS_MAX_BYTES = 8 * 1024 * 1024
 EVALUATIONS_KEEP_LINES = 5_000
 PROSPECTIVE_MAX_BYTES = 8 * 1024 * 1024
 PROSPECTIVE_KEEP_LINES = 20_000
+ATTRIBUTIONS_MAX_BYTES = 8 * 1024 * 1024
+ATTRIBUTIONS_KEEP_LINES = 5_000
 
 #: Reasons an append is acknowledged without writing a new row.
 REASON_STORED = "STORED"
@@ -94,6 +98,10 @@ def _parse_prospective_line(line: bytes):
     return prospective_record_from_dict(parse_json_object_line(line))
 
 
+def _parse_attribution_line(line: bytes):
+    return attribution_report_from_dict(parse_json_object_line(line))
+
+
 class CommitteeEvidenceStore:
     """Append-only durable store for committee observations and case outcomes."""
 
@@ -109,16 +117,20 @@ class CommitteeEvidenceStore:
         evaluations_keep_lines: int = EVALUATIONS_KEEP_LINES,
         prospective_max_bytes: int = PROSPECTIVE_MAX_BYTES,
         prospective_keep_lines: int = PROSPECTIVE_KEEP_LINES,
+        attributions_max_bytes: int = ATTRIBUTIONS_MAX_BYTES,
+        attributions_keep_lines: int = ATTRIBUTIONS_KEEP_LINES,
     ) -> None:
         self.root = Path(root)
         self.call_lock_file = self.root / ".call_outcomes.lock"
         self.case_lock_file = self.root / ".case_outcomes.lock"
         self.evaluation_lock_file = self.root / ".evaluations.lock"
         self.prospective_lock_file = self.root / ".prospective.lock"
+        self.attribution_lock_file = self.root / ".attributions.lock"
         self.calls_index_file = self.root / "call_outcome_index.json"
         self.cases_index_file = self.root / "case_outcome_index.json"
         self.evaluations_index_file = self.root / "evaluation_index.json"
         self.prospective_index_file = self.root / "prospective_index.json"
+        self.attribution_index_file = self.root / "attribution_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -154,6 +166,15 @@ class CommitteeEvidenceStore:
             archive_prefix="prospective",
             parse_line=_parse_prospective_line,
             visible_at=lambda row: row.observed_at,
+        )
+        self._attributions = BoundedJsonlArchive(
+            data_file=self.root / "attributions.jsonl",
+            archive_dir=self.root / "archive_attributions",
+            max_bytes=attributions_max_bytes,
+            keep_lines=attributions_keep_lines,
+            archive_prefix="attributions",
+            parse_line=_parse_attribution_line,
+            visible_at=lambda row: row.generated_at,
         )
 
     # ---------------------------------------------------------------- calls
@@ -265,20 +286,30 @@ class CommitteeEvidenceStore:
             seen.add(row.report_id)
             yield row
 
-    def _load_evaluation_ids(self) -> set[str]:
-        raw = self._load_index_payload(self.evaluations_index_file)
+    def _load_id_set(self, path: Path) -> set[str]:
+        raw = self._load_index_payload(path)
         entries = raw.get("entries")
         if not isinstance(entries, Mapping):
             return set()
         return {key for key in entries if isinstance(key, str)}
 
-    def _save_evaluation_ids(self, ids: set[str]) -> None:
+    def _save_id_set(
+        self, path: Path, *, kind: str, ids: set[str], label: str
+    ) -> None:
         payload = {
             "schema_version": 1,
-            "kind": "EVALUATION",
+            "kind": kind,
             "entries": {key: key for key in sorted(ids)},
         }
-        self._write_index(self.evaluations_index_file, payload, label="evaluation")
+        self._write_index(path, payload, label=label)
+
+    def _load_evaluation_ids(self) -> set[str]:
+        return self._load_id_set(self.evaluations_index_file)
+
+    def _save_evaluation_ids(self, ids: set[str]) -> None:
+        self._save_id_set(
+            self.evaluations_index_file, kind="EVALUATION", ids=ids, label="evaluation"
+        )
 
     # ----------------------------------------------------------- prospective
 
@@ -360,19 +391,49 @@ class CommitteeEvidenceStore:
                 yield row
 
     def _load_prospective_ids(self) -> set[str]:
-        raw = self._load_index_payload(self.prospective_index_file)
-        entries = raw.get("entries")
-        if not isinstance(entries, Mapping):
-            return set()
-        return {key for key in entries if isinstance(key, str)}
+        return self._load_id_set(self.prospective_index_file)
 
     def _save_prospective_ids(self, ids: set[str]) -> None:
-        payload = {
-            "schema_version": 1,
-            "kind": "PROSPECTIVE",
-            "entries": {key: key for key in sorted(ids)},
-        }
-        self._write_index(self.prospective_index_file, payload, label="prospective")
+        self._save_id_set(
+            self.prospective_index_file, kind="PROSPECTIVE", ids=ids, label="prospective"
+        )
+
+    # ----------------------------------------------------------- attributions
+
+    def append_attribution_report(self, report) -> StoreAppendResult:
+        """Append an attribution report, or acknowledge a duplicate."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.attribution_lock_file):
+            self._attributions.repair_tail()
+            known = self._load_id_set(self.attribution_index_file)
+            if report.attribution_id in known:
+                return StoreAppendResult(False, report.attribution_id, REASON_DUPLICATE)
+            self._attributions.append_encoded_locked(
+                encode_row(attribution_report_to_dict(report))
+            )
+            known.add(report.attribution_id)
+            self._save_id_set(
+                self.attribution_index_file,
+                kind="ATTRIBUTION",
+                ids=known,
+                label="attribution",
+            )
+            self._compact(self._attributions, "attribution report")
+            return StoreAppendResult(True, report.attribution_id, REASON_STORED)
+
+    def iter_attribution_reports(self, *, include_archive: bool = True):
+        seen: set[str] = set()
+        if include_archive:
+            for row in self._attributions.iter_archive_rows():
+                if row.attribution_id in seen:
+                    continue
+                seen.add(row.attribution_id)
+                yield row
+        for row in self._attributions.iter_hot_rows():
+            if row.attribution_id in seen:
+                continue
+            seen.add(row.attribution_id)
+            yield row
 
     # --------------------------------------------------------------- helpers
 
@@ -408,19 +469,12 @@ class CommitteeEvidenceStore:
         self._write_index(self.calls_index_file, payload, label="call outcome")
 
     def _load_case_ids(self) -> set[str]:
-        raw = self._load_index_payload(self.cases_index_file)
-        entries = raw.get("entries")
-        if not isinstance(entries, Mapping):
-            return set()
-        return {key for key in entries if isinstance(key, str)}
+        return self._load_id_set(self.cases_index_file)
 
     def _save_case_ids(self, ids: set[str]) -> None:
-        payload = {
-            "schema_version": 1,
-            "kind": "CASE_OUTCOME",
-            "entries": {key: key for key in sorted(ids)},
-        }
-        self._write_index(self.cases_index_file, payload, label="case outcome")
+        self._save_id_set(
+            self.cases_index_file, kind="CASE_OUTCOME", ids=ids, label="case outcome"
+        )
 
     def _load_index_payload(self, path: Path) -> Mapping[str, Any]:
         if not path.exists():
@@ -511,6 +565,8 @@ class DurableObservationLedger:
 
 
 __all__ = [
+    "ATTRIBUTIONS_KEEP_LINES",
+    "ATTRIBUTIONS_MAX_BYTES",
     "CALL_OUTCOMES_KEEP_LINES",
     "CALL_OUTCOMES_MAX_BYTES",
     "CASE_OUTCOMES_KEEP_LINES",
