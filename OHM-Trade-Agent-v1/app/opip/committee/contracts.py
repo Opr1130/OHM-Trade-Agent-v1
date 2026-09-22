@@ -245,6 +245,55 @@ def _require_non_empty_str(value: object, *, field_name: str) -> str:
     return text
 
 
+def _validate_case_outcome_seats(outcome: "CommitteeCaseOutcome") -> None:
+    if not isinstance(outcome.outcomes, tuple) or not outcome.outcomes:
+        raise ValueError("a committee case outcome requires at least one call")
+    seen: set[ProviderFamily] = set()
+    for seat in outcome.outcomes:
+        if not isinstance(seat, ProviderCallOutcome):
+            raise ValueError("outcomes must be ProviderCallOutcome")
+        if seat.case_id != outcome.case_id:
+            raise ValueError("every call outcome must belong to this case")
+        if seat.provider_family in seen:
+            raise ValueError("one sealed opinion per provider family")
+        seen.add(seat.provider_family)
+
+
+def _validate_case_outcome(outcome: "CommitteeCaseOutcome") -> None:
+    """Validate an aggregated committee case outcome."""
+    if outcome.schema_version != COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION or (
+        type(outcome.schema_version) is not int
+    ):
+        raise ValueError("unsupported CommitteeCaseOutcome schema_version")
+    for field_name in (
+        "case_id",
+        "evidence_snapshot_hash",
+        "committee_policy_version",
+    ):
+        object.__setattr__(
+            outcome,
+            field_name,
+            _require_non_empty_str(
+                getattr(outcome, field_name), field_name=field_name
+            ),
+        )
+    if not isinstance(outcome.phase, EvaluationPhase):
+        raise ValueError("invalid evaluation phase")
+    _validate_case_outcome_seats(outcome)
+    if outcome.canonical_binding is not None and not isinstance(
+        outcome.canonical_binding, CanonicalDecisionBinding
+    ):
+        raise ValueError("invalid canonical_binding")
+    for field_name in ("started_at", "completed_at"):
+        object.__setattr__(
+            outcome,
+            field_name,
+            require_utc(getattr(outcome, field_name), field_name=field_name),
+        )
+    if outcome.completed_at < outcome.started_at:
+        raise ValueError("completed_at must be >= started_at")
+
+
 def _require_optional_opaque_ref(value: object, *, field_name: str) -> str | None:
     """Accept a non-empty opaque id, or ``None``. Empty/whitespace fails closed."""
     if value is None:
@@ -933,6 +982,10 @@ class ProviderCallOutcome:
             and self.opinion is not None
         )
 
+    def estimated_microunits_reported(self) -> int:
+        """Reported cost only, never invented. Used for spend reconstruction."""
+        return self.estimated_cost_microunits or 0
+
     def identity_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -998,49 +1051,7 @@ class CommitteeCaseOutcome:
     schema_version: int = COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION or (
-            type(self.schema_version) is not int
-        ):
-            raise ValueError("unsupported CommitteeCaseOutcome schema_version")
-        for field_name in (
-            "case_id",
-            "evidence_snapshot_hash",
-            "committee_policy_version",
-        ):
-            object.__setattr__(
-                self,
-                field_name,
-                _require_non_empty_str(getattr(self, field_name), field_name=field_name),
-            )
-        if not isinstance(self.phase, EvaluationPhase):
-            raise ValueError("invalid evaluation phase")
-        if not isinstance(self.outcomes, tuple) or not self.outcomes:
-            raise ValueError("a committee case outcome requires at least one call")
-        seen: set[ProviderFamily] = set()
-        for outcome in self.outcomes:
-            if not isinstance(outcome, ProviderCallOutcome):
-                raise ValueError("outcomes must be ProviderCallOutcome")
-            if outcome.case_id != self.case_id:
-                raise ValueError("every call outcome must belong to this case")
-            if outcome.provider_family in seen:
-                raise ValueError("one sealed opinion per provider family")
-            seen.add(outcome.provider_family)
-        if self.canonical_binding is not None and not isinstance(
-            self.canonical_binding, CanonicalDecisionBinding
-        ):
-            raise ValueError("invalid canonical_binding")
-        object.__setattr__(
-            self,
-            "started_at",
-            require_utc(self.started_at, field_name="started_at"),
-        )
-        object.__setattr__(
-            self,
-            "completed_at",
-            require_utc(self.completed_at, field_name="completed_at"),
-        )
-        if self.completed_at < self.started_at:
-            raise ValueError("completed_at must be >= started_at")
+        _validate_case_outcome(self)
 
     @property
     def sealed_opinions(self) -> tuple[StructuredOpinion, ...]:
@@ -1084,7 +1095,7 @@ class CommitteeCaseOutcome:
         )
 
     def identity_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
             "case_id": self.case_id,
             "evidence_snapshot_hash": self.evidence_snapshot_hash,
@@ -1093,15 +1104,17 @@ class CommitteeCaseOutcome:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "outcomes": tuple(outcome.outcome_id for outcome in self.outcomes),
-            "canonical_binding": (
-                None
-                if self.canonical_binding is None
-                else (
-                    self.canonical_binding.decision_id,
-                    self.canonical_binding.episode_id,
-                )
-            ),
         }
+        # The binding is added only when present. Omitting the key for unbound
+        # outcomes preserves the identity that was recorded before this field
+        # existed, so durable pre-change evidence still verifies instead of being
+        # rejected as tampered.
+        if self.canonical_binding is not None:
+            payload["canonical_binding"] = (
+                self.canonical_binding.decision_id,
+                self.canonical_binding.episode_id,
+            )
+        return payload
 
     @property
     def case_outcome_id(self) -> str:

@@ -1861,3 +1861,113 @@ def test_the_binding_participates_in_the_case_outcome_identity():
         plain, canonical_binding=CanonicalDecisionBinding(decision_id="DEC-1")
     )
     assert bound.case_outcome_id != plain.case_outcome_id
+
+
+def test_an_unbound_case_outcome_keeps_its_pre_binding_identity():
+    """Legacy unbound evidence must still verify after the binding field exists."""
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    case_outcome = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
+    ).case_outcome
+    # No binding is supplied, so the identity payload omits the key entirely and
+    # matches what the preceding schema recorded.
+    assert "canonical_binding" not in case_outcome.identity_payload()
+    from app.opip.committee.contracts import (
+        COMMITTEE_CASE_OUTCOME_IDENTITY_DOMAIN,
+    )
+    from app.opip.decision_intelligence.serialization import stable_hash
+
+    legacy_payload = {
+        "schema_version": case_outcome.schema_version,
+        "case_id": case_outcome.case_id,
+        "evidence_snapshot_hash": case_outcome.evidence_snapshot_hash,
+        "committee_policy_version": case_outcome.committee_policy_version,
+        "phase": case_outcome.phase,
+        "started_at": case_outcome.started_at,
+        "completed_at": case_outcome.completed_at,
+        "outcomes": tuple(o.outcome_id for o in case_outcome.outcomes),
+    }
+    assert case_outcome.case_outcome_id == stable_hash(
+        COMMITTEE_CASE_OUTCOME_IDENTITY_DOMAIN, legacy_payload
+    )
+
+
+def test_a_reservation_is_persisted_even_when_reported_cost_is_unknown(tmp_path):
+    """Reconstruction must include reservations, not only reported cost."""
+    first = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(text=opinion_json(), estimated_cost_microunits=None, cost_completeness=CostCompleteness.UNKNOWN),),
+    )
+    first._estimated_cost_microunits = 80  # noqa: SLF001 - test double
+    second = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    second._estimated_cost_microunits = 30  # noqa: SLF001 - test double
+    store = CommitteeEvidenceStore(root=tmp_path)
+    ledger = DurableObservationLedger(store=store)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first, ProviderFamily.ANTHROPIC: second},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(
+        families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+        cost_ceiling=100,
+    )
+    first_run = runner.run_case(_case(policy=policy))
+    # The first seat consumed its 80-unit reservation with no reported cost, so
+    # the second seat is blocked.
+    assert first_run.seats[0].outcome.estimated_cost_microunits is None
+    assert first_run.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []
+    # The reservation survives in durable state.
+    assert DurableObservationLedger(store=store).case_spend_microunits("case-1") == 80
+
+    # Redelivery: the acknowledged first seat contributes no new charge, but the
+    # persisted reservation still blocks the second seat.
+    second_run = runner.run_case(_case(policy=policy))
+    assert second_run.seats[0].outcome.status is ObservationStatus.DUPLICATE_OK
+    assert second_run.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []
+
+
+def test_reattributing_a_case_to_another_decision_fails_closed(tmp_path):
+    """A reused case must not be durably attributed to a different decision."""
+    from app.opip.committee.contracts import CanonicalDecisionBinding
+
+    store = CommitteeEvidenceStore(root=tmp_path)
+    ledger = DurableObservationLedger(store=store)
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: _ok(ProviderFamily.OPENAI)},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(families=(ProviderFamily.OPENAI,))
+
+    def _bound(decision_id):
+        return CommitteeCase(
+            case_id="case-1",
+            case_type=CaseType.MARKET_OPPORTUNITY,
+            snapshot=_snapshot(),
+            policy=policy,
+            created_at=NOW,
+            provenance=_provenance(),
+            instrument_id="INSTR:kraken:SOL:USD:1",
+            canonical_binding=CanonicalDecisionBinding(decision_id=decision_id),
+        )
+
+    first = runner.run_case(_bound("D1"))
+    assert store.append_case_outcome(first.case_outcome).stored is True
+
+    # The same logical seat is reused, but the case is reattributed to D2.
+    with pytest.raises(CommitteePolicyViolation):
+        runner.run_case(_bound("D2"))

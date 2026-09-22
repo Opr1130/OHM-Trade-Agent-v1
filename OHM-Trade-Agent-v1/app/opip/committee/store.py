@@ -184,6 +184,7 @@ class CommitteeEvidenceStore:
         self.evaluations_index_file = self.root / "evaluation_index.json"
         self.prospective_index_file = self.root / "prospective_index.json"
         self.attribution_index_file = self.root / "attribution_index.json"
+        self.case_charge_file = self.root / "case_charge_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -282,12 +283,47 @@ class CommitteeEvidenceStore:
 
     # ---------------------------------------------------------------- cases
 
+    def load_case_charges(self) -> dict[str, int]:
+        """Persisted per-case charges recorded by the committee runtime."""
+        raw = self._load_index_payload(self.case_charge_file)
+        entries = raw.get("entries")
+        if not isinstance(entries, Mapping):
+            return {}
+        charges: dict[str, int] = {}
+        for key, value in entries.items():
+            if isinstance(key, str) and type(value) is int and value >= 0:
+                charges[key] = value
+        return charges
+
+    def save_case_charges(self, charges: Mapping[str, int]) -> None:
+        """Persist per-case charges so a redelivery cannot respend the ceiling."""
+        payload = {
+            "schema_version": 1,
+            "kind": "CASE_CHARGE",
+            "entries": {key: int(value) for key, value in charges.items()},
+        }
+        self._write_index(self.case_charge_file, payload, label="case charge")
+
     def append_case_outcome(self, outcome: CommitteeCaseOutcome) -> StoreAppendResult:
         self.root.mkdir(parents=True, exist_ok=True)
         with registry_lock(self.case_lock_file):
             self._cases.repair_tail()
             known = self._load_case_ids()
             if outcome.case_outcome_id in known:
+                return StoreAppendResult(False, outcome.case_outcome_id, REASON_DUPLICATE)
+            # A case may hold only one case outcome. A second outcome for the same
+            # case with a different canonical binding would durably attribute an
+            # opinion obtained for one decision to an unrelated one, so it fails
+            # closed rather than being appended.
+            for existing in self.iter_case_outcomes():
+                if existing.case_id != outcome.case_id:
+                    continue
+                if existing.canonical_binding != outcome.canonical_binding:
+                    raise CommitteeSerializationError(
+                        f"case {outcome.case_id!r} already has a case outcome with a "
+                        "different canonical binding; a reused case cannot be "
+                        "reattributed to another decision"
+                    )
                 return StoreAppendResult(False, outcome.case_outcome_id, REASON_DUPLICATE)
             self._cases.append_encoded_locked(encode_row(case_outcome_to_dict(outcome)))
             known.add(outcome.case_outcome_id)
@@ -693,6 +729,8 @@ class DurableObservationLedger:
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
         self._case_spend: dict[str, int] = {}
+        self._case_charge: dict[str, int] = {}
+        self._case_bindings: dict[str, object | None] = {}
         self._loaded_signature: tuple[int, int] | None = None
         self._loaded = False
 
@@ -707,19 +745,56 @@ class DurableObservationLedger:
             key = row.logical_observation_id
             attempts[key] = attempts.get(key, 0) + 1
             case_spend[row.case_id] = case_spend.get(row.case_id, 0) + (
-                row.estimated_cost_microunits or 0
+                row.estimated_microunits_reported()
             )
             if row.status in COMMITTED_STATUSES:
                 committed.setdefault(key, row)
         self._committed = committed
         self._attempts = attempts
         self._case_spend = case_spend
+        self._case_charge = self._store.load_case_charges()
+        self._case_bindings = {
+            outcome.case_id: outcome.canonical_binding
+            for outcome in self._store.iter_case_outcomes()
+        }
         self._loaded_signature = signature
         self._loaded = True
 
     def case_spend_microunits(self, case_id: str) -> int:
+        """Known spend for a case: recorded charges plus reported call costs.
+
+        Charges are recorded explicitly because the runtime's accounting is the
+        per-attempt maximum of the pre-flight estimate and the reported cost, and
+        an attempt with unknown cost still consumes its reservation. Reported
+        costs are also summed so evidence written before charges were recorded is
+        still counted.
+        """
         self._ensure_loaded()
-        return self._case_spend.get(case_id, 0)
+        return max(
+            self._case_charge.get(case_id, 0),
+            self._case_spend.get(case_id, 0),
+        )
+
+    def add_case_charge(self, case_id: str, microunits: int) -> None:
+        self._ensure_loaded()
+        self._case_charge[case_id] = self._case_charge.get(case_id, 0) + microunits
+        self._store.save_case_charges(self._case_charge)
+
+    def recorded_case_binding(self, case_id: str) -> object | None:
+        """The binding already durably recorded for a case, if any.
+
+        Read from the case-outcome artifact itself rather than a cache, because
+        the cache can be populated before the artifact is appended.
+        """
+        for outcome in self._store.iter_case_outcomes():
+            if outcome.case_id == case_id:
+                return outcome.canonical_binding
+        return self._case_bindings.get(case_id)
+
+    def note_case_binding(self, case_id: str, binding: object | None) -> None:
+        # Durability for the binding comes from the case-outcome artifact itself,
+        # which the store refuses to rewrite with a different binding.
+        self._case_bindings.setdefault(case_id, binding)
 
     def committed_opinion(self, logical_observation_id: str) -> ProviderCallOutcome | None:
         self._ensure_loaded()

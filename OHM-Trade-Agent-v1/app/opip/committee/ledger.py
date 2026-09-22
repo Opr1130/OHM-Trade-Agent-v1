@@ -38,6 +38,20 @@ class ObservationLedger(Protocol):
     def case_spend_microunits(self, case_id: str) -> int:
         """Return the known spend already recorded for a case."""
 
+    def add_case_charge(self, case_id: str, microunits: int) -> None:
+        """Persist the charge for one seat's invocations against its case.
+
+        The charge is the runtime's own accounting (per-attempt max of estimate
+        and reported cost), which cannot be reconstructed from reported cost
+        alone - an attempt whose cost is unknown still consumes its reservation.
+        Recording it explicitly is what keeps a redelivery within the ceiling.
+        """
+
+    def recorded_case_binding(self, case_id: str) -> object | None:
+        """Return the canonical binding already recorded for a case, if any."""
+
+    def note_case_binding(self, case_id: str, binding: object | None) -> None:
+        """Remember the canonical binding this case was run with."""
     def record(self, outcome: ProviderCallOutcome) -> None:
         """Record one attempt outcome. Never overwrites a committed opinion."""
 
@@ -49,6 +63,7 @@ class InMemoryObservationLedger:
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
         self._case_spend: dict[str, int] = {}
+        self._case_bindings: dict[str, object | None] = {}
         if prior is not None:
             for outcome in prior:
                 self.record(outcome)
@@ -62,12 +77,20 @@ class InMemoryObservationLedger:
     def case_spend_microunits(self, case_id: str) -> int:
         return self._case_spend.get(case_id, 0)
 
+    def add_case_charge(self, case_id: str, microunits: int) -> None:
+        if microunits < 0:
+            raise ValueError("a case charge cannot be negative")
+        self._case_spend[case_id] = self._case_spend.get(case_id, 0) + microunits
+
+    def recorded_case_binding(self, case_id: str) -> object | None:
+        return self._case_bindings.get(case_id)
+
+    def note_case_binding(self, case_id: str, binding: object | None) -> None:
+        self._case_bindings.setdefault(case_id, binding)
+
     def record(self, outcome: ProviderCallOutcome) -> None:
         key = outcome.logical_observation_id
         self._attempts[key] = self._attempts.get(key, 0) + 1
-        self._case_spend[outcome.case_id] = self._case_spend.get(
-            outcome.case_id, 0
-        ) + (outcome.estimated_cost_microunits or 0)
         if outcome.status in COMMITTED_STATUSES:
             # First committed observation wins; history is never rewritten.
             self._committed.setdefault(key, outcome)

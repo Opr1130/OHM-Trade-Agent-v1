@@ -218,6 +218,15 @@ class CommitteeRunner:
 
         started_at = self._now()
         seats: list[CommitteeSeatResult] = []
+        # A case may hold only one canonical binding: reusing a case's committed
+        # evidence while reattributing it to another decision must fail closed.
+        recorded_binding = self._ledger.recorded_case_binding(case.case_id)
+        if recorded_binding is not None and recorded_binding != case.canonical_binding:
+            raise CommitteePolicyViolation(
+                f"case {case.case_id!r} already carries a different canonical "
+                "binding; a reused case cannot be reattributed to another decision"
+            )
+        self._ledger.note_case_binding(case.case_id, case.canonical_binding)
         # Seed the case budget with spend already recorded for this case, so a
         # redelivery cannot spend the whole ceiling again: duplicate
         # acknowledgements contribute nothing, so without this the case could
@@ -235,10 +244,12 @@ class CommitteeRunner:
                 replay_existing=replay_existing,
             )
             seats.append(seat)
-            # Carry forward the reservations this seat actually consumed, not
-            # just its final reported cost. A timed-out or retried seat can have
-            # reserved more than it finally reported (or reported nothing), and
-            # dropping that would let the next seat spend past the case ceiling.
+            # Persist this seat's charge so a later redelivery of the case cannot
+            # respend it. The charge includes reservations for attempts whose
+            # reported cost is unknown, so it cannot be reconstructed from the
+            # call outcomes alone.
+            if reserved:
+                self._ledger.add_case_charge(case.case_id, reserved)
             spent_microunits += reserved
         completed_at = self._now()
         if completed_at < started_at:
