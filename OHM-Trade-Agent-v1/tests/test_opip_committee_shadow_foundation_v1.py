@@ -1272,8 +1272,9 @@ def test_prospective_visibility_timestamp_fails_closed_for_unknown_type():
     class NotAProspectiveRecord:
         observed_at = NOW
 
+    unknown = NotAProspectiveRecord()
     with pytest.raises(CommitteeSerializationError):
-        _prospective_visible_at(NotAProspectiveRecord())
+        _prospective_visible_at(unknown)
 
 
 def test_prospective_compaction_succeeds_across_all_record_types(tmp_path):
@@ -1388,8 +1389,9 @@ def test_the_execution_api_refuses_to_run_while_the_committee_is_disabled():
         settings={"opip_committee_mode": "off"},
     )
     policy = _policy(families=(ProviderFamily.OPENAI,))
+    disabled_case = _case(policy=policy)
     with pytest.raises(CommitteePolicyViolation):
-        runner.run_case(_case(policy=policy))
+        runner.run_case(disabled_case)
     assert provider.calls == []
 
 

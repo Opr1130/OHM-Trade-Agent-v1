@@ -305,40 +305,18 @@ class CommitteeRunner:
 
         committed = self._ledger.committed_opinion(logical_id)
         if committed is not None and not replay_existing:
-            # A committed logical observation is never asked again. This is the
-            # ACK-loss case: the caller may not know the write landed, but a
-            # second independent opinion must not be manufactured.
-            #
-            # The acknowledgement reuses the original call's timings rather than
-            # stamping a fresh request time. A replay can legitimately arrive
-            # later than the original response, and a synthetic request time
-            # after it would be a contract-violating, falsified provider timing.
-            outcome = ProviderCallOutcome(
-                logical_observation_id=logical_id,
-                case_id=case.case_id,
-                provider_family=family,
-                requested_model=requested_model,
-                status=ObservationStatus.DUPLICATE_OK,
-                attempt=committed.attempt,
-                reproducibility=committed.reproducibility,
-                request_at=committed.request_at,
-                input_hash=input_hash,
-                reported_provider=committed.reported_provider,
-                reported_model=committed.reported_model,
-                opinion=committed.opinion,
-                raw_response_ref=committed.raw_response_ref,
-                response_at=committed.response_at,
-                latency_micros=committed.latency_micros,
-                input_tokens=committed.input_tokens,
-                output_tokens=committed.output_tokens,
-                estimated_cost_microunits=None,
-                cost_completeness=CostCompleteness.UNKNOWN,
-                detail=(
-                    "logical observation already committed; not re-queried; "
-                    "timings are the original call's"
+            return CommitteeSeatResult(
+                family,
+                logical_id,
+                self._duplicate_acknowledgement(
+                    case=case,
+                    family=family,
+                    requested_model=requested_model,
+                    logical_id=logical_id,
+                    input_hash=input_hash,
+                    committed=committed,
                 ),
             )
-            return CommitteeSeatResult(family, logical_id, outcome)
 
         attempt = self._ledger.attempt_count(logical_id) + 1
         if attempt > MAX_RECORDED_ATTEMPTS:
@@ -360,9 +338,108 @@ class CommitteeRunner:
                 ),
             )
 
-        # The estimate is reserved per provider invocation, not once per seat, so
-        # a permitted retry cannot push cumulative spend past the declared case
-        # ceiling.
+        outcome = self._invoke_within_budget(
+            case=case,
+            family=family,
+            provider=provider,
+            wire=wire,
+            input_hash=input_hash,
+            attempt=attempt,
+            spent_microunits=spent_microunits,
+        )
+        if outcome is None:
+            return CommitteeSeatResult(
+                family,
+                logical_id,
+                self._budget_skipped_outcome(
+                    case=case,
+                    family=family,
+                    requested_model=requested_model,
+                    logical_id=logical_id,
+                    input_hash=input_hash,
+                    provider=provider,
+                    attempt=attempt,
+                    reason=self._attempt_budget_reason(
+                        case=case,
+                        estimate=provider.estimate_cost_microunits(wire),
+                        committed_spend=spent_microunits,
+                        seat_reserved=0,
+                    )
+                    or "committee cost ceiling would be exceeded",
+                ),
+            )
+
+        if replay_existing and committed is not None and outcome.opinion is not None:
+            if outcome.opinion.opinion_hash != committed.opinion.opinion_hash:
+                raise CommitteeReplayDivergenceError(
+                    "replayed observation diverges from the sealed opinion for "
+                    f"{family.value}; history is preserved and the replay is refused"
+                )
+
+        self._ledger.record(outcome)
+        return CommitteeSeatResult(family, logical_id, outcome)
+
+    def _duplicate_acknowledgement(
+        self,
+        *,
+        case: CommitteeCase,
+        family: ProviderFamily,
+        requested_model: str,
+        logical_id: str,
+        input_hash: str,
+        committed: ProviderCallOutcome,
+    ) -> ProviderCallOutcome:
+        """Acknowledge an already-committed logical observation.
+
+        The acknowledgement reuses the original call's timings rather than
+        stamping a fresh request time. A replay can legitimately arrive later than
+        the original response, and a synthetic request time after it would be a
+        contract-violating, falsified provider timing. The provider is not asked
+        again: a second independent opinion must not be manufactured.
+        """
+        return ProviderCallOutcome(
+            logical_observation_id=logical_id,
+            case_id=case.case_id,
+            provider_family=family,
+            requested_model=requested_model,
+            status=ObservationStatus.DUPLICATE_OK,
+            attempt=committed.attempt,
+            reproducibility=committed.reproducibility,
+            request_at=committed.request_at,
+            input_hash=input_hash,
+            reported_provider=committed.reported_provider,
+            reported_model=committed.reported_model,
+            opinion=committed.opinion,
+            raw_response_ref=committed.raw_response_ref,
+            response_at=committed.response_at,
+            latency_micros=committed.latency_micros,
+            input_tokens=committed.input_tokens,
+            output_tokens=committed.output_tokens,
+            estimated_cost_microunits=None,
+            cost_completeness=CostCompleteness.UNKNOWN,
+            detail=(
+                "logical observation already committed; not re-queried; "
+                "timings are the original call's"
+            ),
+        )
+
+    def _invoke_within_budget(
+        self,
+        *,
+        case: CommitteeCase,
+        family: ProviderFamily,
+        provider: CommitteeProvider,
+        wire: ProviderWireRequest,
+        input_hash: str,
+        attempt: int,
+        spent_microunits: int,
+    ) -> ProviderCallOutcome | None:
+        """Invoke the seat with bounded, budget-reserved retries.
+
+        The estimate is reserved per provider invocation, not once per seat, so a
+        permitted retry cannot push cumulative spend past the declared case
+        ceiling. Returns ``None`` when no invocation was affordable at all.
+        """
         estimate = provider.estimate_cost_microunits(wire)
         seat_reserved = 0
         outcome: ProviderCallOutcome | None = None
@@ -374,23 +451,8 @@ class CommitteeRunner:
                 seat_reserved=seat_reserved,
             )
             if skip_reason is not None:
-                if outcome is None:
-                    return CommitteeSeatResult(
-                        family,
-                        logical_id,
-                        self._budget_skipped_outcome(
-                            case=case,
-                            family=family,
-                            requested_model=requested_model,
-                            logical_id=logical_id,
-                            input_hash=input_hash,
-                            provider=provider,
-                            attempt=attempt,
-                            reason=skip_reason,
-                        ),
-                    )
-                # A previous attempt already happened and is retained below.
-                break
+                # A previous attempt already happened and is retained.
+                return outcome
             outcome = self._attempt_seat(
                 case=case,
                 family=family,
@@ -407,23 +469,13 @@ class CommitteeRunner:
                 and attempt < case.policy.max_attempts_per_seat
                 and attempt < MAX_RECORDED_ATTEMPTS
             ):
-                break
+                return outcome
             # Persist the failed attempt before retrying, so the audit trail
             # keeps every try rather than only the last one. A failed attempt is
             # not a committed observation, so this cannot create a second
             # opinion.
             self._ledger.record(outcome)
             attempt += 1
-
-        if replay_existing and committed is not None and outcome.opinion is not None:
-            if outcome.opinion.opinion_hash != committed.opinion.opinion_hash:
-                raise CommitteeReplayDivergenceError(
-                    "replayed observation diverges from the sealed opinion for "
-                    f"{family.value}; history is preserved and the replay is refused"
-                )
-
-        self._ledger.record(outcome)
-        return CommitteeSeatResult(family, logical_id, outcome)
 
     def _attempt_seat(
         self,
