@@ -184,7 +184,7 @@ class CommitteeEvidenceStore:
         self.evaluations_index_file = self.root / "evaluation_index.json"
         self.prospective_index_file = self.root / "prospective_index.json"
         self.attribution_index_file = self.root / "attribution_index.json"
-        self.case_charge_file = self.root / "case_charge_index.json"
+        self.call_charge_file = self.root / "call_charge_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -235,12 +235,21 @@ class CommitteeEvidenceStore:
 
     # ---------------------------------------------------------------- calls
 
-    def append_call_outcome(self, outcome: ProviderCallOutcome) -> StoreAppendResult:
+    def append_call_outcome(
+        self,
+        outcome: ProviderCallOutcome,
+        *,
+        charge_microunits: int | None = None,
+    ) -> StoreAppendResult:
         """Append one call outcome, or acknowledge a duplicate without writing.
 
         A committed observation is immutable. When the same logical seat is
         re-delivered with materially different content, the original is kept and
         the divergence is reported instead of silently overwriting history.
+
+        ``charge_microunits`` is the runtime's computed charge for this attempt,
+        written under the same lock as the outcome so a reservation cannot be
+        lost relative to the evidence it belongs to.
         """
         self.root.mkdir(parents=True, exist_ok=True)
         with registry_lock(self.call_lock_file):
@@ -255,6 +264,10 @@ class CommitteeEvidenceStore:
                     return StoreAppendResult(False, previous.outcome_id, REASON_DIVERGENCE)
                 return StoreAppendResult(False, previous.outcome_id, REASON_DUPLICATE)
             self._calls.append_encoded_locked(encode_row(call_outcome_to_dict(outcome)))
+            if charge_microunits is not None:
+                charges = self.load_call_charges()
+                charges[outcome.outcome_id] = charge_microunits
+                self.save_call_charges(charges)
             if outcome.status in COMMITTED_STATUSES and outcome.opinion is not None:
                 index[outcome.logical_observation_id] = _CommittedIndexEntry(
                     outcome_id=outcome.outcome_id,
@@ -283,26 +296,26 @@ class CommitteeEvidenceStore:
 
     # ---------------------------------------------------------------- cases
 
-    def load_case_charges(self) -> dict[str, int]:
-        """Persisted per-case charges recorded by the committee runtime."""
-        raw = self._load_index_payload(self.case_charge_file)
+    def load_call_charges(self) -> dict[str, int]:
+        """Per-call-outcome charges recorded by the committee runtime."""
+        raw = self._load_index_payload(self.call_charge_file)
         entries = raw.get("entries")
         if not isinstance(entries, Mapping):
             return {}
-        charges: dict[str, int] = {}
-        for key, value in entries.items():
-            if isinstance(key, str) and type(value) is int and value >= 0:
-                charges[key] = value
-        return charges
+        return {
+            key: value
+            for key, value in entries.items()
+            if isinstance(key, str) and type(value) is int and value >= 0
+        }
 
-    def save_case_charges(self, charges: Mapping[str, int]) -> None:
-        """Persist per-case charges so a redelivery cannot respend the ceiling."""
+    def save_call_charges(self, charges: Mapping[str, int]) -> None:
+        """Persist per-call charges so a redelivery cannot respend the ceiling."""
         payload = {
             "schema_version": 1,
-            "kind": "CASE_CHARGE",
+            "kind": "CALL_CHARGE",
             "entries": {key: int(value) for key, value in charges.items()},
         }
-        self._write_index(self.case_charge_file, payload, label="case charge")
+        self._write_index(self.call_charge_file, payload, label="call charge")
 
     def append_case_outcome(self, outcome: CommitteeCaseOutcome) -> StoreAppendResult:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -728,8 +741,7 @@ class DurableObservationLedger:
         self._store = store
         self._committed: dict[str, ProviderCallOutcome] = {}
         self._attempts: dict[str, int] = {}
-        self._case_spend: dict[str, int] = {}
-        self._case_charge: dict[str, int] = {}
+        self._charges: dict[str, int] = {}
         self._case_bindings: dict[str, object | None] = {}
         self._loaded_signature: tuple[int, int] | None = None
         self._loaded = False
@@ -740,19 +752,14 @@ class DurableObservationLedger:
             return
         committed: dict[str, ProviderCallOutcome] = {}
         attempts: dict[str, int] = {}
-        case_spend: dict[str, int] = {}
         for row in self._store.iter_call_outcomes():
             key = row.logical_observation_id
             attempts[key] = attempts.get(key, 0) + 1
-            case_spend[row.case_id] = case_spend.get(row.case_id, 0) + (
-                row.estimated_microunits_reported()
-            )
             if row.status in COMMITTED_STATUSES:
                 committed.setdefault(key, row)
         self._committed = committed
         self._attempts = attempts
-        self._case_spend = case_spend
-        self._case_charge = self._store.load_case_charges()
+        self._charges = self._store.load_call_charges()
         self._case_bindings = {
             outcome.case_id: outcome.canonical_binding
             for outcome in self._store.iter_case_outcomes()
@@ -761,35 +768,36 @@ class DurableObservationLedger:
         self._loaded = True
 
     def case_spend_microunits(self, case_id: str) -> int:
-        """Known spend for a case: recorded charges plus reported call costs.
+        """Known spend for a case.
 
-        Charges are recorded explicitly because the runtime's accounting is the
-        per-attempt maximum of the pre-flight estimate and the reported cost, and
-        an attempt with unknown cost still consumes its reservation. Reported
-        costs are also summed so evidence written before charges were recorded is
-        still counted.
+        Each attempt contributes its explicitly recorded charge, falling back to
+        its reported cost for evidence written before charges were recorded. That
+        combines legacy and current evidence: choosing the greater of the two
+        totals would drop one of them for a case that spans the upgrade, since
+        legacy calls have only reported cost and new calls have only a charge.
         """
         self._ensure_loaded()
-        return max(
-            self._case_charge.get(case_id, 0),
-            self._case_spend.get(case_id, 0),
-        )
+        total = 0
+        for row in self._store.iter_call_outcomes():
+            if row.case_id != case_id:
+                continue
+            total += self._charges.get(
+                row.outcome_id, row.estimated_microunits_reported()
+            )
+        return total
 
-    def add_case_charge(self, case_id: str, microunits: int) -> None:
-        self._ensure_loaded()
-        self._case_charge[case_id] = self._case_charge.get(case_id, 0) + microunits
-        self._store.save_case_charges(self._case_charge)
-
-    def recorded_case_binding(self, case_id: str) -> object | None:
-        """The binding already durably recorded for a case, if any.
+    def recorded_case_binding(self, case_id: str) -> tuple[bool, object | None]:
+        """The binding already durably recorded for a case, and whether it was.
 
         Read from the case-outcome artifact itself rather than a cache, because
         the cache can be populated before the artifact is appended.
         """
         for outcome in self._store.iter_case_outcomes():
             if outcome.case_id == case_id:
-                return outcome.canonical_binding
-        return self._case_bindings.get(case_id)
+                return True, outcome.canonical_binding
+        if case_id in self._case_bindings:
+            return True, self._case_bindings[case_id]
+        return False, None
 
     def note_case_binding(self, case_id: str, binding: object | None) -> None:
         # Durability for the binding comes from the case-outcome artifact itself,
@@ -804,15 +812,26 @@ class DurableObservationLedger:
         self._ensure_loaded()
         return self._attempts.get(logical_observation_id, 0)
 
-    def record(self, outcome: ProviderCallOutcome) -> None:
+    def record(
+        self,
+        outcome: ProviderCallOutcome,
+        *,
+        charge_microunits: int | None = None,
+    ) -> None:
         """Persist one attempt, refusing to publish a rejected observation.
+
+        The charge is written together with the call outcome, under the same
+        store lock, so a crash between the two cannot lose a reservation and let
+        a redelivery respend the case ceiling.
 
         If the durable log already holds a different opinion for this logical
         seat, the append is refused as a divergence. That result cannot be
         discarded: the caller must not proceed to publish a case outcome
         containing an opinion the evidence log explicitly rejected.
         """
-        result = self._store.append_call_outcome(outcome)
+        result = self._store.append_call_outcome(
+            outcome, charge_microunits=charge_microunits
+        )
         if not result.stored and result.reason == REASON_DIVERGENCE:
             raise CommitteeReplayDivergenceError(
                 "the durable call log already holds a different opinion for this "

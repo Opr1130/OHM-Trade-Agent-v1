@@ -220,8 +220,12 @@ class CommitteeRunner:
         seats: list[CommitteeSeatResult] = []
         # A case may hold only one canonical binding: reusing a case's committed
         # evidence while reattributing it to another decision must fail closed.
-        recorded_binding = self._ledger.recorded_case_binding(case.case_id)
-        if recorded_binding is not None and recorded_binding != case.canonical_binding:
+        # The found flag distinguishes "never run" from "run without a binding",
+        # so a transition in either direction is caught.
+        was_recorded, recorded_binding = self._ledger.recorded_case_binding(
+            case.case_id
+        )
+        if was_recorded and recorded_binding != case.canonical_binding:
             raise CommitteePolicyViolation(
                 f"case {case.case_id!r} already carries a different canonical "
                 "binding; a reused case cannot be reattributed to another decision"
@@ -244,12 +248,6 @@ class CommitteeRunner:
                 replay_existing=replay_existing,
             )
             seats.append(seat)
-            # Persist this seat's charge so a later redelivery of the case cannot
-            # respend it. The charge includes reservations for attempts whose
-            # reported cost is unknown, so it cannot be reconstructed from the
-            # call outcomes alone.
-            if reserved:
-                self._ledger.add_case_charge(case.case_id, reserved)
             spent_microunits += reserved
         completed_at = self._now()
         if completed_at < started_at:
@@ -383,13 +381,16 @@ class CommitteeRunner:
                 0,
             )
 
-        outcome, reserved, already_recorded = self._invoke_within_budget(            case=case,
-            family=family,
-            provider=provider,
-            wire=wire,
-            input_hash=input_hash,
-            attempt=attempt,
-            spent_microunits=spent_microunits,
+        outcome, reserved, already_recorded, final_charge = (
+            self._invoke_within_budget(
+                case=case,
+                family=family,
+                provider=provider,
+                wire=wire,
+                input_hash=input_hash,
+                attempt=attempt,
+                spent_microunits=spent_microunits,
+            )
         )
         if outcome is None:
             return (
@@ -425,9 +426,9 @@ class CommitteeRunner:
 
         if not already_recorded:
             # A retry that was blocked by the budget already persisted its prior
-            # failure; recording it again would double-count the attempt and
-            # append duplicate raw evidence.
-            self._ledger.record(outcome)
+            # failure (with its charge); recording it again would double-count the
+            # attempt and append duplicate raw evidence.
+            self._ledger.record(outcome, charge_microunits=final_charge)
         # The seat is charged the cumulative per-attempt cost computed while
         # invoking, so a retried or under-estimated seat cannot leave room for the
         # next seat to spend past the case ceiling.
@@ -487,19 +488,22 @@ class CommitteeRunner:
         input_hash: str,
         attempt: int,
         spent_microunits: int,
-    ) -> tuple[ProviderCallOutcome | None, int, bool]:
+    ) -> tuple[ProviderCallOutcome | None, int, bool, int]:
         """Invoke the seat with bounded, budget-reserved retries.
 
         The estimate is reserved per provider invocation, not once per seat, so a
         permitted retry cannot push cumulative spend past the declared case
-        ceiling. Returns ``(outcome, reserved_microunits, already_recorded)``;
-        ``outcome`` is ``None`` when no invocation was affordable at all, and
-        ``already_recorded`` is true when the returned failure was persisted
-        during the loop.
+        ceiling. Returns ``(outcome, seat_charge, already_recorded,
+        final_attempt_charge)``; ``outcome`` is ``None`` when no invocation was
+        affordable at all, ``seat_charge`` is the cumulative per-attempt charge,
+        ``already_recorded`` is true when the returned failure was already
+        persisted with its charge, and ``final_attempt_charge`` is the charge that
+        the caller must persist alongside the returned outcome.
         """
         estimate = provider.estimate_cost_microunits(wire)
         seat_reserved = 0
         seat_charge = 0
+        final_charge = 0
         outcome: ProviderCallOutcome | None = None
         while True:
             skip_reason = self._attempt_budget_reason(
@@ -509,9 +513,9 @@ class CommitteeRunner:
                 seat_reserved=seat_reserved,
             )
             if skip_reason is not None:
-                # A previous attempt already happened, was persisted below, and
-                # is retained as the seat's disposition.
-                return outcome, seat_charge, outcome is not None
+                # A previous attempt already happened, was persisted below with
+                # its charge, and is retained as the seat's disposition.
+                return outcome, seat_charge, outcome is not None, 0
             outcome = self._attempt_seat(
                 case=case,
                 family=family,
@@ -529,26 +533,30 @@ class CommitteeRunner:
             # case ledger so the next seat cannot spend past the ceiling. A seat
             # that was never invoked (an unavailable adapter) incurs no spend, so
             # its estimate is not charged.
-            if outcome.status is not ObservationStatus.UNAVAILABLE:
-                seat_charge += max(
-                    estimate or 0, outcome.estimated_cost_microunits or 0
-                )
+            final_charge = (
+                0
+                if outcome.status is ObservationStatus.UNAVAILABLE
+                else max(estimate or 0, outcome.estimated_cost_microunits or 0)
+            )
+            seat_charge += final_charge
             if not (
                 outcome.status is ObservationStatus.FAILED
                 and outcome.failure_class in RETRYABLE_FAILURE_CLASSES
                 and attempt < case.policy.max_attempts_per_seat
                 and attempt < MAX_RECORDED_ATTEMPTS
             ):
-                return outcome, seat_charge, False
-            # Persist the failed attempt before retrying, so the audit trail
-            # keeps every try rather than only the last one. A failed attempt is
-            # not a committed observation, so this cannot create a second
-            # opinion.
-            self._ledger.record(outcome)
+                return outcome, seat_charge, False, final_charge
+            # Persist the failed attempt, with its charge, before retrying so the
+            # audit trail keeps every try rather than only the last one. The
+            # charge is written under the same lock as the outcome, so a crash
+            # cannot lose a reservation relative to its evidence. A failed
+            # attempt is not a committed observation, so this cannot create a
+            # second opinion.
+            self._ledger.record(outcome, charge_microunits=final_charge)
             if attempt + 1 > case.policy.max_attempts_per_seat:
                 # The retry would exceed the declared per-seat policy, so stop
                 # with the recorded failure rather than spending again.
-                return outcome, seat_charge, True
+                return outcome, seat_charge, True, 0
             attempt += 1
 
     def _attempt_seat(

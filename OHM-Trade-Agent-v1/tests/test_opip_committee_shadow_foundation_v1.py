@@ -1969,5 +1969,20 @@ def test_reattributing_a_case_to_another_decision_fails_closed(tmp_path):
     assert store.append_case_outcome(first.case_outcome).stored is True
 
     # The same logical seat is reused, but the case is reattributed to D2.
+    reattributed = _bound("D2")
     with pytest.raises(CommitteePolicyViolation):
-        runner.run_case(_bound("D2"))
+        runner.run_case(reattributed)
+
+    # A transition in the other direction is caught too: a case that was run with
+    # a binding cannot later be re-run as unbound.
+    unbound = CommitteeCase(
+        case_id="case-1",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        snapshot=_snapshot(),
+        policy=policy,
+        created_at=NOW,
+        provenance=_provenance(),
+        instrument_id="INSTR:kraken:SOL:USD:1",
+    )
+    with pytest.raises(CommitteePolicyViolation):
+        runner.run_case(unbound)
