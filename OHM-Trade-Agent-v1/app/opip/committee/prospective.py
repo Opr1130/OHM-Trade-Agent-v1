@@ -34,7 +34,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Iterable, Mapping, Sequence
 from app.opip.committee.contracts import (
-    CanonicalDecisionBinding,
     CaseType,
     CommitteeCaseOutcome,
     EvaluationPhase,
@@ -303,13 +302,7 @@ class HindsightLeakageError(ProspectivePolicyError):
 
 @dataclass(frozen=True)
 class SealedPrediction:
-    """T0 evidence: the sealed opinion set for one case, with its cutoff.
-
-    An optional :class:`CanonicalDecisionBinding` may be preserved from the
-    originating committee case so a sealed recommendation stays linked to an
-    existing opaque canonical decision/episode by reference. The binding does
-    not grant authority and does not write Decision Intelligence streams.
-    """
+    """T0 evidence: the sealed opinion set for one case, with its cutoff."""
 
     case_id: str
     case_type: CaseType
@@ -324,17 +317,10 @@ class SealedPrediction:
     horizon_seconds: int
     provenance: Provenance
     phase: EvaluationPhase = EvaluationPhase.PROSPECTIVE
-    canonical_binding: CanonicalDecisionBinding | None = None
     schema_version: int = SEALED_PREDICTION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         _validate_sealed_prediction(self)
-        if self.canonical_binding is not None and not isinstance(
-            self.canonical_binding, CanonicalDecisionBinding
-        ):
-            raise ProspectivePolicyError(
-                "canonical_binding must be a CanonicalDecisionBinding or null"
-            )
 
     def identity_payload(self) -> dict[str, object]:
         return {
@@ -349,11 +335,6 @@ class SealedPrediction:
             "committee_policy_version": self.committee_policy_version,
             "sealed_opinion_hashes": self.sealed_opinion_hashes,
             "horizon_seconds": self.horizon_seconds,
-            "canonical_binding": (
-                None
-                if self.canonical_binding is None
-                else self.canonical_binding.identity_payload()
-            ),
         }
 
     @property
@@ -567,7 +548,6 @@ def seal_prediction(
     experiment_id: str,
     provenance: Provenance,
     case_type: CaseType,
-    canonical_binding: CanonicalDecisionBinding | None = None,
 ) -> SealedPrediction:
     """Seal the T0 opinions for a case so no later evidence can alter them.
 
@@ -581,20 +561,11 @@ def seal_prediction(
     from the later observation: accepting a horizon after results are known would
     permit post-hoc horizon selection, which invalidates the experiment even
     though every timestamp check would still pass.
-
-    ``canonical_binding`` is optional opaque linkage preserved onto the sealed
-    prediction. It does not grant authority and is not required for sealing.
     """
     if type(horizon_seconds) is not int or horizon_seconds < 1:
         raise ProspectivePolicyError(_HORIZON_MESSAGE)
     sealed = require_utc(sealed_at, field_name="sealed_at")
     _require_snapshot_binding(case_outcome, evidence_snapshot, case_type=case_type)
-    if canonical_binding is not None and not isinstance(
-        canonical_binding, CanonicalDecisionBinding
-    ):
-        raise ProspectivePolicyError(
-            "canonical_binding must be a CanonicalDecisionBinding or null"
-        )
     cutoff = evidence_snapshot.evidence_cutoff_at
     hashes = _sealed_opinion_hashes(case_outcome)
     if case_outcome.phase is not EvaluationPhase.PROSPECTIVE:
@@ -619,7 +590,6 @@ def seal_prediction(
         sealed_seat_count=len(hashes),
         horizon_seconds=horizon_seconds,
         provenance=provenance,
-        canonical_binding=canonical_binding,
     )
 
 
