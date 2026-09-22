@@ -735,10 +735,11 @@ def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
         provenance=_provenance(),
     )
     retrospective_seal = _provenance()
+    snapshot = _snapshot()
     with pytest.raises(ProspectivePolicyError):
         seal_prediction(
             case_outcome=retrospective,
-            evidence_snapshot=_snapshot(),
+            evidence_snapshot=snapshot,
             sealed_at=SEALED_AT,
             experiment_id=EXPERIMENT_ID,
             provenance=retrospective_seal,
@@ -802,9 +803,10 @@ def test_sealing_rejects_a_snapshot_for_another_case():
         prompt_version="3",
     )
     provenance = _provenance()
+    case_outcome = _case_outcome()
     with pytest.raises(ProspectivePolicyError):
         seal_prediction(
-            case_outcome=_case_outcome(),
+            case_outcome=case_outcome,
             evidence_snapshot=other,
             sealed_at=SEALED_AT,
             experiment_id=EXPERIMENT_ID,
