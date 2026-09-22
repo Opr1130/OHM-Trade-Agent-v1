@@ -58,12 +58,13 @@ services:
       - /etc/opip-cockpit.env
     environment:
       # OPIP_CANONICAL_REPLICA_ROOT is deliberately NOT set here. Bootstrap writes the
-      # stable mounted repository root into /etc/opip-cockpit.env. Installed bundles
-      # live under `generations/<id>` and the atomically replaced plain-text `current`
-      # pointer selects the active immutable generation. The Cockpit resolves that
-      # pointer at read time so normal retention cannot prune a generation it pinned
-      # at deployment. `cockpit-ready` still verifies an exact resolved generation
-      # before readiness is recorded.
+      # stable mounted repository root and exact deployed Cockpit release SHA into
+      # /etc/opip-cockpit.env. Installed bundles live under `generations/<id>` and the
+      # atomically replaced plain-text `current` pointer selects the active immutable
+      # generation. The Cockpit resolves that pointer at read time only when the
+      # generation manifest names its own deployed release. Same-release rotation
+      # survives retention pruning; cross-release drift fails closed. `cockpit-ready`
+      # still verifies an exact resolved generation before readiness is recorded.
       OPIP_COCKPIT_HTTP_PORT: ${OPIP_COCKPIT_HTTP_PORT:-8000}
       PYTHONDONTWRITEBYTECODE: "1"
     command:
