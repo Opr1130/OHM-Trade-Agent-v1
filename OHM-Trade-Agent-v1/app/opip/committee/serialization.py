@@ -15,18 +15,19 @@ from typing import Any, Mapping
 from app.opip.committee.contracts import (
     COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION,
     PROVIDER_CALL_OUTCOME_SCHEMA_VERSION,
-    ProviderCallOutcome,
+    CaseType,
     CommitteeCaseOutcome,
     CostCompleteness,
+    DirectionalAssessment,
     EvaluationPhase,
+    EvidenceSufficiency,
     ObservationStatus,
+    ProviderCallOutcome,
     ProviderFailureClass,
     ProviderFamily,
-    StructuredOpinion,
-    EvidenceSufficiency,
-    DirectionalAssessment,
-    ResearchAction,
     ReproducibilityClass,
+    ResearchAction,
+    StructuredOpinion,
 )
 from app.opip.decision_intelligence.serialization import require_utc
 
@@ -768,6 +769,348 @@ def evaluation_report_from_dict(row: Mapping[str, Any]):
     return report
 
 
+_SEAL_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "prediction_id",
+        "case_id",
+        "case_type",
+        "experiment_id",
+        "evidence_cutoff_at",
+        "sealed_at",
+        "case_outcome_id",
+        "evidence_snapshot_hash",
+        "committee_policy_version",
+        "sealed_opinion_hashes",
+        "sealed_seat_count",
+        "phase",
+        "provenance",
+    }
+)
+
+_OUTCOME_OBSERVATION_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "observation_id",
+        "case_id",
+        "outcome_source",
+        "source_refs",
+        "observed_at",
+        "horizon_seconds",
+        "finality",
+        "positive",
+        "realised_return_microunits",
+        "incomplete_reason",
+    }
+)
+
+_PROSPECTIVE_EVALUATION_FIELDS = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "evaluation_id",
+        "prediction_id",
+        "outcome_observation_id",
+        "case_id",
+        "case_type",
+        "experiment_id",
+        "evidence_cutoff_at",
+        "sealed_at",
+        "observed_at",
+        "evaluated_at",
+        "horizon_seconds",
+        "finality",
+        "phase",
+        "seat_scores",
+        "scored_seats",
+        "abstained_seats",
+        "unavailable_seats",
+        "unscored_directional_seats",
+        "metrics",
+        "confusion",
+        "measurement_only",
+        "automatic_promotion",
+        "trade_authority_changed",
+        "provenance",
+    }
+)
+
+_SEAT_SCORE_FIELDS = frozenset(
+    {"provider_family", "model", "call", "correct", "final"}
+)
+
+_PREDICTION_KIND = "SEALED_PREDICTION"
+_OUTCOME_KIND = "OUTCOME_OBSERVATION"
+_EVALUATION_KIND = "PROSPECTIVE_EVALUATION"
+
+
+def _encode_provenance(provenance) -> dict[str, Any]:
+    return {
+        "schema_version": provenance.schema_version,
+        "producing_component": provenance.producing_component,
+        "artifact_or_build_id": provenance.artifact_or_build_id,
+        "process_instance_id": provenance.process_instance_id,
+        "emitted_at": _iso(provenance.emitted_at),
+        "source_record_refs": list(provenance.source_record_refs),
+    }
+
+
+def _decode_provenance(row: Mapping[str, Any]):
+    from app.opip.decision_intelligence.identity import Provenance
+
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("provenance must be an object")
+    _reject_unknown(row, _PROVENANCE_FIELDS, kind="provenance")
+    return Provenance(
+        schema_version=row.get("schema_version"),
+        producing_component=row.get("producing_component"),
+        artifact_or_build_id=row.get("artifact_or_build_id"),
+        process_instance_id=row.get("process_instance_id"),
+        emitted_at=_parse_dt(row.get("emitted_at"), field="emitted_at"),
+        source_record_refs=_parse_str_tuple(
+            row.get("source_record_refs"), field="source_record_refs"
+        ),
+    )
+
+
+def sealed_prediction_to_dict(prediction) -> dict[str, Any]:
+    return {
+        "kind": _PREDICTION_KIND,
+        "schema_version": prediction.schema_version,
+        "prediction_id": prediction.prediction_id,
+        "case_id": prediction.case_id,
+        "case_type": prediction.case_type.value,
+        "experiment_id": prediction.experiment_id,
+        "evidence_cutoff_at": _iso(prediction.evidence_cutoff_at),
+        "sealed_at": _iso(prediction.sealed_at),
+        "case_outcome_id": prediction.case_outcome_id,
+        "evidence_snapshot_hash": prediction.evidence_snapshot_hash,
+        "committee_policy_version": prediction.committee_policy_version,
+        "sealed_opinion_hashes": list(prediction.sealed_opinion_hashes),
+        "sealed_seat_count": prediction.sealed_seat_count,
+        "phase": prediction.phase.value,
+        "provenance": _encode_provenance(prediction.provenance),
+    }
+
+
+def sealed_prediction_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.prospective import SealedPrediction
+
+    _reject_unknown(row, _SEAL_FIELDS, kind="sealed prediction")
+    prediction = SealedPrediction(
+        schema_version=row.get("schema_version"),
+        case_id=row.get("case_id"),
+        case_type=_parse_enum(row.get("case_type"), CaseType, field="case_type"),
+        experiment_id=row.get("experiment_id"),
+        evidence_cutoff_at=_parse_dt(
+            row.get("evidence_cutoff_at"), field="evidence_cutoff_at"
+        ),
+        sealed_at=_parse_dt(row.get("sealed_at"), field="sealed_at"),
+        case_outcome_id=row.get("case_outcome_id"),
+        evidence_snapshot_hash=row.get("evidence_snapshot_hash"),
+        committee_policy_version=row.get("committee_policy_version"),
+        sealed_opinion_hashes=_parse_str_tuple(
+            row.get("sealed_opinion_hashes"), field="sealed_opinion_hashes"
+        ),
+        sealed_seat_count=row.get("sealed_seat_count"),
+        phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
+        provenance=_decode_provenance(row.get("provenance")),
+    )
+    declared = row.get("prediction_id")
+    if declared is not None and declared != prediction.prediction_id:
+        raise CommitteeSerializationError(
+            "persisted prediction_id does not match its content identity"
+        )
+    return prediction
+
+
+def outcome_observation_to_dict(observation) -> dict[str, Any]:
+    return {
+        "kind": _OUTCOME_KIND,
+        "schema_version": observation.schema_version,
+        "observation_id": observation.observation_id,
+        "case_id": observation.case_id,
+        "outcome_source": observation.outcome_source,
+        "source_refs": list(observation.source_refs),
+        "observed_at": _iso(observation.observed_at),
+        "horizon_seconds": observation.horizon_seconds,
+        "finality": observation.finality.value,
+        "positive": observation.positive,
+        "realised_return_microunits": observation.realised_return_microunits,
+        "incomplete_reason": observation.incomplete_reason,
+    }
+
+
+def outcome_observation_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.prospective import OutcomeFinality, OutcomeObservation
+
+    _reject_unknown(row, _OUTCOME_OBSERVATION_FIELDS, kind="outcome observation")
+    observation = OutcomeObservation(
+        schema_version=row.get("schema_version"),
+        case_id=row.get("case_id"),
+        outcome_source=row.get("outcome_source"),
+        source_refs=_parse_str_tuple(row.get("source_refs"), field="source_refs"),
+        observed_at=_parse_dt(row.get("observed_at"), field="observed_at"),
+        horizon_seconds=row.get("horizon_seconds"),
+        finality=_parse_enum(row.get("finality"), OutcomeFinality, field="finality"),
+        positive=row.get("positive"),
+        realised_return_microunits=_parse_optional_int(
+            row.get("realised_return_microunits"), field="realised_return_microunits"
+        ),
+        incomplete_reason=_parse_optional_str(
+            row.get("incomplete_reason"), field="incomplete_reason"
+        ),
+    )
+    declared = row.get("observation_id")
+    if declared is not None and declared != observation.observation_id:
+        raise CommitteeSerializationError(
+            "persisted observation_id does not match its content identity"
+        )
+    return observation
+
+
+def prospective_evaluation_to_dict(evaluation) -> dict[str, Any]:
+    return {
+        "kind": _EVALUATION_KIND,
+        "schema_version": evaluation.schema_version,
+        "evaluation_id": evaluation.evaluation_id,
+        "prediction_id": evaluation.prediction_id,
+        "outcome_observation_id": evaluation.outcome_observation_id,
+        "case_id": evaluation.case_id,
+        "case_type": evaluation.case_type.value,
+        "experiment_id": evaluation.experiment_id,
+        "evidence_cutoff_at": _iso(evaluation.evidence_cutoff_at),
+        "sealed_at": _iso(evaluation.sealed_at),
+        "observed_at": _iso(evaluation.observed_at),
+        "evaluated_at": _iso(evaluation.evaluated_at),
+        "horizon_seconds": evaluation.horizon_seconds,
+        "finality": evaluation.finality.value,
+        "phase": evaluation.phase.value,
+        "seat_scores": [
+            {
+                "provider_family": score.provider_family.value,
+                "model": score.model,
+                "call": score.call.value,
+                "correct": score.correct,
+                "final": score.final,
+            }
+            for score in evaluation.seat_scores
+        ],
+        "scored_seats": evaluation.scored_seats,
+        "abstained_seats": evaluation.abstained_seats,
+        "unavailable_seats": evaluation.unavailable_seats,
+        "unscored_directional_seats": evaluation.unscored_directional_seats,
+        "metrics": {
+            "precision": _encode_metric(evaluation.precision),
+            "recall": _encode_metric(evaluation.recall),
+            "f1": _encode_metric(evaluation.f1),
+            "accuracy": _encode_metric(evaluation.accuracy),
+        },
+        "confusion": _encode_confusion(evaluation.confusion),
+        "measurement_only": evaluation.measurement_only,
+        "automatic_promotion": evaluation.automatic_promotion,
+        "trade_authority_changed": evaluation.trade_authority_changed,
+        "provenance": _encode_provenance(evaluation.provenance),
+    }
+
+
+def prospective_evaluation_from_dict(row: Mapping[str, Any]):
+    from app.opip.committee.evaluation import DirectionalCall
+    from app.opip.committee.prospective import (
+        OutcomeFinality,
+        ProspectiveEvaluation,
+        ProspectiveSeatScore,
+    )
+
+    _reject_unknown(row, _PROSPECTIVE_EVALUATION_FIELDS, kind="prospective evaluation")
+    raw_metrics = row.get("metrics")
+    if not isinstance(raw_metrics, Mapping):
+        raise CommitteeSerializationError("prospective metrics must be an object")
+    missing = [
+        name
+        for name in ("precision", "recall", "f1", "accuracy")
+        if name not in raw_metrics
+    ]
+    if missing:
+        raise CommitteeSerializationError(f"missing metrics: {missing}")
+    raw_scores = row.get("seat_scores")
+    if not isinstance(raw_scores, list):
+        raise CommitteeSerializationError("seat_scores must be a list")
+    seat_scores = []
+    for score_row in raw_scores:
+        if not isinstance(score_row, Mapping):
+            raise CommitteeSerializationError("seat score must be an object")
+        _reject_unknown(score_row, _SEAT_SCORE_FIELDS, kind="seat score")
+        seat_scores.append(
+            ProspectiveSeatScore(
+                provider_family=_parse_enum(
+                    score_row.get("provider_family"),
+                    ProviderFamily,
+                    field="provider_family",
+                ),
+                model=score_row.get("model"),
+                call=_parse_enum(
+                    score_row.get("call"), DirectionalCall, field="call"
+                ),
+                correct=score_row.get("correct"),
+                final=bool(score_row.get("final")),
+            )
+        )
+    evaluation = ProspectiveEvaluation(
+        schema_version=row.get("schema_version"),
+        prediction_id=row.get("prediction_id"),
+        outcome_observation_id=row.get("outcome_observation_id"),
+        case_id=row.get("case_id"),
+        case_type=_parse_enum(row.get("case_type"), CaseType, field="case_type"),
+        experiment_id=row.get("experiment_id"),
+        evidence_cutoff_at=_parse_dt(
+            row.get("evidence_cutoff_at"), field="evidence_cutoff_at"
+        ),
+        sealed_at=_parse_dt(row.get("sealed_at"), field="sealed_at"),
+        observed_at=_parse_dt(row.get("observed_at"), field="observed_at"),
+        evaluated_at=_parse_dt(row.get("evaluated_at"), field="evaluated_at"),
+        horizon_seconds=row.get("horizon_seconds"),
+        finality=_parse_enum(row.get("finality"), OutcomeFinality, field="finality"),
+        phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
+        seat_scores=tuple(seat_scores),
+        scored_seats=row.get("scored_seats"),
+        abstained_seats=row.get("abstained_seats"),
+        unavailable_seats=row.get("unavailable_seats"),
+        unscored_directional_seats=row.get("unscored_directional_seats"),
+        precision=_decode_metric(raw_metrics["precision"]),
+        recall=_decode_metric(raw_metrics["recall"]),
+        f1=_decode_metric(raw_metrics["f1"]),
+        accuracy=_decode_metric(raw_metrics["accuracy"]),
+        confusion=_decode_confusion(row.get("confusion")),
+        measurement_only=bool(row.get("measurement_only")),
+        automatic_promotion=bool(row.get("automatic_promotion")),
+        trade_authority_changed=bool(row.get("trade_authority_changed")),
+        provenance=_decode_provenance(row.get("provenance")),
+    )
+    declared = row.get("evaluation_id")
+    if declared is not None and declared != evaluation.evaluation_id:
+        raise CommitteeSerializationError(
+            "persisted evaluation_id does not match its content identity"
+        )
+    return evaluation
+
+
+def prospective_record_from_dict(row: Mapping[str, Any]):
+    """Dispatch a persisted prospective row to its contract by record kind."""
+    if not isinstance(row, Mapping):
+        raise CommitteeSerializationError("prospective record must be an object")
+    kind = row.get("kind")
+    if kind == _PREDICTION_KIND:
+        return sealed_prediction_from_dict(row)
+    if kind == _OUTCOME_KIND:
+        return outcome_observation_from_dict(row)
+    if kind == _EVALUATION_KIND:
+        return prospective_evaluation_from_dict(row)
+    raise CommitteeSerializationError(f"undeclared prospective record kind: {kind!r}")
+
+
 __all__ = [
     "COMMITTEE_CASE_OUTCOME_SCHEMA_VERSION",
     "PROVIDER_CALL_OUTCOME_SCHEMA_VERSION",
@@ -780,4 +1123,11 @@ __all__ = [
     "evaluation_report_to_dict",
     "opinion_from_dict",
     "opinion_to_dict",
+    "outcome_observation_from_dict",
+    "outcome_observation_to_dict",
+    "prospective_evaluation_from_dict",
+    "prospective_evaluation_to_dict",
+    "prospective_record_from_dict",
+    "sealed_prediction_from_dict",
+    "sealed_prediction_to_dict",
 ]

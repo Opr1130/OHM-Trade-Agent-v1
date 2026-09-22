@@ -105,10 +105,15 @@ FORBIDDEN_ML_FRAGMENTS = (
 PURE_MODULES = (
     "contracts.py",
     "evidence.py",
+    "evaluation.py",
+    "ledger.py",
+    "metrics.py",
     "opinion.py",
     "outbound.py",
+    "pricing.py",
+    "prospective.py",
     "serialization.py",
-    "ledger.py",
+    "settings.py",
 )
 
 #: The single infrastructure helper the store may use for cross-process locking.
@@ -352,6 +357,40 @@ def test_provider_adapters_never_receive_the_case_or_snapshot():
     assert "model_bound_view" not in source
     assert "EvidenceSnapshot" not in source
     assert "CommitteeCase" not in source
+
+
+def test_prospective_plane_is_deterministic_and_separated():
+    """The prospective protocol takes every timestamp as an argument."""
+    source = (COMMITTEE_ROOT / "prospective.py").read_text(encoding="utf-8")
+    for token in ("datetime.now(", "utcnow(", "time.time("):
+        assert token not in source, token
+    # Phase separation is structural: the module records prospective evidence
+    # and refuses to label a retrospective observation as prospective.
+    assert "HindsightLeakageError" in source
+    assert "EvaluationPhase.PROSPECTIVE" in source
+
+
+def test_no_committee_module_schedules_or_calls_itself():
+    """The plane is inert: nothing self-schedules or starts a background task."""
+    for path in _committee_files():
+        source = path.read_text(encoding="utf-8")
+        for token in (
+            "asyncio.create_task",
+            "threading.Thread",
+            "subprocess",
+            "os.system",
+            "crontab",
+            "APScheduler",
+        ):
+            assert token not in source, (path.name, token)
+
+
+def test_committee_never_evaluates_or_executes_model_text():
+    """Model output is data: it is never evaled, executed, or shelled."""
+    for path in _committee_files():
+        source = path.read_text(encoding="utf-8")
+        for token in ("eval(", "exec(", "os.popen", "yaml.load", "pickle.load"):
+            assert token not in source, (path.name, token)
 
 
 def test_committee_writes_only_inside_its_own_data_directory():

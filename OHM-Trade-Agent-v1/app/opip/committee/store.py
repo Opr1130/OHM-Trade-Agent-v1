@@ -31,6 +31,10 @@ from app.opip.committee.serialization import (
     case_outcome_to_dict,
     evaluation_report_from_dict,
     evaluation_report_to_dict,
+    outcome_observation_to_dict,
+    prospective_evaluation_to_dict,
+    prospective_record_from_dict,
+    sealed_prediction_to_dict,
 )
 from app.opip.storage.bounded_jsonl import (
     BoundedJsonlArchive,
@@ -48,6 +52,8 @@ CASE_OUTCOMES_MAX_BYTES = 8 * 1024 * 1024
 CASE_OUTCOMES_KEEP_LINES = 20_000
 EVALUATIONS_MAX_BYTES = 8 * 1024 * 1024
 EVALUATIONS_KEEP_LINES = 5_000
+PROSPECTIVE_MAX_BYTES = 8 * 1024 * 1024
+PROSPECTIVE_KEEP_LINES = 20_000
 
 #: Reasons an append is acknowledged without writing a new row.
 REASON_STORED = "STORED"
@@ -84,6 +90,10 @@ def _parse_evaluation_line(line: bytes):
     return evaluation_report_from_dict(parse_json_object_line(line))
 
 
+def _parse_prospective_line(line: bytes):
+    return prospective_record_from_dict(parse_json_object_line(line))
+
+
 class CommitteeEvidenceStore:
     """Append-only durable store for committee observations and case outcomes."""
 
@@ -97,14 +107,18 @@ class CommitteeEvidenceStore:
         case_keep_lines: int = CASE_OUTCOMES_KEEP_LINES,
         evaluations_max_bytes: int = EVALUATIONS_MAX_BYTES,
         evaluations_keep_lines: int = EVALUATIONS_KEEP_LINES,
+        prospective_max_bytes: int = PROSPECTIVE_MAX_BYTES,
+        prospective_keep_lines: int = PROSPECTIVE_KEEP_LINES,
     ) -> None:
         self.root = Path(root)
         self.call_lock_file = self.root / ".call_outcomes.lock"
         self.case_lock_file = self.root / ".case_outcomes.lock"
         self.evaluation_lock_file = self.root / ".evaluations.lock"
+        self.prospective_lock_file = self.root / ".prospective.lock"
         self.calls_index_file = self.root / "call_outcome_index.json"
         self.cases_index_file = self.root / "case_outcome_index.json"
         self.evaluations_index_file = self.root / "evaluation_index.json"
+        self.prospective_index_file = self.root / "prospective_index.json"
         self._calls = BoundedJsonlArchive(
             data_file=self.root / "call_outcomes.jsonl",
             archive_dir=self.root / "archive_calls",
@@ -131,6 +145,15 @@ class CommitteeEvidenceStore:
             archive_prefix="evaluations",
             parse_line=_parse_evaluation_line,
             visible_at=lambda row: row.generated_at,
+        )
+        self._prospective = BoundedJsonlArchive(
+            data_file=self.root / "prospective.jsonl",
+            archive_dir=self.root / "archive_prospective",
+            max_bytes=prospective_max_bytes,
+            keep_lines=prospective_keep_lines,
+            archive_prefix="prospective",
+            parse_line=_parse_prospective_line,
+            visible_at=lambda row: row.observed_at,
         )
 
     # ---------------------------------------------------------------- calls
@@ -256,6 +279,100 @@ class CommitteeEvidenceStore:
             "entries": {key: key for key in sorted(ids)},
         }
         self._write_index(self.evaluations_index_file, payload, label="evaluation")
+
+    # ----------------------------------------------------------- prospective
+
+    def append_sealed_prediction(self, prediction) -> StoreAppendResult:
+        return self._append_prospective(
+            row=sealed_prediction_to_dict(prediction),
+            record_id=prediction.prediction_id,
+            label="sealed prediction",
+        )
+
+    def append_outcome_observation(self, observation) -> StoreAppendResult:
+        return self._append_prospective(
+            row=outcome_observation_to_dict(observation),
+            record_id=observation.observation_id,
+            label="outcome observation",
+        )
+
+    def append_prospective_evaluation(self, evaluation) -> StoreAppendResult:
+        return self._append_prospective(
+            row=prospective_evaluation_to_dict(evaluation),
+            record_id=evaluation.evaluation_id,
+            label="prospective evaluation",
+        )
+
+    def _append_prospective(
+        self, *, row: Mapping[str, Any], record_id: str, label: str
+    ) -> StoreAppendResult:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with registry_lock(self.prospective_lock_file):
+            self._prospective.repair_tail()
+            known = self._load_prospective_ids()
+            if record_id in known:
+                return StoreAppendResult(False, record_id, REASON_DUPLICATE)
+            self._prospective.append_encoded_locked(encode_row(dict(row)))
+            known.add(record_id)
+            self._save_prospective_ids(known)
+            self._compact(self._prospective, label)
+            return StoreAppendResult(True, record_id, REASON_STORED)
+
+    def iter_prospective_records(self, *, include_archive: bool = True) -> Iterator[Any]:
+        # Keyed by record type as well as id: a prediction and its evaluation
+        # legitimately share the prediction_id, so id alone would collapse them.
+        seen: set[tuple[str, str]] = set()
+        rows: list[Any] = []
+        if include_archive:
+            rows.extend(self._prospective.iter_archive_rows())
+        rows.extend(self._prospective.iter_hot_rows())
+        for row in rows:
+            record_id = (
+                getattr(row, "prediction_id", None)
+                or getattr(row, "observation_id", None)
+                or getattr(row, "evaluation_id", None)
+            )
+            key = (type(row).__name__, str(record_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            yield row
+
+    def iter_sealed_predictions(self, *, include_archive: bool = True):
+        from app.opip.committee.prospective import SealedPrediction
+
+        for row in self.iter_prospective_records(include_archive=include_archive):
+            if isinstance(row, SealedPrediction):
+                yield row
+
+    def iter_outcome_observations(self, *, include_archive: bool = True):
+        from app.opip.committee.prospective import OutcomeObservation
+
+        for row in self.iter_prospective_records(include_archive=include_archive):
+            if isinstance(row, OutcomeObservation):
+                yield row
+
+    def iter_prospective_evaluations(self, *, include_archive: bool = True):
+        from app.opip.committee.prospective import ProspectiveEvaluation
+
+        for row in self.iter_prospective_records(include_archive=include_archive):
+            if isinstance(row, ProspectiveEvaluation):
+                yield row
+
+    def _load_prospective_ids(self) -> set[str]:
+        raw = self._load_index_payload(self.prospective_index_file)
+        entries = raw.get("entries")
+        if not isinstance(entries, Mapping):
+            return set()
+        return {key for key in entries if isinstance(key, str)}
+
+    def _save_prospective_ids(self, ids: set[str]) -> None:
+        payload = {
+            "schema_version": 1,
+            "kind": "PROSPECTIVE",
+            "entries": {key: key for key in sorted(ids)},
+        }
+        self._write_index(self.prospective_index_file, payload, label="prospective")
 
     # --------------------------------------------------------------- helpers
 
@@ -401,6 +518,8 @@ __all__ = [
     "COMMITTEE_DIR",
     "EVALUATIONS_KEEP_LINES",
     "EVALUATIONS_MAX_BYTES",
+    "PROSPECTIVE_KEEP_LINES",
+    "PROSPECTIVE_MAX_BYTES",
     "REASON_DIVERGENCE",
     "REASON_DUPLICATE",
     "REASON_STORED",
