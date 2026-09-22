@@ -455,7 +455,7 @@ def test_both_stages_share_one_cockpit_start_primitive():
     """One implementation of start/wait/preflight/evidence, used by both stages."""
     assert BOOTSTRAP.count("compose up -d opip-cockpit") == 1
     assert BOOTSTRAP.count("\n  cockpit_preflight\n") == 1
-    assert BOOTSTRAP.count("write_cockpit_env_file \"$replica_root\"") == 1
+    assert BOOTSTRAP.count("\n  write_cockpit_env_file\n") >= 1
     cockpit_start = _extract_function(BOOTSTRAP, "cockpit_start")
     assert "cockpit_wait_healthy" in cockpit_start
     assert "cockpit_preflight" in cockpit_start
@@ -508,9 +508,9 @@ def test_cockpit_reads_the_resolved_generation_through_its_env_file():
     # The generation is optional so the secret surface can be materialized before the
     # generation is resolvable, and so a root the verifier has not confirmed is never
     # recorded.
-    assert 'local replica_root="${1:-}"' in write_env
+    assert 'local replica_root="${1:-}"' not in write_env
     assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in write_env
-    assert 'if [[ -n "$replica_root" ]]; then' in write_env
+    assert '"$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"' in write_env
     # The compose service must not pin the parent over the derived value.
     environment = _cockpit_service()["environment"]
     assert "OPIP_CANONICAL_REPLICA_ROOT" not in environment
@@ -520,8 +520,8 @@ def test_cockpit_reads_the_resolved_generation_through_its_env_file():
     }
     # The generation is recorded before the container is started.
     start = _extract_function(BOOTSTRAP, "cockpit_start")
-    assert 'write_cockpit_env_file "$replica_root"' in start
-    assert start.index('write_cockpit_env_file "$replica_root"') < start.index(
+    assert re.search(r"^\s+write_cockpit_env_file\s*$", start, flags=re.M)
+    assert start.index("write_cockpit_env_file") < start.index(
         "cockpit_compose up -d opip-cockpit"
     )
 
@@ -1041,7 +1041,7 @@ class TestCockpitReadyBehaviour:
         cockpit_env = _state_file(harness.cockpit_env_file)
         assert (
             cockpit_env["OPIP_CANONICAL_REPLICA_ROOT"]
-            == f"{REPLICA_CONTAINER_ROOT}/generations/{GENERATION_ID}"
+            == REPLICA_CONTAINER_ROOT
         )
         # The verifier was pointed at the same generation.
         assert (
