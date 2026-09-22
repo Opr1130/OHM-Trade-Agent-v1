@@ -205,10 +205,13 @@ files, issue/PR comments, or workflow logs.
    freshness contract. The shell reproduces none of those rules, and
    `--max-age-seconds` is deliberately not passed, so this stage cannot widen the
    freshness bound.
-4. The resolved generation is written into `/etc/opip-cockpit.env` as
-   `OPIP_CANONICAL_REPLICA_ROOT`, so the Cockpit process reads the same bundle that was
-   verified. It is deliberately not pinned in compose, because a pinned parent is not a
-   bundle.
+4. `/etc/opip-cockpit.env` receives the stable mounted replica repository root as
+   `OPIP_CANONICAL_REPLICA_ROOT` plus the non-secret `OPIP_COCKPIT_RELEASE_SHA`.
+   The long-lived Cockpit resolves the atomically committed `current` generation at read
+   time and accepts it only when its manifest `source_release_sha` equals that deployed
+   Cockpit release. Same-release replica rotation therefore survives retention pruning;
+   cross-release drift fails closed until the Cockpit is redeployed. Compose does not
+   pin either an immutable generation or the release binding.
 5. The container is started, and a bounded health wait must observe `healthy` before the
    host-loopback preflight below runs. `compose up -d` returns while the container is
    still `starting`, so proving reachability immediately would fail a first deployment

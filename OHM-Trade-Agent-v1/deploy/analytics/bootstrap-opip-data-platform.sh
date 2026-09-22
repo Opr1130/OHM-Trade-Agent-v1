@@ -27,8 +27,11 @@ COCKPIT_STATE_FILE="$STATE_ROOT/cockpit-ready.env"
 # The verified canonical replica. Installed generations live under
 # `generations/<id>` and are selected by a plain-text `current` pointer, so the parent
 # repository is NOT itself a bundle: it holds no manifest and no canonical database.
-# The parent is what gets mounted; the resolved generation is what the Cockpit must
-# read, and it is written into the Cockpit env file as OPIP_CANONICAL_REPLICA_ROOT.
+# The parent is what gets mounted and what the running Cockpit is configured to read.
+# At request time the Cockpit resolves the atomically committed `current` pointer to an
+# immutable generation. `cockpit-ready` still verifies an exact resolved generation
+# before readiness is recorded; runtime following of `current` only prevents a healthy
+# rotating replica from pruning the generation that a long-lived Cockpit had pinned.
 COCKPIT_REPLICA_PARENT_ROOT="/var/lib/opip-learning/canonical-replica"
 COCKPIT_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
@@ -170,29 +173,20 @@ guard_no_trading_credentials() {
 guard_no_trading_credentials
 
 write_cockpit_env_file() {
-  # The Cockpit is externally reachable through the reverse proxy, so it must not
-  # load credentials it has no use for. The sealed analytics env file also holds the
-  # PostgreSQL admin, shipper, learning and dashboard credentials and privileged
-  # database URLs; handing those to an internet-facing read-only service would put
-  # unrelated secrets on an unnecessary surface.
+  # Derive a Cockpit-only env file from the sealed analytics environment. The
+  # allowlist keeps PostgreSQL, Grafana, learning and trading credentials out of
+  # the externally reachable read-only process.
   #
-  # This mirrors the Grafana pattern: derive a dedicated env file from the sealed
-  # source using a strict allowlist, so the Cockpit receives the minimum it needs -
-  # its own authentication secret and its own bound/port configuration. Everything
-  # else the process requires (the container port) is static and set in compose.
+  # Runtime replica resolution deliberately receives the mounted repository root,
+  # not one immutable generation. The learning sync atomically advances `current`
+  # and retains only the active generation plus one fallback. Pinning a generation
+  # here would therefore make a healthy long-lived Cockpit fail once normal retention
+  # pruned that old directory. The application resolves `current` on each request.
   #
-  # ``$1`` is the container-side path of the committed replica generation. It is optional:
-  #
-  #   * omitted - only the secret/port allowlist is written and the application default
-  #     (DEFAULT_REPLICA_ROOT, /app/canonical-replica) applies. Used to materialize the
-  #     secret surface before the generation can be known, because resolving the
-  #     generation needs the image that `cockpit_build_image` produces while Compose loads
-  #     this service's `env_file` in order to build.
-  #   * given - the verified generation is recorded, so the Cockpit reads the bundle the
-  #     pointer names rather than the parent repository.
-  #
-  # Omitting it never records a root the verifier has not confirmed.
-  local replica_root="${1:-}"
+  # Safety is not weakened: `cockpit-ready` still resolves and verifies an exact
+  # generation for TARGET_SHA before `cockpit_start` can record COCKPIT_READY_*.
+  # TARGET_SHA is also written as the non-secret OPIP_COCKPIT_RELEASE_SHA binding;
+  # runtime follows `current` only while that generation's manifest names this SHA.
   local temporary key
   local -a keys=(
     OPIP_COCKPIT_SECRET
@@ -211,9 +205,8 @@ write_cockpit_env_file() {
       exit 78
     fi
   done
-  if [[ -n "$replica_root" ]]; then
-    printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$replica_root" >> "$temporary"
-  fi
+  printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"
+  printf 'OPIP_COCKPIT_RELEASE_SHA=%s\n' "$TARGET_SHA" >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
@@ -490,11 +483,12 @@ cockpit_start() {
   # Start the Cockpit, prove operator reachability, and (only when the replica was
   # verified) record readiness.
   #
-  # ``$1`` is the container-side replica root the Cockpit must read. It is written into
-  # the Cockpit env file so the process reads the committed generation rather than the
-  # parent repository, which contains neither a manifest nor a canonical database.
+  # ``$1`` is the exact immutable generation resolved for this start attempt. It is
+  # retained as readiness evidence only: the long-lived process is configured with
+  # COCKPIT_REPLICA_CONTAINER_ROOT and resolves the atomically committed `current`
+  # generation at read time so normal retention cannot strand it on a pruned directory.
   #
-  # ``$2`` is ``verified`` only when that root passed the replica verifier for this
+  # ``$2`` is ``verified`` only when that exact generation passed the replica verifier
   # release. COCKPIT_READY_* is published only in that case, because the marker means
   # "verified replica + reachable Cockpit". Health and loopback checks prove neither
   # replica integrity, freshness, nor release binding, so a caller that did not verify
@@ -513,7 +507,7 @@ cockpit_start() {
   local replica_root="$1"
   local verification="${2:-unverified}"
 
-  write_cockpit_env_file "$replica_root"
+  write_cockpit_env_file
   cockpit_compose up -d opip-cockpit
   cockpit_wait_healthy
   cockpit_preflight
@@ -525,7 +519,8 @@ cockpit_start() {
   fi
 
   echo "cockpit_ready_sha=$TARGET_SHA"
-  echo "cockpit_replica_root=$replica_root"
+  echo "cockpit_replica_root=$COCKPIT_REPLICA_CONTAINER_ROOT"
+  echo "cockpit_verified_generation=$replica_root"
   echo "cockpit_replica_verified=$verification"
   echo "cockpit_historical_analytics_ready=false"
   echo "cockpit_raw_port_scope=host_loopback"
