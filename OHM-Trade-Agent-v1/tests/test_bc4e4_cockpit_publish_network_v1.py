@@ -170,15 +170,70 @@ def test_7_the_publish_network_binds_host_ports_to_loopback_by_default():
     assert opts["com.docker.network.bridge.host_binding_ipv4"] == "127.0.0.1"
 
 
-def test_7b_the_publish_network_does_not_restore_outbound_internet_egress():
-    """The ordinary bridge must not hand back the egress that internal-only removed.
+def test_7b_publish_network_disables_ip_masquerade():
+    """Config-level fact only: masquerade is disabled on the publish network.
 
-    An ordinary bridge masquerades container traffic, so attaching one would give the
-    Cockpit outbound Internet access it never had. Masquerade is disabled to remove that,
-    which is safe because publishing is host->container and needs no NAT.
+    Review finding (valid): this asserts a *configuration* fact, not egress denial.
+    Disabling masquerade removes source-NAT for container-originated traffic leaving this
+    bridge; it is not an egress firewall. The network is deliberately not `internal`, so
+    Docker still installs a gateway and a default route, and host/direct-routing
+    reachability is not denied.
+
+    Hard egress denial is deliberately NOT implemented (see the README section and the
+    Compose comment). The runtime test
+    `test_runtime_publish_network_has_no_source_nat_and_no_egress_denial` proves the
+    behavioural half that actually holds, and no test claims the half that does not.
     """
     opts = _cockpit_networks()[PUBLISH_NETWORK]["driver_opts"]
     assert opts["com.docker.network.bridge.enable_ip_masquerade"] == "false"
+
+
+def test_7c_egress_claims_are_precise_and_not_overclaimed():
+    """The security contract must not claim egress denial that is not implemented.
+
+    Review finding (valid): an earlier revision said the option "removes that egress". A
+    security claim the configuration cannot support is a defect in its own right, so this
+    pins the precise statement on both the Compose surface and the README.
+    """
+    lowered = README.lower()
+    # It must say what is removed...
+    assert "nat-based internet egress" in lowered
+    # ...and, in the same place, what is NOT.
+    assert "gateway" in lowered
+    assert "default route" in lowered
+    assert "not firewall-denied" in lowered or "not firewall denied" in lowered
+    assert "deliberately accepted" in lowered or "deliberate residual" in lowered
+    assert "no firewall enforcement is installed" in lowered
+
+    # The overclaiming phrasings must be absent from both surfaces.
+    for surface, text in (("README", README), ("compose", COCKPIT_TEXT)):
+        assert "removes that egress" not in text, surface
+        assert "no credentials" not in text, surface
+
+    # The Compose comment carries the same precision as the README.
+    assert "NOT an egress firewall" in COCKPIT_TEXT
+    assert "No firewall enforcement is installed, by design." in COCKPIT_TEXT
+    assert "Residual capability, deliberately accepted" in COCKPIT_TEXT
+
+
+def test_7d_credential_claims_name_the_one_secret_that_is_present():
+    """The Cockpit does hold OPIP_COCKPIT_SECRET, so "no credentials" was wrong.
+
+    Review finding (valid): what is true is the absence of trading, exchange and Telegram
+    authority, plus the presence of exactly one dedicated read-only secret.
+    """
+    assert "no Kraken credentials" in README
+    assert "no Telegram authority" in README
+    assert "no trading `WEBHOOK_SECRET`" in README
+    assert "only the dedicated read-only `OPIP_COCKPIT_SECRET` is present" in README
+
+    # The claim matches the artifact: the secret really is provisioned and delivered.
+    env_example = (REPO / "deploy/analytics/env.example").read_text(encoding="utf-8")
+    assert "OPIP_COCKPIT_SECRET=" in env_example
+    write_env = _extract_function(BOOTSTRAP, "write_cockpit_env_file")
+    assert "OPIP_COCKPIT_SECRET" in write_env
+    service = _cockpit()
+    assert service["env_file"] == ["/etc/opip-cockpit.env"]
 
 
 def test_8_service_level_port_mapping_is_explicitly_loopback():
@@ -304,9 +359,11 @@ def test_12_hardening_and_resource_limits_are_unchanged():
     assert service["container_name"] == "opip-cockpit"
     assert service["healthcheck"]["interval"] == "30s"
     assert service["healthcheck"]["retries"] == 5
-    # No trading or exchange credential surface.
+    # No trading, exchange or Telegram credential is *configured*. Comments explain that
+    # these are absent, so this inspects the configuration rather than the prose.
+    code = _strip_comments(COCKPIT_TEXT)
     for forbidden in ("WEBHOOK_SECRET", "KRAKEN", "TELEGRAM"):
-        assert forbidden not in COCKPIT_TEXT, forbidden
+        assert forbidden not in code, forbidden
 
 
 # ---------------------------------------------------------------------------
@@ -420,14 +477,16 @@ def _free_loopback_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _probe_container_id(compose_path: Path, project: str) -> str:
+def _probe_container_id(compose_path: Path, project: str, *, service: str = "probe") -> str:
     """Resolve the container id through Compose, never by guessing its name.
 
     Guessing ``<project>-<service>-1`` is fragile, and a wrong name makes `docker port`
     print nothing to stdout, which is indistinguishable from a missing mapping. Compose
     labels are the authoritative handle.
     """
-    listed = _docker("compose", "-f", str(compose_path), "ps", "-q", "probe", check=False)
+    listed = _docker(
+        "compose", "-f", str(compose_path), "ps", "-q", service, check=False
+    )
     if listed.returncode == 0 and listed.stdout.strip():
         return listed.stdout.split()[0]
 
@@ -436,10 +495,12 @@ def _probe_container_id(compose_path: Path, project: str) -> str:
         "-aq",
         "--filter",
         f"label=com.docker.compose.project={project}",
+        "--filter",
+        f"label=com.docker.compose.service={service}",
         check=False,
     )
     assert by_label.stdout.strip(), (
-        "could not resolve the probe container: "
+        f"could not resolve the {service} container: "
         f"compose ps -> {listed.stdout!r}/{listed.stderr!r}; "
         f"label filter -> {by_label.stdout!r}/{by_label.stderr!r}"
     )
@@ -505,6 +566,109 @@ def _container_ports_report(container: str) -> str:
         f"\n  Networks = {networks.stdout.strip() or networks.stderr.strip()!r}"
         f"\n  docker ps -a:\n{ps.stdout}"
     )
+
+
+# --- Egress / source-NAT probe -------------------------------------------------
+#
+# A peer that reports the source address it observes is the only way to *measure*
+# masquerade: NAT happens in the host's POSTROUTING, so the connecting container can never
+# see it in its own socket. The observer therefore has to sit behind the host router, on a
+# different bridge, so the traffic is forwarded rather than delivered locally.
+
+_PYTHON_IMAGE_CANDIDATES = ("python:3.12-slim", "python:3.12-alpine", "python:3.11-slim")
+
+_SNAT_SERVER_PROGRAM = (
+    "import http.server as h\n"
+    "class H(h.BaseHTTPRequestHandler):\n"
+    "    def do_GET(self):\n"
+    "        self.send_response(200)\n"
+    "        self.send_header('Content-Type', 'text/plain')\n"
+    "        self.end_headers()\n"
+    "        self.wfile.write(self.client_address[0].encode())\n"
+    "    def log_message(self, *args):\n"
+    "        pass\n"
+    "h.HTTPServer(('0.0.0.0', 8080), H).serve_forever()\n"
+)
+
+_SNAT_CLIENT_PROGRAM = (
+    "import urllib.request\n"
+    "print(urllib.request.urlopen('http://{server_ip}:8080/', timeout=15).read().decode())\n"
+)
+
+
+def _resolve_python_image() -> str | None:
+    """A python image for the egress probe, preferring one already present locally."""
+    override = os.environ.get("OPIP_DOCKER_PYTHON_IMAGE", "").strip()
+    candidates = ((override,) if override else ()) + _PYTHON_IMAGE_CANDIDATES
+    for image in candidates:
+        if _docker("image", "inspect", image, check=False, timeout=60).returncode == 0:
+            return image
+    for image in candidates:
+        if _docker("pull", image, check=False, timeout=600).returncode == 0:
+            return image
+    return None
+
+
+def _snat_probe_compose_data(project: str, image: str) -> dict:  # type: ignore[type-arg]
+    """Two bridges: an ordinary one (server) and a masquerade-disabled one (client).
+
+    This mirrors the production arrangement being tested: the client sits on a bridge with
+    `enable_ip_masquerade: false`, exactly like `opip-cockpit-publish`, and the observer
+    sits behind the host router on an ordinary bridge.
+    """
+    publish = f"{project}-publish"
+    egress = f"{project}-egress"
+    return {
+        "name": project,
+        "services": {
+            "observer": {
+                "image": image,
+                "command": ["python", "-c", _SNAT_SERVER_PROGRAM],
+                "networks": {egress: None},
+            },
+            "client": {
+                "image": image,
+                "command": ["sleep", "infinity"],
+                "networks": {publish: None},
+            },
+        },
+        "networks": {
+            publish: {
+                "driver": "bridge",
+                "driver_opts": {
+                    "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1",
+                    "com.docker.network.bridge.enable_ip_masquerade": "false",
+                },
+            },
+            # Ordinary bridge: default masquerade, like any other Docker network.
+            egress: {"driver": "bridge"},
+        },
+    }
+
+
+def _write_snat_probe_compose(directory: Path, project: str, image: str) -> Path:
+    path = directory / "docker-compose.snat.yml"
+    path.write_text(
+        yaml.safe_dump(_snat_probe_compose_data(project, image), sort_keys=False),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _network_facts(container: str, suffix: str) -> tuple[str, str]:
+    """(container_ip, gateway) on the container's network whose key ends with `suffix`."""
+    settings = yaml.safe_load(
+        _docker(
+            "inspect",
+            container,
+            "--format",
+            "{{json .NetworkSettings.Networks}}",
+        ).stdout
+    )
+    keys = [k for k in settings if k.endswith(suffix)]
+    assert keys, f"no network ending {suffix!r} on {container}: {list(settings)}"
+    entry = settings[keys[0]]
+    return str(entry.get("IPAddress", "")), str(entry.get("Gateway", ""))
 
 
 
@@ -751,6 +915,125 @@ def test_runtime_two_network_topology_publishes_and_is_reachable(tmp_path: Path)
         assert publish_settings.get("Gateway"), f"{publish_settings}{report()}"
     finally:
         _docker("compose", "-f", str(compose), "down", "-v", "--remove-orphans", check=False)
+
+
+@requires_docker_compose
+def test_runtime_publish_network_has_no_source_nat_and_no_egress_denial(tmp_path: Path):
+    """Measured behaviour of the masquerade-disabled publish bridge.
+
+    This is the honest replacement for the earlier config-only claim. It measures the two
+    halves separately and asserts each for what it is:
+
+    * **Masquerade is disabled.** A container on a `enable_ip_masquerade: false` bridge
+      connects to an observer behind the host router, and the observer reports the source
+      address it saw. It must be the *container's own* bridge address, not the host's
+      address on the observer's bridge, which is what source NAT would produce.
+    * **Egress is NOT denied.** That connection must actually succeed. The bridge is not
+      `internal`, so Docker installs a gateway and a default route, and the packet leaves.
+      Asserting this keeps the test truthful: it demonstrates the residual instead of
+      implying the residue was eliminated.
+
+    No firewall enforcement is installed anywhere in this design, so this test is the
+    strongest egress claim the configuration can support.
+    """
+    image = _resolve_python_image()
+    if image is None:
+        pytest.skip("no usable python image available for the egress probe")
+
+    port = _free_loopback_port()
+    project = f"opip-bc4e4-egress-{os.getpid()}-{port}"
+    compose = _write_snat_probe_compose(tmp_path, project, image)
+    try:
+        up = _docker("compose", "-f", str(compose), "up", "-d", check=False, timeout=600)
+        assert up.returncode == 0, up.stderr
+
+        observer = _probe_container_id(compose, project, service="observer")
+        client = _probe_container_id(compose, project, service="client")
+
+        observer_ip, _ = _network_facts(observer, "-egress")
+        client_ip, client_gateway = _network_facts(client, "-publish")
+        _, observer_gateway = _network_facts(observer, "-egress")
+
+        assert observer_ip, observer
+        assert client_ip, client
+        # Sanity on the fixture itself: the observer's gateway is the host's address on its
+        # bridge, which is precisely the source address SNAT would rewrite to.
+        assert observer_gateway, observer
+        assert observer_gateway != client_ip, (observer_gateway, client_ip)
+        assert client_gateway, client
+
+        program = _SNAT_CLIENT_PROGRAM.format(server_ip=observer_ip)
+        observed = ""
+        last_error = ""
+        for _ in range(30):
+            result = _docker(
+                "exec", client, "python", "-c", program, check=False, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                observed = result.stdout.strip()
+                break
+            last_error = result.stderr.strip() or result.stdout.strip()
+            time.sleep(1)
+
+        # Measured: the connection completed at all. The publish bridge is not `internal`,
+        # so it carries a gateway and a default route and container-originated packets do
+        # leave. This is asserted deliberately, so no reader mistakes this topology for an
+        # egress-isolated one.
+        assert observed, (
+            "the publish-network container could not reach the observer; the egress probe "
+            f"needs a working path to measure NAT: last stderr={last_error!r}"
+        )
+
+        # Measured: no source NAT. The observer saw the container's own bridge address...
+        assert observed == client_ip, (
+            f"source NAT is active: observer saw {observed!r}, expected the container's own "
+            f"address {client_ip!r} (host address on the observer bridge is "
+            f"{observer_gateway!r})"
+        )
+        # ...and not the host's address, which is what masquerading would rewrite it to.
+        assert observed != observer_gateway, observed
+    finally:
+        _docker("compose", "-f", str(compose), "down", "-v", "--remove-orphans", check=False)
+
+
+def test_generated_snat_probe_compose_is_valid_and_mirrors_production(tmp_path: Path):
+    """The egress-probe file is verified locally, not only where Docker exists.
+
+    The equivalent guard on the publish probe caught a real portability bug (a Windows path
+    containing backslashes is invalid YAML inside a double-quoted scalar), so probe
+    assembly is validated everywhere rather than first in CI.
+    """
+    compose = _write_snat_probe_compose(tmp_path, "snat-project", "python:3.12-slim")
+    rendered = yaml.safe_load(compose.read_text(encoding="utf-8"))
+    assert rendered["name"] == "snat-project"
+
+    services = rendered["services"]
+    assert set(services) == {"observer", "client"}
+    # The client sits on the masquerade-disabled bridge, mirroring the Cockpit surface...
+    assert set(services["client"]["networks"]) == {"snat-project-publish"}
+    # ...and the observer behind the host router on an ordinary bridge.
+    assert set(services["observer"]["networks"]) == {"snat-project-egress"}
+
+    networks = rendered["networks"]
+    # The probe mirrors the production publish network's driver_opts exactly, so a passing
+    # probe is meaningful for the real artifact.
+    assert (
+        networks["snat-project-publish"]["driver_opts"]
+        == _cockpit_networks()[PUBLISH_NETWORK]["driver_opts"]
+    ), "the egress probe must mirror the production publish network's driver_opts"
+    # The control bridge must keep Docker's default masquerade, or the probe could not
+    # distinguish "no NAT" from "NAT never applied on either side".
+    assert "driver_opts" not in networks["snat-project-egress"]
+
+    # Both programs are syntactically valid Python, so a typo surfaces here rather than as a
+    # mysterious "could not reach the observer" in CI.
+    import ast as _ast
+
+    assert _ast.parse(_SNAT_SERVER_PROGRAM)
+    client_program = _SNAT_CLIENT_PROGRAM.format(server_ip="172.30.0.9")
+    assert _ast.parse(client_program)
+    assert "172.30.0.9" in client_program
+    assert ["python", "-c", _SNAT_SERVER_PROGRAM] == services["observer"]["command"]
 
 
 @requires_docker_compose

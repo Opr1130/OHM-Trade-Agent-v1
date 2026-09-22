@@ -578,9 +578,10 @@ def test_cockpit_hardening_survives_the_move_unchanged():
     assert service["healthcheck"]["retries"] == 5
     assert service["healthcheck"]["start_period"] == "20s"
     assert "/cockpit" in service["healthcheck"]["test"][1]
-    # No credential or write capability is present.
-    assert "WEBHOOK_SECRET" not in COCKPIT_TEXT
-    assert "KRAKEN" not in COCKPIT_TEXT
+    # No trading or exchange credential is *configured*. Comments explain that these are
+    # absent, so this inspects the configuration rather than the prose.
+    assert "WEBHOOK_SECRET" not in _code_only(COCKPIT_TEXT)
+    assert "KRAKEN" not in _code_only(COCKPIT_TEXT)
     assert "TELEGRAM" not in COCKPIT_TEXT
 
 

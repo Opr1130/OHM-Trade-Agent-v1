@@ -262,19 +262,46 @@ Exposure is still loopback-only, and is enforced in three independent places:
 3. `cockpit_preflight` independently refuses any non-loopback bind and any public
    listener at runtime.
 
-**Egress is deliberately given back to the internal-only boundary.** An ordinary bridge
-masquerades container traffic, so attaching one would hand the Cockpit outbound Internet
-access it never had — a real capability increase even though its inbound mapping stays
-loopback-only. `com.docker.network.bridge.enable_ip_masquerade: "false"` removes that
-egress. It does not affect publishing: inbound host→container traffic is delivered to the
-container address and returns over the directly connected bridge, so no NAT is involved.
-The Cockpit needs no egress, since it only serves reads from the mounted replica.
+**Egress: NAT-based Internet egress is removed; the residual is documented, not papered
+over.** An ordinary bridge masquerades container traffic, so attaching one would hand the
+Cockpit outbound Internet access it never had — a real capability increase even though its
+inbound mapping stays loopback-only. `com.docker.network.bridge.enable_ip_masquerade:
+"false"` removes that, and only that. It does not affect publishing: inbound
+host→container traffic is delivered to the container address and returns over the directly
+connected bridge, so no NAT is involved, and the Cockpit needs no egress at all since it
+only serves reads from the mounted replica.
 
-Stated honestly: a directly attached bridge still makes the gateway address reachable at
-layer 2, so this removes Internet egress rather than all host-reachability. That residual
-is inherent to any topology that can be published; the container's other controls
-(`cap_drop: ALL`, `no-new-privileges`, read-only rootfs, no credentials) bound what a
-compromise could do with it.
+Precisely what that option does and does not do:
+
+| | Effect |
+| --- | --- |
+| NAT-based Internet egress | **Removed.** A container packet leaves with its own bridge source address, which no upstream can return to. |
+| Gateway / default route | **Still present.** This network is deliberately not `internal`, so Docker installs a gateway and a default route. |
+| Host / direct-routing reachability | **Not firewall-denied.** Traffic destined for the host's own addresses is delivered locally rather than forwarded, so it never reaches a NAT or filter decision this option could influence. |
+| Hard egress denial | **Not implemented.** See below. |
+
+**No firewall enforcement is installed, by design.** Hard egress denial would mean a
+`DOCKER-USER` (or nftables-backend) rule keyed to this bridge's interface. The repository
+has no firewall management anywhere in it today, the analytics host's other Docker
+networks share that same filter path, and the bridge interface name is derived from a
+network ID that changes whenever the network is recreated — so the rule would need
+re-derivation and reconciliation on every run, and a mistake would affect PostgreSQL,
+Grafana and the learning plane. Adding that is host infrastructure this change is not
+authorised to introduce, and it could not be verified in the development environment at
+all (no Linux, no Docker, no packet filter). Rather than ship an unverifiable rule set
+that would have to be trusted, the capability is stated plainly.
+
+The residual is inherent to any topology that can be published: a non-internal bridge
+always creates a gateway/default route. That residual capability is deliberately accepted
+and is documented here rather than described as if it had been eliminated. What bounds a
+compromise is the rest of the container's posture:
+
+- `cap_drop: ALL`, `no-new-privileges`, a read-only rootfs with no writable state
+- **no Kraken credentials**
+- **no Telegram authority**
+- **no trading `WEBHOOK_SECRET`**
+- only the dedicated read-only `OPIP_COCKPIT_SECRET` is present — it is not a trading
+  credential and grants no order, mode or exchange capability
 
 This was deliberately **not** solved by relaxing `internal: true`, binding `0.0.0.0`,
 using `network_mode: host`, adding a host-side forwarding shim, or connecting the

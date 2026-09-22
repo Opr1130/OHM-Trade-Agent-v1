@@ -156,21 +156,39 @@ networks:
       # `cockpit_preflight` independently refuses any non-loopback or public listener at
       # runtime.
       com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
-      # Give back the egress the internal-only topology used to provide. An ordinary
-      # bridge masquerades container traffic, so attaching one would hand the Cockpit
-      # outbound Internet access it never had - a real capability increase even though its
-      # inbound mapping stays loopback-only. Disabling masquerade removes that egress.
+      # Removes source-NAT for container-originated traffic leaving this bridge. That is a
+      # real reduction, and it is all this option does:
       #
-      # It does NOT affect the publish: inbound host->container traffic is delivered by
-      # Docker's proxy/DNAT to the container address and returns over the directly
-      # connected bridge, so no NAT is involved. The container's reply goes back to the
-      # gateway it is directly attached to. Only container-initiated egress needs
-      # masquerade, and the Cockpit needs none: it serves reads from the mounted replica.
+      #   * NAT-based Internet egress is removed. Without masquerade a container packet
+      #     leaves with its own bridge source address, which no upstream can return to.
+      #   * It is NOT an egress firewall. This network is deliberately NOT `internal`, so
+      #     Docker still installs a gateway and a default route, and packets can still
+      #     leave where host or upstream routing permits. Container-originated access to
+      #     the host's own addresses is not denied either: traffic destined for the host
+      #     is delivered locally rather than forwarded, so it never reaches a NAT or
+      #     filter decision that this option could influence.
       #
-      # Residual, stated honestly: a directly attached bridge still makes the gateway
-      # address reachable at layer 2, so this removes Internet egress rather than all
-      # host-reachability. That residual is inherent to any topology that can be
-      # published, and the container's other controls (cap_drop ALL,
-      # no-new-privileges, read-only rootfs, no credentials) bound what a compromise
-      # could do with it.
+      # No firewall enforcement is installed, by design. Doing it properly would mean a
+      # DOCKER-USER (or nftables-backend) rule keyed to this bridge's interface, which
+      # this repository has no mechanism for: there is no firewall management anywhere in
+      # the repo today, the analytics host's other Docker networks share that same
+      # filter path, and the bridge interface name is derived from a network ID that
+      # changes whenever the network is recreated. Inventing that here would add
+      # unverifiable host infrastructure with a blast radius across PostgreSQL, Grafana
+      # and the learning plane, so the residual below is documented instead of being
+      # papered over with a claim the configuration cannot support.
+      #
+      # It does NOT affect the publish: inbound host->container traffic is delivered to
+      # the container address and returns over the directly connected bridge, so no NAT is
+      # involved. The Cockpit needs no egress at all, since it only serves reads from the
+      # mounted replica.
+      #
+      # Residual capability, deliberately accepted: this bridge still creates a
+      # gateway/default route, and host/direct-routing reachability is not firewall-denied.
+      # That is inherent to any topology that can be published at all. The container's
+      # other controls bound what a compromise could do with it: `cap_drop: ALL`,
+      # `no-new-privileges`, a read-only rootfs with no writable state, no Kraken
+      # credentials, no Telegram authority, no trading WEBHOOK_SECRET, and only the
+      # dedicated read-only OPIP_COCKPIT_SECRET - which is present and is not a trading
+      # credential.
       com.docker.network.bridge.enable_ip_masquerade: "false"
