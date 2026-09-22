@@ -476,8 +476,10 @@ Deployment wiring (implemented):
   `COCKPIT_READY_AT_UTC` / `COCKPIT_READY_SHA` are written only after all of those hold.
 - **The Cockpit receives a filtered environment, and a dedicated read-only
   credential.** It is externally reachable, so bootstrap derives
-  `/etc/opip-cockpit.env` with a strict allowlist containing only
-  `OPIP_COCKPIT_SECRET` and the Cockpit's own bind/port settings. The PostgreSQL,
+  `/etc/opip-cockpit.env` with a strict source allowlist containing only
+  `OPIP_COCKPIT_SECRET` and the Cockpit's own bind/port settings, then appends only
+  derived non-secret runtime metadata: the mounted replica repository root and the
+  exact deployed Cockpit release SHA used to reject cross-release replica drift. The PostgreSQL,
   shipper, learning, dashboard and Grafana credentials never reach it.
 - **The Cockpit credential is distinct from the trading host's operator secret.** That
   secret also gates `POST /operator/mode`, `POST /operator/orders` and
