@@ -185,6 +185,8 @@ write_cockpit_env_file() {
   #
   # Safety is not weakened: `cockpit-ready` still resolves and verifies an exact
   # generation for TARGET_SHA before `cockpit_start` can record COCKPIT_READY_*.
+  # TARGET_SHA is also written as the non-secret OPIP_COCKPIT_RELEASE_SHA binding;
+  # runtime follows `current` only while that generation's manifest names this SHA.
   local temporary key
   local -a keys=(
     OPIP_COCKPIT_SECRET
@@ -204,6 +206,7 @@ write_cockpit_env_file() {
     fi
   done
   printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"
+  printf 'OPIP_COCKPIT_RELEASE_SHA=%s\n' "$TARGET_SHA" >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
