@@ -86,26 +86,34 @@ def _require_secret(value: str | None) -> None:
 
 
 def _replica_db_path() -> Path | None:
-    """The verified canonical replica's SQLite path, or ``None`` when absent.
+    """The current verified canonical replica's SQLite path, or ``None``.
 
-    The cockpit's analytical workload belongs on the analytics plane, so this is the
-    *only* store the cockpit reads. It is resolved from the existing replica
-    configuration (``OPIP_CANONICAL_REPLICA_ROOT``, the single knob the replica
-    bridge already uses) rather than from the live production path.
+    The analytics host mounts the replica repository, whose atomically replaced
+    ``current`` pointer selects an immutable generation. Runtime reads must follow
+    that pointer rather than pinning one generation forever: normal replica sync
+    retains only the active generation plus one fallback, so a permanently pinned
+    generation is eventually pruned even though the replica plane remains healthy.
 
-    Returning ``None`` when the replica is absent is deliberate and is what keeps
-    analytics off the trading host: with no replica present the cockpit reports an
-    explicit unavailable state and computes nothing, instead of silently falling back
-    to reading the authoritative production store or the writer RPC.
+    A direct bundle root is still accepted for tests and explicit one-off use. The
+    production deployment supplies the repository root, so each request resolves the
+    committed generation before opening the database. No fallback to the authoritative
+    production store or writer RPC exists.
     """
     try:
-        from app.opip.learning.canonical_replica import replica_db_path
+        from app.opip.learning.canonical_replica import (
+            host_current_pointer,
+            replica_db_path,
+            replica_root,
+            resolve_current_generation,
+        )
 
-        path = replica_db_path()
+        root = replica_root()
+        if host_current_pointer(root).is_file():
+            root = resolve_current_generation(root)
+        path = replica_db_path(root)
     except Exception:  # noqa: BLE001 - unreadable configuration is reported, not raised
         return None
     return path if path.is_file() else None
-
 
 def _replica_reader():
     """A read-only reader over the replica, or ``None`` when it is unavailable.
