@@ -86,6 +86,23 @@ class Settings(BaseSettings):
         default="off",
         pattern=r"^(off|active)$",
     )
+    # Module 2 Intelligence Committee. Default off; "shadow" is the only value
+    # that permits committee work, and it is research-only: it collects and
+    # evaluates independent model opinions and grants no ranking influence, no
+    # notification, no paper admission, and no exchange authority. It never
+    # activates Paper v2 and never changes funded/live state. An unknown value
+    # must fail Settings parsing rather than silently enabling model spending.
+    opip_committee_mode: str = Field(
+        default="off",
+        pattern=r"^(off|shadow)$",
+    )
+    # Optional committee cost ceiling in microunits. Zero means "no declared
+    # ceiling", and a seat is skipped once the declared ceiling would be
+    # exceeded rather than spending unexpectedly.
+    opip_committee_max_estimated_cost_microunits: int = Field(
+        default=0,
+        ge=0,
+    )
     # Wave 9 continuation/entry quality gate. Default-on for real Settings;
     # legacy test/extension SimpleNamespace callers without this field retain
     # their historical pipeline behavior through getattr(..., False).
