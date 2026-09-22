@@ -480,11 +480,12 @@ cockpit_start() {
   # Start the Cockpit, prove operator reachability, and (only when the replica was
   # verified) record readiness.
   #
-  # ``$1`` is the container-side replica root the Cockpit must read. It is written into
-  # the Cockpit env file so the process reads the committed generation rather than the
-  # parent repository, which contains neither a manifest nor a canonical database.
+  # ``$1`` is the exact immutable generation resolved for this start attempt. It is
+  # retained as readiness evidence only: the long-lived process is configured with
+  # COCKPIT_REPLICA_CONTAINER_ROOT and resolves the atomically committed `current`
+  # generation at read time so normal retention cannot strand it on a pruned directory.
   #
-  # ``$2`` is ``verified`` only when that root passed the replica verifier for this
+  # ``$2`` is ``verified`` only when that exact generation passed the replica verifier
   # release. COCKPIT_READY_* is published only in that case, because the marker means
   # "verified replica + reachable Cockpit". Health and loopback checks prove neither
   # replica integrity, freshness, nor release binding, so a caller that did not verify
@@ -515,7 +516,8 @@ cockpit_start() {
   fi
 
   echo "cockpit_ready_sha=$TARGET_SHA"
-  echo "cockpit_replica_root=$replica_root"
+  echo "cockpit_replica_root=$COCKPIT_REPLICA_CONTAINER_ROOT"
+  echo "cockpit_verified_generation=$replica_root"
   echo "cockpit_replica_verified=$verification"
   echo "cockpit_historical_analytics_ready=false"
   echo "cockpit_raw_port_scope=host_loopback"
