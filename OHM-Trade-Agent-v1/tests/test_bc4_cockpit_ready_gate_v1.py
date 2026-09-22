@@ -511,6 +511,8 @@ def test_cockpit_reads_the_resolved_generation_through_its_env_file():
     assert 'local replica_root="${1:-}"' not in write_env
     assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in write_env
     assert '"$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"' in write_env
+    assert "OPIP_COCKPIT_RELEASE_SHA=%s" in write_env
+    assert '"$TARGET_SHA" >> "$temporary"' in write_env
     # The compose service must not pin the parent over the derived value.
     environment = _cockpit_service()["environment"]
     assert "OPIP_CANONICAL_REPLICA_ROOT" not in environment
@@ -1043,6 +1045,7 @@ class TestCockpitReadyBehaviour:
             cockpit_env["OPIP_CANONICAL_REPLICA_ROOT"]
             == REPLICA_CONTAINER_ROOT
         )
+        assert cockpit_env["OPIP_COCKPIT_RELEASE_SHA"] == TARGET_SHA
         # The verifier was pointed at the same generation.
         assert (
             f"canonical_replica verify --root {REPLICA_CONTAINER_ROOT}/generations/"
