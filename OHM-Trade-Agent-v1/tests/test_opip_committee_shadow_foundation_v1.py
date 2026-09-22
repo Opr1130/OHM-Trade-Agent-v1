@@ -1626,3 +1626,62 @@ def test_the_configured_operator_ceiling_applies_without_a_policy_ceiling():
     )
     assert result.seats[0].outcome.status is ObservationStatus.SKIPPED_BUDGET
     assert provider.calls == []
+
+
+def test_a_redelivery_cannot_restart_the_policy_attempt_budget():
+    """max_attempts_per_seat=1 must bound total calls, not calls per run."""
+    provider = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),),
+    )
+    ledger = InMemoryObservationLedger()
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    policy = _policy(families=(ProviderFamily.OPENAI,), max_attempts=1)
+    first = runner.run_case(_case(policy=policy))
+    assert len(provider.calls) == 1
+    assert first.seats[0].outcome.status is ObservationStatus.FAILED
+
+    # Redelivering the same seat must not invoke again under a one-attempt policy.
+    second = runner.run_case(_case(policy=policy))
+    third = runner.run_case(_case(policy=policy))
+    assert len(provider.calls) == 1
+    assert second.seats[0].outcome.status is ObservationStatus.UNAVAILABLE
+    assert third.seats[0].outcome.status is ObservationStatus.UNAVAILABLE
+
+
+def test_a_reported_cost_above_the_reservation_is_charged_to_the_case():
+    """An under-estimated seat must not leave room for another seat to spend."""
+    first = _ok(ProviderFamily.OPENAI)
+    first._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    first._cost_override = 1_000  # noqa: SLF001 - test double
+    second = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    second._estimated_cost_microunits = 40  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first, ProviderFamily.ANTHROPIC: second},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+                cost_ceiling=100,
+            )
+        )
+    )
+    assert result.seats[0].outcome.status is ObservationStatus.COMPLETED
+    assert result.seats[0].outcome.estimated_cost_microunits == 1_000
+    # The reported 1,000 exceeds the 40 reservation, so the ceiling is spent and
+    # the second seat cannot invoke.
+    assert result.seats[1].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []

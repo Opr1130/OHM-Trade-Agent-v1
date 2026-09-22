@@ -1148,3 +1148,52 @@ def test_duplicate_replay_comparisons_are_rejected():
             generated_at=LATER,
             replays=repeated,
         )
+
+
+def test_a_replay_for_an_unobserved_seat_is_rejected():
+    """A replay must name a seat actually observed for its case."""
+    cases = _cases(2)
+    provenance = _provenance()
+    unobserved = [
+        ReplayComparison(
+            provider_family=ProviderFamily.DEEPSEEK,
+            model="model-not-seated",
+            case_id="case-000",
+            reproduced=True,
+        )
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="replay-3",
+            provenance=provenance,
+            generated_at=LATER,
+            replays=unobserved,
+        )
+
+
+def test_a_valid_replay_still_scores_consistency():
+    cases = _cases(2)
+    report = evaluate_model_bake_off(
+        cases,
+        experiment_id="replay-4",
+        provenance=_provenance(),
+        generated_at=LATER,
+        replays=[
+            ReplayComparison(
+                provider_family=ProviderFamily.OPENAI,
+                model="model-a",
+                case_id="case-000",
+                reproduced=True,
+            ),
+            ReplayComparison(
+                provider_family=ProviderFamily.OPENAI,
+                model="model-a",
+                case_id="case-001",
+                reproduced=True,
+            ),
+        ],
+        minimum_samples=1,
+    )
+    assert report.arm("model:openai:model-a").consistency.value == "1.000000"
+    assert report.arm("model:openai:model-a").consistency.sample_size == 2

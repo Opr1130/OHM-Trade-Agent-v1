@@ -62,6 +62,7 @@ class ScriptedCommitteeProvider(CommitteeProvider):
         answers: Sequence[ScriptedAnswer],
         availability: ProviderAvailability = ProviderAvailability.AVAILABLE,
         estimated_cost_microunits: int | None = None,
+        cost_override: int | None = None,
     ) -> None:
         if not answers:
             raise ValueError("a scripted provider requires at least one answer")
@@ -70,6 +71,10 @@ class ScriptedCommitteeProvider(CommitteeProvider):
         self._answers = tuple(answers)
         self._availability = availability
         self._estimated_cost_microunits = estimated_cost_microunits
+        #: When set, reported cost differs from the modelled answer's cost, so a
+        #: provider whose actual spend exceeds its pre-flight estimate can be
+        #: exercised.
+        self._cost_override = cost_override
         self.calls: list[ProviderWireRequest] = []
 
     def availability(self) -> ProviderAvailability:
@@ -97,7 +102,11 @@ class ScriptedCommitteeProvider(CommitteeProvider):
             received_at=received_at,
             input_tokens=answer.input_tokens,
             output_tokens=answer.output_tokens,
-            estimated_cost_microunits=answer.estimated_cost_microunits,
+        estimated_cost_microunits=(
+            answer.estimated_cost_microunits
+            if self._cost_override is None
+            else self._cost_override
+        ),
             cost_completeness=answer.cost_completeness,
         )
 

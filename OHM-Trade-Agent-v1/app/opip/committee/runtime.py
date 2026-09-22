@@ -331,12 +331,25 @@ class CommitteeRunner:
             )
 
         attempt = self._ledger.attempt_count(logical_id) + 1
-        if attempt > MAX_RECORDED_ATTEMPTS:
-            # The attempt counter is bounded by the outcome contract, and the
-            # provider must not be called again just to construct an outcome the
-            # contract would reject. Return a governed disposition instead of
-            # turning a typed, nonfatal state into an exception after another
-            # external call.
+        # The attempt budget bounds *new* invocations for a seat that has not yet
+        # produced an opinion. It is cumulative per logical seat, bounded by both
+        # the policy's declared retry limit and the contract's serialization cap,
+        # because a redelivery must not restart the budget: with
+        # max_attempts_per_seat=1 a seat that already failed once must not be
+        # invoked again, otherwise repeated deliveries multiply provider calls
+        # and spend past the declared retry policy. A seat that already holds a
+        # committed opinion is exempt, since re-asking it is a drift
+        # verification rather than a spend decision.
+        attempt_ceiling = (
+            MAX_RECORDED_ATTEMPTS
+            if committed is not None
+            else min(case.policy.max_attempts_per_seat, MAX_RECORDED_ATTEMPTS)
+        )
+        if attempt > attempt_ceiling:
+            # The provider must not be called again just to construct an outcome
+            # the contract would reject, nor to exceed the declared policy.
+            # Return a governed disposition instead of turning a typed, nonfatal
+            # state into an exception after another external call.
             return (
                 CommitteeSeatResult(
                     family,
@@ -348,6 +361,7 @@ class CommitteeRunner:
                         logical_id=logical_id,
                         input_hash=input_hash,
                         provider=provider,
+                        recorded_attempts=min(attempt - 1, MAX_RECORDED_ATTEMPTS),
                     ),
                 ),
                 0,
@@ -399,7 +413,15 @@ class CommitteeRunner:
             # failure; recording it again would double-count the attempt and
             # append duplicate raw evidence.
             self._ledger.record(outcome)
-        return CommitteeSeatResult(family, logical_id, outcome), reserved
+        # Charge the greater of what was reserved and what the provider actually
+        # reported. Nothing requires the pre-flight estimate to be an upper
+        # bound, so carrying only the reservation would let an under-estimated
+        # seat leave room for the next seat to spend past the ceiling. A failure
+        # with unknown cost still charges its reservation.
+        reported = outcome.estimated_cost_microunits or 0
+        return CommitteeSeatResult(family, logical_id, outcome), max(
+            reserved, reported
+        )
 
     def _duplicate_acknowledgement(
         self,
@@ -501,6 +523,10 @@ class CommitteeRunner:
             # not a committed observation, so this cannot create a second
             # opinion.
             self._ledger.record(outcome)
+            if attempt + 1 > case.policy.max_attempts_per_seat:
+                # The retry would exceed the declared per-seat policy, so stop
+                # with the recorded failure rather than spending again.
+                return outcome, seat_reserved, True
             attempt += 1
 
     def _attempt_seat(
@@ -740,6 +766,7 @@ class CommitteeRunner:
         logical_id: str,
         input_hash: str,
         provider: CommitteeProvider,
+        recorded_attempts: int,
     ) -> ProviderCallOutcome:
         """A governed disposition for a seat that has used every legal attempt.
 
@@ -749,13 +776,14 @@ class CommitteeRunner:
         persistently failing seat cannot convert a typed, nonfatal disposition
         into an exception after one more external call.
         """
+        attempt = max(1, min(recorded_attempts, MAX_RECORDED_ATTEMPTS))
         return ProviderCallOutcome(
             logical_observation_id=logical_id,
             case_id=case.case_id,
             provider_family=family,
             requested_model=requested_model,
             status=ObservationStatus.UNAVAILABLE,
-            attempt=MAX_RECORDED_ATTEMPTS,
+            attempt=attempt,
             reproducibility=ReproducibilityClass.REPEATABLE_CONFIGURATION,
             request_at=self._now(),
             input_hash=input_hash,

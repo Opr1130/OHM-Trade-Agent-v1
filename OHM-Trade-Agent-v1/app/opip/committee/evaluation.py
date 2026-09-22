@@ -698,6 +698,13 @@ def _validate_bake_off_inputs(
         )
     case_type = next(iter(case_types))
     known_cases = _require_unique_case_ids(observations)
+    observed_seats: dict[str, frozenset[tuple[ProviderFamily, str]]] = {
+        observation.case_id: frozenset(
+            (seat.provider_family, seat.requested_model)
+            for seat in observation.seats
+        )
+        for observation in observations
+    }
     _require_unique_related_records(
         resolved_outcomes=resolved_outcomes,
         deterministic_baseline=deterministic_baseline,
@@ -721,7 +728,9 @@ def _validate_bake_off_inputs(
             raise ValueError(f"{label} for unknown case: {case_id}")
     _require_forecast_support(case_type, probability_forecasts)
     _require_forecast_arms_exist(observations, probability_forecasts)
-    _require_unique_replays(replays, known_cases=known_cases)
+    _require_unique_replays(
+        replays, known_cases=known_cases, observed_seats=observed_seats
+    )
     return case_type
 
 
@@ -788,17 +797,34 @@ def _require_unique_replays(
     replays: Sequence[ReplayComparison],
     *,
     known_cases: set[str],
+    observed_seats: Mapping[str, frozenset[tuple[ProviderFamily, str]]],
 ) -> None:
-    """Replays must be unique and belong to the report's observed cases.
+    """Replays must be unique and name a seat actually observed for that case.
 
     A foreign case id or a repeated comparison would inflate the repeatability
     denominator, letting duplicated or cross-experiment evidence present
-    consistency as an apparently well-sampled 1.0.
+    consistency as an apparently well-sampled 1.0. A replay naming an arm that was
+    never observed for the case would be counted in that arm's consistency while
+    a nonexistent arm would be silently discarded, so the whole key is validated
+    against the seats in the corresponding observation.
     """
     foreign = sorted({r.case_id for r in replays if r.case_id not in known_cases})
     if foreign:
         raise ValueError(
             f"replays reference cases outside this report: {foreign}"
+        )
+    unobserved = sorted(
+        {
+            (r.provider_family.value, r.model, r.case_id)
+            for r in replays
+            if (r.provider_family, r.model)
+            not in observed_seats.get(r.case_id, frozenset())
+        }
+    )
+    if unobserved:
+        raise ValueError(
+            "replays reference seats that were not observed for their case: "
+            f"{unobserved}"
         )
     keys = [(r.provider_family, r.model, r.case_id) for r in replays]
     duplicates = sorted({key for key in keys if keys.count(key) > 1})
