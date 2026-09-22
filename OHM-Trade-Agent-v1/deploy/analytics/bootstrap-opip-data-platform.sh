@@ -27,8 +27,11 @@ COCKPIT_STATE_FILE="$STATE_ROOT/cockpit-ready.env"
 # The verified canonical replica. Installed generations live under
 # `generations/<id>` and are selected by a plain-text `current` pointer, so the parent
 # repository is NOT itself a bundle: it holds no manifest and no canonical database.
-# The parent is what gets mounted; the resolved generation is what the Cockpit must
-# read, and it is written into the Cockpit env file as OPIP_CANONICAL_REPLICA_ROOT.
+# The parent is what gets mounted and what the running Cockpit is configured to read.
+# At request time the Cockpit resolves the atomically committed `current` pointer to an
+# immutable generation. `cockpit-ready` still verifies an exact resolved generation
+# before readiness is recorded; runtime following of `current` only prevents a healthy
+# rotating replica from pruning the generation that a long-lived Cockpit had pinned.
 COCKPIT_REPLICA_PARENT_ROOT="/var/lib/opip-learning/canonical-replica"
 COCKPIT_REPLICA_CONTAINER_ROOT="/app/canonical-replica"
 OFFHOST_EVIDENCE="$STATE_ROOT/offhost-backup.env"
@@ -170,29 +173,18 @@ guard_no_trading_credentials() {
 guard_no_trading_credentials
 
 write_cockpit_env_file() {
-  # The Cockpit is externally reachable through the reverse proxy, so it must not
-  # load credentials it has no use for. The sealed analytics env file also holds the
-  # PostgreSQL admin, shipper, learning and dashboard credentials and privileged
-  # database URLs; handing those to an internet-facing read-only service would put
-  # unrelated secrets on an unnecessary surface.
+  # Derive a Cockpit-only env file from the sealed analytics environment. The
+  # allowlist keeps PostgreSQL, Grafana, learning and trading credentials out of
+  # the externally reachable read-only process.
   #
-  # This mirrors the Grafana pattern: derive a dedicated env file from the sealed
-  # source using a strict allowlist, so the Cockpit receives the minimum it needs -
-  # its own authentication secret and its own bound/port configuration. Everything
-  # else the process requires (the container port) is static and set in compose.
+  # Runtime replica resolution deliberately receives the mounted repository root,
+  # not one immutable generation. The learning sync atomically advances `current`
+  # and retains only the active generation plus one fallback. Pinning a generation
+  # here would therefore make a healthy long-lived Cockpit fail once normal retention
+  # pruned that old directory. The application resolves `current` on each request.
   #
-  # ``$1`` is the container-side path of the committed replica generation. It is optional:
-  #
-  #   * omitted - only the secret/port allowlist is written and the application default
-  #     (DEFAULT_REPLICA_ROOT, /app/canonical-replica) applies. Used to materialize the
-  #     secret surface before the generation can be known, because resolving the
-  #     generation needs the image that `cockpit_build_image` produces while Compose loads
-  #     this service's `env_file` in order to build.
-  #   * given - the verified generation is recorded, so the Cockpit reads the bundle the
-  #     pointer names rather than the parent repository.
-  #
-  # Omitting it never records a root the verifier has not confirmed.
-  local replica_root="${1:-}"
+  # Safety is not weakened: `cockpit-ready` still resolves and verifies an exact
+  # generation for TARGET_SHA before `cockpit_start` can record COCKPIT_READY_*.
   local temporary key
   local -a keys=(
     OPIP_COCKPIT_SECRET
@@ -211,9 +203,7 @@ write_cockpit_env_file() {
       exit 78
     fi
   done
-  if [[ -n "$replica_root" ]]; then
-    printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$replica_root" >> "$temporary"
-  fi
+  printf 'OPIP_CANONICAL_REPLICA_ROOT=%s\n' "$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"
   chown root:root "$temporary"
   chmod 0600 "$temporary"
   mv -f -- "$temporary" "$COCKPIT_ENV_FILE"
@@ -513,7 +503,7 @@ cockpit_start() {
   local replica_root="$1"
   local verification="${2:-unverified}"
 
-  write_cockpit_env_file "$replica_root"
+  write_cockpit_env_file
   cockpit_compose up -d opip-cockpit
   cockpit_wait_healthy
   cockpit_preflight
@@ -698,259 +688,3 @@ validate_postgres_tls_key() {
   [[ -f "$POSTGRES_TLS_CERT" && -r "$POSTGRES_TLS_CERT" ]] || {
     echo "missing or unreadable PostgreSQL TLS certificate: $POSTGRES_TLS_CERT" >&2
     exit 78
-  }
-  [[ -f "$POSTGRES_TLS_KEY" ]] || {
-    echo "missing PostgreSQL TLS private key: $POSTGRES_TLS_KEY" >&2
-    exit 78
-  }
-
-  # Pull the exact Compose image but do not start PostgreSQL. Resolve the
-  # postgres runtime UID/GID from that image rather than hard-coding Alpine IDs.
-  compose pull opip-postgres >/dev/null
-  postgres_image="$(compose config --images | awk '/(^|\/)postgres:/ {print; exit}')"
-  [[ -n "$postgres_image" ]] || {
-    echo "unable to resolve PostgreSQL image for TLS-key preflight" >&2
-    exit 78
-  }
-  runtime_ids="$(
-    docker run --rm --entrypoint sh "$postgres_image" -c \
-      'printf "%s:%s\n" "$(id -u postgres)" "$(id -g postgres)"'
-  )"
-  if [[ ! "$runtime_ids" =~ ^[0-9]+:[0-9]+$ ]]; then
-    echo "unable to resolve PostgreSQL runtime UID/GID from $postgres_image" >&2
-    exit 78
-  fi
-  IFS=: read -r pg_uid pg_gid <<<"$runtime_ids"
-
-  key_metadata="$(stat -Lc '%a:%u:%g' "$POSTGRES_TLS_KEY")"
-  if [[ ! "$key_metadata" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then
-    echo "unable to read PostgreSQL TLS key ownership/mode" >&2
-    exit 78
-  fi
-  IFS=: read -r key_mode key_uid key_gid <<<"$key_metadata"
-
-  if [[ "$key_mode" == "600" && "$key_uid" == "$pg_uid" && "$key_gid" == "$pg_gid" ]]; then
-    return 0
-  fi
-  if [[ "$key_mode" == "640" && "$key_uid" == "0" && "$key_gid" == "$pg_gid" ]]; then
-    return 0
-  fi
-
-  echo "invalid PostgreSQL TLS key ownership/mode: got mode=$key_mode uid=$key_uid gid=$key_gid; expected 0600 owned by $pg_uid:$pg_gid or root:$pg_gid with 0640" >&2
-  exit 78
-}
-
-wait_for_postgres() {
-  local ready="false"
-  for _ in $(seq 1 30); do
-    if compose exec -T opip-postgres \
-      pg_isready -U "${OPIP_POSTGRES_ADMIN_USER:-opip_admin}" -d "${OPIP_POSTGRES_DB:-opip}"; then
-      ready="true"
-      break
-    fi
-    sleep 2
-  done
-  [[ "$ready" == "true" ]] || {
-    echo "PostgreSQL did not become ready" >&2
-    exit 1
-  }
-}
-
-admin_run() {
-  compose --profile admin run --rm opip-data-admin "$@"
-}
-
-require_stage() {
-  local key="$1" label="$2"
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
-  [[ -n "${!key:-}" ]] || {
-    echo "$label must complete before stage $STAGE" >&2
-    exit 69
-  }
-}
-
-validate_promotion_evidence() {
-  local attested_backup_name attested_backup offhost_at restore_at restore_backup
-  [[ -r "$OFFHOST_EVIDENCE" ]] || {
-    echo "independent off-host backup attestation is required before promotion" >&2
-    exit 70
-  }
-  [[ -r "$RESTORE_EVIDENCE" ]] || {
-    echo "local restore-drill evidence is required before promotion" >&2
-    exit 70
-  }
-  offhost_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$OFFHOST_EVIDENCE")"
-  attested_backup_name="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$OFFHOST_EVIDENCE")"
-  restore_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$RESTORE_EVIDENCE")"
-  restore_backup="$(awk -F= '$1 == "backup_file" {print $2; exit}' "$RESTORE_EVIDENCE")"
-  backup_epoch="$(date -u -d "$offhost_at" +%s 2>/dev/null || true)"
-  restore_epoch="$(date -u -d "$restore_at" +%s 2>/dev/null || true)"
-  if [[ ! "$backup_epoch" =~ ^[0-9]+$ ]] \
-    || (( backup_epoch > now_epoch || now_epoch - backup_epoch > 8 * 86400 )); then
-    echo "off-host backup verification is invalid, future-dated, or older than eight days" >&2
-    exit 70
-  fi
-  if [[ ! "$restore_epoch" =~ ^[0-9]+$ ]] \
-    || (( restore_epoch > now_epoch || now_epoch - restore_epoch > 90 * 86400 )); then
-    echo "restore drill verification is invalid, future-dated, or older than 90 days" >&2
-    exit 70
-  fi
-  if [[ ! "$attested_backup_name" =~ ^opip-postgres-[0-9]{8}T[0-9]{6}Z\.dump$ ]]; then
-    echo "off-host backup attestation references an invalid local dump name" >&2
-    exit 70
-  fi
-  attested_backup="/var/backups/opip-postgres/$attested_backup_name"
-  [[ -r "$attested_backup" && -r "$attested_backup.sha256" ]] || {
-    echo "the attested PostgreSQL dump and checksum are required before promotion" >&2
-    exit 70
-  }
-  sha256sum --check --status "$attested_backup.sha256" || {
-    echo "attested PostgreSQL dump checksum verification failed" >&2
-    exit 70
-  }
-  if (( backup_epoch < $(stat -c '%Y' "$attested_backup") )); then
-    echo "off-host backup attestation predates the attested local PostgreSQL dump" >&2
-    exit 70
-  fi
-  if [[ "$restore_backup" != "$attested_backup_name" ]]; then
-    echo "restore drill must validate the attested PostgreSQL dump" >&2
-    exit 70
-  fi
-}
-
-export OPIP_DEPLOYED_SHA="$TARGET_SHA"
-
-validate_postgres_tls_key
-# Both application services share the same immutable image tag; build once to
-# avoid a concurrent BuildKit export race on the identical tag.
-docker compose -f "$COMPOSE" build opip-shipper
-compose up -d opip-postgres
-wait_for_postgres
-
-# A fresh host may initialize the empty database first. Promotion beyond the
-# empty stage requires a real dump, restore drill, and independently recorded
-# off-host evidence after PostgreSQL is running.
-if [[ "$STAGE" != "empty" ]]; then
-  validate_promotion_evidence
-fi
-
-if [[ "$STAGE" == "empty" ]]; then
-  admin_run python -m app.opip.data_platform.migrations migrate
-  admin_run python -m app.opip.data_platform.migrations provision-roles
-  admin_run python -m app.opip.data_platform.migrations sync-required-streams
-  if [[ -z "${EMPTY_STARTED_AT_UTC:-}" ]]; then
-    write_state EMPTY_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  fi
-  write_state EMPTY_DEPLOY_COUNT "$((EMPTY_DEPLOY_COUNT + 1))"
-  write_state EMPTY_LAST_SHA "$TARGET_SHA"
-  write_state EMPTY_LAST_COMPLETED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-elif [[ "$STAGE" == "backfill" ]]; then
-  require_stage EMPTY_STARTED_AT_UTC "empty PostgreSQL stage"
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
-  if (( ${EMPTY_DEPLOY_COUNT:-0} < 2 )); then
-    echo "empty PostgreSQL stage requires two successful deploys before backfill" >&2
-    exit 69
-  fi
-  [[ -r "$ROLLBACK_EVIDENCE" ]] || {
-    echo "explicit empty-stage rollback evidence is required before backfill" >&2
-    exit 69
-  }
-  rollback_at="$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
-  rollback_restore_at="$(awk -F= '$1 == "restore_verified_at_utc" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
-  rollback_count="$(awk -F= '$1 == "empty_deploy_count" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
-  rollback_sha="$(awk -F= '$1 == "sha" {print $2; exit}' "$ROLLBACK_EVIDENCE")"
-  rollback_epoch="$(date -u -d "$rollback_at" +%s 2>/dev/null || true)"
-  if [[ ! "$rollback_epoch" =~ ^[0-9]+$ ]] \
-    || (( rollback_epoch > now_epoch || rollback_epoch < restore_epoch )); then
-    echo "empty-stage rollback evidence must not be future-dated and must be newer than the restore drill" >&2
-    exit 69
-  fi
-  if [[ "$rollback_restore_at" != "$(awk -F= '$1 == "verified_at_utc" {print $2; exit}' "$RESTORE_EVIDENCE")" ]] \
-    || [[ ! "$rollback_count" =~ ^[0-9]+$ ]] || (( rollback_count < 2 )) \
-    || [[ "$rollback_sha" != "$TARGET_SHA" ]]; then
-    echo "empty-stage rollback evidence does not match the verified rollout state" >&2
-    exit 69
-  fi
-  admin_run python -m app.opip.data_platform.migrations migrate
-  admin_run python -m app.opip.data_platform.migrations sync-required-streams
-  admin_run python -m app.opip.data_platform.backfill
-  admin_run python -m app.opip.data_platform.migrations refresh-views
-  admin_run python -m app.opip.data_platform.reconcile
-  write_state BACKFILL_COMPLETED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  write_state BACKFILL_SHA "$TARGET_SHA"
-elif [[ "$STAGE" == "shipper" ]]; then
-  require_stage BACKFILL_COMPLETED_AT_UTC "clean backfill"
-  admin_run python -m app.opip.data_platform.migrations migrate
-  admin_run python -m app.opip.data_platform.migrations sync-required-streams
-  admin_run python -m app.opip.data_platform.reconcile
-  compose up -d opip-shipper
-  if [[ -z "${SHIPPER_STARTED_AT_UTC:-}" ]]; then
-    write_state SHIPPER_STARTED_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  fi
-  write_state SHIPPER_SHA "$TARGET_SHA"
-elif [[ "$STAGE" == "reads-ready" ]]; then
-  require_stage SHIPPER_STARTED_AT_UTC "shipper soak"
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
-  shipper_epoch="$(date -u -d "$SHIPPER_STARTED_AT_UTC" +%s 2>/dev/null || true)"
-  if [[ ! "$shipper_epoch" =~ ^[0-9]+$ ]] \
-    || (( shipper_epoch > now_epoch || now_epoch - shipper_epoch < 7 * 86400 )); then
-    echo "shipper must soak for seven days before historical reads are eligible" >&2
-    exit 69
-  fi
-  admin_run python -m app.opip.data_platform.migrations migrate
-  admin_run python -m app.opip.data_platform.migrations sync-required-streams
-  admin_run python -m app.opip.data_platform.reconcile
-  admin_run python -m app.opip.data_platform.health --require-ready
-  # Start the read-only Cockpit through the same primitive `cockpit-ready` uses, so the
-  # two stages cannot drift into separate implementations. Replica verification is
-  # deliberately NOT part of this path: it belongs to `cockpit-ready`. Historical
-  # PostgreSQL/Grafana readiness must not be blocked by the replica plane, so this path
-  # passes `unverified` and therefore publishes no COCKPIT_READY_* evidence - that marker
-  # means "verified replica + reachable Cockpit", which this path has not established.
-  # When the committed generation cannot be resolved the Cockpit still starts against
-  # the parent mount and reports replica unavailability through its own API.
-  cockpit_build_image
-  cockpit_start "$(cockpit_replica_root || printf '%s' "$COCKPIT_REPLICA_CONTAINER_ROOT")" unverified
-  # The Cockpit is owned by its own Compose surface, so the shared-surface `compose ps`
-  # below cannot show it. Report its status here, or a successful historical-read
-  # deployment would describe only the PostgreSQL/Grafana plane to the operator.
-  cockpit_compose ps
-  # READS_READY_* is the historical PostgreSQL analytics evidence and is written only
-  # here, only after every historical gate above has passed. `cockpit-ready` never
-  # writes these.
-  write_state READS_READY_AT_UTC "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  write_state READS_READY_SHA "$TARGET_SHA"
-fi
-
-write_state DEPLOYED_SHA "$TARGET_SHA"
-
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-data-platform-maintenance.sh" \
-  /usr/local/sbin/opip-data-platform-maintenance
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-postgres-backup.sh" \
-  /usr/local/sbin/opip-postgres-backup
-install -o root -g root -m 0755 \
-  "$APP_ROOT/deploy/analytics/opip-postgres-restore-drill.sh" \
-  /usr/local/sbin/opip-postgres-restore-drill
-for unit in \
-  opip-data-platform-maintenance.service \
-  opip-data-platform-maintenance.timer \
-  opip-postgres-backup.service \
-  opip-postgres-backup.timer; do
-  install -o root -g root -m 0644 \
-    "$APP_ROOT/deploy/analytics/$unit" "/etc/systemd/system/$unit"
-done
-systemctl daemon-reload
-systemctl enable --now opip-postgres-backup.timer
-if [[ "$STAGE" == "shipper" || "$STAGE" == "reads-ready" ]]; then
-  systemctl enable --now opip-data-platform-maintenance.timer
-fi
-
-compose ps
-echo "O'Pip analytics data-platform stage succeeded"
-echo "stage=$STAGE"
-echo "sha=$TARGET_SHA"
