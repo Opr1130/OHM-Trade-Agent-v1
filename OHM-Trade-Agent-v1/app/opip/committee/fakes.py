@@ -134,38 +134,45 @@ def opinion_json(
     evidence_sufficiency: str = "SUFFICIENT",
     hypothesis: str = "the recorded evidence is consistent with the working hypothesis",
     confidence: int | None = 60,
-    supporting_evidence_refs: Sequence[str] = (),
-    contradicting_evidence_refs: Sequence[str] = (),
-    major_assumptions: Sequence[str] = (),
-    risk_factors: Sequence[str] = (),
-    missing_evidence: Sequence[str] = (),
-    alternative_explanations: Sequence[str] = (),
+    lists: Mapping[str, Sequence[str]] | None = None,
     recommended_research_action: str = "NO_ACTION",
     abstention_reason: str | None = None,
     overrides: Mapping[str, Any] | None = None,
     drop: Sequence[str] = (),
 ) -> str:
-    """Build a valid opinion document, optionally mutated for adversarial tests."""
+    """Build a valid opinion document, optionally mutated for adversarial tests.
+
+    The repeated string-list fields are supplied through a single ``lists``
+    mapping rather than one parameter each, which keeps the builder's signature
+    small enough to review at a glance.
+    """
     payload: dict[str, Any] = {
         "schema_version": 1,
         "evidence_sufficiency": evidence_sufficiency,
         "assessment": assessment,
         "hypothesis": hypothesis,
         "confidence": confidence,
-        "supporting_evidence_refs": list(supporting_evidence_refs),
-        "contradicting_evidence_refs": list(contradicting_evidence_refs),
-        "major_assumptions": list(major_assumptions),
-        "risk_factors": list(risk_factors),
-        "missing_evidence": list(missing_evidence),
-        "alternative_explanations": list(alternative_explanations),
         "recommended_research_action": recommended_research_action,
         "abstention_reason": abstention_reason,
     }
+    for list_field in _OPINION_LIST_FIELDS:
+        payload[list_field] = list(dict(lists or {}).get(list_field, ()))
     for key in drop:
         payload.pop(key, None)
     if overrides:
         payload.update(dict(overrides))
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+#: The opinion fields that carry repeated strings rather than a scalar.
+_OPINION_LIST_FIELDS = (
+    "supporting_evidence_refs",
+    "contradicting_evidence_refs",
+    "major_assumptions",
+    "risk_factors",
+    "missing_evidence",
+    "alternative_explanations",
+)
 
 
 __all__ = [

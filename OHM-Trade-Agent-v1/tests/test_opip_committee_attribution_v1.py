@@ -41,6 +41,7 @@ from app.opip.committee.contracts import (
 )
 from app.opip.committee.evaluation import DirectionalCall
 from app.opip.committee.serialization import (
+    CommitteeSerializationError,
     attribution_report_from_dict,
     attribution_report_to_dict,
 )
@@ -668,7 +669,7 @@ def test_forged_attribution_identity_is_rejected_on_read():
     )
     row = attribution_report_to_dict(report)
     row["attribution_id"] = "COMMITTEE-ATTRIBUTION:forged"
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         attribution_report_from_dict(row)
 
 

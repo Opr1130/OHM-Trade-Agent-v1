@@ -43,7 +43,7 @@ from app.opip.committee.fakes import (
     opinion_json,
 )
 from app.opip.committee.ledger import InMemoryObservationLedger
-from app.opip.committee.opinion import parse_structured_opinion
+from app.opip.committee.opinion import OpinionParseError, parse_structured_opinion
 from app.opip.committee.outbound import OutboundPolicyError, screen_model_bound_view
 from app.opip.committee.providers import (
     ProviderAvailability,
@@ -57,6 +57,7 @@ from app.opip.committee.runtime import (
     CommitteeRunner,
 )
 from app.opip.committee.serialization import (
+    CommitteeSerializationError,
     call_outcome_from_dict,
     call_outcome_to_dict,
     case_outcome_from_dict,
@@ -153,24 +154,26 @@ def _ok(family: ProviderFamily = ProviderFamily.OPENAI, model: str = "model-a", 
 
 
 def test_evidence_available_after_cutoff_is_rejected():
+    available_late = CUTOFF + timedelta(seconds=1)
     with pytest.raises(EvidencePolicyError):
         build_evidence_item(
             evidence_id="E-late",
             source_id="market-observation",
-            available_at=CUTOFF + timedelta(seconds=1),
+            available_at=available_late,
             payload={"metric_value": "100"},
             evidence_cutoff_at=CUTOFF,
         )
 
 
 def test_snapshot_rejects_duplicate_evidence_ids():
+    duplicate = _item("E1")
     with pytest.raises(EvidencePolicyError):
         build_evidence_snapshot(
             case_id="case-1",
             case_type=CaseType.MARKET_OPPORTUNITY,
             evidence_cutoff_at=CUTOFF,
             assembled_at=NOW,
-            items=(_item("E1"), _item("E1")),
+            items=(duplicate, duplicate),
             source_refs=("ref",),
             committee_policy_version=POLICY_VERSION,
             prompt_template_id="committee.opinion.v1",
@@ -198,12 +201,12 @@ def test_binary_floats_are_rejected_from_evidence_identity():
 
 
 def test_case_requires_snapshot_policy_alignment():
-    snapshot = _snapshot(policy_version="other-policy")
+    mismatched = _snapshot(policy_version="other-policy")
     with pytest.raises(ValueError):
         CommitteeCase(
             case_id="case-1",
             case_type=CaseType.MARKET_OPPORTUNITY,
-            snapshot=snapshot,
+            snapshot=mismatched,
             policy=_policy(),
             created_at=NOW,
             provenance=_provenance(),
@@ -251,7 +254,7 @@ def test_outbound_screen_allows_ordinary_evidence():
 
 def test_model_bound_view_of_a_secret_bearing_item_fails_closed():
     secret_shaped = "sk-" + "L" * 28
-    snapshot = build_evidence_snapshot(
+    secret_bearing = build_evidence_snapshot(
         case_id="case-1",
         case_type=CaseType.MARKET_OPPORTUNITY,
         evidence_cutoff_at=CUTOFF,
@@ -267,8 +270,9 @@ def test_model_bound_view_of_a_secret_bearing_item_fails_closed():
         prompt_template_id="committee.opinion.v1",
         prompt_version="3",
     )
+    model_bound = secret_bearing.model_bound_view()
     with pytest.raises(OutboundPolicyError):
-        screen_model_bound_view(snapshot.model_bound_view())
+        screen_model_bound_view(model_bound)
 
 
 # ------------------------------------------------------------ opinion parse
@@ -284,9 +288,22 @@ def _parse(text: str, *, allowed=("E1", "E2")):
     )
 
 
+def _parse_error(text: str) -> OpinionParseError:
+    """Return the specific parse error raised for ``text``.
+
+    A single invocation inside the block plus the concrete error type keeps the
+    test from passing for an unrelated reason.
+    """
+    with pytest.raises(OpinionParseError) as excinfo:
+        _parse(text)
+    return excinfo.value
+
+
 def test_valid_opinion_parses():
     opinion = _parse(
-        opinion_json(supporting_evidence_refs=("E1",), confidence=70)
+        opinion_json(
+            lists={"supporting_evidence_refs": ("E1",)}, confidence=70
+        )
     )
     assert opinion.assessment is DirectionalAssessment.SUPPORTIVE
     assert opinion.evidence_sufficiency is EvidenceSufficiency.SUFFICIENT
@@ -296,53 +313,60 @@ def test_valid_opinion_parses():
 
 
 def test_non_json_response_is_malformed():
-    with pytest.raises(Exception) as excinfo:
-        _parse("I think this looks bullish, trust me.")
-    assert excinfo.value.failure_class is ProviderFailureClass.MALFORMED_RESPONSE
+    assert _parse_error("I think this looks bullish, trust me.").failure_class is (
+        ProviderFailureClass.MALFORMED_RESPONSE
+    )
 
 
 def test_markdown_fenced_response_is_rejected_not_repaired():
-    with pytest.raises(Exception) as excinfo:
-        _parse(f"```json\n{opinion_json()}\n```")
-    assert excinfo.value.failure_class is ProviderFailureClass.MALFORMED_RESPONSE
+    fenced = f"```json\n{opinion_json()}\n```"
+    assert _parse_error(fenced).failure_class is (
+        ProviderFailureClass.MALFORMED_RESPONSE
+    )
 
 
 def test_undeclared_opinion_field_is_a_schema_failure():
-    with pytest.raises(Exception) as excinfo:
-        _parse(opinion_json(overrides={"trade_command": "buy"}))
-    assert excinfo.value.failure_class is ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    undeclared = opinion_json(overrides={"trade_command": "buy"})
+    assert _parse_error(undeclared).failure_class is (
+        ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    )
 
 
 def test_confidence_outside_legal_bounds_is_rejected():
     for value in (-1, 101):
-        with pytest.raises(Exception) as excinfo:
-            _parse(opinion_json(overrides={"confidence": value}))
-        assert excinfo.value.failure_class is ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+        out_of_range = opinion_json(overrides={"confidence": value})
+        assert _parse_error(out_of_range).failure_class is (
+            ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+        )
 
 
 def test_hallucinated_evidence_reference_is_rejected():
-    with pytest.raises(Exception) as excinfo:
-        _parse(opinion_json(supporting_evidence_refs=("E-not-in-snapshot",)))
-    assert excinfo.value.failure_class is ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    hallucinated = opinion_json(
+        lists={"supporting_evidence_refs": ("E-not-in-snapshot",)}
+    )
+    assert _parse_error(hallucinated).failure_class is (
+        ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    )
 
 
 def test_abstention_rejects_sufficient_evidence_and_confidence():
-    with pytest.raises(Exception):
-        _parse(
-            opinion_json(
-                abstention_reason="evidence too thin",
-                evidence_sufficiency="SUFFICIENT",
-                confidence=None,
-            )
-        )
-    with pytest.raises(Exception):
-        _parse(
-            opinion_json(
-                abstention_reason="evidence too thin",
-                evidence_sufficiency="INSUFFICIENT",
-                confidence=40,
-            )
-        )
+    sufficient = opinion_json(
+        abstention_reason="evidence too thin",
+        evidence_sufficiency="SUFFICIENT",
+        confidence=None,
+    )
+    assert _parse_error(sufficient).failure_class is (
+        ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    )
+
+    confident = opinion_json(
+        abstention_reason="evidence too thin",
+        evidence_sufficiency="INSUFFICIENT",
+        confidence=40,
+    )
+    assert _parse_error(confident).failure_class is (
+        ProviderFailureClass.SCHEMA_VALIDATION_FAILURE
+    )
 
 
 # ----------------------------------------------------------- provider layer
@@ -360,10 +384,11 @@ def test_missing_adapter_yields_an_explicitly_unavailable_seat():
 
 
 def test_adapter_for_a_different_family_is_refused():
+    misplaced = _ok(ProviderFamily.OPENAI)
     with pytest.raises(ValueError):
         resolve_seated_providers(
             policy_families=(ProviderFamily.ANTHROPIC,),
-            providers={ProviderFamily.ANTHROPIC: _ok(ProviderFamily.OPENAI)},
+            providers={ProviderFamily.ANTHROPIC: misplaced},
         )
 
 
@@ -374,10 +399,9 @@ def test_transport_backed_provider_classifies_unknown_failure():
     provider = TransportBackedProvider(
         family=ProviderFamily.OPENAI, model="m", transport=transport
     )
+    probe = _wire_probe()
     with pytest.raises(ProviderInvocationError) as excinfo:
-        provider.invoke(
-            _wire_probe()
-        )
+        provider.invoke(probe)
     assert excinfo.value.failure_class is ProviderFailureClass.INTERNAL_ERROR
 
 
@@ -883,7 +907,7 @@ def test_persisted_identity_mismatch_is_rejected_on_read(tmp_path):
 
     row = call_outcome_to_dict(committed)
     row["outcome_id"] = "COMMITTEE-CALL:forged"
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         call_outcome_from_dict(row)
 
 

@@ -167,6 +167,113 @@ def _validate_outcome_observation(observation: "OutcomeObservation") -> None:
     _validate_outcome_finality(observation)
 
 
+_PROSPECTIVE_EVALUATION_REQUIRED_FIELDS = (
+    "prediction_id",
+    "outcome_observation_id",
+    "case_id",
+    "experiment_id",
+)
+
+_PROSPECTIVE_EVALUATION_TIMESTAMPS = (
+    "evidence_cutoff_at",
+    "sealed_at",
+    "observed_at",
+    "evaluated_at",
+)
+
+_PROSPECTIVE_EVALUATION_SEAT_COUNTS = (
+    "scored_seats",
+    "abstained_seats",
+    "unavailable_seats",
+    "unscored_directional_seats",
+)
+
+
+def _validate_prospective_authority(evaluation: "ProspectiveEvaluation") -> None:
+    """A prospective result is measurement evidence and can never act."""
+    if evaluation.phase is not EvaluationPhase.PROSPECTIVE:
+        raise ProspectivePolicyError(
+            "a prospective evaluation cannot carry a retrospective phase"
+        )
+    if evaluation.automatic_promotion is not False:
+        raise ProspectivePolicyError("a prospective result can never promote")
+    if evaluation.trade_authority_changed is not False:
+        raise ProspectivePolicyError(
+            "a prospective result can never change trade authority"
+        )
+    if evaluation.measurement_only is not True:
+        raise ProspectivePolicyError("prospective evidence is measurement only")
+
+
+def _validate_prospective_identity(evaluation: "ProspectiveEvaluation") -> None:
+    for field_name in _PROSPECTIVE_EVALUATION_REQUIRED_FIELDS:
+        value = getattr(evaluation, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ProspectivePolicyError(f"{field_name} is required")
+    for field_name, expected in (
+        ("case_type", CaseType),
+        ("finality", OutcomeFinality),
+    ):
+        if not isinstance(getattr(evaluation, field_name), expected):
+            raise ProspectivePolicyError(f"invalid {field_name}")
+    for field_name in _PROSPECTIVE_EVALUATION_TIMESTAMPS:
+        object.__setattr__(
+            evaluation,
+            field_name,
+            require_utc(getattr(evaluation, field_name), field_name=field_name),
+        )
+
+
+def _validate_prospective_timeline(evaluation: "ProspectiveEvaluation") -> None:
+    if type(evaluation.horizon_seconds) is not int or evaluation.horizon_seconds < 1:
+        raise ProspectivePolicyError(_HORIZON_MESSAGE)
+    if evaluation.observed_at < evaluation.sealed_at:
+        raise ProspectivePolicyError(
+            "an outcome observed before sealing is not a prospective outcome"
+        )
+    if evaluation.evaluated_at < evaluation.observed_at:
+        raise ProspectivePolicyError("evaluated_at must be >= observed_at")
+
+
+def _validate_prospective_seat_accounting(
+    evaluation: "ProspectiveEvaluation",
+) -> None:
+    for field_name in _PROSPECTIVE_EVALUATION_SEAT_COUNTS:
+        value = getattr(evaluation, field_name)
+        if type(value) is not int or value < 0:
+            raise ProspectivePolicyError(
+                f"{field_name} must be a non-negative integer"
+            )
+    accounted = sum(
+        getattr(evaluation, field_name)
+        for field_name in _PROSPECTIVE_EVALUATION_SEAT_COUNTS
+    )
+    if len(evaluation.seat_scores) != accounted:
+        raise ProspectivePolicyError(
+            "seat score counts must sum to the recorded seat scores: every "
+            "seat is scored, abstaining, unavailable, or unscored because the "
+            "outcome carried no direction"
+        )
+    if evaluation.finality is OutcomeFinality.PROVISIONAL and any(
+        score.final for score in evaluation.seat_scores
+    ):
+        raise ProspectivePolicyError(
+            "provisional outcome evidence cannot produce a final seat score"
+        )
+
+
+def _validate_prospective_evaluation(evaluation: "ProspectiveEvaluation") -> None:
+    """Validate a T2 evaluation record end to end."""
+    if type(evaluation.schema_version) is not int or evaluation.schema_version != (
+        PROSPECTIVE_EVALUATION_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported ProspectiveEvaluation schema_version")
+    _validate_prospective_authority(evaluation)
+    _validate_prospective_identity(evaluation)
+    _validate_prospective_timeline(evaluation)
+    _validate_prospective_seat_accounting(evaluation)
+
+
 class OutcomeFinality(str, Enum):
     """Whether outcome evidence is complete and final.
 
@@ -336,78 +443,7 @@ class ProspectiveEvaluation:
     schema_version: int = PROSPECTIVE_EVALUATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != (
-            PROSPECTIVE_EVALUATION_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported ProspectiveEvaluation schema_version")
-        if self.phase is not EvaluationPhase.PROSPECTIVE:
-            raise ProspectivePolicyError(
-                "a prospective evaluation cannot carry a retrospective phase"
-            )
-        if self.automatic_promotion is not False:
-            raise ProspectivePolicyError("a prospective result can never promote")
-        if self.trade_authority_changed is not False:
-            raise ProspectivePolicyError(
-                "a prospective result can never change trade authority"
-            )
-        if self.measurement_only is not True:
-            raise ProspectivePolicyError("prospective evidence is measurement only")
-        for field_name in ("prediction_id", "outcome_observation_id", "case_id",
-                           "experiment_id"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ProspectivePolicyError(f"{field_name} is required")
-        if not isinstance(self.case_type, CaseType):
-            raise ProspectivePolicyError("invalid case_type")
-        if not isinstance(self.finality, OutcomeFinality):
-            raise ProspectivePolicyError("invalid finality")
-        for field_name in (
-            "evidence_cutoff_at",
-            "sealed_at",
-            "observed_at",
-            "evaluated_at",
-        ):
-            object.__setattr__(
-                self,
-                field_name,
-                require_utc(getattr(self, field_name), field_name=field_name),
-            )
-        if type(self.horizon_seconds) is not int or self.horizon_seconds < 1:
-            raise ProspectivePolicyError(_HORIZON_MESSAGE)
-        if self.observed_at < self.sealed_at:
-            raise ProspectivePolicyError(
-                "an outcome observed before sealing is not a prospective outcome"
-            )
-        if self.evaluated_at < self.observed_at:
-            raise ProspectivePolicyError("evaluated_at must be >= observed_at")
-        if len(self.seat_scores) != (
-            self.scored_seats
-            + self.abstained_seats
-            + self.unavailable_seats
-            + self.unscored_directional_seats
-        ):
-            raise ProspectivePolicyError(
-                "seat score counts must sum to the recorded seat scores: every "
-                "seat is scored, abstaining, unavailable, or unscored because the "
-                "outcome carried no direction"
-            )
-        for field_name in (
-            "scored_seats",
-            "abstained_seats",
-            "unavailable_seats",
-            "unscored_directional_seats",
-        ):
-            value = getattr(self, field_name)
-            if type(value) is not int or value < 0:
-                raise ProspectivePolicyError(
-                    f"{field_name} must be a non-negative integer"
-                )
-        if self.finality is OutcomeFinality.PROVISIONAL and any(
-            score.final for score in self.seat_scores
-        ):
-            raise ProspectivePolicyError(
-                "provisional outcome evidence cannot produce a final seat score"
-            )
+        _validate_prospective_evaluation(self)
 
     @property
     def counts_as_final_evidence(self) -> bool:

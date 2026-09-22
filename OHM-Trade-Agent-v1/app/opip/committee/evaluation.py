@@ -604,6 +604,122 @@ def _finalize_arm(
     )
 
 
+def _validate_bake_off_inputs(
+    observations: Sequence[CaseObservation],
+    *,
+    resolved_outcomes: Sequence[ResolvedOutcome],
+    deterministic_baseline: Sequence[BaselineCall],
+    probability_forecasts: Sequence[ProbabilityForecast],
+) -> CaseType:
+    """Validate the shared case set and return its single case type."""
+    if not observations:
+        raise ValueError("a bake-off requires at least one case observation")
+    case_types = {observation.case_type for observation in observations}
+    if len(case_types) != 1:
+        raise ValueError(
+            "a bake-off compares arms over a single case type; "
+            "mixed case types must be evaluated separately"
+        )
+    known_cases = {observation.case_id for observation in observations}
+    for label, case_id in (
+        *(
+            ("resolved outcome", item.case_id)
+            for item in resolved_outcomes
+        ),
+        *(
+            ("baseline call", item.case_id)
+            for item in deterministic_baseline
+        ),
+        *(
+            ("forecast", item.case_id)
+            for item in probability_forecasts
+        ),
+    ):
+        if case_id not in known_cases:
+            raise ValueError(f"{label} for unknown case: {case_id}")
+    return next(iter(case_types))
+
+
+def _accumulate_independent_seats(
+    arm_for, observation: CaseObservation
+) -> None:
+    """Accumulate one case's individual-model arms and the committee signal."""
+    for seat in observation.seats:
+        key = f"model:{seat.provider_family.value}:{seat.requested_model}"
+        _accumulate_seat(
+            arm_for(
+                key,
+                kind=ArmKind.INDIVIDUAL_MODEL,
+                label=f"{seat.provider_family.value}/{seat.requested_model}",
+                provider_family=seat.provider_family,
+                model=seat.requested_model,
+            ),
+            seat,
+        )
+
+    signal_call = committee_research_signal(observation.seats)
+    signal = arm_for(
+        "committee:research-signal",
+        kind=ArmKind.COMMITTEE_SIGNAL,
+        label="committee research signal",
+    )
+    # The signal arm's cost is the full cost of producing the committee signal,
+    # so the incremental-information question can be asked directly.
+    _record(
+        signal,
+        case_id=observation.case_id,
+        call=signal_call,
+        status=None,
+        schema_valid=signal_call
+        in (DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE),
+        input_tokens=_sum_tokens(observation.seats, "input_tokens"),
+        output_tokens=_sum_tokens(observation.seats, "output_tokens"),
+        cost_microunits=_sum_costs(observation.seats),
+    )
+
+
+def _accumulate_baseline_arm(arm_for, deterministic_baseline) -> None:
+    if not deterministic_baseline:
+        return
+    baseline = arm_for(
+        "baseline:deterministic",
+        kind=ArmKind.DETERMINISTIC_BASELINE,
+        label="deterministic O'Pip baseline",
+    )
+    for call in deterministic_baseline:
+        _record(
+            baseline,
+            case_id=call.case_id,
+            call=(
+                DirectionalCall.POSITIVE
+                if call.positive
+                else DirectionalCall.NEGATIVE
+            ),
+            status=None,
+            schema_valid=True,
+            cost_microunits=None,
+        )
+
+
+def _accumulate_null_arm(arm_for, resolved) -> None:
+    if not resolved:
+        return
+    null_arm = arm_for(
+        "baseline:null",
+        kind=ArmKind.NULL_BASELINE,
+        label="always-positive null baseline",
+    )
+    for case_id in resolved:
+        _record(
+            null_arm,
+            case_id=case_id,
+            call=DirectionalCall.POSITIVE,
+            status=None,
+            schema_valid=True,
+            cost_microunits=None,
+        )
+
+
 def evaluate_model_bake_off(
     observations: Sequence[CaseObservation],
     *,
@@ -622,27 +738,12 @@ def evaluate_model_bake_off(
     Retrospective and prospective evidence must be evaluated separately: the
     caller selects one ``phase`` and one case type per report.
     """
-    if not observations:
-        raise ValueError("a bake-off requires at least one case observation")
-    case_types = {observation.case_type for observation in observations}
-    if len(case_types) != 1:
-        raise ValueError(
-            "a bake-off compares arms over a single case type; "
-            "mixed case types must be evaluated separately"
-        )
-    known_cases = {observation.case_id for observation in observations}
-    for outcome in resolved_outcomes:
-        if outcome.case_id not in known_cases:
-            raise ValueError(
-                f"resolved outcome for unknown case: {outcome.case_id}"
-            )
-    for call in deterministic_baseline:
-        if call.case_id not in known_cases:
-            raise ValueError(f"baseline call for unknown case: {call.case_id}")
-    for forecast in probability_forecasts:
-        if forecast.case_id not in known_cases:
-            raise ValueError(f"forecast for unknown case: {forecast.case_id}")
-
+    case_type = _validate_bake_off_inputs(
+        observations,
+        resolved_outcomes=resolved_outcomes,
+        deterministic_baseline=deterministic_baseline,
+        probability_forecasts=probability_forecasts,
+    )
     resolved = {outcome.case_id: outcome for outcome in resolved_outcomes}
     probabilities = {
         (forecast.case_id, forecast.arm_id): forecast.probability
@@ -651,80 +752,15 @@ def evaluate_model_bake_off(
 
     accumulators: dict[str, _ArmAccumulator] = {}
 
-    def _arm(key: str, **kwargs) -> _ArmAccumulator:
+    def arm_for(key: str, **kwargs) -> _ArmAccumulator:
         if key not in accumulators:
             accumulators[key] = _ArmAccumulator(arm_id=key, **kwargs)
         return accumulators[key]
 
     for observation in observations:
-        for seat in observation.seats:
-            key = f"model:{seat.provider_family.value}:{seat.requested_model}"
-            _accumulate_seat(
-                _arm(
-                    key,
-                    kind=ArmKind.INDIVIDUAL_MODEL,
-                    label=f"{seat.provider_family.value}/{seat.requested_model}",
-                    provider_family=seat.provider_family,
-                    model=seat.requested_model,
-                ),
-                seat,
-            )
-
-        signal_call = committee_research_signal(observation.seats)
-        signal = _arm(
-            "committee:research-signal",
-            kind=ArmKind.COMMITTEE_SIGNAL,
-            label="committee research signal",
-        )
-        # The signal arm's cost is the full cost of producing the committee
-        # signal, so the incremental-information question can be asked directly.
-        _record(
-            signal,
-            case_id=observation.case_id,
-            call=signal_call,
-            status=None,
-            schema_valid=signal_call
-            in (DirectionalCall.POSITIVE, DirectionalCall.NEGATIVE),
-            input_tokens=_sum_tokens(observation.seats, "input_tokens"),
-            output_tokens=_sum_tokens(observation.seats, "output_tokens"),
-            cost_microunits=_sum_costs(observation.seats),
-        )
-
-    if deterministic_baseline:
-        baseline = _arm(
-            "baseline:deterministic",
-            kind=ArmKind.DETERMINISTIC_BASELINE,
-            label="deterministic O'Pip baseline",
-        )
-        for call in deterministic_baseline:
-            _record(
-                baseline,
-                case_id=call.case_id,
-                call=(
-                    DirectionalCall.POSITIVE
-                    if call.positive
-                    else DirectionalCall.NEGATIVE
-                ),
-                status=None,
-                schema_valid=True,
-                cost_microunits=None,
-            )
-
-    if resolved:
-        null_arm = _arm(
-            "baseline:null",
-            kind=ArmKind.NULL_BASELINE,
-            label="always-positive null baseline",
-        )
-        for case_id in resolved:
-            _record(
-                null_arm,
-                case_id=case_id,
-                call=DirectionalCall.POSITIVE,
-                status=None,
-                schema_valid=True,
-                cost_microunits=None,
-            )
+        _accumulate_independent_seats(arm_for, observation)
+    _accumulate_baseline_arm(arm_for, deterministic_baseline)
+    _accumulate_null_arm(arm_for, resolved)
 
     arms = tuple(
         _finalize_arm(
@@ -740,7 +776,7 @@ def evaluate_model_bake_off(
     return EvaluationReport(
         experiment_id=experiment_id,
         phase=phase,
-        case_type=next(iter(case_types)),
+        case_type=case_type,
         generated_at=generated_at,
         case_count=len(observations),
         minimum_samples=minimum_samples,

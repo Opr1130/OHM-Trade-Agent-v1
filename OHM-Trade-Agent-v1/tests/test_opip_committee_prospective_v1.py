@@ -44,10 +44,12 @@ from app.opip.committee.prospective import (
     verify_seal,
 )
 from app.opip.committee.serialization import (
+    CommitteeSerializationError,
     outcome_observation_from_dict,
     outcome_observation_to_dict,
     prospective_evaluation_from_dict,
     prospective_evaluation_to_dict,
+    prospective_record_from_dict,
     sealed_prediction_from_dict,
     sealed_prediction_to_dict,
 )
@@ -214,11 +216,9 @@ def test_seal_verification_detects_a_rewritten_t0_opinion():
     assert rewritten_seat.opinion.opinion_hash != prediction.sealed_opinion_hashes[0]
     del rewritten_opinion
 
+    rewritten = _case_outcome(rewritten_seat)
     with pytest.raises(ProspectivePolicyError):
-        verify_seal(
-            prediction,
-            _case_outcome(rewritten_seat),
-        )
+        verify_seal(prediction, rewritten)
 
 
 def test_seal_verification_detects_a_different_evidence_snapshot():
@@ -244,6 +244,7 @@ def test_a_prediction_cannot_be_sealed_before_its_run_completed():
 
 
 def test_a_retrospective_prediction_cannot_be_labelled_prospective():
+    provenance = _provenance()
     with pytest.raises(ProspectivePolicyError):
         SealedPrediction(
             case_id=CASE_ID,
@@ -256,7 +257,7 @@ def test_a_retrospective_prediction_cannot_be_labelled_prospective():
             committee_policy_version="committee-policy-v1",
             sealed_opinion_hashes=("COMMITTEE-OPINION:x",),
             sealed_seat_count=1,
-            provenance=_provenance(),
+            provenance=provenance,
             phase=EvaluationPhase.RETROSPECTIVE,
         )
 
@@ -285,10 +286,9 @@ def test_outcome_window_overlapping_the_cutoff_is_refused():
 
 def test_outcome_for_another_case_is_refused():
     prediction = _prediction()
+    foreign = _observation(case_id="some-other-case")
     with pytest.raises(ProspectivePolicyError):
-        assert_outcome_is_prospective(
-            prediction, _observation(case_id="some-other-case")
-        )
+        assert_outcome_is_prospective(prediction, foreign)
 
 
 def test_outcome_observed_before_sealing_is_refused():
@@ -304,13 +304,14 @@ def test_evaluation_refuses_a_leaked_outcome_end_to_end():
     prediction = _prediction()
     case_outcome = _case_outcome()
     leaked = _observation(observed_at=CUTOFF - timedelta(minutes=30))
+    provenance = _provenance()
     with pytest.raises(HindsightLeakageError):
         evaluate_prospective(
             prediction=prediction,
             case_outcome=case_outcome,
             observation=leaked,
             evaluated_at=EVALUATED_AT,
-            provenance=_provenance(),
+            provenance=provenance,
         )
 
 
@@ -409,27 +410,28 @@ def test_prospective_evaluation_cannot_carry_a_retrospective_phase():
         evaluated_at=EVALUATED_AT,
         provenance=_provenance(),
     )
-    with pytest.raises(Exception):
-        type(evaluation)(
-            **{
-                **{
-                    field: getattr(evaluation, field)
-                    for field in evaluation.__dataclass_fields__
-                },
-                "phase": EvaluationPhase.RETROSPECTIVE,
-                "seat_scores": evaluation.seat_scores,
-            }
-        )
+    retrospective_fields = {
+        field: getattr(evaluation, field)
+        for field in evaluation.__dataclass_fields__
+    }
+    retrospective_fields["phase"] = EvaluationPhase.RETROSPECTIVE
+    with pytest.raises(ProspectivePolicyError):
+        type(evaluation)(**retrospective_fields)
 
 
 def test_evaluation_time_cannot_precede_the_outcome():
+    prediction = _prediction()
+    case_outcome = _case_outcome()
+    observation = _observation()
+    too_early = OBSERVED_AT - timedelta(minutes=1)
+    provenance = _provenance()
     with pytest.raises(ProspectivePolicyError):
         evaluate_prospective(
-            prediction=_prediction(),
-            case_outcome=_case_outcome(),
-            observation=_observation(),
-            evaluated_at=OBSERVED_AT - timedelta(minutes=1),
-            provenance=_provenance(),
+            prediction=prediction,
+            case_outcome=case_outcome,
+            observation=observation,
+            evaluated_at=too_early,
+            provenance=provenance,
         )
 
 
@@ -618,7 +620,9 @@ def test_prospective_records_round_trip_and_are_immutable(tmp_path):
     seals = list(store.iter_sealed_predictions())
     observations = list(store.iter_outcome_observations())
     evaluations = list(store.iter_prospective_evaluations())
-    assert len(seals) == 1 and len(observations) == 1 and len(evaluations) == 1
+    assert len(seals) == 1
+    assert len(observations) == 1
+    assert len(evaluations) == 1
     assert seals[0].prediction_id == prediction.prediction_id
     assert seals[0].sealed_opinion_hashes == prediction.sealed_opinion_hashes
     assert observations[0].source_refs == observation.source_refs
@@ -630,13 +634,13 @@ def test_a_forged_prospective_identity_is_rejected_on_read():
     prediction = _prediction()
     row = sealed_prediction_to_dict(prediction)
     row["prediction_id"] = "COMMITTEE-SEAL:forged"
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         sealed_prediction_from_dict(row)
 
     observation = _observation()
     row = outcome_observation_to_dict(observation)
     row["observation_id"] = "COMMITTEE-OUTCOME-OBS:forged"
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         outcome_observation_from_dict(row)
 
     evaluation = evaluate_prospective(
@@ -648,14 +652,12 @@ def test_a_forged_prospective_identity_is_rejected_on_read():
     )
     row = prospective_evaluation_to_dict(evaluation)
     row["evaluation_id"] = "COMMITTEE-PROSPECTIVE-EVAL:forged"
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         prospective_evaluation_from_dict(row)
 
 
 def test_undeclared_prospective_record_kind_is_rejected():
-    from app.opip.committee.serialization import prospective_record_from_dict
-
-    with pytest.raises(Exception):
+    with pytest.raises(CommitteeSerializationError):
         prospective_record_from_dict({"kind": "SOMETHING_ELSE"})
 
 
@@ -683,13 +685,14 @@ def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
         outcomes=(_seat(),),
         provenance=_provenance(),
     )
+    retrospective_seal = _provenance()
     with pytest.raises(ProspectivePolicyError):
         seal_prediction(
             case_outcome=retrospective,
             evidence_cutoff_at=CUTOFF,
             sealed_at=SEALED_AT,
             experiment_id=EXPERIMENT_ID,
-            provenance=_provenance(),
+            provenance=retrospective_seal,
             case_type=CaseType.MARKET_OPPORTUNITY,
         )
 

@@ -278,15 +278,17 @@ def test_bake_off_can_never_promote_or_rank_for_action():
     assert fields["measurement_only"].default is True
 
     # The contract itself refuses anything that would read as promotion.
+    empty_arms: tuple = ()
+    generated_at = datetime.now(timezone.utc)
     with pytest.raises(ValueError):
         EvaluationReport(
             experiment_id="x",
             phase=EvaluationPhase.RETROSPECTIVE,
             case_type=CaseType.MARKET_OPPORTUNITY,
-            generated_at=datetime.now(timezone.utc),
+            generated_at=generated_at,
             case_count=1,
             minimum_samples=1,
-            arms=(),
+            arms=empty_arms,
             provenance=None,  # type: ignore[arg-type]
         )
 

@@ -266,7 +266,8 @@ def test_calibration_reports_bins_and_error():
     assert report.expected_calibration_error.applicable is True
     assert sum(item.count for item in report.bins) == 5
     high = [item for item in report.bins if Decimal(item.lower) == Decimal("0.9")]
-    assert high and high[0].observed_rate == "1.000000"
+    assert high
+    assert high[0].observed_rate == "1.000000"
 
 
 def test_calibration_without_samples_is_not_applicable_not_zero():
@@ -567,30 +568,35 @@ def test_bake_off_rejects_mixed_case_types():
             seats=(_seat("case-other"),),
         )
     )
+    mixed = tuple(cases)
+    provenance = _provenance()
     with pytest.raises(ValueError):
         evaluate_model_bake_off(
-            tuple(cases),
+            mixed,
             experiment_id="exp-4",
-            provenance=_provenance(),
+            provenance=provenance,
             generated_at=LATER,
         )
 
 
 def test_bake_off_rejects_a_label_for_an_unknown_case():
+    observations = _cases(2)
+    provenance = _provenance()
+    unknown_label = [
+        ResolvedOutcome(
+            case_id="not-a-case",
+            positive=True,
+            observed_at=LATER,
+            source_ref="outcome",
+        )
+    ]
     with pytest.raises(ValueError):
         evaluate_model_bake_off(
-            _cases(2),
+            observations,
             experiment_id="exp-5",
-            provenance=_provenance(),
+            provenance=provenance,
             generated_at=LATER,
-            resolved_outcomes=[
-                ResolvedOutcome(
-                    case_id="not-a-case",
-                    positive=True,
-                    observed_at=LATER,
-                    source_ref="outcome",
-                )
-            ],
+            resolved_outcomes=unknown_label,
         )
 
 
