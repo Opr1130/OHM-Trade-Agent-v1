@@ -371,7 +371,7 @@ _CALL_OUTCOME_STATUS_VALIDATORS = {
 
 
 def _validate_call_outcome_status(outcome: "ProviderCallOutcome") -> None:
-    """Validate the status-specific shape of a call outcome."""
+    """Validate the status-specific form of a call outcome."""
     validator = _CALL_OUTCOME_STATUS_VALIDATORS.get(outcome.status)
     if validator is None:
         raise ValueError(f"undeclared observation status: {outcome.status}")
