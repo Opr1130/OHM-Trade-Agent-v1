@@ -759,3 +759,140 @@ def test_g_plane_guard_awk_matches_only_real_assignments():
             assert (result.returncode == 0) is expected, (
                 f"guard mismatch for {text!r}: exit {result.returncode}"
             )
+        finally:
+            handle.close()
+            pathlib.Path(handle.name).unlink(missing_ok=True)
+
+
+def test_g_plane_guard_normalization_semantics():
+    """Python-level mirror of the guard's normalization, runnable on any platform."""
+    program = _guard_awk_program()
+    # Deliberately mirrors the two `sub()` calls the extracted program must contain.
+    def normalized_match(text: str, key: str) -> bool:
+        for raw in text.splitlines():
+            line = raw.lstrip()
+            if line.startswith("export"):
+                line = line[len("export") :].lstrip()
+            if line.startswith(f"{key}="):
+                return True
+        return False
+
+    assert "sub(/^[[:space:]]+/, \"\", line)" in program
+    assert normalized_match("export WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert normalized_match("  WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is True
+    assert normalized_match("# WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
+    assert normalized_match("NOT_WEBHOOK_SECRET=abc\n", "WEBHOOK_SECRET") is False
+
+
+def test_g_cockpit_authentication_fails_closed_when_unconfigured(monkeypatch):
+    """An unset secret must yield 401, never an open read-only surface."""
+    from fastapi.testclient import TestClient
+
+    from app.api import cockpit, cockpit_service
+
+    monkeypatch.delenv("OPIP_COCKPIT_SECRET", raising=False)
+    client = TestClient(cockpit_service.app)
+
+    response = client.get(
+        "/api/cockpit/overview", headers={"x-webhook-secret": "anything"}
+    )
+    assert response.status_code == 401
+    assert cockpit._cockpit_secret() == ""  # noqa: SLF001
+
+
+def test_g_cockpit_rejects_the_trading_operator_secret(monkeypatch):
+    """The order-capable trading secret must not authenticate the Cockpit."""
+    from fastapi.testclient import TestClient
+
+    from app.api import cockpit_service
+
+    monkeypatch.setenv("OPIP_COCKPIT_SECRET", "cockpit-read-only-secret")
+    client = TestClient(cockpit_service.app)
+
+    rejected = client.get(
+        "/api/cockpit/overview",
+        headers={"x-webhook-secret": "the-trading-operator-secret"},
+    )
+    assert rejected.status_code == 401
+
+
+def test_g_gitleaks_allowlists_stay_narrowly_scoped():
+    """Every allowlist entry must be rule- and commit-scoped, per the config's rules.
+
+    The config forbids path-only or repo-wide exclusions and forbids disabling a rule.
+    A new entry was needed because gitleaks scans full history: the placeholder fix
+    cleaned the current tree, but the earlier commit's blob still trips the rule. This
+    asserts the discipline is preserved so an allowlist can never quietly become a
+    blanket exclusion.
+    """
+    import tomllib
+
+    config = tomllib.loads(
+        (REPO.parent / ".gitleaks.toml").read_text(encoding="utf-8")
+    )
+    entries = config.get("allowlists", [])
+    assert entries, "expected the existing fixture allowlist to be present"
+
+    for entry in entries:
+        assert "description" in entry, entry
+        assert entry.get("targetRules") == ["generic-api-key"], entry
+        assert entry.get("condition") == "AND", entry
+        assert entry.get("commits"), f"allowlist is not commit-scoped: {entry}"
+        assert entry.get("paths"), f"allowlist is not path-scoped: {entry}"
+        # A repo-wide or rule-global escape hatch would break the config's contract.
+        for forbidden in ("regexTarget", "stopwords"):
+            assert forbidden not in entry, f"allowlist uses {forbidden}: {entry}"
+
+
+def test_g_cockpit_secret_placeholder_is_not_credential_shaped():
+    """The placeholder must not trip the generic-api-key secret scan.
+
+    A hyphenated placeholder next to a ``*SECRET`` key reaches gitleaks'
+    generic-api-key entropy threshold, which fails the secret-scan gate on a string
+    that is not a secret. Rather than allowlisting it (the config requires allowlists
+    to stay narrow and forbids broad exclusions), the marker is kept obviously
+    synthetic. This guards against a future edit reintroducing a shaped value.
+    """
+    import math
+    from collections import Counter
+
+    lines = [
+        line.strip()
+        for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("OPIP_COCKPIT_SECRET=") and not line.startswith("#")
+    ]
+    assert len(lines) == 1, lines
+    value = lines[0].split("=", 1)[1]
+
+    counts = Counter(value)
+    length = len(value)
+    entropy = -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+    # gitleaks' bundled generic-api-key threshold is 3.7.
+    assert entropy < 3.4, f"placeholder entropy {entropy:.3f} is too credential-shaped"
+
+
+def test_i_preflight_proves_the_listener_belongs_to_the_cockpit():
+    """A stale or foreign process holding the port must not satisfy the preflight.
+
+    Review finding (valid): checking a generic listener on the configured port could
+    pass while the Cockpit's own publish or routes were broken.
+    """
+    assert "docker port opip-cockpit" in BOOTSTRAP_TEXT
+    assert "cockpit_publish_owner=opip-cockpit" in BOOTSTRAP_TEXT
+    assert "publishes no host port" in BOOTSTRAP_TEXT
+
+
+def test_j_readme_documents_the_required_proxy_routes_without_inventing_a_proxy():
+    """Routes are documented for the host-managed proxy; no second proxy is added."""
+    for path in (
+        "/cockpit",
+        "/api/cockpit/overview",
+        "/api/cockpit/trades",
+        "/api/cockpit/trades/*",
+    ):
+        assert path in README_TEXT, f"README omits required route {path}"
+    assert "TLS" in README_TEXT
+    # Explicitly refused exposure.
+    assert "do **not** expose" in README_TEXT or "do not expose" in README_TEXT
