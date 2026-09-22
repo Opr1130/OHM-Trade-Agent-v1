@@ -558,7 +558,9 @@ def test_cockpit_hardening_survives_the_move_unchanged():
     assert service["volumes"] == [
         "/var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro"
     ]
-    assert list(service["networks"]) == ["opip-analytics"]
+    # Two networks: the internal analytics plane, plus the dedicated non-internal
+    # publish network Docker needs in order to install the host-loopback mapping.
+    assert list(service["networks"]) == ["opip-analytics", "opip-cockpit-publish"]
     assert service["read_only"] is True
     assert service["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=32m"]
     assert service["mem_limit"] == "256m"
@@ -576,9 +578,10 @@ def test_cockpit_hardening_survives_the_move_unchanged():
     assert service["healthcheck"]["retries"] == 5
     assert service["healthcheck"]["start_period"] == "20s"
     assert "/cockpit" in service["healthcheck"]["test"][1]
-    # No credential or write capability is present.
-    assert "WEBHOOK_SECRET" not in COCKPIT_TEXT
-    assert "KRAKEN" not in COCKPIT_TEXT
+    # No trading or exchange credential is *configured*. Comments explain that these are
+    # absent, so this inspects the configuration rather than the prose.
+    assert "WEBHOOK_SECRET" not in _code_only(COCKPIT_TEXT)
+    assert "KRAKEN" not in _code_only(COCKPIT_TEXT)
     assert "TELEGRAM" not in COCKPIT_TEXT
 
 

@@ -82,7 +82,11 @@ services:
       # already expects. Same host root the learning-plane jobs mount.
       - /var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro
     networks:
+      # The internal analytics network the Cockpit shares with the analytics plane, and
+      # a dedicated non-internal network that makes the host publish work. Both are
+      # required; see the network comments at the bottom of this file.
       opip-analytics:
+      opip-cockpit-publish:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m
@@ -120,3 +124,76 @@ networks:
     ipam:
       config:
         - subnet: 172.29.0.0/24
+
+  # Dedicated publish network. Used by opip-cockpit and nothing else.
+  #
+  # Why this exists: Docker Compose correctly declares the host publish on the service,
+  # but a container attached ONLY to `internal: true` bridge networks receives no host
+  # port mapping. On the production engine that surfaced exactly as:
+  #
+  #   docker port opip-cockpit                     => empty
+  #   .NetworkSettings.Ports["8000/tcp"]           => null
+  #   ss -ltnp | grep :8000                        => empty
+  #
+  # while the container itself was healthy. An internal bridge does not supply the
+  # gateway/forwarding path Docker needs to install the requested mapping, so the
+  # Cockpit had no host-loopback endpoint for the TLS reverse proxy to reach.
+  #
+  # Attaching a second, ordinary bridge gives Docker that path while leaving the
+  # analytics network's `internal: true` isolation untouched. This is deliberately NOT
+  # solved by relaxing `internal: true`, by binding 0.0.0.0, by `network_mode: host`, or
+  # by any host-side forwarding shim: those would all widen exposure or hide the defect.
+  #
+  # No subnet is pinned: Docker allocates a non-conflicting one, so adding this network
+  # cannot collide with the analytics subnet or with a host that already uses 172.29.x.
+  opip-cockpit-publish:
+    driver: bridge
+    driver_opts:
+      # Defense in depth only. This makes 127.0.0.1 the default host binding address for
+      # any port published on this network, so a future service that forgets an explicit
+      # loopback bind still cannot reach a public interface. It is NOT the primary
+      # guarantee: the service-level port mapping is explicitly loopback, and
+      # `cockpit_preflight` independently refuses any non-loopback or public listener at
+      # runtime.
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+      # Removes source-NAT for container-originated traffic leaving this bridge. That is a
+      # real reduction, and it is all this option does:
+      #
+      #   * NAT-based Internet egress is removed. Disabling Docker bridge masquerading
+      #     removes Docker's automatic source-NAT for traffic leaving this bridge, so
+      #     packets retain their bridge source address. Ordinary Internet connectivity will
+      #     generally fail unless the surrounding network has a return route, but direct
+      #     routing remains possible where the host or upstream network explicitly routes
+      #     this subnet. Internet egress is therefore not categorically impossible.
+      #   * It is NOT an egress firewall. This network is deliberately NOT `internal`, so
+      #     Docker still installs a gateway and a default route, and packets can still
+      #     leave where host or upstream routing permits. Container-originated access to
+      #     the host's own addresses is not denied either: traffic destined for the host
+      #     is delivered locally rather than forwarded, so it never reaches a NAT or
+      #     filter decision that this option could influence.
+      #
+      # No firewall enforcement is installed, by design. Doing it properly would mean a
+      # DOCKER-USER (or nftables-backend) rule keyed to this bridge's interface, which
+      # this repository has no mechanism for: there is no firewall management anywhere in
+      # the repo today, the analytics host's other Docker networks share that same
+      # filter path, and the bridge interface name is derived from a network ID that
+      # changes whenever the network is recreated. Inventing that here would add
+      # unverifiable host infrastructure with a blast radius across PostgreSQL, Grafana
+      # and the learning plane, so the residual below is documented instead of being
+      # papered over with a claim the configuration cannot support.
+      #
+      # It does NOT affect the publish: inbound host->container traffic is delivered to
+      # the container address and returns over the directly connected bridge, so no NAT is
+      # involved. The Cockpit needs no egress at all, since it only serves reads from the
+      # mounted replica.
+      #
+      # Residual capability, deliberately accepted: this bridge still creates a
+      # gateway/default route, and host/direct-routing reachability is not firewall-denied.
+      # That is inherent to any topology that can be published at all. The container's
+      # other controls bound what a compromise could do with it: `cap_drop: ALL`,
+      # `no-new-privileges`, a read-only rootfs with no persistent writable application
+      # state (only the bounded `/tmp` tmpfs is writable: rw,noexec,nosuid,size=32m), no
+      # Kraken credentials, no Telegram authority, no trading WEBHOOK_SECRET, and only the
+      # dedicated read-only OPIP_COCKPIT_SECRET - which is present and is not a trading
+      # credential.
+      com.docker.network.bridge.enable_ip_masquerade: "false"

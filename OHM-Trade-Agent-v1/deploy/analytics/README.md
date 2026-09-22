@@ -219,6 +219,101 @@ The health wait never replaces the preflight, and neither replaces the verifier:
 missing, unreadable, structurally invalid, SHA-mismatched or stale replica, or an
 unresolvable `current` pointer, fails the stage closed before the Cockpit is started.
 
+### Why the Cockpit needs a second network
+
+The Cockpit is attached to **two** networks, and both are required:
+
+| Network | Internal | Purpose |
+| --- | --- | --- |
+| `opip-analytics` | `true` | the internal analytics plane it shares with the other analytics services |
+| `opip-cockpit-publish` | `false` | the ordinary bridge Docker needs in order to install the host-loopback publish |
+
+A container attached **only** to `internal: true` bridge networks can end up with no host
+port mapping: Docker accepts the declared publish and installs nothing. How strictly an
+engine suppresses it is engine-dependent, but the effect is what production hit — a healthy
+container with no reachable endpoint at all:
+
+```
+docker port opip-cockpit                             -> empty
+docker inspect opip-cockpit --format '{{json .NetworkSettings.Ports}}'
+                                                     -> {"8000/tcp":null}
+ss -ltnp | grep ':8000'                              -> empty
+curl http://127.0.0.1:8000/cockpit                   -> connection refused
+```
+
+`cockpit-ready` failed its preflight with `cockpit container is healthy but NOT published
+on host loopback 127.0.0.1:8000` — the preflight did exactly what it is for.
+
+Because the internal-only behaviour is not guaranteed to fail the same way everywhere, the
+two-network topology below is the **portable, tested** arrangement: it does not depend on
+an engine choosing to suppress the mapping, and the publish network is verified to carry a
+real gateway and a real host mapping by an executed Docker test.
+
+`opip-cockpit-publish` is used by the Cockpit and nothing else. It is deliberately **not**
+declared in the shared analytics Compose file, so no PostgreSQL or Grafana service can
+join it. No subnet is pinned, so Docker allocates a non-conflicting one.
+
+Exposure is still loopback-only, and is enforced in three independent places:
+
+1. the service port mapping is explicitly `${OPIP_COCKPIT_BIND_ADDRESS:-127.0.0.1}`;
+2. the publish network sets `com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"`
+   as defense in depth, so a future service that forgets an explicit bind still cannot
+   reach a public interface — this is not the primary guarantee;
+3. `cockpit_preflight` independently refuses any non-loopback bind and any public
+   listener at runtime.
+
+**Egress: NAT-based Internet egress is removed; the residual is documented, not papered
+over.** An ordinary bridge masquerades container traffic, so attaching one would hand the
+Cockpit outbound Internet access it never had — a real capability increase even though its
+inbound mapping stays loopback-only. `com.docker.network.bridge.enable_ip_masquerade:
+"false"` removes that, and only that. It does not affect publishing: inbound
+host→container traffic is delivered to the container address and returns over the directly
+connected bridge, so no NAT is involved, and the Cockpit needs no egress at all since it
+only serves reads from the mounted replica.
+
+Precisely what that option does and does not do:
+
+| | Effect |
+| --- | --- |
+| NAT-based Internet egress | **Removed.** Docker's automatic source-NAT for traffic leaving this bridge is gone, so packets retain their bridge source address. Ordinary Internet connectivity will generally fail without a return route, but direct routing remains possible where the host or upstream network explicitly routes this subnet. |
+| Gateway / default route | **Still present.** This network is deliberately not `internal`, so Docker installs a gateway and a default route. |
+| Host / direct-routing reachability | **Not firewall-denied.** Traffic destined for the host's own addresses is delivered locally rather than forwarded, so it never reaches a NAT or filter decision this option could influence. |
+| Hard egress denial | **Not implemented.** See below. |
+
+Internet egress is therefore **not categorically impossible**: an upstream or host network
+that explicitly routes this bridge's subnet can still return traffic. What is removed is
+Docker's automatic NAT, not the possibility of a return path.
+
+**No firewall enforcement is installed, by design.** Hard egress denial would mean a
+`DOCKER-USER` (or nftables-backend) rule keyed to this bridge's interface. The repository
+has no firewall management anywhere in it today, the analytics host's other Docker
+networks share that same filter path, and the bridge interface name is derived from a
+network ID that changes whenever the network is recreated — so the rule would need
+re-derivation and reconciliation on every run, and a mistake would affect PostgreSQL,
+Grafana and the learning plane. Adding that is host infrastructure this change is not
+authorised to introduce, and it could not be verified in the development environment at
+all (no Linux, no Docker, no packet filter). Rather than ship an unverifiable rule set
+that would have to be trusted, the capability is stated plainly.
+
+The residual is inherent to any topology that can be published: a non-internal bridge
+always creates a gateway/default route. That residual capability is deliberately accepted
+and is documented here rather than described as if it had been eliminated. What bounds a
+compromise is the rest of the container's posture:
+
+- `cap_drop: ALL`, `no-new-privileges`, a read-only rootfs with no persistent writable
+  application state — only the bounded `/tmp` tmpfs is writable
+  (`rw,noexec,nosuid,size=32m`)
+- **no Kraken credentials**
+- **no Telegram authority**
+- **no trading `WEBHOOK_SECRET`**
+- only the dedicated read-only `OPIP_COCKPIT_SECRET` is present — it is not a trading
+  credential and grants no order, mode or exchange capability
+
+This was deliberately **not** solved by relaxing `internal: true`, binding `0.0.0.0`,
+using `network_mode: host`, adding a host-side forwarding shim, or connecting the
+container to a network by hand: each of those would either widen exposure or hide the
+defect instead of fixing the topology.
+
 ## Canonical freshness contract
 
 `ops.dashboard_freshness_v` is the single freshness result consumed by

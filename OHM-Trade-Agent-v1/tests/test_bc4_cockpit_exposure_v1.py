@@ -478,8 +478,10 @@ def test_j_no_new_dependency_or_service_platform_is_introduced():
     service = _service()
     # The same image the other analytics services run.
     assert service["image"] == "opip-data-platform:${OPIP_DEPLOYED_SHA:-local}"
-    # The same network the other analytics services use.
-    assert list(service["networks"]) == ["opip-analytics"]
+    # The analytics plane network, plus the dedicated non-internal publish network that
+    # gives Docker a path to install the host-loopback port mapping. The publish network
+    # is used by this service only; no new service or platform is introduced.
+    assert list(service["networks"]) == ["opip-analytics", "opip-cockpit-publish"]
     # The same cockpit-only entry point already reviewed.
     assert "app.api.cockpit_service:app" in service["command"]
     assert "app.main:app" not in " ".join(service["command"])
