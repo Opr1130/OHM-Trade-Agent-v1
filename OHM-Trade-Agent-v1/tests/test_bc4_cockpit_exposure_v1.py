@@ -221,19 +221,16 @@ def test_f_replica_is_mounted_read_only_at_the_expected_path():
         "/var/lib/opip-learning/canonical-replica:/app/canonical-replica:ro"
     )
 
-    # The service must NOT pin OPIP_CANONICAL_REPLICA_ROOT to the mounted parent.
-    #
-    # `current` + `generations/<id>` is how an installed replica is addressed: the
-    # parent directory is a repository of generations, so it holds no manifest and no
-    # canonical database. Pinning it here would point the Cockpit at a directory that is
-    # not a bundle. Bootstrap instead writes the resolved generation into
-    # /etc/opip-cockpit.env, which this service loads via env_file.
+    # The service definition itself must not hard-code a replica root. Bootstrap
+    # derives the stable mounted repository root and the exact deployed Cockpit SHA
+    # into the filtered env file; the app follows `current` only when the selected
+    # generation manifest is release-bound to that SHA.
     assert "OPIP_CANONICAL_REPLICA_ROOT" not in _service()["environment"]
     assert "OPIP_CANONICAL_REPLICA_ROOT=%s" in BOOTSTRAP_TEXT
-    # The generation is optional, so the secret surface can be materialized before the
-    # generation is resolvable, and an unverified root is never recorded.
+    assert "OPIP_COCKPIT_RELEASE_SHA=%s" in BOOTSTRAP_TEXT
     assert 'local replica_root="${1:-}"' not in BOOTSTRAP_TEXT
     assert '"$COCKPIT_REPLICA_CONTAINER_ROOT" >> "$temporary"' in BOOTSTRAP_TEXT
+    assert '"$TARGET_SHA" >> "$temporary"' in BOOTSTRAP_TEXT
     # The resolution itself is delegated to the existing resolver, never reimplemented.
     assert "python -m app.opip.learning.canonical_replica resolve" in BOOTSTRAP_TEXT
 
