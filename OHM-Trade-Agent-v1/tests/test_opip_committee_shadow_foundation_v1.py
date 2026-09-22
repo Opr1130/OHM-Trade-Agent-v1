@@ -81,6 +81,9 @@ from app.opip.decision_intelligence.identity import Provenance
 #: than depending on ambient process settings.
 SHADOW_SETTINGS = CommitteeShadowSettings()
 
+#: Horizon used by the archive-integrity prediction helper.
+SHADOW_ARCHIVE_HORIZON = 4 * 3600
+
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 CUTOFF = NOW - timedelta(minutes=5)
 POLICY_VERSION = "committee-policy-v1"
@@ -1210,6 +1213,7 @@ def _prediction_with_snapshot():
         case_outcome=_prospective_case_outcome(snapshot),
         evidence_snapshot=snapshot,
         sealed_at=NOW + timedelta(seconds=30),
+        horizon_seconds=SHADOW_ARCHIVE_HORIZON,
         experiment_id="archive-exp-1",
         provenance=_provenance(),
         case_type=CaseType.MARKET_OPPORTUNITY,
@@ -1541,3 +1545,84 @@ def test_a_stale_case_sidecar_is_reconciled_before_append(tmp_path):
     assert result.stored is False
     assert result.reason == REASON_DUPLICATE
     assert len(list(store.iter_case_outcomes())) == 1
+
+
+def test_two_seats_cannot_each_invoke_under_one_shared_ceiling():
+    """Reservations carry across seats, so one ceiling bounds the whole case."""
+    first = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),),
+    )
+    first._estimated_cost_microunits = 60  # noqa: SLF001 - test double
+    second = _provider(
+        ProviderFamily.ANTHROPIC,
+        answers=(ScriptedAnswer(text=opinion_json()),),
+        model="model-b",
+    )
+    second._estimated_cost_microunits = 60  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: first, ProviderFamily.ANTHROPIC: second},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI, ProviderFamily.ANTHROPIC),
+                cost_ceiling=100,
+            )
+        )
+    )
+    statuses = [seat.outcome.status for seat in result.seats]
+    assert statuses[0] is ObservationStatus.FAILED
+    # The first seat reserved its full 60 even though it reported no cost, so the
+    # second seat cannot also spend 60 under a 100 ceiling.
+    assert statuses[1] is ObservationStatus.SKIPPED_BUDGET
+    assert second.calls == []
+
+
+def test_a_budget_blocked_retry_does_not_double_record_the_prior_failure():
+    """One provider call must not increment attempts twice."""
+    provider = _provider(
+        ProviderFamily.OPENAI,
+        answers=(ScriptedAnswer(failure_class=ProviderFailureClass.TIMEOUT),),
+    )
+    provider._estimated_cost_microunits = 60  # noqa: SLF001 - test double
+    ledger = InMemoryObservationLedger()
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=ledger,
+        now=lambda: NOW,
+        settings=SHADOW_SETTINGS,
+    )
+    result = runner.run_case(
+        _case(
+            policy=_policy(
+                families=(ProviderFamily.OPENAI,),
+                max_attempts=3,
+                cost_ceiling=100,
+            )
+        )
+    )
+    assert len(provider.calls) == 1
+    assert ledger.attempt_count(result.seats[0].logical_observation_id) == 1
+
+
+def test_the_configured_operator_ceiling_applies_without_a_policy_ceiling():
+    """the configured spending guard must not require per-policy duplication."""
+    provider = _ok(ProviderFamily.OPENAI)
+    provider._estimated_cost_microunits = 5_000  # noqa: SLF001 - test double
+    runner = CommitteeRunner(
+        providers={ProviderFamily.OPENAI: provider},
+        ledger=InMemoryObservationLedger(),
+        now=lambda: NOW,
+        settings=CommitteeShadowSettings(
+            opip_committee_max_estimated_cost_microunits=1_000
+        ),
+    )
+    result = runner.run_case(
+        _case(policy=_policy(families=(ProviderFamily.OPENAI,)))
+    )
+    assert result.seats[0].outcome.status is ObservationStatus.SKIPPED_BUDGET
+    assert provider.calls == []

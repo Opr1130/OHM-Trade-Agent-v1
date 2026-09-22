@@ -52,7 +52,10 @@ from app.opip.committee.providers import (
     RETRYABLE_FAILURE_CLASSES,
     resolve_seated_providers,
 )
-from app.opip.committee.settings import committee_shadow_enabled
+from app.opip.committee.settings import (
+    committee_shadow_enabled,
+    resolve_committee_cost_ceiling,
+)
 from app.opip.decision_intelligence.serialization import stable_hash
 
 #: The provider-agnostic instruction. One prompt for every seat is what makes
@@ -217,7 +220,7 @@ class CommitteeRunner:
         seats: list[CommitteeSeatResult] = []
         spent_microunits = 0
         for family in case.policy.seated_providers:
-            seat = self._run_seat(
+            seat, reserved = self._run_seat(
                 case=case,
                 family=family,
                 provider=providers[family],
@@ -228,8 +231,11 @@ class CommitteeRunner:
                 replay_existing=replay_existing,
             )
             seats.append(seat)
-            if seat.outcome.estimated_cost_microunits is not None:
-                spent_microunits += seat.outcome.estimated_cost_microunits
+            # Carry forward the reservations this seat actually consumed, not
+            # just its final reported cost. A timed-out or retried seat can have
+            # reserved more than it finally reported (or reported nothing), and
+            # dropping that would let the next seat spend past the case ceiling.
+            spent_microunits += reserved
         completed_at = self._now()
         if completed_at < started_at:
             completed_at = started_at
@@ -274,7 +280,8 @@ class CommitteeRunner:
         prompt_hash: str,
         spent_microunits: int,
         replay_existing: bool,
-    ) -> CommitteeSeatResult:
+    ) -> tuple[CommitteeSeatResult, int]:
+        """Run one seat, returning its result and the cost it reserved."""
         requested_model = provider.model_identifier()
         logical_id = logical_observation_id(
             case_id=case.case_id,
@@ -305,17 +312,22 @@ class CommitteeRunner:
 
         committed = self._ledger.committed_opinion(logical_id)
         if committed is not None and not replay_existing:
-            return CommitteeSeatResult(
-                family,
-                logical_id,
-                self._duplicate_acknowledgement(
-                    case=case,
-                    family=family,
-                    requested_model=requested_model,
-                    logical_id=logical_id,
-                    input_hash=input_hash,
-                    committed=committed,
+            return (
+                CommitteeSeatResult(
+                    family,
+                    logical_id,
+                    self._duplicate_acknowledgement(
+                        case=case,
+                        family=family,
+                        requested_model=requested_model,
+                        logical_id=logical_id,
+                        input_hash=input_hash,
+                        committed=committed,
+                    ),
                 ),
+                # A duplicate acknowledgement performs no new invocation and
+                # therefore reserves nothing.
+                0,
             )
 
         attempt = self._ledger.attempt_count(logical_id) + 1
@@ -325,20 +337,23 @@ class CommitteeRunner:
             # contract would reject. Return a governed disposition instead of
             # turning a typed, nonfatal state into an exception after another
             # external call.
-            return CommitteeSeatResult(
-                family,
-                logical_id,
-                self._exhausted_attempt_outcome(
-                    case=case,
-                    family=family,
-                    requested_model=requested_model,
-                    logical_id=logical_id,
-                    input_hash=input_hash,
-                    provider=provider,
+            return (
+                CommitteeSeatResult(
+                    family,
+                    logical_id,
+                    self._exhausted_attempt_outcome(
+                        case=case,
+                        family=family,
+                        requested_model=requested_model,
+                        logical_id=logical_id,
+                        input_hash=input_hash,
+                        provider=provider,
+                    ),
                 ),
+                0,
             )
 
-        outcome = self._invoke_within_budget(
+        outcome, reserved, already_recorded = self._invoke_within_budget(
             case=case,
             family=family,
             provider=provider,
@@ -348,25 +363,28 @@ class CommitteeRunner:
             spent_microunits=spent_microunits,
         )
         if outcome is None:
-            return CommitteeSeatResult(
-                family,
-                logical_id,
-                self._budget_skipped_outcome(
-                    case=case,
-                    family=family,
-                    requested_model=requested_model,
-                    logical_id=logical_id,
-                    input_hash=input_hash,
-                    provider=provider,
-                    attempt=attempt,
-                    reason=self._attempt_budget_reason(
+            return (
+                CommitteeSeatResult(
+                    family,
+                    logical_id,
+                    self._budget_skipped_outcome(
                         case=case,
-                        estimate=provider.estimate_cost_microunits(wire),
-                        committed_spend=spent_microunits,
-                        seat_reserved=0,
-                    )
-                    or "committee cost ceiling would be exceeded",
+                        family=family,
+                        requested_model=requested_model,
+                        logical_id=logical_id,
+                        input_hash=input_hash,
+                        provider=provider,
+                        attempt=attempt,
+                        reason=self._attempt_budget_reason(
+                            case=case,
+                            estimate=provider.estimate_cost_microunits(wire),
+                            committed_spend=spent_microunits,
+                            seat_reserved=0,
+                        )
+                        or "committee cost ceiling would be exceeded",
+                    ),
                 ),
+                0,
             )
 
         if replay_existing and committed is not None and outcome.opinion is not None:
@@ -376,8 +394,12 @@ class CommitteeRunner:
                     f"{family.value}; history is preserved and the replay is refused"
                 )
 
-        self._ledger.record(outcome)
-        return CommitteeSeatResult(family, logical_id, outcome)
+        if not already_recorded:
+            # A retry that was blocked by the budget already persisted its prior
+            # failure; recording it again would double-count the attempt and
+            # append duplicate raw evidence.
+            self._ledger.record(outcome)
+        return CommitteeSeatResult(family, logical_id, outcome), reserved
 
     def _duplicate_acknowledgement(
         self,
@@ -433,12 +455,15 @@ class CommitteeRunner:
         input_hash: str,
         attempt: int,
         spent_microunits: int,
-    ) -> ProviderCallOutcome | None:
+    ) -> tuple[ProviderCallOutcome | None, int, bool]:
         """Invoke the seat with bounded, budget-reserved retries.
 
         The estimate is reserved per provider invocation, not once per seat, so a
         permitted retry cannot push cumulative spend past the declared case
-        ceiling. Returns ``None`` when no invocation was affordable at all.
+        ceiling. Returns ``(outcome, reserved_microunits, already_recorded)``;
+        ``outcome`` is ``None`` when no invocation was affordable at all, and
+        ``already_recorded`` is true when the returned failure was persisted
+        during the loop.
         """
         estimate = provider.estimate_cost_microunits(wire)
         seat_reserved = 0
@@ -451,8 +476,9 @@ class CommitteeRunner:
                 seat_reserved=seat_reserved,
             )
             if skip_reason is not None:
-                # A previous attempt already happened and is retained.
-                return outcome
+                # A previous attempt already happened, was persisted below, and
+                # is retained as the seat's disposition.
+                return outcome, seat_reserved, outcome is not None
             outcome = self._attempt_seat(
                 case=case,
                 family=family,
@@ -469,7 +495,7 @@ class CommitteeRunner:
                 and attempt < case.policy.max_attempts_per_seat
                 and attempt < MAX_RECORDED_ATTEMPTS
             ):
-                return outcome
+                return outcome, seat_reserved, False
             # Persist the failed attempt before retrying, so the audit trail
             # keeps every try rather than only the last one. A failed attempt is
             # not a committed observation, so this cannot create a second
@@ -635,6 +661,20 @@ class CommitteeRunner:
             )
         return None
 
+    def _effective_cost_ceiling(self, case: CommitteeCase) -> int | None:
+        """The ceiling in force for this case.
+
+        A policy ceiling wins; otherwise the operator-level configured ceiling
+        applies. Reading only the policy would silently ignore
+        ``OPIP_COMMITTEE_MAX_ESTIMATED_COST_MICROUNITS``, so an operator's
+        spending guard would have no effect unless every caller copied it into
+        every policy by hand.
+        """
+        policy_ceiling = case.policy.max_estimated_cost_microunits
+        if policy_ceiling is not None:
+            return policy_ceiling
+        return resolve_committee_cost_ceiling(self._settings)
+
     def _attempt_budget_reason(
         self,
         *,
@@ -651,7 +691,7 @@ class CommitteeRunner:
         unbounded cost also skips, because it cannot be shown to fit; an operator
         who wants the seat to run without a ceiling simply does not declare one.
         """
-        ceiling = case.policy.max_estimated_cost_microunits
+        ceiling = self._effective_cost_ceiling(case)
         if ceiling is None:
             return None
         if estimate is None:

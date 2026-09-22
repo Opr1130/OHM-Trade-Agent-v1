@@ -192,6 +192,7 @@ def _prediction(case_outcome=None, **overrides) -> SealedPrediction:
         "case_outcome": case_outcome,
         "evidence_snapshot": _snapshot(),
         "sealed_at": SEALED_AT,
+        "horizon_seconds": HORIZON,
         "experiment_id": EXPERIMENT_ID,
         "provenance": _provenance(),
         "case_type": CaseType.MARKET_OPPORTUNITY,
@@ -278,6 +279,7 @@ def test_a_retrospective_prediction_cannot_be_labelled_prospective():
             experiment_id=EXPERIMENT_ID,
             evidence_cutoff_at=CUTOFF,
             sealed_at=SEALED_AT,
+            horizon_seconds=HORIZON,
             case_outcome_id="COMMITTEE-OUTCOME:x",
             evidence_snapshot_hash="COMMITTEE-EVIDENCE:abc",
             committee_policy_version="committee-policy-v1",
@@ -712,11 +714,9 @@ def test_undeclared_prospective_record_kind_is_rejected():
 
 def test_outcome_eligibility_is_derived_from_the_cutoff_and_horizon():
     prediction = _prediction()
-    assert prediction.outcome_eligible_at(HORIZON) == CUTOFF + timedelta(
-        seconds=HORIZON
-    )
-    with pytest.raises(ProspectivePolicyError):
-        prediction.outcome_eligible_at(0)
+    # The horizon is the one committed at sealing, not a caller-supplied value.
+    assert prediction.horizon_seconds == HORIZON
+    assert prediction.outcome_eligible_at() == CUTOFF + timedelta(seconds=HORIZON)
 
 
 # ------------------------------------------- review findings (fail-closed)
@@ -741,6 +741,7 @@ def test_a_retrospective_run_cannot_be_sealed_as_a_prospective_prediction():
             case_outcome=retrospective,
             evidence_snapshot=snapshot,
             sealed_at=SEALED_AT,
+            horizon_seconds=HORIZON,
             experiment_id=EXPERIMENT_ID,
             provenance=retrospective_seal,
             case_type=CaseType.MARKET_OPPORTUNITY,
@@ -776,6 +777,7 @@ def test_sealing_derives_the_cutoff_from_the_authenticated_snapshot():
             case_outcome=case_outcome,
             evidence_snapshot=earlier,
             sealed_at=SEALED_AT,
+            horizon_seconds=HORIZON,
             experiment_id=EXPERIMENT_ID,
             provenance=provenance,
             case_type=CaseType.MARKET_OPPORTUNITY,
@@ -809,6 +811,7 @@ def test_sealing_rejects_a_snapshot_for_another_case():
             case_outcome=case_outcome,
             evidence_snapshot=other,
             sealed_at=SEALED_AT,
+            horizon_seconds=HORIZON,
             experiment_id=EXPERIMENT_ID,
             provenance=provenance,
             case_type=CaseType.MARKET_OPPORTUNITY,
@@ -880,3 +883,43 @@ def test_a_lost_prospective_index_is_rebuilt_with_evaluation_ids(tmp_path):
     assert result.reason == REASON_DUPLICATE
     assert result.record_id == evaluation.evaluation_id
     assert len(list(store.iter_prospective_evaluations())) == 1
+
+# ============ review findings: horizon binding and reservation integrity
+
+
+def test_the_outcome_horizon_must_be_the_one_committed_at_sealing():
+    """A later horizon cannot be selected once results are known."""
+    prediction = _prediction()
+    wrong_horizon = _observation(horizon_seconds=12 * 3600, observed_at=SEALED_AT + timedelta(hours=13))
+    with pytest.raises(ProspectivePolicyError):
+        assert_outcome_is_prospective(prediction, wrong_horizon)
+
+
+def test_the_evaluation_records_the_sealed_horizon_not_the_observation_horizon():
+    prediction = _prediction()
+    evaluation = evaluate_prospective(
+        prediction=prediction,
+        case_outcome=_case_outcome(),
+        observation=_observation(),
+        evaluated_at=EVALUATED_AT,
+        provenance=_provenance(),
+    )
+    assert evaluation.horizon_seconds == prediction.horizon_seconds == HORIZON
+
+
+def test_the_sealed_horizon_participates_in_the_prediction_identity():
+    from dataclasses import replace
+
+    prediction = _prediction()
+    other = replace(prediction, horizon_seconds=HORIZON * 2)
+    assert other.prediction_id != prediction.prediction_id
+    assert prediction.identity_payload()["horizon_seconds"] == HORIZON
+
+
+def test_the_sealed_horizon_survives_a_storage_round_trip(tmp_path):
+    store = CommitteeEvidenceStore(root=tmp_path)
+    prediction = _prediction()
+    assert store.append_sealed_prediction(prediction).reason == REASON_STORED
+    reloaded = list(store.iter_sealed_predictions())[0]
+    assert reloaded.horizon_seconds == HORIZON
+    assert reloaded.prediction_id == prediction.prediction_id

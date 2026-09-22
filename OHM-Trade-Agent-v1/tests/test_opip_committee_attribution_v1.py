@@ -885,3 +885,28 @@ def test_attribution_round_trip_preserves_the_declared_threshold(tmp_path):
     assert reloaded.minimum_samples == MIN_ATTRIBUTION_SAMPLES * 3
     assert reloaded.providers[0].minimum_samples == MIN_ATTRIBUTION_SAMPLES * 3
     assert reloaded.added_information is None
+
+
+def test_the_provider_sample_threshold_participates_in_the_identity():
+    """Changing a provider threshold must not preserve attribution_id."""
+    from dataclasses import replace
+
+    # Three scored cases is below the default 30, so the arm is inadequate.
+    report = _report(_uniform_cases(3, committee_right=True, baseline_right=False))
+    provider = report.providers[0]
+    assert provider.minimum_samples == MIN_ATTRIBUTION_SAMPLES
+    assert provider.adequacy_note.startswith("INSUFFICIENT_SAMPLE")
+    assert report.identity_payload()["providers"][0]["minimum_samples"] == (
+        MIN_ATTRIBUTION_SAMPLES
+    )
+
+    # Relaxing the threshold flips adequacy, so the identity must change too.
+    relaxed = replace(
+        report,
+        providers=(
+            replace(provider, minimum_samples=1),
+            *report.providers[1:],
+        ),
+    )
+    assert relaxed.providers[0].adequacy_note == "adequate"
+    assert relaxed.attribution_id != report.attribution_id

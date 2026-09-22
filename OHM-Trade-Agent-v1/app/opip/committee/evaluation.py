@@ -482,8 +482,10 @@ class _ArmAccumulator:
     skipped_budget: int = 0
     input_tokens: int = 0
     input_tokens_seen: bool = False
+    input_tokens_incomplete: bool = False
     output_tokens: int = 0
     output_tokens_seen: bool = False
+    output_tokens_incomplete: bool = False
     latencies: list[int] = field(default_factory=list)
     costs: list[int | None] = field(default_factory=list)
 
@@ -515,9 +517,13 @@ def _record(
     if input_tokens is not None:
         accumulator.input_tokens += input_tokens
         accumulator.input_tokens_seen = True
+    else:
+        accumulator.input_tokens_incomplete = True
     if output_tokens is not None:
         accumulator.output_tokens += output_tokens
         accumulator.output_tokens_seen = True
+    else:
+        accumulator.output_tokens_incomplete = True
     if latency_micros is not None:
         accumulator.latencies.append(latency_micros)
     accumulator.costs.append(cost_microunits)
@@ -577,6 +583,7 @@ def _finalize_arm(
     resolved: Mapping[str, ResolvedOutcome],
     probabilities: Mapping[tuple[str, str], Decimal],
     replays: Sequence[ReplayComparison],
+    observed_cases: frozenset[str],
     case_count: int,
     minimum_samples: int,
 ) -> ArmEvaluation:
@@ -592,6 +599,7 @@ def _finalize_arm(
         for replay in replays
         if replay.provider_family is accumulator.provider_family
         and replay.model == accumulator.model
+        and replay.case_id in observed_cases
     ]
     consistency = repeatability_metric(
         agreed=sum(1 for replay in relevant_replays if replay.reproduced),
@@ -619,10 +627,16 @@ def _finalize_arm(
         unavailable=accumulator.unavailable,
         skipped_budget=accumulator.skipped_budget,
         input_tokens=(
-            accumulator.input_tokens if accumulator.input_tokens_seen else None
+            accumulator.input_tokens
+            if accumulator.input_tokens_seen
+            and not accumulator.input_tokens_incomplete
+            else None
         ),
         output_tokens=(
-            accumulator.output_tokens if accumulator.output_tokens_seen else None
+            accumulator.output_tokens
+            if accumulator.output_tokens_seen
+            and not accumulator.output_tokens_incomplete
+            else None
         ),
         adequacy=(
             ADEQUACY_ADEQUATE if adequate else ADEQUACY_INSUFFICIENT_SAMPLE
@@ -671,6 +685,7 @@ def _validate_bake_off_inputs(
     resolved_outcomes: Sequence[ResolvedOutcome],
     deterministic_baseline: Sequence[BaselineCall],
     probability_forecasts: Sequence[ProbabilityForecast],
+    replays: Sequence[ReplayComparison] = (),
 ) -> CaseType:
     """Validate the shared case set and return its single case type."""
     if not observations:
@@ -705,6 +720,8 @@ def _validate_bake_off_inputs(
         if case_id not in known_cases:
             raise ValueError(f"{label} for unknown case: {case_id}")
     _require_forecast_support(case_type, probability_forecasts)
+    _require_forecast_arms_exist(observations, probability_forecasts)
+    _require_unique_replays(replays, known_cases=known_cases)
     return case_type
 
 
@@ -731,6 +748,62 @@ def _require_unique_case_ids(
             f"{sorted(set(duplicates))}"
         )
     return seen
+
+
+def _require_forecast_arms_exist(
+    observations: Sequence[CaseObservation],
+    probability_forecasts: Sequence[ProbabilityForecast],
+) -> None:
+    """A forecast must name an arm the report will actually build.
+
+    A mistyped or nonexistent arm would be silently skipped for every arm,
+    handing the caller a valid report with no indication that the supplied
+    forecast was discarded - leaving that learning evidence without a traceable
+    disposition.
+    """
+    if not probability_forecasts:
+        return
+    known_arms = {
+        f"model:{seat.provider_family.value}:{seat.requested_model}"
+        for observation in observations
+        for seat in observation.seats
+    }
+    # The committee signal arm is also constructed, though it has no
+    # probabilistic definition of its own and so carries no sample.
+    unknown = sorted(
+        {
+            forecast.arm_id
+            for forecast in probability_forecasts
+            if forecast.arm_id not in known_arms
+        }
+    )
+    if unknown:
+        raise ValueError(
+            "forecasts reference arms that this report does not build: "
+            f"{unknown}"
+        )
+
+
+def _require_unique_replays(
+    replays: Sequence[ReplayComparison],
+    *,
+    known_cases: set[str],
+) -> None:
+    """Replays must be unique and belong to the report's observed cases.
+
+    A foreign case id or a repeated comparison would inflate the repeatability
+    denominator, letting duplicated or cross-experiment evidence present
+    consistency as an apparently well-sampled 1.0.
+    """
+    foreign = sorted({r.case_id for r in replays if r.case_id not in known_cases})
+    if foreign:
+        raise ValueError(
+            f"replays reference cases outside this report: {foreign}"
+        )
+    keys = [(r.provider_family, r.model, r.case_id) for r in replays]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate replay comparisons: {duplicates}")
 
 
 def _require_unique_related_records(
@@ -890,6 +963,7 @@ def evaluate_model_bake_off(
         resolved_outcomes=resolved_outcomes,
         deterministic_baseline=deterministic_baseline,
         probability_forecasts=probability_forecasts,
+        replays=replays,
     )
     resolved = {outcome.case_id: outcome for outcome in resolved_outcomes}
     probabilities = {
@@ -915,6 +989,9 @@ def evaluate_model_bake_off(
             resolved=resolved,
             probabilities=probabilities,
             replays=replays,
+            observed_cases=frozenset(
+                observation.case_id for observation in observations
+            ),
             case_count=len(observations),
             minimum_samples=minimum_samples,
         )

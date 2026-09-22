@@ -1034,3 +1034,117 @@ def test_report_identity_covers_failures_skips_cost_and_latency():
         (failed_case,), experiment_id="ident-1", provenance=_provenance(), generated_at=LATER
     )
     assert third.report_id != first.report_id
+
+
+def test_an_individual_arm_propagates_unknown_token_usage():
+    """An arm with one unknown call must not report a partial total."""
+    case_known = CaseObservation(
+        case_id="case-000",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(_seat("case-000", input_tokens=10, output_tokens=4),),
+    )
+    case_unknown = CaseObservation(
+        case_id="case-001",
+        case_type=CaseType.MARKET_OPPORTUNITY,
+        seats=(_seat("case-001", input_tokens=None, output_tokens=None),),
+    )
+    report = evaluate_model_bake_off(
+        (case_known, case_unknown),
+        experiment_id="tok-arm-1",
+        provenance=_provenance(),
+        generated_at=LATER,
+    )
+    arm = report.arm("model:openai:model-a")
+    assert arm.input_tokens is None
+    assert arm.output_tokens is None
+
+
+def test_an_individual_arm_reports_totals_when_every_call_is_known():
+    cases = (
+        CaseObservation(
+            case_id="case-000",
+            case_type=CaseType.MARKET_OPPORTUNITY,
+            seats=(_seat("case-000", input_tokens=10, output_tokens=4),),
+        ),
+        CaseObservation(
+            case_id="case-001",
+            case_type=CaseType.MARKET_OPPORTUNITY,
+            seats=(_seat("case-001", input_tokens=32, output_tokens=8),),
+        ),
+    )
+    report = evaluate_model_bake_off(
+        cases, experiment_id="tok-arm-2", provenance=_provenance(), generated_at=LATER
+    )
+    arm = report.arm("model:openai:model-a")
+    assert arm.input_tokens == 42
+    assert arm.output_tokens == 12
+
+
+def test_a_forecast_for_a_nonexistent_arm_is_rejected():
+    """A mistyped arm id must not be silently discarded."""
+    cases = _cases(2)
+    provenance = _provenance()
+    bogus = [
+        ProbabilityForecast(
+            case_id="case-000",
+            arm_id="model:openai:model-typo",
+            probability=Decimal("0.6"),
+        )
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="arm-1",
+            provenance=provenance,
+            generated_at=LATER,
+            probability_forecasts=bogus,
+        )
+
+
+def test_replays_outside_the_report_case_set_are_rejected():
+    cases = _cases(2)
+    provenance = _provenance()
+    foreign = [
+        ReplayComparison(
+            provider_family=ProviderFamily.OPENAI,
+            model="model-a",
+            case_id="not-a-case",
+            reproduced=True,
+        )
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="replay-1",
+            provenance=provenance,
+            generated_at=LATER,
+            replays=foreign,
+        )
+
+
+def test_duplicate_replay_comparisons_are_rejected():
+    """A repeated comparison must not inflate the repeatability denominator."""
+    cases = _cases(2)
+    provenance = _provenance()
+    repeated = [
+        ReplayComparison(
+            provider_family=ProviderFamily.OPENAI,
+            model="model-a",
+            case_id="case-000",
+            reproduced=True,
+        ),
+        ReplayComparison(
+            provider_family=ProviderFamily.OPENAI,
+            model="model-a",
+            case_id="case-000",
+            reproduced=True,
+        ),
+    ]
+    with pytest.raises(ValueError):
+        evaluate_model_bake_off(
+            cases,
+            experiment_id="replay-2",
+            provenance=provenance,
+            generated_at=LATER,
+            replays=repeated,
+        )

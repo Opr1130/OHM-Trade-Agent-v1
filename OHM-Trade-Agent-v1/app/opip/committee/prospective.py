@@ -109,6 +109,8 @@ def _validate_sealed_prediction(prediction: "SealedPrediction") -> None:
         raise ProspectivePolicyError(
             "sealed_seat_count must match the sealed opinion hashes"
         )
+    if type(prediction.horizon_seconds) is not int or prediction.horizon_seconds < 1:
+        raise ProspectivePolicyError(_HORIZON_MESSAGE)
 
 
 def _validate_outcome_references(observation: "OutcomeObservation") -> None:
@@ -312,6 +314,7 @@ class SealedPrediction:
     committee_policy_version: str
     sealed_opinion_hashes: tuple[str, ...]
     sealed_seat_count: int
+    horizon_seconds: int
     provenance: Provenance
     phase: EvaluationPhase = EvaluationPhase.PROSPECTIVE
     schema_version: int = SEALED_PREDICTION_SCHEMA_VERSION
@@ -331,6 +334,7 @@ class SealedPrediction:
             "evidence_snapshot_hash": self.evidence_snapshot_hash,
             "committee_policy_version": self.committee_policy_version,
             "sealed_opinion_hashes": self.sealed_opinion_hashes,
+            "horizon_seconds": self.horizon_seconds,
         }
 
     @property
@@ -339,11 +343,13 @@ class SealedPrediction:
             SEALED_PREDICTION_IDENTITY_DOMAIN, self.identity_payload()
         )
 
-    def outcome_eligible_at(self, horizon_seconds: int) -> datetime:
-        """The earliest instant at which this prediction may be judged."""
-        if type(horizon_seconds) is not int or horizon_seconds < 1:
-            raise ProspectivePolicyError(_HORIZON_MESSAGE)
-        return self.evidence_cutoff_at + timedelta(seconds=horizon_seconds)
+    def outcome_eligible_at(self) -> datetime:
+        """The earliest instant at which this prediction may be judged.
+
+        Derived from the horizon committed at sealing, so a caller cannot select
+        a different horizon once results are known.
+        """
+        return self.evidence_cutoff_at + timedelta(seconds=self.horizon_seconds)
 
 
 @dataclass(frozen=True)
@@ -538,6 +544,7 @@ def seal_prediction(
     case_outcome: CommitteeCaseOutcome,
     evidence_snapshot: EvidenceSnapshot,
     sealed_at: datetime,
+    horizon_seconds: int,
     experiment_id: str,
     provenance: Provenance,
     case_type: CaseType,
@@ -549,7 +556,14 @@ def seal_prediction(
     one the snapshot was actually built with, which would let
     :func:`assert_outcome_is_prospective` admit an outcome that overlaps evidence
     already present at T0 and quietly defeat the anti-hindsight guarantee.
+
+    The evaluation horizon is committed here, at T0. It is deliberately not taken
+    from the later observation: accepting a horizon after results are known would
+    permit post-hoc horizon selection, which invalidates the experiment even
+    though every timestamp check would still pass.
     """
+    if type(horizon_seconds) is not int or horizon_seconds < 1:
+        raise ProspectivePolicyError(_HORIZON_MESSAGE)
     sealed = require_utc(sealed_at, field_name="sealed_at")
     _require_snapshot_binding(case_outcome, evidence_snapshot, case_type=case_type)
     cutoff = evidence_snapshot.evidence_cutoff_at
@@ -574,6 +588,7 @@ def seal_prediction(
         committee_policy_version=case_outcome.committee_policy_version,
         sealed_opinion_hashes=hashes,
         sealed_seat_count=len(hashes),
+        horizon_seconds=horizon_seconds,
         provenance=provenance,
     )
 
@@ -646,6 +661,12 @@ def assert_outcome_is_prospective(
     if observation.observed_at < prediction.sealed_at:
         raise HindsightLeakageError(
             "the outcome was observed before the prediction was sealed"
+        )
+    if observation.horizon_seconds != prediction.horizon_seconds:
+        raise ProspectivePolicyError(
+            "the outcome horizon must be the one committed at sealing "
+            f"({prediction.horizon_seconds}s); got {observation.horizon_seconds}s. "
+            "Accepting a later horizon would permit post-hoc horizon selection."
         )
     if observation.horizon_seconds < 1:
         raise ProspectivePolicyError(_HORIZON_MESSAGE)
@@ -726,7 +747,7 @@ def evaluate_prospective(
         sealed_at=prediction.sealed_at,
         observed_at=observation.observed_at,
         evaluated_at=evaluated,
-        horizon_seconds=observation.horizon_seconds,
+        horizon_seconds=prediction.horizon_seconds,
         finality=observation.finality,
         seat_scores=tuple(scores),
         scored_seats=scored_seats,

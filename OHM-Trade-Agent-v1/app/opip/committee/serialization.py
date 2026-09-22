@@ -787,6 +787,7 @@ _SEAL_FIELDS = frozenset(
         "committee_policy_version",
         "sealed_opinion_hashes",
         "sealed_seat_count",
+        "horizon_seconds",
         "phase",
         "provenance",
     }
@@ -893,6 +894,7 @@ def sealed_prediction_to_dict(prediction) -> dict[str, Any]:
         "committee_policy_version": prediction.committee_policy_version,
         "sealed_opinion_hashes": list(prediction.sealed_opinion_hashes),
         "sealed_seat_count": prediction.sealed_seat_count,
+        "horizon_seconds": prediction.horizon_seconds,
         "phase": prediction.phase.value,
         "provenance": _encode_provenance(prediction.provenance),
     }
@@ -918,6 +920,7 @@ def sealed_prediction_from_dict(row: Mapping[str, Any]):
             row.get("sealed_opinion_hashes"), field="sealed_opinion_hashes"
         ),
         sealed_seat_count=row.get("sealed_seat_count"),
+        horizon_seconds=row.get("horizon_seconds"),
         phase=_parse_enum(row.get("phase"), EvaluationPhase, field="phase"),
         provenance=_decode_provenance(row.get("provenance")),
     )

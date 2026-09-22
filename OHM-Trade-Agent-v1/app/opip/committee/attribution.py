@@ -458,6 +458,10 @@ def _provider_identity(provider: "ProviderAttribution") -> dict[str, object]:
         ),
         "known_cost_microunits": provider.known_cost_microunits,
         "unknown_cost_samples": provider.unknown_cost_samples,
+        # The threshold this arm was assessed against is persisted, so it must
+        # participate in the identity: changing it can move adequacy_note from
+        # INSUFFICIENT_SAMPLE to adequate.
+        "minimum_samples": provider.minimum_samples,
     }
 
 
