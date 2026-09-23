@@ -50,7 +50,7 @@ from app.opip.decision_intelligence.serialization import require_utc
 #: The exact endpoints the approved adapters may reach. Declared as data so the
 #: allowlist can be asserted, and so adding a destination is a visible change.
 ALLOWED_ENDPOINTS: Mapping[ProviderFamily, str] = {
-    ProviderFamily.OPENAI: "https://api.openai.com/v1/chat/completions",
+    ProviderFamily.OPENAI: "https://api.openai.com/v1/responses",
     ProviderFamily.ANTHROPIC: "https://api.anthropic.com/v1/messages",
 }
 
@@ -309,10 +309,11 @@ class _BaseTransport:
 
 
 class OpenAITransport(_BaseTransport):
-    """OpenAI chat-completions adapter.
+    """OpenAI Responses adapter.
 
-    Pins the model id and reasoning effort from the route, and never sends the
-    credential anywhere except the authorization header.
+    GPT-5.6 reasoning models are invoked through the Responses API. The model,
+    LOW reasoning effort, output bound, stateless mode, and empty tool surface are
+    explicit on every request rather than inherited from a provider default.
     """
 
     def _vendor_headers(self, token: str) -> Mapping[str, str]:
@@ -324,41 +325,64 @@ class OpenAITransport(_BaseTransport):
     def _vendor_body(self, request: ProviderWireRequest) -> Mapping[str, Any]:
         return {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": request.system_prompt},
-                {"role": "user", "content": json.dumps(dict(request.user_payload), sort_keys=True)},
+            "instructions": request.system_prompt,
+            "input": [
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        dict(request.user_payload), sort_keys=True
+                    ),
+                }
             ],
-            "max_completion_tokens": request.max_output_tokens,
-            "reasoning_effort": self.reasoning_effort,
+            "max_output_tokens": request.max_output_tokens,
+            "reasoning": {"effort": self.reasoning_effort},
+            "store": False,
+            # No built-in or custom tool is available to a committee seat.
+            "tools": [],
         }
 
-    def _extract(self, payload: Mapping[str, Any]) -> tuple[str, int | None, int | None, str | None]:
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
+    def _extract(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[str, int | None, int | None, str | None]:
+        status = payload.get("status")
+        if status != "completed":
             raise ProviderInvocationError(
-                "openai response carried no choices",
+                f"openai response was not completed (status={status!r})",
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
-        first = choices[0]
-        if not isinstance(first, Mapping):
+        output = payload.get("output")
+        if not isinstance(output, list) or not output:
             raise ProviderInvocationError(
-                "openai response choice was not an object",
+                "openai response carried no output items",
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
-        message = first.get("message")
-        if not isinstance(message, Mapping) or not isinstance(message.get("content"), str):
+        texts: list[str] = []
+        for item in output:
+            if not isinstance(item, Mapping) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (
+                    isinstance(block, Mapping)
+                    and block.get("type") == "output_text"
+                    and isinstance(block.get("text"), str)
+                ):
+                    texts.append(block["text"])
+        if not texts:
             raise ProviderInvocationError(
-                "openai response carried no message content",
+                "openai response carried no output_text block",
                 failure_class=ProviderFailureClass.MALFORMED_RESPONSE,
             )
         usage = payload.get("usage")
         input_tokens = output_tokens = None
         if isinstance(usage, Mapping):
-            input_tokens = _optional_int(usage.get("prompt_tokens"))
-            output_tokens = _optional_int(usage.get("completion_tokens"))
+            input_tokens = _optional_int(usage.get("input_tokens"))
+            output_tokens = _optional_int(usage.get("output_tokens"))
         served = payload.get("model")
         return (
-            message["content"],
+            "".join(texts),
             input_tokens,
             output_tokens,
             served if isinstance(served, str) else None,
@@ -385,8 +409,17 @@ class AnthropicTransport(_BaseTransport):
             "max_tokens": request.max_output_tokens,
             "system": request.system_prompt,
             "messages": [
-                {"role": "user", "content": json.dumps(dict(request.user_payload), sort_keys=True)}
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        dict(request.user_payload), sort_keys=True
+                    ),
+                }
             ],
+            # Sonnet 5 defaults to adaptive thinking with HIGH effort. Pin the
+            # approved LOW effort explicitly so provider defaults cannot drift.
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": self.reasoning_effort},
         }
 
     def _extract(self, payload: Mapping[str, Any]) -> tuple[str, int | None, int | None, str | None]:
