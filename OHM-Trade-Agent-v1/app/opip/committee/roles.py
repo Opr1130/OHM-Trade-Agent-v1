@@ -34,6 +34,9 @@ from app.opip.decision_intelligence.serialization import stable_hash
 #: Schema version for the role-spec contract.
 COMMITTEE_ROLE_SPEC_SCHEMA_VERSION = 1
 
+#: Identity domain for a single role's contract.
+ROLE_SPEC_IDENTITY_DOMAIN = "COMMITTEE-ROLE-SPEC"
+
 #: Identity domain for a canonical role-spec set.
 ROLE_SPEC_SET_IDENTITY_DOMAIN = "COMMITTEE-ROLE-SPECS"
 
@@ -146,8 +149,13 @@ class CommitteeRoleSpec:
 
     @property
     def spec_hash(self) -> str:
-        """Content-derived identity of this role contract."""
-        return stable_hash(ROLE_SPEC_SET_IDENTITY_DOMAIN, self.identity_payload())
+        """Content-derived identity of this role contract.
+
+        Uses its own domain: a spec and a spec *set* are different record kinds,
+        and the repository's convention is one domain per kind so two kinds can
+        never collide on a digest.
+        """
+        return stable_hash(ROLE_SPEC_IDENTITY_DOMAIN, self.identity_payload())
 
 
 @dataclass(frozen=True)
@@ -294,6 +302,7 @@ __all__ = [
     "OPTIONAL_ROLES",
     "REQUIRED_ROLES",
     "ROLE_EVIDENCE_DEPENDENCY",
+    "ROLE_SPEC_IDENTITY_DOMAIN",
     "ROLE_SPEC_SET_IDENTITY_DOMAIN",
     "CommitteeRole",
     "CommitteeRoleSpec",

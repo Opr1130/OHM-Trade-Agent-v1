@@ -270,6 +270,8 @@ class ModelRegistry:
             raise ValueError("registry_version is required")
         if not isinstance(self.entries, tuple):
             raise ValueError("entries must be a tuple")
+        if not isinstance(self.routes, Mapping):
+            raise ValueError("routes must be a mapping of role to (primary, fallback)")
         seen: set[str] = set()
         for entry in self.entries:
             if not isinstance(entry, ModelRegistryEntry):
@@ -361,6 +363,16 @@ class ModelRegistry:
     @property
     def registry_hash(self) -> str:
         return stable_hash(MODEL_REGISTRY_IDENTITY_DOMAIN, self.identity_payload())
+
+    def __hash__(self) -> int:
+        """Hash by content, not by field identity.
+
+        ``routes`` is a mapping, so the generated dataclass hash would raise on
+        an unhashable field. Hashing the content-derived registry identity keeps
+        the type usable as a set/dict key without making identity depend on the
+        mapping's insertion order.
+        """
+        return hash(self.registry_hash)
 
 
 def assert_result_served_by_route(

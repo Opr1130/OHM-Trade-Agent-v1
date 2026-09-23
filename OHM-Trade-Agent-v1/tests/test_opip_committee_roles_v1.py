@@ -156,7 +156,11 @@ def test_each_role_carries_its_own_prompt_identity():
     assert len(set(templates)) == len(templates)
     for spec in spec_set.specs:
         assert spec.prompt_version == "1"
-        assert spec.spec_hash.startswith("COMMITTEE-ROLE-SPECS:")
+        # A spec and a spec set are different record kinds and use different hash
+        # domains, so the two can never collide on a digest.
+        assert spec.spec_hash.startswith("COMMITTEE-ROLE-SPEC:")
+        assert not spec.spec_hash.startswith("COMMITTEE-ROLE-SPECS:")
+    assert spec_set.spec_set_hash.startswith("COMMITTEE-ROLE-SPECS:")
 
 
 def test_a_role_result_cannot_be_re_attributed_to_another_prompt_version():
