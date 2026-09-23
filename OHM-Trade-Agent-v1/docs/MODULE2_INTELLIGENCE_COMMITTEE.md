@@ -691,3 +691,89 @@ Write **"authority-bearing"** / **"action-bearing"** instead, and run
 `tests/test_opip_decision_safety_v1.py` after any change that touches prose under
 `app/opip/`. The scan is a frozen contract and must not be weakened to
 accommodate wording.
+
+## IC-001 to IC-045 reconciliation
+
+Status vocabulary, applied strictly:
+
+- **GREEN** - the requirement is implemented and its lifecycle is proved by tests at
+  this revision.
+- **PARTIAL** - the contract, lifecycle, and tests exist, but the requirement is not
+  yet exercised end to end against real data or a real deployment.
+- **MISSING** - not implemented.
+- **OUT_OF_SCOPE** - deliberately not built in this revision, with the reason.
+
+A module or class existing is **not** sufficient for GREEN; the evidence column
+names the lifecycle behaviour that is actually tested.
+
+| IC | Requirement | Status | Evidence at this revision |
+| --- | --- | --- | --- |
+| IC-001 | Zero trading/order/risk authority | **GREEN** | Structural tests assert the plane cannot import exchange, order, registry, or notification modules; `AUTHORITATIVE` and `CAN_PLACE_ORDERS` are False; no runtime root imports the plane. |
+| IC-002 | Dark-by-default mode enforcement | **GREEN** | `Settings` defaults to `off`; `CommitteeShadowSettings` defaults to `off`; an unrecognised mode resolves to `off`; `run_case` raises unless enabled; scheduler cycle does not run when disabled. |
+| IC-003 | Point-in-time evidence with explicit cutoff | **GREEN** | `EvidenceSnapshot` carries the cutoff; `seal_prediction` derives the cutoff from the authenticated snapshot rather than a caller argument. |
+| IC-004 | Future/hindsight exclusion | **GREEN** | `HindsightLeakageError` on an overlapping window, an outcome observed before sealing, or a horizon mismatch; adversarial tests cover each. |
+| IC-005 | DecisionContext to Committee linkage | **PARTIAL** | `CanonicalDecisionBinding` is opaque by reference, participates in case/case-outcome identity, is persisted, and refuses reattribution and unbinding, with legacy-identity tests. Not yet populated from a real canonical decision, which needs the governed DI bridge. |
+| IC-006 | Explicit role-based Committee | **GREEN** | Seven roles; six required and enforced by `validate_complete`; the optional role must report `UNKNOWN` rather than invent a view; a provider family is asserted never to be a role. |
+| IC-007 | Provider-neutral adapter boundary | **GREEN** | `CommitteeProvider` plus injected `ProviderTransport`; the router never branches on vendor; an absent adapter is `UNAVAILABLE` rather than substituted. |
+| IC-008 | Real governed provider transports | **MISSING** | Adapters exist and are exercised by deterministic fakes; a real transport with credentials and network policy is a separate approved change and is documented as such. |
+| IC-009 | Versioned Model Registry | **GREEN** | Versioned registry of role routes with prompt/schema hashes, owner, approval state, effective and review dates, reasoning mode, and budget limits. |
+| IC-010 | Primary plus at most one approved fallback | **GREEN** | Two routes for one role are refused as ambiguous; the fallback shares the primary's request, deadline, and reservations; an unusable fallback is dropped, never substituted; only `APPROVED` routes. |
+| IC-011 | Deadline/token/cost/concurrency budgets | **GREEN** | `RoleBudget` validates and enforces deadline and cost ceilings, bounds concurrency, and refuses an unknown cost rather than treating it as free. |
+| IC-012 | Per-attempt latency/token/model/cost accounting | **PARTIAL** | Call outcomes persist served provider/model, tokens, cost, and completeness; `RoleAttempt` carries cost. **Latency is not currently measured** by the router, so the latency field is not populated in role results. |
+| IC-013 | Strict structured-response validation | **GREEN** | Non-JSON, fenced, undeclared, out-of-range, non-finite, and missing-field responses are refused; one bounded repair path only. |
+| IC-014 | Evidence-reference validation | **GREEN** | A citation outside the screened manifest is refused, including after whitespace normalisation; tested against path-like and URL-like references. |
+| IC-015 | Immutable/durable evidence store | **GREEN** | Append-only bounded JSONL with durable idempotency ledger; sidecars are caches reconciled against the authoritative log; divergent replays are refused with durable rejection records. |
+| IC-016 | Durable scheduler from committed evidence | **GREEN** | Deterministic schedule key; redelivery returns the existing disposition and executes nothing; restart resumes from the checkpoint; each disposition is persisted before the cycle continues; executor faults are contained. |
+| IC-017 | Population accounting | **GREEN** | Ten dispositions; `PopulationTally` reports every state even at zero and the cycle's considered count is checked against the accounted total; `SKIPPED_BUDGET` and `SKIPPED_CAPACITY` remain distinct from `UNAVAILABLE`, `FAILED`, `INVALID`, `EXPIRED`, and `LATE`. |
+| IC-018 | Phase-A conformance/security bake-off | **GREEN** | 542 deterministic fixtures exceed the 500 minimum; all four required directions are asserted at zero (unauthorised action fields, citations outside the manifest, embedded instructions, unhandled malformed payloads); repair is bounded to one registered strategy. |
+| IC-019 | Retrospective role/model bake-off | **PARTIAL** | Frozen corpus identity, required diagnostic-class breadth, a 120-case minimum, and answer-hiding are enforced, and every result carries `RESEARCH_ONLY_NOT_PORTFOLIO_EVIDENCE`. Not yet run against a real retrospective corpus. |
+| IC-020 | Sealed prospective experiment | **PARTIAL** | Registration freezes corpus, routes, mapping, horizon, stopping rule, and exact release identity; edits fail closed; maturity and release drift are enforced; populations cannot mix. Not yet running against live cases. |
+| IC-021 | Deterministic O'Pip baseline comparison | **PARTIAL** | The bake-off compares a deterministic baseline arm; economics requires a `DETERMINISTIC_BASELINE` arm under matched conditions. Not yet populated from production baseline results. |
+| IC-022 | Cash/no-trade comparator | **PARTIAL** | A `CASH_NO_TRADE` arm is a declared type, must share conditions, and is carried into the report. Not yet populated from real data. |
+| IC-023 | Disagreement taxonomy | **GREEN** | The attribution matrix separates unanimous agreement, confidence, evidence, and assumption disagreement, single dissent, split, insufficient evidence, provider failure, schema-invalid, and unavailability. |
+| IC-024 | Incremental-information attribution | **GREEN** | Independent incremental correctness requires disagreeing with the baseline, being right, and the baseline being wrong; paired-population restriction is enforced. |
+| IC-025 | Matched portfolio economic comparison | **GREEN** | Two arms may only be subtracted under identical conditions, and the error names the differing fields. |
+| IC-026 | Incremental Trading Net | **GREEN** | Committee net minus frozen baseline net; unknown when either side is unknown. |
+| IC-027 | Incremental Operating Net | **GREEN** | Incremental trading net minus attributable operating cost; unknown cost leaves it unknown; negative operating value with positive gross value is surfaced. |
+| IC-028 | Avoided-loss / missed-gain semantics | **GREEN** | Requires a preregistered policy and feasible timing, is labelled `SIMULATED_NOT_REALISED_CASH`, and cannot be relabelled as realised. |
+| IC-029 | Durable Weakness Finding Registry | **GREEN** | Findings are immutable; duplicate ids are refused; validation and follow-up records are appended rather than folded in; state is derived from appended history. |
+| IC-030 | Controlled weakness taxonomy | **GREEN** | Seventeen categories plus a constrained `OTHER`; the taxonomy version is recorded on both the finding and its recurrence key so history cannot be re-labelled. |
+| IC-031 | Weakness outcome validation | **GREEN** | `PENDING`, `VALIDATED`, `REJECTED`, `INCONCLUSIVE`; a resolved validation must reference realised outcome evidence; the committee plane is refused as a validator. |
+| IC-032 | Weakness recurrence tracking | **GREEN** | Recurrence keys are scope- and subject-bound, so unrelated incidents are never merged; recurrence requires at least two occurrences. |
+| IC-033 | Economic impact of validated weakness | **GREEN** | Reported only for a validated finding and only when measured; an unmeasured effect stays null rather than zero. |
+| IC-034 | Role/model attribution to weakness | **GREEN** | Findings carry committee role, provider, model, prompt/policy version, case id, paper trade id, and baseline decision reference. |
+| IC-035 | Hypothesis registry | **GREEN** | Hypothesis records mechanism, cohort, falsifiable prediction, expected effect, and source findings; grounding in a `VALIDATED` finding is enforced. |
+| IC-036 | Registered experiment | **GREEN** | Every axis is frozen and required; post-sealing edits fail closed; compromise is explicit, reasoned, and identity-bearing. |
+| IC-037 | ACCEPTED / REJECTED / INCONCLUSIVE | **GREEN** | Exactly three values; a resolved conclusion must reference its sealed evaluation; inconclusive is first class; `authorises_policy_change` is always false. |
+| IC-038 | Human-governed promotion only | **GREEN** | A release requires the conclusion, an approving identity, and a full 40-character lowercase SHA; no module in the plane can change a threshold, route, or weight. |
+| IC-039 | Release/artifact linkage | **GREEN** | `ReleaseRecord` links conclusion to released SHA and artifact reference; the chain refuses a release without a conclusion. |
+| IC-040 | Post-change effectiveness | **GREEN** | Reports before/after windows, metric delta, and recurrence delta; an incomparable cohort must state why and must not report a metric. |
+| IC-041 | Exact release SHA binding | **PARTIAL** | Releases carry an exact SHA, and prospective evaluation fails closed on release drift with an explicit ineligible disposition. Not yet verified against a deployed release SHA. |
+| IC-042 | Isolated shadow deployment architecture | **MISSING** | Not deployed, by instruction. The contracts it depends on (off-by-default mode, advisory-only persistence, contained failure) exist and are tested. |
+| IC-043 | Learning observability | **PARTIAL** | Prospective pending counters and a six-gate trust report with explicit insufficiency reasons exist. No deployed dashboard, which is out of scope for this revision. |
+| IC-044 | Committee investment measurement | **GREEN** | Attributable cost, token totals, call and failure counts, with unknown cost remaining unknown and a failure rate that is null when nothing was called. |
+| IC-045 | No credentials or executable tools to models | **GREEN** | Fail-closed outbound screening by prohibited key name, credential-formed value, and environment-dump field; the plane exposes no tool, shell, or browsing surface to a model. |
+
+### Summary
+
+| Status | Count |
+| --- | --- |
+| GREEN | 35 |
+| PARTIAL | 8 |
+| MISSING | 2 |
+| OUT_OF_SCOPE | 0 |
+
+### What blocks READY_TO_FREEZE
+
+The two MISSING requirements are the honest blockers, and both are deliberate:
+
+1. **IC-008 real governed provider transports** requires credentials and a network
+   policy. That is an owner-authorised change, and no credential may be placed on
+   this plane by an agent.
+2. **IC-042 isolated shadow deployment** requires a deployment decision that this
+   mandate explicitly withholds.
+
+Neither is a correctness defect. The eight PARTIAL requirements are contracts with
+proven lifecycles that have not yet been exercised against real evidence or a real
+release; every one of them is blocked on live providers, live cases, or a deployed
+release, not on missing implementation.
