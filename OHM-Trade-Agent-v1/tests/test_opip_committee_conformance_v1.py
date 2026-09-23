@@ -229,9 +229,10 @@ def test_a_boolean_schema_version_is_refused():
     Discovered by the Phase-A corpus, fixed in the parser by requiring the type to
     be exactly ``int``. This test keeps the fix from regressing.
     """
+    raw = _valid_payload(schema_version=True)
     with pytest.raises(OpinionParseError):
         parse_structured_opinion(
-            raw_text=_valid_payload(schema_version=True),
+            raw_text=raw,
             case_id="c",
             provider="p",
             model="m",
@@ -283,9 +284,10 @@ def test_only_the_declared_optional_fields_may_be_omitted():
     for field in sorted(OPINION_FIELDS - OPTIONAL_OPINION_FIELDS):
         payload = json.loads(_valid_payload())
         payload.pop(field)
+        raw = json.dumps(payload)
         with pytest.raises(OpinionParseError):
             parse_structured_opinion(
-                raw_text=json.dumps(payload),
+                raw_text=raw,
                 case_id="c",
                 provider="p",
                 model="m",

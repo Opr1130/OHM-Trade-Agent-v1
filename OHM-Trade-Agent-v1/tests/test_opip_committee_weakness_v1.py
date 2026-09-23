@@ -145,22 +145,41 @@ def test_the_recurrence_key_carries_its_own_taxonomy_version():
 # ------------------------------------------------- IC-029 registry
 
 
+def _finding_params(**overrides) -> dict:
+    """Construction arguments for a finding, so a test can vary one field.
+
+    Exposed so a test can build the arguments outside a ``pytest.raises`` block and
+    leave exactly one possibly-throwing invocation inside it.
+    """
+    params: dict = {
+        "finding_id": "w-1",
+        "decision_context_id": "ctx-1",
+        "weakness_category": WeaknessCategory.SLIPPAGE,
+        "finding_statement": "entry filled materially worse than the decision price",
+        "detected_at": NOW,
+        "evidence_cutoff": CUTOFF,
+        "evidence_refs": ("ev-1",),
+        "recurrence_key": RecurrenceKey(
+            category=WeaknessCategory.SLIPPAGE,
+            scope="instrument:BTC-USD",
+            subject="spread-at-entry",
+        ),
+    }
+    params.update(overrides)
+    return params
+
+
 def test_a_finding_requires_evidence_and_a_coherent_key():
-    with pytest.raises(WeaknessRegistryError, match="at least one piece of evidence"):
-        _finding(refs=())
-    with pytest.raises(WeaknessRegistryError, match="must match the finding category"):
-        WeaknessFinding(
-            finding_id="w",
-            decision_context_id="ctx",
-            weakness_category=WeaknessCategory.SLIPPAGE,
-            finding_statement="s",
-            detected_at=NOW,
-            evidence_cutoff=CUTOFF,
-            evidence_refs=("ev-1",),
-            recurrence_key=RecurrenceKey(
-                category=WeaknessCategory.EXIT_POLICY, scope="s", subject="x"
-            ),
+    no_evidence = _finding_params(evidence_refs=())
+    mismatched_key = _finding_params(
+        recurrence_key=RecurrenceKey(
+            category=WeaknessCategory.EXIT_POLICY, scope="s", subject="x"
         )
+    )
+    with pytest.raises(WeaknessRegistryError, match="at least one piece of evidence"):
+        WeaknessFinding(**no_evidence)
+    with pytest.raises(WeaknessRegistryError, match="must match the finding category"):
+        WeaknessFinding(**mismatched_key)
 
 
 def test_a_finding_may_not_cite_evidence_from_its_own_future():
@@ -172,8 +191,9 @@ def test_registering_a_duplicate_finding_id_is_refused():
     """Findings are immutable, so an id cannot be quietly replaced."""
     registry = WeaknessRegistry()
     registry.append_finding(_finding())
+    duplicate = _finding(statement="a different statement")
     with pytest.raises(WeaknessRegistryError, match="immutable"):
-        registry.append_finding(_finding(statement="a different statement"))
+        registry.append_finding(duplicate)
 
 
 def test_the_original_finding_is_never_mutated_by_validation():
@@ -195,17 +215,17 @@ def test_a_finding_without_a_validation_is_pending():
 
 def test_validation_and_follow_up_reference_known_findings():
     registry = WeaknessRegistry()
+    orphan_validation = _validation(finding_id="nope")
+    orphan_follow_up = WeaknessFollowUp(
+        follow_up_id="f-1",
+        finding_id="nope",
+        recorded_at=NOW,
+        remediation_ref="pr-1",
+    )
     with pytest.raises(WeaknessRegistryError, match="unknown finding"):
-        registry.append_validation(_validation(finding_id="nope"))
+        registry.append_validation(orphan_validation)
     with pytest.raises(WeaknessRegistryError, match="unknown finding"):
-        registry.append_follow_up(
-            WeaknessFollowUp(
-                follow_up_id="f-1",
-                finding_id="nope",
-                recorded_at=NOW,
-                remediation_ref="pr-1",
-            )
-        )
+        registry.append_follow_up(orphan_follow_up)
 
 
 def test_a_rejected_append_can_be_recorded_rather_than_lost():

@@ -193,7 +193,7 @@ class RetrospectiveCorpus:
             seen.add(case.case_id)
 
     def class_counts(self) -> Mapping[CaseClass, int]:
-        counts = {case_class: 0 for case_class in CaseClass}
+        counts = dict.fromkeys(CaseClass, 0)
         for case in self.cases:
             counts[case.case_class] += 1
         return counts

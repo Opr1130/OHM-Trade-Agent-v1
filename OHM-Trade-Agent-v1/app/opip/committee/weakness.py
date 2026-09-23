@@ -160,6 +160,83 @@ class RecurrenceKey:
         return stable_hash(RECURRENCE_KEY_IDENTITY_DOMAIN, self.identity_payload())
 
 
+def _validate_finding_schema_version(schema_version: object) -> None:
+    if schema_version != WEAKNESS_FINDING_SCHEMA_VERSION or (
+        type(schema_version) is not int
+    ):
+        raise ValueError("unsupported WeaknessFinding schema_version")
+
+
+def _require_finding_text_fields(finding: "WeaknessFinding") -> None:
+    for field_name in (
+        "finding_id",
+        "decision_context_id",
+        "finding_statement",
+        "taxonomy_version",
+    ):
+        value = getattr(finding, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise WeaknessRegistryError(f"{field_name} is required")
+
+
+def _require_finding_category_and_key(finding: "WeaknessFinding") -> None:
+    if not isinstance(finding.weakness_category, WeaknessCategory):
+        raise WeaknessRegistryError("invalid weakness_category")
+    if not isinstance(finding.recurrence_key, RecurrenceKey):
+        raise WeaknessRegistryError("recurrence_key is required")
+    if finding.recurrence_key.category is not finding.weakness_category:
+        raise WeaknessRegistryError(
+            "the recurrence key category must match the finding category"
+        )
+
+
+def _require_finding_evidence(evidence_refs: object) -> None:
+    if not isinstance(evidence_refs, tuple) or not evidence_refs:
+        raise WeaknessRegistryError(
+            "a finding must cite at least one piece of evidence"
+        )
+
+
+def _require_finding_role(role: object) -> None:
+    if role is not None and not isinstance(role, CommitteeRole):
+        raise WeaknessRegistryError("invalid committee_role")
+
+
+def _require_optional_effect(value: object) -> None:
+    if value is not None and type(value) is not int:
+        raise WeaknessRegistryError(
+            "economic_effect_microunits must be an integer or null"
+        )
+
+
+def _normalise_finding_timestamps(finding: "WeaknessFinding") -> None:
+    for field_name in ("detected_at", "evidence_cutoff"):
+        object.__setattr__(
+            finding,
+            field_name,
+            require_utc(getattr(finding, field_name), field_name=field_name),
+        )
+    if finding.evidence_cutoff > finding.detected_at:
+        raise WeaknessRegistryError(
+            "evidence_cutoff cannot be after detected_at; a finding may not "
+            "cite evidence from its own future"
+        )
+
+
+def _require_finding_statement_quality(finding: "WeaknessFinding") -> None:
+    """``OTHER`` must be specific, or the escape hatch replaces categorising.
+
+    Evidence is required of every finding, so that part needs no separate rule.
+    """
+    if finding.weakness_category is not WeaknessCategory.OTHER:
+        return
+    if len(finding.finding_statement.strip()) < 20:
+        raise WeaknessRegistryError(
+            "a weakness categorised OTHER requires a specific structured "
+            "statement, not a placeholder"
+        )
+
+
 @dataclass(frozen=True)
 class WeaknessFinding:
     """One immutable weakness finding.
@@ -192,61 +269,14 @@ class WeaknessFinding:
     schema_version: int = WEAKNESS_FINDING_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != WEAKNESS_FINDING_SCHEMA_VERSION or (
-            type(self.schema_version) is not int
-        ):
-            raise ValueError("unsupported WeaknessFinding schema_version")
-        for field_name in (
-            "finding_id",
-            "decision_context_id",
-            "finding_statement",
-            "taxonomy_version",
-        ):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise WeaknessRegistryError(f"{field_name} is required")
-        if not isinstance(self.weakness_category, WeaknessCategory):
-            raise WeaknessRegistryError("invalid weakness_category")
-        if not isinstance(self.recurrence_key, RecurrenceKey):
-            raise WeaknessRegistryError("recurrence_key is required")
-        if self.recurrence_key.category is not self.weakness_category:
-            raise WeaknessRegistryError(
-                "the recurrence key category must match the finding category"
-            )
-        if not isinstance(self.evidence_refs, tuple) or not self.evidence_refs:
-            raise WeaknessRegistryError(
-                "a finding must cite at least one piece of evidence"
-            )
-        if self.committee_role is not None and not isinstance(
-            self.committee_role, CommitteeRole
-        ):
-            raise WeaknessRegistryError("invalid committee_role")
-        if self.economic_effect_microunits is not None and (
-            type(self.economic_effect_microunits) is not int
-        ):
-            raise WeaknessRegistryError(
-                "economic_effect_microunits must be an integer or null"
-            )
-        for field_name in ("detected_at", "evidence_cutoff"):
-            object.__setattr__(
-                self,
-                field_name,
-                require_utc(getattr(self, field_name), field_name=field_name),
-            )
-        if self.evidence_cutoff > self.detected_at:
-            raise WeaknessRegistryError(
-                "evidence_cutoff cannot be after detected_at; a finding may not "
-                "cite evidence from its own future"
-            )
-        if self.weakness_category is WeaknessCategory.OTHER:
-            # OTHER must still be specific, or the taxonomy's escape hatch becomes
-            # a way to avoid categorising at all. Evidence is required of every
-            # finding, so that part needs no separate rule here.
-            if len(self.finding_statement.strip()) < 20:
-                raise WeaknessRegistryError(
-                    "a weakness categorised OTHER requires a specific structured "
-                    "statement, not a placeholder"
-                )
+        _validate_finding_schema_version(self.schema_version)
+        _require_finding_text_fields(self)
+        _require_finding_category_and_key(self)
+        _require_finding_evidence(self.evidence_refs)
+        _require_finding_role(self.committee_role)
+        _require_optional_effect(self.economic_effect_microunits)
+        _normalise_finding_timestamps(self)
+        _require_finding_statement_quality(self)
 
     @property
     def is_economically_measured(self) -> bool:
@@ -536,7 +566,7 @@ class WeaknessRegistry:
         A state that no finding occupies is reported as zero rather than omitted,
         so a reader cannot mistake an absent key for an unimplemented state.
         """
-        counts = {state: 0 for state in WeaknessValidationState}
+        counts = dict.fromkeys(WeaknessValidationState, 0)
         for finding in self._findings.values():
             counts[self.state_of(finding.finding_id)] += 1
         return {

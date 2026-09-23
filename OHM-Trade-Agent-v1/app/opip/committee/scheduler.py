@@ -361,6 +361,82 @@ class CaseExecutor(Protocol):
         """Execute one selected item, returning whether it completed."""
 
 
+def _zero_disposition_counts() -> dict[CommitteeScheduleDisposition, int]:
+    """A count for every disposition, so no state can be absent from a tally."""
+    return dict.fromkeys(CommitteeScheduleDisposition, 0)
+
+
+def _run_selected(
+    *,
+    item: CommittedEvidenceItem,
+    executor: CaseExecutor | None,
+) -> tuple[CommitteeScheduleDisposition, str | None, str | None, int | None]:
+    """Hand one selected item to the executor and classify the result.
+
+    Returns the disposition, an optional reason, an optional detail, and the cost
+    to charge. A scheduler fault is contained here rather than propagating into a
+    caller's trading path.
+    """
+    if executor is None:
+        return (
+            CommitteeScheduleDisposition.UNAVAILABLE,
+            "no executor is configured for this scheduler",
+            None,
+            None,
+        )
+    try:
+        completed = executor(item)
+    except Exception as exc:  # noqa: BLE001 - contained on purpose
+        return (
+            CommitteeScheduleDisposition.FAILED,
+            "executor raised",
+            f"{type(exc).__name__}: {exc}",
+            None,
+        )
+    if completed:
+        return (
+            CommitteeScheduleDisposition.COMPLETED,
+            None,
+            None,
+            item.estimated_cost_microunits,
+        )
+    return (
+        CommitteeScheduleDisposition.FAILED,
+        "executor reported no completion",
+        None,
+        None,
+    )
+
+
+@dataclass
+class _CycleState:
+    """Mutable accumulation for one scheduling cycle.
+
+    Kept as a small explicit object rather than a long list of locals, so the
+    per-item decision stays readable and the cycle's accounting is auditable in one
+    place.
+    """
+
+    moment: datetime
+    counts: dict[CommitteeScheduleDisposition, int]
+    decided: dict[str, ScheduleDispositionRecord]
+    records: list[ScheduleDispositionRecord] = field(default_factory=list)
+    cursor: SchedulerCursor | None = None
+    redelivered: int = 0
+    considered: int = 0
+    spent: int = 0
+    selected: int = 0
+
+    def __post_init__(self) -> None:
+        if self.cursor is None:
+            self.cursor = SchedulerCursor(
+                last_evidence_id=None, processed=0, updated_at=self.moment
+            )
+
+    def advance(self, item: CommittedEvidenceItem) -> None:
+        self.cursor = self.cursor.advanced_to(item.evidence_id, at=self.moment)
+
+
 @dataclass
 class CommitteeScheduler:
     """Plans committee cases from committed evidence, durably and idempotently."""
@@ -383,16 +459,7 @@ class CommitteeScheduler:
         trading-path fault.
         """
         moment = require_utc(self._now(), field_name="now")
-        decided = dict(self.checkpoint.load_decided())
-        counts: dict[CommitteeScheduleDisposition, int] = {
-            disposition: 0 for disposition in CommitteeScheduleDisposition
-        }
-        records: list[ScheduleDispositionRecord] = []
-        redelivered = 0
-        considered = 0
-        cursor = SchedulerCursor(
-            last_evidence_id=None, processed=0, updated_at=moment
-        )
+        counts = _zero_disposition_counts()
 
         # An unreadable checkpoint must not cause the scheduler to reprocess
         # everything, and must not cause it to silently skip either: the cycle
@@ -401,90 +468,88 @@ class CommitteeScheduler:
             return SchedulerRun(
                 ran=False,
                 reason=MODE_DISABLED,
-                tally=PopulationTally(
-                    counts=counts, considered=0, redelivered=0
+                tally=PopulationTally(counts=counts, considered=0, redelivered=0),
+                cursor=SchedulerCursor(
+                    last_evidence_id=None, processed=0, updated_at=moment
                 ),
-                cursor=cursor,
             )
 
-        spent = 0
-        selected = 0
+        state = _CycleState(
+            moment=moment,
+            counts=counts,
+            decided=dict(self.checkpoint.load_decided()),
+        )
         for item in items:
-            considered += 1
-            key = ScheduleKey.for_item(item)
-            existing = decided.get(key.schedule_key_id)
-            if existing is not None:
-                # At-least-once delivery: the original disposition stands and no
-                # second logical case is created.
-                redelivered += 1
-                records.append(existing)
-                counts[existing.disposition] += 1
-                cursor = cursor.advanced_to(item.evidence_id, at=moment)
-                continue
-
-            disposition, reason, detail = self._decide(
-                item=item,
-                moment=moment,
-                spent=spent,
-                selected=selected,
-            )
-            if disposition is CommitteeScheduleDisposition.SELECTED:
-                # Counted as selected *before* execution, because execution
-                # replaces the disposition with COMPLETED/FAILED and the capacity
-                # check reads this counter. Counting afterwards would let an
-                # exhausted cycle keep selecting.
-                selected += 1
-                if executor is None:
-                    disposition = CommitteeScheduleDisposition.UNAVAILABLE
-                    reason = "no executor is configured for this scheduler"
-                    detail = None
-                else:
-                    try:
-                        completed = executor(item)
-                    except Exception as exc:  # noqa: BLE001 - contained on purpose
-                        # A scheduler fault must never propagate into a caller's
-                        # trading path; it is recorded instead.
-                        disposition = CommitteeScheduleDisposition.FAILED
-                        reason = "executor raised"
-                        detail = f"{type(exc).__name__}: {exc}"
-                    else:
-                        disposition = (
-                            CommitteeScheduleDisposition.COMPLETED
-                            if completed
-                            else CommitteeScheduleDisposition.FAILED
-                        )
-                        reason = None if completed else "executor reported no completion"
-                        detail = None
-                        if completed and item.estimated_cost_microunits is not None:
-                            spent += item.estimated_cost_microunits
-
-            record = ScheduleDispositionRecord(
-                schedule_key_id=key.schedule_key_id,
-                evidence_id=item.evidence_id,
-                disposition=disposition,
-                decided_at=moment,
-                reason=reason,
-                detail=detail,
-            )
-            # Persisted before the cycle continues, so a crash mid-cycle cannot
-            # lose a decision that has already been made.
-            self.checkpoint.save_disposition(record)
-            decided[key.schedule_key_id] = record
-            records.append(record)
-            counts[disposition] += 1
-            cursor = cursor.advanced_to(item.evidence_id, at=moment)
+            self._consider(item=item, state=state, executor=executor)
 
         return SchedulerRun(
             ran=True,
             reason=None,
             tally=PopulationTally(
-                counts=counts, considered=considered, redelivered=redelivered
+                counts=state.counts,
+                considered=state.considered,
+                redelivered=state.redelivered,
             ),
-            cursor=cursor,
-            dispositions=tuple(records),
+            cursor=state.cursor,
+            dispositions=tuple(state.records),
         )
 
     # -------------------------------------------------------------- internals
+
+    def _consider(
+        self,
+        *,
+        item: CommittedEvidenceItem,
+        state: "_CycleState",
+        executor: CaseExecutor | None,
+    ) -> None:
+        """Decide and durably record one item's disposition."""
+        state.considered += 1
+        key = ScheduleKey.for_item(item)
+
+        existing = state.decided.get(key.schedule_key_id)
+        if existing is not None:
+            # At-least-once delivery: the original disposition stands and no
+            # second logical case is created.
+            state.redelivered += 1
+            state.records.append(existing)
+            state.counts[existing.disposition] += 1
+            state.advance(item)
+            return
+
+        disposition, reason, detail = self._decide(
+            item=item,
+            moment=state.moment,
+            spent=state.spent,
+            selected=state.selected,
+        )
+        if disposition is CommitteeScheduleDisposition.SELECTED:
+            # Counted as selected *before* execution, because execution replaces
+            # the disposition with COMPLETED/FAILED and the capacity check reads
+            # this counter. Counting afterwards would let an exhausted cycle keep
+            # selecting.
+            state.selected += 1
+            disposition, reason, detail, cost = _run_selected(
+                item=item, executor=executor
+            )
+            if cost is not None:
+                state.spent += cost
+
+        record = ScheduleDispositionRecord(
+            schedule_key_id=key.schedule_key_id,
+            evidence_id=item.evidence_id,
+            disposition=disposition,
+            decided_at=state.moment,
+            reason=reason,
+            detail=detail,
+        )
+        # Persisted before the cycle continues, so a crash mid-cycle cannot lose a
+        # decision that has already been made.
+        self.checkpoint.save_disposition(record)
+        state.decided[key.schedule_key_id] = record
+        state.records.append(record)
+        state.counts[disposition] += 1
+        state.advance(item)
 
     def _now(self) -> datetime:
         return self.now()

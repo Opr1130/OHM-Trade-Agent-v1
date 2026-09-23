@@ -97,11 +97,13 @@ def test_identical_conditions_match():
 def test_an_arm_that_did_not_run_under_the_stated_conditions_is_refused():
     conditions = _conditions()
     other = _conditions(population_id="panel-2")
+    baseline = _arm(PortfolioArm.DETERMINISTIC_BASELINE, -1_000)
+    committee = _arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, -500, conditions=other)
     with pytest.raises(EconomicsError, match="did not run under the stated conditions"):
         build_incremental_economics(
             matched_conditions=conditions,
-            baseline=_arm(PortfolioArm.DETERMINISTIC_BASELINE, -1_000),
-            committee=_arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, -500, conditions=other),
+            baseline=baseline,
+            committee=committee,
             operating_cost_microunits=100,
             four_way=FourWayComparison(1, 1, 1, 1),
         )
@@ -118,10 +120,11 @@ def test_a_zero_length_window_is_refused():
 def test_an_arm_must_account_for_every_population():
     """An omitted population is an unreported exclusion."""
     partial = {PopulationKind.FILLED: 3}
+    conditions_hash = _conditions().conditions_hash
     with pytest.raises(EconomicsError, match="does not account for every population"):
         ArmOutcome(
             arm=PortfolioArm.DETERMINISTIC_BASELINE,
-            conditions_hash=_conditions().conditions_hash,
+            conditions_hash=conditions_hash,
             net_microunits=0,
             population=partial,
             net_completeness="COMPLETE",
@@ -258,11 +261,14 @@ def test_the_cash_comparator_is_carried_when_supplied():
 
 
 def test_a_mislabelled_arm_is_refused():
+    conditions = _conditions()
+    baseline = _arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, 0)
+    committee = _arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, 0)
     with pytest.raises(EconomicsError, match="must be DETERMINISTIC_BASELINE"):
         build_incremental_economics(
-            matched_conditions=_conditions(),
-            baseline=_arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, 0),
-            committee=_arm(PortfolioArm.COMMITTEE_RESEARCH_POLICY, 0),
+            matched_conditions=conditions,
+            baseline=baseline,
+            committee=committee,
             operating_cost_microunits=0,
             four_way=FourWayComparison(0, 0, 0, 0),
         )

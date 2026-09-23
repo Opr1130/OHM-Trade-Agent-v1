@@ -19,6 +19,7 @@ integration risk in this area. These tests hold the separation:
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -287,7 +288,7 @@ def test_redelivery_semantics_are_unaffected_by_the_codec():
 
 def test_the_disposition_record_is_immutable():
     record = _record()
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         record.disposition = CommitteeScheduleDisposition.FAILED  # type: ignore[misc]
 
 

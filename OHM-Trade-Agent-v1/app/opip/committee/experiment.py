@@ -140,6 +140,56 @@ class RouteSeal:
         }
 
 
+def _validate_registration_schema_version(schema_version: object) -> None:
+    if schema_version != REGISTRATION_SCHEMA_VERSION or (
+        type(schema_version) is not int
+    ):
+        raise ValueError("unsupported ExperimentRegistration schema_version")
+
+
+def _require_registration_text_fields(registration: "ExperimentRegistration") -> None:
+    for field_name in (
+        "experiment_id",
+        "corpus_version",
+        "corpus_hash",
+        "release_sha",
+        "stopping_rule",
+    ):
+        value = getattr(registration, field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} is required")
+
+
+def _require_registration_horizon(horizon_seconds: object) -> None:
+    if type(horizon_seconds) is not int or horizon_seconds < 1:
+        raise ExperimentError("horizon_seconds must be a positive integer")
+
+
+def _require_registration_mapping(mapping: object) -> None:
+    if not isinstance(mapping, ResearchMapping):
+        raise ExperimentError("research_mapping is required")
+
+
+def _require_sealed_routes(routes: object) -> None:
+    """A registration seals at least one route, and never two for one role.
+
+    Two routes for a single role would make automatic selection possible after the
+    fact, which is what the seal exists to prevent.
+    """
+    if not isinstance(routes, tuple) or not routes:
+        raise ExperimentError("a registration seals at least one route")
+    seen: set[CommitteeRole] = set()
+    for route in routes:
+        if not isinstance(route, RouteSeal):
+            raise ExperimentError("routes must be RouteSeal values")
+        if route.role in seen:
+            raise ExperimentError(
+                f"duplicate sealed route for {route.role.value}; automatic "
+                "selection would be ambiguous"
+            )
+        seen.add(route.role)
+
+
 @dataclass(frozen=True)
 class ExperimentRegistration:
     """A sealed prospective experiment.
@@ -161,36 +211,11 @@ class ExperimentRegistration:
     schema_version: int = REGISTRATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != REGISTRATION_SCHEMA_VERSION or (
-            type(self.schema_version) is not int
-        ):
-            raise ValueError("unsupported ExperimentRegistration schema_version")
-        for field_name in (
-            "experiment_id",
-            "corpus_version",
-            "corpus_hash",
-            "release_sha",
-            "stopping_rule",
-        ):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{field_name} is required")
-        if type(self.horizon_seconds) is not int or self.horizon_seconds < 1:
-            raise ExperimentError("horizon_seconds must be a positive integer")
-        if not isinstance(self.research_mapping, ResearchMapping):
-            raise ExperimentError("research_mapping is required")
-        if not isinstance(self.routes, tuple) or not self.routes:
-            raise ExperimentError("a registration seals at least one route")
-        seen: set[CommitteeRole] = set()
-        for route in self.routes:
-            if not isinstance(route, RouteSeal):
-                raise ExperimentError("routes must be RouteSeal values")
-            if route.role in seen:
-                raise ExperimentError(
-                    f"duplicate sealed route for {route.role.value}; automatic "
-                    "selection would be ambiguous"
-                )
-            seen.add(route.role)
+        _validate_registration_schema_version(self.schema_version)
+        _require_registration_text_fields(self)
+        _require_registration_horizon(self.horizon_seconds)
+        _require_registration_mapping(self.research_mapping)
+        _require_sealed_routes(self.routes)
         object.__setattr__(
             self,
             "registered_at",

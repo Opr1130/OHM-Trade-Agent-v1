@@ -125,11 +125,9 @@ def test_the_corpus_identity_is_content_derived_and_frozen():
 
 
 def test_duplicate_case_ids_are_refused():
+    duplicate_cases = (_case(1, CaseClass.WIN), _case(1, CaseClass.LOSS))
     with pytest.raises(CorpusError, match="duplicate corpus case id"):
-        RetrospectiveCorpus(
-            corpus_version="dup",
-            cases=(_case(1, CaseClass.WIN), _case(1, CaseClass.LOSS)),
-        )
+        RetrospectiveCorpus(corpus_version="dup", cases=duplicate_cases)
 
 
 def test_a_role_comparison_names_the_corpus_it_ran_on():
@@ -271,8 +269,9 @@ def test_editing_a_registration_after_sealing_fails_closed():
 
 def test_a_registration_cannot_seal_two_routes_for_one_role():
     """Two routes for one role would make automatic selection possible."""
+    ambiguous_routes = (_route(), _route())
     with pytest.raises(ExperimentError, match="automatic selection would be ambiguous"):
-        _registration(routes=(_route(), _route()))
+        _registration(routes=ambiguous_routes)
 
 
 def test_a_registration_requires_a_bounded_horizon_and_stopping_rule():
