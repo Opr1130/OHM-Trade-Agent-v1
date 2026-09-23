@@ -360,7 +360,51 @@ downstream work, so scheduling is separable from execution and from authority.
 - **Dark by default.** With committee mode `off` — or any unrecognised value — the
   cycle does not run, selects nothing, persists nothing, and creates no case.
 
-### 3E — Contribution to the profitability loop
+### 3F — Phase B retrospective corpus and Phase C sealed experiment (IC-019, IC-020)
+
+**Phase B (`retrospective.py`).** A role/model comparison runs on a *frozen*
+retrospective corpus, and three properties are enforced rather than described:
+
+- **Frozen.** The corpus carries a content-derived identity over every case, so an
+  edit after results are seen changes the identity, and a comparison names the
+  corpus hash it actually ran on.
+- **Breadth checked.** The required diagnostic classes — baseline accepts, baseline
+  rejects, wins, losses, late extensions, no-fills, missing evidence, grade B/C
+  evidence, incidents — must all be present, and the corpus must meet
+  `MINIMUM_CORPUS_CASES` (120). A corpus of easy cases is refused rather than used
+  with a caveat nobody reads.
+- **Answer hidden.** A case whose model-bound payload contains its own resolved
+  outcome is refused, because the comparison would then measure recall of the
+  fixture rather than analysis. The check is recursive, so a nested `label` cannot
+  smuggle it through.
+
+Every Phase-B result carries the explicit disposition
+`RESEARCH_ONLY_NOT_PORTFOLIO_EVIDENCE`, and the type refuses to be constructed with
+a prospective phase, `automatic_promotion=True`, or a trading-authority change. A
+retrospective win rate is not realised profitability, and the record says so.
+
+**Phase C (`experiment.py`).** A prospective experiment is *sealed before results
+are seen*:
+
+- **Registration freezes what would otherwise be chosen later**: corpus identity,
+  role routes with prompt/schema hashes, the research mapping, the horizon, the
+  stopping rule, and the exact release identity permitted to score it. The
+  registration participates in its own identity, and `verify_unchanged` refuses an
+  edited registration, so a post-hoc change is a new experiment or an explicit
+  `COMPROMISED` — never a quiet edit.
+- **Automatic selection is impossible**: two routes for one role are refused as
+  ambiguous.
+- **Maturity is enforced.** A record before its sealed horizon is
+  `PENDING_MATURITY`, never scored; a drifted release is `INELIGIBLE`; only
+  `MATURED` records are scorable.
+- **Populations stay separate.** A record declares its scope, and the type refuses
+  a retrospective record with a prospective phase (and vice versa), refuses a
+  prospective record that does not declare its maturity state — so a pending record
+  cannot be counted as matured by omission — and `ProspectiveTally` **excludes**
+  retrospective and ineligible records by construction rather than by a filter a
+  caller might forget.
+
+### 3G — Contribution to the profitability loop
 
 This slice supplies the **role-attribution** substrate the profitability loop
 requires. It is not yet wired to a live case pipeline, so the loop above is not
