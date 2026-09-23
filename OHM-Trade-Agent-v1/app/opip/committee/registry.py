@@ -438,6 +438,37 @@ APPROVED_MAX_DAILY_COST_MICROUNITS = 10_000_000
 #: Initial reasoning effort for the approved routes.
 APPROVED_SHADOW_REASONING_MODE = ReasoningMode.LOW
 
+#: Per-attempt bounds, as approved.
+APPROVED_DEADLINE_SECONDS = 45
+APPROVED_MAX_OUTPUT_TOKENS = 1_200
+
+#: The approved price book, in the format :mod:`app.opip.committee.pricing` parses:
+#: ``provider:model=input/output`` in microunits per million tokens, separated by
+#: ``;``. $2.00/1M input is 2_000_000 microunits; $12.00/1M output is 12_000_000.
+APPROVED_PRICE_BOOK_SPEC = (
+    "openai:gpt-5.6-terra=2000000/12000000;"
+    "anthropic:claude-sonnet-5=2000000/10000000"
+)
+
+#: Whether prompt-cache savings may be credited against cost.
+#:
+#: False, deliberately. Cache usage and its cost effect are not measured yet, so
+#: cost is accounted at uncached rates. Crediting an unmeasured saving would
+#: understate spend and make the ceiling look looser than it is. This flips only
+#: when cache usage is measured explicitly.
+CACHE_SAVINGS_CREDITED = False
+
+
+def approved_price_book():
+    """The approved price book, parsed from its declared specification.
+
+    Returned as a :class:`~app.opip.committee.pricing.PriceBook` so the declared
+    rates are exercised as configuration rather than restated in code.
+    """
+    from app.opip.committee.pricing import COMMITTEE_PRICES_ENV, PriceBook
+
+    return PriceBook.from_env({COMMITTEE_PRICES_ENV: APPROVED_PRICE_BOOK_SPEC})
+
 
 def default_shadow_registry(
     *,
@@ -484,6 +515,8 @@ def default_shadow_registry(
                     model_id_kind=ModelIdKind.FIXED,
                     reasoning_mode=APPROVED_SHADOW_REASONING_MODE,
                     max_cost_microunits=APPROVED_MAX_CASE_COST_MICROUNITS,
+                    max_output_tokens=APPROVED_MAX_OUTPUT_TOKENS,
+                    deadline_seconds=APPROVED_DEADLINE_SECONDS,
                 )
             )
         routes[role] = (primary_id, fallback_id)
@@ -516,11 +549,15 @@ def assert_result_served_by_route(
 
 
 __all__ = [
+    "APPROVED_DEADLINE_SECONDS",
     "APPROVED_MAX_CASE_COST_MICROUNITS",
     "APPROVED_MAX_DAILY_COST_MICROUNITS",
+    "APPROVED_MAX_OUTPUT_TOKENS",
+    "APPROVED_PRICE_BOOK_SPEC",
     "APPROVED_SHADOW_MODELS",
     "APPROVED_SHADOW_REASONING_MODE",
     "APPROVED_SHADOW_ROLE_PRIMARIES",
+    "CACHE_SAVINGS_CREDITED",
     "MODEL_REGISTRY_ENTRY_SCHEMA_VERSION",
     "MODEL_REGISTRY_SCHEMA_VERSION",
     "MODEL_REGISTRY_ENTRY_IDENTITY_DOMAIN",
@@ -534,5 +571,6 @@ __all__ = [
     "RegistryError",
     "RoleRoute",
     "assert_result_served_by_route",
+    "approved_price_book",
     "default_shadow_registry",
 ]
